@@ -116,7 +116,9 @@ joins gets everyone's current value. A value over one datagram (about 1 KB) goes
   throws a `RangeError`, and a larger one from a member is ignored. For more, split it across keys.
 - Shared state: at most 1024 keys (`MAX_KEYS`) and 1 MiB of values in all, as JSON (`MAX_STORE_LENGTH`). When
   it's full, a member's new key is ignored, unless a mounted hook reads it: then it takes the room of the oldest
-  keys no hook reads. So does our own write, and one that still doesn't fit throws a `RangeError`. Shared values
+  keys no hook reads. So does our own write, and one that still doesn't fit is dropped with a console warning,
+  as every member drops one; the setter doesn't throw. A key no mounted hook reads may be dropped when shared
+  state is full: a hook that mounts for it later reads `initial` until the key is written again. Shared values
   stay after their writer leaves.
 - Per-peer state: each member, us included, can have 64 keys (`MAX_PEER_KEYS`) and 256 KiB of values
   (`MAX_PEER_LENGTH`). A member's values past that are ignored, and ours throw a `RangeError`. A member that
