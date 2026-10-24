@@ -1514,8 +1514,9 @@ impl<A: Address> Endpoint<A> {
             // makes the address a candidate, and PUNCH_ACK decides.
             (Path::Direct(x), Path::Via(_)) => reflexive = Some(x.clone()),
             (Path::Via(r), Path::Via(q)) if r == q => sess.last_path = now,
-            // The peer moved to another relay: so does the link, unless it holds that one off.
-            (Path::Via(r), Path::Via(_)) => {
+            // The peer moved to another relay: so does the link, if that one is worth
+            // relaying through (as `offered`, `moved`) and not held off.
+            (Path::Via(r), Path::Via(_)) if fast_from => {
                 if !holds(&sess.held, r, now) {
                     sess.last_path = now;
                     sess.via_since = now;
@@ -2644,6 +2645,18 @@ mod tests {
     /// a moved, doesn't take a's link onto c.
     #[test]
     fn a_held_relay_is_not_roamed_to() {
+        roam_past_c(true);
+    }
+
+    /// FL2F-1: nor is a relay linked only over its slow address (see `add_relay`),
+    /// as above with a's link to c on its slow address instead of held off.
+    #[test]
+    fn a_relay_linked_on_its_slow_address_is_not_roamed_to() {
+        roam_past_c(false);
+    }
+
+    /// b offers c, a offers d; a holds c off (`held`) or reaches it on its slow address.
+    fn roam_past_c(held: bool) {
         let ids: Vec<Identity> = (1..=4u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
         let (a, b, c, d) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id(), ids[3].peer_id());
         let mut eps: Vec<Endpoint<u32>> =
@@ -2658,8 +2671,12 @@ mod tests {
         eps[0].set_slow(&b, Some(2));
         eps[1].set_slow(&a, Some(1));
         events(&mut eps[0]);
-        let idx = eps[0].peers[&b];
-        eps[0].sessions.get_mut(&idx).unwrap().hold(c, t);
+        if held {
+            let idx = eps[0].peers[&b];
+            eps[0].sessions.get_mut(&idx).unwrap().hold(c, t);
+        } else {
+            eps[0].set_slow(&c, Some(3));
+        }
         eps[1].add_relay(t, c, &a);
         eps[0].add_relay(t, d, &b);
         let sent = route(&mut eps, &mut t, 2_000, None);
