@@ -95,7 +95,7 @@ await room.leave();                             // peers see 'peer-leave' at onc
   real networks pass `RTCPeerConnection` from a WebRTC package such as
   node-datachannel's polyfill. Known issue: on Node 26.7, a script can hang in
   `process.exit()` on a busy machine while V8 is still optimising the wasm in the
-  background; run it with `node --no-wasm-tier-up` (the repo's tests do).
+  background; run it with `node --no-wasm-tier-up` (the gate runs its tests that way).
 - **Identity:** `room.endpoint.secret()` returns 32 bytes; pass them back as
   `secret` to keep the same PeerId.
 
@@ -237,14 +237,16 @@ it is given:
 **With microphone or camera permission.** Until a page has it, browsers hide its local
 addresses (behind mDNS names; Android Chrome offers only its mobile-data interface).
 Connections made after the grant list every network interface (RFC 8828 mode 1), which
-affects every voice or video app:
+affects every voice or video app. The grant is stored per origin, so it also applies on
+later visits and to pages of that origin that never ask:
 - `'direct'`: members get each interface's real address, LAN, hotspot and IPv6 ones.
   That is also what lets a phone and a laptop on its hotspot link directly. In one field
   test (October 2026: Android Chrome on mobile data, a laptop on its hotspot) the pair
   linked direct in 1.2 s, at about 10 ms, when both pages had microphone permission, and
   over the signalling relays in 5 to 6 s, at about 600 ms, when they didn't.
 - `'public-only'`: none of those, and so not that direct path either. Each interface's
-  public address as STUN sees it still goes (the Wi-Fi's and the mobile network's, say).
+  public address as STUN sees it still goes (the Wi-Fi's and the mobile network's, or
+  the real network's under a VPN).
 
 ## Trying it
 

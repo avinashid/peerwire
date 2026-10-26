@@ -73,11 +73,12 @@ export interface JoinRoomOptions {
    * a candidate's related address or the SDP's `c=` line either), so tabs of one
    * machine with no STUN server can't link. Relay-only is not available for rooms: use
    * `WebRtcTransport` with `privacy: 'relay-only'`.
-   * Once the page has microphone or camera permission, browsers list every network interface to connections made
-   * after the grant (RFC 8828 mode 1). With `'direct'`, members then get each one's real address (LAN, hotspot and
-   * IPv6 ones), which is what lets a phone and a laptop on its hotspot link directly. `'public-only'` withholds
-   * those, and that direct path with them, but still sends each interface's public address as STUN sees it (the
-   * Wi-Fi's and the mobile network's, say). Voice and video apps ask for that permission anyway. */
+   * Once the origin has a stored microphone or camera grant (it lasts across visits and covers every page of the
+   * origin, even one that never asks), browsers list every network interface to connections made after the grant
+   * (RFC 8828 mode 1). With `'direct'`, members then get each one's real address (LAN, hotspot and IPv6 ones),
+   * which is what lets a phone and a laptop on its hotspot link directly. `'public-only'` withholds those, and that
+   * direct path with them, but still sends each interface's public address as STUN sees it (the Wi-Fi's and the
+   * mobile network's, or the real network's under a VPN). Voice and video apps ask for that permission anyway. */
   privacy?: 'direct' | 'public-only';
   /** What to do for a peer WebRTC can't link (symmetric NAT on both sides, no TURN):
    * - `'auto'` (default): dial it through every member linked to both of you, and over the

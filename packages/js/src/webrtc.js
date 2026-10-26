@@ -195,9 +195,9 @@ export class WebRtcTransport {
   // gathering finishes (fewer signalling messages, for relays like Nostr).
   // `RTCPeerConnection` lets Node pass in an implementation (node-datachannel).
   // `privacy`: which addresses peers are given in ICE candidates.
-  //   'direct' (default): all of them. Once the page has mic or camera permission,
-  //     browsers list every network interface (RFC 8828 mode 1), so that is every
-  //     local address the device has.
+  //   'direct' (default): all of them. Once the origin has a stored mic or camera
+  //     grant, browsers list every network interface (RFC 8828 mode 1), so that is
+  //     every local address the device has.
   //   'public-only': no `host` candidates (LAN, loopback): only what STUN sees, which
   //     with that permission is each interface's public address.
   //   'relay-only': a WebRTC link to `relay` (a peer id, public-only) and to no one
