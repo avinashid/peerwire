@@ -72,6 +72,7 @@ NODE=(
   "node retry backoff|node packages/js/test/retry_backoff.mjs"
   "node nat prediction|node packages/js/test/nat_predict.mjs"
   "node late ice|node packages/js/test/late_ice.mjs"
+  "node restart budget|node packages/js/test/restart_budget.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"

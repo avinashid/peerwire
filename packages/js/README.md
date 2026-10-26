@@ -387,10 +387,16 @@ Run these with Node and the Playwright install on this host:
   candidates, the 32 predicted candidates, and a peer's prediction refused unless it is an
   IPv4 address and ports in range (nothing can be spliced into a candidate line).
 - `node packages/js/test/ice_restart.mjs` (Chromium, loopback): an ICE restart by either side
-  renews the ICE credentials while the DataChannel stays open and datagrams flow; ICE
-  `disconnected` restarts after 2 s, `failed` at once; at most 3 while ICE stays down;
-  `networkChanged()` touches only links whose ICE is down; an offer's prediction adds 32
-  candidates, a malformed one none.
+  renews the ICE credentials while the DataChannel stays open and datagrams flow; the
+  other side's ask is ignored while the dialling side's own ICE is connected; ICE
+  `disconnected` restarts after 2 s, `failed` at once; at most 3 a minute, ICE reconnecting
+  or not; `networkChanged()` touches only links whose ICE is down; an offer's prediction adds
+  32 candidates, a malformed one none.
+- `node packages/js/test/restart_budget.mjs`: a peer can't keep us publishing to the
+  signalling relays. A peer looping `restart` asks (answering each, ICE reconnecting) gets
+  3 restarts; an offer and 200 copies of it, or 50 new offers from a linked peer, get 6
+  answers (the per-peer budget: 6 at once, then 1 per 5 s; the rest counted in
+  `throttled`); a genuine ICE failure still restarts, on either side.
 - `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
   DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
   the outage still arrives after it, by retransmit.
