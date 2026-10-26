@@ -505,7 +505,7 @@ impl<A: Address> Race<A> {
         let mut best: Option<(Path<A>, u64)> = None;
         for a in &mut self.alts {
             let Some(r) = a.rtt.take() else { continue };
-            if own.is_none_or(|o| r + PATH_MARGIN.max(o / 5) <= o) {
+            if own.is_none_or(|o| r.saturating_add(PATH_MARGIN.max(o / 5)) <= o) {
                 a.wins += 1;
                 if a.wins >= PATH_WINS && best.as_ref().is_none_or(|b| r < b.1) {
                     best = Some((a.path.clone(), r));
@@ -516,9 +516,9 @@ impl<A: Address> Race<A> {
     }
 }
 
-/// `old` smoothed with the sample `r`.
+/// `old` smoothed with the sample `r` (saturating, as the RTTs of a host clock jump can be huge).
 fn smooth(old: Option<u64>, r: u64) -> u64 {
-    old.map_or(r, |o| (o * 7 + r) / 8)
+    old.map_or(r, |o| o.saturating_mul(7).saturating_add(r) / 8)
 }
 
 /// Microseconds from `earlier` to `later`.
@@ -3624,6 +3624,29 @@ mod tests {
         rc.score();
         assert_eq!(rc.answer(t, &Path::Via(r), !7), None, "scored: closed");
         assert_eq!(rc.own, None);
+    }
+
+    /// FL3-N1: RTTs that a host clock jump makes huge saturate rather than wrap (or
+    /// panic, in a debug build): an RTT near the largest isn't clearly faster than
+    /// the same, and smoothing one stays the largest it can be.
+    #[test]
+    fn huge_rtts_saturate_in_a_race_and_in_smoothing() {
+        let mut rc = Race {
+            on: Path::Direct(1u32),
+            token: 7,
+            sent_at: Instant::ZERO,
+            next_at: Instant::ZERO,
+            rounds: 0,
+            open: true,
+            own: Some(u64::MAX - 1),
+            alts: Vec::new(),
+            again: None,
+        };
+        rc.add(Path::Direct(2), 8);
+        rc.alts[0].rtt = Some(u64::MAX - 1);
+        rc.score();
+        assert_eq!(rc.alts[0].wins, 0);
+        assert_eq!((smooth(Some(5), 13), smooth(Some(u64::MAX / 4), 0)), (6, u64::MAX / 8));
     }
 
     /// A relay the link holds off isn't probed, nor taken: b races d, then holds it.
