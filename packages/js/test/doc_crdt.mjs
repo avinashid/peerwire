@@ -72,6 +72,7 @@ class Net {
         this.timers.push(t);
         return () => (t.fn = null);
       },
+      now: () => this.now,
       incarnation: () => int(this.r, 2 ** 32).toString(16).padStart(8, '0'),
     };
     if (open) this.open(n);
@@ -137,15 +138,29 @@ class Net {
   run(limit = 1e6) {
     for (let n = 0; n < limit; n++) {
       if (this.step()) continue;
-      const live = this.timers.filter((t) => t.fn);
-      if (!live.length) return;
-      const t = live.reduce((a, b) => (b.at < a.at ? b : a));
-      this.now = Math.max(this.now, t.at);
-      const fn = t.fn;
-      t.fn = null;
-      fn();
+      if (!this.fire(Infinity)) return;
     }
     fail('the network never went quiet');
+  }
+
+  // Fires the first timer due by `end`, if any.
+  fire(end) {
+    this.timers = this.timers.filter((t) => t.fn);
+    if (!this.timers.length) return false;
+    const t = this.timers.reduce((a, b) => (b.at < a.at ? b : a));
+    if (t.at > end) return false;
+    this.now = Math.max(this.now, t.at);
+    const fn = t.fn;
+    t.fn = null;
+    fn();
+    return true;
+  }
+
+  // Lets `ms` pass, firing the timers due meanwhile; delivers nothing.
+  wait(ms) {
+    const end = this.now + ms;
+    for (let n = 0; n < 1e5 && this.fire(end); n++);
+    this.now = end;
   }
 
   quiet() {
@@ -546,27 +561,80 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
 }
 console.log('member data: malformed frames dropped whole without a throw; 20000 mutated frames never threw');
 
-// A member that asks over and over gets at most MAX_ANSWERS answers while it stays, and each entry once.
+// A member that asks over and over is answered 8 times at once, then once per 15 s, each entry once to each
+// incarnation of its doc. An ask past the budget waits for it, and only the latest one waits.
 {
   const net = new Net(8);
   const [a, b] = ['a', 'b'].map((x) => net.node(x));
   net.mesh([a, b]);
   churn(net, [a], 100);
   net.run();
-  const answers = [];
-  b.host.send = (to, m) => m.t === 3 && answers.push(m);
+  let answers = [];
+  const asks = [];
+  b.host.send = (to, m) => (m.t === 3 ? answers : asks).push(m);
+  const ends = () => answers.filter((m) => m.end).length;
+  const entries = () => answers.reduce((s, m) => s + (m.e?.length ?? 0), 0);
+  const ask = (r = []) => b.doc.receive(a.self, { d: 'board', t: 2, ws: [a.doc.writer], r, i: a.doc.writer });
   b.doc.left(a.self); // as if a joined again: the ask from its first join counted
-  for (let i = 0; i < 50; i++) b.doc.receive(a.self, { d: 'board', t: 2, ws: [a.doc.writer], r: [], i: a.doc.writer });
-  const ends = answers.filter((m) => m.end).length;
-  const entries = answers.reduce((s, m) => s + (m.e?.length ?? 0), 0);
-  if (ends !== 8 || entries !== b.doc.entries.size) fail(`50 asks got ${ends} answers carrying ${entries} entries for ${b.doc.entries.size}`);
+  for (let i = 0; i < 50; i++) ask();
+  if (ends() !== 8 || entries() !== b.doc.entries.size) fail(`50 asks got ${ends()} answers carrying ${entries()} entries for ${b.doc.entries.size}`);
+  net.wait(14999);
+  if (ends() !== 8) fail(`an answer past the budget went after ${net.now} ms`);
+  net.wait(60000);
+  if (ends() !== 9 || entries() !== b.doc.entries.size) fail(`the ask that waited got ${ends() - 8} answers carrying ${entries()} entries`);
+  // An hour idle refills the budget to 8, not more.
+  net.wait(3600e3);
+  answers = [];
+  for (let i = 0; i < 50; i++) ask();
+  if (ends() !== 8) fail(`after an hour idle, 50 asks got ${ends()} answers`);
+  // An ask every second for a minute: one answer each 15 s.
+  answers = [];
+  for (let i = 0; i < 60; i++) {
+    ask();
+    net.wait(1000);
+  }
+  if (ends() !== 4) fail(`an ask a second for 60 s got ${ends()} answers`);
+  // Our asks of a member have the same budget: 12 asks of ours due at once, as a's asks show dots we lack, send
+  // 8 and the rest wait, then go one at a time.
+  b.doc.left(a.self);
+  for (let i = 0; i < 12; i++) {
+    ask([[0, 1, 1000 + i]]);
+    b.doc.nextAsk(true); // as if a answered
+  }
+  if (asks.length !== 8) fail(`12 asks due at once sent ${asks.length}`);
+  net.wait(15000);
+  if (asks.length !== 9) fail(`an ask of ours that waited for the budget went ${asks.length - 8} times`);
   // Leaving and joining again starts afresh.
-  answers.length = 0;
+  answers = [];
   b.doc.left(a.self);
   b.doc.receive(a.self, { d: 'board', t: 2, ws: [], r: [], i: a.doc.writer });
-  if (answers.reduce((s, m) => s + (m.e?.length ?? 0), 0) !== b.doc.entries.size) fail('a member that joined again was not answered afresh');
+  if (entries() !== b.doc.entries.size) fail('a member that joined again was not answered afresh');
 }
-console.log('answers: at most 8 per member while it stays, each entry sent once');
+console.log('answers: 8 per member at once, then one per 15 s; an ask past that waits; each entry once per incarnation');
+
+// A member that closes the doc and opens it again, over and over, while it stays (a component that remounts, a
+// page switching views) catches up every time: 7 times at once (its first ask, from the join, counted), then
+// each 15 s later.
+{
+  const net = new Net(13);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x));
+  net.mesh([a, b]);
+  for (let i = 0; i < 5; i++) a.doc.set('s').add(i);
+  a.doc.map('m').set('k', 'v');
+  net.run();
+  const late = [];
+  for (let i = 1; i <= 12; i++) {
+    b.doc.close();
+    const t = net.now;
+    net.open(b);
+    net.run();
+    if (b.doc.set('s').entries().length !== 5) fail(`reopen ${i}: b holds ${b.doc.set('s').entries().length} of 5 items`);
+    same([a, b], `reopen ${i}`);
+    late.push(net.now - t);
+  }
+  if (late.join() !== '0,0,0,0,0,0,0,15000,15000,15000,15000,15000') fail(`reopens caught up after ${late.join(', ')} ms`);
+}
+console.log('reopening a doc 12 times while a member stays: each catches up, 7 at once and then each after 15 s');
 
 // Stamps: one more than MAX_CLOCK_STEP ahead of ours is ignored, so no frame can run the clock out.
 {

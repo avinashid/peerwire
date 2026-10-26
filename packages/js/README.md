@@ -160,6 +160,9 @@ doc.close();                                     // room.leave() closes the room
     writer, the ranges of writes it has seen.
   - It asks one member at a time, so a joiner is sent each entry about once (at most 1.00× the entries it holds
     in `test/doc_crdt.mjs`), not once per member.
+  - A member is answered 8 times at once, then once per 15 s, and our asks of it go at the same rate. An ask
+    past that waits rather than being dropped, so a doc closed and opened again (a component that remounts)
+    catches up every time: 8 times in a row at once, then each up to 15 s late.
   - Every frame stays under 512 KiB.
   - Doc frames have their own tag, so they never reach `'message'` or `poll()`. `@peerwire/js` 0.1.1 drops them.
 - **Logs:** give `keep` the same value on every member, and call `doc.log()` right after `room.doc()`. A member
@@ -174,6 +177,8 @@ doc.close();                                     // room.leave() closes the room
 - **Member data:**
   - Members are trusted alike, as in the room itself: any member can overwrite, delete or fill a doc.
   - What a member sends is checked and capped before it reaches you. A malformed frame is dropped whole.
+  - A member that asks from a new doc each time can have you send it the whole doc 8 times at once, then once
+    per 15 s: theoretical, at most 4 MiB of JSON text and its dead ranges per 15 s per member.
   - `from` is the writer as the doc was told. A member relaying a catch-up can name any writer, so use `from` to
     colour or group, not as proof of who wrote something. Check every field you render, as with messages.
 - **Not yet:** collaborative text (character sequences), and docs in Rust and Godot.
@@ -499,7 +504,8 @@ Run these with Node and the Playwright install on this host:
   - limits, including a full doc;
   - frames: every one under 512 KiB;
   - 20,000 mutated frames, none of which throws;
-  - 8 answers per member;
+  - answers per member: 8 at once, then one per 15 s, and an ask past that waits;
+  - a doc closed and opened 12 times while a member stays catches up every time;
   - Lamport stamps far ahead;
   - claims on a member's future writes.
 - `node packages/js/test/room_doc.mjs`: `room.doc()` with three members in a real `'local'` room: they converge, a

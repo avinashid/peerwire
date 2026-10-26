@@ -398,6 +398,7 @@ export class Room {
         const t = setTimeout(fn, ms);
         return () => clearTimeout(t);
       },
+      now: () => performance.now(),
       closed: (doc) => this.docs.get(name) === doc && this.docs.delete(name),
     });
     this.docs.set(name, d);

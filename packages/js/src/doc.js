@@ -28,10 +28,12 @@
 // Members are trusted alike to write, as in the room itself: any member can overwrite, delete or fill a doc,
 // and a member relaying a catch-up can claim any writer, so `from` is as good as the member that told us.
 // What the doc defends is each member's app and resources. Frames are checked field by field and dropped
-// whole if anything is off; state lives in Maps; names, keys, values, entries, characters, writers, context
-// ranges and the answers each member gets are capped. A Lamport stamp may run at most MAX_CLOCK_STEP ahead of
-// ours per frame. A member could claim dots another member hasn't written yet, so that the room ignores its
-// next writes: a doc that sees such a claim on its own dots moves to a new incarnation.
+// whole if anything is off; state lives in Maps; names, keys, values, entries, characters, writers and context
+// ranges are capped, and the asks and answers each member gets are a rate (CATCHUP_BURST at once, then one per
+// CATCHUP_EVERY_MS), so a member can have us send it the whole doc at most that often. A Lamport stamp may run
+// at most MAX_CLOCK_STEP ahead of ours per frame. A member could claim dots another member hasn't written yet,
+// so that the room ignores its next writes: a doc that sees such a claim on its own dots moves to a new
+// incarnation.
 
 export const MAX_NAME_LENGTH = 128; // a doc's or a collection's name, in UTF-16 code units
 export const MAX_KEY_LENGTH = 256; // a map key
@@ -44,11 +46,11 @@ export const MAX_RANGES = 8192; // ranges of dots a doc's context holds
 export const DEFAULT_KEEP = 1000; // entries a log keeps unless doc.log() says otherwise
 export const MAX_CLOCK_STEP = 2 ** 32; // how far a frame's stamps may run ahead of our clock
 export const MESSAGE_BYTES = 512 * 1024; // the most a doc frame takes as UTF-8, half room.send's 1 MiB
-// Asks a member gets answered while it stays, asks we send it, and how often a member's new incarnation
-// (a doc closed and opened again) clears what we have sent it.
-const MAX_ANSWERS = 8;
-const MAX_ASKS = 8;
-const MAX_RESETS = 2;
+// Catching up with a member: the answers it gets and the asks we send it each come from a budget of
+// CATCHUP_BURST that refills one per CATCHUP_EVERY_MS. One over the budget waits for it rather than being
+// dropped, so a doc closed and opened again (a component that remounts) catches up every time.
+const CATCHUP_BURST = 8;
+const CATCHUP_EVERY_MS = 15000;
 // How long an answer may take before the next member is asked.
 const ASK_WAIT_MS = 5000;
 // Incarnations a doc moves through when members claim its future dots.
@@ -226,7 +228,8 @@ function parseFrame(m, peer) {
 }
 
 // One doc, shared by every member that opens the same name. `host` is the room's side:
-// { self, peers() (joined members), send(peer, message), after(ms, fn) -> cancel, closed(doc), incarnation() }.
+// { self, peers() (joined members), send(peer, message), after(ms, fn) -> cancel, now() (ms), closed(doc),
+// incarnation() }.
 export class Doc {
   constructor(name, host) {
     if (!validName(name)) throw new RangeError(`a doc name is 1 to ${MAX_NAME_LENGTH} characters`);
@@ -243,7 +246,7 @@ export class Doc {
     this.newIncarnation();
     this.handlers = new Set();
     this.touched = new Map(); // changes during one frame or write: ref -> { coll, ref, before }
-    this.members = new Map(); // peer -> { answers, asks, sent, inc, resets }
+    this.members = new Map(); // peer -> { answers, asks, sent, inc, theirs, askLater, wait }
     this.queue = []; // members to ask, in turn
     this.asking = null; // the member asked, until its answer ends or ASK_WAIT_MS passes
     this.cancelWait = null;
@@ -299,6 +302,7 @@ export class Doc {
     this.entries.clear();
     this.byWriter.clear();
     this.colls.clear();
+    for (const st of this.members.values()) st.wait?.();
     this.members.clear();
     this.host.closed?.(this);
   }
@@ -315,6 +319,7 @@ export class Doc {
   }
 
   left(peer) {
+    this.members.get(peer)?.wait?.();
     this.members.delete(peer);
     this.queue = this.queue.filter((p) => p !== peer);
     if (this.asking === peer) this.nextAsk(true);
@@ -669,18 +674,51 @@ export class Doc {
     return frames;
   }
 
+  // A member's catch-up: when its budgets of answers and of asks are whole again, the entries sent to its
+  // incarnation `inc`, its ask waiting for an answer (`theirs`), whether our ask of it waits, and the wait.
   member(peer) {
     let st = this.members.get(peer);
-    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, sent: new Set(), inc: null, resets: 0 }));
+    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, sent: new Set(), inc: null, theirs: null, askLater: false, wait: null }));
     return st;
+  }
+
+  now() {
+    return this.host.now?.() ?? performance.now();
+  }
+
+  // Takes one from the member's budget `kind` ('answers' or 'asks'): CATCHUP_BURST that refill one per
+  // CATCHUP_EVERY_MS, kept as the time the budget is whole again, so nothing accumulates rounding. When it is
+  // empty, returns false and has retry() run once one is back.
+  take(peer, st, kind) {
+    const now = this.now();
+    const whole = Math.max(st[kind], now);
+    const early = whole - (CATCHUP_BURST - 1) * CATCHUP_EVERY_MS - now;
+    if (early <= 0) {
+      st[kind] = whole + CATCHUP_EVERY_MS;
+      return true;
+    }
+    st.wait ??= this.host.after(Math.ceil(early), () => this.retry(peer, st));
+    return false;
+  }
+
+  // What waited for a member's budgets: its latest ask, and ours (unless one is under way or queued by now).
+  retry(peer, st) {
+    st.wait = null;
+    if (this.closed || this.members.get(peer) !== st) return;
+    if (st.theirs) this.answer(peer, st);
+    if (st.askLater) {
+      st.askLater = false;
+      this.startAsk(peer);
+    }
   }
 
   // Catching up.
 
   startAsk(peer) {
     const st = this.member(peer);
-    if (this.asking === peer || this.queue.includes(peer) || st.asks >= MAX_ASKS) return;
-    st.asks++;
+    if (this.asking === peer || this.queue.includes(peer)) return;
+    st.askLater = !this.take(peer, st, 'asks');
+    if (st.askLater) return;
     this.queue.push(peer);
     if (!this.asking) this.nextAsk(false);
   }
@@ -734,22 +772,21 @@ export class Doc {
     const st = this.member(peer);
     // A new incarnation of theirs (the doc opened again) holds none of what we sent the old one.
     if (st.inc !== f.inc) {
-      if (st.inc !== null && st.resets < MAX_RESETS) {
-        st.sent.clear();
-        st.resets++;
-      }
+      st.sent.clear();
       st.inc = f.inc;
     }
-    if (st.answers < MAX_ANSWERS) {
-      st.answers++;
-      this.answer(peer, theirs, st);
-    }
+    // Answered now or, past the member's budget, when it allows: only the latest ask waits.
+    st.theirs = theirs;
+    this.answer(peer, st);
     // It has seen dots we haven't: ask it back.
     if (f.ranges.some(([w, a, b]) => !this.ctx.covers(w, a, b))) this.startAsk(peer);
   }
 
-  // The entries `theirs` lacks that we haven't sent this member, and every dot we know is dead.
-  answer(peer, theirs, st) {
+  // The entries the member's ask lacks that we haven't sent it, and every dot we know is dead.
+  answer(peer, st) {
+    if (!this.take(peer, st, 'answers')) return;
+    const theirs = st.theirs;
+    st.theirs = null;
     for (const id of st.sent) if (!this.entries.has(id)) st.sent.delete(id);
     const entries = [];
     for (const e of this.entries.values()) {
