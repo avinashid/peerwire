@@ -2,9 +2,10 @@
 
 Scope of this document: `peerwire-core` (handshake, wire format, lanes, relay, NAT
 traversal, STUN, invites, sealed messages), the C ABI (`peerwire-ffi`), the
-JavaScript glue and transport (`packages/js`), and the Nostr / BroadcastChannel
-signaling adapters. It records what Peerwire defends against, what it does not, and
-the findings of the first security review (M5, NB-013).
+JavaScript glue and transport (`packages/js`), the React hooks (`packages/react`),
+and the Nostr / BroadcastChannel signaling adapters. It records what Peerwire
+defends against, what it does not, and the findings of the first security review
+(M5, NB-013) and of every review since.
 
 Status: pre-1.0, no external audit. See [SECURITY.md](../SECURITY.md).
 
@@ -55,7 +56,7 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `7b716a2`, with the NB-044…NB-048 branches reviewed on 2026-10-23.**
+**Status as of main `dec1554` (2026-10-24).**
 
 | Finding | Status |
 |---|---|
@@ -84,7 +85,11 @@ that needs a change is tracked as an NB card.
 | MIC-4 (Low) | **Fixed** by `134fed3` (the button rejoins before it re-tests the network), reviewed 2026-10-24 |
 | MIC-5 (Info) | Open, same section |
 | FL1-1 (Info), FL1-2 (Low) | **Fixed** by `4b131ee` (at most one new connection per peer per 2 s from retry offers; only the dialling side acts on a `retry` ask), reviewed 2026-10-24, [WebRTC retries](#webrtc-retries-fast-lane-1--fl1-1-fl1-2) |
-| FL2-1 (Low), FL2-2 (Low) | Open, [Member relays for pipe links](#member-relays-for-pipe-links-fast-lane-2--fl2-1-fl2-2) |
+| FL2-1 (Low), FL2-2 (Low) | **Fixed** by `63e5b72` and `ddae245`, merged `8314aa8` (a member relay that stalls data hands the link back to the pipe and is held off; a datagram names the peer whose channel it came on), reviewed 2026-10-24; residuals R1, R2, [Member relays for pipe links](#member-relays-for-pipe-links-fast-lane-2--fl2-1-fl2-2) |
+| FL2F-1 (Info) | Open, same section |
+| RH-2 (Medium), RH-1, RH-3, RH-4 (Low) | **Fixed** by `78c4ebe` and `8126119`, merged `dec1554`, before `@peerwire/react` 0.1.0 was published (deep `accept` checks required, per-key clocks bounded by wall time, per-member quotas, catch-up by digest), reviewed 2026-10-24, [`@peerwire/react` hooks](#peerwirereact-hooks-nb-049--rh-1rh-6) |
+| RH-5 (Low), catch-up message size (Low), RH-6 (Info), N1 (nit) | Open in `@peerwire/react` 0.1.0, planned for 0.1.1, same section |
+| OUT-1 (Low) | Open, `@peerwire/js` 0.1.1 and main, [JS endpoint and rooms](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | RX-1 (Low), RX-2 (Info) | **Fixed** by `b0d354b` (the README's React example keeps string messages only, and only the last 100), reviewed 2026-10-24, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
@@ -817,7 +822,8 @@ probes with a sealed PUNCH through the member and moves on the PUNCH_ACK that co
 through it. The far end answers only if it would use that member too. The link goes back
 to the pipe when the member's link goes, when the peer's newer traffic comes over the
 pipe, or after 15 s of relay silence. Reviewed 2026-10-24 by reading the code, with two
-scratch core repros:
+scratch core repros; the follow-up fixes (`63e5b72`, `eb20605`, `ddae245`, merged
+`8314aa8`) were re-checked the same day with one more:
 - Only the two ends can move a link. Every move or return needs an inner packet sealed
   under their session and passing its replay window; a relay can only forward, withhold
   or delay it. A move needs the prober's random token on a relay it offered. A return to
@@ -835,7 +841,9 @@ scratch core repros:
   share; the asker has its own pipe. Relays on 0.1.x still forward.
 - After a move, the member stays the link's fallback relay. If the pipe is silent for
   15 s, the link goes back to that member without a probe; with a 10 s keepalive, that
-  means the pipe is down.
+  means the pipe is down. Since `63e5b72` the fallback also needs that member linked
+  directly, not over its own pipe, and not held off (FL2-1). Before, it needed only a
+  link of any kind (review question Q4).
 
 **FL2-1 — A member that drops only data holds a moved link until it fails (Low).** On a
 member relay, `last_path` is kept fresh by any packet, and the peer sends through the
@@ -847,6 +855,28 @@ link stayed on the member, and a dropped it as timed out at 70 s. Fix: on a rela
 slow address, go back to the pipe once reliable data has waited about 5 s unacked, and
 hold that member off for the link for a while: no offer, no answer to its probes, and no
 fallback to it.
+**Fixed** by `63e5b72` (tests in `eb20605`, merged `8314aa8`). On a member relay, for a
+link with a slow address to go back to, data unacknowledged for `RELAY_STALL` (5 s,
+timed from the move at the earliest) sends the link back to the slow address and resends
+what is in flight there at once. That member is then held off for the link for
+`RELAY_HOLD` (60 s), doubled for each repeat up to 16 times. A link holds at most
+`MAX_RELAYS` (8) members off, and a new hold replaces the one that ends first. A held
+member isn't offered, its probes aren't answered, and neither the relay-to-relay roam nor
+the fallback moves the link to it. A link that moves to a member pings through it at
+once, so both ends have a non-probe packet through it and follow each other back. The
+core test `a_relay_that_stalls_the_data_hands_the_link_back_and_is_held_off` is the
+repro's case: the link goes back to the pipe `RELAY_STALL` after the data went out, the
+data arrives there, and the member isn't taken again until its hold runs out. Native UDP
+links have no slow address, so the rule doesn't apply to them. Residuals:
+- **R1 (Info, accepted):** the rule watches reliable and urgent data in flight. A member
+  that drops only large unreliable datagrams, or delays everything by just under 5 s,
+  keeps the link. The unreliable lane promises no delivery, so the ends can't tell those
+  drops from loss.
+- **R2 (Info, accepted):** holds are per link and at most 8. More than 8 members acting
+  together can stall the link in turn, each new hold pushing out an older one and its
+  doubling. The link can then keep cycling between the pipe and a stalling member, each
+  round delaying its reliable data by up to `RELAY_STALL`. The data still arrives over
+  the pipe.
 
 **FL2-2 — A member offered as a relay can roam a pipe link onto its own channel (Low).**
 The peer's sealed probes, acks and data for a pipe link pass through every member
@@ -861,6 +891,164 @@ moved the link from the pipe to the member. Fix: in JS every handle belongs to o
 datagram, and drop a data packet for another peer's session before any roam, which also
 closes NB43-I1 in JS. Give relay probes their own token. Rust UDP sets no slow address
 and is unchanged.
+**Fixed** by `63e5b72` (core) and `ddae245` (FFI and JS), merged `8314aa8`.
+`Endpoint::handle_datagram_from` takes the peer whose channel a datagram came on, and
+drops a data packet, HS1 or HS2 meant for another peer before decryption and before any
+roam (`Stats::rx_wrong_peer`). `pw_handle_datagram_from` exposes it, and
+`Endpoint.receive(addr, bytes, peer)` uses it. Every JS channel passes its peer: WebRTC
+data channels, pipes (the authenticated sender of the sealed signal), adopted channels
+and `LocalTransport`. Relay probes carry their own token (the direct one inverted), so a
+relayed PUNCH_ACK never counts as a direct punch answer. This also closes NB43-I1 in JS.
+A native UDP socket serves every peer, so it still uses `handle_datagram`, and NB43-I1
+stays as recorded there.
+
+**FL2F-1 — The relay-to-relay roam doesn't need a direct link to the new member
+(Info).** Found in the follow-up re-check. The other moves onto a member relay (a probe's
+answer, the fallback) need that member linked directly. The roam from one member relay
+to another (`endpoint.rs:1518`) also takes a newer packet through a member reached only
+over our pipe to it, such as a 0.1.x member, which still forwards over pipes. The link
+then runs over that pipe's shared budget until a newer packet through the other member
+moves it back. A held member is still refused. Repro (scratch core test): with a's link
+to c on its slow address, a packet relayed by c moved a's link from d to c, and later
+back to d. Fix: take that roam only when the packet came over a direct link
+(`if fast_from`), as the probe answer does; with it the core library tests pass. Open,
+suggested with Fast lane 3.
+
+### `@peerwire/react` hooks (NB-049) — RH-1…RH-6
+
+`@peerwire/react` (`packages/react`, 0.1.0 published from `dec1554`) wraps a room in
+React hooks. Its store (`store.ts`, one per room) keeps shared keys (one value per key
+for the whole room, last writer wins, replayed to each member that joins) and per-peer
+values (each member's latest value per key, such as a cursor). Both travel as room
+messages with a `$peerwire` field. Reviewed 2026-10-24 at `d369c8d` and re-checked at
+`8126119` by reading the code, with Node probes on fake rooms, the real hooks on jsdom,
+and two loopback rooms.
+
+**Trust statement.** Every member is trusted alike to write, as in the room itself: any
+member can overwrite any shared key, write well-typed nonsense, or show members different
+values by sending a write to some of them only (`to`). What the store defends is each
+member's app and resources. A member must not be able to crash another's app, make its
+own writes fail, use up the caps for everyone, or make catch-up costly. Shared values
+outlive their writer and every member replays them to each joiner, so a bad value there
+repeats on every join, where a bad chat message (RX-1) happens once.
+
+What holds:
+- **Message checks.** Keys are at most 256 characters and values at most 64 KiB as JSON
+  (`MAX_VALUE_LENGTH`). Clocks and sequence numbers must be safe integers of at least 1.
+  A writer named in a catch-up must be a PeerId. Catch-up arrays hold at most 1024
+  entries. State lives in `Map`s, so keys such as `__proto__` are harmless, and the member
+  list and per-peer views the hooks return are frozen.
+- **Attribution.** Per-peer values, also inside a catch-up, are charged to the peer that
+  sent the message, never to a claimed id. A shared value's writer `w` can be claimed in
+  a catch-up, on purpose: that's how a joiner gets a value whose writer has left. A
+  claimed writer matters only in a tie, and a member can win any key outright with a
+  later clock. So `w` must never be shown to users as "who wrote it" (nothing does today).
+- **Checks.** An `accept` check that throws counts as failed. A shared value that fails
+  the check reads as `initial`, the same on every member.
+- **Internal messages.** `useMessages` and `useRoomEvent` hide `$peerwire` messages. Code
+  that listens to the room directly sees them.
+
+**RH-2 — The default shared-state check was one level deep (Medium).** Without `accept`,
+`useSharedState(key, initial)` checked only that a value had the same top-level kind as
+`initial`, and a `null` initial took anything. A member wrote `[{"text":{"x":1}}]` to an
+array key. Every app that rendered `t.text` threw while rendering; with no error
+boundary the app unmounted and its cleanup left the room. The value persisted, so each
+joiner got it in catch-up and crashed the same way, until the key was written again or
+every member holding it had left. Reproduced with the real hooks on jsdom. **Fixed** by
+`78c4ebe` and `8126119`: without `accept`, `initial` must be a string, number or boolean
+(a TypeScript overload, and a `TypeError` at render otherwise). Arrays, objects and
+`null` need `accept`. Member data in `useMessages`, `usePeerState` and `usePeers` is
+typed `unknown` unless checked, so TypeScript flags rendering an unchecked value. The
+README tells apps to check every field they render, however deep, and to put an error
+boundary inside `RoomProvider`; the example has one. `test/hooks.mjs` covers the nested
+case. What is left is the app's to get right: an `accept` shallower than what the app
+renders. An error boundary catches errors in render and effects, not in event handlers.
+
+**RH-1 — One far-future clock froze every shared key (Low).** The store kept one clock
+for all keys and raised it to any member's clock. One write with a clock of
+`Number.MAX_SAFE_INTEGER`, to any key, made every later `setShared` throw "clock
+exhausted", for every key, on every member. Catch-up carried it to joiners, so it
+outlived the writer, and a setter called in an effect unmounted the app. **Fixed** by
+`78c4ebe` before the first publish, because the clock is part of the messages between
+versions. Each key has its own hybrid clock: a write is stamped
+`max(Date.now(), current + 1)`, and a member's clock is taken only up to `Date.now()` +
+`MAX_CLOCK_DRIFT` (5 min), in writes and in catch-up versions alike. Nothing throws for a
+clock any more. A bound relative to our own last clock was rejected: a joiner starts at
+0, and members would stop agreeing. Residual:
+- **Clock skew near the bound (Info, accepted).** When honest members' clocks differ by
+  δ, a write stamped within δ of `now + MAX_CLOCK_DRIFT` is taken by the members whose
+  clocks are ahead and ignored by those behind. No write is sent twice, so they disagree
+  on that key until a write that every member takes beats that stamp. Writes from the
+  members that took it qualify about δ later; writes from the others only once their own
+  clocks pass the stamp, up to `MAX_CLOCK_DRIFT` + δ later. A member can do this on
+  purpose by stamping near the bound, which gives it no more than a write sent to some
+  members only. A member whose clock runs more than `MAX_CLOCK_DRIFT` ahead has all its
+  shared writes ignored (the README says so).
+
+**RH-3 — All members shared the caps, first come, first served (Low).** One 82 KB message
+with 1024 junk keys meant no member kept any member's new shared key, even after the
+writer left. One member could take every per-peer slot. A local write past the cap was
+kept and sent, but every other member dropped it, so the writer silently disagreed with
+the room. **Fixed** by `78c4ebe`. Per-peer values have a quota per member, ours included:
+`MAX_PEER_KEYS` (64) and `MAX_PEER_LENGTH` (256 KiB), charged to the sender and freed
+when it leaves. Shared state holds 1024 keys and `MAX_STORE_LENGTH` (1 MiB) in all. When
+it is full, a key a mounted hook reads, or our own write, pushes out the oldest keys no
+hook reads; a local write that still doesn't fit throws a `RangeError` (but see RH-5).
+Accepted: what is pushed out is local, so members can hold different unread keys; a
+joiner gets the newest version any member still holds. A hook that mounts later for a
+key that was pushed out reads `initial` until the key is written again, while others hold
+a value (a route change or a virtualized list can do this). A member can force it by
+filling the unread space, which is no more than overwriting the key, as it can anyway.
+"Oldest" is insertion order, so long-held app data goes before fresh junk.
+
+**RH-4 — Each join cost every member its whole state twice (Low).** On a join both sides
+sent everything and asked, and the answer to an ask sent everything again: 100 KB of
+shared state cost 216 KB to one joiner (2.16×). At the old 16 MiB cap that was up to
+32 MiB per member per join, more with repeated asks, and minutes of the pipes' shared
+budget. **Fixed** by `78c4ebe` (a change to the catch-up messages, before the first
+publish): catch-up by digest. A join sends the versions held (`[key, clock, writer]`)
+and asks. The answer carries only the values the asker's digest lacks, plus our
+per-peer values, and never one already sent to that member. It asks back when the asker
+holds a version we lack or hasn't answered us yet, which covers a first message lost to
+the room's welcome race (on `@peerwire/js` 0.1.1). A store answers at most 4 asks per
+member while it stays, and keeps at most 1024 of the versions a member told it. Per
+membership, a member can now draw from us at most 1 MiB of values once, 4 digests (up to
+1024 versions, about 350 KB each) and our per-peer values (256 KiB) once: about 2.5 MB,
+where it was 4 × 16 MiB. A 100 KB store now costs 1.18× per joiner. Every member still
+sends its state to each joiner, which is slow over a relayed link or the pipe; the
+README says to keep shared state small.
+
+**Open in 0.1.0, planned for 0.1.1.** `@peerwire/react` 0.1.0 was published with these,
+and none needs a change to the messages:
+- **RH-5 (Low): member data can still make our own shared write throw.** In an app whose
+  hooks read more than 16 shared keys (`MAX_STORE_LENGTH / MAX_VALUE_LENGTH`), members can
+  fill the keys it reads with 64 KiB values. Then our write to a new key, or one that
+  grows a value, has nothing it may push out, and `setShared` throws `RangeError`
+  (`store.ts:173`). Called from an effect, that shows the error boundary's fallback, or
+  unmounts the app without one. From an event handler it is an uncaught error and the
+  write is lost. It is RH-1's kind (member data causing a throw in app code), narrower.
+  Fix: the hook's setter drops a write that doesn't fit, with a `console.warn`, as every
+  member drops a member's write that doesn't fit, and throws only for the app's own
+  mistakes (a value over 64 KiB, a key too long). Until then, an app that reads many
+  shared keys can catch the `RangeError` around its setter calls.
+- **Catch-up message size (Low, via OUT-1).** A catch-up message holds at most 64 values
+  but has no byte cap, so near a full store one can pass the reliable lane's 1 MiB
+  (non-ASCII text takes up to 3 bytes per character). The store splits a message when
+  the room throws `RangeError`, but the room doesn't throw when that peer's outbox holds
+  frames (OUT-1, below): it drops the message silently, and the store has marked those
+  values as sent. The joiner then lacks them from us until they are written again;
+  another member's answer may still bring them. Fix: cap each message by size (about
+  3 × length + key + 100 bytes per value, up to 512 KiB), so no split is needed.
+- **RH-6 (Info): catch-up records keep replaced values alive.** For each member the store
+  keeps the entries it last sent it (`sentShared`, `sentLive`). When a key is written
+  again, the old value stays in memory while that member stays. That is at most one old
+  value per key per member: up to about 1 MiB of shared and 256 KiB of per-peer values
+  for each member, beyond the store itself, if keys keep being rewritten between joins.
+  Fix: keep each entry's version (clock and writer, or sequence number) instead; it
+  compares the same, because a write never replaces an entry with an equal version.
+- **N1 (nit, cost only):** an asker whose digest already holds a newer version of a key
+  still gets our older value, which it ignores. `tell()` records the asker's version only
+  when it isn't newer than ours. Fix: record it either way, still asking back.
 
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
@@ -913,6 +1101,18 @@ and what it accepted. Values are from main `7b716a2`.
 - **Sends.** `sendRetry` keeps at most one message above the 16 KiB scratch buffer
   between tries. The room's outbox has no cap. It holds only what the local
   application sends, so that is application policy.
+  - **OUT-1 (Low, open; `@peerwire/js` 0.1.1 and main):** `room.send()` throws
+    `RangeError` for a message too large for its lane only when that peer's outbox is
+    empty. When it holds frames (more than the 4 MiB send buffer unacknowledged to that
+    peer: a slow or relayed link, or a burst), `write()` queues the frame unchecked and
+    `flush()` later drops it as too large. The caller sees no error, the peer never gets
+    the message, and later messages still arrive. Found in the `@peerwire/react` review:
+    its catch-up split relies on the throw, and so does `setLive`'s move from the
+    unreliable to the reliable lane. Reproduced with two loopback rooms: a 1 MiB + 1 KiB
+    send threw with an empty outbox, and with 9 frames queued it didn't throw and never
+    arrived. Fix: in `write()`, check the frame against the lane's limit before queueing
+    and throw the same `RangeError`; for a broadcast, check once before writing to any
+    member, so a throw doesn't leave the message sent to some members only.
 - **Signals.**
   - Malformed or unproven signals are counted in `badSignals` (a counter only, with
     no action).
@@ -930,8 +1130,10 @@ and what it accepted. Values are from main `7b716a2`.
   - Incoming batches are capped at 64 items but not rate-limited.
   - Residuals:
     - **NB43-I1:** a relaying member can roam a link onto its own pipe, because a
-      direct-to-direct roam needs no path validation. Since Fast lane 2 this reaches
-      pipe links too (FL2-2).
+      direct-to-direct roam needs no path validation. Since Fast lane 2 this reached
+      pipe links too (FL2-2). **Fixed in JS** by `63e5b72` and `ddae245`: each datagram
+      names the peer whose channel it came on, and a packet for another peer is dropped
+      before any roam. Still open on native UDP, where one socket serves every peer.
     - **NB43-I2:** an insider holding the room key can churn the pipe permissions,
       take the shared budget, and send 64 HS1s per batch. Card NB-043b; it supports
       SEC-4.
