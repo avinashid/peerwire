@@ -165,7 +165,8 @@ doc.close();                                     // room.leave() closes the room
     ask past that waits rather than being dropped, so a doc closed and opened again (a component that remounts)
     catches up every time: a small doc 8 times in a row at once, then each up to 15 s late.
   - Every frame stays under 512 KiB.
-  - Doc frames have their own tag, so they never reach `'message'` or `poll()`. `@peerwire/js` 0.1.1 drops them.
+  - Doc frames have their own tag, so they never reach `'message'` or `poll()`. Versions without `room.doc()`
+    (`@peerwire/js` 0.1.0 to 0.2.0) drop them.
 - **Logs:** give `keep` the same value on every member, and call `doc.log()` right after `room.doc()`. A member
   that keeps fewer entries never trims another's log.
 - **Limits:**
@@ -509,13 +510,14 @@ Run these with Node and the Playwright install on this host:
   arrive in random order and twice (no catch-up needed), after drops healed by joining again, and after a
   partition heals; a late joiner is sent each entry about once. It also checks:
   - intent: a later set wins, a set beats a delete it didn't see, a reply sorts after what it saw;
-  - one `'change'` per change, and frozen values;
+  - one `'change'` per change, also for a map whose name ends where another's key begins, and frozen values;
   - limits, including a full doc;
   - frames: every one under 512 KiB;
   - 20,000 mutated frames, none of which throws;
   - answers per member: 8 at once, then one per 15 s, and an ask past that waits; what they carry to a member
     that asks for a 2 Mi-character doc every second for a minute (6 sends, under the 8 Mi + 64 Ki/s bound);
   - a doc closed and opened 12 times while a member stays catches up every time;
+  - a member that never answers is asked once, however often it prompts us, until it answers;
   - Lamport stamps moved far ahead (by 2^32 four times, or to 2^53 - 1): a member cut off meanwhile and one that
     joins after still converge, and so do a member's writes after a jump sent to it alone;
   - claims on a member's future writes, also past its 16 moves: an entry forged on its next write is never held

@@ -422,6 +422,18 @@ console.log('intent: a later set wins, a set beats a delete it did not see, a re
   process.off('uncaughtException', caught);
   if (seen.join() !== 'k' || b.doc.map('m').get('k') !== 4 || thrown.join() !== 'app bug') fail(`throwing handler: ${seen} ${thrown}`);
 }
+// A map whose name ends where another's key begins, map 'a' key 'b\0c' and map 'a\0b' key 'c', changed by one
+// frame: two events.
+{
+  const net = new Net(17);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x));
+  net.mesh([a, b]);
+  net.run();
+  const events = [];
+  b.doc.on('change', (ev) => events.push(`${ev.name}|${ev.key}`));
+  b.doc.receive(a.self, { d: 'board', t: 1, ws: [a.doc.writer], e: [[0, 100, 1, 'm', 'a', 'b\u0000c', 1], [0, 101, 1, 'm', 'a\u0000b', 'c', 2]] });
+  if (events.length !== 2) fail(`two maps' keys changed in one frame gave ${events.length} events: ${JSON.stringify(events)}`);
+}
 console.log("'change': one event per change, local and remote alike; frozen values; a throwing handler stops nothing");
 
 // Our own mistakes throw; member data never makes our writes throw.
@@ -694,6 +706,31 @@ console.log('answers: 8 per member at once, then one per 15 s, each with all the
   if (late.join() !== '0,0,0,0,0,0,0,15000,15000,15000,15000,15000') fail(`reopens caught up after ${late.join(', ')} ms`);
 }
 console.log('reopening a doc 12 times while a member stays: each catches up, 7 at once and then each after 15 s');
+
+// A member that never answers holds our asks up once: asked when it joined, it had 5 s, and it isn't asked again
+// until it answers, however often it prompts us to; once it does, the ask it was due goes.
+{
+  const net = new Net(16);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x));
+  const m = net.node('f', { open: false });
+  net.mesh([a, b, m]);
+  net.run();
+  let asked = 0;
+  const send = b.host.send;
+  b.host.send = (to, msg) => {
+    if (to === m.self && msg.t === 2) asked++;
+    send(to, msg);
+  };
+  for (let i = 1; i <= 10; i++) {
+    b.doc.receive(m.self, { d: 'board', t: 2, ws: [m.self + '00000001'], r: [[0, 1, i]] });
+    net.run();
+  }
+  if (asked) fail(`a member that never answered was asked ${asked} times more`);
+  b.doc.receive(m.self, { d: 'board', t: 3, ws: [], end: 1 });
+  net.run();
+  if (asked !== 1) fail(`a member that answered at last was asked ${asked} times`);
+}
+console.log('a member that never answers is asked once, until it answers');
 
 // Stamps far ahead: a member moves the stamps by 2^32 in each of k deltas of its own (the earlier ones deleted,
 // or not), or to 2^53 - 1 at once, sent to a and b while c is cut off; then a, b and c write. Every member takes

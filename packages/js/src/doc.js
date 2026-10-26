@@ -303,9 +303,9 @@ export class Doc {
     this.incarnations = 0;
     this.newIncarnation();
     this.handlers = new Set();
-    this.touched = new Map(); // changes during one frame or write: ref -> { coll, ref, before }
+    this.touched = new Map(); // changes during one frame or write: collection -> ref -> { coll, ref, before }
     this.idle = new Set(); // writers the context holds with no live entry, longest idle first
-    this.members = new Map(); // peer -> { answers, asks, chars, theirs, answerWait, askWait }
+    this.members = new Map(); // peer -> { answers, asks, chars, theirs, answerWait, askWait, stalled, askAgain }
     this.queue = []; // members to ask, in turn
     this.asking = null; // the member asked, until its answer ends or ASK_WAIT_MS passes
     this.cancelWait = null;
@@ -409,6 +409,15 @@ export class Doc {
     // or a member claimed the sender's dots ahead of it. Our ask shows the sender our context.
     if (this.unheard) this.startAsk(peer);
     if (f.t === ANSWER && f.end && this.asking === peer) this.nextAsk(true);
+    // A member whose ask timed out is asked again once it has answered, if it was due an ask meanwhile.
+    const st = this.members.get(peer);
+    if (f.t === ANSWER && f.end && st?.stalled) {
+      st.stalled = false;
+      if (st.askAgain) {
+        st.askAgain = false;
+        this.startAsk(peer);
+      }
+    }
   }
 
   // Local writes.
@@ -669,14 +678,17 @@ export class Doc {
     return coll.t === 'm' ? Doc.shown(c.keys.get(ref)) : c.items.get(ref);
   }
 
+  // Notes a key or item about to change, with what it showed before. Keyed by collection, then ref, as a name and
+  // a key may hold any character.
   touch(coll, ref) {
-    const key = `${coll.t}${coll.name}\u0000${ref}`;
-    if (!this.touched.has(key)) this.touched.set(key, { coll: { t: coll.t, name: coll.name }, ref, before: this.current(coll, ref) });
+    let refs = this.touched.get(coll.t + coll.name);
+    if (!refs) this.touched.set(coll.t + coll.name, (refs = new Map()));
+    if (!refs.has(ref)) refs.set(ref, { coll: { t: coll.t, name: coll.name }, ref, before: this.current(coll, ref) });
   }
 
   // Emits 'change' for what a frame or write changed, now that all of it is in.
   flush(from, local) {
-    const touched = [...this.touched.values()];
+    const touched = [...this.touched.values()].flatMap((refs) => [...refs.values()]);
     this.touched.clear();
     for (const { coll, ref, before } of touched) {
       const now = this.current(coll, ref);
@@ -768,10 +780,11 @@ export class Doc {
   }
 
   // A member's catch-up: when each of its budgets (BUDGETS) is whole again, its latest ask (`theirs`) and the
-  // wait for its answer, and the wait for our ask of it.
+  // wait for its answer, the wait for our ask of it, and whether our last ask timed out (`stalled`) and another
+  // is due once it answers.
   member(peer) {
     let st = this.members.get(peer);
-    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, chars: 0, theirs: null, answerWait: null, askWait: null }));
+    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, chars: 0, theirs: null, answerWait: null, askWait: null, stalled: false, askAgain: false }));
     return st;
   }
 
@@ -801,9 +814,12 @@ export class Doc {
 
   // Catching up.
 
+  // Queues an ask of `peer`. One that let an ask of ours time out isn't asked again until it answers, so a member
+  // that never does holds the others' turns up once, not each time it prompts us.
   startAsk(peer) {
     const st = this.member(peer);
     if (this.asking === peer || this.queue.includes(peer)) return;
+    if (st.stalled) return void (st.askAgain = true);
     const now = this.now();
     const wait = this.early(st, 'asks', now);
     if (wait > 0) return this.later(peer, st, 'askWait', wait, () => this.startAsk(peer));
@@ -826,7 +842,11 @@ export class Doc {
       if (!peers.has(p)) continue;
       this.asking = p;
       this.host.send(p, this.askFrame());
-      this.cancelWait = this.host.after(ASK_WAIT_MS, () => this.asking === p && this.nextAsk(true));
+      this.cancelWait = this.host.after(ASK_WAIT_MS, () => {
+        if (this.asking !== p) return;
+        this.member(p).stalled = true;
+        this.nextAsk(true);
+      });
       return;
     }
   }
