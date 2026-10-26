@@ -1,6 +1,6 @@
 {
   "name": "@peerwire/react",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "React hooks for Peerwire rooms: join a peer-to-peer room, list its members, chat, and share state across the room with no backend.",
   "license": "MIT OR Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/avinashid/peerwire.git", "directory": "packages/react" },

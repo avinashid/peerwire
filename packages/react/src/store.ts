@@ -30,6 +30,10 @@ const MAX_ANSWERS = 4;
 /** Entries per catch-up message: values, then versions in a digest. */
 const CHUNK = 64;
 const DIGEST_CHUNK = 256;
+/** The most a catch-up message carries, at 3 bytes per UTF-16 code unit of its entries as JSON. room.send takes
+ * 1 MiB, and with a peer's outbox holding frames it drops a larger message instead of throwing, so every
+ * message is cut to fit: the largest entry, a value of MAX_VALUE_LENGTH, comes to about 200 KiB. */
+const CHUNK_BYTES = 512 * 1024;
 
 export interface Peer<P = unknown> {
   id: PeerId;
@@ -47,8 +51,8 @@ type Parts = { s?: Entry[]; p?: Entry[]; h?: Entry[] };
 // versions it has told us it holds since its last ask, whether it holds one we lack, whether it has answered
 // us, and the asks we have answered.
 type Catchup = {
-  sentShared: Map<string, Shared>;
-  sentLive: Map<string, Live>;
+  sentShared: Map<string, Version>;
+  sentLive: Map<string, number>;
   told: Map<string, Version>;
   more: boolean;
   answered: boolean;
@@ -165,16 +169,21 @@ export class RoomStore {
     return this.shared.get(key);
   }
 
-  setShared(key: string, value: unknown): void {
+  // A key or value past the limits is the app's own bug, so it throws. A write that doesn't fit because
+  // members have filled shared state with keys the app reads is dropped with a warning, as every member drops
+  // one, so member data can't make the app's setter throw. Returns whether it was written.
+  setShared(key: string, value: unknown): boolean {
     if (!validKey(key)) throw new RangeError(`shared state key longer than ${MAX_KEY_LENGTH}`);
     const cur = this.shared.get(key);
     const c = Math.max(Date.now(), (cur?.c ?? 0) + 1);
     const { v, len } = asJson(value);
     if (!this.makeRoom(key, len, cur, true)) {
-      throw new RangeError(`shared state is full: ${MAX_KEYS} keys or ${MAX_STORE_LENGTH} characters as JSON`);
+      console.warn(`@peerwire/react: shared state is full (${MAX_KEYS} keys or ${MAX_STORE_LENGTH} characters as JSON); dropped the write to ${JSON.stringify(key)}`);
+      return false;
     }
     this.send({ $peerwire: 'set', k: key, v, c });
     this.putShared(key, { v, c, w: this.room.self, len }, cur);
+    return true;
   }
 
   private merge(k: unknown, v: unknown, c: unknown, w: PeerId): void {
@@ -330,18 +339,19 @@ export class RoomStore {
     const h: Entry[] = [];
     for (const [k, e] of this.shared) {
       const t = cu.told.get(k);
-      if (cu.sentShared.get(k) === e || (t && !newer(e, t))) {
+      const sent = cu.sentShared.get(k);
+      if ((sent && sent.c === e.c && sent.w === e.w) || (t && !newer(e, t))) {
         h.push([k, e.c, e.w]);
         continue;
       }
       s.push([k, e.v, e.c, e.w]);
-      cu.sentShared.set(k, e);
+      cu.sentShared.set(k, { c: e.c, w: e.w });
     }
     const p: Entry[] = [];
     for (const [k, e] of this.mine) {
-      if (cu.sentLive.get(k) === e) continue;
+      if (cu.sentLive.get(k) === e.n) continue;
       p.push([k, e.v, e.n]);
-      cu.sentLive.set(k, e);
+      cu.sentLive.set(k, e.n);
     }
     const ask = cu.more || !cu.answered;
     cu.told.clear();
@@ -354,20 +364,28 @@ export class RoomStore {
   private tell(cu: Catchup, k: unknown, c: unknown, w: PeerId, digest: boolean): void {
     if (!validKey(k) || !stamp(c)) return;
     const cur = this.shared.get(k);
-    if (!cur || newer({ c, w }, cur)) {
-      if (digest) cu.more = true;
-    } else if (cu.told.size < MAX_KEYS || cu.told.has(k)) {
-      cu.told.set(k, { c, w });
-    }
+    if (digest && (!cur || newer({ c, w }, cur))) cu.more = true;
+    if (cu.told.size < MAX_KEYS || cu.told.has(k)) cu.told.set(k, { c, w });
   }
 
-  // Sends `parts` to `peer` in messages of at most CHUNK values or DIGEST_CHUNK versions, `ask` on the last.
-  // `re` marks an answer.
+  // Sends `parts` to `peer` in messages of at most CHUNK values or DIGEST_CHUNK versions and CHUNK_BYTES,
+  // `ask` on the last. `re` marks an answer.
   private sendSync(peer: PeerId, parts: Parts, ask: boolean, re: boolean): void {
     const msgs: Parts[] = [];
     for (const [f, size] of [['s', CHUNK], ['p', CHUNK], ['h', DIGEST_CHUNK]] as const) {
-      const list = parts[f] ?? [];
-      for (let i = 0; i < list.length; i += size) msgs.push({ [f]: list.slice(i, i + size) });
+      let part: Entry[] = [];
+      let bytes = 0;
+      for (const e of parts[f] ?? []) {
+        const b = 3 * JSON.stringify(e).length;
+        if (part.length === size || (part.length && bytes + b > CHUNK_BYTES)) {
+          msgs.push({ [f]: part });
+          part = [];
+          bytes = 0;
+        }
+        part.push(e);
+        bytes += b;
+      }
+      if (part.length) msgs.push({ [f]: part });
     }
     if (!msgs.length) {
       if (!ask) return;
@@ -381,7 +399,8 @@ export class RoomStore {
       this.send({ $peerwire: 'sync', ask, re, ...m }, peer);
     } catch (err) {
       if (!(err instanceof RangeError)) throw err;
-      // Too large together: one entry per message. One that is too large alone can't be sent at all.
+      // Too large together (CHUNK_BYTES should prevent it): one entry per message. One that is too large alone
+      // can't be sent at all.
       const one: Parts[] = Object.entries(m).flatMap(([f, list]: [string, Entry[]]) => list.map((e) => ({ [f]: [e] })));
       if (one.length > 1) one.forEach((o, i) => this.sendPart(peer, o, ask && i === one.length - 1, re));
     }

@@ -23,7 +23,9 @@ const full = 'x'.repeat(MAX_VALUE_LENGTH - 2); // MAX_VALUE_LENGTH as JSON, with
 function net() {
   const nodes = new Map();
   let queue = [];
-  const n = { lose: null, sent: new Map(), log: [] };
+  // `outbox`: a reliable message over MAX_MESSAGE bytes is dropped without a throw, as room.js does when the
+  // peer's outbox holds frames (OUT-1).
+  const n = { lose: null, outbox: false, sent: new Map(), log: [], largest: 0 };
   n.node = (c, { start = true } = {}) => {
     const self = id(c);
     const on = {};
@@ -34,7 +36,12 @@ function net() {
       getPresence() {},
       send(m, o) {
         const text = JSON.stringify(m);
-        if (text.length > (o?.lane === 'unreliable' ? 1200 : MAX_MESSAGE)) throw new RangeError('too large');
+        const bytes = Buffer.byteLength(text);
+        if (o?.lane !== 'unreliable') n.largest = Math.max(n.largest, bytes);
+        if (bytes > (o?.lane === 'unreliable' ? 1200 : MAX_MESSAGE)) {
+          if (n.outbox && o?.lane !== 'unreliable') return 0;
+          throw new RangeError('too large');
+        }
         const to = o?.to ? [o.to] : room.peers;
         for (const t of to) queue.push([self, t, text]);
         return to.length;
@@ -134,16 +141,33 @@ const throws = (fn) => {
   if (read(a, 'j0') !== undefined || read(a, 'j1') !== 0) fail('the oldest unread key was not the one pushed out');
   a.st.setShared('mine', 1);
   if (read(a, 'mine') !== 1 || read(a, 'j1') !== undefined) fail('a local write to a full store');
-  // A store full of keys hooks read: a local write past the caps throws, and nothing is sent.
-  const b = net().node('d');
+  // RH-5: a store full of keys hooks read, filled by members: a local write past the caps is dropped with a
+  // warning, not thrown, and nothing is sent.
+  const m = net();
+  const [b, z] = [m.node('d'), m.raw('e')];
+  m.join(b, z);
   for (let i = 0; i < MAX_KEYS; i++) {
     b.st.subscribe(`s:k${i}`, () => {});
-    b.st.setShared(`k${i}`, i);
+    m.from(z, b, { $peerwire: 'set', k: `k${i}`, v: i, c: now });
   }
-  const err = throws(() => b.st.setShared('one-more', 1));
-  if (!(err instanceof RangeError) || read(b, 'one-more') !== undefined) fail(`a local write past MAX_KEYS: ${err}`);
+  m.flush();
+  z.got.length = 0;
+  const warned = [];
+  const warn = console.warn;
+  console.warn = (w) => warned.push(w);
+  let err, wrote;
+  try {
+    err = throws(() => (wrote = b.st.setShared('one-more', 1)));
+  } finally {
+    console.warn = warn;
+  }
+  m.flush();
+  if (err || wrote !== false || read(b, 'one-more') !== undefined || z.got.length) fail(`RH-5: a local write past MAX_KEYS: ${err}, ${wrote}, sent ${z.got.length}`);
+  if (warned.length !== 1 || !/full/.test(warned[0])) fail(`RH-5: warnings ${JSON.stringify(warned)}`);
+  if (b.st.setShared('k0', 'replaced') !== true || read(b, 'k0') !== 'replaced') fail('RH-5: replacing a key in a full store');
   unsub();
-  console.log(`RH-3 shared: ${MAX_KEYS} junk keys can't keep out a key a hook reads or a local write; past the caps a local write throws`);
+  console.log(`RH-3 shared: ${MAX_KEYS} junk keys can't keep out a key a hook reads or a local write`);
+  console.log('RH-5: past the caps a local write is dropped with one warning; the setter does not throw');
 }
 
 // RH-3: per-peer values have a quota per member, MAX_PEER_KEYS keys and MAX_PEER_LENGTH in all, so one member
@@ -276,6 +300,38 @@ const throws = (fn) => {
   const answers = x.got.filter((m) => m.$peerwire === 'sync' && m.ask === true).length;
   if (n.values(a, x) !== 100 || answers > 4) fail(`20 asks: ${n.values(a, x)} values in ${answers} answers`);
   console.log(`RH-4: 20 asks: 100 values sent once, ${answers} answers`);
+}
+
+// Catch-up messages are cut to CHUNK_BYTES, so none reaches room.send's 1 MiB even at 3 bytes a character:
+// with room.js queueing an oversize message and dropping it unthrown (OUT-1), a joiner still gets every value.
+{
+  const n = net();
+  n.outbox = true;
+  const [a, b] = [n.node('a'), n.node('b')];
+  const fit = MAX_STORE_LENGTH / MAX_VALUE_LENGTH;
+  const wide = '\u20ac'.repeat(MAX_VALUE_LENGTH - 2); // MAX_VALUE_LENGTH as JSON, 3 bytes a character
+  for (let i = 0; i < fit; i++) a.st.setShared(`w${i}`, wide);
+  n.join(a, b);
+  n.flush();
+  const got = Array.from({ length: fit }, (_, i) => read(b, `w${i}`) === wide).filter(Boolean).length;
+  if (got !== fit || n.largest > 512 * 1024 + 1024) fail(`chunk bytes: the joiner got ${got} of ${fit} values; largest message ${n.largest} B`);
+  console.log(`chunks: ${fit} values of ${MAX_VALUE_LENGTH} three-byte characters all arrive, largest message ${n.largest} B`);
+}
+
+// N1: an asker whose digest holds a newer version of a key doesn't get our older value.
+{
+  const n = net();
+  const [a, x] = [n.node('a'), n.raw('b')];
+  a.st.setShared('doc', 'old');
+  a.st.setShared('other', 1);
+  n.join(a, x);
+  n.flush();
+  x.got.length = 0;
+  n.from(x, a, { $peerwire: 'sync', ask: true, h: [['doc', Date.now() + 1000, x.self]] });
+  n.flush();
+  const sent = x.got.filter((m) => m.$peerwire === 'sync').flatMap((m) => m.s ?? []).map((e) => e[0]);
+  if (sent.includes('doc') || !sent.includes('other')) fail(`N1: the answer carried ${JSON.stringify(sent)}`);
+  console.log("N1: a key the asker holds newer is left out of the answer");
 }
 
 // Writes that cross: both members hold different versions of the same keys, and settle on the same ones.
