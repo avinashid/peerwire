@@ -36,6 +36,10 @@
 // Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
 // room.poll() / room.receive() return queued events as plain objects (strings,
 // numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
+//
+// room.doc(name) opens a shared document (doc.js) that every member holds and that
+// catches up members who join later. Its frames have their own tag, so they never show
+// as messages; an older peer drops a tag it doesn't know.
 
 import { loadPeerwire, Lane, toHex, fromHex, isPeerId } from './peerwire.js';
 import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
@@ -43,11 +47,13 @@ import { NostrSignaling } from './nostr.js';
 import { LocalTransport } from './local.js';
 import { RoomProof } from './proof.js';
 import { DirectRetries } from './retry.js';
+import { Doc } from './doc.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
-// Nudge carries nothing (peers ignore tags they don't know): see the 'open' handler.
-const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6 };
+// Nudge carries nothing (peers ignore tags they don't know): see the 'open' handler. Doc
+// carries a shared document's frame as JSON (doc.js), on the reliable lane.
+const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6, Doc: 7 };
 // Presence is re-announced this often, so a lost hello only delays a join.
 const HELLO_EVERY_MS = 15000;
 // A link must prove the room key this soon after it connects.
@@ -205,6 +211,7 @@ export class Room {
     this.routes = new Map(); // linked peer -> { kind: 'direct' | 'peer' | 'signaling', via?, adopted? }
     this.paths = new Map(); // linked peer -> the endpoint's path to it
     this.fallingBack = new Set(); // peers we dial by fallback since WebRTC failed
+    this.docs = new Map(); // name -> open Doc
     this.transport = makeTransport((peer, state, handle) => {
       if (state === 'closed') this.rtcClosed(peer, handle);
       else if (state === 'failed') this.rtcFailed(peer);
@@ -377,6 +384,47 @@ export class Room {
     return true;
   }
 
+  // The shared document `name`, opened on first call: the same name on every member is
+  // the same document. See doc.js.
+  doc(name) {
+    if (this.left) throw new Error('left the room');
+    let d = this.docs.get(name);
+    if (d) return d;
+    d = new Doc(name, {
+      self: this.self,
+      peers: () => this.peers,
+      send: (peer, m) => this.writeDoc(peer, m),
+      after: (ms, fn) => {
+        const t = setTimeout(fn, ms);
+        return () => clearTimeout(t);
+      },
+      closed: (doc) => this.docs.get(name) === doc && this.docs.delete(name),
+    });
+    this.docs.set(name, d);
+    d.open();
+    return d;
+  }
+
+  writeDoc(peer, m) {
+    try {
+      this.write(peer, frame(T.Doc, enc.encode(JSON.stringify(m))), Lane.Reliable);
+    } catch {
+      // A doc frame stays under half the lane's limit, and a peer gone meanwhile is no error here.
+    }
+  }
+
+  // A doc frame from a member: for the open doc it names, if any. It never throws into the room.
+  onDoc(peer, body) {
+    if (!this.docs.size) return;
+    try {
+      const m = JSON.parse(dec.decode(body));
+      const d = typeof m?.d === 'string' ? this.docs.get(m.d) : undefined;
+      d?.receive(peer, m);
+    } catch {
+      // Malformed: dropped.
+    }
+  }
+
   rtt(peer) {
     return this.endpoint.rttMs(peer);
   }
@@ -400,6 +448,7 @@ export class Room {
     globalThis.navigator?.connection?.removeEventListener?.('change', this.onNetwork);
     this.retries.close();
     for (const off of this.unwatch) off();
+    for (const d of [...this.docs.values()]) d.close();
     const bye = Uint8Array.of(T.Bye);
     for (const p of this.linked) this.endpoint.send(p, bye, Lane.Unreliable);
     this.endpoint.pump();
@@ -486,11 +535,13 @@ export class Room {
       const joined = this.members.has(peer);
       this.members.set(peer, p);
       this.emit(joined ? 'presence' : 'peer-join', peer, p);
+      if (!joined) for (const d of this.docs.values()) d.joined(peer);
       return;
     }
     if (tag === T.Bye) return this.lost(peer, 'left');
     // Before its presence, a peer hasn't joined: only unreliable data can race it.
     if (!this.members.has(peer)) return;
+    if (tag === T.Doc) return this.onDoc(peer, body);
     let value;
     if (tag === T.Bytes) value = body;
     else if (tag === T.Text) value = dec.decode(body);
@@ -636,7 +687,10 @@ export class Room {
     // Its sealed close may never come now that its transport is gone: end the session
     // here, so links it relayed go back to signalling at once.
     if (reason === 'left') this.endpoint.disconnect(peer);
-    if (member) this.emit('peer-leave', peer, reason);
+    if (member) {
+      for (const d of this.docs.values()) d.left(peer);
+      this.emit('peer-leave', peer, reason);
+    }
   }
 
   // Throws RangeError for a frame over its lane's limit before queueing or sending it,

@@ -187,6 +187,10 @@ export declare class Room {
    * True once the channel carries the link; false, leaving the channel to the caller, if the link is direct
    * already or the peer didn't adopt within 5 s. When the channel closes, the link goes back to its fallback. */
   adoptChannel(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel): Promise<boolean>;
+  /** The shared document `name` (1 to 128 characters), opened on the first call and the same object until it is
+   * closed: the same name on every member is the same document. Throws after `leave()`, which closes the room's
+   * docs. See {@link Doc}. */
+  doc(name: string): Doc;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
@@ -194,6 +198,95 @@ export declare class Room {
    * where it also runs): the promise is already settled. Reliable messages not yet acknowledged may not arrive:
    * the goodbye can overtake them. */
   leave(): Promise<void>;
+}
+
+/** A map key, set item or log entry as `entries()` lists it. Values come back frozen. A value is member data: check
+ * every field you render. `from` is the writer as the doc was told: a member relaying a catch-up can name any
+ * writer, so use it to colour or group, not as proof. */
+export interface DocMapEntry {
+  readonly key: string;
+  readonly value: unknown;
+  readonly from: PeerId;
+}
+export interface DocItem {
+  /** The item's id: opaque, the same on every member. */
+  readonly id: string;
+  readonly value: unknown;
+  readonly from: PeerId;
+}
+
+/** What `doc.on('change')` reports: one event per key or item a write or a member's frame changed. */
+export interface DocChange {
+  /** The collection's name, as given to `doc.map()`, `doc.set()` or `doc.log()`. */
+  name: string;
+  type: 'map' | 'set' | 'log';
+  /** A map's key. */
+  key?: string;
+  /** A set item's or log entry's id. */
+  id?: string;
+  /** What the key or item holds now; undefined once it is gone. */
+  value: unknown;
+  /** The key or item is gone: deleted, or trimmed from a log. */
+  deleted?: true;
+  /** The writer of the value now shown or, for a deletion, the member it came from (us for our own writes). */
+  from: PeerId;
+  /** Our own write. */
+  local: boolean;
+}
+
+/** One value per key. A `set` replaces the values its writer has seen; of values set at the same time, the one
+ * with the later Lamport stamp shows, then the higher writer. A `delete` removes the values its writer has seen,
+ * so a set made elsewhere at the same time wins. */
+export interface DocMap {
+  /** True; false, with a warning, when members have filled the doc. Throws RangeError for a key over 256
+   * characters or a value over 64 KiB as JSON (or nested over 64 deep), TypeError for a value that isn't JSON. */
+  set(key: string, value: unknown): boolean;
+  get(key: string): unknown;
+  has(key: string): boolean;
+  /** False when the key holds nothing. */
+  delete(key: string): boolean;
+  /** By key. The same array until the map changes. */
+  entries(): readonly DocMapEntry[];
+}
+
+/** Items, each with its own id; `delete(id)` removes one (undo: delete your item). */
+export interface DocSet {
+  /** The new item's id; null, with a warning, when members have filled the doc. Throws as `DocMap.set` does. */
+  add(value: unknown): string | null;
+  get(id: string): unknown;
+  has(id: string): boolean;
+  /** False when no such item is held. */
+  delete(id: string): boolean;
+  /** Oldest first, by Lamport stamp then writer: the same order on every member (a whiteboard's z-order). */
+  entries(): readonly DocItem[];
+}
+
+/** Append-only, keeping the newest `keep` entries. */
+export interface DocLog {
+  /** The new entry's id; null, with a warning, when members have filled the doc. Throws as `DocMap.set` does. */
+  append(value: unknown): string | null;
+  get(id: string): unknown;
+  /** Oldest first, by Lamport stamp then writer: an entry appended after seeing another sorts after it. */
+  entries(): readonly DocItem[];
+}
+
+/** A shared document from `room.doc(name)`: maps, sets and logs that every member holds and that converge. Writes
+ * reach every member at once on the reliable lane; members that join later, or come back after a partition, catch
+ * up. Limits: 10,000 entries and 4 MiB of JSON text per doc; names 128 characters, keys 256, values 64 KiB as JSON.
+ * Members are trusted alike: any member can overwrite, delete or fill a doc. */
+export interface Doc {
+  readonly name: string;
+  map(name: string): DocMap;
+  set(name: string): DocSet;
+  /** `keep`: the newest entries kept, 1 to 10,000 (default 1000). Give every member the same, right after
+   * `room.doc()`. Calling again with another `keep` trims to it. */
+  log(name: string, options?: { keep?: number }): DocLog;
+  /** Subscribes; returns a function that unsubscribes. A handler that throws is reported on its own. */
+  on(event: 'change', fn: (change: DocChange) => void): () => void;
+  off(event: 'change', fn: (change: DocChange) => void): void;
+  /** Stops syncing and forgets the doc; `room.doc(name)` later opens it afresh and catches up. Writes after it
+   * throw. */
+  close(): void;
 }
 
 /** Joins a room: `const room = await joinRoom({ appId: 'my-app', roomId: 'lobby' })`. */
