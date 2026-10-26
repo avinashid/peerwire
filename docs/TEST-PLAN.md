@@ -132,6 +132,11 @@ workspace first and takes several times that. With no Rust change since `origin/
 - NAT: reflexive address discovery, mapping expiry, relayed dial then punch, relay refusal, symmetric pairs stay
   relayed, direct-path failure falls back to the relay, LAN candidates behind one NAT, and the full NAT matrix
   (public, full-cone, restricted, port-restricted, symmetric sequential/random, two CGNAT stacks).
+- Fast lane 3, with the per-packet `delay` hook: under 20 ms of jitter a relayed link takes a relay 110 ms faster a
+  round trip, once each end, and stays there over 60 s with both relays offered again every second, every message
+  arriving once and in order; a relay only 14 ms faster (inside the margin) is taken at most once and never swapped
+  back (3 seeds); two peers behind one hairpinning NAT, linked over their public mappings (30 ms slower), move to
+  the LAN once given each other's LAN address, and both time the new path.
 
 ### peerwire-game (`crates/peerwire-game/tests/`)
 
@@ -151,7 +156,7 @@ is the full harness for `docs/PERFORMANCE.md`.
 
 ### peerwire-ffi and packages/js
 
-`two_endpoints_through_the_c_abi` (Rust), `node_pair.mjs` (wasm in Node), `browser.mjs` and `arena.mjs`
+`two_endpoints_through_the_c_abi` and `path_rtt_is_timed_from_the_handshake` (Rust), `node_pair.mjs` (wasm in Node), `browser.mjs` and `arena.mjs`
 (Chromium, WebRTC over loopback), `nostr.mjs` (opt-in).
 
 ## Godot binding (NB-020)

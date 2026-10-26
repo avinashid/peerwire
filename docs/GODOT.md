@@ -80,6 +80,7 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `set_max_peers(max: int)` / `get_max_peers()` | Host: the most joiners it keeps (default 32). Past it, a newcomer is disconnected before `peer_connected`, as with `refuse_new_connections`. Applies at once; links already up stay |
 | `get_public_key() -> PackedByteArray` | This peer's own key |
 | `get_peer_rtt_ms(id) -> float` | Smoothed RTT to a directly connected peer, `-1` if unknown |
+| `get_peer_path_rtt_ms(id) -> float` | RTT over the path the link to `id` is on now (a LAN or a public address, say), measured since it moved there; `-1` if unknown. A link races its other addresses and takes one clearly faster |
 | `get_peer_loss(id) -> float` | Loss estimate 0–1 from reliable retransmissions, `-1` if unknown |
 
 The rest of the `MultiplayerPeer` API works as documented: `refuse_new_connections`, `disconnect_peer()`,
