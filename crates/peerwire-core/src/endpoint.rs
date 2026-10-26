@@ -921,13 +921,18 @@ impl<A: Address> Endpoint<A> {
     /// relayed, the relays offered for it ([`add_relay`](Endpoint::add_relay)) or that
     /// carried the peer's probes. A race is up to 5 rounds, 2 s apart, of a sealed
     /// probe on each path at once, the link's too; it starts when a path turns up,
-    /// the link changes kind, or its path has carried nothing for `keepalive` plus
-    /// 2 s. A path at least 15 ms and a fifth faster than the link's in 3 rounds, or
-    /// answering when the link's path doesn't, is taken (`PathChanged`), at most
-    /// once in 20 s, by the end with the smaller PeerId; the other follows. A direct
-    /// path never gives way to a relay this way, nor a relay to the slow address
-    /// ([`set_slow`](Endpoint::set_slow)), and a peer answers a probe through a relay
-    /// only if it would follow there. No races while relay-only.
+    /// the link changes kind, its path has carried nothing for `keepalive` plus 2 s,
+    /// or 20 s after the link took a path for being faster (the path it left is raced
+    /// against it once more, so a move won on lost probes goes back). A path at
+    /// least 15 ms and a fifth faster than the link's in 3 rounds, or answering when
+    /// the link's path doesn't, is taken (`PathChanged`), at most once in 20 s, by
+    /// the end with the smaller PeerId; the other follows. A relay that leaves the
+    /// link's data unacknowledged for 5 s, with no slow address to go back to, is
+    /// held off as [`set_slow`](Endpoint::set_slow) describes, and raced at once
+    /// without being probed (it goes on while the relay is held): either end leaves
+    /// it for the path that wins, at once. A direct path never gives way to a relay
+    /// this way, nor a relay to the slow address, and a peer answers a probe through
+    /// a relay only if it would follow there. No races while relay-only.
     pub fn path_rtt(&self, peer: &PeerId) -> Option<Duration> {
         self.sessions.get(self.peers.get(peer)?)?.path_rtt.map(Duration::from_micros)
     }
@@ -1165,17 +1170,22 @@ impl<A: Address> Endpoint<A> {
         }
     }
 
-    /// Offers `relay`, a peer linked directly, to carry the link to `peer` while
-    /// that link is on its slow address ([`set_slow`](Endpoint::set_slow)). A
-    /// sealed PUNCH goes to `peer` through `relay` every `RELAY_ROUNDS` punch
-    /// intervals for `punch_duration`, and `peer` answers it through `relay` only
-    /// if it would use the relay too: it is on its own slow address, or on that
-    /// relay already. The answer moves the link to the relay (a `PathChanged`
-    /// event); several relays can be offered, and the first to answer wins. A
-    /// probe arriving through a relay offers that relay back, so both ends move.
-    /// Ignored while relay-only, for a link not on its slow address, for a relay
-    /// not linked directly or linked only over its own slow address, and for one
-    /// the link holds off for stalling it (see [`set_slow`](Endpoint::set_slow)).
+    /// Offers `relay`, a peer linked directly, to carry the link to `peer`. While
+    /// that link is on its slow address ([`set_slow`](Endpoint::set_slow)), a sealed
+    /// PUNCH goes to `peer` through `relay` every `RELAY_ROUNDS` punch intervals for
+    /// `punch_duration`, and the answer moves the link to the relay (a `PathChanged`
+    /// event); several relays can be offered, and the first to answer wins. While
+    /// the link is on another relay, `relay` is raced against that one and taken if
+    /// clearly faster (see [`path_rtt`](Endpoint::path_rtt)). Either way `peer`
+    /// answers through `relay` only if it would use the relay too: it is on its own
+    /// slow address or a relay, and linked to `relay` directly other than over its
+    /// slow address, or it is on `relay` already; it isn't relay-only, and doesn't
+    /// hold `relay` off. A probe arriving through a relay offers that relay back, so
+    /// both ends move. Ignored while relay-only, for a peer not linked, for a link
+    /// on a direct path other than its slow address (it races its direct addresses
+    /// instead), for a relay not linked directly or linked only over its own slow
+    /// address, and for one the link holds off for stalling it (see
+    /// [`set_slow`](Endpoint::set_slow) and [`path_rtt`](Endpoint::path_rtt)).
     pub fn add_relay(&mut self, now: Instant, relay: PeerId, peer: &PeerId) {
         if let Some(&idx) = self.peers.get(peer) {
             self.offer_relay(now, idx, relay);

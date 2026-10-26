@@ -174,9 +174,11 @@ pub unsafe extern "C" fn pw_set_slow(h: *mut PwEndpoint, peer_id: *const u8, add
     }
 }
 
-/// Offers the directly linked peer `relay` to carry the link to `peer_id` while
-/// that link is on its slow address: probes go through it, and the link moves
-/// there (PATH_CHANGED) once `peer_id` answers. See `Endpoint::add_relay`.
+/// Offers the directly linked peer `relay` to carry the link to `peer_id`. While
+/// that link is on its slow address, probes go through it, and the link moves
+/// there (PATH_CHANGED) once `peer_id` answers; while it is on another relay, the
+/// two are raced, and `relay` is taken if clearly faster (see `pw_path_rtt_us`).
+/// See `Endpoint::add_relay`.
 #[no_mangle]
 pub unsafe extern "C" fn pw_add_relay(h: *mut PwEndpoint, now_us: u64, relay: *const u8, peer_id: *const u8) -> i32 {
     let (Some(r), Some(p)) = (peer(relay), peer(peer_id)) else { return PW_ERR_INVALID };

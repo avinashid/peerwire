@@ -294,8 +294,10 @@ export declare class Endpoint {
    * ('pathChanged') once `peer` answers through it, which it does only if it would use the relay too. The first
    * probe goes out after the current task, with any others offered in it. On a link relayed already, the relay
    * is raced against the one it is on (a probe round every 2 s, 5 rounds), and the end with the smaller
-   * PeerId moves the link to it once it is clearly faster; the other follows. Does nothing while relay-only, for
-   * a link that is direct, for a relay the link holds off (see `setSlow`), or after `close()`. */
+   * PeerId moves the link to it once it is clearly faster; the other follows. A relay that leaves the link's data
+   * unacknowledged for 5 s, on a link with no slow address, is held off as `setSlow` describes and raced at once,
+   * and either end moves the link to the relay that wins. Does nothing while relay-only, for a link that is
+   * direct, for a relay the link holds off (see `setSlow`), or after `close()`. */
   addRelay(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): void;
   /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
    * (reason 'closed') now rather than after its idle timeout. No local event for `peer`, though links it relayed

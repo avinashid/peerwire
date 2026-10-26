@@ -261,10 +261,11 @@ export class Endpoint {
     if (this.closed) return;
     this.pw.x.pw_set_slow(this.h, this.setPeer(peer), addr ?? 0, addr == null ? 0 : 1);
   }
-  // Offers `relay`, a peer linked directly, to carry the link to `peer` while that link
-  // is on its slow address: probes go through `relay`, and the link moves there once
-  // `peer` answers through it. The probes go out after this task, with those of any other
-  // relays offered in it. Does nothing while relay-only or after close().
+  // Offers `relay`, a peer linked directly, to carry the link to `peer`. On its slow
+  // address, probes go through `relay`, and the link moves there once `peer` answers
+  // through it; on another relay, the two are raced, and `relay` is taken if clearly
+  // faster. The probes go out after this task, with those of any other relays offered
+  // in it. Does nothing while relay-only or after close().
   addRelay(relay, peer) {
     if (this.closed) return;
     const pp = this.setPeer(peer);
