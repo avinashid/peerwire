@@ -504,12 +504,12 @@ struct Session<A> {
     /// a relay: the link leaves it for a relay that answers a probe, and goes back
     /// to it when that relay goes.
     slow: Option<A>,
-    /// On a relay: the newest nonce of a packet other than a probe that came
-    /// through it, so the peer is on it too. Only probes leave a path, so a newer
-    /// one over the slow address means the peer went back there.
-    relay_nonce: Option<u64>,
-    /// When the link last moved onto a relay: a stall there is timed from then.
-    via_since: Instant,
+    /// The newest nonce of a packet other than a probe that came over `path`, so
+    /// the peer is on it too. Only probes leave a path, so a newer one over another
+    /// path means the peer went there (from a relay, back to the slow address).
+    path_nonce: Option<u64>,
+    /// When the link last moved to another path: a stall on a relay is timed from then.
+    path_since: Instant,
     /// Relays that stalled the link, at most `MAX_RELAYS`.
     held: Vec<Hold>,
 }
@@ -862,8 +862,8 @@ impl<A: Address> Endpoint<A> {
                 last_path: now,
                 seen_as: None,
                 slow: None,
-                relay_nonce: None,
-                via_since: now,
+                path_nonce: None,
+                path_since: now,
                 held: Vec::new(),
             },
         );
@@ -1114,9 +1114,7 @@ impl<A: Address> Endpoint<A> {
             State::Live(link) if matches!(sess.path, Path::Via(_)) && !relay_only => {
                 let p = sess.punch.get_or_insert(Punch { token, next_at: now, until, round: 0, relays: Vec::new() });
                 p.until = p.until.max(until);
-                let mut f = Vec::with_capacity(9);
-                wire::put_punch(&mut f, false, p.token);
-                seal(link, &f)
+                seal_punch(link, false, p.token)
             }
             State::Live(_) => None,
         }
@@ -1169,8 +1167,9 @@ impl<A: Address> Endpoint<A> {
         mark_ready(&mut self.ready, idx, link);
         sess.path = path.clone();
         sess.last_path = at;
+        sess.path_since = at;
         sess.punch = None;
-        sess.relay_nonce = None;
+        sess.path_nonce = None;
         self.events.push_back(Event::PathChanged { peer: sess.peer, path });
     }
 
@@ -1380,8 +1379,8 @@ impl<A: Address> Endpoint<A> {
                 last_path: now,
                 seen_as: None,
                 slow: None,
-                relay_nonce: None,
-                via_since: now,
+                path_nonce: None,
+                path_since: now,
                 held: Vec::new(),
             },
         );
@@ -1501,11 +1500,21 @@ impl<A: Address> Endpoint<A> {
         let mut path_changed = false;
         let mut reflexive = None;
         let mut offered = None;
+        // Probes (punches) only measure paths: they move no link.
+        let probes_only = wire::frames(&pt[..n]).all(|f| matches!(f, Ok(Frame::Punch(_) | Frame::PunchAck(_))));
+        // Between paths of a kind, the link follows the peer to the path of its newest
+        // packets, not to late ones over a path it left, unless this end leads (the
+        // smaller PeerId) and holds its path: a relay the peer was heard on.
+        let newer = !probes_only && sess.path_nonce.is_none_or(|m| nonce > m);
+        let leads = self.me < sess.peer;
         match (&from, &sess.path) {
-            (Path::Direct(x), Path::Direct(y)) => {
-                sess.last_path = now;
-                if x != y {
+            (Path::Direct(x), Path::Direct(y)) if x == y => sess.last_path = now,
+            (Path::Direct(_), Path::Direct(_)) => {
+                if newer {
                     sess.path = from.clone();
+                    sess.last_path = now;
+                    sess.path_since = now;
+                    sess.path_nonce = None;
                     self.stats.roams += 1;
                     path_changed = true;
                 }
@@ -1516,12 +1525,12 @@ impl<A: Address> Endpoint<A> {
             (Path::Via(r), Path::Via(q)) if r == q => sess.last_path = now,
             // The peer moved to another relay: so does the link, if that one is worth
             // relaying through (as `offered`, `moved`) and not held off.
-            (Path::Via(r), Path::Via(_)) if fast_from => {
-                if !holds(&sess.held, r, now) {
+            (Path::Via(r), Path::Via(_)) if fast_from && !holds(&sess.held, r, now) => {
+                if newer && !(leads && sess.path_nonce.is_some()) {
                     sess.last_path = now;
-                    sess.via_since = now;
+                    sess.path_since = now;
                     sess.path = from.clone();
-                    sess.relay_nonce = None;
+                    sess.path_nonce = None;
                     path_changed = true;
                 }
             }
@@ -1546,9 +1555,7 @@ impl<A: Address> Endpoint<A> {
         let mut observed = None;
         let mut violation = false;
         let mut closed = false;
-        let mut probes_only = true;
         for f in wire::frames(&pt[..n]) {
-            probes_only &= matches!(f, Ok(Frame::Punch(_) | Frame::PunchAck(_)));
             match f {
                 // Answered with an ACK, so a silent-side probe gets a reply.
                 Ok(Frame::Ping) => link.rx.ack_pending = true,
@@ -1609,18 +1616,14 @@ impl<A: Address> Endpoint<A> {
             }
         }
         for (dst, token) in punch_acks {
-            let mut f = Vec::with_capacity(9);
-            wire::put_punch(&mut f, true, token);
-            if let Some(p) = seal(link, &f) {
+            if let Some(p) = seal_punch(link, true, token) {
                 self.stats.tx_packets += 1;
                 self.outbox.push_back(Transmit { dst, payload: p });
             }
         }
         let mut sealed = Vec::new();
         for (r, token) in relay_acks {
-            let mut f = Vec::with_capacity(9);
-            wire::put_punch(&mut f, true, token);
-            if let Some(p) = seal(link, &f) {
+            if let Some(p) = seal_punch(link, true, token) {
                 sealed.push((r, p));
             }
         }
@@ -1630,6 +1633,8 @@ impl<A: Address> Endpoint<A> {
             sess.guesses.clear();
             sess.spray = None;
             sess.last_path = now;
+            sess.path_since = now;
+            sess.path_nonce = None;
             self.stats.punch_succeeded += 1;
             path_changed = true;
         }
@@ -1638,10 +1643,10 @@ impl<A: Address> Endpoint<A> {
             sess.relay = Some(r);
             sess.punch = None;
             sess.last_path = now;
-            sess.via_since = now;
-            sess.relay_nonce = None;
+            sess.path_since = now;
+            sess.path_nonce = None;
             // Through it at once: the peer, there too, answers, so each end has had a
-            // packet through the relay that isn't a probe (`relay_nonce`) and follows the
+            // packet through the relay that isn't a probe (`path_nonce`) and follows the
             // other back to the slow address on its first one there.
             link.ping_pending = true;
             path_changed = true;
@@ -1650,10 +1655,10 @@ impl<A: Address> Endpoint<A> {
         let mut follow = false;
         if !probes_only {
             match (&from, &sess.path) {
-                (Path::Via(r), Path::Via(q)) if r == q => sess.relay_nonce = sess.relay_nonce.max(Some(nonce)),
                 (Path::Direct(x), Path::Via(_)) => {
-                    follow = sess.slow.as_ref() == Some(x) && sess.relay_nonce.is_some_and(|n| nonce > n)
+                    follow = sess.slow.as_ref() == Some(x) && sess.path_nonce.is_some_and(|n| nonce > n)
                 }
+                _ if from == sess.path => sess.path_nonce = sess.path_nonce.max(Some(nonce)),
                 _ => {}
             }
         }
@@ -1827,10 +1832,8 @@ impl<A: Address> Endpoint<A> {
                             sess.spray = None; // punching ran out
                             continue;
                         };
-                        let mut f = Vec::with_capacity(9);
-                        wire::put_punch(&mut f, false, p.token);
                         for dst in batch {
-                            if let Some(payload) = seal(link, &f) {
+                            if let Some(payload) = seal_punch(link, false, p.token) {
                                 self.stats.tx_packets += 1;
                                 self.outbox.push_back(Transmit { dst, payload });
                             }
@@ -1866,13 +1869,9 @@ impl<A: Address> Endpoint<A> {
                             self.stats.punch_failed += 1;
                         } else if now >= p.next_at {
                             p.next_at = now + self.config.punch_interval;
-                            let mut f = Vec::with_capacity(9);
-                            wire::put_punch(&mut f, false, p.token);
                             if p.round % RELAY_ROUNDS == 0 && !p.relays.is_empty() {
-                                let mut f = Vec::with_capacity(9);
-                                wire::put_punch(&mut f, false, p.relay_token());
                                 for &r in &p.relays {
-                                    if let Some(payload) = seal(link, &f) {
+                                    if let Some(payload) = seal_punch(link, false, p.relay_token()) {
                                         resend.push((Path::Via(r), sess.peer, payload));
                                     }
                                 }
@@ -1888,7 +1887,7 @@ impl<A: Address> Endpoint<A> {
                                 std::iter::once(Some(c.clone())).chain((1..=spray).map(|k| c.port_offset(k))).flatten()
                             });
                             for dst in sprayed.chain(guessed.iter().cloned()) {
-                                if let Some(payload) = seal(link, &f) {
+                                if let Some(payload) = seal_punch(link, false, p.token) {
                                     self.stats.tx_packets += 1;
                                     self.stats.punches_sent += 1;
                                     self.outbox.push_back(Transmit { dst, payload });
@@ -1914,7 +1913,7 @@ impl<A: Address> Endpoint<A> {
                     // A relay that carries nothing from the peer, or not our data: back to the
                     // slow address before `idle_timeout` or the retries would drop the link.
                     if let (Path::Via(r), Some(_), false) = (&sess.path, &sess.slow, self.relay_only) {
-                        if link.tx.oldest_unacked().is_some_and(|s| now >= s.max(sess.via_since) + RELAY_STALL) {
+                        if link.tx.oldest_unacked().is_some_and(|s| now >= s.max(sess.path_since) + RELAY_STALL) {
                             stalled.push((idx, *r));
                         } else if now >= sess.last_path + self.config.direct_timeout {
                             unrelayed.push(idx);
@@ -1955,8 +1954,8 @@ impl<A: Address> Endpoint<A> {
                 }
             }
             sess.last_path = now;
-            sess.via_since = now;
-            sess.relay_nonce = None;
+            sess.path_since = now;
+            sess.path_nonce = None;
             if let State::Live(link) = &mut sess.state {
                 link.ping_pending = true;
                 mark_ready(&mut self.ready, idx, link);
@@ -2022,7 +2021,7 @@ impl<A: Address> Endpoint<A> {
                     if let (Path::Via(_), Some(_), false) = (&sess.path, &sess.slow, self.relay_only) {
                         min(sess.last_path + self.config.direct_timeout);
                         if let Some(s) = link.tx.oldest_unacked() {
-                            min(s.max(sess.via_since) + RELAY_STALL);
+                            min(s.max(sess.path_since) + RELAY_STALL);
                         }
                     }
                 }
@@ -2164,6 +2163,14 @@ fn push_relay_frame(link: &mut Link, frame: Vec<u8>, cap: usize, dropped: &mut u
         *dropped += 1;
     }
     link.relay_q.push_back(frame);
+}
+
+/// A PUNCH, or PUNCH_ACK if `ack`, with `token`, sealed as the next DATA packet on `link`.
+#[inline(never)]
+fn seal_punch(link: &mut Link, ack: bool, token: u64) -> Option<Vec<u8>> {
+    let mut f = Vec::with_capacity(9);
+    wire::put_punch(&mut f, ack, token);
+    seal(link, &f)
 }
 
 fn seal(link: &mut Link, pt: &[u8]) -> Option<Vec<u8>> {
@@ -2682,6 +2689,13 @@ mod tests {
         let sent = route(&mut eps, &mut t, 2_000, None);
         assert!(sent.iter().filter(|&&(i, dst)| i == 2 && dst == 1).count() >= 2, "c relayed b's probes to a");
         assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(d)), Some(&Path::Via(d))));
+        // Nor a packet of b's, not a probe, that c relays: a, which follows b (b < a), stays.
+        assert!(b < a);
+        let mut ping = Vec::new();
+        wire::put_ping(&mut ping);
+        let ping = eps[1].seal_raw(&a, &ping).unwrap();
+        eps[0].on_packet(t, Path::Via(c), None, &ping);
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(d)));
         assert_eq!(events(&mut eps[0]), vec![Event::PathChanged { peer: b, path: Path::Via(d) }]);
     }
 
@@ -2712,8 +2726,8 @@ mod tests {
     /// FL2-2: b offers c as a relay for its link to a, which is on its slow
     /// address, and c keeps b's probe for a instead of relaying it, and sends it on
     /// its own channel. Told the channel is c's, a drops it unread and stays put;
-    /// from an address anyone can send from (UDP), the same packet still moves the
-    /// link there, as its nonce wasn't taken.
+    /// from an address anyone can send from (UDP), the same packet, a probe, moves
+    /// nothing either, but any other packet of b's does.
     #[test]
     fn a_relay_cannot_move_a_link_onto_its_own_channel() {
         let mut t = Instant::from_millis(1);
@@ -2739,6 +2753,11 @@ mod tests {
         eps[0].handle_datagram_from(t, 3, &c, &sealed);
         assert_eq!(eps[0].stats().rx_wrong_peer, 2, "any packet of b's");
         eps[0].handle_datagram(t, 3, &packet);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)), "a probe moves no link");
+        let mut ping = Vec::new();
+        wire::put_ping(&mut ping);
+        let ping = eps[1].seal_raw(&a, &ping).unwrap();
+        eps[0].handle_datagram(t, 3, &ping);
         assert_eq!(eps[0].path(&b), Some(&Path::Direct(3)));
         assert_eq!(events(&mut eps[0]), vec![Event::PathChanged { peer: b, path: Path::Direct(3) }]);
     }
@@ -2772,7 +2791,7 @@ mod tests {
 
     /// A relay probe's answer, sent on from an address of its own by a relay that
     /// kept it, answers no direct probe: relay probes carry a token of their own.
-    /// (On an address anyone can send from, the link roams there all the same.)
+    /// Nor, a probe, does it move the link.
     #[test]
     fn a_relayed_punch_ack_answers_no_direct_probe() {
         let mut t = Instant::from_millis(1);
@@ -2793,7 +2812,7 @@ mod tests {
         let Some(Ok(Frame::Relayed { packet, .. })) = wire::frames(&frame).next() else { panic!() };
         let packet = packet.to_vec();
         eps[0].handle_datagram(t, 9, &packet);
-        assert_eq!(eps[0].path(&b), Some(&Path::Direct(9)));
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)));
         assert_eq!(eps[0].stats().punch_succeeded, 0);
     }
 
@@ -2821,5 +2840,150 @@ mod tests {
             let fell_back = eps[0].path(&b) == Some(&Path::Via(c));
             assert_eq!((fell_back, eps[0].stats().direct_fallbacks), (!slow, !slow as u64), "c slow: {slow}");
         }
+    }
+
+    /// Datagrams in flight between endpoints (see `Net::run`).
+    struct Net(Vec<(Instant, usize, u32, Vec<u8>)>);
+
+    impl Net {
+        /// Runs `eps` for `ms` from `t` in 1 ms steps, timers every step. `hop(i, dst)`
+        /// says where endpoint i's datagram to `dst` goes: to endpoint j, from address
+        /// `src`, `delay` ms later; or nowhere.
+        fn run(
+            &mut self,
+            eps: &mut [Endpoint<u32>],
+            t: &mut Instant,
+            ms: u64,
+            hop: impl Fn(usize, u32) -> Option<(usize, u32, u64)>,
+        ) {
+            for _ in 0..ms {
+                for (i, ep) in eps.iter_mut().enumerate() {
+                    while let Some(tx) = ep.poll_transmit(*t) {
+                        if let Some((j, src, d)) = hop(i, tx.dst) {
+                            self.0.push((*t + Duration::from_millis(d), j, src, tx.payload));
+                        }
+                    }
+                }
+                *t = *t + Duration::from_millis(1);
+                let now = *t;
+                let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.0).into_iter().partition(|x| x.0 <= now);
+                self.0 = rest;
+                for (_, j, src, data) in due {
+                    eps[j].handle_datagram(now, src, &data);
+                }
+                for ep in eps.iter_mut() {
+                    ep.handle_timeout(now);
+                }
+            }
+        }
+    }
+
+    /// a, b, c, d and e at addresses 1 to 5: a and b linked over each other's slow
+    /// address (100 ms a hop), c, d and e linked to both directly (40, 10 and 1 ms a
+    /// hop), and a and b on c (offered as a relay by both).
+    fn relay_five(t: &mut Instant, net: &mut Net) -> (Vec<Endpoint<u32>>, [PeerId; 5]) {
+        let ids: Vec<Identity> = (1..=5u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let p = [0, 1, 2, 3, 4].map(|i| ids[i].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        eps[0].connect(*t, 2, p[1]).unwrap();
+        for ep in &mut eps[2..] {
+            ep.connect(*t, 1, p[0]).unwrap();
+            ep.connect(*t, 2, p[1]).unwrap();
+        }
+        net.run(&mut eps, t, 1_000, five);
+        eps[0].set_slow(&p[1], Some(2));
+        eps[1].set_slow(&p[0], Some(1));
+        eps[0].add_relay(*t, p[2], &p[1]);
+        eps[1].add_relay(*t, p[2], &p[0]);
+        net.run(&mut eps, t, 2_000, five);
+        assert_eq!((eps[0].path(&p[1]), eps[1].path(&p[0])), (Some(&Path::Via(p[2])), Some(&Path::Via(p[2]))));
+        for ep in eps.iter_mut() {
+            events(ep);
+        }
+        (eps, p)
+    }
+
+    /// The hops of `relay_five` (see `Net::run`).
+    fn five(i: usize, dst: u32) -> Option<(usize, u32, u64)> {
+        let j = (dst as usize).checked_sub(1)?;
+        let ms = [0, 0, 40, 10, 1][i.max(j)];
+        Some((j, i as u32 + 1, if i.max(j) == 1 { 100 } else { ms }))
+    }
+
+    /// The paths changed to in `got`.
+    fn moves(got: &[Event<u32>]) -> Vec<Path<u32>> {
+        got.iter()
+            .filter_map(|e| if let Event::PathChanged { path, .. } = e { Some(path.clone()) } else { None })
+            .collect()
+    }
+
+    /// A late packet over an address the link left doesn't take it back: b's
+    /// packets from a new address move a's link there, and one sealed before them,
+    /// arriving from the old address after, doesn't move it back; a newer one does.
+    #[test]
+    fn a_late_packet_over_an_old_address_does_not_take_the_link_back() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b) = (ids[0].peer_id(), ids[1].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, 2, b).unwrap();
+        route(&mut eps, &mut t, 200, None);
+        events(&mut eps[0]);
+        let mut ping = Vec::new();
+        wire::put_ping(&mut ping);
+        let [late, moved, newer] = [(); 3].map(|_| eps[1].seal_raw(&a, &ping).unwrap());
+        eps[0].handle_datagram(t, 12, &moved);
+        eps[0].handle_datagram(t, 2, &late);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(12)));
+        eps[0].handle_datagram(t, 2, &newer);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)));
+        let moves = vec![
+            Event::PathChanged { peer: b, path: Path::Direct(12) },
+            Event::PathChanged { peer: b, path: Path::Direct(2) },
+        ];
+        assert_eq!(events(&mut eps[0]), moves);
+    }
+
+    /// The two ends of a link on different relays (each fell back to its own, say)
+    /// meet on one, in a move or two each, and stay there.
+    #[test]
+    fn the_ends_of_a_link_on_two_relays_meet_on_one() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, c, d, _] = p;
+        let idx = eps[1].peers[&a];
+        let sess = eps[1].sessions.get_mut(&idx).unwrap();
+        (sess.path, sess.path_nonce) = (Path::Via(d), None);
+        let mut got = [Vec::new(), Vec::new()];
+        for k in 0..200u32 {
+            eps[0].send(&b, Lane::Reliable, &k.to_le_bytes()).unwrap();
+            eps[1].send(&a, Lane::Reliable, &k.to_le_bytes()).unwrap();
+            net.run(&mut eps, &mut t, 50, five);
+            got[0].extend(events(&mut eps[0]));
+            got[1].extend(events(&mut eps[1]));
+        }
+        let (pa, pb) = (eps[0].path(&b).cloned().unwrap(), eps[1].path(&a).cloned().unwrap());
+        assert!(pa == pb && [Path::Via(c), Path::Via(d)].contains(&pa), "{pa:?} {pb:?}");
+        assert!(moves(&got[0]).len() <= 2 && moves(&got[1]).len() <= 2, "{got:?}");
+    }
+
+    /// Of the two ends of a link on a relay, each having heard the other there, a
+    /// newer packet through another relay moves the end that follows (a: b's PeerId
+    /// is the smaller), not the one that leads, so the two never chase each other.
+    #[test]
+    fn only_the_end_that_follows_leaves_a_relay_it_heard_the_peer_on() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, c, d, _] = p;
+        assert!(b < a);
+        let mut ping = Vec::new();
+        wire::put_ping(&mut ping);
+        let (to_b, to_a) = (eps[0].seal_raw(&b, &ping).unwrap(), eps[1].seal_raw(&a, &ping).unwrap());
+        eps[1].on_packet(t, Path::Via(d), None, &to_b);
+        eps[0].on_packet(t, Path::Via(d), None, &to_a);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(d)), Some(&Path::Via(c))));
+        assert_eq!((moves(&events(&mut eps[0])), moves(&events(&mut eps[1]))), (vec![Path::Via(d)], vec![]));
     }
 }
