@@ -618,9 +618,10 @@ struct Session<A> {
     /// a relay: the link leaves it for a relay that answers a probe, and goes back
     /// to it when that relay goes.
     slow: Option<A>,
-    /// The newest nonce of a packet other than a probe that came over `path`, so
-    /// the peer is on it too. Only probes leave a path, so a newer one over another
-    /// path means the peer went there (from a relay, back to the slow address).
+    /// The newest nonce of a packet other than a probe that came over `path` (or of
+    /// the probe answer that moved the link there), so the peer is on it too. Only
+    /// probes leave a path, so a newer one over another path means the peer went
+    /// there (from a relay, back to the slow address).
     path_nonce: Option<u64>,
     /// When the link last moved to another path: a stall on a relay is timed from
     /// then, and `path_rtt` measured.
@@ -1869,7 +1870,7 @@ impl<A: Address> Endpoint<A> {
             sess.spray = None;
             sess.last_path = now;
             sess.path_since = now;
-            sess.path_nonce = None;
+            sess.path_nonce = Some(nonce); // nothing the peer sealed before its answer roams the link
             sess.path_rtt = None;
             self.stats.punch_succeeded += 1;
             path_changed = true;
@@ -3574,5 +3575,43 @@ mod tests {
         net.run(&mut eps, &mut t, 15_000, five);
         assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(d)), Some(&Path::Via(d))));
         assert_eq!((eps[0].stats().path_switches, eps[1].stats().path_switches), (0, 1));
+    }
+
+    /// FL3-1: right after a punch moves a relayed link direct, an older packet of
+    /// b's that relay c kept, sent from c's own (UDP) address, doesn't roam a's link
+    /// there: the answer that moved it is newer. A packet b seals now, from a new
+    /// address (a rebinding), still roams.
+    #[test]
+    fn a_packet_kept_from_before_an_upgrade_does_not_roam_the_link() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b, c) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[2].connect(t, 1, a).unwrap();
+        eps[2].connect(t, 2, b).unwrap();
+        route(&mut eps, &mut t, 200, None);
+        eps[0].connect_via(t, c, b, &[]).unwrap();
+        let cut = |i: usize, dst: u32| (i == 0 && dst == 2) || (i == 1 && dst == 1);
+        route_with(&mut eps, &mut t, 300, cut);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+        // A ping of b's that c, relaying it, keeps (c sees exactly these bytes in the FWD).
+        let mut ping = Vec::new();
+        wire::put_ping(&mut ping);
+        let kept = eps[1].seal_raw(&a, &ping).unwrap();
+        for _ in 0..500 {
+            if eps[0].path(&b) == Some(&Path::Direct(2)) {
+                break;
+            }
+            route(&mut eps, &mut t, 10, None);
+        }
+        assert_eq!((eps[0].path(&b), eps[0].stats().punch_succeeded), (Some(&Path::Direct(2)), 1), "upgraded");
+        events(&mut eps[0]);
+        eps[0].handle_datagram(t, 3, &kept);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)), "the kept packet roamed a's link to c");
+        let fresh = eps[1].seal_raw(&a, &ping).unwrap();
+        eps[0].handle_datagram(t, 12, &fresh);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(12)));
+        assert_eq!(events(&mut eps[0]), vec![Event::PathChanged { peer: b, path: Path::Direct(12) }]);
     }
 }
