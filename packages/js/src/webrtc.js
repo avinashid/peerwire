@@ -63,9 +63,9 @@ const MAX_ICE_BATCH = 32; // candidates in one 'ice-batch', and held before a re
 // 'disconnected' for RESTART_AFTER_MS, or at once on 'failed', the dialling side
 // renegotiates with new ICE credentials (the other side asks it to, so offers never
 // cross; an ask is heeded only while our own ICE is down too). At most MAX_RESTARTS
-// per link in RESTART_WINDOW_MS, RESTART_AFTER_MS doubling between them; ICE
-// connecting again doesn't start the count over, so a peer that answers each one
-// can't loop them (NB46-1). The Peerwire session keeps its handle.
+// per link in RESTART_WINDOW_MS (one past them waits for the window), RESTART_AFTER_MS
+// doubling between them; ICE connecting again doesn't start the count over, so a peer
+// that answers each one can't loop them (NB46-1). The Peerwire session keeps its handle.
 export const RESTART_AFTER_MS = 2000;
 export const MAX_RESTARTS = 3;
 export const RESTART_WINDOW_MS = 60000;
@@ -201,7 +201,8 @@ export class WebRtcTransport {
   // a budget: publishBurst at once, then one per publishEveryMs, so no peer can keep us
   // publishing to the signalling relays, which rate-limit and ban busy clients (NB46-1).
   // A link takes 1 to 3 (its description, and copies when one is lost). ICE candidates
-  // (which follow a description) and pipe batches (PIPE_RATE) don't count. Tests shorten it.
+  // don't count: they follow a description that went out (an answer past the budget holds
+  // its own, see `unsent`). Nor do pipe batches (PIPE_RATE). Tests shorten it.
   static publishBurst = 6;
   static publishEveryMs = 5000;
 
@@ -318,9 +319,10 @@ export class WebRtcTransport {
     // Without trickle: `described` once the offer or answer is out, `late` holds the
     // candidates found after it, `held` the peer's that came before its description.
     // `mine` and `theirs`: the public IPv4s each side's candidates name (see sameNat);
-    // `heard` once the DataChannel has carried a datagram from the peer.
+    // `heard` once the DataChannel has carried a datagram from the peer; `unsent` while
+    // our answer waits for budget (its candidates wait with it).
     const l = { pc, dc, peer, handle: h, dialer: false, timer: null, watchedAt: 0, failed: false, described: false, late: [], lateTimer: null,
-      held: [], offerMsg: null, offerSdp: null, answerMsg: null, resends: [],
+      held: [], offerMsg: null, offerSdp: null, answerMsg: null, unsent: false, resends: [],
       lateSent: 0, opened: false, restartAt: [], restartTimer: null, guessed: null,
       mine: new Set(), theirs: new Set(), sameNat: false, heard: false, retry: false };
     dc.onopen = () => {
@@ -348,7 +350,7 @@ export class WebRtcTransport {
       const c = e.candidate;
       if (c) this.sameNat(l, l.mine, c.candidate);
       if (c && this.privacy !== 'direct' && HOST.test(c.candidate)) return;
-      if (this.trickle) return void (c && this.signal(peer, { kind: 'ice', candidate: this.outgoing(c) }));
+      if (this.trickle) return void (c && !l.unsent && this.signal(peer, { kind: 'ice', candidate: this.outgoing(c) }));
       if (!l.described) return; // still to go in the description
       if (!c) return void this.sendLate(l); // gathering complete: send what is buffered
       if (l.lateSent + l.late.length >= MAX_LATE) return; // bounded
@@ -444,7 +446,8 @@ export class WebRtcTransport {
     if (!l.opened || this.links.get(l.handle) !== l) return;
     const now = Date.now();
     l.restartAt = l.restartAt.filter((t) => now - t < RESTART_WINDOW_MS);
-    if (l.restartAt.length >= MAX_RESTARTS) return;
+    // Over the limit: if ICE is still down when the oldest leaves the window, try then.
+    if (l.restartAt.length >= MAX_RESTARTS) return void (!iceUp(l.pc) && this.restartSoon(l, l.restartAt[0] + RESTART_WINDOW_MS - now));
     clearTimeout(l.restartTimer);
     l.restartAt.push(now);
     const n = l.restartAt.length;
@@ -584,7 +587,7 @@ export class WebRtcTransport {
   sendLate(l) {
     clearTimeout(l.lateTimer);
     l.lateTimer = null;
-    if (this.links.get(l.handle) !== l || !l.late.length) return;
+    if (this.links.get(l.handle) !== l || !l.late.length || l.unsent) return;
     const batch = l.late.splice(0, MAX_ICE_BATCH);
     l.lateSent += batch.length;
     this.signal(l.peer, { kind: 'ice-batch', c: batch, ...this.prediction(l, batch) });
@@ -694,7 +697,11 @@ export class WebRtcTransport {
         // within the peer's budget, so a flood of copies gets a few.
         const l = this.links.get(this.byPeer.get(from));
         if (sdp !== null && sdp === l.offerSdp) {
-          if (l.answerMsg && this.publish(from, l.answerMsg)) {
+          // One never sent is made again, with the candidates found since in it (none while
+          // it is being made: the description is still the last offer's).
+          const msg = l.answerMsg && l.unsent ? { kind: 'answer', sdp: this.description(l.pc), ...this.prediction(l) } : l.answerMsg;
+          if (msg && this.publish(from, msg)) {
+            if (l.unsent) Object.assign(l, { answerMsg: msg, unsent: false, late: [] });
             this.resent++;
             this.tr(from, 'answer-sent', { ...candidateSummary(l.answerMsg.sdp.sdp), resend: true });
           }
@@ -703,6 +710,7 @@ export class WebRtcTransport {
       }
       const l = this.link(from);
       l.offerSdp = sdp; // a copy that comes while this one is answered is ignored
+      l.answerMsg = null;
       if (fresh) l.retry = msg.retry === true;
       try {
         await l.pc.setRemoteDescription(msg.sdp);
@@ -720,7 +728,8 @@ export class WebRtcTransport {
       if (this.links.get(l.handle) !== l) return; // dropped meanwhile
       l.answerMsg = { kind: 'answer', sdp: this.describe(l), ...this.prediction(l) };
       // Past the peer's budget it waits for a copy of the offer (the dialler sends it again).
-      if (this.publish(from, l.answerMsg)) this.tr(from, 'answer-sent', { ...candidateSummary(l.answerMsg.sdp.sdp), restart: !fresh });
+      l.unsent = !this.publish(from, l.answerMsg);
+      if (!l.unsent) this.tr(from, 'answer-sent', { ...candidateSummary(l.answerMsg.sdp.sdp), restart: !fresh });
       if (fresh) this.watch(l);
       await this.guess(l, msg.nat);
     } else if (msg.kind === 'answer') {

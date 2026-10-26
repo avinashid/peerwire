@@ -414,12 +414,14 @@ export declare class WebRtcTransport implements Transport {
   readonly resent: number;
   /**
    * Offers, answers, copies of either and `restart` asks not sent because the peer's publish budget was spent:
-   * 6 at once, then 1 per 5 s per peer, so no peer can keep us publishing to the signalling relays.
+   * 6 at once, then 1 per 5 s per peer, so no peer can keep us publishing to the signalling relays. The ICE
+   * candidates of an answer not sent wait with it, until a copy of its offer finds budget.
    */
   readonly throttled: number;
   /**
    * ICE restarts begun as the dialling side (a link that was open lost ICE). At most 3 per link a minute, whether
-   * or not ICE reconnects in between; the other side's ask is heeded only while our own ICE is down too.
+   * or not ICE reconnects in between (while it stays down, the next is made once the minute frees); the other
+   * side's ask is heeded only while our own ICE is down too.
    */
   readonly restarts: number;
   /** Retries begun as the dialling side (see `retry`). */

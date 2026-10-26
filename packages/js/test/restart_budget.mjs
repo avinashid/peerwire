@@ -11,10 +11,18 @@
 // 4. a linked peer's 50 new offers (ICE-restart offers) get at most the budget of answers;
 // 5. a genuine ICE failure still restarts: 'failed' at once as the dialling side (an
 //    offer with restart: true) and as the other side (a 'restart' ask); a second drop
-//    after a reconnect, with the peer's ask, restarts at once.
+//    after a reconnect, with the peer's ask, restarts at once;
+// 6. candidates of an answer past the budget wait with it (NB46-1a): a linked peer's 50
+//    new offers get the budget of answers and only their candidates, trickled ('ice') or
+//    late ('ice-batch'); a copy that releases a held answer sends it made again, with the
+//    candidates found meanwhile in it and none sent twice, and those found after flow;
+// 7. a copy of a new offer that comes while it is being answered gets no answer to the
+//    last one (NB46-1b), whether that one went out or was held;
+// 8. the restart window slides: a minute after the 3rd restart a 4th goes through (NB46-T1),
+//    and one refused while ICE is down is made once the window frees (NB46-1c).
 //
 //   node packages/js/test/restart_budget.mjs
-import { WebRtcTransport, MAX_RESTARTS } from '../src/webrtc.js';
+import { WebRtcTransport, MAX_RESTARTS, RESTART_WINDOW_MS } from '../src/webrtc.js';
 
 let failed = 0;
 const ok = (cond, what) => {
@@ -48,7 +56,7 @@ class FakePc extends EventTarget {
   async createOffer() { return { type: 'offer', sdp: sdp(`o${++seq}`) }; }
   async createAnswer() { return { type: 'answer', sdp: sdp(`a${++seq}`) }; }
   async setLocalDescription(d) {
-    this.localDescription = { ...d, toJSON: () => ({ type: d.type, sdp: d.sdp }) };
+    this.localDescription = { ...d, toJSON() { return { type: this.type, sdp: this.sdp }; } };
     this.signalingState = d.type === 'offer' ? 'have-local-offer' : 'stable';
   }
   async setRemoteDescription(d) {
@@ -65,13 +73,38 @@ class FakePc extends EventTarget {
   }
 }
 
+// A server-reflexive candidate.
+const cand = (n) => ({ candidate: `candidate:${n} 1 udp 1 203.0.113.5 ${50000 + n} typ srflx raddr 0.0.0.0 rport 0`, sdpMid: '0',
+  toJSON() { return { candidate: this.candidate, sdpMid: '0' }; } });
+// Gathering that finds `k` candidates a moment after each answer is set (as a browser does
+// once an ICE-restart offer is applied), then completes. `found(c)` adds one to the local
+// description, as a browser does, and hands it to the transport.
+const gathering = (k) => class extends FakePc {
+  async setLocalDescription(d) {
+    await super.setLocalDescription(d);
+    if (d.type !== 'answer') return;
+    setTimeout(() => {
+      for (let i = 0; i < k; i++) this.found(cand(seq * 10 + i));
+      this.onicecandidate?.({ candidate: null });
+    }, 1);
+  }
+  found(c) {
+    this.localDescription = { ...this.localDescription, sdp: `${this.localDescription.sdp}a=${c.candidate}\r\n` };
+    this.onicecandidate?.({ candidate: c });
+  }
+};
+// The candidates a message published to the peer carries, in its description or as 'ice'
+// or 'ice-batch'.
+const carried = (m) => (m.kind === 'ice' ? [m.candidate.candidate] : m.kind === 'ice-batch' ? m.c.map((c) => c.candidate)
+  : (m.sdp?.sdp ?? '').split('\r\n').filter((a) => a.startsWith('a=candidate:')).map((a) => a.slice(2)));
+
 // Our transport; `from(peer, msg)` hands it a signal, `to(peer, kind)` lists what it sent.
-const mk = () => {
+const mk = (trickle = false, Pc = FakePc) => {
   const sent = [];
   const traces = [];
   const sig = { send: (to, msg) => sent.push([to, msg]), onMessage(fn) { this.fn = fn; }, close() {} };
   const ep = { set onTransmit(f) {}, connect() {}, receive() {}, setRelayOnly() {}, isConnected: () => false };
-  const t = new WebRtcTransport(ep, sig, { trickle: false, RTCPeerConnection: FakePc });
+  const t = new WebRtcTransport(ep, sig, { trickle, RTCPeerConnection: Pc });
   t.trace = (peer, what, d) => traces.push({ peer, what, ...d });
   const from = (peer, msg) => sig.fn(peer, msg);
   const to = (peer, kind) => sent.filter(([p, m]) => p === peer && (!kind || m.kind === kind));
@@ -208,6 +241,135 @@ const answered = async (s, peer) => {
   await sleep(20);
   ok(s2.to(PEER, 'restart').length === 1, `ICE 'failed' as the answering side: it asks the peer to restart (${s2.to(PEER, 'restart').length} ask)`);
   s2.t.close();
+}
+
+// 6. Candidates of an answer past the budget wait with it (NB46-1a): a linked peer's 50 new
+// offers, our gathering finding candidates after each answer.
+for (const [trickle, k, kind] of [[true, 3, 'ice'], [false, 1, 'ice-batch']]) {
+  WebRtcTransport.publishEveryMs = 1e9; // no refill while the offers come, however slow the host
+  const s = mk(trickle, gathering(k));
+  await answered(s, PEER);
+  for (let i = 1; i <= 50; i++) {
+    s.from(PEER, offer(`new${i}`, { restart: true }));
+    await sleep(3);
+  }
+  await sleep(50);
+  const [answers, cands] = [s.to(PEER, 'answer').length, s.to(PEER, kind).length];
+  const want = trickle ? k * BURST : BURST;
+  ok(answers === BURST && cands === want, `${trickle ? 'trickle' : 'no trickle'}: a linked peer's first offer and 50 new ones: ${answers} answers and ${cands} '${kind}', want ${BURST} and ${want}`);
+  ok(s.t.badSignals === 0, 'no signal failed');
+  WebRtcTransport.publishEveryMs = EVERY;
+  s.t.close();
+}
+// A held answer released by a copy of its offer once the budget refills: made again with
+// the candidates found meanwhile, none of them sent twice, and those found after it flow.
+for (const trickle of [true, false]) {
+  const how = trickle ? 'trickle' : 'no trickle';
+  WebRtcTransport.publishBurst = 1;
+  const s = mk(trickle, gathering(2));
+  const l = await answered(s, PEER); // spends the one token
+  const n0 = s.to(PEER).length;
+  const o = offer('held', { restart: true });
+  s.from(PEER, o);
+  await sleep(20);
+  ok(l.unsent && s.to(PEER).length === n0, `${how}: an answer past the budget is held, and its 2 candidates with it (${s.to(PEER).length - n0} published)`);
+  WebRtcTransport.publishEveryMs = 10;
+  await sleep(30);
+  s.from(PEER, structuredClone(o));
+  await sleep(5);
+  l.pc.found(cand(999));
+  l.pc.onicecandidate({ candidate: null });
+  await sleep(5);
+  const after = s.to(PEER).slice(n0).map(([, m]) => m);
+  const [answerOut, next] = [after[0] ?? {}, after[1] ?? {}];
+  ok(after.length === 2 && answerOut.kind === 'answer' && carried(answerOut).length === 2 && !l.unsent,
+    `${how}: a copy of its offer once the budget refills releases it, made again with the 2 candidates found meanwhile (${after.map((m) => m.kind)}; ${carried(answerOut).length} in the answer)`);
+  ok(next.kind === (trickle ? 'ice' : 'ice-batch') && carried(next).join() === cand(999).candidate,
+    `${how}: a candidate found after it goes out, alone (${carried(next).length} in its '${next.kind}')`);
+  WebRtcTransport.publishBurst = BURST;
+  WebRtcTransport.publishEveryMs = EVERY;
+  s.t.close();
+}
+
+// 7. A copy of a new offer that comes while it is being answered (NB46-1b): no answer to
+// the last offer, whether that went out or was held for the budget.
+{
+  const s = mk();
+  await answered(s, PEER);
+  const n0 = s.to(PEER, 'answer').length;
+  const last = s.to(PEER, 'answer')[0][1].sdp.sdp;
+  const o2 = offer('second', { restart: true });
+  s.from(PEER, o2);
+  s.from(PEER, structuredClone(o2)); // the dialler's copy, or a relay's duplicate
+  await sleep(20);
+  const after = s.to(PEER, 'answer').slice(n0).map(([, m]) => m.sdp.sdp);
+  ok(after.length === 1 && after[0] !== last, `a copy of a new offer while it is answered, the last answer sent: ${after.length} answers, ${after.filter((a) => a === last).length} to the last offer (want 1 and 0)`);
+  s.t.close();
+}
+{
+  WebRtcTransport.publishBurst = 1;
+  const s = mk();
+  const l = await answered(s, PEER); // spends the one token
+  s.from(PEER, offer('first', { restart: true }));
+  await sleep(10);
+  const last = l.pc.localDescription.sdp; // its answer, held
+  WebRtcTransport.publishEveryMs = 10;
+  await sleep(30);
+  const n0 = s.to(PEER, 'answer').length;
+  const o2 = offer('second', { restart: true });
+  s.from(PEER, o2);
+  s.from(PEER, structuredClone(o2));
+  await sleep(20);
+  const after = s.to(PEER, 'answer').slice(n0).map(([, m]) => m.sdp.sdp);
+  ok(after.length === 1 && after[0] === l.pc.localDescription.sdp && !l.unsent,
+    `a copy of a new offer while it is answered, the last answer held: ${after.length} answers, ${after.filter((a) => a === last).length} to the last offer (want 1 and 0)`);
+  WebRtcTransport.publishBurst = BURST;
+  WebRtcTransport.publishEveryMs = EVERY;
+  s.t.close();
+}
+
+// 8. The restart window slides (NB46-T1): ICE fails as the dialling side, we restart, the
+// peer answers and ICE connects, MAX_RESTARTS + 1 times; then the clock moves on a minute.
+{
+  const realNow = Date.now;
+  const s = mk();
+  const l = await dialled(s);
+  const round = async () => {
+    l.pc.ice('failed');
+    await sleep(10);
+    if (l.pc.signalingState === 'have-local-offer') s.from(PEER, answer(`round${++seq}`));
+    await sleep(5);
+    l.pc.ice('connected');
+  };
+  for (let i = 0; i <= MAX_RESTARTS; i++) await round();
+  ok(s.t.restarts === MAX_RESTARTS, `ICE failing ${MAX_RESTARTS + 1} times in a row: ${s.t.restarts} restarts, want ${MAX_RESTARTS}`);
+  Date.now = () => realNow() + RESTART_WINDOW_MS + 1000;
+  await round();
+  Date.now = realNow;
+  ok(s.t.restarts === MAX_RESTARTS + 1, `${(RESTART_WINDOW_MS + 1000) / 1000} s later, ICE failing again: ${s.t.restarts} restarts, want ${MAX_RESTARTS + 1}`);
+  s.t.close();
+}
+// One refused while ICE is down is made once the window frees, with no other event (NB46-1c).
+{
+  const realNow = Date.now;
+  const s = mk();
+  const l = await dialled(s);
+  for (let i = 0; i < MAX_RESTARTS; i++) {
+    l.pc.ice('failed');
+    await sleep(10);
+    s.from(PEER, answer(`round${++seq}`));
+    await sleep(5);
+    l.pc.ice('connected');
+  }
+  // The clock moves on to 30 ms before the first leaves the window, and ICE fails for good.
+  const skew = l.restartAt[0] + RESTART_WINDOW_MS - 30 - realNow();
+  Date.now = () => realNow() + skew;
+  l.pc.ice('failed');
+  await sleep(150);
+  Date.now = realNow;
+  ok(s.t.restarts === MAX_RESTARTS + 1 && l.pc.signalingState === 'have-local-offer',
+    `ICE failing a ${MAX_RESTARTS + 1}th time, 30 ms before the window frees: ${s.t.restarts} restarts once it does, want ${MAX_RESTARTS + 1}`);
+  s.t.close();
 }
 
 console.log(failed ? `${failed} FAILED` : 'all passed');
