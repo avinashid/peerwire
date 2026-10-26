@@ -184,6 +184,20 @@ function state(doc) {
   return JSON.stringify(out);
 }
 
+// Whether a doc's indexes agree: every entry listed in a collection is held, and the counts and length add up.
+function whole(doc, what) {
+  let n = 0;
+  let len = 0;
+  for (const coll of doc.colls.values()) {
+    for (const e of coll.t === 'm' ? [...coll.keys.values()].flat() : coll.items.values()) {
+      n++;
+      len += e.len;
+      if (doc.entries.get(e.id) !== e || doc.byWriter.get(e.w)?.get(e.n) !== e) fail(`${what}: ${e.id} is listed but not held`);
+    }
+  }
+  if (n !== doc.entries.size || len !== doc.length) fail(`${what}: ${doc.entries.size} entries held and ${n} listed; length ${doc.length}, listed ${len}`);
+}
+
 function same(nodes, what) {
   const s = nodes.map((n) => state(n.doc));
   for (let i = 1; i < s.length; i++) {
@@ -759,6 +773,48 @@ for (const via of ['delta', 'answer', 'ask']) {
   same([a, b, m], `claims via ${via}`);
 }
 console.log('claims on our future dots: the doc moves to a new incarnation and its writes reach everyone');
+
+// Past the incarnation cap: a member claims a's next dots until a has moved on 16 times, then sends an entry on
+// a's next dot. a never holds it (it isn't a's), writes after it, and its writes keep the doc whole and don't
+// throw. With every dot claimed, its writes return false or null with a warning.
+{
+  const net = new Net(15);
+  const [a, b, m] = ['a', 'b', 'f'].map((x) => net.node(x));
+  net.mesh([a, b, m]);
+  net.run();
+  for (let i = 0; i < 20; i++) a.doc.receive(m.self, { d: 'board', t: 2, ws: [a.doc.writer], r: [[0, 1, a.doc.n + 5]] });
+  if (a.doc.incarnations !== 16) fail(`20 claims moved a ${a.doc.incarnations} times`);
+  net.run();
+  const w = a.doc.writer;
+  const next = a.doc.n + 1;
+  // Sent to b as well, which takes it for a's: a tells b it is dead.
+  const forged = { d: 'board', t: 3, ws: [w], e: [[0, next, a.doc.clock + 1, 's', 'x', null, 'forged']] };
+  for (const p of [b, a]) p.doc.receive(m.self, forged);
+  net.run();
+  if (a.doc.entries.has(`${w}.${next}`) || a.doc.set('x').entries().length) fail('a holds an entry on its own next dot that it did not write');
+  if (b.doc.entries.has(`${w}.${next}`)) fail("b kept an entry forged on a's next dot");
+  const strokes = a.doc.set('s');
+  const sid = strokes.add({ stroke: 1 });
+  if (sid === `${w}.${next}`) fail('a wrote on a dot it had seen');
+  a.doc.map('x').set('k', 'mine');
+  a.doc.map('x').delete('k');
+  strokes.delete(sid);
+  whole(a.doc, 'writes after an entry forged on our next dot');
+  if (strokes.entries().length || a.doc.entries.size) fail(`a holds ${a.doc.entries.size} entries after deleting its own`);
+  // Every dot claimed, in an answer's dead ranges.
+  a.doc.receive(m.self, { d: 'board', t: 3, ws: [w], x: [[0, 1, Number.MAX_SAFE_INTEGER]] });
+  const warn = console.warn;
+  let warned = 0;
+  console.warn = () => warned++;
+  try {
+    const got = [strokes.add(1), a.doc.map('x').set('k', 1), a.doc.log('l', { keep: KEEP }).append(1)];
+    if (got.join() !== ',false,' || warned !== 3) fail(`with every dot claimed, writes gave ${JSON.stringify(got)} and ${warned} warnings`);
+  } finally {
+    console.warn = warn;
+  }
+  whole(a.doc, 'every dot claimed');
+}
+console.log('claims past the 16 incarnations: an entry on our next dot is never held, writes skip claimed dots, and with none left warn');
 
 // A full context makes room: a member's claims for 2000 writers that hold nothing don't stop a new writer.
 {

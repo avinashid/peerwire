@@ -38,7 +38,10 @@
 // stamps to 2^53 - 1 in one frame; from then on, values set at the same time, and set items and log entries,
 // are ordered by writer, and a log keeps the highest writers' entries. A later set still wins, as it replaces
 // what it has seen. A member could claim dots another member hasn't written yet, so that the room ignores its
-// next writes: a doc that sees such a claim on its own dots moves to a new incarnation.
+// next writes: a doc that sees such a claim on its own dots moves to a new incarnation, at most
+// MAX_INCARNATIONS times. Past that it writes after the dots it knows are claimed; a write on a dot claimed
+// where it hasn't heard is lost at the members that took the claim, and once every dot is claimed, writes are
+// refused with a warning until the doc is opened again.
 
 export const MAX_NAME_LENGTH = 128; // a doc's or a collection's name, in UTF-16 code units
 export const MAX_KEY_LENGTH = 256; // a map key
@@ -187,6 +190,14 @@ class Context {
     if (!l) return;
     this.size -= l.length;
     this.writers.delete(w);
+  }
+
+  // The first of w's dots from n on that hasn't been seen.
+  next(w, n) {
+    const l = this.writers.get(w);
+    if (!l) return n;
+    const i = seek(l, n);
+    return i < l.length && l[i][0] <= n ? l[i][1] + 1 : n;
   }
 
   // A context of `ranges` ([w, a, b] in any order), added in order so each lands at the end of its writer's.
@@ -426,17 +437,24 @@ export class Doc {
 
   // Whether an entry of `cost` fits in place of `old`. A doc that members filled refuses our write with a
   // warning, as every member refuses one that doesn't fit, so member data can't make the app's writes throw.
+  // So does one with no dot left to write on: members claimed them all, and the doc has moved on as often as
+  // it may (MAX_INCARNATIONS).
   fits(cost, old) {
     const entries = this.entries.size - old.length + 1;
     const length = this.length - old.reduce((s, o) => s + o.len, 0) + cost;
+    if (this.ctx.next(this.writer, this.n + 1) > MAX_STAMP) {
+      console.warn(`@peerwire/js: doc ${JSON.stringify(this.name)}: members claimed every write of ours; the write was dropped (close the doc and open it again)`);
+      return false;
+    }
     if (entries <= MAX_ENTRIES && length <= MAX_DOC_LENGTH) return true;
     console.warn(`@peerwire/js: doc ${JSON.stringify(this.name)} is full (${MAX_ENTRIES} entries or ${MAX_DOC_LENGTH} characters as JSON); the write was dropped`);
     return false;
   }
 
-  // A new entry of ours, held and counted in our context.
+  // A new entry of ours, held and counted in our context, on the next dot we haven't seen: a member may have
+  // claimed some (see put).
   mint(t, name, k, v, len) {
-    const n = ++this.n;
+    const n = (this.n = this.ctx.next(this.writer, this.n + 1));
     const c = this.clock < MAX_STAMP ? ++this.clock : MAX_STAMP;
     this.ctx.add(this.writer, n, n);
     const e = { id: `${this.writer}.${n}`, w: this.writer, n, c, t, coll: name, k, v, len };
@@ -468,8 +486,15 @@ export class Doc {
       if (sender) this.unheard = true;
       return;
     }
+    // An entry on our own writer that we didn't write (a member claiming our next dot): never held, as our
+    // write would then take its id. Its dot counts as seen and dead, so our answers kill it where it went.
+    if (x.w === this.writer) {
+      this.claimed = true;
+      this.record(x.w, x.n, x.n);
+      this.dropped?.push([x.w, x.n, x.n]);
+      return;
+    }
     if (this.entries.size >= MAX_ENTRIES || this.length + x.len > MAX_DOC_LENGTH) return;
-    if (x.w === this.writer && x.n > this.n) this.claimed = true;
     if (!this.record(x.w, x.n, x.n)) return;
     if (x.c > this.clock) this.clock = x.c;
     const e = { id, w: x.w, n: x.n, c: x.c, t: x.t, coll: x.coll, k: x.k, v: x.v, len: x.len };

@@ -178,6 +178,10 @@ doc.close();                                     // room.leave() closes the room
 - **Member data:**
   - Members are trusted alike, as in the room itself: any member can overwrite, delete or fill a doc.
   - What a member sends is checked and capped before it reaches you. A malformed frame is dropped whole.
+  - A member can make the room ignore another member's writes, by claiming it has seen them before they are
+    written. A doc that hears such a claim on its own writes moves on to new ones, 16 times; past that, its writes
+    are lost at the members that took a claim, and once every write is claimed they return false or null with a
+    warning, until the doc is closed and opened again.
   - Every member takes a Lamport stamp however far ahead, as refusing one would split the room. So a member can
     move the stamps to 2^53 - 1 at once; from then on, values set at the same time, and set items and log
     entries, are ordered by writer, and a log keeps the highest writers' entries. A later set still wins.
@@ -514,7 +518,8 @@ Run these with Node and the Playwright install on this host:
   - a doc closed and opened 12 times while a member stays catches up every time;
   - Lamport stamps moved far ahead (by 2^32 four times, or to 2^53 - 1): a member cut off meanwhile and one that
     joins after still converge, and so do a member's writes after a jump sent to it alone;
-  - claims on a member's future writes.
+  - claims on a member's future writes, also past its 16 moves: an entry forged on its next write is never held
+    and the doc stays whole, and with every write claimed its writes warn and return false or null.
 - `node packages/js/test/room_doc.mjs`: `room.doc()` with three members in a real `'local'` room: they converge, a
   doc opened late and a fourth member catch up, doc frames never show as messages, writes outlive their writer,
   and leaving closes docs.
