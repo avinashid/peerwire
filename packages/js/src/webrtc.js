@@ -33,12 +33,15 @@ export const RTC_SAME_NAT_FALLBACK_MS = 3000;
 // Pipes: datagrams are batched for PIPE_FLUSH_MS into one signalling message of at
 // most PIPE_BATCH bytes. All pipes together send PIPE_RATE messages a second (burst
 // PIPE_BURST), within what public relays allow one client, and batch more while they
-// wait; past PIPE_QUEUE bytes waiting on a pipe, the oldest is dropped.
+// wait; past PIPE_QUEUE bytes waiting on a pipe, the oldest is dropped. close() sends
+// what waits as one last batch per pipe, past the budget, for at most PIPE_CLOSE_BATCHES
+// pipes, those that queued last first.
 export const PIPE_FLUSH_MS = 40;
 export const PIPE_BATCH = 16 * 1024;
 export const PIPE_RATE = 3;
 export const PIPE_BURST = 6;
 export const PIPE_QUEUE = 64 * 1024;
+export const PIPE_CLOSE_BATCHES = 16;
 const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
 export const MAX_PIPE_PEERS = 256; // peers allowed to open a pipe to us
 // Without trickle, an offer or answer goes once ICE gathering is complete, or
@@ -239,6 +242,7 @@ export class WebRtcTransport {
     this.pipeAllowed = new Set(); // peers whose datagrams over signalling we take
     this.pipeTokens = PIPE_BURST; // the rate budget all pipes share
     this.pipeRefilled = Date.now();
+    this.pipeQueued = 0; // datagrams queued on pipes so far; a pipe's `queued`: the count at its latest
     // Batches sent; datagrams received, dropped (queue full), and stale (from a peer whose
     // own DataChannel carries its datagrams now: sent before it opened).
     this.piped = { sent: 0, received: 0, dropped: 0, stale: 0 };
@@ -765,7 +769,7 @@ export class WebRtcTransport {
     let h = this.pipeByPeer.get(peer);
     if (h !== undefined) return h;
     h = this.nextHandle++;
-    this.pipes.set(h, { peer, handle: h, q: [], bytes: 0, timer: null });
+    this.pipes.set(h, { peer, handle: h, q: [], bytes: 0, timer: null, queued: 0 });
     this.pipeByPeer.set(peer, h);
     return h;
   }
@@ -773,6 +777,7 @@ export class WebRtcTransport {
   pipeSend(p, bytes) {
     p.q.push([b64(bytes), bytes.length]);
     p.bytes += bytes.length;
+    p.queued = ++this.pipeQueued;
     // Like a full UDP buffer: drop the oldest and let congestion control back off.
     while (p.bytes > PIPE_QUEUE && p.q.length > 1) {
       p.bytes -= p.q.shift()[1];
@@ -971,10 +976,13 @@ export class WebRtcTransport {
   close() {
     // What waits in a pipe goes now, before the channels close: a leaving room's Bye and
     // the core's sealed close sit there for PIPE_FLUSH_MS, and lost, the peer would see
-    // us go only at its idle timeout.
-    for (const p of this.pipes.values()) {
+    // us go only at its idle timeout. At most PIPE_CLOSE_BATCHES over signalling, from the
+    // pipes that queued last (PBF-1), so many busy pipes can't burst the relays as we go;
+    // the peers of the rest see us go at their timeout, as before.
+    const sent = this.piped.sent;
+    for (const p of [...this.pipes.values()].sort((x, y) => y.queued - x.queued)) {
       clearTimeout(p.timer);
-      this.pipeFlush(p, true);
+      if (this.piped.sent - sent < PIPE_CLOSE_BATCHES) this.pipeFlush(p, true);
     }
     this.checking.clear();
     this.retryTaken.clear();
