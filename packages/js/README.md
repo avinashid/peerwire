@@ -270,17 +270,18 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
      addresses (a laptop on a phone's hotspot) gets `sameNatFallbackMs` (3 s) instead.
      Browsers find no direct path there unless they show their LAN addresses: mDNS hides
      them, and Android Chrome lists only its mobile-data interface. Waiting the full 8 s
-     rarely helps, so such a pair links over signalling about 4 s after hearing each
-     other, not 9 s. Strangers behind one carrier NAT match too, and seldom link direct
-     either. The transport traces `same-nat`.
-3. **Over the signalling relays.** If no member has answered within 1 s, Peerwire
-   datagrams also go as signalling messages (a *pipe*). On Nostr each batch is sealed
-   to the peer again (`'signaling'`). This works wherever the relays are reachable.
-   It is slow, though: a relay round trip per batch, 40 ms batching, and at most 3
-   batches a second for all of a client's pipes together. That is within what public
-   relays allow one client. A relay that refuses events for its rate limit gets none
-   for 30 s, doubling up to 10 min. The pause starts over at 30 s once the relay has
-   gone 10 min without refusing.
+     rarely helps, so such a pair links over signalling about 3 to 4 s after hearing
+     each other (the handshake crosses the relays), not 9 s. Strangers behind one
+     carrier NAT match too, and seldom link direct either. The transport traces
+     `same-nat`.
+3. **Over the signalling relays.** If no member has answered within 1 s, or at once
+   when there is no other member to ask, Peerwire datagrams also go as signalling
+   messages (a *pipe*). On Nostr each batch is sealed to the peer again
+   (`'signaling'`). This works wherever the relays are reachable. It is slow, though: a
+   relay round trip per batch, 40 ms batching, and at most 3 batches a second for all
+   of a client's pipes together. That is within what public relays allow one client. A
+   relay that refuses events for its rate limit gets none for 30 s, doubling up to 10
+   min. The pause starts over at 30 s once the relay has gone 10 min without refusing.
 
 The core keeps the first path that completes the handshake, and the room's proofs,
 presence and messages run unchanged on it. A pipe opens only for a peer whose hello
