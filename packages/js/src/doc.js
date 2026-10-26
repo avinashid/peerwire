@@ -29,8 +29,9 @@
 // and a member relaying a catch-up can claim any writer, so `from` is as good as the member that told us.
 // What the doc defends is each member's app and resources. Frames are checked field by field and dropped
 // whole if anything is off; state lives in Maps; names, keys, values, entries, characters, writers and context
-// ranges are capped, and the asks and answers each member gets are a rate (CATCHUP_BURST at once, then one per
-// CATCHUP_EVERY_MS), so a member can have us send it the whole doc at most that often. A Lamport stamp may run
+// ranges are capped, and so is what a member can have us send it to catch up: answers and asks at a rate
+// (CATCHUP_BURST at once, then one per CATCHUP_EVERY_MS), and what answers carry, CATCHUP_CHARS at once, then
+// CATCHUP_CHARS_PER_S, as an asker can always claim to lack the whole doc. A Lamport stamp may run
 // at most MAX_CLOCK_STEP ahead of ours per frame. A member could claim dots another member hasn't written yet,
 // so that the room ignores its next writes: a doc that sees such a claim on its own dots moves to a new
 // incarnation.
@@ -47,10 +48,20 @@ export const DEFAULT_KEEP = 1000; // entries a log keeps unless doc.log() says o
 export const MAX_CLOCK_STEP = 2 ** 32; // how far a frame's stamps may run ahead of our clock
 export const MESSAGE_BYTES = 512 * 1024; // the most a doc frame takes as UTF-8, half room.send's 1 MiB
 // Catching up with a member: the answers it gets and the asks we send it each come from a budget of
-// CATCHUP_BURST that refills one per CATCHUP_EVERY_MS. One over the budget waits for it rather than being
-// dropped, so a doc closed and opened again (a component that remounts) catches up every time.
+// CATCHUP_BURST that refills one per CATCHUP_EVERY_MS, and what our answers carry, as JSON text, from one of
+// CATCHUP_CHARS (two full docs) that refills CATCHUP_CHARS_PER_S. An answer or ask past a budget waits for it
+// rather than being dropped, so a doc closed and opened again (a component that remounts) catches up every
+// time, and an asker can't have us send more, whatever it claims to lack.
 const CATCHUP_BURST = 8;
 const CATCHUP_EVERY_MS = 15000;
+const CATCHUP_CHARS = 2 * MAX_DOC_LENGTH;
+const CATCHUP_CHARS_PER_S = 64 * 1024;
+// Each budget: [burst, ms one unit takes to refill].
+const BUDGETS = {
+  answers: [CATCHUP_BURST, CATCHUP_EVERY_MS],
+  asks: [CATCHUP_BURST, CATCHUP_EVERY_MS],
+  chars: [CATCHUP_CHARS, 1000 / CATCHUP_CHARS_PER_S],
+};
 // How long an answer may take before the next member is asked.
 const ASK_WAIT_MS = 5000;
 // Incarnations a doc moves through when members claim its future dots.
@@ -175,6 +186,14 @@ class Context {
     this.writers.delete(w);
   }
 
+  // A context of `ranges` ([w, a, b] in any order), added in order so each lands at the end of its writer's.
+  static of(ranges) {
+    const c = new Context();
+    const sorted = [...ranges].sort(([v, a], [w, b]) => (v < w ? -1 : v > w ? 1 : a - b));
+    for (const [w, a, b] of sorted) c.add(w, a, b);
+    return c;
+  }
+
   // Drops w's highest range.
   dropLast(w) {
     const l = this.writers.get(w);
@@ -203,10 +222,7 @@ function parseFrame(m, peer) {
       ranges.push([w, r[1], r[2]]);
     }
   }
-  if (t === ASK) {
-    if (typeof m.i !== 'string' || !WRITER.test(m.i) || peerOf(m.i) !== peer) return null;
-    return { t, ranges, inc: m.i };
-  }
+  if (t === ASK) return { t, ranges };
   const entries = [];
   if (m.e !== undefined) {
     if (!Array.isArray(m.e) || m.e.length > FRAME_ITEMS) return null;
@@ -246,7 +262,7 @@ export class Doc {
     this.newIncarnation();
     this.handlers = new Set();
     this.touched = new Map(); // changes during one frame or write: ref -> { coll, ref, before }
-    this.members = new Map(); // peer -> { answers, asks, sent, inc, theirs, askLater, wait }
+    this.members = new Map(); // peer -> { answers, asks, chars, theirs, answerWait, askWait }
     this.queue = []; // members to ask, in turn
     this.asking = null; // the member asked, until its answer ends or ASK_WAIT_MS passes
     this.cancelWait = null;
@@ -302,7 +318,10 @@ export class Doc {
     this.entries.clear();
     this.byWriter.clear();
     this.colls.clear();
-    for (const st of this.members.values()) st.wait?.();
+    for (const st of this.members.values()) {
+      st.answerWait?.();
+      st.askWait?.();
+    }
     this.members.clear();
     this.host.closed?.(this);
   }
@@ -319,7 +338,9 @@ export class Doc {
   }
 
   left(peer) {
-    this.members.get(peer)?.wait?.();
+    const st = this.members.get(peer);
+    st?.answerWait?.();
+    st?.askWait?.();
     this.members.delete(peer);
     this.queue = this.queue.filter((p) => p !== peer);
     if (this.asking === peer) this.nextAsk(true);
@@ -674,11 +695,11 @@ export class Doc {
     return frames;
   }
 
-  // A member's catch-up: when its budgets of answers and of asks are whole again, the entries sent to its
-  // incarnation `inc`, its ask waiting for an answer (`theirs`), whether our ask of it waits, and the wait.
+  // A member's catch-up: when each of its budgets (BUDGETS) is whole again, its latest ask (`theirs`) and the
+  // wait for its answer, and the wait for our ask of it.
   member(peer) {
     let st = this.members.get(peer);
-    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, sent: new Set(), inc: null, theirs: null, askLater: false, wait: null }));
+    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, chars: 0, theirs: null, answerWait: null, askWait: null }));
     return st;
   }
 
@@ -686,30 +707,24 @@ export class Doc {
     return this.host.now?.() ?? performance.now();
   }
 
-  // Takes one from the member's budget `kind` ('answers' or 'asks'): CATCHUP_BURST that refill one per
-  // CATCHUP_EVERY_MS, kept as the time the budget is whole again, so nothing accumulates rounding. When it is
-  // empty, returns false and has retry() run once one is back.
-  take(peer, st, kind) {
-    const now = this.now();
-    const whole = Math.max(st[kind], now);
-    const early = whole - (CATCHUP_BURST - 1) * CATCHUP_EVERY_MS - now;
-    if (early <= 0) {
-      st[kind] = whole + CATCHUP_EVERY_MS;
-      return true;
-    }
-    st.wait ??= this.host.after(Math.ceil(early), () => this.retry(peer, st));
-    return false;
+  // How long until the member's budget `kind` has one unit to spend; at most 0 if it has now. A budget is kept
+  // as the time it is whole again, so nothing accumulates rounding.
+  early(st, kind, now) {
+    const [burst, every] = BUDGETS[kind];
+    return Math.max(st[kind], now) - now - (burst - 1) * every;
   }
 
-  // What waited for a member's budgets: its latest ask, and ours (unless one is under way or queued by now).
-  retry(peer, st) {
-    st.wait = null;
-    if (this.closed || this.members.get(peer) !== st) return;
-    if (st.theirs) this.answer(peer, st);
-    if (st.askLater) {
-      st.askLater = false;
-      this.startAsk(peer);
-    }
+  // Spends `n` units of it. An answer's characters may take it past empty: the next answer waits until it's back.
+  spend(st, kind, n, now) {
+    st[kind] = Math.max(st[kind], now) + n * BUDGETS[kind][1];
+  }
+
+  // Runs `fn` in `ms` if the member stays; `wait` ('answerWait' or 'askWait') holds it, one of each at a time.
+  later(peer, st, wait, ms, fn) {
+    st[wait] ??= this.host.after(Math.ceil(ms), () => {
+      st[wait] = null;
+      if (!this.closed && this.members.get(peer) === st) fn();
+    });
   }
 
   // Catching up.
@@ -717,8 +732,10 @@ export class Doc {
   startAsk(peer) {
     const st = this.member(peer);
     if (this.asking === peer || this.queue.includes(peer)) return;
-    st.askLater = !this.take(peer, st, 'asks');
-    if (st.askLater) return;
+    const now = this.now();
+    const wait = this.early(st, 'asks', now);
+    if (wait > 0) return this.later(peer, st, 'askWait', wait, () => this.startAsk(peer));
+    this.spend(st, 'asks', 1, now);
     this.queue.push(peer);
     if (!this.asking) this.nextAsk(false);
   }
@@ -758,43 +775,41 @@ export class Doc {
         bytes += RANGE_BYTES;
       }
     }
-    return { d: this.name, t: ASK, ws, r, i: this.writer };
+    return { d: this.name, t: ASK, ws, r };
   }
 
   onAsk(peer, f) {
-    const theirs = new Context();
-    let claimed = false;
-    for (const [w, a, b] of f.ranges) {
-      theirs.add(w, a, b);
-      if (w === this.writer && b > this.n) claimed = true;
-    }
-    if (claimed) this.newIncarnation();
+    if (f.ranges.some(([w, , b]) => w === this.writer && b > this.n)) this.newIncarnation();
     const st = this.member(peer);
-    // A new incarnation of theirs (the doc opened again) holds none of what we sent the old one.
-    if (st.inc !== f.inc) {
-      st.sent.clear();
-      st.inc = f.inc;
-    }
-    // Answered now or, past the member's budget, when it allows: only the latest ask waits.
-    st.theirs = theirs;
+    // Answered now or, past the member's budgets, once they allow: only its latest ask waits.
+    st.theirs = Context.of(f.ranges);
     this.answer(peer, st);
     // It has seen dots we haven't: ask it back.
     if (f.ranges.some(([w, a, b]) => !this.ctx.covers(w, a, b))) this.startAsk(peer);
   }
 
-  // The entries the member's ask lacks that we haven't sent it, and every dot we know is dead.
+  // The entries the member's ask lacks, and every dot we know is dead, if its budgets allow. A wait may find
+  // its ask answered already, when a later one came as the budget did.
   answer(peer, st) {
-    if (!this.take(peer, st, 'answers')) return;
+    if (!st.theirs) return;
+    const now = this.now();
+    const wait = Math.max(this.early(st, 'answers', now), this.early(st, 'chars', now));
+    if (wait > 0) return this.later(peer, st, 'answerWait', wait, () => this.answer(peer, st));
+    st.answerWait?.();
+    st.answerWait = null;
     const theirs = st.theirs;
     st.theirs = null;
-    for (const id of st.sent) if (!this.entries.has(id)) st.sent.delete(id);
     const entries = [];
+    let chars = 0;
     for (const e of this.entries.values()) {
-      if (theirs.has(e.w, e.n) || st.sent.has(e.id)) continue;
+      if (theirs.has(e.w, e.n)) continue;
       entries.push(e);
-      st.sent.add(e.id);
+      chars += ENTRY_BYTES + e.len;
     }
-    for (const f of this.pack(ANSWER, entries, this.dead(), true)) this.host.send(peer, f);
+    const dead = this.dead();
+    this.spend(st, 'answers', 1, now);
+    this.spend(st, 'chars', chars + RANGE_BYTES * dead.length, now);
+    for (const f of this.pack(ANSWER, entries, dead, true)) this.host.send(peer, f);
   }
 
   // The dots we have seen and don't hold, as ranges.

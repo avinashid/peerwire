@@ -513,11 +513,11 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
     E(0, F, 1, 'q', 's', null, 1), E(0, F, 1, '__proto__', 's', null, 1), E(0, F, 1, 's', '', null, 1), E(0, F, 1, 's', 's', 'key', 1),
     E(0, F, 1, 'm', 's', null, 1), E(0, F, 1, 'm', 's', 'k'.repeat(MAX_KEY_LENGTH + 1), 1), E(0, F, 1, 's', 's', null, 'x'.repeat(MAX_VALUE_LENGTH)),
     E(0, F, 1, 's', 's', null), { ...good, e: {} }, { ...good, x: [[0, 5, 4]] }, { ...good, x: [[0, 0, 4]] }, { ...good, x: [[0, 1]] },
-    { ...good, end: true }, { d: 'board', t: 2, ws: [w], r: [[0, 1, 1]] }, { d: 'board', t: 2, ws: [w], r: [[0, 1, 1]], i: b.doc.writer },
+    { ...good, end: true }, { d: 'board', t: 2, ws: [w], r: [[0, 2, 1]] }, { d: 'board', t: 2, ws: [w], r: [[1, 1, 1]] },
     { ...good, t: 1, ws: [id('c') + '00000000'] }, // a delta carrying another member's write
     E(0, F, 1, 's', 's', null, JSON.parse('['.repeat(MAX_VALUE_DEPTH + 1) + ']'.repeat(MAX_VALUE_DEPTH + 1))),
   ];
-  // Nor does one make b send anything: an ask without a valid incarnation of its sender's is not answered.
+  // Nor does one make b send anything: a malformed ask is not answered.
   let sent = 0;
   const bsend = b.host.send;
   b.host.send = () => sent++;
@@ -561,8 +561,8 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
 }
 console.log('member data: malformed frames dropped whole without a throw; 20000 mutated frames never threw');
 
-// A member that asks over and over is answered 8 times at once, then once per 15 s, each entry once to each
-// incarnation of its doc. An ask past the budget waits for it, and only the latest one waits.
+// A member that asks over and over is answered 8 times at once, then once per 15 s, each time with all it
+// lacks. An ask past the budget waits for it, and only the latest one waits.
 {
   const net = new Net(8);
   const [a, b] = ['a', 'b'].map((x) => net.node(x));
@@ -574,14 +574,15 @@ console.log('member data: malformed frames dropped whole without a throw; 20000 
   b.host.send = (to, m) => (m.t === 3 ? answers : asks).push(m);
   const ends = () => answers.filter((m) => m.end).length;
   const entries = () => answers.reduce((s, m) => s + (m.e?.length ?? 0), 0);
-  const ask = (r = []) => b.doc.receive(a.self, { d: 'board', t: 2, ws: [a.doc.writer], r, i: a.doc.writer });
+  const ask = (r = []) => b.doc.receive(a.self, { d: 'board', t: 2, ws: [a.doc.writer], r });
+  const size = b.doc.entries.size;
   b.doc.left(a.self); // as if a joined again: the ask from its first join counted
   for (let i = 0; i < 50; i++) ask();
-  if (ends() !== 8 || entries() !== b.doc.entries.size) fail(`50 asks got ${ends()} answers carrying ${entries()} entries for ${b.doc.entries.size}`);
+  if (ends() !== 8 || entries() !== 8 * size) fail(`50 asks got ${ends()} answers carrying ${entries()} entries for ${size}`);
   net.wait(14999);
   if (ends() !== 8) fail(`an answer past the budget went after ${net.now} ms`);
   net.wait(60000);
-  if (ends() !== 9 || entries() !== b.doc.entries.size) fail(`the ask that waited got ${ends() - 8} answers carrying ${entries()} entries`);
+  if (ends() !== 9 || entries() !== 9 * size) fail(`the ask that waited got ${ends() - 8} answers carrying ${entries() - 8 * size} entries`);
   // An hour idle refills the budget to 8, not more.
   net.wait(3600e3);
   answers = [];
@@ -594,6 +595,15 @@ console.log('member data: malformed frames dropped whole without a throw; 20000 
     net.wait(1000);
   }
   if (ends() !== 4) fail(`an ask a second for 60 s got ${ends()} answers`);
+  // An ask answered at once while an earlier one waits, the budget being back before the wait ran: the wait
+  // finds nothing left to answer, and neither throws nor answers twice.
+  b.doc.left(a.self);
+  answers = [];
+  for (let i = 0; i < 9; i++) ask();
+  net.now += 15000;
+  ask();
+  net.wait(60000);
+  if (ends() !== 9) fail(`10 asks, the last as the budget came back, got ${ends()} answers`);
   // Our asks of a member have the same budget: 12 asks of ours due at once, as a's asks show dots we lack, send
   // 8 and the rest wait, then go one at a time.
   b.doc.left(a.self);
@@ -607,10 +617,45 @@ console.log('member data: malformed frames dropped whole without a throw; 20000 
   // Leaving and joining again starts afresh.
   answers = [];
   b.doc.left(a.self);
-  b.doc.receive(a.self, { d: 'board', t: 2, ws: [], r: [], i: a.doc.writer });
-  if (entries() !== b.doc.entries.size) fail('a member that joined again was not answered afresh');
+  b.doc.receive(a.self, { d: 'board', t: 2, ws: [], r: [] });
+  if (entries() !== size) fail('a member that joined again was not answered afresh');
 }
-console.log('answers: 8 per member at once, then one per 15 s; an ask past that waits; each entry once per incarnation');
+console.log('answers: 8 per member at once, then one per 15 s, each with all the member lacks; an ask past that waits');
+
+// What answers carry is bounded as well, whatever the asker claims to lack: 8 Mi characters of JSON text at
+// once (two full docs), then 64 Ki a second. A member asks with an empty context every second for a minute, of
+// a doc of 2 Mi characters: it is sent the doc at once 5 times (the last takes the budget past empty), then
+// about once every 32 s.
+{
+  const CHARS = 8 * 2 ** 20;
+  const CHARS_PER_S = 64 * 1024;
+  const net = new Net(14);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x));
+  net.mesh([a, b]);
+  for (let i = 0; i < 32; i++) b.doc.set('s').add('x'.repeat(MAX_VALUE_LENGTH - 2));
+  net.run();
+  let chars = 0;
+  let answer = 0;
+  let largest = 0;
+  const times = [];
+  b.host.send = (to, m) => {
+    if (m.t !== 3) return;
+    answer += JSON.stringify(m).length;
+    if (!m.end) return;
+    times.push(net.now);
+    chars += answer;
+    largest = Math.max(largest, answer);
+    answer = 0;
+  };
+  b.doc.left(a.self);
+  for (let i = 0; i < 60; i++) {
+    b.doc.receive(a.self, { d: 'board', t: 2, ws: [], r: [] });
+    net.wait(1000);
+  }
+  const bound = CHARS + 60 * CHARS_PER_S + largest;
+  if (chars > bound || times.slice(0, 5).join() !== '0,1000,2000,3000,4000' || times.length !== 6) fail(`an asker of a ${b.doc.length}-character doc was sent ${chars} characters in 60 s (bound ${bound}), answers at ${times.join(', ')} ms`);
+  console.log(`answers: a ${b.doc.length}-character doc asked for every second, sent ${times.length} times in 60 s (at ${times.join(', ')} ms), ${chars} characters of at most ${bound}`);
+}
 
 // A member that closes the doc and opens it again, over and over, while it stays (a component that remounts, a
 // page switching views) catches up every time: 7 times at once (its first ask, from the join, counted), then
@@ -662,7 +707,7 @@ for (const via of ['delta', 'answer', 'ask']) {
   const claim = { d: 'board', ws: [w], x: [[0, a.doc.n + 1, a.doc.n + 1000]] };
   if (via === 'delta') b.doc.receive(m.self, { ...claim, t: 1 });
   else if (via === 'answer') b.doc.receive(m.self, { ...claim, t: 3 });
-  else a.doc.receive(m.self, { d: 'board', t: 2, ws: [w], r: [[0, 1, a.doc.n + 1000]], i: m.doc.writer });
+  else a.doc.receive(m.self, { d: 'board', t: 2, ws: [w], r: [[0, 1, a.doc.n + 1000]] });
   // A claim that reaches a itself moves it at once, before it writes.
   if (via !== 'ask') {
     const c = net.node('c');
