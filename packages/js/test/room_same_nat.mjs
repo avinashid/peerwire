@@ -12,7 +12,9 @@
 //    whose DataChannel then opens: both routes go direct and stay there while the
 //    pipe's late batches arrive, and data goes over the channel, none over the pipe;
 // 6. three members on one NAT, a|b relayed by c, then a|b's DataChannel opens: direct;
-// 7. a same-NAT pair whose DataChannel opens at once (a LAN): direct, nothing fails.
+// 7. a same-NAT pair whose DataChannel opens at once (a LAN): direct, nothing fails;
+// 8. a|b linked over signalling, then a|c's DataChannel opens and delivers: a still takes
+//    b's pipe datagrams (only b's own open channel makes them stale).
 //
 //   node packages/js/test/room_same_nat.mjs
 import { joinRoom } from '../src/index.js';
@@ -252,6 +254,34 @@ async function quick() {
   return '7: same NAT, the DataChannel opened at once: direct, and nothing failed after 3 s';
 }
 
+// 8: a third member's open, heard channel doesn't make another peer's pipe stale.
+async function scope() {
+  const id = `stale-scope-${process.pid}`;
+  const mk = (name) => joinRoom({
+    appId: 'peerwire-test', roomId: id, presence: { name },
+    signaling: gated(Promise.resolve(), 300), RTCPeerConnection: fakePc(name, NAT),
+  });
+  const [x, y] = await Promise.all([mk('s1'), mk('s2')]);
+  await until('8: s1|s2 over signalling', () => x.route(y.self)?.kind === 'signaling' && y.route(x.self)?.kind === 'signaling', 30000);
+  const opened = pairWhenReady('s1', 's3');
+  const z = await mk('s3');
+  await opened;
+  await until('8: s1|s3 direct', () => x.route(z.self)?.kind === 'direct', 30000);
+  await until('8: s1 heard s3 over its channel', () => x.transport.links.get(x.transport.byPeer.get(z.self))?.heard, 5000);
+  const got = [];
+  x.on('message', (m, from) => from === y.self && got.push(m));
+  const staleBefore = x.transport.piped.stale;
+  const ticker = setInterval(() => y.send('tick', { to: x.self }), 50);
+  await sleep(2000);
+  clearInterval(ticker);
+  // The pipe holds batches 300 ms; on a loaded host give the last ones longer to land.
+  for (const end = Date.now() + 8000; got.length < 5 && Date.now() < end;) await sleep(50);
+  const r = { got: got.length, stale: x.transport.piped.stale - staleBefore, route: x.route(y.self)?.kind };
+  await Promise.all([x.leave(), y.leave(), z.leave()]);
+  if (r.stale || r.got < 5 || r.route !== 'signaling') fail(`8: s2's pipe to s1 cut while s1|s3 is direct: ${JSON.stringify(r)}`);
+  return `8: s1|s3 direct and heard, s1|s2 piped: ${r.got} messages from s2, 0 stale`;
+}
+
 const results = await Promise.all([
   timing('1: same public IPv4 in both descriptions', ['a1', NAT], ['a2', NAT], {}, true),
   timing("2: the answerer's srflx trickles 1 s late", ['b1', NAT, { lateAnswer: 1000 }], ['b2', NAT, { lateAnswer: 1000 }], { gate: false }, true),
@@ -260,6 +290,7 @@ const results = await Promise.all([
   lateOpen(),
   lateOpenRelayed(),
   quick(),
+  scope(),
 ]);
 for (const r of results) console.log(r);
 console.log('room_same_nat: ok');

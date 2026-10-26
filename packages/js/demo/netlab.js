@@ -696,11 +696,19 @@ async function onBirthday(peer, data) {
     b.ctx.offered = true;
     // The hard side: open the fleet answering the easy side's one offer, aimed only at the
     // one validated address it gave (openFleet strips the offer's candidates). Answer with our IP.
-    const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
-    if (!current(peer, b)) return;
-    const creds = randomCredentials();
-    const size = Number(params.get('fleet')) || FLEET_SIZE;
-    const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: data.sdp, size, easyAddr: data.addr });
+    let hard;
+    try {
+      const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
+      if (!current(peer, b)) return;
+      const creds = randomCredentials();
+      const size = Number(params.get('fleet')) || FLEET_SIZE;
+      hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: data.sdp, size, easyAddr: data.addr });
+    } catch (e) {
+      // A refused offer fails the punch, unless it ended meanwhile: openFleet closed what it
+      // opened when it threw, and the card keeps why the punch ended.
+      if (current(peer, b)) throw e;
+      return;
+    }
     if (!current(peer, b)) {
       for (const c of hard.conns) c.pc.close();
       return;
