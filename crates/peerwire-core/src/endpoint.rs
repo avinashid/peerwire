@@ -785,7 +785,9 @@ impl<A: Address> Endpoint<A> {
     /// a peer it is dialling directly or already has a direct link with. Direct
     /// links and dials, such as those to the relay, are unaffected, and so is a
     /// direct dial later given a relay: it keeps its direct addresses and may
-    /// complete direct, though it takes no new ones. Links already up keep their
+    /// complete direct, though it takes no new ones, until the next call with
+    /// `on`. Every such call, even with relay-only already on, sends each dial
+    /// that has a relay through it alone. Links already up keep their
     /// path, and none moves between a slow address and a relay
     /// ([`add_relay`](Endpoint::add_relay)): relays offered are ignored, probes
     /// through them stop and aren't answered, and a relayed link doesn't fall back

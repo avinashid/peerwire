@@ -23,6 +23,9 @@ export interface SignalingAdapter {
   onHello: (peer: PeerId, meta?: unknown) => void;
   hello(meta?: unknown): void | Promise<void>;
   send(to: PeerId, body: unknown): void | Promise<void>;
+  /** `from` must be the sender's PeerId, authenticated by the adapter (as the Nostr adapter's sealed messages are;
+   * BroadcastChannel is same-origin): WebRTC offers, answers, ICE candidates and restarts, retry requests, and the
+   * signalling pipe and its stale drop all trust it. */
   onMessage(fn: (from: PeerId, body: any) => void): void;
   close(): void;
 }
@@ -50,7 +53,8 @@ export interface JoinRoomOptions {
    * - a factory returning your own adapter.
    */
   signaling?: 'local' | 'nostr' | ((ctx: SignalingContext) => SignalingAdapter);
-  /** Shared with every peer when it joins; change it with `room.setPresence`. Default `{}`. */
+  /** Shared with every peer when it joins; change it with `room.setPresence`. Default `{}`. `joinRoom` rejects
+   * one over 1 MiB as JSON (RangeError) or one JSON can't encode, such as a function or a BigInt (TypeError). */
   presence?: Presence;
   /** Queue events for `room.poll()`/`room.receive()` from the start; otherwise the first call starts the queue. */
   queue?: boolean;
@@ -68,7 +72,13 @@ export interface JoinRoomOptions {
    * `'public-only'`: no LAN or loopback (`host`) candidates, only what STUN reports (and no local address in
    * a candidate's related address or the SDP's `c=` line either), so tabs of one
    * machine with no STUN server can't link. Relay-only is not available for rooms: use
-   * `WebRtcTransport` with `privacy: 'relay-only'`. */
+   * `WebRtcTransport` with `privacy: 'relay-only'`.
+   * Once the origin has a stored microphone or camera grant (it lasts across visits and covers every page of the
+   * origin, even one that never asks), browsers list every network interface to connections made after the grant
+   * (RFC 8828 mode 1). With `'direct'`, members then get each one's real address (LAN, hotspot and IPv6 ones),
+   * which is what lets a phone and a laptop on its hotspot link directly. `'public-only'` withholds those, and that
+   * direct path with them, but still sends each interface's public address as STUN sees it (the Wi-Fi's and the
+   * mobile network's, or the real network's under a VPN). Voice and video apps ask for that permission anyway. */
   privacy?: 'direct' | 'public-only';
   /** What to do for a peer WebRTC can't link (symmetric NAT on both sides, no TURN):
    * - `'auto'` (default): dial it through every member linked to both of you, and over the
@@ -124,7 +134,8 @@ export interface RoomEvents {
 export interface SendOptions {
   /** One peer or several; default every joined peer. */
   to?: PeerId | PeerId[];
-  /** Default `'reliable'`. */
+  /** Default `'reliable'`. A number must be 0, 1 or 2 (reliable, unreliable, urgent); anything else throws
+   * TypeError. */
   lane?: LaneName | number;
 }
 
@@ -140,7 +151,8 @@ export declare class Room {
   on<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): () => void;
   off<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): void;
   /** Sends to every joined peer, or to `to`. Returns how many peers it was queued for.
-   * Throws RangeError if the message can't fit the lane (unreliable: one datagram; urgent: 64 KiB). */
+   * Throws RangeError if the message can't fit the lane (reliable: 1 MiB; unreliable: one datagram; urgent:
+   * 64 KiB), also while earlier messages wait for the send window, and then sends it to no one. */
   send(data: RoomData, options?: SendOptions): number;
   /** `send` with positional arguments; `peer` '' or null sends to everyone. */
   sendTo(peer: PeerId | '' | null, data: RoomData, lane?: LaneName | number): number;
@@ -150,6 +162,8 @@ export declare class Room {
   receive(): RoomEvent | null;
   /** Our presence, or a joined peer's. */
   getPresence(peer?: PeerId): Presence | undefined;
+  /** Throws RangeError for a presence over 1 MiB as JSON, TypeError for one JSON can't encode (`undefined`, a
+   * function, a Symbol, a BigInt, a cycle), and keeps the old one. */
   setPresence(presence: Presence): void;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   /** How `peer` is reached: its own WebRTC link, a channel handed to `adoptChannel` (`adopted`), relayed by
@@ -285,8 +299,10 @@ export declare class Endpoint {
   disconnect(peer: PeerId | Uint8Array): void;
   /** Relayed links never punch to a direct path, dials through a relay alone (given the relay before any
    * direct address of their own, or with a relay when this is turned on) send nothing direct, relays forward
-   * without our address, and a direct handshake is answered only from a peer we are dialling directly. A direct
-   * dial later given a relay keeps its direct addresses and may complete direct. */
+   * without our address, and a direct handshake is answered only from a peer we are dialling directly or already
+   * have a direct link with. A direct dial later given a relay keeps its direct addresses and may complete direct,
+   * until the next `setRelayOnly(true)`: every such call, even with relay-only already on, sends each dial that has
+   * a relay through it alone. */
   setRelayOnly(on: boolean): void;
   /** After `close()`, the counters as they were when it closed. */
   stats(): EndpointStats;
@@ -389,7 +405,15 @@ export declare class WebRtcTransport implements Transport {
   readonly badSignals: number;
   /** Offers sent again for want of an answer, and answers sent again for a repeated offer. */
   readonly resent: number;
-  /** ICE restarts begun as the dialling side (a link that was open lost ICE). */
+  /**
+   * Offers, answers, copies of either and `restart` asks not sent because the peer's publish budget was spent:
+   * 6 at once, then 1 per 5 s per peer, so no peer can keep us publishing to the signalling relays.
+   */
+  readonly throttled: number;
+  /**
+   * ICE restarts begun as the dialling side (a link that was open lost ICE). At most 3 per link a minute, whether
+   * or not ICE reconnects in between; the other side's ask is heeded only while our own ICE is down too.
+   */
   readonly restarts: number;
   /** Retries begun as the dialling side (see `retry`). */
   readonly retried: number;
@@ -399,8 +423,9 @@ export declare class WebRtcTransport implements Transport {
    * `restart: true` for an ICE restart, `retry: true` for a retry's offer), retries (`retry` with `dialer`,
    * `retry-failed`), ICE (`ice-state` with `state`, `candidate-error` with the STUN server `url`,
    * `code`, `text`, `address`, `ice-restart` with `n`, `reason`, `dialer`), port prediction (`guesses` with the
-   * peer's `ip`, `next`, `step` and the `n` candidates added) and `same-nat` (the peer's candidates name our
-   * public IPv4 `ip`, so the link falls back after `ms`).
+   * peer's `ip`, `next`, `step` and the `n` candidates added), `same-nat` (the peer's candidates name our
+   * public IPv4 `ip`, so the link falls back after `ms`) and `throttled` (a message of `kind` not sent: see
+   * `throttled`).
    */
   trace: ((peer: PeerId, what: string, detail: Record<string, unknown>) => void) | null;
   /**

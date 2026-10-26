@@ -227,7 +227,10 @@ export class Endpoint {
   // punch to a direct path, dials through a relay alone send nothing direct (a
   // direct dial later given a relay may still complete direct), relays forward
   // our packets without our address, and a direct handshake is answered only
-  // from a peer we are dialling directly.
+  // from a peer we are dialling directly or already have a direct link with.
+  // Every call with `true`, even with relay-only already on, sends each dial that
+  // has a relay through it alone (a direct dial given a relay since loses its
+  // direct addresses).
   setRelayOnly(on) {
     if (this.closed) return;
     this.pw.x.pw_set_relay_only(this.h, on ? 1 : 0);

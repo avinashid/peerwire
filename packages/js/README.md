@@ -93,7 +93,9 @@ await room.leave();                             // peers see 'peer-leave' at onc
 - **Node:** Node has no WebRTC. `signaling: 'local'` rooms then carry their
   datagrams over the BroadcastChannel (peers in one process or its workers). For
   real networks pass `RTCPeerConnection` from a WebRTC package such as
-  node-datachannel's polyfill.
+  node-datachannel's polyfill. Known issue: on Node 26.7, a script can hang in
+  `process.exit()` on a busy machine while V8 is still optimising the wasm in the
+  background; run it with `node --no-wasm-tier-up` (the gate runs its tests that way).
 - **Identity:** `room.endpoint.secret()` returns 32 bytes; pass them back as
   `secret` to keep the same PeerId.
 
@@ -232,6 +234,20 @@ it is given:
   path, and the relay is asked not to pass on your address. The relay sees both
   ends. There is no TURN: a peer not linked to the relay can't be reached.
 
+**With microphone or camera permission.** Until a page has it, browsers hide its local
+addresses (behind mDNS names; Android Chrome offers only its mobile-data interface).
+Connections made after the grant list every network interface (RFC 8828 mode 1), which
+affects every voice or video app. The grant is stored per origin, so it also applies on
+later visits and to pages of that origin that never ask:
+- `'direct'`: members get each interface's real address, LAN, hotspot and IPv6 ones.
+  That is also what lets a phone and a laptop on its hotspot link directly. In one field
+  test (October 2026: Android Chrome on mobile data, a laptop on its hotspot) the pair
+  linked direct in 1.2 s, at about 10 ms, when both pages had microphone permission, and
+  over the signalling relays in 5 to 6 s, at about 600 ms, when they didn't.
+- `'public-only'`: none of those, and so not that direct path either. Each interface's
+  public address as STUN sees it still goes (the Wi-Fi's and the mobile network's, or
+  the real network's under a VPN).
+
 ## Trying it
 
 - Same browser: open `demo/index.html` or the arena pages in several tabs.
@@ -270,17 +286,18 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
      addresses (a laptop on a phone's hotspot) gets `sameNatFallbackMs` (3 s) instead.
      Browsers find no direct path there unless they show their LAN addresses: mDNS hides
      them, and Android Chrome lists only its mobile-data interface. Waiting the full 8 s
-     rarely helps, so such a pair links over signalling about 4 s after hearing each
-     other, not 9 s. Strangers behind one carrier NAT match too, and seldom link direct
-     either. The transport traces `same-nat`.
-3. **Over the signalling relays.** If no member has answered within 1 s, Peerwire
-   datagrams also go as signalling messages (a *pipe*). On Nostr each batch is sealed
-   to the peer again (`'signaling'`). This works wherever the relays are reachable.
-   It is slow, though: a relay round trip per batch, 40 ms batching, and at most 3
-   batches a second for all of a client's pipes together. That is within what public
-   relays allow one client. A relay that refuses events for its rate limit gets none
-   for 30 s, doubling up to 10 min. The pause starts over at 30 s once the relay has
-   gone 10 min without refusing.
+     rarely helps, so such a pair links over signalling about 3 to 4 s after hearing
+     each other (the handshake crosses the relays), not 9 s. Strangers behind one
+     carrier NAT match too, and seldom link direct either. The transport traces
+     `same-nat`.
+3. **Over the signalling relays.** If no member has answered within 1 s, or at once
+   when there is no other member to ask, Peerwire datagrams also go as signalling
+   messages (a *pipe*). On Nostr each batch is sealed to the peer again
+   (`'signaling'`). This works wherever the relays are reachable. It is slow, though: a
+   relay round trip per batch, 40 ms batching, and at most 3 batches a second for all
+   of a client's pipes together. That is within what public relays allow one client. A
+   relay that refuses events for its rate limit gets none for 30 s, doubling up to 10
+   min. The pause starts over at 30 s once the relay has gone 10 min without refusing.
 
 The core keeps the first path that completes the handshake, and the room's proofs,
 presence and messages run unchanged on it. A pipe opens only for a peer whose hello
@@ -319,7 +336,8 @@ the fallback and the peer stay as they are. The room retries:
   estimate doesn't count);
 - **after a microphone or camera grant**, with privacy `'direct'`: browsers show their local
   addresses (mDNS hides them, Android Chrome lists only mobile data) only to connections
-  made after one, so a laptop on a phone's hotspot can then link to the phone directly.
+  made after one, so a laptop on a phone's hotspot can then link to the phone directly
+  (when both pages have the permission; see Privacy for what members then see).
   `retryOnGrant: false` turns this off. With `'public-only'`, retries offer no local
   address, as first dials don't;
 - **when the app asks:** `room.retryDirect(peer?)`, for every peer on a fallback or one.
@@ -387,10 +405,16 @@ Run these with Node and the Playwright install on this host:
   candidates, the 32 predicted candidates, and a peer's prediction refused unless it is an
   IPv4 address and ports in range (nothing can be spliced into a candidate line).
 - `node packages/js/test/ice_restart.mjs` (Chromium, loopback): an ICE restart by either side
-  renews the ICE credentials while the DataChannel stays open and datagrams flow; ICE
-  `disconnected` restarts after 2 s, `failed` at once; at most 3 while ICE stays down;
-  `networkChanged()` touches only links whose ICE is down; an offer's prediction adds 32
-  candidates, a malformed one none.
+  renews the ICE credentials while the DataChannel stays open and datagrams flow; the
+  other side's ask is ignored while the dialling side's own ICE is connected; ICE
+  `disconnected` restarts after 2 s, `failed` at once; at most 3 a minute, ICE reconnecting
+  or not; `networkChanged()` touches only links whose ICE is down; an offer's prediction adds
+  32 candidates, a malformed one none.
+- `node packages/js/test/restart_budget.mjs`: a peer can't keep us publishing to the
+  signalling relays. A peer looping `restart` asks (answering each, ICE reconnecting) gets
+  3 restarts; an offer and 200 copies of it, or 50 new offers from a linked peer, get 6
+  answers (the per-peer budget: 6 at once, then 1 per 5 s; the rest counted in
+  `throttled`); a genuine ICE failure still restarts, on either side.
 - `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
   DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
   the outage still arrives after it, by retransmit.

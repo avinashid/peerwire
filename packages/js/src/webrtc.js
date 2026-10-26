@@ -7,7 +7,8 @@
 // handshake over the DataChannel proves the remote holds the PeerId it claims.
 //
 // Signalling adapters implement { id, send(to, msg), onMessage(fn), close() };
-// messages are JSON-able objects. See BroadcastSignaling below.
+// messages are JSON-able objects. See BroadcastSignaling below. close() may come
+// right after a send() (a leaving room's last pipe batch): that message should still go.
 //
 // When WebRTC can't link two peers (symmetric NAT on both sides, no TURN), the
 // transport can carry Peerwire datagrams over the signalling channel itself: a
@@ -32,12 +33,15 @@ export const RTC_SAME_NAT_FALLBACK_MS = 3000;
 // Pipes: datagrams are batched for PIPE_FLUSH_MS into one signalling message of at
 // most PIPE_BATCH bytes. All pipes together send PIPE_RATE messages a second (burst
 // PIPE_BURST), within what public relays allow one client, and batch more while they
-// wait; past PIPE_QUEUE bytes waiting on a pipe, the oldest is dropped.
+// wait; past PIPE_QUEUE bytes waiting on a pipe, the oldest is dropped. close() sends
+// what waits as one last batch per pipe, past the budget, for at most PIPE_CLOSE_BATCHES
+// pipes, those that queued last first.
 export const PIPE_FLUSH_MS = 40;
 export const PIPE_BATCH = 16 * 1024;
 export const PIPE_RATE = 3;
 export const PIPE_BURST = 6;
 export const PIPE_QUEUE = 64 * 1024;
+export const PIPE_CLOSE_BATCHES = 16;
 const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
 export const MAX_PIPE_PEERS = 256; // peers allowed to open a pipe to us
 // Without trickle, an offer or answer goes once ICE gathering is complete, or
@@ -58,10 +62,13 @@ const MAX_ICE_BATCH = 32; // candidates in one 'ice-batch', and held before a re
 // ICE restart, for a link whose DataChannel was open: once ICE has been
 // 'disconnected' for RESTART_AFTER_MS, or at once on 'failed', the dialling side
 // renegotiates with new ICE credentials (the other side asks it to, so offers never
-// cross). At most MAX_RESTARTS in a row, RESTART_AFTER_MS doubling between them,
-// counted afresh once ICE connects again. The Peerwire session keeps its handle.
+// cross; an ask is heeded only while our own ICE is down too). At most MAX_RESTARTS
+// per link in RESTART_WINDOW_MS, RESTART_AFTER_MS doubling between them; ICE
+// connecting again doesn't start the count over, so a peer that answers each one
+// can't loop them (NB46-1). The Peerwire session keeps its handle.
 export const RESTART_AFTER_MS = 2000;
 export const MAX_RESTARTS = 3;
+export const RESTART_WINDOW_MS = 60000;
 // Port prediction (as the native traversal does): a NAT whose two STUN mappings share
 // an IP and are 1 to MAX_STEP ports apart hands ports out in sequence. A peer not
 // behind a symmetric NAT itself adds GUESS_BEFORE + GUESS_AFTER + 1 candidates around
@@ -164,14 +171,25 @@ export function candidateSummary(sdp) {
 // has mic or camera permission) is cleared, and the connection line and m-line port go
 // back to the values before gathering (which writes the default candidate there, a host
 // one when no STUN server answered). ICE reads none of those.
+// MIC-5: lines are split on `\n` alone, as Chrome's SDP parser and stripCandidates split
+// them, each keeping its `\r`, so an SDP with bare `\n` line ends (from an
+// RTCPeerConnection that isn't a browser's) is filtered too: split on `\r\n` it was one
+// line and came back whole, every address in it.
 export function withoutHostCandidates(sdp) {
-  return sdp.split('\r\n').filter((l) => !(l.startsWith('a=candidate:') && / typ host( |$)/.test(l))).map(unaddressed).join('\r\n');
+  return sdp.split('\n').filter((l) => !(/^\s*a=candidate:/i.test(l) && HOST.test(l))).map(unaddressed).join('\n');
 }
+const HOST = / typ host(\s|$)/;
 
-// A candidate (with or without `a=`) or SDP line that names no local address.
+// A candidate (with or without `a=`) or SDP line that names no local address. A port of 0
+// marks a rejected m-section and is kept.
 function unaddressed(l) {
   return l.replace(/ raddr \S+ rport \d+/, ' raddr 0.0.0.0 rport 0').replace(/^c=IN IP[46] [^\s]+/i, 'c=IN IP4 0.0.0.0')
-    .replace(/^(m=\S+ )\d+/, (_, m) => `${m}9`).replace(/^a=rtcp:\d+ IN IP[46] [^\s]+/i, 'a=rtcp:9 IN IP4 0.0.0.0');
+    .replace(/^(m=\S+ )[1-9]\d*/, (_, m) => `${m}9`).replace(/^a=rtcp:\d+ IN IP[46] [^\s]+/i, 'a=rtcp:9 IN IP4 0.0.0.0');
+}
+
+// Whether `pc`'s ICE is connected now.
+function iceUp(pc) {
+  return pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
 }
 
 export class WebRtcTransport {
@@ -179,14 +197,24 @@ export class WebRtcTransport {
   // peer (a copy of the one taken is still answered again). A peer's own retries are a
   // fallback clock apart, so only a peer that floods them is refused. Tests shorten it.
   static retryAnswerMs = 2000;
+  // Offers, answers, copies of either and 'restart' asks to one peer are published within
+  // a budget: publishBurst at once, then one per publishEveryMs, so no peer can keep us
+  // publishing to the signalling relays, which rate-limit and ban busy clients (NB46-1).
+  // A link takes 1 to 3 (its description, and copies when one is lost). ICE candidates
+  // (which follow a description) and pipe batches (PIPE_RATE) don't count. Tests shorten it.
+  static publishBurst = 6;
+  static publishEveryMs = 5000;
 
   // `loss` drops that fraction of outgoing datagrams, for testing.
   // `trickle: false` sends one offer/answer with every candidate once ICE
   // gathering finishes (fewer signalling messages, for relays like Nostr).
   // `RTCPeerConnection` lets Node pass in an implementation (node-datachannel).
   // `privacy`: which addresses peers are given in ICE candidates.
-  //   'direct' (default): all of them.
-  //   'public-only': no `host` candidates (LAN, loopback): only what STUN sees.
+  //   'direct' (default): all of them. Once the origin has a stored mic or camera
+  //     grant, browsers list every network interface (RFC 8828 mode 1), so that is
+  //     every local address the device has.
+  //   'public-only': no `host` candidates (LAN, loopback): only what STUN sees, which
+  //     with that permission is each interface's public address.
   //   'relay-only': a WebRTC link to `relay` (a peer id, public-only) and to no one
   //     else; reach others with endpoint.connectVia(relay, peer), which stays
   //     relayed. Browsers have no relay but a peer: with no TURN server there is
@@ -220,6 +248,8 @@ export class WebRtcTransport {
     this.congested = 0; // datagrams dropped because the DataChannel was full or refused them
     this.badSignals = 0; // signals refused as malformed, unproven or too soon (see onSignal, apply)
     this.retryTaken = new Map(); // peer hex -> when its last retry offer made a connection
+    this.budgets = new Map(); // peer hex -> { tokens, at }: its publish budget (see publish)
+    this.throttled = 0; // offers, answers and asks not sent: the peer's publish budget was spent
     this.resent = 0; // offers and answers sent again (OFFER_RESEND_MS)
     this.restarts = 0; // ICE restarts begun (as the dialling side)
     this.retried = 0; // retries begun (as the dialling side), see retry()
@@ -238,6 +268,7 @@ export class WebRtcTransport {
     this.pipeAllowed = new Set(); // peers whose datagrams over signalling we take
     this.pipeTokens = PIPE_BURST; // the rate budget all pipes share
     this.pipeRefilled = Date.now();
+    this.pipeQueued = 0; // datagrams queued on pipes so far; a pipe's `queued`: the count at its latest
     // Batches sent; datagrams received, dropped (queue full), and stale (from a peer whose
     // own DataChannel carries its datagrams now: sent before it opened).
     this.piped = { sent: 0, received: 0, dropped: 0, stale: 0 };
@@ -290,7 +321,7 @@ export class WebRtcTransport {
     // `heard` once the DataChannel has carried a datagram from the peer.
     const l = { pc, dc, peer, handle: h, dialer: false, timer: null, watchedAt: 0, failed: false, described: false, late: [], lateTimer: null,
       held: [], offerMsg: null, offerSdp: null, answerMsg: null, resends: [],
-      lateSent: 0, opened: false, restarts: 0, restartTimer: null, guessed: null,
+      lateSent: 0, opened: false, restartAt: [], restartTimer: null, guessed: null,
       mine: new Set(), theirs: new Set(), sameNat: false, heard: false, retry: false };
     dc.onopen = () => {
       clearTimeout(l.timer);
@@ -316,7 +347,7 @@ export class WebRtcTransport {
     pc.onicecandidate = (e) => {
       const c = e.candidate;
       if (c) this.sameNat(l, l.mine, c.candidate);
-      if (c && this.privacy !== 'direct' && / typ host( |$)/.test(c.candidate)) return;
+      if (c && this.privacy !== 'direct' && HOST.test(c.candidate)) return;
       if (this.trickle) return void (c && this.signal(peer, { kind: 'ice', candidate: this.outgoing(c) }));
       if (!l.described) return; // still to go in the description
       if (!c) return void this.sendLate(l); // gathering complete: send what is buffered
@@ -373,15 +404,15 @@ export class WebRtcTransport {
     this.onPeer(l.peer, 'retry-failed');
   }
 
-  // ICE state of a link whose DataChannel was open: connected again resets the
-  // restart count; 'disconnected' restarts after a grace, 'failed' at once.
+  // ICE state of a link whose DataChannel was open: connected again calls off a
+  // restart that was due (the count stands, see RESTART_WINDOW_MS); 'disconnected'
+  // restarts after a grace, 'failed' at once.
   iceChanged(l) {
     if (!l.opened || this.links.get(l.handle) !== l) return;
     const s = l.pc.iceConnectionState;
-    if (s === 'connected' || s === 'completed') {
+    if (iceUp(l.pc)) {
       clearTimeout(l.restartTimer);
       l.restartTimer = null;
-      l.restarts = 0;
     } else if (s === 'disconnected') this.restartSoon(l, RESTART_AFTER_MS);
     else if (s === 'failed') this.restartSoon(l, 0);
   }
@@ -410,17 +441,20 @@ export class WebRtcTransport {
   // and the Peerwire session over it carry on. Only the dialling side offers; the
   // other asks it to with a 'restart' signal.
   async restartIce(l, reason) {
-    if (!l.opened || this.links.get(l.handle) !== l || l.restarts >= MAX_RESTARTS) return;
+    if (!l.opened || this.links.get(l.handle) !== l) return;
+    const now = Date.now();
+    l.restartAt = l.restartAt.filter((t) => now - t < RESTART_WINDOW_MS);
+    if (l.restartAt.length >= MAX_RESTARTS) return;
     clearTimeout(l.restartTimer);
-    l.restarts++;
-    const again = RESTART_AFTER_MS * 2 ** l.restarts; // if this one doesn't connect either
+    l.restartAt.push(now);
+    const n = l.restartAt.length;
+    const again = RESTART_AFTER_MS * 2 ** n; // if this one doesn't connect either
     l.restartTimer = setTimeout(() => {
       l.restartTimer = null;
-      const s = l.pc.iceConnectionState;
-      if (s !== 'connected' && s !== 'completed') this.restartIce(l, 'retry');
+      if (!iceUp(l.pc)) this.restartIce(l, 'retry');
     }, again);
-    this.tr(l.peer, 'ice-restart', { n: l.restarts, reason, dialer: l.dialer });
-    if (!l.dialer) return this.signal(l.peer, { kind: 'restart' });
+    this.tr(l.peer, 'ice-restart', { n, reason, dialer: l.dialer });
+    if (!l.dialer) return void this.publish(l.peer, { kind: 'restart' });
     this.restarts++;
     try {
       await l.pc.setLocalDescription(await l.pc.createOffer({ iceRestart: true }));
@@ -433,8 +467,7 @@ export class WebRtcTransport {
     const p = this.offerProof ? await this.offerProof.sign(l.peer) : undefined;
     if (this.links.get(l.handle) !== l) return;
     l.offerMsg = { kind: 'offer', sdp: this.describe(l), p, restart: true, ...this.prediction(l) };
-    this.signal(l.peer, l.offerMsg);
-    this.tr(l.peer, 'offer-sent', { ...candidateSummary(l.offerMsg.sdp.sdp), restart: true });
+    if (this.publish(l.peer, l.offerMsg)) this.tr(l.peer, 'offer-sent', { ...candidateSummary(l.offerMsg.sdp.sdp), restart: true });
     this.resendOffer(l);
   }
 
@@ -450,9 +483,8 @@ export class WebRtcTransport {
     const msg = l.offerMsg;
     l.resends = OFFER_RESEND_MS.map((ms) => setTimeout(() => {
       if (this.links.get(l.handle) !== l || l.offerMsg !== msg || !this.awaiting(l) || l.failed) return;
-      if (!msg.restart && l.dc.readyState === 'open') return;
+      if ((!msg.restart && l.dc.readyState === 'open') || !this.publish(l.peer, msg)) return;
       this.resent++;
-      this.signal(l.peer, msg);
       this.tr(l.peer, 'offer-sent', { ...candidateSummary(msg.sdp.sdp), resend: true, restart: !!msg.restart });
     }, ms));
   }
@@ -506,6 +538,27 @@ export class WebRtcTransport {
     }
   }
 
+  // Sends `msg` (an offer, an answer, a copy of either, or a 'restart' ask) to `peer` if its
+  // publish budget allows (see publishBurst); else counts it in `throttled` and returns false.
+  publish(peer, msg) {
+    const { publishBurst: burst, publishEveryMs: every } = WebRtcTransport;
+    const now = Date.now();
+    const b = this.budgets.get(peer) ?? { tokens: burst, at: now };
+    b.tokens = Math.min(burst, b.tokens + (now - b.at) / every);
+    b.at = now;
+    // Peers whose budget is whole again are forgotten: the map holds only those signalled lately.
+    for (const [p, o] of this.budgets) if (o.tokens + (now - o.at) / every >= burst) this.budgets.delete(p);
+    this.budgets.set(peer, b);
+    if (b.tokens < 1) {
+      this.throttled++;
+      this.tr(peer, 'throttled', { kind: msg.kind });
+      return false;
+    }
+    b.tokens--;
+    this.signal(peer, msg);
+    return true;
+  }
+
   tr(peer, what, detail) {
     try {
       this.trace?.(peer, what, detail);
@@ -553,8 +606,7 @@ export class WebRtcTransport {
     if (this.links.get(l.handle) !== l) return; // dropped meanwhile
     const again = retry ? { retry: true } : {};
     l.offerMsg = { kind: 'offer', sdp: this.describe(l), p, ...this.prediction(l), ...again };
-    this.signal(peer, l.offerMsg);
-    this.tr(peer, 'offer-sent', { ...candidateSummary(l.offerMsg.sdp.sdp), ...again });
+    if (this.publish(peer, l.offerMsg)) this.tr(peer, 'offer-sent', { ...candidateSummary(l.offerMsg.sdp.sdp), ...again });
     this.watch(l);
     this.resendOffer(l);
   }
@@ -638,12 +690,12 @@ export class WebRtcTransport {
       if (old && old.offerSdp !== sdp) this.dropRtc(from);
       const fresh = !this.byPeer.has(from);
       if (!fresh) {
-        // The same offer again: our answer was lost (or is still being made). Send it again.
+        // The same offer again: our answer was lost (or is still being made). Send it again,
+        // within the peer's budget, so a flood of copies gets a few.
         const l = this.links.get(this.byPeer.get(from));
         if (sdp !== null && sdp === l.offerSdp) {
-          if (l.answerMsg) {
+          if (l.answerMsg && this.publish(from, l.answerMsg)) {
             this.resent++;
-            this.signal(from, l.answerMsg);
             this.tr(from, 'answer-sent', { ...candidateSummary(l.answerMsg.sdp.sdp), resend: true });
           }
           return;
@@ -667,8 +719,8 @@ export class WebRtcTransport {
       await this.gathered(l.pc);
       if (this.links.get(l.handle) !== l) return; // dropped meanwhile
       l.answerMsg = { kind: 'answer', sdp: this.describe(l), ...this.prediction(l) };
-      this.signal(from, l.answerMsg);
-      this.tr(from, 'answer-sent', { ...candidateSummary(l.answerMsg.sdp.sdp), restart: !fresh });
+      // Past the peer's budget it waits for a copy of the offer (the dialler sends it again).
+      if (this.publish(from, l.answerMsg)) this.tr(from, 'answer-sent', { ...candidateSummary(l.answerMsg.sdp.sdp), restart: !fresh });
       if (fresh) this.watch(l);
       await this.guess(l, msg.nat);
     } else if (msg.kind === 'answer') {
@@ -685,9 +737,10 @@ export class WebRtcTransport {
       await this.addHeld(l);
       await this.guess(l, msg.nat);
     } else if (msg.kind === 'restart') {
-      // The other side lost ICE: as the dialling side, renegotiate (within the limit).
+      // The other side lost ICE: as the dialling side, renegotiate (within the limit), if
+      // ours is down too. A working link isn't renegotiated because a peer says so.
       const l = this.links.get(this.byPeer.get(from));
-      if (l.dialer) this.restartIce(l, 'asked');
+      if (l.dialer && !iceUp(l.pc)) this.restartIce(l, 'asked');
     } else if (msg.kind === 'ice' || msg.kind === 'ice-batch') {
       const cands = msg.kind === 'ice' ? [msg.candidate] : msg.c;
       if (!Array.isArray(cands) || cands.length > MAX_ICE_BATCH) return void this.badSignals++;
@@ -764,7 +817,7 @@ export class WebRtcTransport {
     let h = this.pipeByPeer.get(peer);
     if (h !== undefined) return h;
     h = this.nextHandle++;
-    this.pipes.set(h, { peer, handle: h, q: [], bytes: 0, timer: null });
+    this.pipes.set(h, { peer, handle: h, q: [], bytes: 0, timer: null, queued: 0 });
     this.pipeByPeer.set(peer, h);
     return h;
   }
@@ -772,6 +825,7 @@ export class WebRtcTransport {
   pipeSend(p, bytes) {
     p.q.push([b64(bytes), bytes.length]);
     p.bytes += bytes.length;
+    p.queued = ++this.pipeQueued;
     // Like a full UDP buffer: drop the oldest and let congestion control back off.
     while (p.bytes > PIPE_QUEUE && p.q.length > 1) {
       p.bytes -= p.q.shift()[1];
@@ -784,7 +838,9 @@ export class WebRtcTransport {
     if (!p.timer) p.timer = setTimeout(() => this.pipeFlush(p), ms);
   }
 
-  pipeFlush(p) {
+  // Sends a batch from `p`'s queue. `last` (see close()): one batch now, past the rate
+  // budget, of the newest datagrams if they don't all fit, as those are a leaving room's.
+  pipeFlush(p, last = false) {
     p.timer = null;
     if (this.pipes.get(p.handle) !== p || !p.q.length) return;
     // A channel carries the peer's datagrams now (an adopted one, or its own that opened
@@ -800,8 +856,12 @@ export class WebRtcTransport {
     const now = Date.now();
     this.pipeTokens = Math.min(PIPE_BURST, this.pipeTokens + ((now - this.pipeRefilled) / 1000) * PIPE_RATE);
     this.pipeRefilled = now;
-    if (this.pipeTokens < 1) return this.pipeFlushSoon(p, Math.ceil(((1 - this.pipeTokens) * 1000) / PIPE_RATE));
+    if (this.pipeTokens < 1 && !last) return this.pipeFlushSoon(p, Math.ceil(((1 - this.pipeTokens) * 1000) / PIPE_RATE));
     this.pipeTokens -= 1;
+    while (last && (p.q.length > MAX_PIPE_ITEMS || (p.bytes > PIPE_BATCH && p.q.length > 1))) {
+      p.bytes -= p.q.shift()[1];
+      this.piped.dropped++;
+    }
     const d = [];
     let n = 0;
     while (p.q.length && d.length < MAX_PIPE_ITEMS && (n === 0 || n + p.q[0][1] <= PIPE_BATCH)) {
@@ -962,10 +1022,20 @@ export class WebRtcTransport {
   }
 
   close() {
+    // What waits in a pipe goes now, before the channels close: a leaving room's Bye and
+    // the core's sealed close sit there for PIPE_FLUSH_MS, and lost, the peer would see
+    // us go only at its idle timeout. At most PIPE_CLOSE_BATCHES over signalling, from the
+    // pipes that queued last (PBF-1), so many busy pipes can't burst the relays as we go;
+    // the peers of the rest see us go at their timeout, as before.
+    const sent = this.piped.sent;
+    for (const p of [...this.pipes.values()].sort((x, y) => y.queued - x.queued)) {
+      clearTimeout(p.timer);
+      if (this.piped.sent - sent < PIPE_CLOSE_BATCHES) this.pipeFlush(p, true);
+    }
     this.checking.clear();
     this.retryTaken.clear();
+    this.budgets.clear();
     for (const peer of [...this.carriers.keys()]) this.dropCarrier(peer, undefined, true);
-    for (const p of this.pipes.values()) clearTimeout(p.timer);
     this.pipes.clear();
     this.pipeByPeer.clear();
     for (const l of this.links.values()) this.shut(l);

@@ -72,6 +72,7 @@ NODE=(
   "node retry backoff|node packages/js/test/retry_backoff.mjs"
   "node nat prediction|node packages/js/test/nat_predict.mjs"
   "node late ice|node packages/js/test/late_ice.mjs"
+  "node restart budget|node packages/js/test/restart_budget.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
@@ -233,9 +234,11 @@ browser_lane() {
   fi
 }
 
-# The Rust tests run from start to end; the Node tests beside them, then the browser tests. Some Node tests are
-# timing-sensitive (room_adopt.mjs failed once with Chromium running beside it), so the browser tests wait for
-# them and overlap only the Rust tests.
+# The Rust tests run from start to end; the Node tests beside them, then the browser tests, which overlap only the
+# Rust tests. That order came in when room_adopt.mjs failed beside Chromium and nextest ("batches still went over
+# signalling"). The flake is fixed: the test by 2c80929, its cause in webrtc.js by 5a7e4ba. On a4299d3 it passed
+# 66 of 66 runs: 20 in the gate's Node mix, 18 pinned to one core with a CPU burner, 16 beside cargo nextest and
+# 12 beside the browser tests.
 lanes() {
   if [ -z "$rust_skip" ]; then
     { step "cargo test" rust_tests; [ $strict = 0 ] || step "fuzz (debug)" fuzz_tests; } &

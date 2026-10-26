@@ -7,7 +7,8 @@
 // machine (and the public IP does not hairpin), so the two sockets can't actually meet.
 // Cross-NAT success is proven by the fleet test (birthday_fleet.mjs, the mechanism) and
 // the native simulator (NB-044, the maths); real two-device success is what the Net Lab
-// button is for.
+// button is for. A peer behind our own public IP (the transport's same-nat trace) gets
+// no punch: a click or the console logs it as skipped, and its invite gets an abort.
 //
 //   node packages/js/test/netlab_birthday.mjs [screenshot-prefix]
 import { spawn } from 'node:child_process';
@@ -130,6 +131,77 @@ try {
     return window.netlab.birthday().find((b) => b.id === id);
   }, t1);
   ok(next.status === 'running', `and its slot is free: a punch with another peer runs (${next.status}${next.why ? `: ${next.why}` : ''})`);
+
+  // A peer behind our own public IP gets no punch: the shared NAT doesn't hairpin, so
+  // none gets through. Two more tabs in a room of their own; tab 3's transport traces
+  // same-nat for tab 4, as it does when their candidates name one public IPv4.
+  const pair = [];
+  for (const i of [3, 4]) {
+    const p = await ctx.newPage();
+    p.on('pageerror', (e) => errors.push(`tab ${i}: ${e.message}`));
+    await p.goto(`http://127.0.0.1:${port}/demo/netlab.html?signal=local&name=n${i}&fleet=8#key=same${key}`);
+    pair.push(p);
+  }
+  const [s3, s4] = pair;
+  await Promise.all(pair.map((p) => p.waitForFunction(() => window.netlab.peers()[0]?.route && window.netlab.report().me.network, null, { timeout: 40000 })));
+  const logged = (p, re) => p.evaluate((src) => [...document.querySelectorAll('#log div')].filter((d) => new RegExp(src).test(d.textContent)).length, re.source);
+  const bday = (p) => p.evaluate(() => window.netlab.birthday()[0]);
+  const sameNat = () => s3.evaluate(() => window.netlab.trace(0, 'same-nat', { ip: '203.0.113.7', ms: 3000 }));
+  const newOffer = () => s3.evaluate(() => window.netlab.trace(0, 'offer-sent', {}));
+  const button = () => s3.evaluate(() => document.querySelector('#peers [data-bday]').disabled);
+  // 1. The card says why, its button disabled.
+  await sameNat();
+  await s3.waitForFunction(() => /skipped: n4 is behind our own public IP \(203\.0\.113\.7\)/.test(document.querySelector('#peers .bdayrow')?.textContent ?? ''), null, { timeout: 10000 });
+  ok(await button(), 'same public IP: the peer card says why, and its button is disabled');
+  if (shot) await s3.screenshot({ path: `${shot}-same-nat.png`, fullPage: true });
+  // 2. A new connection (its offer traced) is judged afresh: no same-nat yet.
+  await newOffer();
+  await s3.waitForFunction(() => !document.querySelector('#peers [data-bday]').disabled, null, { timeout: 10000 }).catch(() => {});
+  ok(!(await button()), "a new connection's offer clears it: the button is enabled again");
+  // 3. Tab 4 invites before tab 3 finds the same NAT; tab 3 accepts after: skipped, and
+  // tab 4 is told to stop at once instead of waiting out its 70 s.
+  await s4.click('#peers [data-bday]');
+  await s3.waitForFunction(() => window.netlab.birthday()[0]?.status === 'invited', null, { timeout: 20000 });
+  await sameNat();
+  const t4 = Date.now();
+  await s3.click('#peers [data-bday]'); // the user accepts
+  await s4.waitForFunction(() => window.netlab.birthday()[0]?.status === 'failed', null, { timeout: 20000 }).catch(() => {});
+  const [accepted, aborted] = [await bday(s3), await bday(s4)];
+  ok(accepted.status === 'failed' && /^skipped: /.test(accepted.why) && (await logged(s3, /birthday punch with n4: skipped: /)) === 1 &&
+    !(await logged(s3, /starting as the|opened \d+ sockets/)) && aborted.status === 'failed' && /the peer stopped: we share a public IP/.test(aborted.why),
+    `an invite accepted once the same NAT is found: skipped (${accepted.why}), no fleet; the inviter stopped in ${Date.now() - t4} ms (${aborted.why ?? aborted.status})`);
+  if (shot) await s3.screenshot({ path: `${shot}-same-nat-skipped.png`, fullPage: true });
+  if (shot) await s4.screenshot({ path: `${shot}-same-nat-aborted.png`, fullPage: true });
+  // 4. A punch from the console: skipped and logged.
+  const tried = await s3.evaluate(async () => {
+    await window.netlab.punch(0);
+    return window.netlab.birthday()[0];
+  });
+  ok(tried.status === 'failed' && /^skipped: /.test(tried.why) && (await logged(s3, /birthday punch with n4: skipped: /)) === 2, `a punch from the console is skipped and logged: ${tried.status}`);
+  // 5. An invite that comes once the same NAT is known gets an abort at once, and no
+  // invite shows. Tab 4 sends it straight from its Room (its own button waits 5 min now).
+  const answered = await s4.evaluate(async (to) => {
+    const { Room } = await import('/src/room.js');
+    const send = Room.prototype.send;
+    const room = await new Promise((resolve) => {
+      Room.prototype.send = function (...a) {
+        Room.prototype.send = send;
+        resolve(this);
+        return send.apply(this, a);
+      };
+    });
+    const abort = new Promise((resolve) => room.on('message', (d, from) => from === to && d?.t === 'bday' && d.step === 'abort' && resolve(true)));
+    room.send({ t: 'bday', step: 'start', yourRole: 'hard' }, { to });
+    return Promise.race([abort, new Promise((r) => setTimeout(() => r(false), 10000))]);
+  }, await s3.evaluate(() => window.netlab.self));
+  ok(answered && (await bday(s3)).status !== 'invited' && (await logged(s3, /birthday punch with n4: skipped: /)) === 3, `an invite once the same NAT is known: aborted at once (${answered}), not shown as an invite`);
+  // 6. After a new connection's offer the punch runs.
+  await newOffer();
+  const again = await s3.evaluate(async () => {
+    await window.netlab.punch(0);
+    return window.netlab.birthday()[0];
+  });
+  ok(again.status === 'running', `after a new connection's offer the punch runs (${again.status})`);
 
   if (errors.length) throw new Error(`page errors: ${errors.join('; ')}`);
 } catch (e) {

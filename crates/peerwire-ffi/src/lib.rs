@@ -188,9 +188,11 @@ pub unsafe extern "C" fn pw_add_relay(h: *mut PwEndpoint, now_us: u64, relay: *c
 /// path), dials through a relay alone (given the relay before any direct address
 /// of their own, or with a relay when this is turned on) send nothing direct,
 /// relays are asked not to tag our packets with our address, and a direct
-/// handshake is answered only from a peer this endpoint is dialling directly. A
-/// direct dial later given a relay keeps its direct addresses and may complete
-/// direct.
+/// handshake is answered only from a peer this endpoint is dialling directly or
+/// already has a direct link with. A direct dial later given a relay keeps its
+/// direct addresses and may complete direct, until the next call with `on` != 0:
+/// every such call, even with relay-only already on, sends each dial that has a
+/// relay through it alone.
 #[no_mangle]
 pub unsafe extern "C" fn pw_set_relay_only(h: *mut PwEndpoint, on: u32) {
     (*h).ep.set_relay_only(on != 0);
