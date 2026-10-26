@@ -17,14 +17,25 @@ if (/typ host/.test(kept) || !/typ srflx/.test(kept) || !kept.includes('a=mid:0'
 // MIC-1: once a page has mic or camera permission, a srflx candidate's related address is
 // its local socket, and gathering writes the default candidate (a host one when no STUN
 // server answered) into the connection line and the m-line port. None of that is sent.
-for (const c of ['c=IN IP4 10.0.0.170', 'c=IN IP6 2001:db8::5']) {
-  const gathered = ['v=0', 'm=application 56167 UDP/DTLS/SCTP webrtc-datachannel', c,
-    'a=candidate:1 1 udp 2122260223 10.0.0.170 56167 typ host generation 0',
-    'a=candidate:3 1 udp 1686052607 203.0.113.9 61000 typ srflx raddr 10.0.0.170 rport 56167 generation 0', 'a=mid:0'].join('\r\n');
-  const pub = withoutHostCandidates(gathered);
-  const want = ['v=0', 'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'c=IN IP4 0.0.0.0',
-    'a=candidate:3 1 udp 1686052607 203.0.113.9 61000 typ srflx raddr 0.0.0.0 rport 0 generation 0', 'a=mid:0'].join('\r\n');
-  if (pub !== want) fail(`public-only description of a gathered SDP (${c}): ${JSON.stringify(pub)}`);
+// MIC-5: the same with bare `\n` line ends (an RTCPeerConnection that isn't a browser's),
+// and a host candidate last, with no `generation` after `typ host`.
+for (const eol of ['\r\n', '\n']) {
+  for (const c of ['c=IN IP4 10.0.0.170', 'c=IN IP6 2001:db8::5']) {
+    const gathered = ['v=0', 'm=application 56167 UDP/DTLS/SCTP webrtc-datachannel', c,
+      'a=candidate:1 1 udp 2122260223 10.0.0.170 56167 typ host generation 0',
+      'a=candidate:3 1 udp 1686052607 203.0.113.9 61000 typ srflx raddr 10.0.0.170 rport 56167 generation 0', 'a=mid:0',
+      'a=candidate:2 1 udp 2122260223 10.0.0.171 56168 typ host', ''].join(eol);
+    const pub = withoutHostCandidates(gathered);
+    const want = ['v=0', 'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'c=IN IP4 0.0.0.0',
+      'a=candidate:3 1 udp 1686052607 203.0.113.9 61000 typ srflx raddr 0.0.0.0 rport 0 generation 0', 'a=mid:0', ''].join(eol);
+    if (pub !== want) fail(`public-only description of a gathered SDP (${c}, lines end ${JSON.stringify(eol)}): ${JSON.stringify(pub)}`);
+  }
+}
+// A rejected m-section (port 0) stays rejected; only a gathered port goes back to 9.
+{
+  const two = ['v=0', 'm=application 56167 UDP/DTLS/SCTP webrtc-datachannel', 'a=mid:0', 'm=application 0 UDP/DTLS/SCTP webrtc-datachannel', 'a=mid:1', ''].join('\r\n');
+  const pub = withoutHostCandidates(two);
+  if (pub !== two.replace('56167', '9')) fail(`public-only description with a rejected section: ${JSON.stringify(pub)}`);
 }
 // The candidates a public-only transport sends on their own (trickled, or late after its
 // description) have their related address cleared too; under 'direct' they go as they are.

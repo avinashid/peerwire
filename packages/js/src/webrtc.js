@@ -165,14 +165,20 @@ export function candidateSummary(sdp) {
 // has mic or camera permission) is cleared, and the connection line and m-line port go
 // back to the values before gathering (which writes the default candidate there, a host
 // one when no STUN server answered). ICE reads none of those.
+// MIC-5: lines are split on `\n` alone, as Chrome's SDP parser and stripCandidates split
+// them, each keeping its `\r`, so an SDP with bare `\n` line ends (from an
+// RTCPeerConnection that isn't a browser's) is filtered too: split on `\r\n` it was one
+// line and came back whole, every address in it.
 export function withoutHostCandidates(sdp) {
-  return sdp.split('\r\n').filter((l) => !(l.startsWith('a=candidate:') && / typ host( |$)/.test(l))).map(unaddressed).join('\r\n');
+  return sdp.split('\n').filter((l) => !(/^\s*a=candidate:/i.test(l) && HOST.test(l))).map(unaddressed).join('\n');
 }
+const HOST = / typ host(\s|$)/;
 
-// A candidate (with or without `a=`) or SDP line that names no local address.
+// A candidate (with or without `a=`) or SDP line that names no local address. A port of 0
+// marks a rejected m-section and is kept.
 function unaddressed(l) {
   return l.replace(/ raddr \S+ rport \d+/, ' raddr 0.0.0.0 rport 0').replace(/^c=IN IP[46] [^\s]+/i, 'c=IN IP4 0.0.0.0')
-    .replace(/^(m=\S+ )\d+/, (_, m) => `${m}9`).replace(/^a=rtcp:\d+ IN IP[46] [^\s]+/i, 'a=rtcp:9 IN IP4 0.0.0.0');
+    .replace(/^(m=\S+ )[1-9]\d*/, (_, m) => `${m}9`).replace(/^a=rtcp:\d+ IN IP[46] [^\s]+/i, 'a=rtcp:9 IN IP4 0.0.0.0');
 }
 
 export class WebRtcTransport {
@@ -317,7 +323,7 @@ export class WebRtcTransport {
     pc.onicecandidate = (e) => {
       const c = e.candidate;
       if (c) this.sameNat(l, l.mine, c.candidate);
-      if (c && this.privacy !== 'direct' && / typ host( |$)/.test(c.candidate)) return;
+      if (c && this.privacy !== 'direct' && HOST.test(c.candidate)) return;
       if (this.trickle) return void (c && this.signal(peer, { kind: 'ice', candidate: this.outgoing(c) }));
       if (!l.described) return; // still to go in the description
       if (!c) return void this.sendLate(l); // gathering complete: send what is buffered
