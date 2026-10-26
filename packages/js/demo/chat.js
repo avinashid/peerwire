@@ -11,12 +11,14 @@ import { qrCode } from './qr.js';
 const APP = 'peerwire-chat';
 const MAX_TEXT = 2000; // characters (UTF-16 units, as the textarea's maxlength counts them)
 const MAX_NAME = 32;
-const MAX_ROOM = 256;
+const MAX_ROOM = 256; // bytes of the room id in a link (percent-encoded), so the link's QR code always fits
 const TYPING_MS = 3000; // how long "is typing" lasts after the last typing frame
 const TYPING_EVERY_MS = 1000; // how often a typing frame goes out while typing goes on
 const KEEP = 500; // lines on screen
 const GROUP_MS = 3 * 60 * 1000; // one sender's messages this close together share a name and avatar
 const NAME_KEY = 'peerwire-chat/name';
+const KEY_HINT = 'Anyone with this link can join: it is the room’s only key.';
+const GUESSABLE = 'This room’s name can be guessed: anyone who guesses it can join and read along. Start a New room for a private one.';
 
 const params = new URLSearchParams(location.search);
 const signaling = params.get('signal') === 'local' ? 'local' : 'nostr';
@@ -55,6 +57,11 @@ function cleanName(v) {
 function loadName() {
   try { return cleanName(localStorage.getItem(NAME_KEY)); } catch { return ''; }
 }
+// A room id fits in a link, and its QR code, at 256 bytes once percent-encoded.
+const fits = (id) => encodeURIComponent(id).length <= MAX_ROOM;
+// A room id that doesn't look random, like 'family', is a public lobby: anyone who guesses it can join. (A floor,
+// not a proof: randomRoomId() gives 22 of these characters.)
+const guessable = (id) => !/^[A-Za-z0-9_-]{22,}$/.test(id);
 const hue = (id) => parseInt(id.slice(0, 6), 16) % 360;
 const guest = (id) => `guest ${id.slice(0, 4)}`;
 const nameOf = (peer) => (room && peer === room.self ? myName : names.get(peer) || guest(peer));
@@ -90,6 +97,7 @@ function chatMessage(d) {
 async function enter(id) {
   const my = ++session;
   closeDrawer();
+  setComposer(false);
   if (room) {
     const r = room;
     room = null;
@@ -105,14 +113,13 @@ async function enter(id) {
   list.replaceChildren();
   renderTyping();
   renderMembers();
-  setInvite(id);
-  setComposer(false);
   setStatus('connecting', signaling === 'local' ? 'Joining…' : 'Joining through the Nostr signalling relays…');
+  setInvite(id);
   let r;
   try {
     r = await joinRoom({ appId: APP, roomId: id, signaling, presence: { name: myName } });
   } catch (e) {
-    if (my === session) setStatus('error', `Couldn’t join: ${e.message}`, { label: 'Retry', run: () => enter(id) });
+    if (my === session) setStatus('error', `Couldn’t join: ${e.message}`, { label: 'Retry', run: () => join(id) });
     return;
   }
   if (my !== session) return void r.leave();
@@ -123,7 +130,19 @@ async function enter(id) {
   setStatus(null);
   setComposer(true);
   system(['You joined as ', [myName], `. ${chatHistory.hint}`]);
+  if (guessable(id)) system([GUESSABLE], 'warn');
   renderMembers();
+}
+
+// enter(), with anything it throws shown, rather than left as a page that never joins.
+function join(id) {
+  const done = enter(id);
+  const my = session;
+  done.catch((e) => {
+    if (my !== session) return;
+    setComposer(false);
+    setStatus('error', `Something went wrong: ${e.message}`, { label: 'Retry', run: () => join(id) });
+  });
 }
 
 function listen(r) {
@@ -285,18 +304,29 @@ function setComposer(on) {
   if (on && matchMedia('(pointer: fine)').matches) input.focus();
 }
 
-const inviteLink = (id) => `${location.origin}${location.pathname}${location.search}#${encodeURIComponent(id)}`;
+// The link carries the room and ?signal=local, nothing else from this page's query.
+const inviteLink = (id) => `${location.origin}${location.pathname}${signaling === 'local' ? '?signal=local' : ''}#${encodeURIComponent(id)}`;
 function setInvite(id) {
   const link = inviteLink(id);
+  const open = guessable(id);
   $('link').value = link;
-  $('where').textContent = `${signaling === 'local' ? 'tabs of this browser' : 'peer to peer, no server'} · room ${id.slice(0, 6)}…`;
-  const { size, modules } = qrCode(link, { ecl: 'M' });
-  const q = 4; // the quiet zone around it, in modules
-  let d = '';
-  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (modules[y][x]) d += `M${x + q} ${y + q}h1v1h-1z`;
-  $('qr').setAttribute('viewBox', `0 0 ${size + 2 * q} ${size + 2 * q}`);
-  $('qr').setAttribute('shape-rendering', 'crispEdges');
-  $('qr-path').setAttribute('d', d);
+  $('where').textContent = `${signaling === 'local' ? 'tabs of this browser' : 'peer to peer, end-to-end encrypted'} · room ${id.slice(0, 6)}…${open ? ' · its name can be guessed' : ''}`;
+  $('where').classList.toggle('warn', open);
+  $('key-hint').textContent = open ? GUESSABLE : KEY_HINT;
+  $('key-hint').classList.toggle('warn', open);
+  try {
+    const { size, modules } = qrCode(link, { ecl: 'M' });
+    const q = 4; // the quiet zone around it, in modules
+    let d = '';
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (modules[y][x]) d += `M${x + q} ${y + q}h1v1h-1z`;
+    $('qr').setAttribute('viewBox', `0 0 ${size + 2 * q} ${size + 2 * q}`);
+    $('qr').setAttribute('shape-rendering', 'crispEdges');
+    $('qr-path').setAttribute('d', d);
+  } catch {
+    // Too long for a QR code: none is shown (the CSS hides #qr without a viewBox); the link and Copy still work.
+    $('qr').removeAttribute('viewBox');
+    $('qr-path').removeAttribute('d');
+  }
 }
 
 async function copyLink(btn) {
@@ -334,7 +364,7 @@ function setName(v) {
 function hashRoom() {
   let h;
   try { h = decodeURIComponent(location.hash.slice(1)).trim(); } catch { return null; }
-  return h && h.length <= MAX_ROOM ? h : null;
+  return h && fits(h) ? h : null;
 }
 // An invite link or a bare room name, as typed into the welcome form.
 function roomFrom(v) {
@@ -344,24 +374,31 @@ function roomFrom(v) {
     if (u.origin === location.origin && u.pathname === location.pathname) return { href: u.href };
     v = decodeURIComponent(u.hash.slice(1)).trim();
   } catch {}
-  return v && v.length <= MAX_ROOM ? { id: v } : null;
+  return v && fits(v) ? { id: v } : null;
 }
 
-function showWelcome(id) {
+const BAD_ROOM = 'That room name isn’t valid: it is malformed or longer than 256 bytes. Start a new room, or paste another link.';
+function welcomeWarn(text) {
+  $('welcome-warn').textContent = text;
+  $('welcome-warn').classList.toggle('hidden', !text);
+}
+// The welcome form: for the room `id` if there is one, else to start one. `bad` if the link's room isn't valid.
+function showWelcome(id, bad = false) {
   pending = id;
   $('welcome').classList.remove('hidden');
   $('name').value = myName;
   $('welcome-title').textContent = id ? 'You’re invited to a chat' : 'Peerwire chat';
   $('go').textContent = id ? 'Join the room' : 'Start a new room';
   $('join-other').classList.toggle('hidden', Boolean(id));
+  welcomeWarn(bad ? BAD_ROOM : id && guessable(id) ? GUESSABLE : '');
   (myName ? $('go') : $('name')).focus();
 }
 function route() {
   const id = hashRoom();
   if (id && myName) {
     $('welcome').classList.add('hidden');
-    if (id !== roomId || !room) enter(id);
-  } else showWelcome(id);
+    if (id !== roomId || !room) join(id);
+  } else showWelcome(id, !id && location.hash.length > 1);
 }
 
 const openDrawer = () => { $('side').classList.add('open'); $('backdrop').classList.add('open'); };
@@ -375,7 +412,7 @@ $('welcome-form').addEventListener('submit', (e) => {
 });
 $('join-go').addEventListener('click', () => {
   const to = roomFrom($('join-link').value);
-  if (!to) return $('join-link').focus();
+  if (!to) return welcomeWarn($('join-link').value.trim() ? BAD_ROOM : ''), $('join-link').focus();
   if (!setName($('name').value)) return $('name').focus();
   if (to.href) location.href = to.href;
   else location.hash = encodeURIComponent(to.id);

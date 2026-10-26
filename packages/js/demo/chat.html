@@ -31,6 +31,7 @@
   .title { flex: 1; min-width: 0; }
   h1 { font-size: 17px; margin: 0; line-height: 1.2; }
   #where { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #where.warn, .hint.warn, .welcome .warn { color: var(--amber); }
   .head-actions { display: flex; gap: 8px; }
   #people { display: none; }
 
@@ -44,6 +45,7 @@
 
   #scroll { overflow-y: auto; padding: 12px 16px 4px; overscroll-behavior: contain; }
   #messages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+  .msg, .sys { contain: paint; } /* a pile of combining marks stays inside its own line */
   .msg { display: grid; grid-template-columns: 34px minmax(0, 1fr); column-gap: 10px; margin-top: 10px; }
   .msg.cont { margin-top: 0; }
   .msg.cont .avatar, .msg.cont .meta { visibility: hidden; height: 0; }
@@ -141,7 +143,7 @@
     <div class="mark" aria-hidden="true"></div>
     <div class="title">
       <h1>Peerwire chat</h1>
-      <div id="where" class="dim">no server: peers talk directly</div>
+      <div id="where" class="dim">peer to peer, end-to-end encrypted</div>
     </div>
     <div class="head-actions">
       <button id="new" title="Start a new private room">New room</button>
@@ -155,7 +157,7 @@
         <ol id="messages" aria-live="polite"></ol>
         <div id="empty" class="hidden">
           <h2>You’re the only one here</h2>
-          <p>Send the invite link to someone. When they open it, their browser joins this room and connects straight to yours.</p>
+          <p>Send the invite link to someone. When they open it, their browser joins this room and connects to yours.</p>
           <button id="empty-copy" class="primary">Copy invite link</button>
         </div>
       </div>
@@ -175,7 +177,7 @@
         <div class="row"><input id="link" readonly aria-label="Invite link"><button id="copy">Copy</button></div>
         <div class="row" style="margin-top:8px"><button id="share" class="hidden" style="flex:1">Share…</button></div>
         <svg id="qr" role="img" aria-label="QR code of the invite link"><path id="qr-path" fill="#000"></path></svg>
-        <p class="hint">Anyone with this link can join: it is the room’s only key.</p>
+        <p id="key-hint" class="hint">Anyone with this link can join: it is the room’s only key.</p>
       </div>
       <div class="card">
         <h2>You</h2>
@@ -195,7 +197,8 @@
   <form class="welcome" id="welcome-form">
     <div class="mark" aria-hidden="true"></div>
     <h1 id="welcome-title">Peerwire chat</h1>
-    <p id="welcome-text">A chat room that lives in the browsers of the people in it: no server, no account. Messages go straight from peer to peer, end-to-end encrypted.</p>
+    <p id="welcome-text">A chat room that lives in the browsers of the people in it: no account, and no server of ours. Messages go peer to peer, through another member or the signalling relays when two browsers can’t link directly, and are end-to-end encrypted either way.</p>
+    <p id="welcome-warn" class="warn hidden"></p>
     <label for="name">Your nickname</label>
     <input id="name" maxlength="32" placeholder="e.g. Ada" required>
     <div class="row"><button id="go" class="primary">Start a new room</button></div>

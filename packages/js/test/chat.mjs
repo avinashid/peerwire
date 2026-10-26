@@ -165,6 +165,37 @@ try {
   check(true, 'Grace sees Ada leave the old room');
   if (shots) await a.screenshot({ path: `${shots}/chat-empty.png` });
 
+  // A room whose name can be guessed says so, in the invite hint, the header and the chat; a random one doesn't.
+  const flagged = (p) => p.evaluate(() => [
+    document.getElementById('key-hint').classList.contains('warn') && /can be guessed/.test(document.getElementById('key-hint').textContent),
+    /can be guessed/.test(document.getElementById('where').textContent),
+    [...document.querySelectorAll('#messages .sys.warn')].some((s) => /can be guessed/.test(s.textContent)),
+  ]);
+  check((await flagged(a)).every((f) => !f), 'a random room carries no guessable-name warning');
+  await a.evaluate(() => (location.hash = 'family'));
+  await a.waitForFunction(() => window.chat.room && window.chat.roomId === 'family', null, WAIT);
+  check((await flagged(a)).every(Boolean), 'a guessable room (#family) is flagged in the invite hint, the header and the chat');
+  if (shots) await a.screenshot({ path: `${shots}/chat-guessable.png` });
+
+  // A room name over 256 bytes in a link (256 CJK characters are 2304) is refused with a message, and the page
+  // keeps its room.
+  await a.evaluate((h) => (location.hash = h), encodeURIComponent('中'.repeat(256)));
+  await a.waitForSelector('#welcome:not(.hidden)', WAIT);
+  check(/isn’t valid/.test(await a.$eval('#welcome-warn', (w) => w.textContent))
+    && await a.evaluate(() => window.chat.roomId === 'family' && Boolean(window.chat.room)), 'a room name over 256 bytes is refused with a message, and the page keeps its room');
+
+  // A long query stays out of the invite link, and a QR code that can't be drawn doesn't stop the join (qr.js is
+  // swapped here for one that always throws).
+  const c = await ctx.newPage();
+  watch(c, 'C');
+  await c.route('**/demo/qr.js', (r) => r.fulfill({ contentType: 'text/javascript', body: 'export function qrCode() { throw new RangeError("too long for a QR code"); }' }));
+  const cRoom = 'Q'.repeat(22);
+  await c.goto(`http://127.0.0.1:${port}/demo/chat.html?signal=local&x=${'a'.repeat(2400)}#${cRoom}`);
+  await c.waitForFunction(() => window.chat?.room, null, WAIT);
+  check(await c.$eval('#link', (l) => l.value) === `http://127.0.0.1:${port}/demo/chat.html?signal=local#${cRoom}`, 'the invite link carries ?signal=local and nothing else from the query');
+  check(await c.evaluate(() => !document.getElementById('qr').hasAttribute('viewBox') && !document.getElementById('text').disabled),
+    'a QR code that can\'t be drawn is left out, and the room is joined anyway');
+
   check(errors.length === 0, `no page errors${errors.length ? `: ${errors.join('; ')}` : ''}`);
 } catch (e) {
   console.log(`FAIL ${e.message.split('\n')[0]}`);
