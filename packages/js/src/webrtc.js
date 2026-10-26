@@ -7,7 +7,8 @@
 // handshake over the DataChannel proves the remote holds the PeerId it claims.
 //
 // Signalling adapters implement { id, send(to, msg), onMessage(fn), close() };
-// messages are JSON-able objects. See BroadcastSignaling below.
+// messages are JSON-able objects. See BroadcastSignaling below. close() may come
+// right after a send() (a leaving room's last pipe batch): that message should still go.
 //
 // When WebRTC can't link two peers (symmetric NAT on both sides, no TURN), the
 // transport can carry Peerwire datagrams over the signalling channel itself: a
@@ -784,7 +785,9 @@ export class WebRtcTransport {
     if (!p.timer) p.timer = setTimeout(() => this.pipeFlush(p), ms);
   }
 
-  pipeFlush(p) {
+  // Sends a batch from `p`'s queue. `last` (see close()): one batch now, past the rate
+  // budget, of the newest datagrams if they don't all fit, as those are a leaving room's.
+  pipeFlush(p, last = false) {
     p.timer = null;
     if (this.pipes.get(p.handle) !== p || !p.q.length) return;
     // A channel carries the peer's datagrams now (an adopted one, or its own that opened
@@ -800,8 +803,12 @@ export class WebRtcTransport {
     const now = Date.now();
     this.pipeTokens = Math.min(PIPE_BURST, this.pipeTokens + ((now - this.pipeRefilled) / 1000) * PIPE_RATE);
     this.pipeRefilled = now;
-    if (this.pipeTokens < 1) return this.pipeFlushSoon(p, Math.ceil(((1 - this.pipeTokens) * 1000) / PIPE_RATE));
+    if (this.pipeTokens < 1 && !last) return this.pipeFlushSoon(p, Math.ceil(((1 - this.pipeTokens) * 1000) / PIPE_RATE));
     this.pipeTokens -= 1;
+    while (last && (p.q.length > MAX_PIPE_ITEMS || (p.bytes > PIPE_BATCH && p.q.length > 1))) {
+      p.bytes -= p.q.shift()[1];
+      this.piped.dropped++;
+    }
     const d = [];
     let n = 0;
     while (p.q.length && d.length < MAX_PIPE_ITEMS && (n === 0 || n + p.q[0][1] <= PIPE_BATCH)) {
@@ -962,10 +969,16 @@ export class WebRtcTransport {
   }
 
   close() {
+    // What waits in a pipe goes now, before the channels close: a leaving room's Bye and
+    // the core's sealed close sit there for PIPE_FLUSH_MS, and lost, the peer would see
+    // us go only at its idle timeout.
+    for (const p of this.pipes.values()) {
+      clearTimeout(p.timer);
+      this.pipeFlush(p, true);
+    }
     this.checking.clear();
     this.retryTaken.clear();
     for (const peer of [...this.carriers.keys()]) this.dropCarrier(peer, undefined, true);
-    for (const p of this.pipes.values()) clearTimeout(p.timer);
     this.pipes.clear();
     this.pipeByPeer.clear();
     for (const l of this.links.values()) this.shut(l);
