@@ -11,7 +11,9 @@
 // 3. hard side, a second offer straight after the first: one fleet only, closed at the end;
 // 4. easy side, aborted while its spray connection opens: it closes;
 // 5. easy side, aborted while it applies the answer: no stale error on the card;
-// 6. easy side, a second answer straight after the first: ignored, the punch runs on.
+// 6. easy side, a second answer straight after the first: ignored, the punch runs on;
+// 7. hard side, an offer that isn't SDP, aborted while its fleet holds it: the fleet's
+//    late refusal stays off the card, which keeps why the punch ended.
 // Sprays aim only at TEST-NET-3 (203.0.113.9), and V drops those candidates, so nothing
 // is sent off the host.
 //
@@ -114,15 +116,15 @@ try {
   let vId = null;
   const tell = (msg) => a.evaluate(([t, m]) => window.__room.send(m, { to: t }), [vId, msg]);
   const pause = (ms) => v.waitForTimeout(ms);
-  // A new V, linked to A, invited to a punch as `role` (with A's offer for a hard side),
-  // accepted there by a click; `hold` holds its setup from the click on.
-  async function accept(role, hold) {
+  // A new V, linked to A, invited to a punch as `role` (with A's offer, or `sdp`, for a
+  // hard side), accepted there by a click; `hold` holds its setup from the click on.
+  async function accept(role, hold, sdp = offer) {
     if (vId) await v.reload();
     vId = await v.waitForFunction(() => window.netlab?.self).then((h) => h.jsonValue());
     await v.waitForFunction((x) => window.netlab.peers().some((p) => p.id === x) && window.netlab.report().me.network, aId, { timeout: 40000 });
     await a.waitForFunction((x) => window.netlab.peers().some((p) => p.id === x), vId, { timeout: 40000 });
     await tell({ t: 'bday', step: 'start', yourRole: role });
-    if (role === 'hard') await tell({ t: 'bday', step: 'offer', sdp: offer, addr: null });
+    if (role === 'hard') await tell({ t: 'bday', step: 'offer', sdp, addr: null });
     await v.waitForFunction((x) => window.netlab.birthday().find((b) => b.id === x)?.status === 'invited', aId, { timeout: 20000 });
     await pause(300); // the offer follows the invite on the same lane
     const before = await v.evaluate((h) => { window.__hold = h; return window.__pcs.length; }, hold ? HOLD : 0);
@@ -213,6 +215,15 @@ try {
   ok(running.bday?.status === 'running' && !running.errors.length && running.states.every((s) => s !== 'closed') && stopped(r),
     `6 easy side, a second answer: still ${running.bday?.status}${running.bday?.why ? ` (${running.bday.why})` : ''}, then card "${r.bday?.why}"`);
   ok(dropped > 0 && remote === 0, `and its spray stayed on the host: ${dropped} candidates at ${TESTNET} dropped, ${remote} given to ICE`);
+
+  // 7. An offer Chrome refuses, aborted while the fleet holds it: when the refusal comes
+  // the punch has ended, so the card keeps "the peer stopped", not the error.
+  n = await accept('hard', true, 'not an SDP offer');
+  await pause(HOLD + 500);
+  await abort();
+  await settle('hard');
+  r = await after(n);
+  ok(r.states.length === FLEET && r.states.every((s) => s === 'closed') && stopped(r), `7 hard side, a bad offer refused after the abort: ${states(r)}, card "${r.bday?.why}"`);
   ok(!errors.length, `no page errors${errors.length ? `: ${errors.join('; ')}` : ''}`);
 } catch (e) {
   ok(false, e.stack ?? String(e));
