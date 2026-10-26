@@ -75,6 +75,7 @@ NODE=(
   "node late ice|node packages/js/test/late_ice.mjs"
   "node restart budget|node packages/js/test/restart_budget.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
+  "node qr|node packages/js/test/qr.mjs"
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
 )
@@ -86,6 +87,7 @@ BROWSER=(
   "readme chat|node packages/js/test/readme.mjs"
   "wasm url|node packages/js/test/wasm_url.mjs"
   "poll|node packages/js/test/poll.mjs 3"
+  "chat|node packages/js/test/chat.mjs"
   "webrtc signals|node packages/js/test/webrtc_signals.mjs"
   "ice restart|node packages/js/test/ice_restart.mjs"
   "retry direct|node packages/js/test/retry_direct.mjs"

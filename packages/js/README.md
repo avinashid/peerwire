@@ -206,6 +206,7 @@ function Chat() {
 | `src/local.js` | `LocalTransport`: datagrams over the BroadcastChannel, for Node and tests. |
 | `src/index.d.ts` | TypeScript types. |
 | `demo/index.html` | Mesh chat on the low-level API: every tab links to every other. |
+| `demo/chat.html` | Chat on `joinRoom`, mobile-friendly: a room per link (`#<room>`; New room makes one with `randomRoomId()`), an invite link with a copy button and a QR code (`demo/qr.js`, a small encoder), nicknames in presence (remembered in localStorage), members with their route (direct, relayed by a member, or over signalling) and RTT, a typing indicator on the unreliable lane that goes after 3 s, and messages on the reliable lane (up to 2000 characters). What members send is shown as text only (`textContent`), never as HTML. Nostr by default; `?signal=local` for tabs of one browser. A member sees messages sent while it is in the room. |
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
 | `demo/netlab.html` | Net Lab, a connection diagnostics page (not a game), mobile-friendly: join a room by any name you type (`office test` is the room `office-test`, shared as a `#room=` link, with recent rooms and a "make private" suffix), the global room, or a private one shared as a `#key=` link, and every member links to every other. An overview row sums up the room (peers, average and worst ping, packet loss, routes, WebRTC traffic, packets). Per peer: ping measured on the route in use (latest, min/avg/max, jitter, loss, with a sparkline), core and ICE round trips, WebRTC traffic, ICE restarts and port guesses, the route (direct, relayed by a member, or over signalling), the ICE candidate pair (IPv4/IPv6, UDP/TCP), the offer/answer exchange (times, resends, the addresses each carried), ICE connectivity checks sent, answered and received with a verdict on which way packets are blocked, time to link and the other side's NAT. Also this device's public addresses, IPv6 and a NAT mapping estimate, the signalling relays' state, chat, an event log with warnings and errors, and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it at `/`. |
@@ -251,6 +252,8 @@ later visits and to pages of that origin that never ask:
 ## Trying it
 
 - Same browser: open `demo/index.html` or the arena pages in several tabs.
+- Chat: open `demo/chat.html`, start a room, and send its invite link to another browser or scan its QR code with a
+  phone. Add `?signal=local` to keep it to tabs of one browser.
 - Different machines: add `?signal=nostr&room=<something only you know>` to every
   page. Peers meet through `wss://nos.lol`, `wss://relay.primal.net` and `wss://nostr.mom` and use
   Google's public STUN. Peers behind symmetric NATs on both sides still meet: see
@@ -505,6 +508,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/wasm_url.mjs [shot-prefix]`: two tabs join with a root-relative `wasm`
   (`'/pkg/peerwire_ffi.wasm'`, the kind of URL a bundler's `?url` import gives) and chat; relative and
   absolute URLs load, and a 404 rejects with its status.
+- `node packages/js/test/chat.mjs [shot dir]`: the chat demo in two tabs: members and routes, nicknames,
+  the typing indicator, messages shown as text only, frames that aren't messages dropped, leaving and New room.
+- `node packages/js/test/qr.mjs`: the chat demo's QR encoder against known answers.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
   every tab must see every other, and a closed tab must leave.
 - `node packages/js/test/leave.mjs [--runs=10] [--stress=N] [--crash=1]`: closes a streaming

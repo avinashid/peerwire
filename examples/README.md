@@ -2,7 +2,7 @@
 
 | Example | Status | Shows |
 |---|---|---|
-| chat | planned (NB-007) | rooms, presence, history for late joiners |
+| [chat](../packages/js/demo/chat.html) | working; history for late joiners planned | rooms by invite link or QR code, nicknames in presence, members and their routes, typing indicator |
 | whiteboard | planned (NB-008) | CRDT strokes, live cursors |
 | game | planned (NB-009); today: `packages/js/demo/arena.html` | super-peer lockstep islands |
 | meet | planned (NB-010) | WebRTC audio/video over Peerwire signaling |
