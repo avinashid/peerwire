@@ -31,10 +31,14 @@
 // whole if anything is off; state lives in Maps; names, keys, values, entries, characters, writers and context
 // ranges are capped, and so is what a member can have us send it to catch up: answers and asks at a rate
 // (CATCHUP_BURST at once, then one per CATCHUP_EVERY_MS), and what answers carry, CATCHUP_CHARS at once, then
-// CATCHUP_CHARS_PER_S, as an asker can always claim to lack the whole doc. A Lamport stamp may run
-// at most MAX_CLOCK_STEP ahead of ours per frame. A member could claim dots another member hasn't written yet,
-// so that the room ignores its next writes: a doc that sees such a claim on its own dots moves to a new
-// incarnation.
+// CATCHUP_CHARS_PER_S, as an asker can always claim to lack the whole doc.
+//
+// Every member takes any stamp up to 2^53 - 1, as refusing one far ahead would split the room: no member is a
+// reference for how far ahead is plausible, and a refused entry never comes again. So a member can move the
+// stamps to 2^53 - 1 in one frame; from then on, values set at the same time, and set items and log entries,
+// are ordered by writer, and a log keeps the highest writers' entries. A later set still wins, as it replaces
+// what it has seen. A member could claim dots another member hasn't written yet, so that the room ignores its
+// next writes: a doc that sees such a claim on its own dots moves to a new incarnation.
 
 export const MAX_NAME_LENGTH = 128; // a doc's or a collection's name, in UTF-16 code units
 export const MAX_KEY_LENGTH = 256; // a map key
@@ -45,7 +49,6 @@ export const MAX_DOC_LENGTH = 4 * 1024 * 1024; // what a doc's values, keys and 
 export const MAX_WRITERS = 1024; // writers a doc's context holds
 export const MAX_RANGES = 8192; // ranges of dots a doc's context holds
 export const DEFAULT_KEEP = 1000; // entries a log keeps unless doc.log() says otherwise
-export const MAX_CLOCK_STEP = 2 ** 32; // how far a frame's stamps may run ahead of our clock
 export const MESSAGE_BYTES = 512 * 1024; // the most a doc frame takes as UTF-8, half room.send's 1 MiB
 // Catching up with a member: the answers it gets and the asks we send it each come from a budget of
 // CATCHUP_BURST that refills one per CATCHUP_EVERY_MS, and what our answers carry, as JSON text, from one of
@@ -454,19 +457,17 @@ export class Doc {
   // Joins frame `f` into the doc. Its entries and dead ranges never share a dot, so their order doesn't
   // matter, and 'change' compares each key or item before and after the whole frame.
   apply(f, peer) {
-    const limit = this.clock + MAX_CLOCK_STEP;
-    for (const x of f.entries) this.put(x, limit, f.t === DELTA && peer);
+    for (const x of f.entries) this.put(x, f.t === DELTA && peer);
     for (const [w, a, b] of f.ranges) this.kill(w, a, b);
   }
 
-  put(x, limit, sender) {
+  put(x, sender) {
     const id = `${x.w}.${x.n}`;
     if (this.entries.has(id)) return;
     if (this.ctx.has(x.w, x.n)) {
       if (sender) this.unheard = true;
       return;
     }
-    if (x.c > limit) return;
     if (this.entries.size >= MAX_ENTRIES || this.length + x.len > MAX_DOC_LENGTH) return;
     if (x.w === this.writer && x.n > this.n) this.claimed = true;
     if (!this.record(x.w, x.n, x.n)) return;

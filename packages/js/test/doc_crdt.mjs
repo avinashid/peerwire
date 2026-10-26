@@ -5,10 +5,10 @@
 // after random order and duplicates with no catch-up, after drops healed by joining again, after a partition
 // heals, and for a late joiner, which gets each entry about once. Then intent (a later write wins, a set
 // beats a delete it didn't see, a log keeps causal order), the checks on member data (malformed frames,
-// caps, a frame's size, answers per member, stamps far ahead, claims on our future dots) and 'change'.
+// caps, a frame's size, answers per member, stamps far ahead (all taken), claims on our future dots) and 'change'.
 //
 //   node packages/js/test/doc_crdt.mjs
-import { Doc, MAX_VALUE_LENGTH, MAX_VALUE_DEPTH, MAX_ENTRIES, MAX_DOC_LENGTH, MAX_WRITERS, MAX_RANGES, MAX_KEY_LENGTH, MAX_NAME_LENGTH, MAX_CLOCK_STEP, MESSAGE_BYTES } from '../src/doc.js';
+import { Doc, MAX_VALUE_LENGTH, MAX_VALUE_DEPTH, MAX_ENTRIES, MAX_DOC_LENGTH, MAX_WRITERS, MAX_RANGES, MAX_KEY_LENGTH, MAX_NAME_LENGTH, MESSAGE_BYTES } from '../src/doc.js';
 
 const fail = (m) => {
   console.error(`FAIL ${m}`);
@@ -681,18 +681,52 @@ console.log('answers: 8 per member at once, then one per 15 s, each with all the
 }
 console.log('reopening a doc 12 times while a member stays: each catches up, 7 at once and then each after 15 s');
 
-// Stamps: one more than MAX_CLOCK_STEP ahead of ours is ignored, so no frame can run the clock out.
+// Stamps far ahead: a member moves the stamps by 2^32 in each of k deltas of its own (the earlier ones deleted,
+// or not), or to 2^53 - 1 at once, sent to a and b while c is cut off; then a, b and c write. Every member takes
+// them, so c, back, and d, joining after, converge with a and b, writes made after the jump included.
+for (const [k, kill] of [[1, false], [4, false], [4, true], [Infinity, false]]) {
+  const net = new Net(9);
+  const [a, b, c, m] = ['a', 'b', 'c', 'f'].map((x) => net.node(x));
+  net.mesh([a, b, c, m]);
+  a.doc.map('m').set('title', 'before');
+  a.doc.set('s').add('a before');
+  net.run();
+  for (const p of [a, b, m]) net.unlink(c, p);
+  const w = m.self + '0badc10c';
+  for (let i = 1; i <= Math.min(k, 4); i++) {
+    const t = k === Infinity ? Number.MAX_SAFE_INTEGER : Math.max(a.doc.clock, b.doc.clock) + 2 ** 32;
+    const x = kill && i > 1 ? { x: [[0, i - 1, i - 1]] } : {};
+    for (const p of [a, b]) p.doc.receive(m.self, { d: 'board', t: 1, ws: [w], e: [[0, i, t, 'm', 'z', 'k', i]], ...x });
+    if (k === Infinity) break;
+  }
+  a.doc.map('m').set('title', 'after');
+  a.doc.set('s').add('a after');
+  b.doc.log('l', { keep: KEEP }).append('b after');
+  c.doc.set('s').add('c, cut off');
+  net.run();
+  const d = net.node('d');
+  net.mesh([a, b, c, d]);
+  net.run();
+  a.doc.log('l', { keep: KEEP }).append('a, after d joined');
+  net.run();
+  const what = `stamps moved ${k === Infinity ? 'to 2^53 - 1' : `${k} x 2^32`}${kill ? ', earlier ones deleted' : ''}`;
+  same([a, b, c, d], what);
+  if (d.doc.map('m').get('title') !== 'after' || d.doc.set('s').entries().length !== 3 || d.doc.log('l').entries().length !== 2) fail(`${what}: d holds ${state(d.doc).slice(0, 300)}`);
+}
+// And sent to a alone, so a's next writes carry stamps far past b's clock: b takes them.
 {
   const net = new Net(9);
-  const [a, b] = ['a', 'b'].map((x) => net.node(x));
-  net.mesh([a, b]);
-  const w = a.doc.writer;
-  b.doc.receive(a.self, { d: 'board', t: 1, ws: [w], e: [[0, 50, b.doc.clock + MAX_CLOCK_STEP + 1, 's', 's', null, 'far']] });
-  if (b.doc.entries.size || b.doc.ctx.has(w, 50)) fail('a stamp far ahead was taken');
-  b.doc.receive(a.self, { d: 'board', t: 1, ws: [w], e: [[0, 50, b.doc.clock + MAX_CLOCK_STEP, 's', 's', null, 'near']] });
-  if (b.doc.clock !== MAX_CLOCK_STEP) fail('a stamp at the step was not taken');
+  const [a, b, m] = ['a', 'b', 'f'].map((x) => net.node(x));
+  net.mesh([a, b, m]);
+  net.run();
+  const w = m.self + '0badc10c';
+  for (let i = 1; i <= 2; i++) a.doc.receive(m.self, { d: 'board', t: 1, ws: [w], e: [[0, i, a.doc.clock + 2 ** 32, 'm', 'z', 'k', i]], ...(i > 1 && { x: [[0, i - 1, i - 1]] }) });
+  for (let i = 0; i < 5; i++) a.doc.log('l', { keep: KEEP }).append(i);
+  b.doc.log('l', { keep: KEEP }).append('b');
+  net.run();
+  if (b.doc.log('l').entries().length !== 6) fail(`a's writes after a jump sent to it alone: b holds ${b.doc.log('l').entries().length} of 6 log entries`);
 }
-console.log('stamps: a frame may move the clock at most MAX_CLOCK_STEP');
+console.log('stamps: taken however far ahead, so members cut off or joining after a jump converge with the rest');
 
 // Claims on a member's future dots: a member says a's next dots are dead, so others would ignore a's writes.
 // a sees the claim (it is in the ask that b sends a when a write of a's comes in already counted) and moves

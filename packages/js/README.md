@@ -178,6 +178,9 @@ doc.close();                                     // room.leave() closes the room
 - **Member data:**
   - Members are trusted alike, as in the room itself: any member can overwrite, delete or fill a doc.
   - What a member sends is checked and capped before it reaches you. A malformed frame is dropped whole.
+  - Every member takes a Lamport stamp however far ahead, as refusing one would split the room. So a member can
+    move the stamps to 2^53 - 1 at once; from then on, values set at the same time, and set items and log
+    entries, are ordered by writer, and a log keeps the highest writers' entries. A later set still wins.
   - A member can ask for the whole doc as often as it likes. What it is sent is at most 8 Mi characters of JSON
     text at once and 64 Ki a second after, plus one answer (theoretical, from those budgets; UTF-8 takes 1 to 3
     bytes a character).
@@ -509,7 +512,8 @@ Run these with Node and the Playwright install on this host:
   - answers per member: 8 at once, then one per 15 s, and an ask past that waits; what they carry to a member
     that asks for a 2 Mi-character doc every second for a minute (6 sends, under the 8 Mi + 64 Ki/s bound);
   - a doc closed and opened 12 times while a member stays catches up every time;
-  - Lamport stamps far ahead;
+  - Lamport stamps moved far ahead (by 2^32 four times, or to 2^53 - 1): a member cut off meanwhile and one that
+    joins after still converge, and so do a member's writes after a jump sent to it alone;
   - claims on a member's future writes.
 - `node packages/js/test/room_doc.mjs`: `room.doc()` with three members in a real `'local'` room: they converge, a
   doc opened late and a fourth member catch up, doc frames never show as messages, writes outlive their writer,
