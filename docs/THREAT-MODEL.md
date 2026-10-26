@@ -56,7 +56,7 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `dec1554` (2026-10-24).**
+**Status as of main `41cc24a` (2026-10-26).**
 
 | Finding | Status |
 |---|---|
@@ -88,8 +88,8 @@ that needs a change is tracked as an NB card.
 | FL2-1 (Low), FL2-2 (Low) | **Fixed** by `63e5b72` and `ddae245`, merged `8314aa8` (a member relay that stalls data hands the link back to the pipe and is held off; a datagram names the peer whose channel it came on), reviewed 2026-10-24; residuals R1, R2, [Member relays for pipe links](#member-relays-for-pipe-links-fast-lane-2--fl2-1-fl2-2) |
 | FL2F-1 (Info) | Open, same section |
 | RH-2 (Medium), RH-1, RH-3, RH-4 (Low) | **Fixed** by `78c4ebe` and `8126119`, merged `dec1554`, before `@peerwire/react` 0.1.0 was published (deep `accept` checks required, per-key clocks bounded by wall time, per-member quotas, catch-up by digest), reviewed 2026-10-24, [`@peerwire/react` hooks](#peerwirereact-hooks-nb-049--rh-1rh-6) |
-| RH-5 (Low), catch-up message size (Low), RH-6 (Info), N1 (nit) | Open in `@peerwire/react` 0.1.0, planned for 0.1.1, same section |
-| OUT-1 (Low) | Open, `@peerwire/js` 0.1.1 and main, [JS endpoint and rooms](#bounds-and-residuals-from-reviews-nb-014nb-043) |
+| RH-5 (Low), catch-up message size (Low), RH-6 (Info), N1 (nit) | **Fixed** by `12974c4`, merged `41cc24a`, in `@peerwire/react` 0.1.1 (a write members' data leaves no room for is dropped with a warning; catch-up messages capped at 512 KiB; versions kept instead of entries; a newer version an asker holds isn't sent), reviewed 2026-10-26, same section |
+| OUT-1 (Low) | Open, `@peerwire/js` 0.2.0 and main, [JS endpoint and rooms](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | RX-1 (Low), RX-2 (Info) | **Fixed** by `b0d354b` (the README's React example keeps string messages only, and only the last 100), reviewed 2026-10-24, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
@@ -993,7 +993,7 @@ the room. **Fixed** by `78c4ebe`. Per-peer values have a quota per member, ours 
 `MAX_PEER_KEYS` (64) and `MAX_PEER_LENGTH` (256 KiB), charged to the sender and freed
 when it leaves. Shared state holds 1024 keys and `MAX_STORE_LENGTH` (1 MiB) in all. When
 it is full, a key a mounted hook reads, or our own write, pushes out the oldest keys no
-hook reads; a local write that still doesn't fit throws a `RangeError` (but see RH-5).
+hook reads; a local write that still doesn't fit is dropped with a warning (RH-5).
 Accepted: what is pushed out is local, so members can hold different unread keys; a
 joiner gets the newest version any member still holds. A hook that mounts later for a
 key that was pushed out reads `initial` until the key is written again, while others hold
@@ -1018,37 +1018,53 @@ where it was 4 × 16 MiB. A 100 KB store now costs 1.18× per joiner. Every memb
 sends its state to each joiner, which is slow over a relayed link or the pipe; the
 README says to keep shared state small.
 
-**Open in 0.1.0, planned for 0.1.1.** `@peerwire/react` 0.1.0 was published with these,
-and none needs a change to the messages:
-- **RH-5 (Low): member data can still make our own shared write throw.** In an app whose
-  hooks read more than 16 shared keys (`MAX_STORE_LENGTH / MAX_VALUE_LENGTH`), members can
-  fill the keys it reads with 64 KiB values. Then our write to a new key, or one that
-  grows a value, has nothing it may push out, and `setShared` throws `RangeError`
-  (`store.ts:173`). Called from an effect, that shows the error boundary's fallback, or
+**Fixed in 0.1.1.** `@peerwire/react` 0.1.0 was published with these four. `12974c4`
+(merged `41cc24a`, `@peerwire/react` 0.1.1) fixes all of them, re-checked 2026-10-26 by
+reading the code, with Node probes on `dist/store.js` built from that commit. None
+changed the messages:
+- **RH-5 (Low): member data could still make our own shared write throw.** In an app
+  whose hooks read more than 16 shared keys (`MAX_STORE_LENGTH / MAX_VALUE_LENGTH`),
+  members can fill the keys it reads with 64 KiB values. Then our write to a new key, or
+  one that grows a value, has nothing it may push out, and in 0.1.0 `setShared` throws
+  `RangeError`. Called from an effect, that shows the error boundary's fallback, or
   unmounts the app without one. From an event handler it is an uncaught error and the
   write is lost. It is RH-1's kind (member data causing a throw in app code), narrower.
-  Fix: the hook's setter drops a write that doesn't fit, with a `console.warn`, as every
-  member drops a member's write that doesn't fit, and throws only for the app's own
-  mistakes (a value over 64 KiB, a key too long). Until then, an app that reads many
-  shared keys can catch the `RangeError` around its setter calls.
-- **Catch-up message size (Low, via OUT-1).** A catch-up message holds at most 64 values
-  but has no byte cap, so near a full store one can pass the reliable lane's 1 MiB
-  (non-ASCII text takes up to 3 bytes per character). The store splits a message when
-  the room throws `RangeError`, but the room doesn't throw when that peer's outbox holds
-  frames (OUT-1, below): it drops the message silently, and the store has marked those
-  values as sent. The joiner then lacks them from us until they are written again;
-  another member's answer may still bring them. Fix: cap each message by size (about
-  3 × length + key + 100 bytes per value, up to 512 KiB), so no split is needed.
-- **RH-6 (Info): catch-up records keep replaced values alive.** For each member the store
-  keeps the entries it last sent it (`sentShared`, `sentLive`). When a key is written
-  again, the old value stays in memory while that member stays. That is at most one old
-  value per key per member: up to about 1 MiB of shared and 256 KiB of per-peer values
-  for each member, beyond the store itself, if keys keep being rewritten between joins.
-  Fix: keep each entry's version (clock and writer, or sequence number) instead; it
-  compares the same, because a write never replaces an entry with an equal version.
-- **N1 (nit, cost only):** an asker whose digest already holds a newer version of a key
-  still gets our older value, which it ignores. `tell()` records the asker's version only
-  when it isn't newer than ours. Fix: record it either way, still asking back.
+  **Fixed**: a write that doesn't fit is dropped with a `console.warn`, as every member
+  drops a member's write that doesn't fit, and `setShared` returns `false`. The store
+  works out what it would push out before it pushes anything, so a dropped write sends
+  nothing and changes nothing. It still throws, before any change, for the app's own
+  mistakes: a value over 64 KiB as JSON or a key over 256 characters. An app on 0.1.0
+  that reads many shared keys can catch the `RangeError` around its setter calls, or
+  upgrade. Residual (Info): the warning comes once per dropped call, so an app that
+  writes on every frame to a store members have filled logs on every frame; warning once
+  per key is planned for 0.1.2.
+- **Catch-up message size (Low, via OUT-1).** In 0.1.0 a catch-up message holds at most
+  64 values but has no byte cap, so near a full store one can pass the reliable lane's
+  1 MiB (non-ASCII text takes up to 3 bytes per character). The store splits a message
+  when the room throws `RangeError`, but the room doesn't throw when that peer's outbox
+  holds frames (OUT-1, below): it drops the message silently, and the store has marked
+  those values as sent. The joiner then lacks them from us until they are written again;
+  another member's answer may still bring them. **Fixed**: each catch-up message, digests
+  included, is cut at 512 KiB (`CHUNK_BYTES`), counting 3 bytes per UTF-16 code unit of
+  each entry as JSON. UTF-8 takes at most that, since `JSON.stringify` escapes lone
+  surrogates, so a message stays under 512 KiB plus its envelope, and one entry alone (a
+  64 KiB value under a 256-character key) under about 200 KiB. A probe with worst-case
+  `€` keys and values, measured as the room frames it, found 394,963 bytes at most,
+  against the 1,048,576 limit. The split on `RangeError` stays as a fallback. OUT-1
+  itself is still open in `room.js`.
+- **RH-6 (Info): catch-up records kept replaced values alive.** For each member the store
+  kept the entries it last sent it (`sentShared`, `sentLive`). When a key was written
+  again, the old value stayed in memory while that member stayed: at most one old value
+  per key per member, up to about 1 MiB of shared and 256 KiB of per-peer values for each
+  member, beyond the store itself, if keys kept being rewritten between joins. **Fixed**:
+  the records hold each entry's version (clock and writer, or sequence number) instead,
+  which compares the same, because a write never replaces an entry with an equal version.
+  A key pushed out of the store is removed from every member's record, as before.
+- **N1 (nit, cost only):** an asker whose digest already held a newer version of a key
+  still got our older value, which it ignored, because `tell()` recorded the asker's
+  version only when it wasn't newer than ours. **Fixed**: `tell()` records it either way,
+  so the answer carries only that key's version. It still asks back only for a digest
+  version we lack, and still keeps at most 1024 told versions per member.
 
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
@@ -1101,18 +1117,19 @@ and what it accepted. Values are from main `7b716a2`.
 - **Sends.** `sendRetry` keeps at most one message above the 16 KiB scratch buffer
   between tries. The room's outbox has no cap. It holds only what the local
   application sends, so that is application policy.
-  - **OUT-1 (Low, open; `@peerwire/js` 0.1.1 and main):** `room.send()` throws
+  - **OUT-1 (Low, open; `@peerwire/js` 0.2.0 and main):** `room.send()` throws
     `RangeError` for a message too large for its lane only when that peer's outbox is
     empty. When it holds frames (more than the 4 MiB send buffer unacknowledged to that
     peer: a slow or relayed link, or a burst), `write()` queues the frame unchecked and
     `flush()` later drops it as too large. The caller sees no error, the peer never gets
     the message, and later messages still arrive. Found in the `@peerwire/react` review:
-    its catch-up split relies on the throw, and so does `setLive`'s move from the
-    unreliable to the reliable lane. Reproduced with two loopback rooms: a 1 MiB + 1 KiB
-    send threw with an empty outbox, and with 9 frames queued it didn't throw and never
-    arrived. Fix: in `write()`, check the frame against the lane's limit before queueing
-    and throw the same `RangeError`; for a broadcast, check once before writing to any
-    member, so a throw doesn't leave the message sent to some members only.
+    its catch-up split relied on the throw in 0.1.0 (capped by size in 0.1.1, so it no
+    longer does), and `setLive`'s move from the unreliable to the reliable lane still
+    does. Reproduced with two loopback rooms: a 1 MiB + 1 KiB send threw with an empty
+    outbox, and with 9 frames queued it didn't throw and never arrived. Fix: in
+    `write()`, check the frame against the lane's limit before queueing and throw the
+    same `RangeError`; for a broadcast, check once before writing to any member, so a
+    throw doesn't leave the message sent to some members only.
 - **Signals.**
   - Malformed or unproven signals are counted in `badSignals` (a counter only, with
     no action).
