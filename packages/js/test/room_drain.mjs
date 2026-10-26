@@ -8,7 +8,9 @@
 // OUT-1: a message over its lane's limit throws RangeError even while the outbox holds
 // frames (the core refused it only later, in flush, and the frame was lost unseen), a
 // message of exactly the limit is queued and arrives, and a broadcast throws before any
-// peer's outbox takes the frame.
+// peer's outbox takes the frame. A lane other than 0, 1 or 2 throws TypeError (OUT-1a).
+// A presence over the limit is refused before it is stored (OUT-1b): setPresence keeps
+// the old one, joinRoom rejects, and a room that joins later still lists us both ways.
 //
 //   node packages/js/test/room_drain.mjs
 import { joinRoom } from '../src/index.js';
@@ -116,6 +118,28 @@ check(arrived && got.length === 44 && sizes.every((s) => got.some((d) => d.lengt
   got.some((d) => d.length === 1), `b got ${got.length} of 44 messages: the 40, each lane's limit intact, and the 1 B sent last`);
 check(refused.length === 0 && a.outbox.size === 0, `the core refused no queued frame (refused: ${refused.join(', ') || 'none'})`);
 
-await Promise.all([a.leave(), b.leave(), c.leave()]);
+// OUT-1a: only lanes 0, 1 and 2 (or their names); the core would send any other number
+// as unreliable, past MAX_FRAME, and a name off Object.prototype would be read as one.
+const before = got.length;
+const odd = [3, -1, NaN, 1.5, 2 ** 32, 'toString'].map((lane) => tried(() => a.send(new Uint8Array(1200), { to: b.self, lane })));
+await sleep(200);
+check(odd.every((r) => r.startsWith('TypeError')) && queued() === 0 && got.length === before,
+  `lanes 3, -1, NaN, 1.5, 2**32 and 'toString' -> ${[...new Set(odd.map((r) => r.split(':')[0]))].join(', ')}; nothing queued or sent`);
+
+// OUT-1b: a presence that can't go out is refused before it is stored.
+const unhandled = [];
+process.on('unhandledRejection', (e) => unhandled.push(String(e)));
+const huge = { blob: 'x'.repeat(1 << 20) };
+const mine = a.getPresence();
+const set = [huge, { n: 1n }].map((p) => tried(() => a.setPresence(p)));
+check(set[0].startsWith('RangeError') && set[1].startsWith('TypeError') && a.getPresence() === mine,
+  `setPresence of 1 MiB -> ${set[0]}; of a BigInt -> ${set[1].split(':')[0]}; getPresence() unchanged`);
+const join = await joinRoom({ ...opts, presence: huge }).then((r) => (r.leave(), 'joined'), (e) => `${e.name}: ${e.message}`);
+check(join.startsWith('RangeError'), `joinRoom({ presence: 1 MiB }) -> ${join}`);
+const d = await joinRoom(opts);
+const listed = await until(() => a.peers.includes(d.self) && d.peers.includes(a.self), 15000);
+check(listed && !unhandled.length, `a room joined later: a and it list each other (${listed}); unhandled rejections: ${unhandled.join('; ') || 'none'}`);
+
+await Promise.all([a.leave(), b.leave(), c.leave(), d.leave()]);
 console.log(failed ? `${failed} FAILED` : 'room drain: all passed');
 process.exit(failed ? 1 : 0);

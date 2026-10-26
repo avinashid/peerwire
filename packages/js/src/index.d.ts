@@ -50,7 +50,8 @@ export interface JoinRoomOptions {
    * - a factory returning your own adapter.
    */
   signaling?: 'local' | 'nostr' | ((ctx: SignalingContext) => SignalingAdapter);
-  /** Shared with every peer when it joins; change it with `room.setPresence`. Default `{}`. */
+  /** Shared with every peer when it joins; change it with `room.setPresence`. Default `{}`. `joinRoom` rejects
+   * one over 1 MiB as JSON (RangeError) or one JSON can't encode. */
   presence?: Presence;
   /** Queue events for `room.poll()`/`room.receive()` from the start; otherwise the first call starts the queue. */
   queue?: boolean;
@@ -124,7 +125,8 @@ export interface RoomEvents {
 export interface SendOptions {
   /** One peer or several; default every joined peer. */
   to?: PeerId | PeerId[];
-  /** Default `'reliable'`. */
+  /** Default `'reliable'`. A number must be 0, 1 or 2 (reliable, unreliable, urgent); anything else throws
+   * TypeError. */
   lane?: LaneName | number;
 }
 
@@ -151,6 +153,7 @@ export declare class Room {
   receive(): RoomEvent | null;
   /** Our presence, or a joined peer's. */
   getPresence(peer?: PeerId): Presence | undefined;
+  /** Throws RangeError for a presence over 1 MiB as JSON (or JSON's own error), and keeps the old one. */
   setPresence(presence: Presence): void;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   /** How `peer` is reached: its own WebRTC link, a channel handed to `adoptChannel` (`adopted`), relayed by

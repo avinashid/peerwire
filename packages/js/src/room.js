@@ -90,10 +90,20 @@ function encode(data) {
   return frame(T.Json, enc.encode(JSON.stringify(data)));
 }
 
+// A lane by name or number. Only the three named ones: the core sends any other
+// number as unreliable, but MAX_FRAME wouldn't know its limit.
 function laneOf(lane) {
   const n = typeof lane === 'number' ? lane : LANES[lane];
-  if (n === undefined) throw new TypeError(`unknown lane ${lane}: use 'reliable', 'unreliable' or 'urgent'`);
+  if (n !== Lane.Reliable && n !== Lane.Unreliable && n !== Lane.Urgent) throw new TypeError(`unknown lane ${String(lane)}: use 'reliable', 'unreliable' or 'urgent' (0, 1 or 2)`);
   return n;
+}
+
+// Our presence as a frame, checked before anything stores it: one over the reliable
+// lane's limit would fail every later welcome, and so every later join.
+function presenceFrame(presence) {
+  const f = frame(T.Presence, enc.encode(JSON.stringify(presence)));
+  if (f.length > MAX_FRAME[Lane.Reliable]) throw tooLarge(f);
+  return f;
 }
 
 // A queued event: only strings, numbers, plain JSON values and ArrayBuffers.
@@ -128,6 +138,7 @@ export async function joinRoom({
   // A room dials every member, so relay-only (one WebRTC link, to the relay) can't apply.
   if (privacy !== 'direct' && privacy !== 'public-only') throw new TypeError(`joinRoom privacy must be 'direct' or 'public-only', not ${privacy}`);
   if (!['auto', 'peers', 'off'].includes(fallback)) throw new TypeError(`joinRoom fallback must be 'auto', 'peers' or 'off', not ${fallback}`);
+  presenceFrame(presence);
   const src = wasm ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url);
   const key = String(src);
   if (!modules.has(key)) modules.set(key, loadPeerwire(src).catch((e) => (modules.delete(key), Promise.reject(e))));
@@ -298,8 +309,8 @@ export class Room {
   }
 
   setPresence(presence) {
+    const f = presenceFrame(presence);
     this.me = presence;
-    const f = frame(T.Presence, enc.encode(JSON.stringify(presence)));
     for (const p of this.proven) this.write(p, f, Lane.Reliable);
   }
 
