@@ -32,7 +32,7 @@ browser tests.
 | Node privacy | `node packages/js/test/privacy.mjs` | host candidates are filtered; a relay-only endpoint links through its relay and refuses a direct dial |
 | Node room | `node packages/js/test/room_node.mjs` | three `joinRoom` peers mesh; presence, lanes, targeted sends, backpressure, leave, a late joiner and `poll()` work |
 | Node peer ids | `node packages/js/test/peer_id.mjs` | SEC-1: an over-long or malformed peer id (the 8192-character repro, wrong sizes, uppercase, non-strings) throws a TypeError at every wasm copy and the module keeps working; BroadcastChannel, Nostr, WebRTC, local and room signalling drop a `from` that isn't 64 lowercase hex; `LocalTransport` names a datagram's sender as its handle's peer |
-| Node receive from | `node packages/js/test/receive_from.mjs` | FL2-2: `Endpoint.receive(addr, bytes, peer)`: one of b's datagrams to a, kept back and given to a on handle 3 naming c, is dropped unread (no path change, not read as a replay); the same datagram with no peer named is fresh, and the link roams to handle 3 as on UDP; messages still flow both ways. Core cases: `a_relay_cannot_move_a_link_onto_its_own_channel`, `a_handshake_on_another_peers_channel_is_dropped`, `a_relayed_punch_ack_answers_no_direct_probe`; FFI: `handle_datagram_from_drops_another_peers_packets` |
+| Node receive from | `node packages/js/test/receive_from.mjs` | FL2-2: `Endpoint.receive(addr, bytes, peer)`: one of b's datagrams to a, kept back and given to a on handle 3 naming c, is dropped unread (no path change, not read as a replay); the same datagram with no peer named (b's later ones held back, so it is b's newest) is fresh, and the link roams to handle 3 as on UDP; b's later datagrams, released on handle 2, take it back; messages still flow both ways. Core cases: `a_relay_cannot_move_a_link_onto_its_own_channel`, `a_handshake_on_another_peers_channel_is_dropped`, `a_relayed_punch_ack_answers_no_direct_probe`; FFI: `handle_datagram_from_drops_another_peers_packets` |
 | Node pump re-arm | `node packages/js/test/pump_rearm.mjs` | PERF-1: the endpoint re-arms its timer whatever `onTransmit` or `onEvent` do; a reliable message sent while the transport throws, refuses, or has a DataChannel over `MAX_BUFFERED` (1 MiB) queued arrives after the outage by retransmit, well inside the 10 s keepalive; `WebRtcTransport` counts those drops in `congested` |
 | Node nostr bounds | `node packages/js/test/nostr_bounds.mjs` | PERF-2: 12,000 distinct relay events keep `NostrSignaling.seen` at `MAX_SEEN` (4096), oldest evicted first, recent duplicates still dropped; ids that are not 64 lowercase hex (including 4096 events with 64 KiB ids) never enter the set, and non-array tags are ignored without throwing; base64 round-trips 100 KB and 1 MB |
 | Node endpoint closed | `node packages/js/test/endpoint_closed.mjs` | PERF1-2: after `Endpoint.close()` no public method calls into wasm (counted per export): late `receive` datagrams and `addCandidate` are ignored, `send`/`connect`/`connectVia` throw `endpoint closed`, `secret`/`seal`/`open`/`rttMs` return null, `isConnected` false, `stats` the counters at close; a second `close()` frees nothing; other endpoints on the module keep working |
@@ -106,6 +106,15 @@ workspace first and takes several times that. With no Rust change since `origin/
 - `stun`: RFC 5769 IPv4/IPv6 vectors; Peerwire packets are not mistaken for STUN.
 - `crypto`, `identity`, `sealed`, `invite`, `addr`: Noise static key derivation, sign/verify, replay window,
   sealed-box open/reject, RFC 4648 vectors, invite round trip and garbage rejection, socket address round trip.
+- `endpoint`, path choice (Fast lane 3, over a delayed test network, `Net`): probes move no link and a late
+  packet over an old address doesn't take it back; of two ends on a relay only the follower (the larger PeerId)
+  leaves one it heard the peer on, and two ends on different relays meet on one; a relayed link takes a relay
+  clearly faster after 3 winning rounds, once, the peer following, messages flowing, `path_rtt` the new path's;
+  a relay inside the margin isn't taken and the race ends after 5 rounds; a relay the peer holds off, or this end
+  does, isn't taken; one faster still waits out the 20 s dwell; the relays probed with the first to answer, and a
+  relay offered at one end only, are raced, and of two faster relays the fastest is taken; a race takes only
+  answers to its open round with its path's token; a direct link takes a faster address, relay-only stops a race
+  under way, and local handles aren't raced.
 
 ### peerwire-core over the simulator (`crates/peerwire-sim/tests/endpoint.rs`, `nat.rs`)
 
