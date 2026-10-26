@@ -3860,7 +3860,7 @@ mod tests {
                     due += eps[s].poll_timeout().is_some_and(|x| x <= t) as u32;
                     held_at = sess.held[0].until.as_micros() - RELAY_HOLD.as_micros() as u64;
                     let sent = sess.race.as_ref().unwrap().sent_at.as_micros();
-                    first = first.or((sent >= held_at).then_some(sent - held_at));
+                    first = first.or(sent.checked_sub(held_at));
                 }
                 let new = [events(&mut eps[0]), events(&mut eps[1])];
                 got += new[r].iter().filter(|e| matches!(e, Event::Message { .. })).count();
