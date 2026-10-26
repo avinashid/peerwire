@@ -99,9 +99,13 @@ function laneOf(lane) {
 }
 
 // Our presence as a frame, checked before anything stores it: one over the reliable
-// lane's limit would fail every later welcome, and so every later join.
+// lane's limit would fail every later welcome, and so every later join. JSON.stringify
+// gives undefined, not an error, for undefined, a function or a Symbol: that frame would
+// go out empty, no peer could parse it, and a room joining later would never list us.
 function presenceFrame(presence) {
-  const f = frame(T.Presence, enc.encode(JSON.stringify(presence)));
+  const json = JSON.stringify(presence);
+  if (json === undefined) throw new TypeError('presence must be a JSON value');
+  const f = frame(T.Presence, enc.encode(json));
   if (f.length > MAX_FRAME[Lane.Reliable]) throw tooLarge(f);
   return f;
 }

@@ -11,6 +11,8 @@
 // peer's outbox takes the frame. A lane other than 0, 1 or 2 throws TypeError (OUT-1a).
 // A presence over the limit is refused before it is stored (OUT-1b): setPresence keeps
 // the old one, joinRoom rejects, and a room that joins later still lists us both ways.
+// So is one JSON gives no text for (OUT-1c): undefined, a function or a Symbol went out
+// as an empty frame, which no peer could parse, so a room joining later never listed us.
 //
 //   node packages/js/test/room_drain.mjs
 import { joinRoom } from '../src/index.js';
@@ -136,9 +138,19 @@ check(set[0].startsWith('RangeError') && set[1].startsWith('TypeError') && a.get
   `setPresence of 1 MiB -> ${set[0]}; of a BigInt -> ${set[1].split(':')[0]}; getPresence() unchanged`);
 const join = await joinRoom({ ...opts, presence: huge }).then((r) => (r.leave(), 'joined'), (e) => `${e.name}: ${e.message}`);
 check(join.startsWith('RangeError'), `joinRoom({ presence: 1 MiB }) -> ${join}`);
-const d = await joinRoom(opts);
+const empty = [undefined, () => 0, Symbol('p')].map((p) => tried(() => a.setPresence(p)));
+check(empty.every((r) => r.startsWith('TypeError')) && a.getPresence() === mine,
+  `setPresence of undefined, a function, a Symbol -> ${[...new Set(empty.map((r) => r.split(':')[0]))].join(', ')}; getPresence() unchanged`);
+const asNull = tried(() => a.setPresence(null));
+check(asNull === 'no throw' && a.getPresence() === null, `setPresence(null) -> ${asNull}`);
+a.setPresence(mine);
+const joinFn = await joinRoom({ ...opts, presence: () => 0 }).then((r) => (r.leave(), 'joined'), (e) => `${e.name}: ${e.message}`);
+check(joinFn.startsWith('TypeError'), `joinRoom({ presence: () => 0 }) -> ${joinFn}`);
+const d = await joinRoom({ ...opts, presence: undefined });
 const listed = await until(() => a.peers.includes(d.self) && d.peers.includes(a.self), 15000);
 check(listed && !unhandled.length, `a room joined later: a and it list each other (${listed}); unhandled rejections: ${unhandled.join('; ') || 'none'}`);
+const seen = [JSON.stringify(d.getPresence(a.self)), JSON.stringify(a.getPresence(d.self))];
+check(seen[0] === JSON.stringify(mine) && seen[1] === '{}', `it sees a's presence ${seen[0]}; a sees its presence: undefined gave the default ${seen[1]}`);
 
 await Promise.all([a.leave(), b.leave(), c.leave(), d.leave()]);
 console.log(failed ? `${failed} FAILED` : 'room drain: all passed');
