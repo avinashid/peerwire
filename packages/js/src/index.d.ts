@@ -24,7 +24,8 @@ export interface SignalingAdapter {
   hello(meta?: unknown): void | Promise<void>;
   send(to: PeerId, body: unknown): void | Promise<void>;
   /** `from` must be the sender's PeerId, authenticated by the adapter (as the Nostr adapter's sealed messages are;
-   * BroadcastChannel is same-origin): WebRTC offers and answers, the signalling pipe and its stale drop all trust it. */
+   * BroadcastChannel is same-origin): WebRTC offers, answers, ICE candidates and restarts, retry requests, and the
+   * signalling pipe and its stale drop all trust it. */
   onMessage(fn: (from: PeerId, body: any) => void): void;
   close(): void;
 }
