@@ -52,11 +52,12 @@ Peerwire is **v0.1 and in early development**. The APIs will change, and nothing
 | `Node` / `AsyncNode`: UDP host, STUN, rooms, `MemoryHub` and Nostr signaling, NAT traversal | ✅ Working, tested |
 | Godot 4 `PeerwireMultiplayerPeer` (desktop) | ✅ Working, tested |
 | WebAssembly module and JS package (WebRTC transport, Nostr signaling) | ✅ Working, tested in headless browsers |
+| Shared documents in the JS package: `room.doc()` with maps, sets and logs (CRDT, catch-up for late joiners) | ✅ Working, tested |
 | Deterministic network simulator and multiplayer arena benchmark | ✅ Working |
 | Game layer: fixed-point maths, Hilbert islands, desync detection, lockstep | ✅ Working |
 | Mesh size limit and super-peers in the `Node` facade | 🚧 Planned |
 | mDNS and DHT signaling | 🚧 Planned |
-| `peerwire-sync` (CRDTs), `peerwire-media` (audio and video), `peerwire-store` (offline store-and-forward) | 🚧 Planned |
+| `peerwire-sync` (CRDTs in Rust and Godot), `peerwire-media` (audio and video), `peerwire-store` (offline store-and-forward) | 🚧 Planned |
 | Godot on Android, iOS and web; mobile bindings | 🚧 Planned |
 
 NAT behaviour is verified in a simulator that models RFC 4787 NAT types, and over public Nostr relays and STUN on
