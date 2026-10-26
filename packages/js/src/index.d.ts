@@ -238,8 +238,9 @@ export interface DocChange {
  * with the later Lamport stamp shows, then the higher writer. A `delete` removes the values its writer has seen,
  * so a set made elsewhere at the same time wins. */
 export interface DocMap {
-  /** True; false, with a warning, when members have filled the doc. Throws RangeError for a key over 256
-   * characters or a value over 64 KiB as JSON (or nested over 64 deep), TypeError for a value that isn't JSON. */
+  /** True; false, with a warning, when members have filled the doc or claimed every write of ours (see the README).
+   * Throws RangeError for a key over 256 characters or a value over 64 KiB as JSON (or nested over 64 deep),
+   * TypeError for a value that isn't JSON. */
   set(key: string, value: unknown): boolean;
   get(key: string): unknown;
   has(key: string): boolean;
@@ -251,7 +252,7 @@ export interface DocMap {
 
 /** Items, each with its own id; `delete(id)` removes one (undo: delete your item). */
 export interface DocSet {
-  /** The new item's id; null, with a warning, when members have filled the doc. Throws as `DocMap.set` does. */
+  /** The new item's id; null, with a warning, when `DocMap.set` would return false. Throws as it does. */
   add(value: unknown): string | null;
   get(id: string): unknown;
   has(id: string): boolean;
@@ -263,7 +264,7 @@ export interface DocSet {
 
 /** Append-only, keeping the newest `keep` entries. */
 export interface DocLog {
-  /** The new entry's id; null, with a warning, when members have filled the doc. Throws as `DocMap.set` does. */
+  /** The new entry's id; null, with a warning, when `DocMap.set` would return false. Throws as it does. */
   append(value: unknown): string | null;
   get(id: string): unknown;
   /** Oldest first, by Lamport stamp then writer: an entry appended after seeing another sorts after it. */
