@@ -50,7 +50,8 @@ export interface JoinRoomOptions {
    * - a factory returning your own adapter.
    */
   signaling?: 'local' | 'nostr' | ((ctx: SignalingContext) => SignalingAdapter);
-  /** Shared with every peer when it joins; change it with `room.setPresence`. Default `{}`. */
+  /** Shared with every peer when it joins; change it with `room.setPresence`. Default `{}`. `joinRoom` rejects
+   * one over 1 MiB as JSON (RangeError) or one JSON can't encode. */
   presence?: Presence;
   /** Queue events for `room.poll()`/`room.receive()` from the start; otherwise the first call starts the queue. */
   queue?: boolean;
@@ -124,7 +125,8 @@ export interface RoomEvents {
 export interface SendOptions {
   /** One peer or several; default every joined peer. */
   to?: PeerId | PeerId[];
-  /** Default `'reliable'`. */
+  /** Default `'reliable'`. A number must be 0, 1 or 2 (reliable, unreliable, urgent); anything else throws
+   * TypeError. */
   lane?: LaneName | number;
 }
 
@@ -140,7 +142,8 @@ export declare class Room {
   on<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): () => void;
   off<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): void;
   /** Sends to every joined peer, or to `to`. Returns how many peers it was queued for.
-   * Throws RangeError if the message can't fit the lane (unreliable: one datagram; urgent: 64 KiB). */
+   * Throws RangeError if the message can't fit the lane (reliable: 1 MiB; unreliable: one datagram; urgent:
+   * 64 KiB), also while earlier messages wait for the send window, and then sends it to no one. */
   send(data: RoomData, options?: SendOptions): number;
   /** `send` with positional arguments; `peer` '' or null sends to everyone. */
   sendTo(peer: PeerId | '' | null, data: RoomData, lane?: LaneName | number): number;
@@ -150,6 +153,7 @@ export declare class Room {
   receive(): RoomEvent | null;
   /** Our presence, or a joined peer's. */
   getPresence(peer?: PeerId): Presence | undefined;
+  /** Throws RangeError for a presence over 1 MiB as JSON (or JSON's own error), and keeps the old one. */
   setPresence(presence: Presence): void;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   /** How `peer` is reached: its own WebRTC link, a channel handed to `adoptChannel` (`adopted`), relayed by

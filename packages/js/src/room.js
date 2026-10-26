@@ -65,6 +65,11 @@ const PAGEHIDE_GRACE_MS = 20;
 const NOT_CONNECTED = -1;
 const TOO_LARGE = -2;
 const WOULD_BLOCK = -3;
+// The core's limit per lane on a message, here a frame (tag byte and data): reliable
+// Config::max_message, unreliable MAX_UNRELIABLE, urgent MAX_URGENT. write() checks it
+// itself, since a frame that waits in the outbox meets the core only in flush().
+const MAX_FRAME = { [Lane.Reliable]: 1 << 20, [Lane.Unreliable]: 1100, [Lane.Urgent]: 64 << 10 };
+const tooLarge = (f) => new RangeError(`message of ${f.length - 1} bytes is too large for this lane`);
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -85,10 +90,20 @@ function encode(data) {
   return frame(T.Json, enc.encode(JSON.stringify(data)));
 }
 
+// A lane by name or number. Only the three named ones: the core sends any other
+// number as unreliable, but MAX_FRAME wouldn't know its limit.
 function laneOf(lane) {
   const n = typeof lane === 'number' ? lane : LANES[lane];
-  if (n === undefined) throw new TypeError(`unknown lane ${lane}: use 'reliable', 'unreliable' or 'urgent'`);
+  if (n !== Lane.Reliable && n !== Lane.Unreliable && n !== Lane.Urgent) throw new TypeError(`unknown lane ${String(lane)}: use 'reliable', 'unreliable' or 'urgent' (0, 1 or 2)`);
   return n;
+}
+
+// Our presence as a frame, checked before anything stores it: one over the reliable
+// lane's limit would fail every later welcome, and so every later join.
+function presenceFrame(presence) {
+  const f = frame(T.Presence, enc.encode(JSON.stringify(presence)));
+  if (f.length > MAX_FRAME[Lane.Reliable]) throw tooLarge(f);
+  return f;
 }
 
 // A queued event: only strings, numbers, plain JSON values and ArrayBuffers.
@@ -123,6 +138,7 @@ export async function joinRoom({
   // A room dials every member, so relay-only (one WebRTC link, to the relay) can't apply.
   if (privacy !== 'direct' && privacy !== 'public-only') throw new TypeError(`joinRoom privacy must be 'direct' or 'public-only', not ${privacy}`);
   if (!['auto', 'peers', 'off'].includes(fallback)) throw new TypeError(`joinRoom fallback must be 'auto', 'peers' or 'off', not ${fallback}`);
+  presenceFrame(presence);
   const src = wasm ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url);
   const key = String(src);
   if (!modules.has(key)) modules.set(key, loadPeerwire(src).catch((e) => (modules.delete(key), Promise.reject(e))));
@@ -263,6 +279,7 @@ export class Room {
     const l = laneOf(lane);
     const f = encode(data);
     const targets = to === undefined ? this.peers : [to].flat().filter((p) => this.members.has(p));
+    // A message too large for the lane throws at the first target, before any is written.
     for (const p of targets) this.write(p, f, l);
     return targets.length;
   }
@@ -292,8 +309,8 @@ export class Room {
   }
 
   setPresence(presence) {
+    const f = presenceFrame(presence);
     this.me = presence;
-    const f = frame(T.Presence, enc.encode(JSON.stringify(presence)));
     for (const p of this.proven) this.write(p, f, Lane.Reliable);
   }
 
@@ -615,7 +632,11 @@ export class Room {
     if (member) this.emit('peer-leave', peer, reason);
   }
 
+  // Throws RangeError for a frame over its lane's limit before queueing or sending it,
+  // whether or not the outbox holds frames for `peer`: flush() could only drop it. A
+  // frame sent to several peers throws at the first, so none of them is sent it.
   write(peer, f, lane) {
+    if (f.length > MAX_FRAME[lane]) throw tooLarge(f);
     const q = this.outbox.get(peer);
     if (q) return void q.push([f, lane]);
     const r = this.endpoint.sendRetry(peer, f, lane);
@@ -623,7 +644,7 @@ export class Room {
       this.outbox.set(peer, [[f, lane]]);
       this.flushSoon();
     } else if (r === TOO_LARGE) {
-      throw new RangeError(`message of ${f.length - 1} bytes is too large for this lane`);
+      throw tooLarge(f);
     } else if (r < 0 && r !== NOT_CONNECTED) {
       throw new Error(`send failed (${r})`);
     }
