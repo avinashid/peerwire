@@ -1140,14 +1140,22 @@ impl<A: Address> Endpoint<A> {
     /// for 5 s. Then the link holds that relay off for a minute, twice as long each
     /// time it stalls the link again (up to 16 minutes): no probing it, answering a
     /// probe through it, or moving or falling back to it. A slow address is never
-    /// punched to, and a relay never forwards to a peer linked only over its slow
-    /// address. Ignored for a peer that isn't linked.
+    /// punched to or raced (marked during a race, it leaves it; the link's own path
+    /// marked, the race ends), and a relay never forwards to a peer linked only over
+    /// its slow address. Ignored for a peer that isn't linked.
     pub fn set_slow(&mut self, peer: &PeerId, addr: Option<A>) {
         let Some(sess) = self.peers.get(peer).and_then(|i| self.sessions.get_mut(i)) else { return };
         sess.candidates.retain(|c| Some(c) != addr.as_ref()); // a dial's own target is one
         sess.slow = addr;
         if matches!(sess.path, Path::Direct(_)) && !sess.on_slow() {
             sess.punch = None; // a probe of relays, and the path isn't slow any more
+        }
+        // Nor raced: a race on the slow address ends.
+        if let Some(rc) = &mut sess.race {
+            rc.alts.retain(|a| !on_slow(&a.path, &sess.slow));
+            if on_slow(&sess.path, &sess.slow) {
+                (rc.alts, rc.rounds, rc.open) = (Vec::new(), 0, false);
+            }
         }
     }
 
@@ -3482,6 +3490,47 @@ mod tests {
         net.run(&mut eps, &mut t, 10_000, lan);
         assert_eq!(eps[0].path(&b), Some(&Path::Direct(12)));
         assert_eq!((eps[0].stats().path_probes, eps[1].stats().path_probes), (0, 0));
+    }
+
+    /// FL3-2: an address marked slow during a race is raced no more. As in
+    /// `a_direct_link_takes_a_faster_address`, once the race is on each end marks the
+    /// other's LAN address slow: the link stays on the public ones, and nothing more
+    /// goes to the LAN ones. Marking the link's own path slow instead ends the race.
+    #[test]
+    fn an_address_marked_slow_during_a_race_is_raced_no_more() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b) = (ids[0].peer_id(), ids[1].peer_id());
+        let to_lan = std::cell::Cell::new(0);
+        let lan = |i: usize, dst: u32| match dst {
+            1 | 2 => Some((dst as usize - 1, i as u32 + 1, 30)),
+            11 | 12 => {
+                to_lan.set(to_lan.get() + 1);
+                Some((dst as usize - 11, i as u32 + 11, 2))
+            }
+            _ => None,
+        };
+        for own in [false, true] {
+            let mut eps: Vec<Endpoint<u32>> =
+                ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+            let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+            eps[0].connect(t, 2, b).unwrap();
+            net.run(&mut eps, &mut t, 500, lan);
+            eps[0].add_candidates(t, &b, &[12]);
+            eps[1].add_candidates(t, &a, &[11]);
+            net.run(&mut eps, &mut t, 10, lan);
+            assert_eq!(eps[1].stats().path_probes, 2, "a round at once: b's path and the LAN address");
+            let (slow_a, slow_b) = if own { (2, 1) } else { (12, 11) };
+            eps[0].set_slow(&b, Some(slow_a));
+            eps[1].set_slow(&a, Some(slow_b));
+            let (sent, probes) = (to_lan.get(), [0, 1].map(|i| eps[i].stats().path_probes));
+            net.run(&mut eps, &mut t, 30_000, lan);
+            assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(2)), Some(&Path::Direct(1))));
+            if own {
+                assert_eq!([0, 1].map(|i| eps[i].stats().path_probes), probes, "the race ended");
+            } else {
+                assert_eq!(to_lan.get(), sent, "datagrams to a slow address");
+            }
+        }
     }
 
     /// Of two relays clearly faster than the link's, winning the same rounds, the
