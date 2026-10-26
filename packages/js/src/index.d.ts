@@ -140,7 +140,8 @@ export declare class Room {
   on<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): () => void;
   off<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): void;
   /** Sends to every joined peer, or to `to`. Returns how many peers it was queued for.
-   * Throws RangeError if the message can't fit the lane (unreliable: one datagram; urgent: 64 KiB). */
+   * Throws RangeError if the message can't fit the lane (reliable: 1 MiB; unreliable: one datagram; urgent:
+   * 64 KiB), also while earlier messages wait for the send window, and then sends it to no one. */
   send(data: RoomData, options?: SendOptions): number;
   /** `send` with positional arguments; `peer` '' or null sends to everyone. */
   sendTo(peer: PeerId | '' | null, data: RoomData, lane?: LaneName | number): number;
