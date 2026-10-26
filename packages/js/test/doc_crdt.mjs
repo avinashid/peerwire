@@ -831,8 +831,59 @@ console.log('claims past the 16 incarnations: an entry on our next dot is never 
   const c = net.node('c');
   net.link(b, c);
   c.doc.set('s').add('new writer');
-  net.run();
+  net.run(1e4); // were the writes refused, asks for them would go on every 15 s
   if (b.doc.set('s').entries().length !== 2) fail(`a full context refused writes: ${JSON.stringify(b.doc.set('s').entries())}`);
 }
 console.log('context caps: writers and ranges stay capped and new writers are still heard');
+
+// A member's frame costs about one pass over what it names. Three shapes from the security review (DOC-3), each
+// timed against taking a frame of 16384 set items into an empty doc (the best of 3 runs each, so the host's load
+// counts alike), must stay within a few times it, where walking what the doc holds again for each item made them
+// 6 to 60 times: 16384 copies of a dead range over a writer's 9000 entries (within 3 times), 16384 entries into
+// a log that keeps 5000 (5, as each goes in and out), and dead ranges naming 16000 fresh writers into a context
+// of 1000 writers with live entries (3).
+{
+  const peer = id('e');
+  const w = peer + '0badc10c';
+  const host = { self: id('a'), peers: () => [peer], send: () => {}, after: () => () => {}, now: () => 0 };
+  const best = (make) => {
+    let t = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const [doc, frame] = make();
+      const t0 = performance.now();
+      doc.receive(peer, frame);
+      t = Math.min(t, performance.now() - t0);
+    }
+    return t;
+  };
+  const items = (n, from, t = 's') => Array.from({ length: n }, (_, i) => [0, from + i, from + i, t, t, null, 0]);
+  const base = best(() => [new Doc('board', host), { d: 'board', t: 1, ws: [w], e: items(16384, 1) }]);
+  const shapes = {
+    'dead ranges over held entries': [3, () => {
+      const doc = new Doc('board', host);
+      doc.receive(peer, { d: 'board', t: 1, ws: [w], e: items(9000, 1) });
+      return [doc, { d: 'board', t: 1, ws: [w], x: Array.from({ length: 16384 }, () => [0, 9001, 17999]) }];
+    }],
+    'log entries past keep': [5, () => {
+      const doc = new Doc('board', host);
+      doc.log('l', { keep: 5000 });
+      doc.receive(peer, { d: 'board', t: 1, ws: [w], e: items(5000, 1, 'l') });
+      return [doc, { d: 'board', t: 1, ws: [w], e: items(16384, 5001, 'l') }];
+    }],
+    'fresh writers into a full context': [3, () => {
+      const doc = new Doc('board', host);
+      const ws = Array.from({ length: 1000 }, (_, i) => peer + i.toString(16).padStart(8, '0'));
+      doc.receive(peer, { d: 'board', t: 1, ws, e: ws.map((_, i) => [i, 1, 1, 's', 's', null, 0]) });
+      const fresh = Array.from({ length: 16000 }, (_, i) => 'd' + i.toString(16).padStart(71, '0'));
+      return [doc, { d: 'board', t: 1, ws: fresh, x: fresh.map((_, i) => [i, 1, 1]) }];
+    }],
+  };
+  const got = [];
+  for (const [what, [limit, make]] of Object.entries(shapes)) {
+    const t = best(make);
+    got.push(`${what} ${t.toFixed(0)} ms`);
+    if (t > limit * base) fail(`${what}: ${t.toFixed(0)} ms, ${(t / base).toFixed(1)} times a frame of 16384 items (${base.toFixed(0)} ms)`);
+  }
+  console.log(`frame cost: ${got.join(', ')}; a frame of 16384 items ${base.toFixed(0)} ms`);
+}
 console.log('all doc CRDT checks passed');

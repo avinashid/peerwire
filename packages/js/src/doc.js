@@ -91,6 +91,34 @@ const peerOf = (w) => w.slice(0, 64);
 // Whether entry a sorts after entry b: the later stamp, then the higher writer, then the later dot.
 const after = (a, b) => a.c > b.c || (a.c === b.c && (a.w > b.w || (a.w === b.w && a.n > b.n)));
 const byStamp = (a, b) => (after(a, b) ? 1 : after(b, a) ? -1 : 0);
+
+// A binary heap of entries, the one sorting first on top: a log's, so trimming one costs log n.
+function heapPush(h, e) {
+  let i = h.push(e) - 1;
+  while (i > 0) {
+    const p = (i - 1) >> 1;
+    if (!after(h[p], e)) break;
+    h[i] = h[p];
+    i = p;
+  }
+  h[i] = e;
+}
+
+function heapPop(h) {
+  const top = h[0];
+  const last = h.pop();
+  if (h.length) {
+    let i = 0;
+    for (let c = 1; c < h.length; c = 2 * i + 1) {
+      if (c + 1 < h.length && after(h[c], h[c + 1])) c++;
+      if (!after(last, h[c])) break;
+      h[i] = h[c];
+      i = c;
+    }
+    h[i] = last;
+  }
+  return top;
+}
 const validName = (s) => typeof s === 'string' && s.length >= 1 && s.length <= MAX_NAME_LENGTH;
 const validKey = (k) => typeof k === 'string' && k.length <= MAX_KEY_LENGTH;
 function collection(name) {
@@ -276,6 +304,7 @@ export class Doc {
     this.newIncarnation();
     this.handlers = new Set();
     this.touched = new Map(); // changes during one frame or write: ref -> { coll, ref, before }
+    this.idle = new Set(); // writers the context holds with no live entry, longest idle first
     this.members = new Map(); // peer -> { answers, asks, chars, theirs, answerWait, askWait }
     this.queue = []; // members to ask, in turn
     this.asking = null; // the member asked, until its answer ends or ASK_WAIT_MS passes
@@ -474,9 +503,11 @@ export class Doc {
 
   // Joins frame `f` into the doc. Its entries and dead ranges never share a dot, so their order doesn't
   // matter, and 'change' compares each key or item before and after the whole frame.
+  // A member's frame costs about one pass over what it names: dead ranges are merged per writer first, so a
+  // writer's entries are walked once.
   apply(f, peer) {
     for (const x of f.entries) this.put(x, f.t === DELTA && peer);
-    for (const [w, a, b] of f.ranges) this.kill(w, a, b);
+    for (const [w, l] of Context.of(f.ranges).writers) this.kill(w, l);
   }
 
   put(x, sender) {
@@ -502,22 +533,30 @@ export class Doc {
     if (e.t === 'l') this.trim(this.colls.get('l' + e.coll));
   }
 
-  // Dots a to b of writer w are dead: entries of theirs we hold go, except a log's, which only its own
-  // `keep` trims (members may keep different lengths).
-  kill(w, a, b) {
-    if (w === this.writer && b > this.n) this.claimed = true;
+  // The dots in ranges `l` of writer w (sorted and apart) are dead: entries of theirs we hold go, except a
+  // log's, which only its own `keep` trims (members may keep different lengths). Walks the fewer of the dots
+  // named and the entries held.
+  kill(w, l) {
+    if (w === this.writer && l[l.length - 1][1] > this.n) this.claimed = true;
     const held = this.byWriter.get(w);
     if (held) {
-      if (b - a < held.size) {
-        for (let n = a; n <= b; n++) {
-          const e = held.get(n);
-          if (e && e.t !== 'l') this.drop(e);
+      let dots = 0;
+      for (const [a, b] of l) dots += b - a + 1;
+      if (dots < held.size) {
+        for (const [a, b] of l) {
+          for (let n = a; n <= b; n++) {
+            const e = held.get(n);
+            if (e && e.t !== 'l') this.drop(e);
+          }
         }
       } else {
-        for (const [n, e] of [...held]) if (n >= a && n <= b && e.t !== 'l') this.drop(e);
+        for (const [n, e] of [...held]) {
+          const i = seek(l, n);
+          if (i < l.length && l[i][0] <= n && e.t !== 'l') this.drop(e);
+        }
       }
     }
-    this.record(w, a, b);
+    for (const [a, b] of l) this.record(w, a, b);
   }
 
   drop(e) {
@@ -531,6 +570,7 @@ export class Doc {
     if (!this.room(w, a, b)) this.makeRoom(w);
     if (!this.room(w, a, b)) return false;
     this.ctx.add(w, a, b);
+    if (!this.byWriter.has(w)) this.idle.add(w);
     return true;
   }
 
@@ -539,13 +579,15 @@ export class Doc {
     return writers && (this.ctx.size < MAX_RANGES || this.ctx.touches(w, a, b));
   }
 
-  // A full context forgets what matters least: first the writers with no live entry (oldest first), then the
-  // highest range of the writer with the most. A forgotten dead dot can come back from a member that missed
-  // its deletion; nothing else is lost.
+  // A full context forgets what matters least: first the writers with no live entry (longest idle first, kept
+  // in `idle` so finding them costs nothing), then the highest range of the writer with the most. A forgotten
+  // dead dot can come back from a member that missed its deletion; nothing else is lost.
   makeRoom(keep) {
-    for (const w of this.ctx.writers.keys()) {
+    for (const w of this.idle) {
       if (this.ctx.writers.size < MAX_WRITERS && this.ctx.size < MAX_RANGES) return;
-      if (w !== keep && w !== this.writer && !this.byWriter.has(w)) this.ctx.drop(w);
+      if (w === keep || w === this.writer) continue;
+      this.ctx.drop(w);
+      this.idle.delete(w);
     }
     while (this.ctx.size >= MAX_RANGES) {
       let most = null;
@@ -558,7 +600,7 @@ export class Doc {
   collection(t, name, create) {
     let coll = this.colls.get(t + name);
     if (!coll && create) {
-      coll = { t, name, keys: t === 'm' ? new Map() : null, items: t === 'm' ? null : new Map(), keep: this.keeps.get(name) ?? DEFAULT_KEEP, list: null };
+      coll = { t, name, keys: t === 'm' ? new Map() : null, items: t === 'm' ? null : new Map(), heap: t === 'l' ? [] : null, keep: this.keeps.get(name) ?? DEFAULT_KEEP, list: null };
       this.colls.set(t + name, coll);
     }
     return coll;
@@ -569,7 +611,10 @@ export class Doc {
     this.touch(coll, e.t === 'm' ? e.k : e.id);
     this.entries.set(e.id, e);
     let held = this.byWriter.get(e.w);
-    if (!held) this.byWriter.set(e.w, (held = new Map()));
+    if (!held) {
+      this.byWriter.set(e.w, (held = new Map()));
+      this.idle.delete(e.w);
+    }
     held.set(e.n, e);
     this.length += e.len;
     if (e.t === 'm') {
@@ -578,6 +623,7 @@ export class Doc {
       else coll.keys.set(e.k, [e]);
     } else {
       coll.items.set(e.id, e);
+      if (e.t === 'l') heapPush(coll.heap, e);
     }
     coll.list = null;
   }
@@ -588,7 +634,10 @@ export class Doc {
     this.entries.delete(e.id);
     const held = this.byWriter.get(e.w);
     held.delete(e.n);
-    if (!held.size) this.byWriter.delete(e.w);
+    if (!held.size) {
+      this.byWriter.delete(e.w);
+      if (this.ctx.writers.has(e.w)) this.idle.add(e.w);
+    }
     this.length -= e.len;
     if (e.t === 'm') {
       const list = coll.keys.get(e.k);
@@ -601,13 +650,10 @@ export class Doc {
     if (!coll.keys?.size && !coll.items?.size) this.colls.delete(e.t + e.coll);
   }
 
-  // Trims a log to its newest `keep` entries.
+  // Trims a log to its newest `keep` entries. Trimming is the only way a log's entries go, so its heap holds
+  // exactly its items, oldest on top.
   trim(coll) {
-    while (coll && coll.items.size > coll.keep) {
-      let oldest = null;
-      for (const e of coll.items.values()) if (!oldest || after(oldest, e)) oldest = e;
-      this.remove(oldest);
-    }
+    while (coll && coll.items.size > coll.keep) this.remove(heapPop(coll.heap));
   }
 
   // What a map key shows: of its values, the one that sorts last.

@@ -519,7 +519,10 @@ Run these with Node and the Playwright install on this host:
   - Lamport stamps moved far ahead (by 2^32 four times, or to 2^53 - 1): a member cut off meanwhile and one that
     joins after still converge, and so do a member's writes after a jump sent to it alone;
   - claims on a member's future writes, also past its 16 moves: an entry forged on its next write is never held
-    and the doc stays whole, and with every write claimed its writes warn and return false or null.
+    and the doc stays whole, and with every write claimed its writes warn and return false or null;
+  - what one member frame costs: 16384 copies of a dead range over 9000 entries, 16384 entries into a log
+    that keeps 5000, and 16000 fresh writers into a full context, each timed against a frame of 16384 items
+    (within 3 to 5 times it).
 - `node packages/js/test/room_doc.mjs`: `room.doc()` with three members in a real `'local'` room: they converge, a
   doc opened late and a fourth member catch up, doc frames never show as messages, writes outlive their writer,
   and leaving closes docs.
