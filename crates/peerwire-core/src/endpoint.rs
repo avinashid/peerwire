@@ -52,7 +52,8 @@ const PATH_ROUNDS: u32 = 5;
 /// at most the link's. One that is so in `PATH_WINS` rounds of a race is taken.
 const PATH_MARGIN: u64 = 15_000;
 const PATH_WINS: u32 = 3;
-/// No path is taken for being faster within this of the last one.
+/// No path is taken for being faster within this of the last one; then the two
+/// are raced once more, so a move won on lost probes goes back.
 const PATH_DWELL: Duration = Duration::from_secs(20);
 /// For this long after taking a faster path, until the peer is heard on it, the
 /// end that took it doesn't follow the peer's packets on others: they left before
@@ -443,6 +444,9 @@ struct Race<A> {
     /// `on`'s RTT this round, in µs (as all RTTs of the race).
     own: Option<u64>,
     alts: Vec<Alt<A>>,
+    /// When to race once more: `PATH_DWELL` after the link took `on` for being
+    /// faster, so a move won on lost probes goes back.
+    again: Option<Instant>,
 }
 
 struct Alt<A> {
@@ -695,6 +699,7 @@ impl<A: Address> Session<A> {
                     open: false,
                     own: None,
                     alts: Vec::new(),
+                    again: None,
                 };
                 if let Some(o) = old {
                     rc.next_at = o.next_at;
@@ -2175,7 +2180,11 @@ impl<A: Address> Endpoint<A> {
                         // so is a relay held off (it stalled the link), which isn't probed: others win.
                         let quiet = sess.last_path + self.config.keepalive + PATH_GAP;
                         let held = matches!(&sess.path, Path::Via(r) if holds(&sess.held, r, now));
-                        if rc.rounds == 0 && !rc.open && !rc.alts.is_empty() && (now >= quiet || held) {
+                        let again = rc.again.is_some_and(|a| now >= a);
+                        if again {
+                            rc.again = None;
+                        }
+                        if rc.rounds == 0 && !rc.open && !rc.alts.is_empty() && (now >= quiet || held || again) {
                             rc.start();
                         }
                         if (rc.rounds > 0 || rc.open) && now >= rc.next_at {
@@ -2301,6 +2310,8 @@ impl<A: Address> Endpoint<A> {
             mark_ready(&mut self.ready, idx, link);
             self.stats.path_switches += 1;
             self.events.push_back(Event::PathChanged { peer: sess.peer, path: to });
+            // The path left is raced against this one once more after the dwell.
+            sess.race(direct, max).again = Some(now + PATH_DWELL);
         }
         for idx in unrelayed {
             self.back_to_slow(idx, now);
@@ -2375,6 +2386,9 @@ impl<A: Address> Endpoint<A> {
                     match &sess.race {
                         _ if self.relay_only => {}
                         Some(rc) if rc.on == sess.path => {
+                            if let Some(a) = rc.again {
+                                min(a);
+                            }
                             if rc.rounds > 0 || rc.open {
                                 min(rc.next_at);
                             } else if !rc.alts.is_empty() {
@@ -3599,6 +3613,7 @@ mod tests {
             open: true,
             own: None,
             alts: Vec::new(),
+            again: None,
         };
         rc.add(Path::Direct(5u32), 8);
         let t = Instant::from_millis(31);
@@ -3836,5 +3851,60 @@ mod tests {
             let by = RELAY_STALL.max(Duration::from_secs(down)) + PATH_GAP * (PATH_WINS + 1);
             assert!(left < by, "sent by {s}, c down {down} s: left d after {left:?}");
         }
+    }
+
+    /// A path taken for being faster is raced against the one left once more after
+    /// the dwell, so a move won on lost probes goes back and a genuine one stays. a
+    /// and b take e (1 ms a hop) from c (40 ms); past the dwell, d (10 ms) is offered
+    /// while everything over e is lost, so d answers and e doesn't, and b takes d.
+    /// `PATH_DWELL` later e wins the race on d, and b takes it back; a follows each
+    /// time. Neither move to e is undone by its own race once more.
+    #[test]
+    fn a_move_won_on_lost_probes_goes_back_after_the_dwell() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, _, d, e] = p;
+        assert!(b < a);
+        let lose_e = std::cell::Cell::new(false);
+        let hop = |i: usize, dst: u32| {
+            if lose_e.get() && ((i < 2 && dst == 5) || (i == 4 && dst < 3)) {
+                return None;
+            }
+            five(i, dst)
+        };
+        // Runs for `ms`, noting when each end moved, and where.
+        let mut moved = [Vec::new(), Vec::new()];
+        let mut run = |eps: &mut [Endpoint<u32>], t: &mut Instant, ms: u64| {
+            for _ in 0..ms / 10 {
+                net.run(eps, t, 10, hop);
+                for (m, ep) in moved.iter_mut().zip(eps.iter_mut()) {
+                    m.extend(moves(&events(ep)).into_iter().map(|p| (*t, p)));
+                }
+            }
+        };
+        eps[0].add_relay(t, e, &b);
+        eps[1].add_relay(t, e, &a);
+        run(&mut eps, &mut t, 40_000);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(e)), Some(&Path::Via(e))));
+        lose_e.set(true);
+        eps[0].add_relay(t, d, &b);
+        eps[1].add_relay(t, d, &a);
+        for _ in 0..1_000 {
+            if eps[1].path(&a) == Some(&Path::Via(d)) {
+                break;
+            }
+            run(&mut eps, &mut t, 10);
+        }
+        lose_e.set(false);
+        run(&mut eps, &mut t, 60_000);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(e)), Some(&Path::Via(e))));
+        let paths = |m: &[(Instant, Path<u32>)]| m.iter().map(|x| x.1.clone()).collect::<Vec<_>>();
+        let went = vec![Path::Via(e), Path::Via(d), Path::Via(e)];
+        assert_eq!((paths(&moved[0]), paths(&moved[1])), (went.clone(), went), "{moved:?}");
+        assert_eq!((eps[0].stats().path_switches, eps[1].stats().path_switches), (0, 3));
+        // e won the first `PATH_WINS` rounds, the first sent as the dwell ended (to a step).
+        let back = moved[1][2].0 - moved[1][1].0;
+        let due = PATH_DWELL + PATH_GAP * PATH_WINS;
+        assert!(back >= due && back < due + Duration::from_millis(10), "{back:?}");
     }
 }
