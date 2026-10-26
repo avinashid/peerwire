@@ -275,9 +275,11 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
      `failed`, the dialling side renegotiates with new ICE credentials, so ICE gathers the
      new network's addresses and checks again; the other side asks it to. The DataChannel
      and the Peerwire session over it carry on, so the app sees no leave. At most 3 tries
-     (2, 4, 8 s apart) until ICE connects again. `online` and `navigator.connection`
+     a minute (2, 4, 8 s apart), whether or not ICE connects in between; while it stays
+     down, the next waits for the minute to free. `online` and `navigator.connection`
      changes restart links whose ICE is down at once. Each restart is an offer and an
-     answer over signalling.
+     answer over signalling, within the peer's publish budget (6 at once, then 1 per 5 s;
+     the candidates of an answer it refused wait with it).
 2. **Through another member.** When a link isn't open `fallbackMs` (8 s) after its
    offer, or its ICE fails, the dialling side dials the peer again through every member
    it has a direct link to, including members that link later. The core forwards for
@@ -414,7 +416,11 @@ Run these with Node and the Playwright install on this host:
   signalling relays. A peer looping `restart` asks (answering each, ICE reconnecting) gets
   3 restarts; an offer and 200 copies of it, or 50 new offers from a linked peer, get 6
   answers (the per-peer budget: 6 at once, then 1 per 5 s; the rest counted in
-  `throttled`); a genuine ICE failure still restarts, on either side.
+  `throttled`), and only those answers' candidates (`ice` or `ice-batch`); a copy of the
+  offer releases a held answer, made again with the candidates found meanwhile; a copy of
+  a new offer never gets the last one's answer; a genuine ICE failure still restarts, on
+  either side; a minute after the 3rd restart a 4th goes through, by itself if ICE is
+  still down.
 - `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
   DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
   the outage still arrives after it, by retransmit.
