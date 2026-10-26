@@ -114,7 +114,9 @@ workspace first and takes several times that. With no Rust change since `origin/
   does, isn't taken; one faster still waits out the 20 s dwell; the relays probed with the first to answer, and a
   relay offered at one end only, are raced, and of two faster relays the fastest is taken; a race takes only
   answers to its open round with its path's token; a direct link takes a faster address, relay-only stops a race
-  under way, and local handles aren't raced.
+  under way, and local handles aren't raced; the leader leaves a relay that stops answering (12 s quiet, then 3
+  rounds where only the other relay answers) and the link lives on; after a punch upgrade a packet sealed before
+  the answer doesn't roam the link (FL3-1). `Net` runs each endpoint's timers only when its `poll_timeout` is due.
 
 ### peerwire-core over the simulator (`crates/peerwire-sim/tests/endpoint.rs`, `nat.rs`)
 

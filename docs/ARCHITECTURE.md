@@ -55,8 +55,9 @@ over a signaling carrier, and simultaneous dials. See [NAT-TRAVERSAL.md](NAT-TRA
 6. **Take the fastest path of a kind.** A link races the other paths it has of its own kind: its other direct
    addresses (LAN or public, IPv4 or IPv6, when addresses are network addresses) or, while relayed, the other
    relays offered for it or seen carrying the peer's probes. A round sends a sealed PUNCH down each, its own path
-   too, at once, every 2 s for 5 rounds; a path at least 15 ms and a fifth faster in 3 rounds is taken by the end
-   with the smaller PeerId, at most once in 20 s, and the other end follows its packets there. A peer answers a
+   too, at once, every 2 s for 5 rounds, again whenever the path in use carries nothing for 12 s; a path at least
+   15 ms and a fifth faster in 3 rounds, or answering when the path in use doesn't, is taken by the end with the
+   smaller PeerId, at most once in 20 s, and the other end follows its packets there. A peer answers a
    probe through a relay only if it would follow there. A direct path never gives way to a relay this way, nor a
    relay to the slow address. `path_rtt` (`pw_path_rtt_us`, JS `route(peer).rttMs`) is the RTT over the path in
    use.

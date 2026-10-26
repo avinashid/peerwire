@@ -457,13 +457,18 @@ impl<A: Address> Race<A> {
     fn add(&mut self, path: Path<A>, max: usize) {
         if path != self.on && !self.alts.iter().any(|a| a.path == path) && self.alts.len() < max {
             self.alts.push(Alt { path, rtt: None, wins: 0 });
-            if self.rounds == 0 && !self.open {
-                for a in &mut self.alts {
-                    a.wins = 0;
-                }
-            }
-            self.rounds = PATH_ROUNDS;
+            self.start();
         }
+    }
+
+    /// Races for `PATH_ROUNDS` rounds more; a race that was over starts afresh.
+    fn start(&mut self) {
+        if self.rounds == 0 && !self.open {
+            for a in &mut self.alts {
+                a.wins = 0;
+            }
+        }
+        self.rounds = PATH_ROUNDS;
     }
 
     /// Takes an answer with `token` back over `from` to the open round; returns its
@@ -486,19 +491,19 @@ impl<A: Address> Race<A> {
         None
     }
 
-    /// Scores the open round: a path clearly faster than `on` in it wins it. Returns
-    /// the fastest in it of those with `PATH_WINS` wins, and its RTT.
+    /// Scores the open round: a path clearly faster than `on` in it, or answered
+    /// when `on` wasn't, wins it. Returns the fastest in it of those with
+    /// `PATH_WINS` wins, and its RTT.
     fn score(&mut self) -> Option<(Path<A>, u64)> {
         self.open = false;
         let own = self.own.take();
         let mut best: Option<(Path<A>, u64)> = None;
         for a in &mut self.alts {
-            if let (Some(o), Some(r)) = (own, a.rtt.take()) {
-                if r + PATH_MARGIN.max(o / 5) <= o {
-                    a.wins += 1;
-                    if a.wins >= PATH_WINS && best.as_ref().is_none_or(|b| r < b.1) {
-                        best = Some((a.path.clone(), r));
-                    }
+            let Some(r) = a.rtt.take() else { continue };
+            if own.is_none_or(|o| r + PATH_MARGIN.max(o / 5) <= o) {
+                a.wins += 1;
+                if a.wins >= PATH_WINS && best.as_ref().is_none_or(|b| r < b.1) {
+                    best = Some((a.path.clone(), r));
                 }
             }
         }
@@ -907,13 +912,14 @@ impl<A: Address> Endpoint<A> {
     /// when addresses are network addresses, `Config::share_addresses`), or, while
     /// relayed, the relays offered for it ([`add_relay`](Endpoint::add_relay)) or that
     /// carried the peer's probes. A race is up to 5 rounds, 2 s apart, of a sealed
-    /// probe on each path at once, the link's too; it starts when a path turns up or
-    /// the link changes kind. A path at least 15 ms and a fifth faster than the
-    /// link's in 3 rounds is taken (`PathChanged`), at most once in 20 s, by the end
-    /// with the smaller PeerId; the other follows. A direct path never gives way to a
-    /// relay this way, nor a relay to the slow address ([`set_slow`](Endpoint::set_slow)),
-    /// and a peer answers a probe through a relay only if it would follow there. No
-    /// races while relay-only.
+    /// probe on each path at once, the link's too; it starts when a path turns up,
+    /// the link changes kind, or its path has carried nothing for `keepalive` plus
+    /// 2 s. A path at least 15 ms and a fifth faster than the link's in 3 rounds, or
+    /// answering when the link's path doesn't, is taken (`PathChanged`), at most
+    /// once in 20 s, by the end with the smaller PeerId; the other follows. A direct
+    /// path never gives way to a relay this way, nor a relay to the slow address
+    /// ([`set_slow`](Endpoint::set_slow)), and a peer answers a probe through a relay
+    /// only if it would follow there. No races while relay-only.
     pub fn path_rtt(&self, peer: &PeerId) -> Option<Duration> {
         self.sessions.get(self.peers.get(peer)?)?.path_rtt.map(Duration::from_micros)
     }
@@ -2154,6 +2160,11 @@ impl<A: Address> Endpoint<A> {
                     }
                     // A latency race's next round: the last one scored, then the next sent.
                     if let (Some(rc), true) = (&mut sess.race, racing) {
+                        // A path gone quiet is raced again, so the leader can leave it for one that answers.
+                        let quiet = sess.last_path + self.config.keepalive + PATH_GAP;
+                        if rc.rounds == 0 && !rc.open && !rc.alts.is_empty() && now >= quiet {
+                            rc.start();
+                        }
                         if (rc.rounds > 0 || rc.open) && now >= rc.next_at {
                             // The leader takes a winner, once the dwell is over: until then it races on.
                             if let Some((to, rtt)) = rc.score().filter(|_| self.me < sess.peer) {
@@ -2335,6 +2346,8 @@ impl<A: Address> Endpoint<A> {
                         Some(rc) if rc.on == sess.path => {
                             if rc.rounds > 0 || rc.open {
                                 min(rc.next_at);
+                            } else if !rc.alts.is_empty() {
+                                min(sess.last_path + self.config.keepalive + PATH_GAP);
                             }
                         }
                         _ => min(sess.last_path),
@@ -3161,7 +3174,8 @@ mod tests {
     struct Net(Vec<(Instant, usize, u32, Vec<u8>)>);
 
     impl Net {
-        /// Runs `eps` for `ms` from `t` in 1 ms steps, timers every step. `hop(i, dst)`
+        /// Runs `eps` for `ms` from `t` in 1 ms steps, each endpoint's timers when its
+        /// `poll_timeout` is due, as a host runs them. `hop(i, dst)`
         /// says where endpoint i's datagram to `dst` goes: to endpoint j, from address
         /// `src`, `delay` ms later; or nowhere.
         fn run(
@@ -3187,7 +3201,9 @@ mod tests {
                     eps[j].handle_datagram(now, src, &data);
                 }
                 for ep in eps.iter_mut() {
-                    ep.handle_timeout(now);
+                    if ep.poll_timeout().is_some_and(|d| d <= now) {
+                        ep.handle_timeout(now);
+                    }
                 }
             }
         }
@@ -3613,5 +3629,41 @@ mod tests {
         eps[0].handle_datagram(t, 12, &fresh);
         assert_eq!(eps[0].path(&b), Some(&Path::Direct(12)));
         assert_eq!(events(&mut eps[0]), vec![Event::PathChanged { peer: b, path: Path::Direct(12) }]);
+    }
+
+    /// The leader leaves a relay that stops answering for one that does: a and b on d
+    /// (taken for being faster, c raced too), with no slow address to go back to nor
+    /// any direct path (as two symmetric NATs), and d drops everything. 12 s after d
+    /// last carried anything, the race starts again;
+    /// c answers and d doesn't, so b takes c (after the dwell) and a follows, and the
+    /// link lives on.
+    #[test]
+    fn the_leader_leaves_a_relay_that_stops_answering() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, c, d, _] = p;
+        eps[0].add_relay(t, d, &b);
+        eps[1].add_relay(t, d, &a);
+        net.run(&mut eps, &mut t, 10_000, five);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(d)), Some(&Path::Via(d))));
+        let apart = |i: usize, dst: u32| if i < 2 && dst < 3 { None } else { five(i, dst) };
+        eps[0].set_slow(&b, None);
+        eps[1].set_slow(&a, None);
+        net.run(&mut eps, &mut t, 1_000, apart);
+        events(&mut eps[0]);
+        events(&mut eps[1]);
+        let dead = |i: usize, dst: u32| if i == 3 || dst == 4 { None } else { apart(i, dst) };
+        let killed = t;
+        net.run(&mut eps, &mut t, 5_000, dead);
+        let due = eps[1].poll_timeout().unwrap();
+        assert!(due <= killed + Duration::from_secs(11) + PATH_GAP, "wakes for the quiet path: {due:?}");
+        net.run(&mut eps, &mut t, 35_000, dead);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+        let (ga, gb) = (events(&mut eps[0]), events(&mut eps[1]));
+        let lost = |g: &[Event<u32>], peer: PeerId| {
+            g.iter().any(|e| matches!(e, Event::Disconnected { peer: q, .. } if *q == peer))
+        };
+        assert!(!lost(&ga, b) && !lost(&gb, a), "{ga:?} {gb:?}");
+        assert_eq!((moves(&ga), moves(&gb)), (vec![Path::Via(c)], vec![Path::Via(c)]));
     }
 }
