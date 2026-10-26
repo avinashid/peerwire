@@ -35,9 +35,10 @@ const SPRAY_RANGE: u32 = 65536 - SPRAY_LOW;
 const RELAY_ROUNDS: u32 = 5;
 /// Most relays probed at once for one link, and held off at once.
 const MAX_RELAYS: usize = 8;
-/// A link on a relay, with a slow address to go back to, leaves the relay once
-/// the oldest of its data still unacknowledged has waited this long there: the
-/// relay carries the small packets (probes, acks, pings) but not the data.
+/// A link on a relay leaves it once the oldest of its data still unacknowledged
+/// has waited this long there: the relay carries the small packets (probes, acks,
+/// pings) but not the data. It goes back to its slow address, or with none, holds
+/// the relay off and races the others at once, taking the first to win.
 const RELAY_STALL: Duration = Duration::from_secs(5);
 /// A relay that stalled a link isn't taken for that link again for this long,
 /// twice as long each time it stalls it again, up to 16 times as long.
@@ -2170,15 +2171,18 @@ impl<A: Address> Endpoint<A> {
                     }
                     // A latency race's next round: the last one scored, then the next sent.
                     if let (Some(rc), true) = (&mut sess.race, racing) {
-                        // A path gone quiet is raced again, so the leader can leave it for one that answers.
+                        // A path gone quiet is raced again, so the leader can leave it for one that answers;
+                        // so is a relay held off (it stalled the link), which isn't probed: others win.
                         let quiet = sess.last_path + self.config.keepalive + PATH_GAP;
-                        if rc.rounds == 0 && !rc.open && !rc.alts.is_empty() && now >= quiet {
+                        let held = matches!(&sess.path, Path::Via(r) if holds(&sess.held, r, now));
+                        if rc.rounds == 0 && !rc.open && !rc.alts.is_empty() && (now >= quiet || held) {
                             rc.start();
                         }
                         if (rc.rounds > 0 || rc.open) && now >= rc.next_at {
                             // The leader takes a winner, once the dwell is over: until then it races on.
-                            if let Some((to, rtt)) = rc.score().filter(|_| self.me < sess.peer) {
-                                if sess.switched.is_none_or(|s| now >= s + PATH_DWELL) {
+                            // Either end leaves a relay it holds off, at once.
+                            if let Some((to, rtt)) = rc.score().filter(|_| held || self.me < sess.peer) {
+                                if held || sess.switched.is_none_or(|s| now >= s + PATH_DWELL) {
                                     switches.push((idx, to, rtt));
                                     rc.rounds = 0;
                                 } else {
@@ -2212,11 +2216,15 @@ impl<A: Address> Endpoint<A> {
                         }
                     }
                     // A relay that carries nothing from the peer, or not our data: back to the
-                    // slow address before `idle_timeout` or the retries would drop the link.
-                    if let (Path::Via(r), Some(_), false) = (&sess.path, &sess.slow, self.relay_only) {
+                    // slow address before `idle_timeout` or the retries would drop the link. With
+                    // none, the relay is held off, and the race finds the link another.
+                    if let (Path::Via(r), false) = (&sess.path, self.relay_only) {
+                        let slow = sess.slow.is_some();
                         if link.tx.oldest_unacked().is_some_and(|s| now >= s.max(sess.path_since) + RELAY_STALL) {
-                            stalled.push((idx, *r));
-                        } else if now >= sess.last_path + self.config.direct_timeout {
+                            if slow || !holds(&sess.held, r, now) {
+                                stalled.push((idx, *r));
+                            }
+                        } else if slow && now >= sess.last_path + self.config.direct_timeout {
                             unrelayed.push(idx);
                         }
                     }
@@ -2280,6 +2288,9 @@ impl<A: Address> Endpoint<A> {
                 }
                 sess.relay = Some(*r);
             }
+            if matches!(&sess.path, Path::Via(r) if holds(&sess.held, r, now)) {
+                link.tx.resend_all(now); // lost on the relay left: on the new path at once
+            }
             sess.path = to.clone();
             sess.last_path = now;
             sess.path_since = now;
@@ -2295,11 +2306,17 @@ impl<A: Address> Endpoint<A> {
             self.back_to_slow(idx, now);
         }
         for (idx, relay) in stalled {
-            if let Some(sess) = self.sessions.get_mut(&idx) {
-                sess.hold(relay, now);
-                if let State::Live(link) = &mut sess.state {
-                    link.tx.resend_all(now); // lost on the relay: over the slow address at once
+            let Some(sess) = self.sessions.get_mut(&idx) else { continue };
+            sess.hold(relay, now);
+            if sess.slow.is_none() {
+                // Neither probed nor kept now: the race, at once, finds the link another relay.
+                if let Some(rc) = &mut sess.race {
+                    rc.start();
                 }
+                continue;
+            }
+            if let State::Live(link) = &mut sess.state {
+                link.tx.resend_all(now); // lost on the relay: over the slow address at once
             }
             self.back_to_slow(idx, now);
         }
@@ -2344,10 +2361,14 @@ impl<A: Address> Endpoint<A> {
                     if let (Path::Direct(_), Some(_)) = (&sess.path, sess.relay) {
                         min(sess.last_path + self.config.direct_timeout);
                     }
-                    if let (Path::Via(_), Some(_), false) = (&sess.path, &sess.slow, self.relay_only) {
-                        min(sess.last_path + self.config.direct_timeout);
+                    if let (Path::Via(r), false) = (&sess.path, self.relay_only) {
+                        if sess.slow.is_some() {
+                            min(sess.last_path + self.config.direct_timeout);
+                        }
                         if let Some(s) = link.tx.oldest_unacked() {
-                            min(s.max(sess.path_since) + RELAY_STALL);
+                            // On a relay held off (it stalled the link), once the hold is over.
+                            let held = sess.held.iter().find(|h| h.relay == *r).map_or(s, |h| h.until);
+                            min((s.max(sess.path_since) + RELAY_STALL).max(held));
                         }
                     }
                     // A race to make for a new path, or its next round.
@@ -3195,10 +3216,21 @@ mod tests {
             ms: u64,
             hop: impl Fn(usize, u32) -> Option<(usize, u32, u64)>,
         ) {
+            self.run_sized(eps, t, ms, |i, dst, _| hop(i, dst));
+        }
+
+        /// `run`, with `hop(i, dst, len)` given the datagram's length too.
+        fn run_sized(
+            &mut self,
+            eps: &mut [Endpoint<u32>],
+            t: &mut Instant,
+            ms: u64,
+            hop: impl Fn(usize, u32, usize) -> Option<(usize, u32, u64)>,
+        ) {
             for _ in 0..ms {
                 for (i, ep) in eps.iter_mut().enumerate() {
                     while let Some(tx) = ep.poll_transmit(*t) {
-                        if let Some((j, src, d)) = hop(i, tx.dst) {
+                        if let Some((j, src, d)) = hop(i, tx.dst, tx.payload.len()) {
                             self.0.push((*t + Duration::from_millis(d), j, src, tx.payload));
                         }
                     }
@@ -3716,5 +3748,93 @@ mod tests {
         };
         assert!(!lost(&ga, b) && !lost(&gb, a), "{ga:?} {gb:?}");
         assert_eq!((moves(&ga), moves(&gb)), (vec![Path::Via(c)], vec![Path::Via(c)]));
+    }
+
+    /// FL3-3: on a link with no slow address, a relay that carries the small packets
+    /// (probes, pings, acks) but drops data is held off and left for one that carries
+    /// it. a and b on d, with no direct path (as in
+    /// `the_leader_leaves_a_relay_that_stops_answering`), then d forwards only packets
+    /// of 200 bytes or less to them, and one end sends a 400-byte message every
+    /// 100 ms. Once its data has stalled there, the sender holds d off and races at
+    /// once (its first round on the next step), and leaves d for c when c wins:
+    /// - a, which follows; b follows once d goes quiet for it;
+    /// - b, which leads, sending from just after it took d: within the dwell;
+    /// - b, with c down too for the first race: the race goes on while d is held.
+    ///
+    /// Every message arrives, and the link is never dropped.
+    #[test]
+    fn a_relay_that_drops_data_is_left_for_one_that_carries_it() {
+        for (s, count, down) in [(0, 3000, 0), (1, 600, 0), (1, 600, 16)] {
+            let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+            let (mut eps, p) = relay_five(&mut t, &mut net);
+            let [a, b, c, d, _] = p;
+            let apart = |i: usize, dst: u32| if i < 2 && dst < 3 { None } else { five(i, dst) };
+            eps[0].set_slow(&b, None);
+            eps[1].set_slow(&a, None);
+            net.run(&mut eps, &mut t, 1_000, apart);
+            eps[0].add_relay(t, d, &b);
+            eps[1].add_relay(t, d, &a);
+            let on_d = |eps: &[Endpoint<u32>]| {
+                (eps[0].path(&b), eps[1].path(&a)) == (Some(&Path::Via(d)), Some(&Path::Via(d)))
+            };
+            for _ in 0..1_000 {
+                if on_d(&eps) {
+                    break;
+                }
+                net.run(&mut eps, &mut t, 10, apart);
+            }
+            assert!(on_d(&eps), "on d");
+            if s == 0 {
+                net.run(&mut eps, &mut t, 10_000, apart);
+            }
+            events(&mut eps[0]);
+            events(&mut eps[1]);
+            let (took_d, c_down) = (t, std::cell::Cell::new(true));
+            let picky = |i: usize, dst: u32, len: usize| {
+                if (i == 3 && dst < 3 && len > 200) || (c_down.get() && (i == 2 || dst == 3)) {
+                    return None;
+                }
+                apart(i, dst)
+            };
+            let (to, r) = ([b, a][s], 1 - s);
+            let (mut got, mut left, mut all) = (0, None, [Vec::new(), Vec::new()]);
+            // While on d held off: how often the sender's timers were due (a host spinning
+            // on them is at every step), in how many steps; when d was held off, and the
+            // race's first round after that (µs).
+            let (mut due, mut steps, mut held_at, mut first) = (0, 0, 0, None);
+            for k in 0..count as u32 {
+                c_down.set(t < took_d + Duration::from_secs(down));
+                eps[s].send(&to, Lane::Reliable, &[k as u8; 400]).unwrap();
+                net.run_sized(&mut eps, &mut t, 100, picky);
+                let sess = &eps[s].sessions[&eps[s].peers[&to]];
+                if sess.path == Path::Via(d) && holds(&sess.held, &d, t) {
+                    steps += 1;
+                    due += eps[s].poll_timeout().is_some_and(|x| x <= t) as u32;
+                    held_at = sess.held[0].until.as_micros() - RELAY_HOLD.as_micros() as u64;
+                    let sent = sess.race.as_ref().unwrap().sent_at.as_micros();
+                    first = first.or((sent >= held_at).then_some(sent - held_at));
+                }
+                let new = [events(&mut eps[0]), events(&mut eps[1])];
+                got += new[r].iter().filter(|e| matches!(e, Event::Message { .. })).count();
+                left = left.or(moves(&new[s]).contains(&Path::Via(c)).then_some(t));
+                for (g, n) in all.iter_mut().zip(new) {
+                    g.extend(n.into_iter().filter(|e| !matches!(e, Event::Message { .. })));
+                }
+            }
+            assert_eq!(got, count, "sent by {s}");
+            assert_eq!((moves(&all[0]), moves(&all[1])), (vec![Path::Via(c)], vec![Path::Via(c)]), "{all:?}");
+            assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+            let held = &eps[s].sessions[&eps[s].peers[&to]].held;
+            assert_eq!(held.iter().map(|h| (h.relay, h.strikes)).collect::<Vec<_>>(), vec![(d, 1)], "sent by {s}");
+            // Held off as the stall is due (the first message went out as the link took d),
+            // and raced on the next step; never due again while held.
+            let stall = held_at - took_d.as_micros() - RELAY_STALL.as_micros() as u64;
+            assert!(stall <= 1_000 && first.is_some_and(|us| us <= 1_000), "sent by {s}: {stall} µs, {first:?}");
+            assert!(steps >= 50 && due <= 1, "sent by {s}: due in {due} of {steps} steps on d held off");
+            // c's wins, 2 s apart, from the stall or from when c is back.
+            let left = left.expect("left d") - took_d;
+            let by = RELAY_STALL.max(Duration::from_secs(down)) + PATH_GAP * (PATH_WINS + 1);
+            assert!(left < by, "sent by {s}, c down {down} s: left d after {left:?}");
+        }
     }
 }
