@@ -1,9 +1,9 @@
 // @peerwire/react in Node: React components rendered with react-dom into jsdom, members of one room over
 // BroadcastChannel (signaling 'local'). Checks server rendering (initial values, no room), joining under StrictMode with no ghost member, presence both
 // ways, messages and their limit, shared state (concurrent writes converge, a late joiner catches up), per-peer
-// values, leaving, switching rooms, a failed join, a member that sends malformed, flooding or far-ahead state
-// messages, catch-up answers sent once, and `accept` keeping a member's wrongly typed presence, messages, shared
-// and per-peer values out, nested ones too. test/store.mjs covers the store's caps and catch-up in detail.
+// values, leaving, switching rooms, a failed join (and a presence the room refuses, set while joining), a member
+// that sends malformed, flooding or far-ahead state messages, catch-up answers sent once, and `accept` keeping a
+// member's wrongly typed presence, messages, shared and per-peer values out, nested ones too. test/store.mjs covers the store's caps and catch-up in detail.
 // Needs the build: `npm run build` (packages/react) and packages/js/build.sh.
 //
 //   node packages/react/test/hooks.mjs
@@ -68,6 +68,7 @@ globalThis.document = dom.window.document;
 // Only what Node lacks: jsdom's Event would break Node's own BroadcastChannel.
 for (const k of ['HTMLElement', 'HTMLIFrameElement', 'Node', 'Element']) globalThis[k] ??= dom.window[k];
 const { createRoot } = await import('react-dom/client');
+const { flushSync } = await import('react-dom');
 
 // One member: a component that puts what its hooks return in `out`, and their setters.
 function Probe({ out }) {
@@ -290,7 +291,8 @@ await until('the leave', () => [B, C, D].every((m) => m.out.peers.length === 3 &
 await E.leave();
 console.log('unmount: members see the leave, the per-peer value goes');
 
-// usePeerwireRoom: null stays out, a room joins, another roomId leaves the first, a failed join reports it.
+// usePeerwireRoom: null stays out, a room joins, another roomId leaves the first, a failed join reports it, and so
+// does a presence that changes while joining to one the room refuses (OUT-1d: it stayed 'joining' in a joined room).
 function Switch({ out }) {
   const [opts, setOpts] = useState(null);
   const state = usePeerwireRoom(opts);
@@ -313,9 +315,16 @@ if (sw.peers.length !== 0) fail('the second room has members');
 sw.setOpts({ appId, roomId, wasm: '/no/such/peerwire_ffi.wasm' });
 await until('a failed join', () => sw.status === 'error');
 if (!(sw.error instanceof Error) || sw.room !== null) fail(`error state: ${sw.error}`);
+// Each flushSync commits and starts its effects, so the join is under way before the presence changes.
+flushSync(() => sw.setOpts({ appId, roomId, presence: { name: 'gus' } }));
+flushSync(() => sw.setOpts({ appId, roomId, presence: () => 0 }));
+if (sw.status !== 'joining') fail(`a presence changed while joining: ${sw.status}`);
+await until('a refused presence to fail the join', () => sw.status === 'error');
+if (!(sw.error instanceof TypeError) || sw.room !== null) fail(`refused presence: ${sw.error}`);
+for (const t = Date.now(); Date.now() - t < 3000; await sleep(50)) if (names(B).includes('gus')) fail('B lists the member whose join failed');
 sw.setOpts(null);
 await until('idle again', () => sw.status === 'idle');
-console.log('usePeerwireRoom: idle, join, switch rooms, error, idle');
+console.log('usePeerwireRoom: idle, join, switch rooms, error, a refused presence while joining fails the join, idle');
 
 for (const m of [B, C, D]) m.root.unmount();
 swRoot.unmount();

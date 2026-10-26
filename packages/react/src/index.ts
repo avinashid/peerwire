@@ -117,9 +117,17 @@ export function usePeerwireRoom(options: JoinRoomOptions | null | undefined): Ro
       (room) => {
         if (gone) return void room.leave();
         joined = room;
-        // The presence may have changed while joining.
+        // The presence may have changed while joining. One the room refuses (over 1 MiB, a function, a Symbol)
+        // fails the join, as joinRoom does with it at the start, rather than stay 'joining' in a joined room.
         const p = latest.current?.presence;
-        if (p !== undefined && JSON.stringify(p) !== JSON.stringify(room.getPresence())) storeOf(room).setPresence(p);
+        try {
+          if (p !== undefined && JSON.stringify(p) !== JSON.stringify(room.getPresence())) storeOf(room).setPresence(p);
+        } catch (e) {
+          joined = null;
+          closeStore(room);
+          void room.leave();
+          return setState({ room: null, status: 'error', error: e instanceof Error ? e : new Error(String(e)) });
+        }
         setState({ room, status: 'joined', error: null });
       },
       (e: unknown) => {
