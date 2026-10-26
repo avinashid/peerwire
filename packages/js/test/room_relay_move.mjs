@@ -122,7 +122,7 @@ const room = async (name) => {
   };
   return r;
 };
-const same = (r, want) => JSON.stringify(r) === JSON.stringify(want);
+const same = (r, want) => JSON.stringify(r && { ...r, rttMs: undefined }) === JSON.stringify(want);
 
 blocked.add('a|b').add('b|a');
 const [a, b] = await Promise.all(['a', 'b'].map(room));

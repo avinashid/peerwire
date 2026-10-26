@@ -174,9 +174,11 @@ pub unsafe extern "C" fn pw_set_slow(h: *mut PwEndpoint, peer_id: *const u8, add
     }
 }
 
-/// Offers the directly linked peer `relay` to carry the link to `peer_id` while
-/// that link is on its slow address: probes go through it, and the link moves
-/// there (PATH_CHANGED) once `peer_id` answers. See `Endpoint::add_relay`.
+/// Offers the directly linked peer `relay` to carry the link to `peer_id`. While
+/// that link is on its slow address, probes go through it, and the link moves
+/// there (PATH_CHANGED) once `peer_id` answers; while it is on another relay, the
+/// two are raced, and `relay` is taken if clearly faster (see `pw_path_rtt_us`).
+/// See `Endpoint::add_relay`.
 #[no_mangle]
 pub unsafe extern "C" fn pw_add_relay(h: *mut PwEndpoint, now_us: u64, relay: *const u8, peer_id: *const u8) -> i32 {
     let (Some(r), Some(p)) = (peer(relay), peer(peer_id)) else { return PW_ERR_INVALID };
@@ -214,6 +216,13 @@ pub unsafe extern "C" fn pw_is_connected(h: *const PwEndpoint, peer_id: *const u
 #[no_mangle]
 pub unsafe extern "C" fn pw_rtt_us(h: *const PwEndpoint, peer_id: *const u8) -> i64 {
     peer(peer_id).and_then(|p| (*h).ep.rtt(&p)).map_or(-1, |d| d.as_micros() as i64)
+}
+
+/// RTT over the path the link to the peer is on, measured since it moved there,
+/// in microseconds, or -1 if unknown (see `Endpoint::path_rtt`).
+#[no_mangle]
+pub unsafe extern "C" fn pw_path_rtt_us(h: *const PwEndpoint, peer_id: *const u8) -> i64 {
+    peer(peer_id).and_then(|p| (*h).ep.path_rtt(&p)).map_or(-1, |d| d.as_micros() as i64)
 }
 
 /// Writes 16 counters as u64 to `out`: tx_packets, rx_packets, rx_malformed,
@@ -605,6 +614,29 @@ mod tests {
             }
             if buf[0] == 5 && buf[33] == 0 {
                 out.push(u32::from_le_bytes(buf[34..38].try_into().unwrap()));
+            }
+        }
+    }
+
+    /// pw_path_rtt_us: a link's path is timed from its handshake (pumped in one
+    /// instant here: 0 µs); an unknown peer or a bad pointer is -1.
+    #[test]
+    fn path_rtt_is_timed_from_the_handshake() {
+        unsafe {
+            let mut ids = [[0u8; 32]; 2];
+            let eps: Vec<_> = (0..2)
+                .map(|i| pw_endpoint_new(std::ptr::null(), [i as u8 + 1; 32].as_ptr(), 0, ids[i].as_mut_ptr()))
+                .collect();
+            let (a, b) = (eps[0], eps[1]);
+            assert_eq!(pw_path_rtt_us(a, ids[1].as_ptr()), -1);
+            assert_eq!(pw_connect(a, 0, 2, ids[1].as_ptr()), 0);
+            pump(a, b, 1000);
+            assert_eq!(pw_is_connected(a, ids[1].as_ptr()), 1);
+            assert_eq!(pw_path_rtt_us(a, ids[1].as_ptr()), 1000);
+            assert_eq!(pw_path_rtt_us(a, [7u8; 32].as_ptr()), -1);
+            assert_eq!(pw_path_rtt_us(a, std::ptr::null()), -1);
+            for h in eps {
+                pw_endpoint_free(h);
             }
         }
     }

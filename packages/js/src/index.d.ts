@@ -165,13 +165,14 @@ export declare class Room {
   /** Throws RangeError for a presence over 1 MiB as JSON, TypeError for one JSON can't encode (`undefined`, a
    * function, a Symbol, a BigInt, a cycle), and keeps the old one. */
   setPresence(presence: Presence): void;
-  /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   /** How `peer` is reached: its own WebRTC link, a channel handed to `adoptChannel` (`adopted`), relayed by
    * member `via`, or over the signalling relays; null while it isn't linked. A `'peer'` or `'signaling'` route
    * can become `'direct'` later, with the same session (no `peer-leave` or `peer-join`): ICE goes on checking,
    * the room retries WebRTC (see `retryDirect`), or a channel is adopted. A `'signaling'` route also moves to a
-   * member linked directly to both of you once that member is seen to relay both ways, and back if it goes. */
-  route(peer: PeerId): { kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' } | null;
+   * member linked directly to both of you once that member is seen to relay both ways, and back if it goes; a
+   * `'peer'` route to another such member once it is clearly faster (20 % and 15 ms, in 3 of 5 probe rounds 2 s
+   * apart). `rttMs`: the round trip over this path, measured since the link moved there; null until then. */
+  route(peer: PeerId): ({ kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' }) & { rttMs: number | null } | null;
   /** Tries WebRTC again, now, with `peer` (or every peer) the room reaches only by fallback: a new connection,
    * so one made after a network change, or a microphone or camera grant (privacy `'direct'`), offers the new
    * addresses. If its DataChannel opens, the link moves onto it and `route(peer)` says `'direct'`; if not, it
@@ -186,6 +187,7 @@ export declare class Room {
    * True once the channel carries the link; false, leaving the channel to the caller, if the link is direct
    * already or the peer didn't adopt within 5 s. When the channel closes, the link goes back to its fallback. */
   adoptChannel(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel): Promise<boolean>;
+  /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
   /** Tells every peer we're going, then closes the links, all before it returns (so it works from `pagehide`,
@@ -290,8 +292,12 @@ export declare class Endpoint {
   /** Offers `relay`, a peer linked directly, to carry the link to `peer` while that link is on its slow address
    * (`setSlow`): a sealed probe goes through `relay` every half second for 5 s, and the link moves there
    * ('pathChanged') once `peer` answers through it, which it does only if it would use the relay too. The first
-   * probe goes out after the current task, with any others offered in it. Does nothing while relay-only, for a
-   * link not on its slow address, for a relay the link holds off (see `setSlow`), or after `close()`. */
+   * probe goes out after the current task, with any others offered in it. On a link relayed already, the relay
+   * is raced against the one it is on (a probe round every 2 s, 5 rounds), and the end with the smaller
+   * PeerId moves the link to it once it is clearly faster; the other follows. A relay that leaves the link's data
+   * unacknowledged for 5 s, on a link with no slow address, is held off as `setSlow` describes and raced at once,
+   * and either end moves the link to the relay that wins. Does nothing while relay-only, for a link that is
+   * direct, for a relay the link holds off (see `setSlow`), or after `close()`. */
   addRelay(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): void;
   /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
    * (reason 'closed') now rather than after its idle timeout. No local event for `peer`, though links it relayed
@@ -311,6 +317,9 @@ export declare class Endpoint {
   open(bytes: Uint8Array): { from: PeerId; data: Uint8Array } | null;
   isConnected(peer: PeerId | Uint8Array): boolean;
   rttMs(peer: PeerId | Uint8Array): number | null;
+  /** Round-trip time over the path the link to `peer` is on now, measured since it moved there; null until
+   * measured, or after `close()`. */
+  pathRttMs(peer: PeerId | Uint8Array): number | null;
   /** 0, or a negative PW_ERR code (-1 not connected, -2 too large: over 1100 B unreliable, 64 KiB urgent,
    * 1 MiB reliable; -3 would block).
    * Throws `Error('send: endpoint closed')` after `close()`: that is a bug in the app, not a lost packet. */

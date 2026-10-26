@@ -137,6 +137,10 @@ impl Default for NetConfig {
 /// Called for every packet put on the wire; return `false` to drop it. May mutate it.
 pub type Hook = Box<dyn FnMut(SimAddr, SimAddr, &mut Vec<u8>) -> bool>;
 
+/// Extra delay for a packet from one address to another (the source as the
+/// destination sees it): a slow route, or a relay far away.
+pub type Delay = Box<dyn FnMut(SimAddr, SimAddr) -> Duration>;
+
 pub struct Node {
     pub endpoint: Endpoint<SimAddr>,
     pub identity: Identity,
@@ -242,6 +246,8 @@ pub struct Sim {
     pub nodes: Vec<Node>,
     pub net: NetConfig,
     pub hook: Option<Hook>,
+    /// Added to `NetConfig::latency` for each packet.
+    pub delay: Option<Delay>,
     pub stats: SimStats,
     /// Time each node's endpoint calls with the wall clock (into `Node::cpu`), for benchmarks.
     pub measure_cpu: bool,
@@ -267,6 +273,7 @@ impl Sim {
             nodes: Vec::new(),
             net,
             hook: None,
+            delay: None,
             stats: SimStats::default(),
             measure_cpu: false,
             owners: HashMap::new(),
@@ -638,11 +645,12 @@ impl Sim {
             realm = self.nats[n].outer;
         }
         let from = src;
+        let delay = self.delay.as_mut().map_or(Duration::ZERO, |d| d(from, to));
         let copies = if self.uniform() < self.net.duplicate { 2 } else { 1 };
         self.stats.duplicated += copies - 1;
         for _ in 0..copies {
             let jitter = self.net.jitter.mul_f64(self.uniform());
-            let mut at = depart + self.net.latency + jitter;
+            let mut at = depart + self.net.latency + delay + jitter;
             if self.net.in_order {
                 let last = self.last_arrival.entry((from, to)).or_insert(at);
                 at = at.max(*last);

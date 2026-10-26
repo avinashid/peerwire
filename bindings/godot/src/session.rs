@@ -908,7 +908,7 @@ mod tests {
         assert_eq!(host.put(b"x"), Err(PutError::Unavailable));
         host.target = 0;
         assert_eq!(host.put(&vec![0; MAX_UNRELIABLE]), Err(PutError::TooLarge));
-        assert!(host.peer_stats(ia).is_some());
+        assert!(host.peer_stats(ia).is_some_and(|s| s.path_rtt.is_some()), "the path in use is timed");
         assert_eq!(host.peer_key(ia), Some(a.public_key()), "ids resolve to the authenticated key");
         assert_eq!(a.peer_key(HOST_ID), Some(host.public_key()), "1 is bound to the dialled host");
         assert_eq!(a.peer_key(ib), None, "joiners hold no link to each other");

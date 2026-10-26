@@ -35,13 +35,30 @@ const SPRAY_RANGE: u32 = 65536 - SPRAY_LOW;
 const RELAY_ROUNDS: u32 = 5;
 /// Most relays probed at once for one link, and held off at once.
 const MAX_RELAYS: usize = 8;
-/// A link on a relay, with a slow address to go back to, leaves the relay once
-/// the oldest of its data still unacknowledged has waited this long there: the
-/// relay carries the small packets (probes, acks, pings) but not the data.
+/// A link on a relay leaves it once the oldest of its data still unacknowledged
+/// has waited this long there: the relay carries the small packets (probes, acks,
+/// pings) but not the data. It goes back to its slow address, or with none, holds
+/// the relay off and races the others at once, taking the first to win.
 const RELAY_STALL: Duration = Duration::from_secs(5);
 /// A relay that stalled a link isn't taken for that link again for this long,
 /// twice as long each time it stalls it again, up to 16 times as long.
 const RELAY_HOLD: Duration = Duration::from_secs(60);
+/// Latency races ([`Race`]): a round of probes at most every `PATH_GAP`, and
+/// `PATH_ROUNDS` rounds once another path turns up or the link changes kind.
+const PATH_GAP: Duration = Duration::from_secs(2);
+const PATH_ROUNDS: u32 = 5;
+/// A path is clearly faster than the link's in a round if its RTT plus
+/// `PATH_MARGIN` (15 ms, in µs), or a fifth of the link's RTT if that is more, is
+/// at most the link's. One that is so in `PATH_WINS` rounds of a race is taken.
+const PATH_MARGIN: u64 = 15_000;
+const PATH_WINS: u32 = 3;
+/// No path is taken for being faster within this of the last one; then the two
+/// are raced once more, so a move won on lost probes goes back.
+const PATH_DWELL: Duration = Duration::from_secs(20);
+/// For this long after taking a faster path, until the peer is heard on it, the
+/// end that took it doesn't follow the peer's packets on others: they left before
+/// the peer moved too.
+const PATH_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -277,6 +294,10 @@ pub struct Stats {
     /// Packets dropped unread for coming over another peer's channel
     /// ([`Endpoint::handle_datagram_from`]).
     pub rx_wrong_peer: u64,
+    /// Latency probes sent ([`Endpoint::path_rtt`]).
+    pub path_probes: u64,
+    /// Links moved to a faster path of the same kind.
+    pub path_switches: u64,
 }
 
 /// Per-link counters for one connected peer; see [`Endpoint::peer_stats`].
@@ -298,6 +319,8 @@ pub struct PeerStats {
     pub inflight: u32,
     /// Window reductions caused by queueing delay rather than loss.
     pub delay_backoffs: u64,
+    /// Round-trip time over the link's path, since it moved there ([`Endpoint::path_rtt`]).
+    pub path_rtt: Option<Duration>,
 }
 
 impl PeerStats {
@@ -402,6 +425,107 @@ fn holds(held: &[Hold], relay: &PeerId, now: Instant) -> bool {
     held.iter().any(|h| h.relay == *relay && now < h.until)
 }
 
+/// A race of the paths a link could take instead of its own, of the same kind: its
+/// other direct addresses while direct, other relays while relayed. A round probes
+/// the link's path and each other one at once, with a sealed PUNCH (through relays
+/// with `!token`, as `Punch::relay_token`), and an answer gives the path it came
+/// back over its RTT for the round. Of the two ends, the one with the smaller
+/// PeerId takes a path clearly faster in `PATH_WINS` rounds; the other follows.
+struct Race<A> {
+    /// The path the race is for: when the link's changes, so does the race.
+    on: Path<A>,
+    token: u64,
+    sent_at: Instant,
+    next_at: Instant,
+    /// Rounds still to send.
+    rounds: u32,
+    /// A round went out and isn't scored yet.
+    open: bool,
+    /// `on`'s RTT this round, in µs (as all RTTs of the race).
+    own: Option<u64>,
+    alts: Vec<Alt<A>>,
+    /// When to race once more: `PATH_DWELL` after the link took `on` for being
+    /// faster, so a move won on lost probes goes back.
+    again: Option<Instant>,
+}
+
+struct Alt<A> {
+    path: Path<A>,
+    /// RTT this round.
+    rtt: Option<u64>,
+    /// Rounds of this race it was clearly faster in.
+    wins: u32,
+}
+
+impl<A: Address> Race<A> {
+    /// Adds `path`, if new and there is room (`max`), and races.
+    fn add(&mut self, path: Path<A>, max: usize) {
+        if path != self.on && !self.alts.iter().any(|a| a.path == path) && self.alts.len() < max {
+            self.alts.push(Alt { path, rtt: None, wins: 0 });
+            self.start();
+        }
+    }
+
+    /// Races for `PATH_ROUNDS` rounds more; a race that was over starts afresh.
+    fn start(&mut self) {
+        if self.rounds == 0 && !self.open {
+            for a in &mut self.alts {
+                a.wins = 0;
+            }
+        }
+        self.rounds = PATH_ROUNDS;
+    }
+
+    /// Takes an answer with `token` back over `from` to the open round; returns its
+    /// RTT if `from` is `on`.
+    fn answer(&mut self, now: Instant, from: &Path<A>, token: u64) -> Option<u64> {
+        let ours = if matches!(from, Path::Via(_)) { !self.token } else { self.token };
+        if token != ours || !self.open {
+            return None;
+        }
+        let rtt = Some(us(now, self.sent_at));
+        if *from == self.on {
+            self.own = rtt;
+            return rtt;
+        }
+        for a in &mut self.alts {
+            if a.path == *from {
+                a.rtt = rtt;
+            }
+        }
+        None
+    }
+
+    /// Scores the open round: a path clearly faster than `on` in it, or answered
+    /// when `on` wasn't, wins it. Returns the fastest in it of those with
+    /// `PATH_WINS` wins, and its RTT.
+    fn score(&mut self) -> Option<(Path<A>, u64)> {
+        self.open = false;
+        let own = self.own.take();
+        let mut best: Option<(Path<A>, u64)> = None;
+        for a in &mut self.alts {
+            let Some(r) = a.rtt.take() else { continue };
+            if own.is_none_or(|o| r.saturating_add(PATH_MARGIN.max(o / 5)) <= o) {
+                a.wins += 1;
+                if a.wins >= PATH_WINS && best.as_ref().is_none_or(|b| r < b.1) {
+                    best = Some((a.path.clone(), r));
+                }
+            }
+        }
+        best
+    }
+}
+
+/// `old` smoothed with the sample `r` (saturating, as the RTTs of a host clock jump can be huge).
+fn smooth(old: Option<u64>, r: u64) -> u64 {
+    old.map_or(r, |o| o.saturating_mul(7).saturating_add(r) / 8)
+}
+
+/// Microseconds from `earlier` to `later`.
+fn us(later: Instant, earlier: Instant) -> u64 {
+    later.as_micros().saturating_sub(earlier.as_micros())
+}
+
 struct Link {
     initiator: bool,
     /// `Connected` has been emitted. A responder link stays unannounced until the
@@ -504,14 +628,21 @@ struct Session<A> {
     /// a relay: the link leaves it for a relay that answers a probe, and goes back
     /// to it when that relay goes.
     slow: Option<A>,
-    /// The newest nonce of a packet other than a probe that came over `path`, so
-    /// the peer is on it too. Only probes leave a path, so a newer one over another
-    /// path means the peer went there (from a relay, back to the slow address).
+    /// The newest nonce of a packet other than a probe that came over `path` (or of
+    /// the probe answer that moved the link there), so the peer is on it too. Only
+    /// probes leave a path, so a newer one over another path means the peer went
+    /// there (from a relay, back to the slow address).
     path_nonce: Option<u64>,
-    /// When the link last moved to another path: a stall on a relay is timed from then.
+    /// When the link last moved to another path: a stall on a relay is timed from
+    /// then, and `path_rtt` measured.
     path_since: Instant,
     /// Relays that stalled the link, at most `MAX_RELAYS`.
     held: Vec<Hold>,
+    race: Option<Race<A>>,
+    /// Round-trip time over `path` since `path_since`, in µs.
+    path_rtt: Option<u64>,
+    /// When the link last took a path for being faster.
+    switched: Option<Instant>,
 }
 
 impl<A: Address> Session<A> {
@@ -541,6 +672,58 @@ impl<A: Address> Session<A> {
         let h = &mut self.held[i];
         h.strikes += 1;
         h.until = now + RELAY_HOLD * (1 << (h.strikes - 1).min(4));
+    }
+
+    /// The link's race, anew for a path of another kind than the race's (the slow
+    /// address is one, with nothing to race): paths of the same kind carry over,
+    /// with the one the link was on, and the race's pace. Direct paths are the
+    /// link's candidates, if `direct` (network addresses, not local handles), up to
+    /// `max`; relays, up to `MAX_RELAYS`.
+    fn race(&mut self, direct: bool, max: usize) -> &mut Race<A> {
+        let (path, slow) = (&self.path, &self.slow);
+        let max = if matches!(path, Path::Via(_)) { MAX_RELAYS } else { max };
+        let kind = |p: &Path<A>| match p {
+            Path::Via(_) => 2,
+            Path::Direct(_) if on_slow(p, slow) => 0,
+            Path::Direct(_) => 1,
+        };
+        let rc = match self.race.take() {
+            Some(rc) if rc.on == *path => rc,
+            old => {
+                let mut rc = Race {
+                    on: path.clone(),
+                    token: 0,
+                    sent_at: Instant::ZERO,
+                    next_at: Instant::ZERO,
+                    rounds: 0,
+                    open: false,
+                    own: None,
+                    alts: Vec::new(),
+                    again: None,
+                };
+                if let Some(o) = old {
+                    rc.next_at = o.next_at;
+                    if kind(&o.on) == kind(path) && kind(path) > 0 {
+                        rc.alts = o.alts;
+                        rc.alts.push(Alt { path: o.on, rtt: None, wins: 0 });
+                        for a in &mut rc.alts {
+                            (a.rtt, a.wins) = (None, 0);
+                        }
+                        rc.alts.retain(|a| a.path != *path);
+                        rc.alts.truncate(max);
+                    }
+                }
+                if rc.alts.is_empty() && kind(path) == 1 && direct {
+                    for c in &self.candidates {
+                        if Some(c) != slow.as_ref() {
+                            rc.add(Path::Direct(c.clone()), max);
+                        }
+                    }
+                }
+                rc
+            }
+        };
+        self.race.insert(rc)
     }
 }
 
@@ -722,9 +905,36 @@ impl<A: Address> Endpoint<A> {
                 cwnd: l.tx.cwnd(),
                 inflight: l.tx.inflight(),
                 delay_backoffs: l.tx.delay_backoffs,
+                path_rtt: self.path_rtt(peer),
             }),
             State::Dialing(_) => None,
         }
+    }
+
+    /// Round-trip time over the path the link to a connected peer is on, measured
+    /// since it moved there: by the handshake, acknowledgements of data sent over it
+    /// and latency probes. Unlike [`rtt`](Endpoint::rtt), it starts afresh on each path.
+    ///
+    /// A link races the other paths it has of the kind of its own: its other direct
+    /// addresses (its candidates: dial targets and [`add_candidates`](Endpoint::add_candidates),
+    /// when addresses are network addresses, `Config::share_addresses`), or, while
+    /// relayed, the relays offered for it ([`add_relay`](Endpoint::add_relay)) or that
+    /// carried the peer's probes. A race is up to 5 rounds, 2 s apart, of a sealed
+    /// probe on each path at once, the link's too; it starts when a path turns up,
+    /// the link changes kind, its path has carried nothing for `keepalive` plus 2 s,
+    /// or 20 s after the link took a path for being faster (the path it left is raced
+    /// against it once more, so a move won on lost probes goes back). A path at
+    /// least 15 ms and a fifth faster than the link's in 3 rounds, or answering when
+    /// the link's path doesn't, is taken (`PathChanged`), at most once in 20 s, by
+    /// the end with the smaller PeerId; the other follows. A relay that leaves the
+    /// link's data unacknowledged for 5 s, with no slow address to go back to, is
+    /// held off as [`set_slow`](Endpoint::set_slow) describes, and raced at once
+    /// without being probed (it goes on while the relay is held): either end leaves
+    /// it for the path that wins, at once. A direct path never gives way to a relay
+    /// this way, nor a relay to the slow address, and a peer answers a probe through
+    /// a relay only if it would follow there. No races while relay-only.
+    pub fn path_rtt(&self, peer: &PeerId) -> Option<Duration> {
+        self.sessions.get(self.peers.get(peer)?)?.path_rtt.map(Duration::from_micros)
     }
 
     /// How the reliable lanes to `peer` have recovered from loss, for the
@@ -867,6 +1077,9 @@ impl<A: Address> Endpoint<A> {
                 path_nonce: None,
                 path_since: now,
                 held: Vec::new(),
+                race: None,
+                path_rtt: None,
+                switched: None,
             },
         );
         self.dialing.insert(peer, idx);
@@ -888,7 +1101,7 @@ impl<A: Address> Endpoint<A> {
     }
 
     fn add_candidate(&mut self, now: Instant, idx: u32, a: A) {
-        let (max, relay_only) = (self.config.max_candidates, self.relay_only);
+        let (max, relay_only, direct) = (self.config.max_candidates, self.relay_only, self.config.share_addresses);
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         // The slow address isn't punched to: a relay beats it.
         let known = sess.path.direct() == Some(&a) || sess.slow.as_ref() == Some(&a);
@@ -899,7 +1112,12 @@ impl<A: Address> Endpoint<A> {
             if sess.candidates.len() >= max {
                 return;
             }
-            sess.candidates.push(a);
+            sess.candidates.push(a.clone());
+        }
+        // On a direct path: raced against it.
+        let live = matches!(sess.state, State::Live(_));
+        if live && direct && !relay_only && matches!(sess.path, Path::Direct(_)) && !sess.on_slow() {
+            sess.race(direct, max).add(Path::Direct(a), max);
         }
         self.start_punch(now, idx);
     }
@@ -933,8 +1151,9 @@ impl<A: Address> Endpoint<A> {
     /// for 5 s. Then the link holds that relay off for a minute, twice as long each
     /// time it stalls the link again (up to 16 minutes): no probing it, answering a
     /// probe through it, or moving or falling back to it. A slow address is never
-    /// punched to, and a relay never forwards to a peer linked only over its slow
-    /// address. Ignored for a peer that isn't linked.
+    /// punched to or raced (marked during a race, it leaves it; the link's own path
+    /// marked, the race ends), and a relay never forwards to a peer linked only over
+    /// its slow address. Ignored for a peer that isn't linked.
     pub fn set_slow(&mut self, peer: &PeerId, addr: Option<A>) {
         let Some(sess) = self.peers.get(peer).and_then(|i| self.sessions.get_mut(i)) else { return };
         sess.candidates.retain(|c| Some(c) != addr.as_ref()); // a dial's own target is one
@@ -942,19 +1161,31 @@ impl<A: Address> Endpoint<A> {
         if matches!(sess.path, Path::Direct(_)) && !sess.on_slow() {
             sess.punch = None; // a probe of relays, and the path isn't slow any more
         }
+        // Nor raced: a race on the slow address ends.
+        if let Some(rc) = &mut sess.race {
+            rc.alts.retain(|a| !on_slow(&a.path, &sess.slow));
+            if on_slow(&sess.path, &sess.slow) {
+                (rc.alts, rc.rounds, rc.open) = (Vec::new(), 0, false);
+            }
+        }
     }
 
-    /// Offers `relay`, a peer linked directly, to carry the link to `peer` while
-    /// that link is on its slow address ([`set_slow`](Endpoint::set_slow)). A
-    /// sealed PUNCH goes to `peer` through `relay` every `RELAY_ROUNDS` punch
-    /// intervals for `punch_duration`, and `peer` answers it through `relay` only
-    /// if it would use the relay too: it is on its own slow address, or on that
-    /// relay already. The answer moves the link to the relay (a `PathChanged`
-    /// event); several relays can be offered, and the first to answer wins. A
-    /// probe arriving through a relay offers that relay back, so both ends move.
-    /// Ignored while relay-only, for a link not on its slow address, for a relay
-    /// not linked directly or linked only over its own slow address, and for one
-    /// the link holds off for stalling it (see [`set_slow`](Endpoint::set_slow)).
+    /// Offers `relay`, a peer linked directly, to carry the link to `peer`. While
+    /// that link is on its slow address ([`set_slow`](Endpoint::set_slow)), a sealed
+    /// PUNCH goes to `peer` through `relay` every `RELAY_ROUNDS` punch intervals for
+    /// `punch_duration`, and the answer moves the link to the relay (a `PathChanged`
+    /// event); several relays can be offered, and the first to answer wins. While
+    /// the link is on another relay, `relay` is raced against that one and taken if
+    /// clearly faster (see [`path_rtt`](Endpoint::path_rtt)). Either way `peer`
+    /// answers through `relay` only if it would use the relay too: it is on its own
+    /// slow address or a relay, and linked to `relay` directly other than over its
+    /// slow address, or it is on `relay` already; it isn't relay-only, and doesn't
+    /// hold `relay` off. A probe arriving through a relay offers that relay back, so
+    /// both ends move. Ignored while relay-only, for a peer not linked, for a link
+    /// on a direct path other than its slow address (it races its direct addresses
+    /// instead), for a relay not linked directly or linked only over its own slow
+    /// address, and for one the link holds off for stalling it (see
+    /// [`set_slow`](Endpoint::set_slow) and [`path_rtt`](Endpoint::path_rtt)).
     pub fn add_relay(&mut self, now: Instant, relay: PeerId, peer: &PeerId) {
         if let Some(&idx) = self.peers.get(peer) {
             self.offer_relay(now, idx, relay);
@@ -965,10 +1196,19 @@ impl<A: Address> Endpoint<A> {
         if self.relay_only || !self.fast_link(&relay) {
             return;
         }
-        let until = now + self.config.punch_duration;
+        let (until, direct, max) =
+            (now + self.config.punch_duration, self.config.share_addresses, self.config.max_candidates);
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         let held = holds(&sess.held, &relay, now);
-        if sess.peer == relay || !sess.on_slow() || !matches!(sess.state, State::Live(_)) || held {
+        if sess.peer == relay || !matches!(sess.state, State::Live(_)) || held {
+            return;
+        }
+        // On a relay: raced against it.
+        if matches!(sess.path, Path::Via(_)) {
+            sess.race(direct, max).add(Path::Via(relay), MAX_RELAYS);
+            return;
+        }
+        if !sess.on_slow() {
             return;
         }
         let rng = &mut self.rng;
@@ -1172,6 +1412,7 @@ impl<A: Address> Endpoint<A> {
         sess.path_since = at;
         sess.punch = None;
         sess.path_nonce = None;
+        sess.path_rtt = None;
         self.events.push_back(Event::PathChanged { peer: sess.peer, path });
     }
 
@@ -1384,6 +1625,9 @@ impl<A: Address> Endpoint<A> {
                 path_nonce: None,
                 path_since: now,
                 held: Vec::new(),
+                race: None,
+                path_rtt: None,
+                switched: None,
             },
         );
         self.start_punch(now, idx);
@@ -1435,6 +1679,7 @@ impl<A: Address> Endpoint<A> {
         let mut link = Link::new(true, sender, transport, now, self.config.relay_burst);
         if dial.attempts == 1 {
             link.tx.seed_rtt(now - dial.sent_at);
+            sess.path_rtt = Some(us(now, dial.sent_at));
         }
         link.ping_pending = true; // lets the responder confirm and announce
         link.confirm_at = now + self.config.handshake_retry;
@@ -1502,21 +1747,24 @@ impl<A: Address> Endpoint<A> {
         let mut path_changed = false;
         let mut reflexive = None;
         let mut offered = None;
-        // Probes (punches) only measure paths: they move no link.
+        // Probes (punches, latency races) only measure paths: they move no link.
         let probes_only = wire::frames(&pt[..n]).all(|f| matches!(f, Ok(Frame::Punch(_) | Frame::PunchAck(_))));
         // Between paths of a kind, the link follows the peer to the path of its newest
         // packets, not to late ones over a path it left, unless this end leads (the
-        // smaller PeerId) and holds its path: a relay the peer was heard on.
+        // smaller PeerId) and holds its path: one it took for being faster, for
+        // `PATH_GRACE` until the peer is heard there, and a relay the peer was heard on.
         let newer = !probes_only && sess.path_nonce.is_none_or(|m| nonce > m);
+        let settling = sess.path_nonce.is_none() && sess.switched.is_some_and(|s| now < s + PATH_GRACE);
         let leads = self.me < sess.peer;
         match (&from, &sess.path) {
             (Path::Direct(x), Path::Direct(y)) if x == y => sess.last_path = now,
             (Path::Direct(_), Path::Direct(_)) => {
-                if newer {
+                if newer && !(leads && settling) {
                     sess.path = from.clone();
                     sess.last_path = now;
                     sess.path_since = now;
                     sess.path_nonce = None;
+                    sess.path_rtt = None;
                     self.stats.roams += 1;
                     path_changed = true;
                 }
@@ -1526,14 +1774,17 @@ impl<A: Address> Endpoint<A> {
             (Path::Direct(x), Path::Via(_)) => reflexive = Some(x.clone()),
             (Path::Via(r), Path::Via(q)) if r == q => sess.last_path = now,
             // The peer moved to another relay: so does the link, if that one is worth
-            // relaying through (as `offered`, `moved`) and not held off.
+            // relaying through (as `offered`, `moved`) and not held off; or it is raced.
             (Path::Via(r), Path::Via(_)) if fast_from && !holds(&sess.held, r, now) => {
-                if newer && !(leads && sess.path_nonce.is_some()) {
+                if newer && !(leads && (settling || sess.path_nonce.is_some())) {
                     sess.last_path = now;
                     sess.path_since = now;
                     sess.path = from.clone();
                     sess.path_nonce = None;
+                    sess.path_rtt = None;
                     path_changed = true;
+                } else {
+                    offered = Some(*r);
                 }
             }
             // Relayed while on the slow address: that relay is probed, and its
@@ -1561,7 +1812,12 @@ impl<A: Address> Endpoint<A> {
             match f {
                 // Answered with an ACK, so a silent-side probe gets a reply.
                 Ok(Frame::Ping) => link.rx.ack_pending = true,
-                Ok(Frame::Ack { cum, bits, urgent }) => link.tx.on_ack(now, cum, bits, urgent),
+                Ok(Frame::Ack { cum, bits, urgent }) => {
+                    // Data sent over the link's path times it.
+                    if let Some(sent) = link.tx.on_ack(now, cum, bits, urgent).filter(|&s| s >= sess.path_since) {
+                        sess.path_rtt = Some(smooth(sess.path_rtt, us(now, sent)));
+                    }
+                }
                 Ok(Frame::Reliable { seq, fin, data, urgent }) => {
                     let rx = if urgent { &mut link.urx } else { &mut link.rx };
                     if rx.on_fragment(seq, fin, data, self.config.max_message(urgent), &mut reliable).is_err() {
@@ -1592,28 +1848,38 @@ impl<A: Address> Endpoint<A> {
                         punch_acks.push((a.clone(), t));
                     } else if let Path::Via(r) = &from {
                         // Through a relay: answered through it only if this end would
-                        // use the relay too, so the prober moves only if both ends do.
-                        let joins = (fast_from && on_slow(&sess.path, &sess.slow)) || sess.path == from;
+                        // use the relay too (from its slow address, or another relay,
+                        // which it races), so the prober moves only if both ends do.
+                        let joins = (fast_from
+                            && (on_slow(&sess.path, &sess.slow) || matches!(sess.path, Path::Via(_))))
+                            || sess.path == from;
                         if joins && !self.relay_only && !holds(&sess.held, r, now) {
                             relay_acks.push((*r, t));
                         }
                     }
                 }
-                Ok(Frame::PunchAck(t)) => match (&from, &sess.punch) {
-                    (Path::Direct(a), Some(p)) if p.token == t && sess.slow.as_ref() != Some(a) => {
-                        upgraded = Some(a.clone())
+                Ok(Frame::PunchAck(t)) => {
+                    match (&from, &sess.punch) {
+                        (Path::Direct(a), Some(p)) if p.token == t && sess.slow.as_ref() != Some(a) => {
+                            upgraded = Some(a.clone())
+                        }
+                        // A relay probe answered through the relay: it carries both ways.
+                        (Path::Via(r), Some(p))
+                            if p.relay_token() == t
+                                && p.relays.contains(r)
+                                && fast_from
+                                && on_slow(&sess.path, &sess.slow) =>
+                        {
+                            moved = Some(*r);
+                        }
+                        _ => {}
                     }
-                    // A relay probe answered through the relay: it carries both ways.
-                    (Path::Via(r), Some(p))
-                        if p.relay_token() == t
-                            && p.relays.contains(r)
-                            && fast_from
-                            && on_slow(&sess.path, &sess.slow) =>
-                    {
-                        moved = Some(*r);
+                    if let Some(r) = sess.race.as_mut().and_then(|rc| rc.answer(now, &from, t)) {
+                        if from == sess.path {
+                            sess.path_rtt = Some(smooth(sess.path_rtt, r));
+                        }
                     }
-                    _ => {}
-                },
+                }
                 Err(()) => violation = true,
             }
         }
@@ -1636,17 +1902,21 @@ impl<A: Address> Endpoint<A> {
             sess.spray = None;
             sess.last_path = now;
             sess.path_since = now;
-            sess.path_nonce = None;
+            sess.path_nonce = Some(nonce); // nothing the peer sealed before its answer roams the link
+            sess.path_rtt = None;
             self.stats.punch_succeeded += 1;
             path_changed = true;
         }
+        // The other relays probed with the one that answered first are raced against it.
+        let mut raced = Vec::new();
         if let Some(r) = moved {
             sess.path = Path::Via(r);
             sess.relay = Some(r);
-            sess.punch = None;
+            raced = sess.punch.take().map_or(raced, |p| p.relays);
             sess.last_path = now;
             sess.path_since = now;
             sess.path_nonce = None;
+            sess.path_rtt = None;
             // Through it at once: the peer, there too, answers, so each end has had a
             // packet through the relay that isn't a probe (`path_nonce`) and follows the
             // other back to the slow address on its first one there.
@@ -1671,6 +1941,7 @@ impl<A: Address> Endpoint<A> {
         let announce = !link.announced;
         if announce && !link.initiator && !link.hs2_resent {
             link.tx.seed_rtt(now - link.created);
+            sess.path_rtt = Some(us(now, link.created));
         }
         if let Some(a) = observed {
             if sess.seen_as.as_ref() != Some(&a) {
@@ -1691,7 +1962,7 @@ impl<A: Address> Endpoint<A> {
         for (r, ack) in sealed {
             self.relay_out(r, &peer, ack);
         }
-        if let Some(r) = offered {
+        for r in offered.into_iter().chain(raced) {
             self.offer_relay(now, receiver, r);
         }
         if moved.is_some() {
@@ -1818,8 +2089,14 @@ impl<A: Address> Endpoint<A> {
         let mut fallbacks = Vec::new();
         let mut unrelayed = Vec::new();
         let mut stalled = Vec::new();
+        let mut switches = Vec::new();
         let spray = self.config.punch_spray as i32;
+        let (direct, max) = (self.config.share_addresses, self.config.max_candidates);
         for (&idx, sess) in self.sessions.iter_mut() {
+            let racing = !self.relay_only && matches!(&sess.state, State::Live(l) if l.announced);
+            if racing {
+                sess.race(direct, max);
+            }
             if let Some(s) = sess.spray.as_mut().filter(|s| now >= s.next_at) {
                 s.next_at = now + SPRAY_GAP;
                 let batch = s.next(SPRAY_BATCH);
@@ -1907,17 +2184,66 @@ impl<A: Address> Endpoint<A> {
                         dead.push(idx);
                         continue;
                     }
+                    // A latency race's next round: the last one scored, then the next sent.
+                    if let (Some(rc), true) = (&mut sess.race, racing) {
+                        // A path gone quiet is raced again, so the leader can leave it for one that answers;
+                        // so is a relay held off (it stalled the link), which isn't probed: others win.
+                        let quiet = sess.last_path + self.config.keepalive + PATH_GAP;
+                        let held = matches!(&sess.path, Path::Via(r) if holds(&sess.held, r, now));
+                        let again = rc.again.is_some_and(|a| now >= a);
+                        if again {
+                            rc.again = None;
+                        }
+                        if rc.rounds == 0 && !rc.open && !rc.alts.is_empty() && (now >= quiet || held || again) {
+                            rc.start();
+                        }
+                        if (rc.rounds > 0 || rc.open) && now >= rc.next_at {
+                            // The leader takes a winner, once the dwell is over: until then it races on.
+                            // Either end leaves a relay it holds off, at once.
+                            if let Some((to, rtt)) = rc.score().filter(|_| held || self.me < sess.peer) {
+                                if held || sess.switched.is_none_or(|s| now >= s + PATH_DWELL) {
+                                    switches.push((idx, to, rtt));
+                                    rc.rounds = 0;
+                                } else {
+                                    rc.rounds = rc.rounds.max(1);
+                                }
+                            }
+                            if rc.rounds > 0 {
+                                rc.rounds -= 1;
+                                rc.open = true;
+                                rc.token = self.rng.next_u64();
+                                rc.sent_at = now;
+                                rc.next_at = now + PATH_GAP;
+                                for p in std::iter::once(&sess.path).chain(rc.alts.iter().map(|a| &a.path)) {
+                                    let relayed = matches!(p, Path::Via(_));
+                                    if matches!(p, Path::Via(r) if holds(&sess.held, r, now)) {
+                                        continue;
+                                    }
+                                    if let Some(payload) =
+                                        seal_punch(link, false, if relayed { !rc.token } else { rc.token })
+                                    {
+                                        self.stats.path_probes += 1;
+                                        resend.push((p.clone(), sess.peer, payload));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let (Path::Direct(_), Some(_)) = (&sess.path, sess.relay) {
                         if now >= sess.last_path + self.config.direct_timeout {
                             fallbacks.push(idx);
                         }
                     }
                     // A relay that carries nothing from the peer, or not our data: back to the
-                    // slow address before `idle_timeout` or the retries would drop the link.
-                    if let (Path::Via(r), Some(_), false) = (&sess.path, &sess.slow, self.relay_only) {
+                    // slow address before `idle_timeout` or the retries would drop the link. With
+                    // none, the relay is held off, and the race finds the link another.
+                    if let (Path::Via(r), false) = (&sess.path, self.relay_only) {
+                        let slow = sess.slow.is_some();
                         if link.tx.oldest_unacked().is_some_and(|s| now >= s.max(sess.path_since) + RELAY_STALL) {
-                            stalled.push((idx, *r));
-                        } else if now >= sess.last_path + self.config.direct_timeout {
+                            if slow || !holds(&sess.held, r, now) {
+                                stalled.push((idx, *r));
+                            }
+                        } else if slow && now >= sess.last_path + self.config.direct_timeout {
                             unrelayed.push(idx);
                         }
                     }
@@ -1958,6 +2284,7 @@ impl<A: Address> Endpoint<A> {
             sess.last_path = now;
             sess.path_since = now;
             sess.path_nonce = None;
+            sess.path_rtt = None;
             if let State::Live(link) = &mut sess.state {
                 link.ping_pending = true;
                 mark_ready(&mut self.ready, idx, link);
@@ -1967,15 +2294,50 @@ impl<A: Address> Endpoint<A> {
             self.events.push_back(Event::PathChanged { peer, path: Path::Via(relay) });
             self.start_punch(now, idx);
         }
+        // Faster paths: a relay still worth relaying through (see `add_relay`), not held off.
+        for (idx, to, rtt) in switches {
+            if matches!(&to, Path::Via(r) if !self.fast_link(r)) {
+                continue;
+            }
+            let Some(sess) = self.sessions.get_mut(&idx) else { continue };
+            let State::Live(link) = &mut sess.state else { continue };
+            if let Path::Via(r) = &to {
+                if holds(&sess.held, r, now) {
+                    continue;
+                }
+                sess.relay = Some(*r);
+            }
+            if matches!(&sess.path, Path::Via(r) if holds(&sess.held, r, now)) {
+                link.tx.resend_all(now); // lost on the relay left: on the new path at once
+            }
+            sess.path = to.clone();
+            sess.last_path = now;
+            sess.path_since = now;
+            sess.path_nonce = None;
+            sess.path_rtt = Some(rtt);
+            sess.switched = Some(now);
+            link.ping_pending = true; // the peer follows on it
+            mark_ready(&mut self.ready, idx, link);
+            self.stats.path_switches += 1;
+            self.events.push_back(Event::PathChanged { peer: sess.peer, path: to });
+            // The path left is raced against this one once more after the dwell.
+            sess.race(direct, max).again = Some(now + PATH_DWELL);
+        }
         for idx in unrelayed {
             self.back_to_slow(idx, now);
         }
         for (idx, relay) in stalled {
-            if let Some(sess) = self.sessions.get_mut(&idx) {
-                sess.hold(relay, now);
-                if let State::Live(link) = &mut sess.state {
-                    link.tx.resend_all(now); // lost on the relay: over the slow address at once
+            let Some(sess) = self.sessions.get_mut(&idx) else { continue };
+            sess.hold(relay, now);
+            if sess.slow.is_none() {
+                // Neither probed nor kept now: the race, at once, finds the link another relay.
+                if let Some(rc) = &mut sess.race {
+                    rc.start();
                 }
+                continue;
+            }
+            if let State::Live(link) = &mut sess.state {
+                link.tx.resend_all(now); // lost on the relay: over the slow address at once
             }
             self.back_to_slow(idx, now);
         }
@@ -2020,11 +2382,30 @@ impl<A: Address> Endpoint<A> {
                     if let (Path::Direct(_), Some(_)) = (&sess.path, sess.relay) {
                         min(sess.last_path + self.config.direct_timeout);
                     }
-                    if let (Path::Via(_), Some(_), false) = (&sess.path, &sess.slow, self.relay_only) {
-                        min(sess.last_path + self.config.direct_timeout);
-                        if let Some(s) = link.tx.oldest_unacked() {
-                            min(s.max(sess.path_since) + RELAY_STALL);
+                    if let (Path::Via(r), false) = (&sess.path, self.relay_only) {
+                        if sess.slow.is_some() {
+                            min(sess.last_path + self.config.direct_timeout);
                         }
+                        if let Some(s) = link.tx.oldest_unacked() {
+                            // On a relay held off (it stalled the link), once the hold is over.
+                            let held = sess.held.iter().find(|h| h.relay == *r).map_or(s, |h| h.until);
+                            min((s.max(sess.path_since) + RELAY_STALL).max(held));
+                        }
+                    }
+                    // A race to make for a new path, or its next round.
+                    match &sess.race {
+                        _ if self.relay_only => {}
+                        Some(rc) if rc.on == sess.path => {
+                            if let Some(a) = rc.again {
+                                min(a);
+                            }
+                            if rc.rounds > 0 || rc.open {
+                                min(rc.next_at);
+                            } else if !rc.alts.is_empty() {
+                                min(sess.last_path + self.config.keepalive + PATH_GAP);
+                            }
+                        }
+                        _ => min(sess.last_path),
                     }
                 }
             }
@@ -2848,7 +3229,8 @@ mod tests {
     struct Net(Vec<(Instant, usize, u32, Vec<u8>)>);
 
     impl Net {
-        /// Runs `eps` for `ms` from `t` in 1 ms steps, timers every step. `hop(i, dst)`
+        /// Runs `eps` for `ms` from `t` in 1 ms steps, each endpoint's timers when its
+        /// `poll_timeout` is due, as a host runs them. `hop(i, dst)`
         /// says where endpoint i's datagram to `dst` goes: to endpoint j, from address
         /// `src`, `delay` ms later; or nowhere.
         fn run(
@@ -2858,10 +3240,21 @@ mod tests {
             ms: u64,
             hop: impl Fn(usize, u32) -> Option<(usize, u32, u64)>,
         ) {
+            self.run_sized(eps, t, ms, |i, dst, _| hop(i, dst));
+        }
+
+        /// `run`, with `hop(i, dst, len)` given the datagram's length too.
+        fn run_sized(
+            &mut self,
+            eps: &mut [Endpoint<u32>],
+            t: &mut Instant,
+            ms: u64,
+            hop: impl Fn(usize, u32, usize) -> Option<(usize, u32, u64)>,
+        ) {
             for _ in 0..ms {
                 for (i, ep) in eps.iter_mut().enumerate() {
                     while let Some(tx) = ep.poll_transmit(*t) {
-                        if let Some((j, src, d)) = hop(i, tx.dst) {
+                        if let Some((j, src, d)) = hop(i, tx.dst, tx.payload.len()) {
                             self.0.push((*t + Duration::from_millis(d), j, src, tx.payload));
                         }
                     }
@@ -2874,7 +3267,9 @@ mod tests {
                     eps[j].handle_datagram(now, src, &data);
                 }
                 for ep in eps.iter_mut() {
-                    ep.handle_timeout(now);
+                    if ep.poll_timeout().is_some_and(|d| d <= now) {
+                        ep.handle_timeout(now);
+                    }
                 }
             }
         }
@@ -2987,5 +3382,562 @@ mod tests {
         eps[0].on_packet(t, Path::Via(d), None, &to_a);
         assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(d)), Some(&Path::Via(c))));
         assert_eq!((moves(&events(&mut eps[0])), moves(&events(&mut eps[1]))), (vec![Path::Via(d)], vec![]));
+    }
+
+    /// FL3: a relayed link races the relays offered for it and takes one clearly
+    /// faster: b, which leads (its PeerId is the smaller), takes d, and a follows,
+    /// once each, and the late packets through c, with messages flowing all along,
+    /// don't take either back; the link stays there. The path's RTT is the new one.
+    #[test]
+    fn a_relayed_link_takes_a_faster_relay_and_the_peer_follows() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, c, d, _] = p;
+        assert!(b < a);
+        assert_eq!(eps[1].path_rtt(&a), None, "nothing timed on c yet");
+        eps[1].send(&a, Lane::Reliable, b"timed").unwrap();
+        net.run(&mut eps, &mut t, 500, five);
+        events(&mut eps[0]);
+        let on_c = eps[1].path_rtt(&a).unwrap();
+        assert!(on_c >= Duration::from_millis(160), "{on_c:?}");
+        eps[0].add_relay(t, d, &b);
+        eps[1].add_relay(t, d, &a);
+        let (offered, mut took) = (t, None);
+        let mut got = [Vec::new(), Vec::new()];
+        for k in 0..600u32 {
+            eps[0].send(&b, Lane::Reliable, &k.to_le_bytes()).unwrap();
+            eps[1].send(&a, Lane::Reliable, &k.to_le_bytes()).unwrap();
+            net.run(&mut eps, &mut t, 50, five);
+            got[0].extend(events(&mut eps[0]));
+            let new = events(&mut eps[1]);
+            took = took.or(moves(&new).contains(&Path::Via(d)).then_some(t));
+            got[1].extend(new);
+        }
+        // Taken once d won `PATH_WINS` rounds, the first at once.
+        let after = took.expect("took d") - offered;
+        assert!(after >= PATH_GAP * PATH_WINS && after < PATH_GAP * (PATH_WINS + 1), "{after:?}");
+        assert_eq!((moves(&got[0]), moves(&got[1])), (vec![Path::Via(d)], vec![Path::Via(d)]));
+        let messages = |g: &[Event<u32>]| g.iter().filter(|e| matches!(e, Event::Message { .. })).count();
+        assert_eq!((messages(&got[0]), messages(&got[1])), (600, 600));
+        assert_eq!((eps[0].stats().path_switches, eps[1].stats().path_switches), (0, 1));
+        let on_d = eps[1].path_rtt(&a).unwrap();
+        assert!(on_d >= Duration::from_millis(40) && on_d < Duration::from_millis(60), "{on_d:?}");
+        assert_eq!(eps[1].peer_stats(&a).unwrap().path_rtt, Some(on_d));
+        assert!(eps[0].path_rtt(&b).unwrap() < Duration::from_millis(60));
+        let _ = c;
+    }
+
+    /// A relay not clearly faster isn't taken (20 ms better of 200, under the fifth),
+    /// and the race stops after its rounds: a few probes, then none.
+    #[test]
+    fn a_relay_not_clearly_faster_is_not_taken_and_the_race_ends() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, c, d, _] = p;
+        let near = |i: usize, dst: u32| {
+            let (j, src, ms) = five(i, dst)?;
+            Some((j, src, if i.max(j) == 3 { 35 } else { ms }))
+        };
+        eps[0].add_relay(t, d, &b);
+        eps[1].add_relay(t, d, &a);
+        net.run(&mut eps, &mut t, 15_000, near);
+        let probes = (eps[0].stats().path_probes, eps[1].stats().path_probes);
+        assert_eq!(probes, (2 * PATH_ROUNDS as u64, 2 * PATH_ROUNDS as u64), "c and d, each round");
+        net.run(&mut eps, &mut t, 30_000, near);
+        assert_eq!((eps[0].stats().path_probes, eps[1].stats().path_probes), probes, "the race ended");
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+        assert_eq!((events(&mut eps[0]), events(&mut eps[1])), (vec![], vec![]));
+    }
+
+    /// A peer answers a probe through a relay only if it would follow there: a holds
+    /// d off, so b's probes through d go unanswered and b stays on c, as does a.
+    #[test]
+    fn a_relay_the_peer_holds_off_is_not_taken() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, c, d, _] = p;
+        let idx = eps[0].peers[&b];
+        eps[0].sessions.get_mut(&idx).unwrap().hold(d, t);
+        eps[1].add_relay(t, d, &a);
+        net.run(&mut eps, &mut t, 15_000, five);
+        assert!(eps[1].stats().path_probes >= 2 * PATH_ROUNDS as u64);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+        assert_eq!((events(&mut eps[0]), events(&mut eps[1])), (vec![], vec![]));
+    }
+
+    /// A faster path is taken at most once in `PATH_DWELL`: e, faster than d,
+    /// offered just after the link took d, is taken `PATH_DWELL` after that.
+    #[test]
+    fn a_faster_relay_waits_out_the_dwell() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, _, d, e] = p;
+        eps[0].add_relay(t, d, &b);
+        eps[1].add_relay(t, d, &a);
+        let mut took_d = None;
+        while took_d.is_none() && t < Instant::from_millis(30_000) {
+            net.run(&mut eps, &mut t, 10, five);
+            took_d = moves(&events(&mut eps[1])).contains(&Path::Via(d)).then_some(t);
+        }
+        let took_d = took_d.expect("took d");
+        eps[0].add_relay(t, e, &b);
+        eps[1].add_relay(t, e, &a);
+        let mut took_e = None;
+        while took_e.is_none() && t < took_d + Duration::from_secs(40) {
+            net.run(&mut eps, &mut t, 10, five);
+            took_e = moves(&events(&mut eps[1])).contains(&Path::Via(e)).then_some(t);
+        }
+        let waited = took_e.expect("took e") - took_d;
+        assert!(waited >= PATH_DWELL && waited < PATH_DWELL + PATH_GAP * 2, "{waited:?}");
+        net.run(&mut eps, &mut t, 1_000, five);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(e)), Some(&Path::Via(e))));
+    }
+
+    /// FL3, direct: a link races its other direct addresses. a and b each have a
+    /// public address (`i + 1`, 30 ms a hop) and a LAN one (`i + 11`, 2 ms), linked
+    /// over the public ones; given the LAN ones, the link moves there: b leads, a
+    /// follows. Relay-only turned on at b mid-race, b races no more, and as it leads,
+    /// the link stays; nor are addresses that are local handles raced
+    /// (`share_addresses` off).
+    #[test]
+    fn a_direct_link_takes_a_faster_address() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b) = (ids[0].peer_id(), ids[1].peer_id());
+        let lan = |i: usize, dst: u32| match dst {
+            1 | 2 => Some((dst as usize - 1, i as u32 + 1, 30)),
+            11 | 12 => Some((dst as usize - 11, i as u32 + 11, 2)),
+            _ => None,
+        };
+        let pair = |share: bool| -> Vec<Endpoint<u32>> {
+            let config = Config { share_addresses: share, ..Config::default() };
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, config.clone(), [s; 32])).collect()
+        };
+        for relay_only in [false, true] {
+            let mut eps = pair(true);
+            let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+            eps[0].connect(t, 2, b).unwrap();
+            net.run(&mut eps, &mut t, 500, lan);
+            assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(2)), Some(&Path::Direct(1))));
+            events(&mut eps[0]);
+            events(&mut eps[1]);
+            eps[0].add_candidates(t, &b, &[12]);
+            eps[1].add_candidates(t, &a, &[11]);
+            net.run(&mut eps, &mut t, 10, lan);
+            let sent = eps[1].stats().path_probes;
+            assert_eq!(sent, 2, "a round at once: b's path and the LAN address");
+            eps[1].set_relay_only(relay_only);
+            net.run(&mut eps, &mut t, 30_000, lan);
+            let (ga, gb) = (moves(&events(&mut eps[0])), moves(&events(&mut eps[1])));
+            if relay_only {
+                assert_eq!(eps[1].stats().path_probes, sent, "relay-only: the race stopped");
+                assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(2)), Some(&Path::Direct(1))));
+                assert_eq!((ga, gb), (vec![], vec![]));
+                continue;
+            }
+            assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(12)), Some(&Path::Direct(11))));
+            assert_eq!((ga, gb), (vec![Path::Direct(12)], vec![Path::Direct(11)]));
+            assert_eq!((eps[1].stats().path_switches, eps[0].stats().roams), (1, 1));
+            assert!(eps[1].path_rtt(&a).unwrap() < Duration::from_millis(10));
+        }
+        // Local handles: a link dialled at both, up on the LAN one, races nothing.
+        let mut eps = pair(false);
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        eps[0].connect_with(t, b, &[Path::Direct(2), Path::Direct(12)]).unwrap();
+        net.run(&mut eps, &mut t, 10_000, lan);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(12)));
+        assert_eq!((eps[0].stats().path_probes, eps[1].stats().path_probes), (0, 0));
+    }
+
+    /// FL3-2: an address marked slow during a race is raced no more. As in
+    /// `a_direct_link_takes_a_faster_address`, once the race is on each end marks the
+    /// other's LAN address slow: the link stays on the public ones, and nothing more
+    /// goes to the LAN ones. Marking the link's own path slow instead ends the race.
+    #[test]
+    fn an_address_marked_slow_during_a_race_is_raced_no_more() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b) = (ids[0].peer_id(), ids[1].peer_id());
+        let to_lan = std::cell::Cell::new(0);
+        let lan = |i: usize, dst: u32| match dst {
+            1 | 2 => Some((dst as usize - 1, i as u32 + 1, 30)),
+            11 | 12 => {
+                to_lan.set(to_lan.get() + 1);
+                Some((dst as usize - 11, i as u32 + 11, 2))
+            }
+            _ => None,
+        };
+        for own in [false, true] {
+            let mut eps: Vec<Endpoint<u32>> =
+                ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+            let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+            eps[0].connect(t, 2, b).unwrap();
+            net.run(&mut eps, &mut t, 500, lan);
+            eps[0].add_candidates(t, &b, &[12]);
+            eps[1].add_candidates(t, &a, &[11]);
+            net.run(&mut eps, &mut t, 10, lan);
+            assert_eq!(eps[1].stats().path_probes, 2, "a round at once: b's path and the LAN address");
+            let (slow_a, slow_b) = if own { (2, 1) } else { (12, 11) };
+            eps[0].set_slow(&b, Some(slow_a));
+            eps[1].set_slow(&a, Some(slow_b));
+            let (sent, probes) = (to_lan.get(), [0, 1].map(|i| eps[i].stats().path_probes));
+            net.run(&mut eps, &mut t, 30_000, lan);
+            assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(2)), Some(&Path::Direct(1))));
+            if own {
+                assert_eq!([0, 1].map(|i| eps[i].stats().path_probes), probes, "the race ended");
+            } else {
+                assert_eq!(to_lan.get(), sent, "datagrams to a slow address");
+            }
+        }
+    }
+
+    /// Of two relays clearly faster than the link's, winning the same rounds, the
+    /// faster is taken: d and e offered together, the link goes to e, once each end.
+    #[test]
+    fn of_two_faster_relays_the_fastest_is_taken() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, _, d, e] = p;
+        for r in [d, e] {
+            eps[0].add_relay(t, r, &b);
+            eps[1].add_relay(t, r, &a);
+        }
+        net.run(&mut eps, &mut t, 15_000, five);
+        assert_eq!(
+            (moves(&events(&mut eps[0])), moves(&events(&mut eps[1]))),
+            (vec![Path::Via(e)], vec![Path::Via(e)])
+        );
+    }
+
+    /// A race takes only answers to its open round, over a path of the kind its
+    /// token is for: the direct token through a relay, the relay one from an
+    /// address, or any answer once the round is scored, counts for nothing.
+    #[test]
+    fn a_race_takes_only_answers_to_its_round_with_their_paths_token() {
+        let r = PeerId([9; 32]);
+        let at = Instant::from_millis(1);
+        let mut rc = Race {
+            on: Path::Via(r),
+            token: 7,
+            sent_at: at,
+            next_at: at,
+            rounds: 0,
+            open: true,
+            own: None,
+            alts: Vec::new(),
+            again: None,
+        };
+        rc.add(Path::Direct(5u32), 8);
+        let t = Instant::from_millis(31);
+        assert_eq!((rc.answer(t, &Path::Via(r), 7), rc.answer(t, &Path::Direct(5), !7)), (None, None));
+        assert_eq!((rc.own, rc.alts[0].rtt), (None, None));
+        assert_eq!((rc.answer(t, &Path::Via(r), !7), rc.answer(t, &Path::Direct(5), 7)), (Some(30_000), None));
+        assert_eq!((rc.own, rc.alts[0].rtt), (Some(30_000), Some(30_000)));
+        rc.score();
+        assert_eq!(rc.answer(t, &Path::Via(r), !7), None, "scored: closed");
+        assert_eq!(rc.own, None);
+    }
+
+    /// FL3-N1: RTTs that a host clock jump makes huge saturate rather than wrap (or
+    /// panic, in a debug build): an RTT near the largest isn't clearly faster than
+    /// the same, and smoothing one stays the largest it can be.
+    #[test]
+    fn huge_rtts_saturate_in_a_race_and_in_smoothing() {
+        let mut rc = Race {
+            on: Path::Direct(1u32),
+            token: 7,
+            sent_at: Instant::ZERO,
+            next_at: Instant::ZERO,
+            rounds: 0,
+            open: true,
+            own: Some(u64::MAX - 1),
+            alts: Vec::new(),
+            again: None,
+        };
+        rc.add(Path::Direct(2), 8);
+        rc.alts[0].rtt = Some(u64::MAX - 1);
+        rc.score();
+        assert_eq!(rc.alts[0].wins, 0);
+        assert_eq!((smooth(Some(5), 13), smooth(Some(u64::MAX / 4), 0)), (6, u64::MAX / 8));
+    }
+
+    /// A relay the link holds off isn't probed, nor taken: b races d, then holds it.
+    #[test]
+    fn a_held_relay_is_not_raced() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, c, d, _] = p;
+        eps[0].add_relay(t, d, &b);
+        eps[1].add_relay(t, d, &a);
+        net.run(&mut eps, &mut t, 100, five);
+        let first = eps[1].stats().path_probes;
+        assert_eq!(first, 2, "c and d");
+        let idx = eps[1].peers[&a];
+        eps[1].sessions.get_mut(&idx).unwrap().hold(d, t);
+        net.run(&mut eps, &mut t, PATH_GAP.as_millis() as u64, five);
+        assert_eq!(eps[1].stats().path_probes - first, 1, "c only");
+        net.run(&mut eps, &mut t, 10_000, five);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+    }
+
+    /// The relays probed from the slow address with the one that answered first are
+    /// raced against it: c and d offered at once, d's first probes lost, the link
+    /// takes c, then d.
+    #[test]
+    fn the_relays_probed_with_the_first_to_answer_are_raced() {
+        let ids: Vec<Identity> = (1..=5u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let p = [0, 1, 2, 3, 4].map(|i| ids[i].peer_id());
+        let [a, b, c, d, _] = p;
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        eps[0].connect(t, 2, b).unwrap();
+        for ep in &mut eps[2..] {
+            ep.connect(t, 1, a).unwrap();
+            ep.connect(t, 2, b).unwrap();
+        }
+        net.run(&mut eps, &mut t, 1_000, five);
+        eps[0].set_slow(&b, Some(2));
+        eps[1].set_slow(&a, Some(1));
+        let lose_d = std::cell::Cell::new(true);
+        let hop = |i: usize, dst: u32| if lose_d.get() && i < 2 && dst == 4 { None } else { five(i, dst) };
+        for r in [c, d] {
+            eps[0].add_relay(t, r, &b);
+            eps[1].add_relay(t, r, &a);
+        }
+        net.run(&mut eps, &mut t, 300, hop);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+        lose_d.set(false);
+        net.run(&mut eps, &mut t, 15_000, hop);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(d)), Some(&Path::Via(d))));
+    }
+
+    /// A relay offered at one end only is raced at the other too, learned from the
+    /// probes through it: a, which follows, is offered d, and b, which leads, takes it.
+    #[test]
+    fn a_relay_offered_at_one_end_is_learned_from_its_probes() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, _, d, _] = p;
+        assert!(b < a);
+        eps[0].add_relay(t, d, &b);
+        net.run(&mut eps, &mut t, 15_000, five);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(d)), Some(&Path::Via(d))));
+        assert_eq!((eps[0].stats().path_switches, eps[1].stats().path_switches), (0, 1));
+    }
+
+    /// FL3-1: right after a punch moves a relayed link direct, an older packet of
+    /// b's that relay c kept, sent from c's own (UDP) address, doesn't roam a's link
+    /// there: the answer that moved it is newer. A packet b seals now, from a new
+    /// address (a rebinding), still roams.
+    #[test]
+    fn a_packet_kept_from_before_an_upgrade_does_not_roam_the_link() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b, c) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[2].connect(t, 1, a).unwrap();
+        eps[2].connect(t, 2, b).unwrap();
+        route(&mut eps, &mut t, 200, None);
+        eps[0].connect_via(t, c, b, &[]).unwrap();
+        let cut = |i: usize, dst: u32| (i == 0 && dst == 2) || (i == 1 && dst == 1);
+        route_with(&mut eps, &mut t, 300, cut);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+        // A ping of b's that c, relaying it, keeps (c sees exactly these bytes in the FWD).
+        let mut ping = Vec::new();
+        wire::put_ping(&mut ping);
+        let kept = eps[1].seal_raw(&a, &ping).unwrap();
+        for _ in 0..500 {
+            if eps[0].path(&b) == Some(&Path::Direct(2)) {
+                break;
+            }
+            route(&mut eps, &mut t, 10, None);
+        }
+        assert_eq!((eps[0].path(&b), eps[0].stats().punch_succeeded), (Some(&Path::Direct(2)), 1), "upgraded");
+        events(&mut eps[0]);
+        eps[0].handle_datagram(t, 3, &kept);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)), "the kept packet roamed a's link to c");
+        let fresh = eps[1].seal_raw(&a, &ping).unwrap();
+        eps[0].handle_datagram(t, 12, &fresh);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(12)));
+        assert_eq!(events(&mut eps[0]), vec![Event::PathChanged { peer: b, path: Path::Direct(12) }]);
+    }
+
+    /// The leader leaves a relay that stops answering for one that does: a and b on d
+    /// (taken for being faster, c raced too), with no slow address to go back to nor
+    /// any direct path (as two symmetric NATs), and d drops everything. 12 s after d
+    /// last carried anything, the race starts again;
+    /// c answers and d doesn't, so b takes c (after the dwell) and a follows, and the
+    /// link lives on.
+    #[test]
+    fn the_leader_leaves_a_relay_that_stops_answering() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, c, d, _] = p;
+        eps[0].add_relay(t, d, &b);
+        eps[1].add_relay(t, d, &a);
+        net.run(&mut eps, &mut t, 10_000, five);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(d)), Some(&Path::Via(d))));
+        let apart = |i: usize, dst: u32| if i < 2 && dst < 3 { None } else { five(i, dst) };
+        eps[0].set_slow(&b, None);
+        eps[1].set_slow(&a, None);
+        net.run(&mut eps, &mut t, 1_000, apart);
+        events(&mut eps[0]);
+        events(&mut eps[1]);
+        let dead = |i: usize, dst: u32| if i == 3 || dst == 4 { None } else { apart(i, dst) };
+        let killed = t;
+        net.run(&mut eps, &mut t, 5_000, dead);
+        let due = eps[1].poll_timeout().unwrap();
+        assert!(due <= killed + Duration::from_secs(11) + PATH_GAP, "wakes for the quiet path: {due:?}");
+        net.run(&mut eps, &mut t, 35_000, dead);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+        let (ga, gb) = (events(&mut eps[0]), events(&mut eps[1]));
+        let lost = |g: &[Event<u32>], peer: PeerId| {
+            g.iter().any(|e| matches!(e, Event::Disconnected { peer: q, .. } if *q == peer))
+        };
+        assert!(!lost(&ga, b) && !lost(&gb, a), "{ga:?} {gb:?}");
+        assert_eq!((moves(&ga), moves(&gb)), (vec![Path::Via(c)], vec![Path::Via(c)]));
+    }
+
+    /// FL3-3: on a link with no slow address, a relay that carries the small packets
+    /// (probes, pings, acks) but drops data is held off and left for one that carries
+    /// it. a and b on d, with no direct path (as in
+    /// `the_leader_leaves_a_relay_that_stops_answering`), then d forwards only packets
+    /// of 200 bytes or less to them, and one end sends a 400-byte message every
+    /// 100 ms. Once its data has stalled there, the sender holds d off and races at
+    /// once (its first round on the next step), and leaves d for c when c wins:
+    /// - a, which follows; b follows once d goes quiet for it;
+    /// - b, which leads, sending from just after it took d: within the dwell;
+    /// - b, with c down too for the first race: the race goes on while d is held.
+    ///
+    /// Every message arrives, and the link is never dropped.
+    #[test]
+    fn a_relay_that_drops_data_is_left_for_one_that_carries_it() {
+        for (s, count, down) in [(0, 3000, 0), (1, 600, 0), (1, 600, 16)] {
+            let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+            let (mut eps, p) = relay_five(&mut t, &mut net);
+            let [a, b, c, d, _] = p;
+            let apart = |i: usize, dst: u32| if i < 2 && dst < 3 { None } else { five(i, dst) };
+            eps[0].set_slow(&b, None);
+            eps[1].set_slow(&a, None);
+            net.run(&mut eps, &mut t, 1_000, apart);
+            eps[0].add_relay(t, d, &b);
+            eps[1].add_relay(t, d, &a);
+            let on_d = |eps: &[Endpoint<u32>]| {
+                (eps[0].path(&b), eps[1].path(&a)) == (Some(&Path::Via(d)), Some(&Path::Via(d)))
+            };
+            for _ in 0..1_000 {
+                if on_d(&eps) {
+                    break;
+                }
+                net.run(&mut eps, &mut t, 10, apart);
+            }
+            assert!(on_d(&eps), "on d");
+            if s == 0 {
+                net.run(&mut eps, &mut t, 10_000, apart);
+            }
+            events(&mut eps[0]);
+            events(&mut eps[1]);
+            let (took_d, c_down) = (t, std::cell::Cell::new(true));
+            let picky = |i: usize, dst: u32, len: usize| {
+                if (i == 3 && dst < 3 && len > 200) || (c_down.get() && (i == 2 || dst == 3)) {
+                    return None;
+                }
+                apart(i, dst)
+            };
+            let (to, r) = ([b, a][s], 1 - s);
+            let (mut got, mut left, mut all) = (0, None, [Vec::new(), Vec::new()]);
+            // While on d held off: how often the sender's timers were due (a host spinning
+            // on them is at every step), in how many steps; when d was held off, and the
+            // race's first round after that (µs).
+            let (mut due, mut steps, mut held_at, mut first) = (0, 0, 0, None);
+            for k in 0..count as u32 {
+                c_down.set(t < took_d + Duration::from_secs(down));
+                eps[s].send(&to, Lane::Reliable, &[k as u8; 400]).unwrap();
+                net.run_sized(&mut eps, &mut t, 100, picky);
+                let sess = &eps[s].sessions[&eps[s].peers[&to]];
+                if sess.path == Path::Via(d) && holds(&sess.held, &d, t) {
+                    steps += 1;
+                    due += eps[s].poll_timeout().is_some_and(|x| x <= t) as u32;
+                    held_at = sess.held[0].until.as_micros() - RELAY_HOLD.as_micros() as u64;
+                    let sent = sess.race.as_ref().unwrap().sent_at.as_micros();
+                    first = first.or((sent >= held_at).then_some(sent - held_at));
+                }
+                let new = [events(&mut eps[0]), events(&mut eps[1])];
+                got += new[r].iter().filter(|e| matches!(e, Event::Message { .. })).count();
+                left = left.or(moves(&new[s]).contains(&Path::Via(c)).then_some(t));
+                for (g, n) in all.iter_mut().zip(new) {
+                    g.extend(n.into_iter().filter(|e| !matches!(e, Event::Message { .. })));
+                }
+            }
+            assert_eq!(got, count, "sent by {s}");
+            assert_eq!((moves(&all[0]), moves(&all[1])), (vec![Path::Via(c)], vec![Path::Via(c)]), "{all:?}");
+            assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+            let held = &eps[s].sessions[&eps[s].peers[&to]].held;
+            assert_eq!(held.iter().map(|h| (h.relay, h.strikes)).collect::<Vec<_>>(), vec![(d, 1)], "sent by {s}");
+            // Held off as the stall is due (the first message went out as the link took d),
+            // and raced on the next step; never due again while held.
+            let stall = held_at - took_d.as_micros() - RELAY_STALL.as_micros() as u64;
+            assert!(stall <= 1_000 && first.is_some_and(|us| us <= 1_000), "sent by {s}: {stall} µs, {first:?}");
+            assert!(steps >= 50 && due <= 1, "sent by {s}: due in {due} of {steps} steps on d held off");
+            // c's wins, 2 s apart, from the stall or from when c is back.
+            let left = left.expect("left d") - took_d;
+            let by = RELAY_STALL.max(Duration::from_secs(down)) + PATH_GAP * (PATH_WINS + 1);
+            assert!(left < by, "sent by {s}, c down {down} s: left d after {left:?}");
+        }
+    }
+
+    /// A path taken for being faster is raced against the one left once more after
+    /// the dwell, so a move won on lost probes goes back and a genuine one stays. a
+    /// and b take e (1 ms a hop) from c (40 ms); past the dwell, d (10 ms) is offered
+    /// while everything over e is lost, so d answers and e doesn't, and b takes d.
+    /// `PATH_DWELL` later e wins the race on d, and b takes it back; a follows each
+    /// time. Neither move to e is undone by its own race once more.
+    #[test]
+    fn a_move_won_on_lost_probes_goes_back_after_the_dwell() {
+        let (mut t, mut net) = (Instant::from_millis(1), Net(Vec::new()));
+        let (mut eps, p) = relay_five(&mut t, &mut net);
+        let [a, b, _, d, e] = p;
+        assert!(b < a);
+        let lose_e = std::cell::Cell::new(false);
+        let hop = |i: usize, dst: u32| {
+            if lose_e.get() && ((i < 2 && dst == 5) || (i == 4 && dst < 3)) {
+                return None;
+            }
+            five(i, dst)
+        };
+        // Runs for `ms`, noting when each end moved, and where.
+        let mut moved = [Vec::new(), Vec::new()];
+        let mut run = |eps: &mut [Endpoint<u32>], t: &mut Instant, ms: u64| {
+            for _ in 0..ms / 10 {
+                net.run(eps, t, 10, hop);
+                for (m, ep) in moved.iter_mut().zip(eps.iter_mut()) {
+                    m.extend(moves(&events(ep)).into_iter().map(|p| (*t, p)));
+                }
+            }
+        };
+        eps[0].add_relay(t, e, &b);
+        eps[1].add_relay(t, e, &a);
+        run(&mut eps, &mut t, 40_000);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(e)), Some(&Path::Via(e))));
+        lose_e.set(true);
+        eps[0].add_relay(t, d, &b);
+        eps[1].add_relay(t, d, &a);
+        for _ in 0..1_000 {
+            if eps[1].path(&a) == Some(&Path::Via(d)) {
+                break;
+            }
+            run(&mut eps, &mut t, 10);
+        }
+        lose_e.set(false);
+        run(&mut eps, &mut t, 60_000);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(e)), Some(&Path::Via(e))));
+        let paths = |m: &[(Instant, Path<u32>)]| m.iter().map(|x| x.1.clone()).collect::<Vec<_>>();
+        let went = vec![Path::Via(e), Path::Via(d), Path::Via(e)];
+        assert_eq!((paths(&moved[0]), paths(&moved[1])), (went.clone(), went), "{moved:?}");
+        assert_eq!((eps[0].stats().path_switches, eps[1].stats().path_switches), (0, 3));
+        // e won the first `PATH_WINS` rounds, the first sent as the dwell ended (to a step).
+        let back = moved[1][2].0 - moved[1][1].0;
+        let due = PATH_DWELL + PATH_GAP * PATH_WINS;
+        assert!(back >= due && back < due + Duration::from_millis(10), "{back:?}");
     }
 }

@@ -66,6 +66,7 @@ NODE=(
   "node room welcome|node packages/js/test/room_welcome.mjs"
   "node room fallback|node packages/js/test/room_fallback.mjs"
   "node room relay move|node packages/js/test/room_relay_move.mjs"
+  "node room relay latency|node packages/js/test/room_relay_latency.mjs"
   "node room adopt|node packages/js/test/room_adopt.mjs"
   "node room same nat|node packages/js/test/room_same_nat.mjs"
   "node room retry|node packages/js/test/room_retry.mjs"
