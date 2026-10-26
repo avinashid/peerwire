@@ -53,7 +53,7 @@ const HELLO_EVERY_MS = 15000;
 // A link must prove the room key this soon after it connects.
 const PROOF_MS = 10000;
 // In a fallback, members get this long to relay a peer before signalling, the
-// slowest path, joins the dial.
+// slowest path, joins the dial. With no other member that could, it is dialled at once.
 const PEER_FIRST_MS = 1000;
 // Frames held from one peer while its link proof is checked (and until our presence
 // has gone to it).
@@ -567,7 +567,8 @@ export class Room {
   // WebRTC couldn't link `peer`. The side that dials (the smaller id) dials it again
   // through every member linked to us directly (and any that links later) and, unless
   // one answers within PEER_FIRST_MS, over signalling too; the core keeps the first
-  // path to answer. The other side just answers.
+  // path to answer. With no other member that could (two in the room, say: a laptop on
+  // a phone's hotspot), signalling is dialled at once. The other side just answers.
   rtcFailed(peer) {
     if (this.left || this.fallback === 'off' || this.self > peer || this.endpoint.isConnected(peer)) return;
     const vias = [...this.routes].filter(([p, r]) => p !== peer && r.kind === 'direct' && this.proven.has(p)).map(([p]) => p);
@@ -577,6 +578,10 @@ export class Room {
     this.fallingBack.add(peer);
     for (const v of vias) this.endpoint.connectVia(v, peer);
     if (pipe == null) return;
+    // Another peer we heard but haven't linked yet may still link and prove the key, and
+    // relayPending dial through it: only with no such peer either is signalling at once.
+    const others = [...this.greeted, ...this.linked].some((p) => p !== peer && (!this.linked.has(p) || this.routes.get(p)?.kind === 'direct'));
+    if (!others) return this.endpoint.connect(pipe, peer);
     setTimeout(() => !this.left && this.fallingBack.has(peer) && this.endpoint.connect(pipe, peer), Room.peerFirstMs);
   }
 
