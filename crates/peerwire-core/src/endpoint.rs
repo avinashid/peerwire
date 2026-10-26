@@ -2857,8 +2857,8 @@ mod tests {
             hop: impl Fn(usize, u32) -> Option<(usize, u32, u64)>,
         ) {
             for _ in 0..ms {
-                for i in 0..eps.len() {
-                    while let Some(tx) = eps[i].poll_transmit(*t) {
+                for (i, ep) in eps.iter_mut().enumerate() {
+                    while let Some(tx) = ep.poll_transmit(*t) {
                         if let Some((j, src, d)) = hop(i, tx.dst) {
                             self.0.push((*t + Duration::from_millis(d), j, src, tx.payload));
                         }
@@ -2887,16 +2887,16 @@ mod tests {
         let mut eps: Vec<Endpoint<u32>> =
             ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
         eps[0].connect(*t, 2, p[1]).unwrap();
-        for r in 2..5 {
-            eps[r].connect(*t, 1, p[0]).unwrap();
-            eps[r].connect(*t, 2, p[1]).unwrap();
+        for ep in &mut eps[2..] {
+            ep.connect(*t, 1, p[0]).unwrap();
+            ep.connect(*t, 2, p[1]).unwrap();
         }
-        net.run(&mut eps, t, 1_000, FIVE);
+        net.run(&mut eps, t, 1_000, five);
         eps[0].set_slow(&p[1], Some(2));
         eps[1].set_slow(&p[0], Some(1));
         eps[0].add_relay(*t, p[2], &p[1]);
         eps[1].add_relay(*t, p[2], &p[0]);
-        net.run(&mut eps, t, 2_000, FIVE);
+        net.run(&mut eps, t, 2_000, five);
         assert_eq!((eps[0].path(&p[1]), eps[1].path(&p[0])), (Some(&Path::Via(p[2])), Some(&Path::Via(p[2]))));
         for ep in eps.iter_mut() {
             events(ep);
@@ -2904,12 +2904,12 @@ mod tests {
         (eps, p)
     }
 
-    /// The hops of `relay_five`.
-    const FIVE: fn(usize, u32) -> Option<(usize, u32, u64)> = |i, dst| {
+    /// The hops of `relay_five` (see `Net::run`).
+    fn five(i: usize, dst: u32) -> Option<(usize, u32, u64)> {
         let j = (dst as usize).checked_sub(1)?;
         let ms = [0, 0, 40, 10, 1][i.max(j)];
         Some((j, i as u32 + 1, if i.max(j) == 1 { 100 } else { ms }))
-    };
+    }
 
     /// The paths changed to in `got`.
     fn moves(got: &[Event<u32>]) -> Vec<Path<u32>> {
@@ -2960,7 +2960,7 @@ mod tests {
         for k in 0..200u32 {
             eps[0].send(&b, Lane::Reliable, &k.to_le_bytes()).unwrap();
             eps[1].send(&a, Lane::Reliable, &k.to_le_bytes()).unwrap();
-            net.run(&mut eps, &mut t, 50, FIVE);
+            net.run(&mut eps, &mut t, 50, five);
             got[0].extend(events(&mut eps[0]));
             got[1].extend(events(&mut eps[1]));
         }

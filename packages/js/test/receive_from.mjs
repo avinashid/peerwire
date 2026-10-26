@@ -2,11 +2,12 @@
 // (its DataChannel, its signalling pipe), so a datagram there for another peer's link is
 // dropped unread. A member that relays for others then can't send a packet of theirs it
 // kept on its own channel to move their link onto it (FL2-2). Without a peer, as on UDP,
-// a link roams to wherever its peer's packets come from. Checks:
-// - one of b's datagrams to a, kept back, given to a on handle 3 naming c: no path change,
-//   nothing decrypted or taken as a replay;
-// - the same datagram on handle 3 with no peer: it was never read, so it is fresh, and a's
-//   link to b roams to handle 3;
+// a link roams to wherever its peer's newest packets come from. Checks:
+// - one of b's datagrams to a, kept back (and b's later ones held), given to a on handle 3
+//   naming c: no path change, nothing decrypted or taken as a replay;
+// - the same datagram on handle 3 with no peer: it was never read, so it is fresh, and as
+//   b's newest, a's link to b roams to handle 3;
+// - b's later datagrams, released on handle 2: the link follows them back there;
 // - the link still carries messages both ways.
 //
 //   node packages/js/test/receive_from.mjs [path/to/peerwire_ffi.wasm]
@@ -32,9 +33,10 @@ const [a, b, c] = [pw.endpoint(), pw.endpoint(), pw.endpoint()];
 // what a sends to any other handle is lost.
 let keep = false;
 let kept = null;
+const held = []; // b's datagrams after the kept one, while keeping
 a.onTransmit = (addr, bytes) => addr === 2 && setImmediate(() => b.receive(1, bytes, a.id));
 b.onTransmit = (addr, bytes) => {
-  if (keep && !kept) return void (kept = bytes);
+  if (keep) return void (kept ? held.push(bytes) : (kept = bytes));
   setImmediate(() => a.receive(2, bytes, b.id));
 };
 const paths = [];
@@ -65,8 +67,12 @@ if (paths.length !== 1 || paths[0].direct !== 3) fail(`with no peer named, the l
 if (a.stats().rxReplayed !== before.rxReplayed) fail('the datagram was taken as a replay: the first one was read');
 console.log('the same datagram with no peer named: fresh, and the link roams to handle 3 (as on UDP)');
 
-// Back on handle 2, b's: a's link follows b's next datagram there.
+// Back on handle 2, b's later datagrams: a's link follows them there.
 keep = false;
+for (const h of held) a.receive(2, h, b.id);
+await tick();
+if (paths.length !== 2 || paths[1].direct !== 2) fail(`the link didn't follow b's newer datagrams back to 2: ${JSON.stringify(paths)}`);
+console.log("b's newer datagrams on handle 2: the link follows them back");
 a.send(b.id, 'to b');
 b.send(a.id, 'to a');
 await until('messages both ways', () => got.some(([w, m]) => w === 'a' && m === 'to a') && got.some(([w, m]) => w === 'b' && m === 'to b'));
