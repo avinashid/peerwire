@@ -55,7 +55,7 @@ room.send({ x: 1, y: 2 }, { lane: 'unreliable' }); // latest-wins, one datagram 
 room.send(bytes, { to: peer });                 // one peer, or an array of them
 room.setPresence({ name: 'Ana', typing: true });
 room.peers; room.self; room.getPresence(peer); room.rtt(peer);
-room.route(peer);                               // { kind: 'direct' (adopted?) | 'peer' (via) | 'signaling' }
+room.route(peer);                               // { kind: 'direct' (adopted?) | 'peer' (via) | 'signaling', rttMs }
 room.retryDirect();                             // try WebRTC again with peers on a fallback (see Through any NAT)
 await room.leave();                             // peers see 'peer-leave' at once
 ```

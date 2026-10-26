@@ -321,9 +321,10 @@ export class Room {
   // How `peer` is reached: { kind: 'direct' } (its own WebRTC link), { kind: 'direct',
   // adopted: true } (a channel handed to adoptChannel), { kind: 'peer', via } (relayed
   // by member `via`), { kind: 'signaling' } (over the signalling relays), or null while
-  // not linked.
+  // not linked; with `rttMs`, the round trip over that path (null until measured).
   route(peer) {
-    return this.routes.get(peer) ?? null;
+    const r = this.routes.get(peer);
+    return r ? { ...r, rttMs: this.endpoint.pathRttMs(peer) } : null;
   }
 
   // Tries WebRTC again, now, with `peer` (or every peer) that the room reaches only by
@@ -565,12 +566,14 @@ export class Room {
   }
 
   // Every proven member linked to us directly is offered as a relay for every proven
-  // peer we reach over signalling: the core probes through it and moves the link there
-  // once the peer answers, which it does only if it would use that member too.
+  // peer we reach over signalling or through another member: the core probes through it
+  // and moves the link there once the peer answers (from signalling), or once it is
+  // clearly faster than the member relaying now; the peer answers only if it would use
+  // that member too.
   offerRelays() {
     const members = [...this.routes].filter(([p, r]) => r.kind === 'direct' && this.proven.has(p)).map(([p]) => p);
     for (const [p, r] of this.routes) {
-      if (r.kind === 'signaling' && this.proven.has(p)) for (const m of members) this.endpoint.addRelay(m, p);
+      if (r.kind !== 'direct' && this.proven.has(p)) for (const m of members) this.endpoint.addRelay(m, p);
     }
   }
 

@@ -331,6 +331,13 @@ export class Endpoint {
     const us = this.pw.x.pw_rtt_us(this.h, this.setPeer(peer));
     return us < 0n ? null : Number(us) / 1000;
   }
+  // Round-trip time over the path the link to `peer` is on now, in ms, measured since it
+  // moved there; null until measured.
+  pathRttMs(peer) {
+    if (this.closed) return null;
+    const us = this.pw.x.pw_path_rtt_us(this.h, this.setPeer(peer));
+    return us < 0n ? null : Number(us) / 1000;
+  }
   // Returns 0, or a negative PW_ERR code (-1 not connected, -2 too large, -3 would block).
   // Throws after close(): a send on a closed endpoint is a bug in the app, not a lost packet.
   send(peer, data, lane = Lane.Reliable) {
