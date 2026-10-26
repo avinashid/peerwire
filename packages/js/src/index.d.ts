@@ -68,7 +68,12 @@ export interface JoinRoomOptions {
    * `'public-only'`: no LAN or loopback (`host`) candidates, only what STUN reports (and no local address in
    * a candidate's related address or the SDP's `c=` line either), so tabs of one
    * machine with no STUN server can't link. Relay-only is not available for rooms: use
-   * `WebRtcTransport` with `privacy: 'relay-only'`. */
+   * `WebRtcTransport` with `privacy: 'relay-only'`.
+   * Once the page has microphone or camera permission, browsers list every network interface to connections made
+   * after the grant (RFC 8828 mode 1). With `'direct'`, members then get each one's real address (LAN, hotspot and
+   * IPv6 ones), which is what lets a phone and a laptop on its hotspot link directly. `'public-only'` withholds
+   * those, and that direct path with them, but still sends each interface's public address as STUN sees it (the
+   * Wi-Fi's and the mobile network's, say). Voice and video apps ask for that permission anyway. */
   privacy?: 'direct' | 'public-only';
   /** What to do for a peer WebRTC can't link (symmetric NAT on both sides, no TURN):
    * - `'auto'` (default): dial it through every member linked to both of you, and over the
@@ -285,8 +290,10 @@ export declare class Endpoint {
   disconnect(peer: PeerId | Uint8Array): void;
   /** Relayed links never punch to a direct path, dials through a relay alone (given the relay before any
    * direct address of their own, or with a relay when this is turned on) send nothing direct, relays forward
-   * without our address, and a direct handshake is answered only from a peer we are dialling directly. A direct
-   * dial later given a relay keeps its direct addresses and may complete direct. */
+   * without our address, and a direct handshake is answered only from a peer we are dialling directly or already
+   * have a direct link with. A direct dial later given a relay keeps its direct addresses and may complete direct,
+   * until the next `setRelayOnly(true)`: every such call, even with relay-only already on, sends each dial that has
+   * a relay through it alone. */
   setRelayOnly(on: boolean): void;
   /** After `close()`, the counters as they were when it closed. */
   stats(): EndpointStats;

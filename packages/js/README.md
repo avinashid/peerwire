@@ -93,7 +93,9 @@ await room.leave();                             // peers see 'peer-leave' at onc
 - **Node:** Node has no WebRTC. `signaling: 'local'` rooms then carry their
   datagrams over the BroadcastChannel (peers in one process or its workers). For
   real networks pass `RTCPeerConnection` from a WebRTC package such as
-  node-datachannel's polyfill.
+  node-datachannel's polyfill. Known issue: on Node 26.7, a script can hang in
+  `process.exit()` on a busy machine while V8 is still optimising the wasm in the
+  background; run it with `node --no-wasm-tier-up` (the repo's tests do).
 - **Identity:** `room.endpoint.secret()` returns 32 bytes; pass them back as
   `secret` to keep the same PeerId.
 
@@ -232,6 +234,18 @@ it is given:
   path, and the relay is asked not to pass on your address. The relay sees both
   ends. There is no TURN: a peer not linked to the relay can't be reached.
 
+**With microphone or camera permission.** Until a page has it, browsers hide its local
+addresses (behind mDNS names; Android Chrome offers only its mobile-data interface).
+Connections made after the grant list every network interface (RFC 8828 mode 1), which
+affects every voice or video app:
+- `'direct'`: members get each interface's real address, LAN, hotspot and IPv6 ones.
+  That is also what lets a phone and a laptop on its hotspot link directly. In one field
+  test (October 2026: Android Chrome on mobile data, a laptop on its hotspot) the pair
+  linked direct in 1.2 s, at about 10 ms, when both pages had microphone permission, and
+  over the signalling relays in 5 to 6 s, at about 600 ms, when they didn't.
+- `'public-only'`: none of those, and so not that direct path either. Each interface's
+  public address as STUN sees it still goes (the Wi-Fi's and the mobile network's, say).
+
 ## Trying it
 
 - Same browser: open `demo/index.html` or the arena pages in several tabs.
@@ -319,7 +333,8 @@ the fallback and the peer stay as they are. The room retries:
   estimate doesn't count);
 - **after a microphone or camera grant**, with privacy `'direct'`: browsers show their local
   addresses (mDNS hides them, Android Chrome lists only mobile data) only to connections
-  made after one, so a laptop on a phone's hotspot can then link to the phone directly.
+  made after one, so a laptop on a phone's hotspot can then link to the phone directly
+  (when both pages have the permission; see Privacy for what members then see).
   `retryOnGrant: false` turns this off. With `'public-only'`, retries offer no local
   address, as first dials don't;
 - **when the app asks:** `room.retryDirect(peer?)`, for every peer on a fallback or one.
