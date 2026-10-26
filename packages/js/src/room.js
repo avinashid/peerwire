@@ -601,10 +601,13 @@ export class Room {
     this.paths.delete(peer);
     this.fallingBack.delete(peer);
     this.retries.forget(peer);
+    // Out of the room before the session ends: disconnect() pumps, and a 'disconnected'
+    // already queued (its sealed close came in the Bye's pipe batch) is not a second leave.
+    const member = this.members.delete(peer);
     // Its sealed close may never come now that its transport is gone: end the session
     // here, so links it relayed go back to signalling at once.
     if (reason === 'left') this.endpoint.disconnect(peer);
-    if (this.members.delete(peer)) this.emit('peer-leave', peer, reason);
+    if (member) this.emit('peer-leave', peer, reason);
   }
 
   write(peer, f, lane) {

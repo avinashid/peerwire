@@ -67,6 +67,7 @@ export class NostrSignaling {
     this.paused = new Map(); // relay url -> { until, ms }: backing off its rate limit
     this.stats = { published: 0, received: 0, rejected: 0, relaysOpen: 0, reconnects: 0 };
     this.closed = false;
+    this.sending = 0; // send()s not yet published: close() leaves the sockets open for them
     this.retry = new Map(); // relay url -> { ms, timer }: redial after a close
     this.onReconnect = () => {}; // (url): a relay opened again after a close
     this.ready = this.start(relays);
@@ -261,15 +262,24 @@ export class NostrSignaling {
 
   async send(to, body) {
     if (!isPeerId(to)) throw new TypeError('send: `to` must be a peer id (64 lowercase hex characters)');
+    if (this.closed) return;
     const sealed = this.ep.seal(to, enc.encode(JSON.stringify(body)));
     if (!sealed) return;
-    await this.publish(hex(await sha256(enc.encode(`peerwire/peer/${to}`))), b64(sealed));
+    this.sending++;
+    try {
+      await this.publish(hex(await sha256(enc.encode(`peerwire/peer/${to}`))), b64(sealed));
+    } finally {
+      if (!--this.sending && this.closed) this.shut();
+    }
   }
 
   onMessage(fn) {
     this.handlers.push(fn);
   }
 
+  // Nothing is read from now on. A message handed to send() before (a leaving room's last
+  // pipe batch, its Bye) is still being hashed and signed, which is asynchronous: the
+  // sockets close once it is published.
   close() {
     this.closed = true;
     for (const r of this.retry.values()) clearTimeout(r.timer);
@@ -277,6 +287,11 @@ export class NostrSignaling {
     globalThis.removeEventListener?.('online', this.wake);
     globalThis.document?.removeEventListener?.('visibilitychange', this.wake);
     globalThis.navigator?.connection?.removeEventListener?.('change', this.wake);
+    for (const ws of this.sockets) ws.onmessage = null;
+    if (!this.sending) this.shut();
+  }
+
+  shut() {
     for (const ws of this.sockets) ws.close();
   }
 }
