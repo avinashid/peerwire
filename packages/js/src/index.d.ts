@@ -405,7 +405,15 @@ export declare class WebRtcTransport implements Transport {
   readonly badSignals: number;
   /** Offers sent again for want of an answer, and answers sent again for a repeated offer. */
   readonly resent: number;
-  /** ICE restarts begun as the dialling side (a link that was open lost ICE). */
+  /**
+   * Offers, answers, copies of either and `restart` asks not sent because the peer's publish budget was spent:
+   * 6 at once, then 1 per 5 s per peer, so no peer can keep us publishing to the signalling relays.
+   */
+  readonly throttled: number;
+  /**
+   * ICE restarts begun as the dialling side (a link that was open lost ICE). At most 3 per link a minute, whether
+   * or not ICE reconnects in between; the other side's ask is heeded only while our own ICE is down too.
+   */
   readonly restarts: number;
   /** Retries begun as the dialling side (see `retry`). */
   readonly retried: number;
@@ -415,8 +423,9 @@ export declare class WebRtcTransport implements Transport {
    * `restart: true` for an ICE restart, `retry: true` for a retry's offer), retries (`retry` with `dialer`,
    * `retry-failed`), ICE (`ice-state` with `state`, `candidate-error` with the STUN server `url`,
    * `code`, `text`, `address`, `ice-restart` with `n`, `reason`, `dialer`), port prediction (`guesses` with the
-   * peer's `ip`, `next`, `step` and the `n` candidates added) and `same-nat` (the peer's candidates name our
-   * public IPv4 `ip`, so the link falls back after `ms`).
+   * peer's `ip`, `next`, `step` and the `n` candidates added), `same-nat` (the peer's candidates name our
+   * public IPv4 `ip`, so the link falls back after `ms`) and `throttled` (a message of `kind` not sent: see
+   * `throttled`).
    */
   trace: ((peer: PeerId, what: string, detail: Record<string, unknown>) => void) | null;
   /**
