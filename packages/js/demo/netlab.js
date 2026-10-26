@@ -434,7 +434,7 @@ function peerState(peer) {
   let p = peers.get(peer);
   if (!p) {
     p = { id: peer, heardAt: null, rtcOpenAt: null, rtcFailedAt: null, joinedAt: null, leftAt: null, leaveReason: null, presence: null,
-      route: null, routeLog: [], ice: null, sig: [], pairs: new Map(), pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set(), bday: null, pathLogged: null };
+      route: null, routeLog: [], ice: null, sig: [], pairs: new Map(), pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set(), bday: null, pathLogged: null, sameNat: null };
     peers.set(peer, p);
   }
   return p;
@@ -536,6 +536,9 @@ function onTrace(peer, what, d) {
   }
   const text = SIG_TEXT[what]?.(d) ?? what;
   if (p.sig.length < 60) p.sig.push({ at, what, ...d });
+  // Whether the peer is behind our public IP, as its newest connection found (see sameNatSkip).
+  if ((what === 'offer-sent' || what === 'offer-received') && !d.resend && !d.restart) p.sameNat = null;
+  if (what === 'same-nat') p.sameNat = d.ip;
   if (what === 'offer-received' || what === 'answer-received' || what === 'ice-batch-received') {
     tryHotspot(p, peer);
     setTimeout(() => { noteTheirHosts(p, peer); tryHotspot(p, peer); }, 500);
@@ -596,6 +599,8 @@ function srflxAddr(sdp) {
 // symmetric one; else the larger id (so both sides agree). `want` ('hard'|'easy') from
 // a retry overrides the guess, since the first roles may have been backwards.
 function punchRoles(peer, want) {
+  const same = sameNatSkip(peer);
+  if (same) return { bad: same };
   const sym = (n) => n === 'symmetric';
   const cell = (c) => /cellular/i.test(c ?? '');
   const them = peerState(peer).presence ?? {};
@@ -607,6 +612,14 @@ function punchRoles(peer, want) {
   else if (cell(connInfo()) !== cell(them.conn)) { iAmHard = cell(connInfo()); why = 'the cellular side is the likely symmetric one'; }
   else { iAmHard = room.self > peer; why = "neither NAT looks symmetric: a guess (press again to swap sides)"; }
   return { iAmHard, why, forced: !sym(mine) && !sym(them.nat) };
+}
+
+// A peer behind our own public IP (a laptop on this phone's hotspot) gets no punch: the
+// shared NAT doesn't hairpin, so none gets through (in the field one ran to its 70 s
+// timeout). Known from the transport's same-nat trace on the newest connection.
+function sameNatSkip(peer) {
+  const ip = peers.get(peer)?.sameNat;
+  return ip ? `skipped: ${nameOf(peer)} is behind our own public IP (${ip}), and a punch can't get through a NAT to itself` : null;
 }
 
 function bdayStatus(peer, status, extra = {}) {
@@ -641,6 +654,11 @@ async function tryBirthday(peer) {
   if (!room || !rtcAvailable()) return;
   const prev = peerState(peer).bday;
   if (prev?.status === 'running') return;
+  const same = sameNatSkip(peer);
+  if (same) {
+    if (prev?.status === 'invited') room.send({ t: 'bday', step: 'abort', why: 'we share a public IP' }, { to: peer });
+    return bdayFail(peer, same);
+  }
   if (bdayBusy) return bdayFail(peer, 'another birthday punch is running — one at a time');
   if (prev?.lastRun && now() - prev.lastRun < BDAY_COOLDOWN_MS) {
     return bdayFail(peer, `one punch per peer per 5 min — wait ${Math.ceil((BDAY_COOLDOWN_MS - (now() - prev.lastRun)) / 1000)} s (or reload)`);
@@ -678,6 +696,12 @@ async function onBirthday(peer, data) {
     // NB48-1: a remote request never opens a fleet on its own — it only invites, and the
     // local user must press the button to accept. (If we already started, our role stands.)
     if (p.bday?.status === 'running') return;
+    // Behind our public IP: tell it to stop now rather than wait out its 70 s.
+    const same = sameNatSkip(peer);
+    if (same) {
+      room.send({ t: 'bday', step: 'abort', why: 'we share a public IP' }, { to: peer });
+      return bdayFail(peer, same);
+    }
     const role = data.yourRole === 'hard' ? 'hard' : 'easy';
     bdayStatus(peer, 'invited', { role });
     log('info', `${nameOf(peer)} wants a birthday punch (you would be the ${role} side) — press Birthday punch to accept`);
@@ -1383,6 +1407,9 @@ window.netlab = {
     return bdayWon(peer, chan);
   },
   birthday: () => room?.peers.map((id) => ({ id, name: nameOf(id), ...(peerState(id).bday ?? { status: null }) })).map(({ ctx, ...b }) => b) ?? [],
+  // Tests: as if the transport had traced `what` for peer i (loopback has one NAT, so
+  // no same-nat of its own).
+  trace: (i, what, d) => room.transport.trace?.(room.peers[i], what, d),
   get room() { return roomKind && { kind: roomKind, label: roomLabel(), link: roomLink() }; },
   roomIdOf,
   joinPrivate: (key) => enter('private', key ?? randomRoomId()),
