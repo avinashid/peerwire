@@ -1114,9 +1114,7 @@ impl<A: Address> Endpoint<A> {
             State::Live(link) if matches!(sess.path, Path::Via(_)) && !relay_only => {
                 let p = sess.punch.get_or_insert(Punch { token, next_at: now, until, round: 0, relays: Vec::new() });
                 p.until = p.until.max(until);
-                let mut f = Vec::with_capacity(9);
-                wire::put_punch(&mut f, false, p.token);
-                seal(link, &f)
+                seal_punch(link, false, p.token)
             }
             State::Live(_) => None,
         }
@@ -1609,18 +1607,14 @@ impl<A: Address> Endpoint<A> {
             }
         }
         for (dst, token) in punch_acks {
-            let mut f = Vec::with_capacity(9);
-            wire::put_punch(&mut f, true, token);
-            if let Some(p) = seal(link, &f) {
+            if let Some(p) = seal_punch(link, true, token) {
                 self.stats.tx_packets += 1;
                 self.outbox.push_back(Transmit { dst, payload: p });
             }
         }
         let mut sealed = Vec::new();
         for (r, token) in relay_acks {
-            let mut f = Vec::with_capacity(9);
-            wire::put_punch(&mut f, true, token);
-            if let Some(p) = seal(link, &f) {
+            if let Some(p) = seal_punch(link, true, token) {
                 sealed.push((r, p));
             }
         }
@@ -1827,10 +1821,8 @@ impl<A: Address> Endpoint<A> {
                             sess.spray = None; // punching ran out
                             continue;
                         };
-                        let mut f = Vec::with_capacity(9);
-                        wire::put_punch(&mut f, false, p.token);
                         for dst in batch {
-                            if let Some(payload) = seal(link, &f) {
+                            if let Some(payload) = seal_punch(link, false, p.token) {
                                 self.stats.tx_packets += 1;
                                 self.outbox.push_back(Transmit { dst, payload });
                             }
@@ -1866,13 +1858,9 @@ impl<A: Address> Endpoint<A> {
                             self.stats.punch_failed += 1;
                         } else if now >= p.next_at {
                             p.next_at = now + self.config.punch_interval;
-                            let mut f = Vec::with_capacity(9);
-                            wire::put_punch(&mut f, false, p.token);
                             if p.round % RELAY_ROUNDS == 0 && !p.relays.is_empty() {
-                                let mut f = Vec::with_capacity(9);
-                                wire::put_punch(&mut f, false, p.relay_token());
                                 for &r in &p.relays {
-                                    if let Some(payload) = seal(link, &f) {
+                                    if let Some(payload) = seal_punch(link, false, p.relay_token()) {
                                         resend.push((Path::Via(r), sess.peer, payload));
                                     }
                                 }
@@ -1888,7 +1876,7 @@ impl<A: Address> Endpoint<A> {
                                 std::iter::once(Some(c.clone())).chain((1..=spray).map(|k| c.port_offset(k))).flatten()
                             });
                             for dst in sprayed.chain(guessed.iter().cloned()) {
-                                if let Some(payload) = seal(link, &f) {
+                                if let Some(payload) = seal_punch(link, false, p.token) {
                                     self.stats.tx_packets += 1;
                                     self.stats.punches_sent += 1;
                                     self.outbox.push_back(Transmit { dst, payload });
@@ -2164,6 +2152,14 @@ fn push_relay_frame(link: &mut Link, frame: Vec<u8>, cap: usize, dropped: &mut u
         *dropped += 1;
     }
     link.relay_q.push_back(frame);
+}
+
+/// A PUNCH, or PUNCH_ACK if `ack`, with `token`, sealed as the next DATA packet on `link`.
+#[inline(never)]
+fn seal_punch(link: &mut Link, ack: bool, token: u64) -> Option<Vec<u8>> {
+    let mut f = Vec::with_capacity(9);
+    wire::put_punch(&mut f, ack, token);
+    seal(link, &f)
 }
 
 fn seal(link: &mut Link, pt: &[u8]) -> Option<Vec<u8>> {
