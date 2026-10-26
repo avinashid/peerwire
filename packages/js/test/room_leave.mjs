@@ -9,7 +9,7 @@
 //
 //   node packages/js/test/room_leave.mjs
 import { joinRoom, Lane, Room } from '../src/index.js';
-import { PIPE_BATCH } from '../src/webrtc.js';
+import { PIPE_BATCH, PIPE_CLOSE_BATCHES, WebRtcTransport } from '../src/webrtc.js';
 
 let failed = 0;
 const check = (ok, what) => {
@@ -142,9 +142,34 @@ const leftFast = async (seen, a, t0, what) => {
   await leftFast(seen, a, t0, 'over a backed-up pipe');
   await b.leave();
 }
+// At most PIPE_CLOSE_BATCHES last batches go over signalling, from the pipes that queued
+// last (PBF-1): 20 pipes each queue a datagram, then pipe 3 queues another, and pipe 19's
+// own DataChannel opens, so its datagram goes there and doesn't count.
+{
+  const out = [];
+  const sig = { send: (to, msg) => out.push([to, msg]), onMessage() {}, close() {} };
+  const ep = { connect() {}, receive() {}, setRelayOnly() {}, isConnected: () => false };
+  const t = new WebRtcTransport(ep, sig, { pipes: true, RTCPeerConnection: DeadPc });
+  const ids = Array.from({ length: 20 }, (_, i) => (i + 1).toString(16).padStart(2, '0').repeat(32));
+  const hs = ids.map((id) => t.pipe(id));
+  for (const h of hs) ep.onTransmit(h, Uint8Array.of(1));
+  ep.onTransmit(hs[3], Uint8Array.of(2));
+  const own = t.link(ids[19]);
+  let overDc = 0;
+  own.dc.readyState = 'open';
+  own.dc.send = () => overDc++;
+  t.close();
+  const piped = out.filter(([, m]) => m.kind === 'dg').map(([to]) => ids.indexOf(to)).sort((x, y) => x - y);
+  const want = Array.from({ length: PIPE_CLOSE_BATCHES }, (_, i) => i + 3); // 3, then 4..18
+  check(piped.join() === want.join() && overDc === 1,
+    `close() with 20 queued pipes: ${piped.length} last batches over signalling (pipes ${piped.join(',')}), want ${PIPE_CLOSE_BATCHES} (pipes 3..18); pipe 19's over its channel (${overDc})`);
+}
 
 // 5. The same over Nostr, which hashes and signs a message after send() returns: close()
-// must let the last batch out, then close the sockets.
+// must let the last batch out, then close the sockets, and read nothing meanwhile (PBF-2):
+// an offer the peer sent after the leave, handed over while the socket waits, opens no
+// link. A room closes its endpoint too, which opens nothing either; a WebRtcTransport
+// closed with its endpoint left open has only the deaf socket.
 {
   class RelaySocket { // an in-process relay: an EVENT goes to every other socket that asked for its tag
     static CONNECTING = 0;
@@ -178,14 +203,44 @@ const leftFast = async (seen, a, t0, what) => {
   }
   const Real = globalThis.WebSocket;
   globalThis.WebSocket = RelaySocket;
-  const [a, b] = await overPipe('nostr', { signaling: 'nostr', relays: ['wss://relay.test'] });
+  const NOSTR = { signaling: 'nostr', relays: ['wss://relay.test'] };
+  // `from`'s offer to `to`, sealed and with its link proof, as the relay would hand it to
+  // `to`'s socket, held back until called.
+  const sealedOffer = async (from, to) => {
+    const ws = from.signaling.sockets[0];
+    let ev;
+    ws.send = (raw) => {
+      const m = JSON.parse(raw);
+      if (m[0] === 'EVENT' && m[1].tags[0][1] !== from.signaling.roomTag) ev = m[1];
+    };
+    await from.signaling.send(to.self, { kind: 'offer', sdp: { type: 'offer', sdp: 'v=0' }, p: await from.transport.offerProof.sign(to.self) });
+    delete ws.send;
+    const sock = to.signaling.sockets[0];
+    return () => sock.onmessage?.({ data: JSON.stringify(['EVENT', sock.req.sub, ev]) });
+  };
+  const [a, b] = await overPipe('nostr', NOSTR);
   const seen = leaves(b);
+  const late = await sealedOffer(b, a);
   const t0 = performance.now();
   a.leave();
+  check(a.signaling.sockets[0].readyState === RelaySocket.OPEN, "a's socket stays open while its last batch is published");
+  late();
   await leftFast(seen, a, t0, 'over Nostr');
   const shut = await until(() => a.signaling.sockets.every((ws) => ws.readyState === RelaySocket.CLOSED), FAST_MS);
   check(shut, "then the leaving room's relay socket closed");
+  check(a.transport.links.size === 0 && a.transport.pipes.size === 0, `b's offer, handed to a's socket after the leave, opened nothing (${a.transport.links.size} links)`);
   await b.leave();
+  // The transport alone closes, its endpoint left open.
+  const [c, d] = await overPipe('nostr-transport', NOSTR);
+  const offer = await sealedOffer(d, c);
+  c.signaling.send(d.self, { kind: 'noop' }); // still being published when the transport closes
+  c.transport.close();
+  check(c.signaling.sockets[0].readyState === RelaySocket.OPEN, "c's socket stays open while its last message is published");
+  offer();
+  await sleep(200);
+  check(!c.endpoint.closed && c.transport.links.size === 0 && c.transport.pipes.size === 0,
+    `a transport closed with its endpoint open: d's offer, handed over in the wait, opened nothing (${c.transport.links.size} links)`);
+  await Promise.all([c.leave(), d.leave()]);
   globalThis.WebSocket = Real;
 }
 
