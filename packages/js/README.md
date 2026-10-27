@@ -168,7 +168,8 @@ doc.close();                                     // room.leave() closes the room
   - Doc frames have their own tag, so they never reach `'message'` or `poll()`. Versions without `room.doc()`
     (`@peerwire/js` 0.1.0 to 0.2.0) drop them.
 - **Logs:** give `keep` the same value on every member, and call `doc.log()` right after `room.doc()`. A member
-  that keeps fewer entries never trims another's log.
+  that keeps fewer entries never trims another's log, but one that keeps more can miss the older entries another
+  has trimmed, once it catches up from that member, directly or through a member that did.
 - **Limits:**
   - Values are JSON: at most 64 KiB as JSON text and nested at most 64 deep. They come back frozen.
   - A doc holds 10,000 entries and 4 MiB of JSON text.
@@ -180,15 +181,20 @@ doc.close();                                     // room.leave() closes the room
   - Members are trusted alike, as in the room itself: any member can overwrite, delete or fill a doc.
   - What a member sends is checked and capped before it reaches you. A malformed frame is dropped whole.
   - A member can make the room ignore another member's writes, by claiming it has seen them before they are
-    written. A doc that hears such a claim on its own writes moves on to new ones, 16 times; past that, its writes
-    are lost at the members that took a claim, and once every write is claimed they return false or null with a
-    warning, until the doc is closed and opened again.
+    written. A doc that hears such a claim on its own writes moves on to new ones, 16 times; past that, it skips
+    every write from the lowest claimed to the highest, its writes are lost at the members that took a claim it
+    hasn't heard, and once every write is claimed they return false or null with a warning, until the doc is
+    closed and opened again.
   - Every member takes a Lamport stamp however far ahead, as refusing one would split the room. So a member can
     move the stamps to 2^53 - 1 at once; from then on, values set at the same time, and set items and log
     entries, are ordered by writer, and a log keeps the highest writers' entries. A later set still wins.
-  - A member can ask for the whole doc as often as it likes. What it is sent is at most 8 Mi characters of JSON
-    text at once and 64 Ki a second after, plus one answer (theoretical, from those budgets; UTF-8 takes 1 to 3
-    bytes a character).
+  - A member can ask for the whole doc as often as it likes, and its answers can name any writes deleted, which
+    we pass on to the other members, one range for each range of it that deleted something here. What it is sent,
+    and what we pass on for it (counted once for each member), is at most 8 Mi characters of JSON text at once and
+    64 Ki a second after, plus the send that went past that (theoretical, from those budgets; UTF-8 takes 1 to 3
+    bytes a character). Past it, the others hear of those deletions from that member or when they next catch up.
+    The budgets are per member while it stays: a member that leaves and joins again, or joins under a new id,
+    starts with whole ones.
   - `from` is the writer as the doc was told. A member relaying a catch-up can name any writer, so use `from` to
     colour or group, not as proof of who wrote something. Check every field you render, as with messages.
 - **Not yet:** collaborative text (character sequences), and docs in Rust and Godot.
@@ -524,7 +530,11 @@ Run these with Node and the Playwright install on this host:
   - Lamport stamps moved far ahead (by 2^32 four times, or to 2^53 - 1): a member cut off meanwhile and one that
     joins after still converge, and so do a member's writes after a jump sent to it alone;
   - claims on a member's future writes, also past its 16 moves: an entry forged on its next write is never held
-    and the doc stays whole, and with every write claimed its writes warn and return false or null;
+    and the doc stays whole, 12000 separate claims take one range of its context and new members are still heard,
+    and with every write claimed its writes warn and return false or null;
+  - a catch-up that deletes 3000 items is passed on as one range per writer; a member that sends us 9000 items of
+    its own, then deletes them, three times, has us pass on at most what it sent (12 other members), and with one
+    range per item, what we pass on for it stops at its 8 Mi budget and goes on once the budget is back;
   - what one member frame costs: 16384 copies of a dead range over 9000 entries, 16384 entries into a log
     that keeps 5000, and 16000 fresh writers into a full context, each timed against a frame of 16384 items
     (within 3 to 5 times it).

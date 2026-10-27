@@ -5,7 +5,8 @@
 // after random order and duplicates with no catch-up, after drops healed by joining again, after a partition
 // heals, and for a late joiner, which gets each entry about once. Then intent (a later write wins, a set
 // beats a delete it didn't see, a log keeps causal order), the checks on member data (malformed frames,
-// caps, a frame's size, answers per member, stamps far ahead (all taken), claims on our future dots) and 'change'.
+// caps, a frame's size, answers per member, stamps far ahead (all taken), claims on our future dots, deletions
+// a catch-up has us pass on) and 'change'.
 //
 //   node packages/js/test/doc_crdt.mjs
 import { Doc, MAX_VALUE_LENGTH, MAX_VALUE_DEPTH, MAX_ENTRIES, MAX_DOC_LENGTH, MAX_WRITERS, MAX_RANGES, MAX_KEY_LENGTH, MAX_NAME_LENGTH, MESSAGE_BYTES } from '../src/doc.js';
@@ -880,6 +881,135 @@ for (const gap of [1, 2]) {
   same([a, m, ...rest], `entries forged on our dots, gap ${gap}`);
 }
 console.log('entries forged on our next dots: sent on as one dead range per member, and dropped everywhere');
+
+// A catch-up that kills: m answers a with one dead range per writer, over the 3000 items the 6 other members
+// wrote. a drops them and sends each other member one frame of one range per writer, from the lowest dot it
+// dropped to the highest, rather than a range per item (about 1000 times what m sent: DOC-2b). The members drop
+// them too, and none takes a range for a claim on its own dots. m's ranges did claim their later dots at a, so
+// their next writes are lost to that and move them on (see claims on our future dots); the ones after reach all.
+{
+  const net = new Net(17);
+  const a = net.node('a');
+  const m = net.node('f', { open: false });
+  const rest = [...'bcde12'].map((x) => net.node(x));
+  net.mesh([a, m, ...rest]);
+  for (const n of rest) {
+    for (let i = 0; i < 500; i++) {
+      n.doc.set('s').add(i);
+      net.run();
+    }
+  }
+  const ws = rest.map((n) => n.doc.writer);
+  a.doc.receive(m.self, { d: 'board', t: 3, ws, x: ws.map((_, i) => [i, 1, Number.MAX_SAFE_INTEGER]) });
+  const sent = net.flight.filter(([f, t]) => f === a.self && t !== m.self).map(([, , text]) => JSON.parse(text));
+  const want = ws.map((w) => `${w}:1-500`).sort().join();
+  const got = sent.map((f) => f.x.map(([i, lo, hi]) => `${f.ws[i]}:${lo}-${hi}`).sort().join());
+  if (sent.length !== rest.length || got.some((g) => g !== want)) fail(`a catch-up killing 3000 items was sent on as ${sent.length} frames, ${sent.map((f) => f.x.length)} ranges`);
+  net.run();
+  if ([a, ...rest].some((n) => n.doc.set('s').entries().length)) fail('a member kept items a catch-up killed');
+  if (rest.some((n, i) => n.doc.writer !== ws[i])) fail("a range sent on was taken for a claim on a member's own dots");
+  for (const word of ['after', 'again']) {
+    for (const n of rest) n.doc.set('s').add(word);
+    net.run();
+  }
+  same([a, ...rest], 'after a catch-up that killed');
+  if (a.doc.set('s').entries().length !== rest.length) fail("the members' writes after a catch-up that killed never reached everyone");
+}
+console.log('a catch-up that kills: sent on as one range per writer, and dropped everywhere');
+
+// The killer's own items: m sends a alone 9000 items of its own, with a dot left out between each two, then one
+// dead range over them, three times. `ranges`: or one dead range per item. Gives what a sent the other 12
+// members, each time, and what m sent it.
+function killOwn(seed, cycles, ranges) {
+  const net = new Net(seed);
+  const a = net.node('a');
+  const m = net.node('f', { open: false });
+  const rest = [...'bcde01234567'].map((x) => net.node(x));
+  net.mesh([a, m, ...rest]);
+  net.run();
+  let up = 0;
+  const send = a.host.send;
+  a.host.send = (to, msg) => {
+    if (to !== m.self) up += Buffer.byteLength(JSON.stringify(msg));
+    send(to, msg);
+  };
+  let sent = 0;
+  const from = (f) => {
+    const text = JSON.stringify(f);
+    sent += Buffer.byteLength(text);
+    a.doc.receive(m.self, JSON.parse(text));
+    net.run(1e5);
+  };
+  const w = m.self + '00000001';
+  const per = [];
+  let base = 1;
+  const cycle = () => {
+    const dots = Array.from({ length: 9000 }, (_, i) => base + 2 * i);
+    from({ d: 'board', t: 1, ws: [w], e: dots.map((n) => [0, n, 1, 's', 's', null, 0]) });
+    if (a.doc.set('s').entries().length !== 9000) fail(`a holds ${a.doc.set('s').entries().length} of m's 9000 items`);
+    const before = up;
+    from({ d: 'board', t: 3, ws: [w], x: ranges ? dots.map((n) => [0, n, n]) : [[0, base, dots.at(-1)]] });
+    if (a.doc.set('s').entries().length) fail(`a kept ${a.doc.set('s').entries().length} items m killed`);
+    per.push(up - before);
+    base = dots.at(-1) + 2;
+  };
+  for (let k = 0; k < cycles; k++) cycle();
+  return { per, up: () => up, sent: () => sent, net, cycle };
+}
+
+// One dead range over them: a sends each member one range each time, so what it sends them is at most what m sent
+// it (3.5 times it with 6 others and 7.0 with 12, before).
+{
+  const { up, sent } = killOwn(18, 3, false);
+  if (up() > sent()) fail(`a sent the other members ${up()} B for the ${sent()} B m sent it`);
+  console.log(`the killer's own items: a sent the others ${(up() / sent()).toFixed(3)} times what m sent`);
+}
+
+// One dead range per item, so a sends 9000 on each time (4.4 times what m sent, each time, with 12 others): what
+// it sends the others for m comes from m's budget for what a sends m, 8 Mi characters at once, then 64 Ki a second.
+// a stops after about 8 Mi, drops m's items all the same, and sends on again once the budget is back.
+{
+  const { per, net, cycle } = killOwn(19, 8, true);
+  const stop = per.indexOf(0);
+  const before = per.slice(0, stop < 0 ? per.length : stop).reduce((s, b) => s + b, 0);
+  if (stop < 1 || per.slice(stop).some((b) => b) || before > 2 * MAX_DOC_LENGTH + per[0]) fail(`a sent the others ${per.join(', ')} B for m's dead ranges, each time`);
+  net.wait(2 * MAX_DOC_LENGTH / 64);
+  cycle();
+  if (!per.at(-1)) fail("a never sent m's dead ranges on again once the budget was back");
+  console.log(`one dead range per item: a sent on ${(before / 2 ** 20).toFixed(1)} MiB in ${stop} times, then nothing until m's budget was back`);
+}
+
+// Past the 16 incarnations, a member claims 12000 separate dots of a's, in frames from the highest down. a holds
+// them as one span from the lowest to the highest, so they neither fill its context (they did, once a full
+// context couldn't forget a's own ranges, and a new member's writes were refused) nor get forgotten: a's next
+// writes skip every one, and a new member's writes reach a.
+{
+  const net = new Net(20);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x));
+  const m = net.node('f', { open: false });
+  net.mesh([a, b, m]);
+  net.run();
+  for (let i = 0; i < 20; i++) a.doc.receive(m.self, { d: 'board', t: 2, ws: [a.doc.writer], r: [[0, 1, a.doc.n + 5]] });
+  net.run();
+  const w = a.doc.writer;
+  a.doc.set('s').add('before');
+  const claimed = Array.from({ length: 12000 }, (_, i) => a.doc.n + 3 + 2 * i);
+  for (let end = claimed.length; end > 0; end -= 4000) {
+    a.doc.receive(m.self, { d: 'board', t: 3, ws: [w], x: claimed.slice(end - 4000, end).map((n) => [0, n, n]) });
+    const held = a.doc.ctx.writers.get(w);
+    if (a.doc.writer !== w || held.length > 2 || !a.doc.ctx.covers(w, claimed[end - 4000], claimed.at(-1))) fail(`claims on a's dots from ${claimed[end - 4000]}: ${held.length} ranges, ${JSON.stringify(held.slice(0, 4))}...`);
+  }
+  const c = net.node('c');
+  net.mesh([a, b, c]);
+  c.doc.set('s').add('new member');
+  net.run(1e4);
+  if (!a.doc.set('s').entries().some((e) => e.value === 'new member')) fail("a new member's write never reached a past 12000 claims on a's dots");
+  const dots = Array.from({ length: 4 }, (_, i) => Number(a.doc.set('t').add(i).split('.')[1]));
+  if (dots.some((n) => n >= claimed[0] && n <= claimed.at(-1))) fail(`a wrote on dots ${dots} among the claimed ${claimed[0]} to ${claimed.at(-1)}`);
+  net.run(1e4);
+  same([a, b, c], 'after 12000 claims on our dots');
+}
+console.log("claims on our dots past the 16 incarnations: held as one span, never forgotten, and new members are still heard");
 
 // A full context makes room: a member's claims for 2000 writers that hold nothing don't stop a new writer.
 {
