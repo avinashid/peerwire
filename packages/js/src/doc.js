@@ -29,9 +29,10 @@
 // and a member relaying a catch-up can claim any writer, so `from` is as good as the member that told us.
 // What the doc defends is each member's app and resources. Frames are checked field by field and dropped
 // whole if anything is off; state lives in Maps; names, keys, values, entries, characters, writers and context
-// ranges are capped, and so is what a member can have us send it to catch up: answers and asks at a rate
-// (CATCHUP_BURST at once, then one per CATCHUP_EVERY_MS), and what answers carry, CATCHUP_CHARS at once, then
-// CATCHUP_CHARS_PER_S, as an asker can always claim to lack the whole doc.
+// ranges are capped, and so is what a member can have us send to catch up: answers and asks at a rate
+// (CATCHUP_BURST at once, then one per CATCHUP_EVERY_MS), and what our answers to it carry, with the deletions
+// its answers have us send on to the others, CATCHUP_CHARS at once, then CATCHUP_CHARS_PER_S, as an asker can
+// always claim to lack the whole doc and an answer can always name dots dead.
 //
 // Every member takes any stamp up to 2^53 - 1, as refusing one far ahead would split the room: no member is a
 // reference for how far ahead is plausible, and a refused entry never comes again. So a member can move the
@@ -41,7 +42,8 @@
 // next writes: a doc that sees such a claim on its own dots moves to a new incarnation, at most
 // MAX_INCARNATIONS times. Past that it writes after the dots it knows are claimed; a write on a dot claimed
 // where it hasn't heard is lost at the members that took the claim, and once every dot is claimed, writes are
-// refused with a warning until the doc is opened again.
+// refused with a warning until the doc is opened again. It holds the claims on its dots as one span, from the
+// lowest to the highest (none of those dots is its yet), so they take one range of its context however many.
 
 export const MAX_NAME_LENGTH = 128; // a doc's or a collection's name, in UTF-16 code units
 export const MAX_KEY_LENGTH = 256; // a map key
@@ -58,7 +60,9 @@ export const MESSAGE_BYTES = 512 * 1024; // the most a doc frame takes as UTF-8,
 // CATCHUP_BURST that refills one per CATCHUP_EVERY_MS, and what our answers carry, as JSON text, from one of
 // CATCHUP_CHARS (two full docs) that refills CATCHUP_CHARS_PER_S. An answer or ask past a budget waits for it
 // rather than being dropped, so a doc closed and opened again (a component that remounts) catches up every
-// time, and an asker can't have us send more, whatever it claims to lack.
+// time, and an asker can't have us send more, whatever it claims to lack. The deletions a member's answers
+// have us send on to the others come from its CATCHUP_CHARS too, once for each member they go to; past it they
+// aren't sent on, and the others hear of them from that member or when they next catch up.
 const CATCHUP_BURST = 8;
 const CATCHUP_EVERY_MS = 15000;
 const CATCHUP_CHARS = 2 * MAX_DOC_LENGTH;
@@ -312,7 +316,7 @@ export class Doc {
     this.cancelWait = null;
     this.closed = false;
     // While a frame is applied: a claim on our own dots, the span of them its entries took, a sender's write
-    // we count as seen and don't hold, and the entries a catch-up dropped.
+    // we count as seen and don't hold, and the dead ranges a catch-up has us send on.
     this.claimed = false;
     this.claim = null; // the lowest and highest of our dots that a frame's entries took
     this.unheard = false;
@@ -398,6 +402,7 @@ export class Doc {
     if (!f) return;
     if (f.t === ASK) return this.onAsk(peer, f);
     this.claimed = false;
+    this.claim = null;
     this.unheard = false;
     this.dropped = f.t === ANSWER ? [] : null;
     this.apply(f, peer);
@@ -413,7 +418,8 @@ export class Doc {
     this.flush(peer, false);
     // Entries a catch-up told us are dead go from our other members too, as if we deleted them: they may
     // have missed the deletion as we did (a partition), or never been told (a member's claim sent to some).
-    if (this.dropped?.length) this.broadcast([], this.dropped, peer);
+    // One range for each range of the answer that dropped any (see kill), while the sender's budget allows.
+    if (this.dropped?.length) this.forward(peer, this.dropped);
     this.dropped = null;
     // A write of the sender's own that we count as seen yet don't hold: it was deleted before it reached us,
     // or a member claimed the sender's dots ahead of it. Our ask shows the sender our context.
@@ -557,38 +563,53 @@ export class Doc {
 
   // The dots in ranges `l` of writer w (sorted and apart) are dead: entries of theirs we hold go, except a
   // log's, which only its own `keep` trims (members may keep different lengths). Walks the fewer of the dots
-  // named and the entries held.
+  // named and the entries held. In a catch-up, each range that dropped entries is sent on from the lowest of
+  // their dots to the highest (see receive): one range, not one per entry, and the answer named all of it dead.
   kill(w, l) {
     if (w === this.writer && l[l.length - 1][1] > this.n) this.claimed = true;
     const held = this.byWriter.get(w);
     if (held) {
+      const spans = new Map(); // index in l -> the lowest and highest dot it dropped
+      const drop = (i, e) => {
+        this.remove(e);
+        const s = spans.get(i);
+        if (!s) spans.set(i, [e.n, e.n]);
+        else if (e.n < s[0]) s[0] = e.n;
+        else if (e.n > s[1]) s[1] = e.n;
+      };
       let dots = 0;
       for (const [a, b] of l) dots += b - a + 1;
       if (dots < held.size) {
-        for (const [a, b] of l) {
-          for (let n = a; n <= b; n++) {
+        for (let i = 0; i < l.length; i++) {
+          for (let n = l[i][0]; n <= l[i][1]; n++) {
             const e = held.get(n);
-            if (e && e.t !== 'l') this.drop(e);
+            if (e && e.t !== 'l') drop(i, e);
           }
         }
       } else {
         for (const [n, e] of [...held]) {
           const i = seek(l, n);
-          if (i < l.length && l[i][0] <= n && e.t !== 'l') this.drop(e);
+          if (i < l.length && l[i][0] <= n && e.t !== 'l') drop(i, e);
         }
       }
+      if (this.dropped) for (const [a, b] of spans.values()) this.dropped.push([w, a, b]);
     }
     for (const [a, b] of l) this.record(w, a, b);
   }
 
-  drop(e) {
-    this.remove(e);
-    this.dropped?.push([e.w, e.n, e.n]);
-  }
-
-  // Counts dots a to b of w as seen, if the context has room or can make it. False if not.
+  // Counts dots a to b of w as seen, if the context has room or can make it. False if not. Our own dots past n
+  // aren't ours yet, so a claim on them joins the claims before it in one span, from the lowest to the highest:
+  // that claims no dot a member couldn't with one range, and our writer holds two ranges at most.
   record(w, a, b) {
     if (this.ctx.covers(w, a, b)) return true;
+    if (w === this.writer && b > this.n) {
+      const l = this.ctx.writers.get(w);
+      const i = l ? seek(l, this.n + 1) : 0;
+      if (l && i < l.length) {
+        a = Math.min(a, l[i][0]);
+        b = Math.max(b, l[l.length - 1][1]);
+      }
+    }
     if (!this.room(w, a, b)) this.makeRoom(w);
     if (!this.room(w, a, b)) return false;
     this.ctx.add(w, a, b);
@@ -603,9 +624,9 @@ export class Doc {
 
   // A full context forgets what matters least: first the writers with no live entry (longest idle first, kept
   // in `idle` so finding them costs nothing), then the highest ranges of the writers with the most, most
-  // first, each down to one range, until FORGET_RANGES are free: so the writers are sorted about once per that
-  // many ranges recorded, not scanned for each. A forgotten dead dot can come back from a member that missed
-  // its deletion; nothing else is lost.
+  // first (never ours: those are claims, see record), each down to one range, until FORGET_RANGES are free: so
+  // the writers are sorted about once per that many ranges recorded, not scanned for each. A forgotten dead dot
+  // can come back from a member that missed its deletion; nothing else is lost.
   makeRoom(keep) {
     for (const w of this.idle) {
       if (this.ctx.writers.size < MAX_WRITERS && this.ctx.size < MAX_RANGES) return;
@@ -614,7 +635,7 @@ export class Doc {
       this.idle.delete(w);
     }
     if (this.ctx.size < MAX_RANGES) return;
-    const most = [...this.ctx.writers].filter(([, l]) => l.length > 1).sort((x, y) => y[1].length - x[1].length);
+    const most = [...this.ctx.writers].filter(([w, l]) => w !== this.writer && l.length > 1).sort((x, y) => y[1].length - x[1].length);
     for (const [w, l] of most) {
       while (l.length > 1 && this.ctx.size > MAX_RANGES - FORGET_RANGES) this.ctx.dropLast(w);
       if (this.ctx.size <= MAX_RANGES - FORGET_RANGES) return;
@@ -756,6 +777,20 @@ export class Doc {
     for (const p of this.host.peers()) if (p !== except) for (const f of frames) this.host.send(p, f);
   }
 
+  // Sends dead ranges member `peer`'s answer named on to our other members, unless its `chars` budget is empty,
+  // and charges it their JSON text once for each member: what a member's answers can have us send the others
+  // comes from the budget of what its asks can have us send it.
+  forward(peer, ranges) {
+    const st = this.member(peer);
+    const now = this.now();
+    if (this.early(st, 'chars', now) > 0) return;
+    const to = this.host.peers().filter((p) => p !== peer);
+    const frames = this.pack(DELTA, [], ranges, false);
+    const chars = frames.reduce((s, f) => s + JSON.stringify(f).length, 0);
+    this.spend(st, 'chars', chars * to.length, now);
+    for (const p of to) for (const f of frames) this.host.send(p, f);
+  }
+
   // Frames of kind `t` holding `entries` and dead `ranges`, each under MESSAGE_BYTES as UTF-8, with `end`
   // on the last if asked.
   pack(t, entries, ranges, end) {
@@ -814,7 +849,8 @@ export class Doc {
     return Math.max(st[kind], now) - now - (burst - 1) * every;
   }
 
-  // Spends `n` units of it. An answer's characters may take it past empty: the next answer waits until it's back.
+  // Spends `n` units of it. An answer's characters, or what we send on for the member, may take it past empty:
+  // the next answer waits until it's back.
   spend(st, kind, n, now) {
     st[kind] = Math.max(st[kind], now) + n * BUDGETS[kind][1];
   }
