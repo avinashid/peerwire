@@ -57,6 +57,7 @@ room.setPresence({ name: 'Ana', typing: true });
 room.peers; room.self; room.getPresence(peer); room.rtt(peer);
 room.route(peer);                               // { kind: 'direct' (adopted?) | 'peer' (via) | 'signaling', rttMs }
 room.retryDirect();                             // try WebRTC again with peers on a fallback (see Through any NAT)
+const doc = room.doc('board');                  // a document every member holds (see Shared documents)
 await room.leave();                             // peers see 'peer-leave' at once
 ```
 
@@ -121,6 +122,76 @@ at the first `poll()` or `receive()`, so callback-only apps never build one up. 
 started queue grows until you drain it. `demo/poll.html` runs this way.
 
 Types are in `src/index.d.ts`.
+
+## Shared documents
+
+`room.doc(name)` opens a document that every member holds: maps, sets of items and logs. Writes reach every member
+at once, members who join later or come back after a partition catch up, and members that have heard the same
+writes hold the same document, whatever order they heard them in.
+
+```js
+const doc = room.doc('board');                   // the same name on every member is the same document
+const meta = doc.map('meta');                    // one value per key
+meta.set('title', 'Plans');                      // true; false, with a warning, if members have filled the doc
+meta.get('title'); meta.has('title'); meta.delete('title');
+const strokes = doc.set('strokes');              // items, each with its own id
+const id = strokes.add({ points, color });       // the id; null if the doc is full
+strokes.delete(id);                              // undo: delete your item
+const chat = doc.log('messages', { keep: 500 }); // append-only, keeps the newest `keep` (1000 if not given)
+chat.append({ text: 'hi' });
+meta.entries();                                  // [{ key, value, from }], by key
+strokes.entries(); chat.entries();               // [{ id, value, from }], oldest first, one order on every member
+doc.on('change', ({ name, type, key, id, value, deleted, from, local }) => render());
+doc.close();                                     // room.leave() closes the room's docs too
+```
+
+- **What wins:**
+  - A `set` replaces the values its writer has seen.
+  - Two values set at the same time, where neither writer had seen the other's, are ordered by Lamport stamp and
+    then by writer, the same on every member.
+  - A `delete` removes the values its writer has seen, so a set made elsewhere at the same time survives it
+    (add-wins, as in Yjs and Automerge).
+  - Set items and log entries sort by Lamport stamp, then writer. A write made after seeing another sorts after
+    it, which gives a whiteboard one z-order and a chat one order. No wall clock is involved.
+- **Sync:**
+  - Each write goes to every member as a delta on the reliable lane: the new entry and the ids of the values it
+    replaces.
+  - A doc asks every member when it opens, and each member that joins. The ask carries its context: for each
+    writer, the ranges of writes it has seen.
+  - It asks one member at a time, so a joiner is sent each entry about once (at most 1.00× the entries it holds
+    in `test/doc_crdt.mjs`), not once per member.
+  - A member is answered 8 times at once, then once per 15 s, and our asks of it go at the same rate. What the
+    answers carry is capped too: 8 Mi characters of JSON text at once (two full docs), then 64 Ki a second. An
+    ask past that waits rather than being dropped, so a doc closed and opened again (a component that remounts)
+    catches up every time: a small doc 8 times in a row at once, then each up to 15 s late.
+  - Every frame stays under 512 KiB.
+  - Doc frames have their own tag, so they never reach `'message'` or `poll()`. Versions without `room.doc()`
+    (`@peerwire/js` 0.1.0 to 0.2.0) drop them.
+- **Logs:** give `keep` the same value on every member, and call `doc.log()` right after `room.doc()`. A member
+  that keeps fewer entries never trims another's log.
+- **Limits:**
+  - Values are JSON: at most 64 KiB as JSON text and nested at most 64 deep. They come back frozen.
+  - A doc holds 10,000 entries and 4 MiB of JSON text.
+  - A value or key over its limit (keys: 256 characters; names: 128), a value that isn't JSON, or a write after
+    `close()` throws: these are the app's own mistakes.
+  - A doc that members have filled refuses writes with a warning, as every member refuses a write that doesn't
+    fit. Deleting frees room.
+- **Member data:**
+  - Members are trusted alike, as in the room itself: any member can overwrite, delete or fill a doc.
+  - What a member sends is checked and capped before it reaches you. A malformed frame is dropped whole.
+  - A member can make the room ignore another member's writes, by claiming it has seen them before they are
+    written. A doc that hears such a claim on its own writes moves on to new ones, 16 times; past that, its writes
+    are lost at the members that took a claim, and once every write is claimed they return false or null with a
+    warning, until the doc is closed and opened again.
+  - Every member takes a Lamport stamp however far ahead, as refusing one would split the room. So a member can
+    move the stamps to 2^53 - 1 at once; from then on, values set at the same time, and set items and log
+    entries, are ordered by writer, and a log keeps the highest writers' entries. A later set still wins.
+  - A member can ask for the whole doc as often as it likes. What it is sent is at most 8 Mi characters of JSON
+    text at once and 64 Ki a second after, plus one answer (theoretical, from those budgets; UTF-8 takes 1 to 3
+    bytes a character).
+  - `from` is the writer as the doc was told. A member relaying a catch-up can name any writer, so use `from` to
+    colour or group, not as proof of who wrote something. Check every field you render, as with messages.
+- **Not yet:** collaborative text (character sequences), and docs in Rust and Godot.
 
 ## Using with React
 
@@ -199,6 +270,7 @@ function Chat() {
 |---|---|
 | `src/index.js` | The package entry: `joinRoom` and everything below. |
 | `src/room.js` | `joinRoom` and `Room`: mesh, presence, message framing, backpressure. |
+| `src/doc.js` | `room.doc()`: shared documents (maps, sets, logs), a delta-state CRDT, catch-up, limits on member data. |
 | `src/proof.js` | Room key and HMAC proofs (hello, offer, link), compatible with Rust's; `randomRoomId()`. |
 | `src/peerwire.js` | Loads the module; `Endpoint` (connect, send, events, stats, seal/open) and Nostr key helpers. Browser and Node. |
 | `src/webrtc.js` | `WebRtcTransport`: one negotiated, unordered, no-retransmit DataChannel per peer. `BroadcastSignaling` for tabs of one browser. |
@@ -398,8 +470,8 @@ Run these with Node and the Playwright install on this host:
   its own link proof after checking the peer's still joins on both sides, and one whose
   link is lost before that proof is sent leaves the peer unproven, with no `peer-join`.
 - `node packages/js/test/fuzz.mjs`: seeded random and mutated input to the JS parsers (Nostr
-  events and relay messages, hex and peer ids, room hello proofs, room frames): nothing throws
-  out of a handler of untrusted input and no promise is left rejected.
+  events and relay messages, hex and peer ids, room hello proofs, room frames and shared document
+  frames): nothing throws out of a handler of untrusted input and no promise is left rejected.
 - `node packages/js/test/webrtc_signals.mjs` (Chromium, loopback): malformed offers leave no
   link and no unhandled rejection, 300 random signals throw nothing, real offers are still
   answered, and each refused signal is counted in `WebRtcTransport.badSignals` (as Nostr's
@@ -437,6 +509,28 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_leave.mjs`: a room leaving with a full send window reaches
   its peers at once, before `leave()` returns; with the Bye lost, the core's close still does;
   the `pagehide` handler holds the page 20 ms after it, only if it had peers.
+- `node packages/js/test/doc_crdt.mjs`: shared documents on fake rooms, seeded. Members converge after frames
+  arrive in random order and twice (no catch-up needed), after drops healed by joining again, and after a
+  partition heals; a late joiner is sent each entry about once. It also checks:
+  - intent: a later set wins, a set beats a delete it didn't see, a reply sorts after what it saw;
+  - one `'change'` per change, also for a map whose name ends where another's key begins, and frozen values;
+  - limits, including a full doc;
+  - frames: every one under 512 KiB;
+  - 20,000 mutated frames, none of which throws;
+  - answers per member: 8 at once, then one per 15 s, and an ask past that waits; what they carry to a member
+    that asks for a 2 Mi-character doc every second for a minute (6 sends, under the 8 Mi + 64 Ki/s bound);
+  - a doc closed and opened 12 times while a member stays catches up every time;
+  - a member that never answers is asked once, however often it prompts us, until it answers;
+  - Lamport stamps moved far ahead (by 2^32 four times, or to 2^53 - 1): a member cut off meanwhile and one that
+    joins after still converge, and so do a member's writes after a jump sent to it alone;
+  - claims on a member's future writes, also past its 16 moves: an entry forged on its next write is never held
+    and the doc stays whole, and with every write claimed its writes warn and return false or null;
+  - what one member frame costs: 16384 copies of a dead range over 9000 entries, 16384 entries into a log
+    that keeps 5000, and 16000 fresh writers into a full context, each timed against a frame of 16384 items
+    (within 3 to 5 times it).
+- `node packages/js/test/room_doc.mjs`: `room.doc()` with three members in a real `'local'` room: they converge, a
+  doc opened late and a fourth member catch up, doc frames never show as messages, writes outlive their writer,
+  and leaving closes docs.
 - `node packages/js/test/room_welcome.mjs`: a message a `peer-join` handler sends to the
   newcomer reaches it, also when the newcomer's presence came while its link proof was
   being checked (forced in 20 joins); 200 two-member joins and 30 third members lose none.

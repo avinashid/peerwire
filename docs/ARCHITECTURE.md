@@ -17,7 +17,7 @@
 ```
  app ───────────────────────────────────────────────────────────────────────
   peerwire (facade, planned): Node/Room API, pub/sub, presence, adapters registry
-  ├─ peerwire-sync   CRDT documents: maps, lists, text, presence (planned)
+  ├─ peerwire-sync   CRDT documents: maps, lists, text, presence (planned; JS has room.doc(): maps, sets, logs)
   ├─ peerwire-game   fixed-point maths, Hilbert islands, desync detection, lockstep/rollback helpers
   ├─ peerwire-media  WebRTC media signaling, mesh / peer-SFU / broadcast tree topologies (planned)
   └─ peerwire-store  offline store-and-forward with erasure coding and quotas (planned)
