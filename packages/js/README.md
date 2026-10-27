@@ -168,7 +168,8 @@ doc.close();                                     // room.leave() closes the room
   - Doc frames have their own tag, so they never reach `'message'` or `poll()`. Versions without `room.doc()`
     (`@peerwire/js` 0.1.0 to 0.2.0) drop them.
 - **Logs:** give `keep` the same value on every member, and call `doc.log()` right after `room.doc()`. A member
-  that keeps fewer entries never trims another's log.
+  that keeps fewer entries never trims another's log, but one that keeps more can miss the older entries another
+  has trimmed, once it catches up from that member, directly or through a member that did.
 - **Limits:**
   - Values are JSON: at most 64 KiB as JSON text and nested at most 64 deep. They come back frozen.
   - A doc holds 10,000 entries and 4 MiB of JSON text.
@@ -192,6 +193,8 @@ doc.close();                                     // room.leave() closes the room
     and what we pass on for it (counted once for each member), is at most 8 Mi characters of JSON text at once and
     64 Ki a second after, plus the send that went past that (theoretical, from those budgets; UTF-8 takes 1 to 3
     bytes a character). Past it, the others hear of those deletions from that member or when they next catch up.
+    The budgets are per member while it stays: a member that leaves and joins again, or joins under a new id,
+    starts with whole ones.
   - `from` is the writer as the doc was told. A member relaying a catch-up can name any writer, so use `from` to
     colour or group, not as proof of who wrote something. Check every field you render, as with messages.
 - **Not yet:** collaborative text (character sequences), and docs in Rust and Godot.
