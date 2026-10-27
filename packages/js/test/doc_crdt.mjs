@@ -853,6 +853,34 @@ console.log('claims on our future dots: the doc moves to a new incarnation and i
 }
 console.log('claims past the 16 incarnations: an entry on our next dot is never held, writes skip claimed dots, and with none left warn');
 
+// An answer of 16384 entries forged on a's next dots, consecutive or every other one (highest first): a takes
+// them as one span of claimed dots and sends each other member that one range, in a frame under 1 KB, rather
+// than a range per entry (each member got about half what the forger sent a: DOC-2a). b, sent them too, drops
+// them, and a's next write reaches everyone.
+for (const gap of [1, 2]) {
+  const net = new Net(16);
+  const [a, m, ...rest] = ['a', 'f', 'b', 'c', 'd'].map((x) => net.node(x));
+  net.mesh([a, m, ...rest]);
+  a.doc.set('s').add('hi');
+  net.run();
+  const from = a.doc.n + 1;
+  const e = Array.from({ length: 16384 }, (_, i) => [0, from + gap * i, 1, 's', 'x', null, 0]);
+  const forged = { d: 'board', t: 3, ws: [a.doc.writer], e: gap === 2 ? e.reverse() : e };
+  rest[0].doc.receive(m.self, forged);
+  a.doc.receive(m.self, forged);
+  const sent = net.flight.filter(([f, t]) => f === a.self && t !== m.self);
+  const ranges = sent.map(([, , text]) => JSON.parse(text).x?.length ?? 0);
+  const bytes = Math.max(...sent.map(([, , text]) => Buffer.byteLength(text)));
+  if (sent.length !== rest.length || ranges.some((n) => n !== 1) || bytes >= 1024) fail(`gap ${gap}: forged entries on our dots were sent on as ${sent.length} frames of ${ranges} ranges, up to ${bytes} B`);
+  net.run();
+  if (rest[0].doc.set('x').entries().length) fail(`gap ${gap}: b kept ${rest[0].doc.set('x').entries().length} entries forged on a's dots`);
+  a.doc.set('s').add('after');
+  net.run();
+  if (rest[0].doc.set('s').entries().length !== 2) fail(`gap ${gap}: a's write after the forged answer never reached b`);
+  same([a, m, ...rest], `entries forged on our dots, gap ${gap}`);
+}
+console.log('entries forged on our next dots: sent on as one dead range per member, and dropped everywhere');
+
 // A full context makes room: a member's claims for 2000 writers that hold nothing don't stop a new writer.
 {
   const net = new Net(12);
@@ -873,12 +901,14 @@ console.log('claims past the 16 incarnations: an entry on our next dot is never 
 }
 console.log('context caps: writers and ranges stay capped and new writers are still heard');
 
-// A member's frame costs about one pass over what it names. Three shapes from the security review (DOC-3), each
-// timed against taking a frame of 16384 set items into an empty doc (the best of 3 runs each, so the host's load
-// counts alike), must stay within a few times it, where walking what the doc holds again for each item made them
-// 6 to 60 times: 16384 copies of a dead range over a writer's 9000 entries (within 3 times), 16384 entries into
-// a log that keeps 5000 (5, as each goes in and out), and dead ranges naming 16000 fresh writers into a context
-// of 1000 writers with live entries (3).
+// A member's frame costs about one pass over what it names. Shapes from the security review (DOC-3, DOC-3a),
+// each timed against taking a frame of 16384 set items into an empty doc (the best of 3 runs each, so the host's
+// load counts alike), must stay within a few times it, where walking what the doc holds again for each item made
+// them 6 to 60 times: 16384 copies of a dead range over a writer's 9000 entries (within 3 times), 16384 entries
+// into a log that keeps 5000 (5, as each goes in and out), dead ranges naming 16000 fresh writers into a context
+// of 1000 writers with live entries (3) or of 1024 (3: none can be forgotten, and finding that costs nothing),
+// and 16384 separate dead ranges into a context of 1024 writers with live entries that is full (3: it forgets
+// 1024 ranges at once rather than scanning the writers for each).
 {
   const peer = id('e');
   const w = peer + '0badc10c';
@@ -913,6 +943,21 @@ console.log('context caps: writers and ranges stay capped and new writers are st
       doc.receive(peer, { d: 'board', t: 1, ws, e: ws.map((_, i) => [i, 1, 1, 's', 's', null, 0]) });
       const fresh = Array.from({ length: 16000 }, (_, i) => 'd' + i.toString(16).padStart(71, '0'));
       return [doc, { d: 'board', t: 1, ws: fresh, x: fresh.map((_, i) => [i, 1, 1]) }];
+    }],
+    'fresh writers into a context of live writers only': [3, () => {
+      const doc = new Doc('board', host);
+      const ws = Array.from({ length: MAX_WRITERS }, (_, i) => peer + i.toString(16).padStart(8, '0'));
+      doc.receive(peer, { d: 'board', t: 3, ws, e: ws.map((_, i) => [i, 1, 1, 's', 's', null, 0]), end: 1 });
+      const fresh = Array.from({ length: 16000 }, (_, i) => 'd' + i.toString(16).padStart(71, '0'));
+      return [doc, { d: 'board', t: 1, ws: fresh, x: fresh.map((_, i) => [i, 1, 1]) }];
+    }],
+    'separate dead ranges into a full context of live writers': [3, () => {
+      const doc = new Doc('board', host);
+      const ws = Array.from({ length: MAX_WRITERS }, (_, i) => peer + i.toString(16).padStart(8, '0'));
+      doc.receive(peer, { d: 'board', t: 3, ws, e: ws.map((_, i) => [i, 1, 1, 's', 's', null, 0]), end: 1 });
+      doc.receive(peer, { d: 'board', t: 1, ws: [ws[0]], x: Array.from({ length: MAX_RANGES - MAX_WRITERS }, (_, i) => [0, 3 + 2 * i, 3 + 2 * i]) });
+      if (doc.ctx.size !== MAX_RANGES || doc.idle.size) fail(`a full context of live writers: ${doc.ctx.size} ranges, ${doc.idle.size} idle`);
+      return [doc, { d: 'board', t: 1, ws: [ws[0]], x: Array.from({ length: 16384 }, (_, i) => [0, 1e5 + 2 * i, 1e5 + 2 * i]) }];
     }],
   };
   const got = [];

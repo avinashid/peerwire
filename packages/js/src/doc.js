@@ -51,6 +51,7 @@ export const MAX_ENTRIES = 10000; // live entries in a doc, all collections
 export const MAX_DOC_LENGTH = 4 * 1024 * 1024; // what a doc's values, keys and names take as JSON text
 export const MAX_WRITERS = 1024; // writers a doc's context holds
 export const MAX_RANGES = 8192; // ranges of dots a doc's context holds
+const FORGET_RANGES = 1024; // ranges a full context frees at once, when no writer is idle
 export const DEFAULT_KEEP = 1000; // entries a log keeps unless doc.log() says otherwise
 export const MESSAGE_BYTES = 512 * 1024; // the most a doc frame takes as UTF-8, half room.send's 1 MiB
 // Catching up with a member: the answers it gets and the asks we send it each come from a budget of
@@ -310,9 +311,10 @@ export class Doc {
     this.asking = null; // the member asked, until its answer ends or ASK_WAIT_MS passes
     this.cancelWait = null;
     this.closed = false;
-    // While a frame is applied: a claim on our own dots, a sender's write we count as seen and don't hold, and
-    // the entries a catch-up dropped.
+    // While a frame is applied: a claim on our own dots, the span of them its entries took, a sender's write
+    // we count as seen and don't hold, and the entries a catch-up dropped.
     this.claimed = false;
+    this.claim = null; // the lowest and highest of our dots that a frame's entries took
     this.unheard = false;
     this.dropped = null;
   }
@@ -399,6 +401,14 @@ export class Doc {
     this.unheard = false;
     this.dropped = f.t === ANSWER ? [] : null;
     this.apply(f, peer);
+    // Entries on our own dots, from the lowest to the highest: all above n, as [1, n] is in our context, so the
+    // span claims nothing a member couldn't claim with one dead range, and it is sent on as one.
+    if (this.claim) {
+      const [a, b] = this.claim;
+      this.claim = null;
+      this.record(this.writer, a, b);
+      this.dropped?.push([this.writer, a, b]);
+    }
     if (this.claimed) this.newIncarnation();
     this.flush(peer, false);
     // Entries a catch-up told us are dead go from our other members too, as if we deleted them: they may
@@ -528,10 +538,13 @@ export class Doc {
     }
     // An entry on our own writer that we didn't write (a member claiming our next dot): never held, as our
     // write would then take its id. Its dot counts as seen and dead, so our answers kill it where it went.
+    // The frame's claims are taken as one span (see receive), so its entries cost one range, not one each.
     if (x.w === this.writer) {
       this.claimed = true;
-      this.record(x.w, x.n, x.n);
-      this.dropped?.push([x.w, x.n, x.n]);
+      const s = this.claim;
+      if (!s) this.claim = [x.n, x.n];
+      else if (x.n < s[0]) s[0] = x.n;
+      else if (x.n > s[1]) s[1] = x.n;
       return;
     }
     if (this.entries.size >= MAX_ENTRIES || this.length + x.len > MAX_DOC_LENGTH) return;
@@ -589,8 +602,10 @@ export class Doc {
   }
 
   // A full context forgets what matters least: first the writers with no live entry (longest idle first, kept
-  // in `idle` so finding them costs nothing), then the highest range of the writer with the most. A forgotten
-  // dead dot can come back from a member that missed its deletion; nothing else is lost.
+  // in `idle` so finding them costs nothing), then the highest ranges of the writers with the most, most
+  // first, each down to one range, until FORGET_RANGES are free: so the writers are sorted about once per that
+  // many ranges recorded, not scanned for each. A forgotten dead dot can come back from a member that missed
+  // its deletion; nothing else is lost.
   makeRoom(keep) {
     for (const w of this.idle) {
       if (this.ctx.writers.size < MAX_WRITERS && this.ctx.size < MAX_RANGES) return;
@@ -598,11 +613,11 @@ export class Doc {
       this.ctx.drop(w);
       this.idle.delete(w);
     }
-    while (this.ctx.size >= MAX_RANGES) {
-      let most = null;
-      for (const [w, l] of this.ctx.writers) if (!most || l.length > this.ctx.writers.get(most).length) most = w;
-      if (!most || this.ctx.writers.get(most).length < 2) return;
-      this.ctx.dropLast(most);
+    if (this.ctx.size < MAX_RANGES) return;
+    const most = [...this.ctx.writers].filter(([, l]) => l.length > 1).sort((x, y) => y[1].length - x[1].length);
+    for (const [w, l] of most) {
+      while (l.length > 1 && this.ctx.size > MAX_RANGES - FORGET_RANGES) this.ctx.dropLast(w);
+      if (this.ctx.size <= MAX_RANGES - FORGET_RANGES) return;
     }
   }
 
