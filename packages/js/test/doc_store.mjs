@@ -2,8 +2,9 @@
 // doc, leaves (which saves) and reloads: the doc is back from its copy alone, and the record IndexedDB holds is
 // sealed (its key and bytes show neither the room, the doc nor what it holds). A write the page makes just
 // before it is hidden is saved at once, so a tab that then crashes (no pagehide) still has it when it opens the
-// doc again. forget() deletes the record. With IndexedDB refusing (as in some private modes) the doc says
-// 'blocked', warns once and still syncs with a second tab.
+// doc again. forget() deletes the record. Once the browser closes the connection (site data cleared), the next
+// save opens it again. With IndexedDB refusing (as in some private modes) the doc says 'blocked', warns once and
+// still syncs with a second tab.
 //
 //   node packages/js/test/doc_store.mjs
 
@@ -119,8 +120,24 @@ try {
   if ((await records(page2)).length) fail('forget() left a record');
   await page2.reload();
   if ((await open(page2)) !== 'empty') fail('a page opened after forget() found a copy');
-  await page2.evaluate(() => window.room.leave());
   console.log('forget() deleted the record');
+
+  // The browser closes the connection under the page (its site data cleared): the next save opens it again.
+  const saveWarnings = [];
+  page2.on('console', (m) => m.type() === 'warning' && saveWarnings.push(m.text()));
+  await page2.evaluate(async () => {
+    window.doc.set('strokes').add('before clearing');
+    await window.doc.save();
+  });
+  await (await ctx.newCDPSession(page2)).send('Storage.clearDataForOrigin', { origin: `http://127.0.0.1:${port}`, storageTypes: 'indexeddb' });
+  await page2.evaluate(async () => {
+    window.doc.set('strokes').add('after clearing');
+    await window.doc.save();
+    await window.room.leave();
+  });
+  const cleared = await records(page2);
+  if (cleared.length !== 1 || saveWarnings.length) fail(`saved after the site data was cleared: ${cleared.length} records, ${saveWarnings.join(' | ')}`);
+  console.log('the connection closed by the browser: the next save opened it again');
 
   // IndexedDB refusing: 'blocked', one warning, and the doc still syncs with another tab.
   const ctx2 = await browser.newContext();

@@ -19,6 +19,9 @@ import { MESSAGE_BYTES, STORED_FRAMES } from './doc.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+// The copy's format. A copy of another VERSION is never read nor written over, so bump it whenever an older
+// release's Doc.restore() would refuse what Doc.snapshot() now writes (a new `v`, a frame it doesn't read): one it
+// refuses counts as none, and its next save replaces it.
 const VERSION = 1;
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
@@ -46,11 +49,13 @@ export function browserStore() {
     const r = indexedDB.open('peerwire', 1);
     r.onupgradeneeded = () => r.result.createObjectStore('docs');
     r.onsuccess = () => {
-      // A newer version opened elsewhere: let it, and open again next time.
+      // A newer version opened elsewhere: let it, and open again next time; so too once the browser closed it
+      // (site data cleared, a connection lost).
       r.result.onversionchange = () => {
         r.result.close();
         db = null;
       };
+      r.result.onclose = () => (db = null);
       resolve(r.result);
     };
     r.onerror = () => reject(r.error);
@@ -98,8 +103,8 @@ function queued(store, name, op) {
 // The copy of doc `name` in `store`, sealed under the room key of `proof` (a RoomProof): the store doc.js takes,
 // { load, save, forget }, each run after the one called before it (see queued). load() gives the copy, null if
 // there is none or it was refused, or false for one of another VERSION, to leave as it is. save() takes the copy
-// or a promise of it (null: nothing to save), so a doc that closes while its copy loads keeps its turn. Throws
-// RangeError for a name that isn't well-formed.
+// or a promise of it (null: nothing to save), so a doc that closes while its copy loads keeps its turn, and gives
+// the bytes it stored (the doc paces its saves by them). Throws RangeError for a name that isn't well-formed.
 export function docCopy(store, proof, name) {
   if (/\p{Cs}/u.test(name)) throw new RangeError('a doc kept on this device needs a well-formed name (no lone surrogate)');
   let keys = null;
@@ -149,6 +154,7 @@ export function docCopy(store, proof, name) {
       bytes.set(iv, 1);
       bytes.set(sealed, 1 + IV_BYTES);
       await store.set(id, bytes);
+      return bytes.length;
     }),
     forget: () => queued(store, name, async () => {
       const { id } = await derive();

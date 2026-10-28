@@ -288,7 +288,8 @@ export interface DocLog {
 }
 
 /** Where a doc kept on this device keeps its copy: a store of bytes by key, e.g. over files. `get` gives back what
- * `set` stored, or undefined. */
+ * `set` stored, undefined only when there is none, and rejects when it can't tell; `set` stores all of it or
+ * nothing (over files: a temp file, then a rename). */
 export interface DocStore {
   get(key: string): Promise<Uint8Array | ArrayBuffer | undefined>;
   set(key: string, bytes: Uint8Array): Promise<void>;
@@ -297,10 +298,12 @@ export interface DocStore {
 
 export interface DocOptions {
   /** Keeps a copy of the doc on this device, loaded when it opens, before members are asked: `true` for IndexedDB
-   * (browsers; TypeError where there is none), or a {@link DocStore}. Saved at most once a second while the doc
-   * changes, when the page is hidden, and on `close()` and `leave()`. The copy is sealed under a key from the room
-   * key, so the storage shows neither the room, the doc nor what it holds; anyone who knows the roomId can read it,
-   * as they could join the room. */
+   * (browsers; TypeError where there is none), or a {@link DocStore}: make it once and pass the same object each
+   * time, as a doc closed and opened again at once loads what the closing one saved only through the same store.
+   * Saved when the page is hidden, on `close()` and `leave()`, and while the doc changes, one save at a time: a
+   * second after a change, and after the last save by its size at 256 KiB/s. The copy is sealed under a key from
+   * the room key, so the storage shows neither the room, the doc nor what it holds; anyone who knows the roomId
+   * can read it, as they could join the room. */
   persist?: boolean | DocStore;
 }
 
@@ -316,9 +319,9 @@ export interface Doc {
   /** True once the doc has caught up, and from then on, also once the other members have gone ('alone'). */
   readonly synced: boolean;
   /** What opening found on this device: 'loaded' (its copy is in the doc), 'empty' (none, or one that couldn't be
-   * read, which the next save replaces), 'blocked' (the storage refused, as in some private modes, or holds a copy
-   * from another version of this package, left as it is: the doc goes on without a copy, with a warning) or 'off'
-   * (no `persist`). */
+   * read, which the next save replaces), 'blocked' (the storage refused, as in some private modes, hadn't loaded
+   * the copy within 5 s, or holds one from another version of this package: the copy is left as it is, and the doc
+   * goes on without one, with a warning) or 'off' (no `persist`). */
   readonly loaded: Promise<'loaded' | 'empty' | 'blocked' | 'off'>;
   map(name: string): DocMap;
   set(name: string): DocSet;
@@ -334,7 +337,8 @@ export interface Doc {
    * What the doc holds stays. Rejects if the storage fails. */
   forget(): Promise<void>;
   /** Stops syncing and forgets the doc; `room.doc(name)` later opens it afresh and catches up. Writes after it
-   * throw. A doc kept on this device saves first: the promise resolves once it has. */
+   * throw. A doc kept on this device saves first: the promise resolves once it has (closed while a store takes
+   * more than 5 s to load the copy, it resolves then, saving nothing). */
   close(): Promise<void>;
 }
 

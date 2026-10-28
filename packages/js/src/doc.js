@@ -32,9 +32,11 @@
 // stands: 'alone', 'loading' from a member with `have` of `total` entries, or 'synced'.
 //
 // A doc opened with a store (room.doc(name, { persist })) keeps a copy on this device: its entries and context,
-// saved at most every SAVE_MS while it changes and when it closes. Opening loads the copy before the first ask,
-// so the ask carries it and members send only what it lacks, and our answers wait for it. The copy joins the
-// doc as an answer from ourselves would, checked as member data, so a copy that is off anywhere is dropped whole.
+// saved while it changes, paced by the copy's size (SAVE_MS, SAVE_RATE), and when it closes. Opening loads the
+// copy before the first ask, so the ask carries it and members send only what it lacks, and our answers wait
+// for it, LOAD_MS at most. The copy joins the doc as an answer from ourselves would, checked as member data, so
+// a copy that is off anywhere is dropped whole. An opening that couldn't read the copy (the store failed or was
+// too slow, or the copy is another version's) never writes it: it goes on without one.
 //
 // Members are trusted alike to write, as in the room itself: any member can overwrite, delete or fill a doc,
 // and a member relaying a catch-up can claim any writer, so `from` is as good as the member that told us.
@@ -100,9 +102,14 @@ const ASK_WAIT_MS = 5000;
 const TURN_MS = 60000;
 // Incarnations a doc moves through when members claim its future dots.
 const MAX_INCARNATIONS = 16;
-// A doc kept on this device is saved at most once per SAVE_MS while it changes. Its copy is answer frames, as
-// pack() cuts them: a full doc takes about 30, and a copy of more than STORED_FRAMES isn't loaded.
-const SAVE_MS = 1000;
+// A doc kept on this device is saved SAVE_MS after it changes, one save at a time, each the whole doc: so the
+// next waits SAVE_MS, or the copy's bytes at SAVE_RATE if longer, after the one before ends (2 s for a 510 KB
+// whiteboard, 48 s for a full doc of 12 MiB; one costs about 5 ms a MiB of main thread). Its copy is answer
+// frames, as pack() cuts them: a full doc takes about 30, and a copy of more than STORED_FRAMES isn't loaded.
+// A store that hasn't loaded the copy LOAD_MS after opening is taken as stuck: the doc goes on without it.
+export const SAVE_MS = 1000;
+export const SAVE_RATE = 256 * 1024; // bytes a second
+export const LOAD_MS = 5000;
 export const STORED_FRAMES = 64;
 // The longest array a frame may hold: entries, dead ranges, writers.
 const FRAME_ITEMS = 16384;
@@ -339,7 +346,8 @@ export function unopened(m) {
 // after(ms, fn) -> cancel, now() (ms), closed(doc), incarnation(), route(peer) ('direct', 'peer' or
 // 'signaling'), deflate (we read deflated frames), store (the copy on this device, or none: load() -> the copy
 // saved, null if there is none or it can't be read, or false for one of another version, to leave as it is;
-// save(copy), `copy` may be a promise of it, or of null: nothing to save; forget(); each a promise that rejects if
+// save(copy) -> the bytes it wrote, `copy` may be a promise of it, or of null: nothing to save; forget(); each
+// a promise that rejects if
 // the storage fails, and each taking effect in the order called, as a doc closed and opened again at once loads
 // what the closing one saved) }.
 export class Doc {
@@ -384,12 +392,19 @@ export class Doc {
     this.rangeCap = MAX_RANGES; // ranges the context may hold: more while a copy joins (see restore)
     this.loaded = Promise.resolve('off');
     this.loading = false;
+    this.loadEnd = null; // resolves `loaded`
+    this.loadWait = null; // cancels the LOAD_MS deadline
     this.version = 0;
     this.savedVersion = 0;
     this.saveWait = null;
     this.saving = Promise.resolve();
+    this.inFlight = false; // a save is with the store
+    this.saveSoon = false; // a save asked at once (the page hidden) while one was in flight: goes as it ends
+    this.nextSave = 0; // host.now() before which no paced save starts (see saved)
     this.forgotten = false;
-    this.foreign = false; // the copy is of another version (a newer release's): left as it is, none kept
+    // This opening couldn't read the copy (the store failed or took LOAD_MS, or the copy is another version's):
+    // it leaves the copy as it is and keeps none.
+    this.blocked = false;
     this.storeWarned = false;
     this.closingCopy = null; // closed while the copy loaded: gives the save close() queued its copy (see load)
   }
@@ -431,16 +446,19 @@ export class Doc {
   }
 
   // Stops syncing and forgets the doc: room.doc(name) later opens it afresh and catches up again. A doc kept on
-  // this device is saved first (one closed while its copy loads, once that is joined in: see load); the promise
-  // resolves once that is done.
+  // this device is saved first, at once, after any save in flight (one closed while its copy loads, once that is
+  // joined in: see load); the promise resolves once that is done.
   close() {
     if (this.closed) return this.saving;
-    this.save();
     if (this.loading && !this.forgotten) {
-      // Saved in its turn now, so a doc opened again at once loads it, with the copy that load() gives it.
+      // Saved in its turn now, so a doc opened again at once loads it, with the copy that load() gives it. Past
+      // LOAD_MS that is nothing, and closing waits no more for a store that is stuck.
       const copy = new Promise((r) => (this.closingCopy = r));
       const store = this.store;
-      this.saving = (async () => store.save(copy))().catch((e) => this.storeFailed(e));
+      const saved = (async () => store.save(copy))().catch((e) => this.storeFailed(e));
+      this.saving = this.loaded.then(() => (this.blocked ? undefined : saved));
+    } else {
+      this.write();
     }
     this.closed = true;
     this.saveWait?.();
@@ -485,7 +503,13 @@ export class Doc {
   open() {
     if (this.store) {
       this.loading = true;
-      this.loaded = this.load();
+      this.loaded = new Promise((r) => (this.loadEnd = r));
+      // A store that never answers would hold our asks and answers for good.
+      this.loadWait = this.host.after(LOAD_MS, () => {
+        this.storeFailed(new Error(`the store hasn't loaded it in ${LOAD_MS} ms`));
+        this.loadDone('blocked');
+      });
+      this.load();
     }
     for (const p of this.host.peers()) this.startAsk(p);
     this.emitSync();
@@ -494,16 +518,16 @@ export class Doc {
   // The copy, joined into the doc before the first ask (see nextAsk), so the ask carries it and members send only
   // what it lacks, and before our first answer (see serve), so answers carry it. What it found: 'loaded', 'empty'
   // (none, or one that couldn't be read or was off) or 'blocked' (the storage failed, private browsing say, or
-  // holds a copy of another version, which the doc leaves as it is and keeps none meanwhile).
+  // holds a copy of another version: see loadDone).
   async load() {
     let found = 'empty';
     try {
       const copy = await this.store.load();
+      if (!this.loading) return; // past LOAD_MS: the doc went on without it
       // With nothing written or heard while it loaded, the doc is now the copy: no need to save it again.
       const unchanged = this.version === this.savedVersion;
       if (copy === false) {
         found = 'blocked';
-        this.foreign = true;
       } else if (copy != null && this.restore(copy)) {
         found = 'loaded';
         if (unchanged) this.savedVersion = this.version;
@@ -514,19 +538,30 @@ export class Doc {
       found = 'blocked';
       this.storeFailed(e);
     }
+    this.loadDone(found);
+  }
+
+  // The load ended, with what it found, or 'blocked' at LOAD_MS (a copy that comes after is dropped). Blocked, the
+  // opening couldn't read the copy, so it never writes it: it may hold what this device kept, or a newer release's
+  // copy. forget() still deletes it.
+  loadDone(found) {
+    if (!this.loading) return;
     this.loading = false;
+    this.loadWait?.();
+    this.loadWait = null;
+    if (found === 'blocked') this.blocked = true;
+    this.loadEnd(found);
     // Closed while it loaded: what was written meanwhile is saved with the copy (see close), then the doc forgets
     // it all.
     if (this.closed) {
-      this.closingCopy?.(this.version !== this.savedVersion && !this.foreign ? this.snapshot() : null);
+      this.closingCopy?.(this.version !== this.savedVersion && !this.blocked ? this.snapshot() : null);
       this.clear();
-      return found;
+      return;
     }
     this.nextAsk(false);
     for (const [p, st] of this.members) if (st.theirs) this.serve(p, st);
     // Writes and frames while it loaded weren't saved, so a copy of part of the doc never replaced it.
     if (this.version !== this.savedVersion) this.dirty();
-    return found;
   }
 
   joined(peer) {
@@ -1325,30 +1360,53 @@ export class Doc {
     return true;
   }
 
-  // Saves the doc SAVE_MS from now, unless a save is due already (see flush).
+  // Saves the doc SAVE_MS from now, or once the last save's size allows (see saved), unless a save is due already
+  // (see flush) or with the store: then saved() sees to it.
   dirty() {
-    if (!this.store || this.forgotten || this.foreign || this.loading || this.closed || this.saveWait) return;
-    this.saveWait = this.host.after(SAVE_MS, () => {
+    if (!this.store || this.forgotten || this.blocked || this.loading || this.closed || this.saveWait || this.inFlight) return;
+    this.saveWait = this.host.after(Math.max(SAVE_MS, this.nextSave - this.host.now()), () => {
       this.saveWait = null;
       this.save();
     });
   }
 
-  // Saves the doc now if it changed since the last save, unless its copy is still loading, is of another version
-  // (left as it is), or the doc is closed. Resolves once saved; a save that fails is tried again with the next
-  // change.
+  // Saves the doc now (it is due, or the page was hidden), or, with a save in flight, as soon as that ends.
+  // Resolves once saved.
   save() {
-    if (!this.store || this.forgotten || this.foreign || this.loading || this.closed || this.version === this.savedVersion) return this.saving;
+    if (this.inFlight) this.saveSoon = true;
+    else this.write();
+    return this.saving;
+  }
+
+  // Hands the store the doc now if it changed since the last save, unless its copy is still loading, this
+  // opening couldn't read it (blocked), or the doc is closed. Whether it did.
+  write() {
+    if (!this.store || this.forgotten || this.blocked || this.loading || this.closed || this.version === this.savedVersion) return false;
     this.saveWait?.();
     this.saveWait = null;
     const copy = this.snapshot();
     const version = (this.savedVersion = this.version);
     const store = this.store;
-    this.saving = (async () => store.save(copy))().catch((e) => {
+    this.inFlight = true;
+    this.saving = (async () => store.save(copy))().then((bytes) => this.saved(bytes, true), (e) => {
       if (this.savedVersion === version) this.savedVersion = -1;
       this.storeFailed(e);
+      return this.saved(0, false);
     });
-    return this.saving;
+    return true;
+  }
+
+  // A save of `bytes` ended: the next waits SAVE_MS, or `bytes` at SAVE_RATE if longer, and saves the changes
+  // made meanwhile once; one asked at once meanwhile goes now. A save that failed is tried again with the next
+  // change. A promise of the save it started, if any, so `saving` resolves once both are done.
+  saved(bytes, ok) {
+    this.inFlight = false;
+    this.nextSave = this.host.now() + Math.max(SAVE_MS, ((Number(bytes) || 0) * 1000) / SAVE_RATE);
+    if (this.saveSoon) {
+      this.saveSoon = false;
+      if (this.write()) return this.saving;
+    }
+    if (ok && this.version !== this.savedVersion) this.dirty();
   }
 
   // Storage that fails (private browsing, a full disk) is said once; the doc goes on in memory.

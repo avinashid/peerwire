@@ -226,21 +226,30 @@ await doc.forget();                                // deletes this device's copy
   - Opening loads the copy before members are asked, so the ask carries it and members send only what it lacks;
     their asks of us wait for it too. A member who was never there gets the doc from one that kept it, once that
     one is online: nothing holds a room's docs while nobody is in it.
-  - The doc is saved at most once a second while it changes, when the page is hidden, and on `doc.close()` and
-    `room.leave()`, whose promises resolve once it is. A page killed while visible can lose its last second of
-    writes here; the members that heard them still have them.
+  - The doc is saved when the page is hidden, on `doc.close()` and `room.leave()`, whose promises resolve once it
+    is, and while it changes: a second after a change, one save at a time, and each save writes the whole doc, so
+    the next waits for the last one's bytes at 256 KiB/s: 2 s for the whiteboard above, 48 s for a full doc. A page
+    killed while visible can lose its last few seconds of writes here, more for a large doc; the members that heard
+    them still have them.
   - `persist` is `true` for IndexedDB (browsers), or a store of bytes, `{ get(key), set(key, bytes), delete(key) }`,
-    each returning a promise. `memoryStore()` keeps copies in the process, and files take a few lines (keys are
-    64 hex characters):
+    each returning a promise. `get` gives undefined only when there is no copy, and rejects when it can't tell.
+    `memoryStore()` keeps copies in the process, and files take a few lines (keys are 64 hex characters). Make the
+    store once and pass the same object each time, as a doc closed and opened again at once loads what the
+    closing one saved only through the same store:
 
     ```js
-    import { readFile, writeFile, rm } from 'node:fs/promises';
+    import { readFile, writeFile, rename, rm } from 'node:fs/promises';
     const files = (dir) => ({
-      get: (key) => readFile(`${dir}/${key}`).then((b) => new Uint8Array(b), () => undefined),
-      set: (key, bytes) => writeFile(`${dir}/${key}`, bytes),
+      get: (key) => readFile(`${dir}/${key}`).then((b) => new Uint8Array(b), (e) => {
+        if (e.code !== 'ENOENT') throw e; // unreadable isn't absent
+      }),
+      // Whole or not at all: a crash mid-write leaves the last copy.
+      set: (key, bytes) => writeFile(`${dir}/${key}.tmp`, bytes)
+        .then(() => rename(`${dir}/${key}.tmp`, `${dir}/${key}`)),
       delete: (key) => rm(`${dir}/${key}`, { force: true }),
     });
-    const doc = room.doc('board', { persist: files('./docs') });
+    const store = files('./docs');
+    const doc = room.doc('board', { persist: store });
     ```
   - The copy is sealed with AES-256-GCM under a key derived from the room key, and kept under an id derived the
     same way, so the storage shows neither the app, the room, the doc nor what it holds. With `persist`, a doc name
@@ -248,10 +257,13 @@ await doc.forget();                                // deletes this device's copy
   - A copy is about the size of the doc's JSON: 510 KB for the whiteboard above (`test/doc_catchup.mjs`), and
     12.1 MiB at most for a full doc of 3-byte characters (`test/doc_crdt.mjs`).
   - Storage that refuses (some private modes, a full disk) gives `'blocked'` or a failed save: one warning, and the
-    doc goes on in memory; a failed save is tried again with the next change. A copy that can't be read (too big,
-    doesn't open, isn't JSON, isn't a doc) counts as none, with a warning saying why, and the next save replaces
-    it; one that reads is checked as member data. A copy saved by another version of this package (a newer one)
-    is left as it is: `'blocked'`, and the doc keeps none until a version that reads it opens it.
+    doc goes on in memory; a failed save is tried again with the next change. A store that hasn't loaded the copy
+    5 s after opening is `'blocked'` too: the doc asks and answers without it, and drops it if it comes later.
+    `'blocked'` leaves the copy as it is: that opening never writes it, as it may hold what it couldn't read
+    (`forget()` still deletes it). A copy that can't be read (too big, doesn't open, isn't JSON, isn't a doc)
+    counts as none, with a warning saying why, and the next save replaces it; one that reads is checked as member
+    data. A copy saved by another version of this package (a newer one) is left as it is: `'blocked'`, and the doc
+    keeps none until a version that reads it opens it.
   - Two tabs of one browser in one room keep one copy of each doc, whichever saved last. Each catches up from the
     other while both are open, but a copy can miss the other tab's latest writes until they reach a member.
   - **What a copy keeps secret, and from whom:**
@@ -660,11 +672,15 @@ Run these with Node and the Playwright install on this host:
   - the copy on this device: a doc opened again is back as closed (entries, context and clock) and a member never
     there gets it; opened again among members, its ask carries the copy and only what it lacks comes, and what
     is written or heard while the copy loads is kept and saved; a doc closed while its copy loads saves both, and
-    one opened again at once gets them; one save a second while the doc changes, none for a frame that changes
-    nothing; `forget()`; a reload that draws an incarnation in the copy draws again, and one on a copy rolled back
-    uses no write twice; a copy of another version is left as it is; copies that are off in 11 ways are dropped
-    whole, 5000 mutated ones never throw, and a store that fails warns once; full docs' copies take at most 36
-    frames of the 64 a copy may hold.
+    one opened again at once gets them; one save a second while a small doc changes, none for a frame that
+    changes nothing; one save at a time (10 s of writes behind a held save call it once, then save once; the page
+    hidden or the doc closed meanwhile saves as it ends); a full doc changed every 100 ms saves every 48 s, its
+    12.1 MiB at 256 KiB/s; `forget()`; a reload that draws an incarnation in the copy draws again, and one on a copy
+    rolled back uses no write twice; a copy of another version is left as it is; copies that are off in 11 ways
+    are dropped whole, 5000 mutated ones never throw; a store that fails warns once, and that opening never writes
+    the copy (nor does one closed during a load that fails), while a failed save is tried again with the next
+    change; a store that never loads: at 5 s the doc asks and answers, saves nothing, closes without waiting, and
+    drops a copy that comes later; full docs' copies take at most 36 frames of the 64 a copy may hold.
 - `node packages/js/test/room_doc.mjs`: `room.doc()` with three members in a real `'local'` room: they converge, a
   doc opened late and a fourth member catch up, doc frames never show as messages, writes outlive their writer,
   and leaving closes docs. A whiteboard-sized doc reaches a late joiner deflated (2.5 times less), members that
@@ -674,8 +690,9 @@ Run these with Node and the Playwright install on this host:
   when its member comes back on the same secret and reaches a member never there; its copy is sealed (neither key
   nor bytes show the room, the doc or what it holds), another room's doc of that name and another doc's key can't
   read it, records sealed without the version or the key as additional data don't open, one of another version
-  is left as it is, each refusal says why, a name with a lone surrogate is refused, `forget()` deletes it, and the
-  file store above works.
+  is left as it is, each refusal says why, a name with a lone surrogate is refused, `forget()` deletes it, a save
+  gives the bytes it stored, and the file store above works, also when it can't read the copy (`'blocked'`, and
+  nothing written over it).
 - `node packages/js/test/doc_catchup.mjs`: a late joiner's catch-up of a whiteboard-sized board (509 KB) over a
   direct link, the signalling pipe through fake rate-limited relays, from a background tab, both at once, from a
   member that kept the board on its device and comes back after nobody was online, and with two holders, one
@@ -767,8 +784,9 @@ Run these with Node and the Playwright install on this host:
   idle timeout. `--stress=N` adds N busy loops for a loaded host.
 - `node packages/js/test/doc_store.mjs`: `room.doc(name, { persist: true })` in IndexedDB: a doc written, left and
   reloaded is back, in one sealed record, in one database and store of constant names; a write just before the
-  page is hidden is saved then and outlives a crash; `forget()` deletes the record; with IndexedDB refusing, the
-  doc says `'blocked'`, warns once and syncs.
+  page is hidden is saved then and outlives a crash; `forget()` deletes the record; once the browser closes the
+  connection (site data cleared), the next save opens it again; with IndexedDB refusing, the doc says `'blocked'`,
+  warns once and syncs.
 - `node packages/js/test/browser.mjs [tabs] [shot.png]`: mesh of tabs, RTT and throughput.
 - `node packages/js/test/arena.mjs [players] [secs] [shot.png|-]`: the arena. `LOSS=0.1`
   drops datagrams. Checks that every island agrees on its lockstep state.

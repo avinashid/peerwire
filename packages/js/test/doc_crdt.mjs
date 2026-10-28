@@ -9,7 +9,7 @@
 // a catch-up has us pass on), 'change', and the copy a doc keeps on this device (host.store).
 //
 //   node packages/js/test/doc_crdt.mjs
-import { Doc, unopened, MAX_VALUE_LENGTH, MAX_VALUE_DEPTH, MAX_ENTRIES, MAX_DOC_LENGTH, MAX_WRITERS, MAX_RANGES, MAX_KEY_LENGTH, MAX_NAME_LENGTH, MESSAGE_BYTES, STORED_FRAMES } from '../src/doc.js';
+import { Doc, unopened, MAX_VALUE_LENGTH, MAX_VALUE_DEPTH, MAX_ENTRIES, MAX_DOC_LENGTH, MAX_WRITERS, MAX_RANGES, MAX_KEY_LENGTH, MAX_NAME_LENGTH, MESSAGE_BYTES, STORED_FRAMES, SAVE_MS, SAVE_RATE, LOAD_MS } from '../src/doc.js';
 
 const fail = (m) => {
   console.error(`FAIL ${m}`);
@@ -1566,9 +1566,11 @@ console.log('context caps: writers and ranges stay capped and new writers are st
 }
 
 // The copy on this device (host.store). A store as the room's is to the doc, keeping the copy as JSON text and
-// running each call after the one before; `fail` makes each call reject, `hold()` holds load() until released.
-function copyStore() {
-  const s = { copy: null, saves: 0, loads: 0, deletes: 0, fail: null, gate: null, last: Promise.resolve() };
+// running each call after the one before; save() gives the bytes it kept. `fail` makes each call reject, `hold()`
+// holds load() until released, `holdSaves()` each save. `calls`: when (`now()`) save() was called, `sizes`: the
+// bytes of each save.
+function copyStore(now = () => 0) {
+  const s = { copy: null, saves: 0, calls: [], sizes: [], loads: 0, deletes: 0, fail: null, gate: null, saveGate: null, last: Promise.resolve() };
   const run = (op) => {
     const p = s.last.then(op);
     s.last = p.catch(() => {});
@@ -1581,28 +1583,38 @@ function copyStore() {
     if (s.foreign) return false;
     return s.copy === null ? null : JSON.parse(s.copy);
   });
-  s.save = (c) => run(async () => {
-    c = await c;
-    if (s.fail) throw s.fail;
-    if (c === null) return;
-    s.saves++;
-    s.copy = JSON.stringify(c);
-  });
+  s.save = (c) => {
+    s.calls.push(now());
+    return run(async () => {
+      c = await c;
+      if (s.saveGate) await s.saveGate.promise;
+      if (s.fail) throw s.fail;
+      if (c === null) return;
+      s.saves++;
+      s.copy = JSON.stringify(c);
+      s.sizes.push(Buffer.byteLength(s.copy));
+      return s.sizes.at(-1);
+    });
+  };
   s.forget = () => run(async () => {
     if (s.fail) throw s.fail;
     s.deletes++;
     s.copy = null;
   });
-  s.hold = () => {
+  const gate = (k) => {
     let release;
-    s.gate = { promise: new Promise((r) => (release = r)) };
+    s[k] = { promise: new Promise((r) => (release = r)) };
     return () => {
-      s.gate = null;
+      s[k] = null;
       release();
     };
   };
+  s.hold = () => gate('gate');
+  s.holdSaves = () => gate('saveGate');
   return s;
 }
+// Lets the store's promises run.
+const settle = () => new Promise((r) => setImmediate(r));
 // A node of `net` whose doc keeps its copy in `store`, opened (its load under way).
 function kept(net, c, store, opts) {
   const n = net.node(c, { ...opts, open: false });
@@ -1650,9 +1662,11 @@ console.warn = (...a) => warnings.push(a.join(' '));
   net.run();
   if (state(c.doc) !== before) fail('a member that was never there did not get the doc from the copy');
   const saves = store.saves;
+  const said = warnings.length;
   net.wait(10000);
   await a.doc.saving;
   if (store.saves !== saves) fail('a copy that loaded into an unchanged doc was saved again');
+  if (warnings.length !== said || (await a.doc.loaded) !== 'loaded') fail(`a copy that loaded: at LOAD_MS, ${warnings.at(-1)}`);
 }
 console.log("the copy: a doc opened again is back as closed, a member never there gets it, and doc.loaded says so");
 
@@ -1674,13 +1688,15 @@ console.log("the copy: a doc opened again is back as closed, a member never ther
   const release = store.hold();
   net.got.clear();
   const saves = store.saves;
+  const calls = store.calls.length;
   net.open(a);
   net.link(a, b);
   a.doc.map('meta').set('title', 'during the load');
-  net.run();
+  a.doc.save(); // the page hidden
+  while (net.step()); // delivers, firing no timer: LOAD_MS hasn't passed
   const asked = net.got.get(b.self) ?? 0;
   if (a.doc.asking || net.got.has(a.self) || asked) fail(`while the copy loads: a asked ${a.doc.asking}, was answered ${net.got.get(a.self)}, answered b ${asked}`);
-  if (store.saves !== saves) fail('saved while the copy loaded');
+  if (store.calls.length !== calls) fail('saved while the copy loaded (the page hidden)');
   release();
   if ((await a.doc.loaded) !== 'loaded') fail('the held copy did not load');
   net.run();
@@ -1710,7 +1726,13 @@ console.log('opening again among members: the ask carries the copy, only what it
   net.open(a);
   const second = a.doc;
   const saves = store.saves;
+  const releaseSave = store.holdSaves();
   release();
+  let done = false;
+  closed.then(() => (done = true));
+  await settle();
+  if (done || store.saves !== saves) fail('a doc closed while its copy loads: close() resolved before its save');
+  releaseSave();
   await closed;
   if ((await second.loaded) !== 'loaded') fail('opened again after a close during the load: no copy');
   const items = second.set('s').entries().map((e) => e.value).sort();
@@ -1731,8 +1753,9 @@ console.log('opening again among members: the ask carries the copy, only what it
 }
 console.log('closed while its copy loads: what it wrote is saved with the copy, and a doc opened again at once gets both');
 
-// Saves: at most one per SAVE_MS while the doc changes, none for a frame that changes nothing, and one on close
-// if it changed. forget() deletes the copy and keeps none after; with no store it does nothing.
+// Saves: SAVE_MS after a change, then, for a small doc, at most one per SAVE_MS while it changes, none for a frame
+// that changes nothing, and one on close if it changed. forget() deletes the copy and keeps none after; with no
+// store it does nothing.
 {
   const net = new Net(9);
   const store = copyStore();
@@ -1762,13 +1785,18 @@ console.log('closed while its copy loads: what it wrote is saved with the copy, 
   net.wait(1000);
   await a.doc.saving;
   if (store.saves - s0 !== 3) fail('a frame that only named dead dots was not saved');
+  // A delete alone removes entries and takes no dot: saved too.
+  a.doc.set('s').delete(a.doc.set('s').entries()[0].id);
+  net.wait(SAVE_MS);
+  await a.doc.saving;
+  if (store.saves - s0 !== 4) fail('a delete alone was not saved');
   await a.doc.close();
-  if (store.saves - s0 !== 3) fail('closing an unchanged doc saved it');
+  if (store.saves - s0 !== 4) fail('closing an unchanged doc saved it');
   net.open(a);
   await a.doc.loaded;
   a.doc.set('s').add('last');
   await a.doc.close();
-  if (store.saves - s0 !== 4 || !store.copy.includes('"last"')) fail('closing saved not the last write');
+  if (store.saves - s0 !== 5 || !store.copy.includes('"last"')) fail('closing saved not the last write');
   net.open(a);
   await a.doc.loaded;
   a.doc.set('s').add('forgotten');
@@ -1776,10 +1804,141 @@ console.log('closed while its copy loads: what it wrote is saved with the copy, 
   a.doc.set('s').add('after');
   net.wait(5000);
   await a.doc.close();
-  if (store.copy !== null || store.deletes !== 1 || store.saves - s0 !== 4) fail(`forget(): copy ${store.copy?.length}, ${store.deletes} deletes, ${store.saves - s0} saves`);
+  if (store.copy !== null || store.deletes !== 1 || store.saves - s0 !== 5) fail(`forget(): copy ${store.copy?.length}, ${store.deletes} deletes, ${store.saves - s0} saves`);
   if ((await new Doc('x', { ...a.host, store: undefined }).forget()) !== undefined || store.deletes !== 1) fail('forget() with no store');
 }
 console.log('saves: one per SAVE_MS while it changes, none for nothing, on close; forget() deletes it and saves stop');
+
+// One save at a time: with the store holding the first, 10 s of writes call save() once; as it ends, what
+// changed meanwhile is saved once, SAVE_MS after, and nothing after that. With the page hidden (twice) while a
+// save is held, the next goes as it ends; closing while one is held saves behind it.
+{
+  const net = new Net(18);
+  const store = copyStore(() => net.now);
+  const a = kept(net, 'a', store);
+  await a.doc.loaded;
+  let release = store.holdSaves();
+  for (let i = 0; i < 100; i++) {
+    a.doc.set('s').add(i < 99 ? i : 'the last');
+    net.wait(100);
+    await settle();
+  }
+  if (store.calls.length !== 1) fail(`with a save held: ${store.calls.length} saves over 10 s of writes`);
+  release();
+  await a.doc.saving;
+  if (store.calls.length !== 1 || store.copy.includes('the last')) fail('a held save ended: the changes made meanwhile were saved at once');
+  net.wait(SAVE_MS);
+  await a.doc.saving;
+  if (store.calls.length !== 2 || store.saves !== 2 || !store.copy.includes('the last')) fail(`a held save ended: ${store.calls.length} saves after, the last write in it ${store.copy.includes('the last')}`);
+  net.wait(60000);
+  await a.doc.saving;
+  if (store.calls.length !== 2) fail('saved again with nothing changed');
+  release = store.holdSaves();
+  a.doc.set('s').add('held');
+  net.wait(SAVE_MS);
+  a.doc.set('s').add('hidden');
+  a.doc.save();
+  a.doc.save();
+  if (store.calls.length !== 3) fail(`the page hidden twice while a save was held: ${store.calls.length - 2} saves`);
+  release();
+  await a.doc.saving;
+  if (store.calls.length !== 4 || !store.copy.includes('"hidden"')) fail('the page hidden while a save was held: not saved as it ended');
+  release = store.holdSaves();
+  a.doc.set('s').add('held again');
+  net.wait(SAVE_MS * 2);
+  a.doc.set('s').add('closing');
+  const closed = a.doc.close();
+  release();
+  await closed;
+  if (store.calls.length !== 6 || !store.copy.includes('"closing"')) fail('closed while a save was held: not saved behind it');
+}
+console.log('one save at a time: 10 s of writes behind a held save, then one save of all of them');
+
+// A full doc (12 MiB as UTF-8), changed every 100 ms for 150 s, saves no more often than its size allows at
+// SAVE_RATE (about every 48 s), each save the doc as it is then, and on close at once.
+{
+  const net = new Net(19);
+  const store = copyStore(() => net.now);
+  const a = kept(net, 'a', store);
+  await a.doc.loaded;
+  const peer = id('e');
+  const ws = Array.from({ length: 64 }, (_, i) => peer + i.toString(16).padStart(8, '0'));
+  const e = Array.from({ length: MAX_ENTRIES - 10 }, (_, i) => [i % 64, 2 + 2 * Math.floor(i / 64), 1, 's', 's', null, '€'.repeat(Math.floor(MAX_DOC_LENGTH / MAX_ENTRIES) - 13)]);
+  for (let i = 0, k = 0; i < e.length; i += 64, k++) a.doc.receive(peer, { d: 'board', t: 3, ws, e: e.slice(i, i + 64), x: ws.map((_, w) => [w, 2 * k + 1, 2 * k + 1]) });
+  const m = a.doc.map('m');
+  for (let i = 0; i < 1500; i++) {
+    if (m.set('k', i) === false) fail('the full doc took no write');
+    net.wait(100);
+    await settle();
+  }
+  const { calls, sizes } = store;
+  const gaps = calls.slice(1).map((t, i) => t - calls[i]);
+  if (sizes[0] < 12 * 2 ** 20 || calls.length < 3 || calls.length > 1 + Math.floor(150000 / ((sizes[0] / SAVE_RATE) * 1000)) || gaps.some((g, i) => g < (sizes[i] / SAVE_RATE) * 1000)) fail(`a full doc changed every 100 ms: saves at ${calls.map((t) => (t / 1000).toFixed(1))} s, ${sizes.map((b) => (b / 2 ** 20).toFixed(1))} MiB`);
+  const last = calls.length;
+  m.set('k', 'closing');
+  await a.doc.close();
+  if (store.calls.length !== last + 1 || !store.copy.includes('"closing"')) fail('closing a full doc between paced saves did not save at once');
+  console.log(`a full doc changed every 100 ms for 150 s: saved at ${calls.slice(0, last).map((t) => (t / 1000).toFixed(1)).join(', ')} s, ${(sizes[0] / 2 ** 20).toFixed(1)} MiB each, and on close at once`);
+}
+
+// A store that never loads the copy: LOAD_MS after opening, the doc goes on without it, 'blocked', with a
+// warning. It asks and answers, saves nothing (also on close, which doesn't wait for the store), and a doc closed
+// while it waits closes at LOAD_MS. A copy that comes after LOAD_MS is dropped, and that opening never saves.
+{
+  const net = new Net(20);
+  const s0 = copyStore();
+  const d = kept(net, 'd', s0);
+  await d.doc.loaded;
+  d.doc.set('s').add('kept');
+  await d.doc.close();
+  const store = copyStore(() => net.now);
+  store.copy = s0.copy;
+  store.hold(); // never released
+  const a = kept(net, 'a', store);
+  const b = net.node('b');
+  b.doc.set('s').add('from b');
+  net.mesh([a, b]);
+  a.doc.set('s').add('from a');
+  while (net.step());
+  if (a.doc.asking || !b.doc.members.get(a.self)?.ask) fail('a store that never loads: asked or answered before LOAD_MS');
+  const said = warnings.length;
+  net.wait(LOAD_MS - 1);
+  if (a.doc.loading !== true) fail('a store that never loads: gave up before LOAD_MS');
+  net.wait(1);
+  if (a.doc.loading || !a.doc.asking) fail('a store that never loads: the doc still waits for it at LOAD_MS');
+  net.run();
+  if ((await a.doc.loaded) !== 'blocked' || warnings.length !== said + 1 || !warnings.at(-1).includes(`hasn't loaded it in ${LOAD_MS} ms`)) fail(`a store that never loads: ${await a.doc.loaded} at LOAD_MS, ${warnings.length - said} warnings`);
+  same([a, b], 'a store that never loads');
+  if (b.doc.members.get(a.self)?.ask || !a.doc.synced || a.doc.set('s').entries().length !== 2) fail("a store that never loads: b's ask unanswered, or a never caught up");
+  a.doc.set('s').add('after');
+  net.run();
+  net.wait(60000);
+  const hung = new Promise((r) => setTimeout(() => r('hung'), 2000));
+  if ((await Promise.race([a.doc.close().then(() => 'closed'), hung])) !== 'closed' || store.calls.length) fail(`a store that never loads: close hung, or ${store.calls.length} saves`);
+  net.unlink(a, b);
+  // Opened again on the same store and closed at once, with a write: its load waits behind the one that never
+  // ends, and close() resolves at LOAD_MS, saving nothing.
+  net.open(a);
+  a.doc.set('s').add('closed while it waited');
+  const closed = a.doc.close().then(() => 'closed');
+  net.wait(LOAD_MS);
+  if ((await Promise.race([closed, hung])) !== 'closed' || (await a.doc.loaded) !== 'blocked' || a.doc.entries.size || store.calls.length !== 1) fail('closed while a store never loads: close hung, saved or kept its entries');
+  // A copy that comes after LOAD_MS: dropped, and that opening still saves nothing.
+  const late = copyStore(() => net.now);
+  late.copy = s0.copy;
+  const release = late.hold();
+  const c = kept(net, 'c', late);
+  net.wait(LOAD_MS);
+  release();
+  await late.last;
+  await settle();
+  c.doc.set('s').add('mine');
+  if (c.doc.set('s').entries().map((x) => x.value).join() !== 'mine') fail('a copy that came after LOAD_MS joined the doc');
+  net.wait(60000);
+  await c.doc.close();
+  if ((await c.doc.loaded) !== 'blocked' || late.calls.length || late.copy !== s0.copy) fail(`a copy that came after LOAD_MS: ${await c.doc.loaded}, ${late.calls.length} saves`);
+}
+console.log("a store that never loads: at LOAD_MS the doc asks, answers and saves nothing, closing doesn't wait, and a late copy is dropped");
 
 // A reload with a stable secret keeps our PeerId: an opening that draws the incarnation of a writer in the copy
 // draws again, so the copy's entries stay and our new writes reach everyone. (Drawing the same again would make
@@ -1901,7 +2060,11 @@ console.log('a copy of another version: left as it is, nothing saved, forget() d
     await n.doc.close();
     if (!store.copy.includes('"new"') || store.copy.includes('kept')) fail(`a copy with ${what} wasn't replaced`);
   }
+  // The store fails to load the copy it holds: 'blocked', said once, and the doc goes on, asking and answering.
+  // That opening never writes the copy it couldn't read, with the next change or on close, even once the store is
+  // back; nor does a doc closed during a load that fails.
   const store = copyStore();
+  store.copy = good.copy;
   store.fail = new Error('storage refused');
   const before = warnings.length;
   const a = kept(net, 'a', store);
@@ -1915,22 +2078,64 @@ console.log('a copy of another version: left as it is, nothing saved, forget() d
   }
   await a.doc.saving;
   if (a.doc.set('s').entries().length !== 6 || b.doc.set('s').entries().length !== 6) fail('a doc whose store fails does not sync');
-  if (store.saves || warnings.length - before !== 1 || !warnings.at(-1).includes("can't keep a copy")) fail(`a store that fails warned ${warnings.length - before} times`);
-  // Back: the next change saves, and so does closing with none since the save that failed.
+  if (warnings.length - before !== 1 || !warnings.at(-1).includes("can't keep a copy")) fail(`a store that fails warned ${warnings.length - before} times`);
   store.fail = null;
   a.doc.set('s').add('back');
   net.run();
   await a.doc.saving;
-  if (!store.copy?.includes('"back"') || store.copy.includes('kept')) fail('a store back from failing was not saved to with the next change');
+  await a.doc.close();
+  net.unlink(a, b);
+  if (store.saves || store.copy !== good.copy) fail(`an opening whose store failed to load wrote over the copy: ${store.saves} saves`);
+  const release = store.hold();
+  store.fail = new Error('storage refused');
+  net.open(a);
+  a.doc.set('s').add('closed while the load failed');
+  const closed = a.doc.close();
+  release();
+  await closed;
+  await store.last;
+  if ((await a.doc.loaded) !== 'blocked' || store.saves || store.copy !== good.copy) fail('a doc closed during a load that failed wrote over the copy');
+  // Opened again with the store back: it loads the copy and saves. A save that fails is tried again with the next
+  // change, and on closing with none since the save that failed.
+  store.fail = null;
+  net.open(a);
+  if ((await a.doc.loaded) !== 'loaded' || a.doc.set('s').entries()[0]?.value !== 'kept') fail('opened again with the store back: no copy');
+  a.doc.set('s').add('saved');
+  net.wait(SAVE_MS);
+  await a.doc.saving;
+  if (store.saves !== 1 || !store.copy.includes('"saved"') || !store.copy.includes('"kept"')) fail('opened again with the store back: not saved');
+  const said = warnings.length;
+  store.fail = new Error('storage refused');
+  a.doc.set('s').add('failed');
+  net.wait(SAVE_MS);
+  await a.doc.saving;
+  const tried = store.calls.length;
+  net.wait(10 * SAVE_MS);
+  await a.doc.saving;
+  if (store.calls.length !== tried) fail('a save that failed was tried again with no change');
+  store.fail = null;
+  a.doc.set('s').add('back');
+  net.wait(SAVE_MS);
+  await a.doc.saving;
+  if (!store.copy.includes('"back"') || !store.copy.includes('"failed"')) fail('a store back from failing was not saved to with the next change');
   store.fail = new Error('storage refused');
   a.doc.set('s').add('last');
-  net.run();
+  net.wait(SAVE_MS);
   await a.doc.saving;
   store.fail = null;
   await a.doc.close();
   if (!store.copy.includes('"last"')) fail('closing after a save that failed, with no change since, did not save');
+  if (warnings.length - said !== 1) fail(`two saves that failed warned ${warnings.length - said} times`);
+  // forget() deletes the copy also from an opening that couldn't read it.
+  store.fail = new Error('storage refused');
+  net.open(a);
+  if ((await a.doc.loaded) !== 'blocked') fail('a store that fails again: not blocked');
+  store.fail = null;
+  await a.doc.forget();
+  if (store.copy !== null || store.deletes !== 1) fail("forget() from an opening whose store failed didn't delete the copy");
+  await a.doc.close();
 }
-console.log("copies that are off are dropped whole and replaced; a store that fails is said once and the doc goes on");
+console.log("copies that are off are dropped whole and replaced; a store that fails is said once, the doc goes on, and that opening never writes the copy");
 
 // Random mutations of a real copy: restore() never throws, and one it refuses joins nothing.
 {

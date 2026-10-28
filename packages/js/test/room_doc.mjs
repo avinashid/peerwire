@@ -306,6 +306,9 @@ for (const r of [b, c, d]) await r.leave();
   v2.map('m').set('x', 2);
   await v2.close();
   if (v2found !== 'blocked' || Buffer.compare(await store.get(vKey), newer) !== 0) fail(`a copy of version 2: ${v2found}, and written over`);
+  // A save gives the bytes it stored, by which the doc paces the next.
+  const wrote = await docCopy(spy, a2.proof, 'sizes').save({ v: 1, c: 0, f: [] });
+  if (wrote !== sets.at(-1)[1].length) fail(`a save gave ${wrote} for a record of ${sets.at(-1)[1].length} bytes`);
   for (const why of ['more than any doc takes', "didn't open under this room's key", 'of another version']) if (!warned.some((m) => m.includes(why))) fail(`no warning says the copy ${why}: ${warned.join(' | ')}`);
   console.warn = warn;
   // With persist, a doc name must be well-formed: lone surrogates would all encode as U+FFFD, one key for all.
@@ -343,19 +346,38 @@ for (const r of [b, c, d]) await r.leave();
     if (!(threw instanceof TypeError)) fail(`persist ${JSON.stringify(persist)} in Node: ${threw}`);
   }
   for (const r of [a2, b2, other]) await r.leave();
-  // The README's store over files.
-  const { readFile, writeFile, rm, mkdtemp, readdir } = await import('node:fs/promises');
+  // The README's store over files. A copy it can't read (here a directory in its place: EISDIR) isn't "no copy":
+  // 'blocked', and that opening writes nothing over it. A save leaves no temp file.
+  const { readFile, writeFile, rename, rm, mkdtemp, mkdir, readdir } = await import('node:fs/promises');
   const files = (dir) => ({
-    get: (key) => readFile(`${dir}/${key}`).then((b) => new Uint8Array(b), () => undefined),
-    set: (key, bytes) => writeFile(`${dir}/${key}`, bytes),
+    get: (key) => readFile(`${dir}/${key}`).then((b) => new Uint8Array(b), (e) => {
+      if (e.code !== 'ENOENT') throw e; // unreadable isn't absent
+    }),
+    // Whole or not at all: a crash mid-write leaves the last copy.
+    set: (key, bytes) => writeFile(`${dir}/${key}.tmp`, bytes)
+      .then(() => rename(`${dir}/${key}.tmp`, `${dir}/${key}`)),
     delete: (key) => rm(`${dir}/${key}`, { force: true }),
   });
   const dir = await mkdtemp(`${(await import('node:os')).tmpdir()}/peerwire-docs-`);
+  const disk = files(dir);
   const f1 = await joinRoom(kopts);
-  f1.doc('board', { persist: files(dir) }).map('meta').set('title', 'On disk');
+  f1.doc('board', { persist: disk }).map('meta').set('title', 'On disk');
   await f1.leave();
+  const [record, ...more] = await readdir(dir);
+  if (more.length) fail(`the README's file store left ${more}`);
+  await rename(`${dir}/${record}`, `${dir}/aside`);
+  await mkdir(`${dir}/${record}`);
+  console.warn = (m) => warned.push(m);
   const f2 = await joinRoom(kopts);
-  const fd = f2.doc('board', { persist: files(dir) });
+  const fb = f2.doc('board', { persist: disk });
+  const unread = await fb.loaded;
+  fb.map('meta').set('title', 'Over it');
+  await fb.close();
+  console.warn = warn;
+  if (unread !== 'blocked' || (await readdir(dir)).sort().join() !== ['aside', record].sort().join() || (await readdir(`${dir}/${record}`)).length) fail(`a file store that can't read the copy: ${unread}, ${await readdir(dir)}`);
+  await rm(`${dir}/${record}`, { recursive: true });
+  await rename(`${dir}/aside`, `${dir}/${record}`);
+  const fd = f2.doc('board', { persist: disk });
   if ((await fd.loaded) !== 'loaded' || fd.map('meta').get('title') !== 'On disk' || (await readdir(dir)).length !== 1) fail("the README's file store");
   await fd.forget();
   if ((await readdir(dir)).length) fail("forget() with the README's file store left a file");
