@@ -11,15 +11,18 @@
 //     room_throttled.mjs, over LocalTransport;
 // (d) A leaves before C joins;
 // (e) (b) and (c) at once: A in the background on the fallback route, where the pipe's batching and rate waits
-//     are timers too. Printed, not checked: its bar is the lead's call once NB-006e lands.
+//     are timers too;
+// (f) two members hold the board, B linked to C directly and A over the pipe: C asks B first and takes one whole
+//     answer, not one from each.
 // For each it prints how long after the link C held every entry (or what it held at the deadline), the doc
 // frames both sides sent (asks, answers, deltas and their bytes), what went on the wire (datagrams, core
-// packets and retransmits, pipe batches, relay events) and when C's ask of A was pending or timed out. (a) to
-// (c) must hold the whole doc within DEADLINE_MS of the link; (d) holds nothing.
+// packets and retransmits, pipe batches, relay events) and when C's ask of A was pending or timed out. C must
+// hold the whole doc within DEADLINE_MS of the link in (a) to (c) and (f), and within BACKGROUND_MS in (e); its
+// first entries within FIRST_MS in (b), and FIRST_BACKGROUND_MS in (e); (d) holds nothing.
 //
-// It fails on main at 45c7cfd (NB-006d), so scripts/gate.sh doesn't run it until NB-006e lands.
+// It failed on main at 45c7cfd (NB-006d): (b) took 32 s and (e) held 26 of 42 entries after 120 s.
 //
-//   node packages/js/test/doc_catchup.mjs [--runs=abcde] [--watch=60] [--relay-rate=10]
+//   node packages/js/test/doc_catchup.mjs [--runs=abcdef] [--watch=60] [--relay-rate=10]
 //
 // --watch keeps watching a run that missed the deadline until that many seconds after the link, to see where
 // it ends up; --relay-rate sets RELAY_RATE.
@@ -33,6 +36,9 @@ const POINTS = 1000;
 const META = { title: 'Field test board', bg: 'grid' };
 const ENTRIES = STROKES + Object.keys(META).length;
 const DEADLINE_MS = 15000;
+const BACKGROUND_MS = 30000; // (e)
+const FIRST_MS = 3000; // (b): C's first entries
+const FIRST_BACKGROUND_MS = 5000; // (e)
 const LINK_MS = 30000; // for C to link to A at all
 const ALONE_MS = 2000; // (d): how long C waits alone
 const CLAMP_MS = 1000; // (c): a background tab's timers
@@ -79,16 +85,17 @@ const held = (doc) => doc.set('strokes').entries().length + Object.entries(META)
 // Doc frames each room sends and receives, and the datagrams each endpoint sends, by peer id.
 const docLog = []; // { self, peer, dir: 'out' | 'in', t, end, entries, bytes, at }
 const writeDoc = Room.prototype.writeDoc;
-Room.prototype.writeDoc = function (peer, m) {
+Room.prototype.writeDoc = function (peer, m, ...rest) {
   docLog.push({ self: this.self, peer, dir: 'out', t: m.t, end: m.end === 1, entries: m.e?.length ?? 0, bytes: JSON.stringify(m).length, at: now() });
-  return writeDoc.call(this, peer, m);
+  return writeDoc.call(this, peer, m, ...rest);
 };
 const dec = new TextDecoder();
-const onDoc = Room.prototype.onDoc;
-Room.prototype.onDoc = function (peer, body) {
-  const t = Number(/"t":(\d)/.exec(dec.decode(body.subarray(0, 64)))?.[1]);
-  docLog.push({ self: this.self, peer, dir: 'in', t, end: dec.decode(body.subarray(-8)) === '"end":1}', bytes: body.length, at: now() });
-  return onDoc.call(this, peer, body);
+// A doc frame's JSON text as it arrives (inflated, if it came deflated).
+const docFrame = Room.prototype.docFrame;
+Room.prototype.docFrame = function (peer, text) {
+  const t = Number(/"t":(\d)/.exec(dec.decode(text.subarray(0, 64)))?.[1]);
+  docLog.push({ self: this.self, peer, dir: 'in', t, end: /"end":1[,}]/.test(dec.decode(text.subarray(-64))), bytes: text.length, at: now() });
+  return docFrame.call(this, peer, text);
 };
 const wire = new Map(); // peer id -> { dgs, bytes }
 const sent = (id, n) => {
@@ -111,8 +118,10 @@ BroadcastSignaling.prototype.send = function (to, body) {
 };
 
 // A fake RTCPeerConnection, as in room_fallback.mjs: two of them in one thread link once the offerer has the
-// answer, unless `iceHangs`, when ICE never completes (and the far one may be in another thread).
+// answer, unless `iceHangs`, when ICE never completes (and the far one may be in another thread), or the pair
+// of owners is in `hangs` ('a|c').
 let iceHangs = false;
+const hangs = new Set();
 const pcs = new Map();
 let tokens = 0;
 class FakeDc {
@@ -157,6 +166,7 @@ const fakePc = (owner) => class FakePc {
     if (iceHangs) return;
     const remote = pcs.get(d.sdp.slice(5));
     if (!remote) throw new Error('unknown remote');
+    if (hangs.has(`${this.owner}|${remote.owner}`) || hangs.has(`${remote.owner}|${this.owner}`)) return;
     this.remote = remote;
     if (d.type === 'answer') setTimeout(() => this.connect(remote), 5);
   }
@@ -230,7 +240,7 @@ if (!isMainThread) {
   parentPort.postMessage({ ready: a.self });
 } else {
   const arg = (name, dflt) => process.argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? dflt;
-  const RUNS = arg('runs', 'abcde');
+  const RUNS = arg('runs', 'abcdef');
   const WATCH_MS = Math.max(DEADLINE_MS, Number(arg('watch', 0)) * 1000);
   const RELAY_RATE = Number(arg('relay-rate', 10));
   const RELAY_CONTENT = 64 * 1024;
@@ -306,7 +316,7 @@ if (!isMainThread) {
 
   // Watches C's doc from C's join (t0): when C links to A, then what C holds and its ask of A, until C holds
   // the whole board or WATCH_MS after the link.
-  async function watch(c, dc, aId, t0) {
+  async function watch(c, dc, aId, t0, until = WATCH_MS) {
     const w = { link: null, whole: null, held: 0, series: [], states: [] };
     while (!c.peers.includes(aId)) {
       if (now() - t0 > LINK_MS) return w;
@@ -329,7 +339,7 @@ if (!isMainThread) {
         w.same = JSON.stringify(dc.set('strokes').entries().map((e) => e.value)) === JSON.stringify(BOARD);
         return w;
       }
-      if (t > WATCH_MS) return w;
+      if (t > until) return w;
       await sleep(25);
     }
   }
@@ -350,12 +360,14 @@ if (!isMainThread) {
   const pipe = (p, st, relay = {}) => `${p.sent} pipe batches, ${p.dropped} datagrams dropped from a full pipe queue; ${st.published} Nostr events, relay-1 accepted ${relay.accepted} (${kb(relay.chars ?? 0)} of content), rate-limited ${relay.limited}, too large ${relay.tooLarge}; backoffs ${st.backoffs ?? 0}`;
 
   const results = [];
-  // Prints run `key` and records whether it met its bar (none with `bar` false: printed only).
-  function report(key, what, w, { aId, cId, aLog = docLog, aWire, cWire, aCore, cCore, extra = [], bar = true }) {
-    const ok = !bar || (w.whole !== null && w.whole <= DEADLINE_MS && w.same);
+  // Prints run `key` and records whether it met its bar: the whole board within `deadline` of the link, and
+  // its first entries within `first` (none with `bar` false: printed only).
+  function report(key, what, w, { aId, cId, aLog = docLog, aWire, cWire, aCore, cCore, extra = [], bar = true, deadline = DEADLINE_MS, first = Infinity }) {
+    w.first = w.series.find(([, n]) => n > 0)?.[0] ?? null;
+    const ok = !bar || (w.whole !== null && w.whole <= deadline && w.same && w.first <= first);
     const head = w.link === null ? `C never linked to A within ${s(LINK_MS)}`
       : w.whole !== null ? `C linked ${s(w.link)} after joining and held the whole board ${s(w.whole)} after the link${w.same ? '' : ', BUT NOT THE SAME BOARD'}`
-      : `C linked ${s(w.link)} after joining and held ${w.held} of ${ENTRIES} entries ${s(WATCH_MS)} after the link`;
+      : `C linked ${s(w.link)} after joining and held ${w.held} of ${ENTRIES} entries ${s(Math.max(WATCH_MS, deadline))} after the link`;
     console.log(`(${key}) ${what}: ${head}`);
     if (w.link !== null) {
       const series = w.series.length > 10 ? [...w.series.slice(0, 5), ...w.series.slice(-5)] : w.series;
@@ -369,7 +381,8 @@ if (!isMainThread) {
       console.log(`    wire: A ${aWire?.dgs ?? 0} datagrams (${kb(aWire?.bytes ?? 0)}), core ${aCore.txPackets} packets, ${aCore.retransmits} retransmits; C ${cWire?.dgs ?? 0} datagrams (${kb(cWire?.bytes ?? 0)}), ${cCore.txPackets} packets, ${cCore.retransmits} retransmits`);
       for (const x of extra) console.log(`    ${x}`);
     }
-    const line = !bar ? `(${key}) printed only: ${head}` : ok ? `(${key}) whole board ${s(w.whole)} after the link` : `(${key}) ${head} (deadline ${s(DEADLINE_MS)})`;
+    const firsts = first < Infinity ? `, first entries ${s(w.first)} (at most ${s(first)})` : '';
+    const line = !bar ? `(${key}) printed only: ${head}` : ok ? `(${key}) whole board ${s(w.whole)} after the link (at most ${s(deadline)})${firsts}` : `(${key}) ${head} (deadline ${s(deadline)})${w.first !== null ? firsts : ''}`;
     results.push({ key, ok, line });
   }
 
@@ -401,7 +414,7 @@ if (!isMainThread) {
     const w = await watch(c, c.doc('board'), a.self, t0);
     const route = c.route(a.self)?.kind;
     report('b', `fallback over the signalling pipe (${RELAY_LIMITS})`, w, {
-      aId: a.self, cId: c.self, aWire: wire.get(a.self), cWire: wire.get(c.self), aCore: a.stats(), cCore: c.stats(),
+      aId: a.self, cId: c.self, aWire: wire.get(a.self), cWire: wire.get(c.self), aCore: a.stats(), cCore: c.stats(), first: FIRST_MS,
       extra: [`route C->A: ${route}`, `A: ${pipe(a.transport.piped, a.signaling.stats, a.signaling.sockets[0]?.stats)}`, `C: ${pipe(c.transport.piped, c.signaling.stats, c.signaling.sockets[0]?.stats)}`],
     });
     if (w.link !== null && route !== 'signaling') results.push({ key: 'b', ok: false, line: `(b) C reached A over ${route}, not the pipe` });
@@ -438,7 +451,7 @@ if (!isMainThread) {
     const t0 = now();
     const extra = pipeRoute ? { signaling: 'nostr', relays: RELAYS, fallbackMs: 300, RTCPeerConnection: fakePc('c') } : {};
     const c = await joinRoom({ appId: APP, roomId, presence: { name: 'c' }, ...extra });
-    const w = await watch(c, c.doc('board'), aId, t0);
+    const w = await watch(c, c.doc('board'), aId, t0, key === 'e' ? Math.max(WATCH_MS, BACKGROUND_MS) : WATCH_MS);
     worker.postMessage('stats');
     const st = await reply();
     const lines = [];
@@ -446,7 +459,8 @@ if (!isMainThread) {
       const route = c.route(aId)?.kind;
       lines.push(`route C->A: ${route}`, `A: ${pipe(st.piped, st.nostr, aSockets[0]?.stats)}`, `C: ${pipe(c.transport.piped, c.signaling.stats, c.signaling.sockets[0]?.stats)}`);
     }
-    report(key, what, w, { aId, cId: c.self, aLog: st.docLog, aWire: st.wire, cWire: wire.get(c.self), aCore: st.core, cCore: c.stats(), extra: lines, bar: key !== 'e' });
+    const bars = key === 'e' ? { deadline: BACKGROUND_MS, first: FIRST_BACKGROUND_MS } : {};
+    report(key, what, w, { aId, cId: c.self, aLog: st.docLog, aWire: st.wire, cWire: wire.get(c.self), aCore: st.core, cCore: c.stats(), extra: lines, ...bars });
     const gone = new Promise((r) => worker.once('exit', r));
     worker.postMessage('leave');
     await Promise.all([c.leave(), gone]);
@@ -474,6 +488,35 @@ if (!isMainThread) {
   }
 
   if (RUNS.includes('e')) await background('e', `A's timers clamped to ${CLAMP_MS} ms on the fallback route of (b) (${RELAY_LIMITS})`, true);
+
+  // (f) Two members hold the board: B, linked to C directly, and A, over the pipe as in (b), to B too (so B
+  // can't relay A for C). C asks B first, the better route, and takes the board from it: the entries A and B
+  // send C in answers come to one whole board, not two.
+  if (RUNS.includes('f')) {
+    hangs.add('a|c').add('a|b');
+    const roomId = `catchup-f-${process.pid}`;
+    const opts = (name) => ({ appId: APP, roomId, presence: { name }, signaling: 'nostr', relays: RELAYS, fallbackMs: 300, RTCPeerConnection: fakePc(name) });
+    const a = await joinRoom(opts('a'));
+    draw(a.doc('board'));
+    const b = await joinRoom(opts('b'));
+    const db = b.doc('board');
+    const t = now();
+    while (held(db) < ENTRIES && now() - t < LINK_MS) await sleep(25);
+    const t0 = now();
+    const c = await joinRoom(opts('c'));
+    const w = await watch(c, c.doc('board'), b.self, t0);
+    await sleep(2000); // A's answer, over the pipe, after B's
+    const sent = (x) => docLog.filter((f) => f.self === x.self && f.peer === c.self && f.dir === 'out' && f.t === 3).reduce((n, f) => n + f.entries, 0);
+    const [fromA, fromB] = [sent(a), sent(b)];
+    const routes = `routes C->A: ${c.route(a.self)?.kind}, C->B: ${c.route(b.self)?.kind}`;
+    report('f', `two holders, B direct and A over the pipe (${RELAY_LIMITS})`, w, {
+      aId: b.self, cId: c.self, aWire: wire.get(b.self), cWire: wire.get(c.self), aCore: b.stats(), cCore: c.stats(),
+      extra: [routes, `answers to C: ${fromB} entries from B, ${fromA} from A`],
+    });
+    if (fromA + fromB > ENTRIES + 8 || c.route(a.self)?.kind !== 'signaling' || c.route(b.self)?.kind !== 'direct') results.push({ key: 'f', ok: false, line: `(f) ${routes}; C was sent ${fromB} entries by B and ${fromA} by A, for ${ENTRIES}` });
+    await Promise.all([a.leave(), b.leave(), c.leave()]);
+    hangs.clear();
+  }
 
   const failed = results.filter((r) => !r.ok);
   for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.line}`);

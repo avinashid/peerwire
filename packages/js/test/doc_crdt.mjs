@@ -9,7 +9,7 @@
 // a catch-up has us pass on) and 'change'.
 //
 //   node packages/js/test/doc_crdt.mjs
-import { Doc, MAX_VALUE_LENGTH, MAX_VALUE_DEPTH, MAX_ENTRIES, MAX_DOC_LENGTH, MAX_WRITERS, MAX_RANGES, MAX_KEY_LENGTH, MAX_NAME_LENGTH, MESSAGE_BYTES } from '../src/doc.js';
+import { Doc, unopened, MAX_VALUE_LENGTH, MAX_VALUE_DEPTH, MAX_ENTRIES, MAX_DOC_LENGTH, MAX_WRITERS, MAX_RANGES, MAX_KEY_LENGTH, MAX_NAME_LENGTH, MESSAGE_BYTES } from '../src/doc.js';
 
 const fail = (m) => {
   console.error(`FAIL ${m}`);
@@ -45,6 +45,8 @@ class Net {
     this.got = new Map(); // peer -> entries it was sent in answers
     this.largest = 0;
     this.lost = 0;
+    this.held = new Set(); // 'from>to': links whose frames wait, in order, in `parked`, until released
+    this.parked = [];
   }
 
   key(a, b) {
@@ -57,7 +59,7 @@ class Net {
 
   node(c, { keep = KEEP, open = true } = {}) {
     const self = id(c);
-    const n = { self, peers: new Set(), doc: null, keep };
+    const n = { self, peers: new Set(), doc: null, keep, routes: new Map() };
     n.host = {
       self,
       peers: () => [...n.peers],
@@ -66,7 +68,7 @@ class Net {
         const bytes = Buffer.byteLength(text) + 1;
         if (bytes > this.largest) this.largest = bytes;
         if (m.t === 3) this.got.set(to, (this.got.get(to) ?? 0) + (m.e?.length ?? 0));
-        this.flight.push([self, to, text, this.epochs.get(this.key(self, to))]);
+        (this.held.has(`${self}>${to}`) ? this.parked : this.flight).push([self, to, text, this.epochs.get(this.key(self, to))]);
       },
       after: (ms, fn) => {
         const t = { at: this.now + ms, fn };
@@ -75,6 +77,7 @@ class Net {
       },
       now: () => this.now,
       incarnation: () => int(this.r, 2 ** 32).toString(16).padStart(8, '0'),
+      route: (p) => n.routes.get(p),
     };
     if (open) this.open(n);
     this.nodes.set(self, n);
@@ -106,6 +109,37 @@ class Net {
     b.peers.delete(a.self);
     a.doc?.left(b.self);
     b.doc?.left(a.self);
+  }
+
+  // The route between a and b, as room.route() names it: each side's doc hears of the change.
+  route(a, b, kind) {
+    a.routes.set(b.self, kind);
+    b.routes.set(a.self, kind);
+    a.doc?.rerouted();
+    b.doc?.rerouted();
+  }
+
+  // Frames from a to b, those in flight and those sent from now on, wait in order until released.
+  hold(a, b) {
+    const k = `${a.self}>${b.self}`;
+    this.held.add(k);
+    this.parked.push(...this.flight.filter(([f, t]) => `${f}>${t}` === k));
+    this.flight = this.flight.filter(([f, t]) => `${f}>${t}` !== k);
+  }
+
+  // Delivers the oldest frame in flight from a to b.
+  deliver(a, b) {
+    const i = this.flight.findIndex(([f, t]) => f === a.self && t === b.self);
+    if (i < 0) fail('nothing in flight to deliver');
+    const [, , text] = this.flight.splice(i, 1)[0];
+    b.doc.receive(a.self, JSON.parse(text));
+  }
+
+  release(a, b) {
+    const k = `${a.self}>${b.self}`;
+    this.held.delete(k);
+    this.flight.push(...this.parked.filter(([f, t]) => `${f}>${t}` === k));
+    this.parked = this.parked.filter(([f, t]) => `${f}>${t}` !== k);
   }
 
   mesh(nodes) {
@@ -205,6 +239,34 @@ function same(nodes, what) {
     if (s[i] !== s[0]) fail(`${what}: members differ\n  ${nodes[0].self.slice(0, 4)} ${s[0].slice(0, 600)}\n  ${nodes[i].self.slice(0, 4)} ${s[i].slice(0, 600)}`);
   }
   return s[0];
+}
+
+// A whiteboard stroke as the demo stores one: { k, c, w, p }, p a pen's 1000 points, a tenth apart at most, along
+// a wandering line (about 12 K characters of JSON).
+function stroke(r) {
+  let x = 200 + r() * 1600;
+  let y = 200 + r() * 900;
+  let a = r() * 2 * Math.PI;
+  const p = [];
+  for (let i = 0; i < 1000; i++) {
+    a += (r() - 0.5) * 0.6;
+    const step = 2 + r() * 6;
+    x += Math.cos(a) * step;
+    y += Math.sin(a) * step;
+    p.push(Math.round(x * 10) / 10, Math.round(y * 10) / 10);
+  }
+  return { k: 'pen', c: '#e5484d', w: 4, p };
+}
+
+// A whiteboard-sized doc at `n`: 40 strokes, a title and a background.
+function board(net, n) {
+  for (let i = 0; i < 40; i++) {
+    n.doc.set('strokes').add(stroke(net.r));
+    net.run();
+  }
+  n.doc.map('meta').set('title', 'Plans');
+  n.doc.map('meta').set('bg', '#ffffff');
+  net.run();
 }
 
 function randomWrite(r, n) {
@@ -515,7 +577,7 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
   const c = net.node('c');
   for (let i = 0; i < MAX_WRITERS - 1; i++) c.doc.ctx.add(i.toString(16).padStart(72, 'f'), 1, 1);
   for (let i = 0; c.doc.ctx.size < MAX_RANGES; i++) c.doc.ctx.add('f'.repeat(72), 2 * i + 2 ** 52, 2 * i + 2 ** 52);
-  const ask = c.doc.askFrame();
+  const ask = c.doc.askFrame(1);
   const bytes = Buffer.byteLength(JSON.stringify(ask)) + 1;
   if (ask.r.length !== MAX_RANGES || bytes > MESSAGE_BYTES) fail(`an ask of ${ask.r.length} ranges takes ${bytes} bytes`);
   console.log(`frames: a full doc's catch-up in frames of at most ${net.largest} bytes, an ask at the caps ${bytes} (limit ${MESSAGE_BYTES})`);
@@ -540,9 +602,15 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
     E(0, F, 1, 'q', 's', null, 1), E(0, F, 1, '__proto__', 's', null, 1), E(0, F, 1, 's', '', null, 1), E(0, F, 1, 's', 's', 'key', 1),
     E(0, F, 1, 'm', 's', null, 1), E(0, F, 1, 'm', 's', 'k'.repeat(MAX_KEY_LENGTH + 1), 1), E(0, F, 1, 's', 's', null, 'x'.repeat(MAX_VALUE_LENGTH)),
     E(0, F, 1, 's', 's', null), { ...good, e: {} }, { ...good, x: [[0, 5, 4]] }, { ...good, x: [[0, 0, 4]] }, { ...good, x: [[0, 1]] },
-    { ...good, end: true }, { d: 'board', t: 2, ws: [w], r: [[0, 2, 1]] }, { d: 'board', t: 2, ws: [w], r: [[1, 1, 1]] },
+    { ...good, end: true }, { d: 'board', t: 2, ws: [w], r: [[0, 2, 1]], q: 1 }, { d: 'board', t: 2, ws: [w], r: [[1, 1, 1]], q: 1 },
     { ...good, t: 1, ws: [id('c') + '00000000'] }, // a delta carrying another member's write
     E(0, F, 1, 's', 's', null, JSON.parse('['.repeat(MAX_VALUE_DEPTH + 1) + ']'.repeat(MAX_VALUE_DEPTH + 1))),
+    // Asks need their number; pieces of an answer need theirs whole, and `s` only on the last.
+    { d: 'board', t: 2, ws: [w], r: [] }, { d: 'board', t: 2, ws: [w], r: [], q: 0 }, { d: 'board', t: 2, ws: [w], r: [], q: 1.5 },
+    { d: 'board', t: 2, ws: [w], r: [], q: 1, z: true }, { ...good, q: 1, n: 1 }, { ...good, q: 1, i: -1, n: 1 }, { ...good, q: 1, i: 0 },
+    { ...good, q: 1, i: 0, n: 0.5 }, { ...good, q: 0, i: 0, n: 1 }, { ...good, q: 1, i: 0, n: 1, s: 1 }, { ...good, q: 1, i: 0, n: 1, end: 1, s: true },
+    // MOREs: a number each, or not one we answer.
+    { d: 'board', t: 4, q: 1 }, { d: 'board', t: 4, i: 0 }, { d: 'board', t: 4, q: 1, i: -1 }, { d: 'board', t: 4, q: 0, i: 0 }, { d: 'board', t: 4, q: 1, i: 0 },
   ];
   // Nor does one make b send anything: a malformed ask is not answered.
   let sent = 0;
@@ -565,7 +633,7 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
   const send = a.host.send;
   a.host.send = (to, m) => frames.push(JSON.parse(JSON.stringify(m)));
   churn(net, [a], 30);
-  a.doc.receive(b.self, b.doc.askFrame());
+  a.doc.receive(b.self, b.doc.askFrame(1));
   a.host.send = send;
   const junk = [null, -1, 0, 2 ** 60, 'x', '', [], {}, [0], true, 1.5, '__proto__', 'f'.repeat(72)];
   for (let i = 0; i < 20000; i++) {
@@ -598,10 +666,11 @@ console.log('member data: malformed frames dropped whole without a throw; 20000 
   net.run();
   let answers = [];
   const asks = [];
-  b.host.send = (to, m) => (m.t === 3 ? answers : asks).push(m);
+  b.host.send = (to, m) => (m.t === 3 ? answers : m.t === 2 ? asks : []).push(m);
   const ends = () => answers.filter((m) => m.end).length;
   const entries = () => answers.reduce((s, m) => s + (m.e?.length ?? 0), 0);
-  const ask = (r = []) => b.doc.receive(a.self, { d: 'board', t: 2, ws: [a.doc.writer], r });
+  let q = 0;
+  const ask = (r = []) => b.doc.receive(a.self, { d: 'board', t: 2, ws: [a.doc.writer], r, q: ++q });
   const size = b.doc.entries.size;
   b.doc.left(a.self); // as if a joined again: the ask from its first join counted
   for (let i = 0; i < 50; i++) ask();
@@ -644,15 +713,17 @@ console.log('member data: malformed frames dropped whole without a throw; 20000 
   // Leaving and joining again starts afresh.
   answers = [];
   b.doc.left(a.self);
-  b.doc.receive(a.self, { d: 'board', t: 2, ws: [], r: [] });
+  b.doc.receive(a.self, { d: 'board', t: 2, ws: [], r: [], q: 1 });
   if (entries() !== size) fail('a member that joined again was not answered afresh');
 }
 console.log('answers: 8 per member at once, then one per 15 s, each with all the member lacks; an ask past that waits');
 
-// What answers carry is bounded as well, whatever the asker claims to lack: 8 Mi characters of JSON text at
-// once (two full docs), then 64 Ki a second. A member asks with an empty context every second for a minute, of
-// a doc of 2 Mi characters: it is sent the doc at once 5 times (the last takes the budget past empty), then
-// about once every 32 s.
+// What answers carry is bounded as well, whatever the asker claims to lack or acknowledges: 8 Mi characters of
+// JSON text at once (two full docs), then 64 Ki a second, each piece taking its own. A member asks with an empty
+// context every second for a minute, of a doc of 2 Mi characters, and acknowledges each piece as it comes: it
+// is sent the doc whole at once 4 times (the last piece of the fourth takes the budget past empty); from then on
+// pieces go as the budget allows, each ask taking the place of the answer under way (an ask waiting for its
+// answer holds the one under way): in all, what the budget allows in the minute, within a piece.
 {
   const CHARS = 8 * 2 ** 20;
   const CHARS_PER_S = 64 * 1024;
@@ -662,26 +733,27 @@ console.log('answers: 8 per member at once, then one per 15 s, each with all the
   for (let i = 0; i < 32; i++) b.doc.set('s').add('x'.repeat(MAX_VALUE_LENGTH - 2));
   net.run();
   let chars = 0;
-  let answer = 0;
   let largest = 0;
   const times = [];
+  const pieces = [];
   b.host.send = (to, m) => {
     if (m.t !== 3) return;
-    answer += JSON.stringify(m).length;
-    if (!m.end) return;
-    times.push(net.now);
-    chars += answer;
-    largest = Math.max(largest, answer);
-    answer = 0;
+    const n = JSON.stringify(m).length;
+    chars += n;
+    largest = Math.max(largest, n);
+    pieces.push(net.now);
+    if (m.end) times.push(net.now);
+    else b.doc.receive(a.self, { d: 'board', t: 4, q: m.q, i: m.i });
   };
   b.doc.left(a.self);
   for (let i = 0; i < 60; i++) {
-    b.doc.receive(a.self, { d: 'board', t: 2, ws: [], r: [] });
+    b.doc.receive(a.self, { d: 'board', t: 2, ws: [], r: [], q: i + 1 });
     net.wait(1000);
   }
   const bound = CHARS + 60 * CHARS_PER_S + largest;
-  if (chars > bound || times.slice(0, 5).join() !== '0,1000,2000,3000,4000' || times.length !== 6) fail(`an asker of a ${b.doc.length}-character doc was sent ${chars} characters in 60 s (bound ${bound}), answers at ${times.join(', ')} ms`);
-  console.log(`answers: a ${b.doc.length}-character doc asked for every second, sent ${times.length} times in 60 s (at ${times.join(', ')} ms), ${chars} characters of at most ${bound}`);
+  const late = pieces.filter((t) => t >= 10000).length;
+  if (chars > bound || chars < CHARS + 59 * CHARS_PER_S || times.join() !== '0,1000,2000,3000') fail(`an asker of a ${b.doc.length}-character doc was sent ${chars} characters in 60 s (bound ${bound}), answers whole at ${times.join(', ')} ms`);
+  console.log(`answers: a ${b.doc.length}-character doc asked for every second, sent whole at ${times.join(', ')} ms, then ${late} pieces after 10 s; ${chars} characters of at most ${bound}`);
 }
 
 // A member that closes the doc and opens it again, over and over, while it stays (a component that remounts, a
@@ -723,15 +795,409 @@ console.log('reopening a doc 12 times while a member stays: each catches up, 7 a
     send(to, msg);
   };
   for (let i = 1; i <= 10; i++) {
-    b.doc.receive(m.self, { d: 'board', t: 2, ws: [m.self + '00000001'], r: [[0, 1, i]] });
+    b.doc.receive(m.self, { d: 'board', t: 2, ws: [m.self + '00000001'], r: [[0, 1, i]], q: i });
     net.run();
   }
   if (asked) fail(`a member that never answered was asked ${asked} times more`);
-  b.doc.receive(m.self, { d: 'board', t: 3, ws: [], end: 1 });
+  b.doc.receive(m.self, { d: 'board', t: 3, ws: [], q: b.doc.members.get(m.self).ask.q, i: 0, n: 0, end: 1 });
   net.run();
   if (asked !== 1) fail(`a member that answered at last was asked ${asked} times`);
 }
 console.log('a member that never answers is asked once, until it answers');
+
+// An answer in pieces (src/doc.js: PIECE_CHARS, WINDOW). A whiteboard-sized doc, 40 strokes of 1000 points, goes
+// to a joiner over signalling in pieces of about 32 Ki characters (two strokes each), the newest entries first,
+// each applied as it lands, with at most 4 unacknowledged; linked directly, in pieces of about 128 Ki.
+const PIECES = { signaling: 32 * 1024, direct: 128 * 1024 };
+for (const kind of ['signaling', 'direct']) {
+  const net = new Net(21);
+  const a = net.node('a');
+  board(net, a);
+  const e = net.node('e');
+  net.route(a, e, kind);
+  const frames = [];
+  const receive = e.doc.receive.bind(e.doc);
+  let landed = 0;
+  e.doc.receive = (from, m) => {
+    receive(from, m);
+    if (m.t !== 3) return;
+    frames.push(m);
+    landed += m.e?.length ?? 0;
+    if (e.doc.entries.size !== landed) fail(`${kind}: a piece of ${m.e?.length} entries left the joiner holding ${e.doc.entries.size} of ${landed} landed`);
+  };
+  net.link(a, e);
+  let window = 0;
+  while (net.step()) {
+    const o = a.doc.members.get(e.self)?.out;
+    if (o) window = Math.max(window, o.next - o.acked - 1);
+  }
+  net.run();
+  same([a, e], `a whiteboard over ${kind}`);
+  const stamps = frames.flatMap((m) => m.e?.map((x) => x[2]) ?? []);
+  if (stamps.some((c, i) => i && c > stamps[i - 1])) fail(`${kind}: entries came oldest first somewhere: ${stamps.join()}`);
+  const big = frames.filter((m) => (m.e?.length ?? 0) > 1 && JSON.stringify(m).length > PIECES[kind]);
+  if (big.length || window > 4 || (kind === 'signaling' && window < 4)) fail(`${kind}: ${big.length} pieces over ${PIECES[kind]} characters, at most ${window} unacknowledged`);
+  const want = kind === 'signaling' ? 20 : 4; // two strokes each (the title and background with the newest), or ten
+  if (frames.length !== want) fail(`${kind}: the doc came in ${frames.length} pieces, not ${want}`);
+  console.log(`pieces over ${kind}: a ${a.doc.length}-character board in ${frames.length} pieces, newest first, each applied as it landed, at most ${window} unacknowledged`);
+}
+
+// The window: a joiner that acknowledges nothing is sent 4 pieces, and one more for each piece it acknowledges.
+// An acknowledgement of a piece not sent, of one acknowledged already, for another ask, or not a piece's number,
+// sends nothing. Acknowledged to the end, the answer carries every entry once, but one deleted since the ask, and
+// then the dots it knows are dead.
+{
+  const net = new Net(22);
+  const a = net.node('a');
+  board(net, a);
+  const ids = a.doc.set('strokes').entries().map((e) => e.id); // oldest first
+  a.doc.set('strokes').delete(ids[0]);
+  a.doc.set('strokes').delete(ids[1]);
+  const m = net.node('f', { open: false });
+  net.link(a, m);
+  net.route(a, m, 'signaling');
+  const sent = [];
+  a.host.send = (to, msg) => to === m.self && msg.t === 3 && sent.push(msg);
+  a.doc.receive(m.self, { d: 'board', t: 2, ws: [], r: [], q: 7 });
+  const more = (q, i) => a.doc.receive(m.self, { d: 'board', t: 4, q, i });
+  const counts = [sent.length];
+  more(7, 4); // not sent yet
+  more(6, 0); // another ask
+  more(7, 1.5);
+  counts.push(sent.length);
+  more(7, 0);
+  counts.push(sent.length);
+  more(7, 0); // again
+  counts.push(sent.length);
+  more(7, 3); // up to 3 at once
+  counts.push(sent.length);
+  if (counts.join() !== '4,4,5,5,8' || sent.some((f, i) => f.q !== 7 || f.i !== i || f.n !== 40)) fail(`the window: pieces sent ${counts.join(', ')}; ${JSON.stringify(sent.map((f) => [f.q, f.i, f.n]))}`);
+  a.doc.set('strokes').delete(ids[2]); // the oldest left: not sent yet
+  while (!sent.at(-1).end) more(7, sent.at(-1).i);
+  const entries = sent.flatMap((f) => f.e ?? []);
+  const lastEntries = sent.findLastIndex((f) => f.e?.length);
+  const firstDead = sent.findIndex((f) => f.x?.length);
+  const gone = ids.slice(0, 3).map((id) => Number(id.split('.')[1]));
+  if (entries.length !== 39 || entries.some((x) => gone.includes(x[1])) || firstDead < lastEntries) fail(`acknowledged to the end: ${entries.length} entries, dead ranges from piece ${firstDead}, entries up to ${lastEntries}`);
+}
+console.log('the window: 4 pieces unacknowledged, one more per piece acknowledged, stray acknowledgements send nothing; then every entry once, but one deleted meanwhile, and the dead dots last');
+
+// A slow answer is taken up, not started again: the joiner's turn on a passes 5 s after a's last piece landed (a
+// stopped after the 4 it may send unacknowledged, its pieces landing 3 s late), not 5 s after the ask, and b is
+// asked with what those pieces brought, so the joiner is sent each entry once.
+{
+  const net = new Net(23);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x));
+  net.mesh([a, b]);
+  board(net, a);
+  const e = net.node('e');
+  let toB = null;
+  const send = e.host.send;
+  e.host.send = (to, msg) => {
+    if (to === b.self && msg.t === 2 && toB === null) toB = net.now;
+    send(to, msg);
+  };
+  for (const n of [a, b]) net.route(n, e, 'signaling');
+  net.hold(a, e);
+  net.link(e, a);
+  net.link(e, b);
+  while (net.step()); // e's ask reaches a, and a's 4 pieces wait
+  net.hold(e, a); // e's acknowledgements never reach a
+  net.wait(3000);
+  net.release(a, e);
+  net.run();
+  same([a, b, e], 'a slow answer taken up by the next member');
+  const got = net.got.get(e.self);
+  if (toB !== 8000 || got !== e.doc.entries.size) fail(`a slow answer: b asked at ${toB} ms, the joiner sent ${got} entries for ${e.doc.entries.size}`);
+  console.log(`a slow answer: the next member asked at ${toB} ms, 5 s after the last piece; the joiner sent ${got} entries for ${e.doc.entries.size}`);
+}
+
+// Routes: members linked directly are asked first, then those relayed by a member, then those over signalling.
+// One over signalling whose answer is under way gives the turn to one linked directly, as it joins or as its
+// route becomes direct, and is asked again after: for what is still missing, nothing.
+{
+  const net = new Net(24);
+  const [a, b, c] = ['a', 'b', 'c'].map((x) => net.node(x));
+  net.mesh([a, b, c]);
+  board(net, a);
+  const asked = (e) => {
+    const order = [];
+    const send = e.host.send;
+    e.host.send = (to, msg) => {
+      if (msg.t === 2) order.push(net.nodes.get(to) === a ? 'a' : net.nodes.get(to) === b ? 'b' : 'c');
+      send(to, msg);
+    };
+    return order;
+  };
+  // Queued while c answers: b, relayed, before a, over signalling.
+  const e = net.node('e');
+  const order = asked(e);
+  net.route(a, e, 'signaling');
+  net.route(b, e, 'peer');
+  net.link(e, c);
+  net.link(e, a);
+  net.link(e, b);
+  net.run();
+  same([a, b, c, e], 'routes in order');
+  if (order.join() !== 'c,b,a') fail(`asked in the order ${order}`);
+  // a, over signalling, is asked first, then c joins linked directly and takes the turn; then b's route becomes
+  // direct as c answers, and b goes before a.
+  const f = net.node('g');
+  const order2 = asked(f);
+  for (const n of [a, b]) net.route(n, f, 'signaling');
+  net.link(f, a);
+  net.link(f, b);
+  net.route(c, f, 'direct');
+  net.link(f, c);
+  net.route(b, f, 'direct');
+  net.run();
+  same([a, b, c, f], 'a better route takes the turn');
+  // a's answer, paused, sent what it may unacknowledged and no more: 4 pieces, of two strokes and the meta keys.
+  const got = net.got.get(f.self);
+  if (order2.join() !== 'a,c,b,a' || got > f.doc.entries.size + 10) fail(`asked in the order ${order2}; sent ${got} entries for ${f.doc.entries.size}`);
+  console.log(`routes: asked ${order} (direct, relayed, signalling), and ${order2} when a direct member came during an answer over signalling (sent ${got} entries for ${f.doc.entries.size})`);
+}
+
+// A member over signalling whose answer is under way gives the turn to one whose route becomes direct, and is asked
+// again after: here its own ask reached us before, so only the turn brings it back.
+{
+  const net = new Net(30);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x));
+  net.mesh([a, b]);
+  board(net, a);
+  const g = net.node('g');
+  const order = [];
+  const send = g.host.send;
+  g.host.send = (to, msg, z) => {
+    if (msg.t === 2) order.push(to === a.self ? 'a' : 'b');
+    send(to, msg, z);
+  };
+  for (const n of [a, b]) net.route(n, g, 'signaling');
+  net.link(g, a);
+  net.deliver(a, g); // a's ask: g is asking a already
+  net.link(g, b);
+  net.route(b, g, 'direct');
+  net.run();
+  same([a, b, g], 'a route that became direct took the turn');
+  if (order.join() !== 'a,b,a') fail(`a route that became direct: asked ${order}`);
+}
+console.log('a member whose route becomes direct takes the turn from one over signalling, which is asked again after');
+
+// A member over signalling gives the turn to a better routed one once until an answer of its ends: here c, linked
+// directly, joins during a's answer and is queued again during each of a's turns after, yet a is asked twice in
+// all, and its answer goes through whole, sent once.
+{
+  const net = new Net(33);
+  const a = net.node('a');
+  board(net, a);
+  const c = net.node('c');
+  c.doc.set('s').add('c');
+  const g = net.node('g');
+  const order = [];
+  const send = g.host.send;
+  g.host.send = (to, msg, z) => {
+    if (msg.t === 2) order.push(to === a.self ? 'a' : 'c');
+    send(to, msg, z);
+  };
+  net.route(a, g, 'signaling');
+  net.route(c, g, 'direct');
+  net.link(g, a);
+  const turns = new Set();
+  for (let n = 0; ; n++) {
+    if (n > 1e6) fail('a paused member: the network never went quiet');
+    const ask = g.doc.members.get(a.self)?.ask;
+    if (g.doc.asking === a.self && ask?.got && !turns.has(ask.q)) {
+      turns.add(ask.q);
+      if (!g.peers.has(c.self)) net.link(g, c);
+      else g.doc.startAsk(c.self);
+    }
+    if (net.step()) continue;
+    if (!net.fire(Infinity)) break;
+  }
+  const got = net.got.get(g.self);
+  for (const id of a.doc.entries.keys()) if (!g.doc.entries.has(id)) fail(`a paused member: g lacks ${id}`);
+  if (order.filter((x) => x === 'a').length !== 2 || turns.size !== 2 || got > a.doc.entries.size + 1 + 10) fail(`a paused member: asked ${order} over ${turns.size} turns of a's; sent ${got} entries for ${a.doc.entries.size + 1}`);
+  console.log(`a member over signalling paused once until its answer ended: asked ${order}, sent ${got} entries for ${a.doc.entries.size + 1}`);
+}
+
+// A member that stalled with no one else to ask keeps the turn, and gives it up as soon as one is: here b, which
+// joins 10 s on, is asked at once.
+{
+  const net = new Net(31);
+  const e = net.node('e');
+  const m = net.node('f', { open: false });
+  net.link(e, m);
+  net.run(); // m never answers: it stalls at 5 s
+  net.wait(5000);
+  if (e.doc.asking !== m.self || !e.doc.members.get(m.self).stalled) fail('a member that stalled with no one else to ask gave up the turn');
+  const b = net.node('b');
+  b.doc.set('s').add('b');
+  const at = net.now;
+  net.link(e, b);
+  if (e.doc.asking !== b.self || net.now !== at) fail(`a member joining after one stalled: the turn is ${e.doc.asking?.slice(0, 1)}`);
+  net.run();
+  same([e, b], 'after a stalled member');
+}
+console.log('a member that stalled keeps the turn only until another can be asked');
+
+// An answer's pieces count for the ask they name: the end of an older ask's answer ends nothing. And a doc opened
+// again while an answer to the one before is under way takes none of it for an answer to its own asks (their
+// numbers come from its incarnation): it catches up whole.
+{
+  const net = new Net(32);
+  const e = net.node('e');
+  const m = net.node('f', { open: false });
+  net.link(e, m);
+  const q = e.doc.members.get(m.self).ask.q;
+  e.doc.receive(m.self, { d: 'board', t: 3, ws: [], q: q + 1, i: 0, n: 0, end: 1 });
+  if (e.doc.asking !== m.self || e.doc.members.get(m.self).answered || e.doc.synced) fail("another ask's answer ended ours");
+  e.doc.receive(m.self, { d: 'board', t: 3, ws: [], q, i: 0, n: 0, end: 1 });
+  if (e.doc.asking || !e.doc.synced) fail('our answer did not end the ask');
+
+  const a = net.node('a');
+  board(net, a);
+  const b = net.node('b');
+  net.route(a, b, 'signaling');
+  let ended = false;
+  const send = a.host.send;
+  a.host.send = (to, msg, z) => {
+    if (to === b.self && msg.t === 3 && msg.end) ended = true;
+    send(to, msg, z);
+  };
+  net.link(a, b);
+  while (!ended && net.step());
+  net.hold(a, b); // the answer's last pieces, its end among them, wait
+  b.doc.close();
+  net.open(b);
+  net.release(a, b);
+  net.run();
+  same([a, b], 'a doc opened again during an answer to the one before');
+}
+console.log("pieces count for the ask they name: an older ask's end ends nothing, also for a doc opened again");
+
+// A route that changes during an answer: pieces sized to it from then on.
+{
+  const net = new Net(25);
+  const a = net.node('a');
+  board(net, a);
+  const e = net.node('e');
+  net.route(a, e, 'signaling');
+  const sizes = [];
+  const send = a.host.send;
+  a.host.send = (to, msg, z) => {
+    if (msg.t === 3) sizes.push(msg.e?.length ?? 0);
+    send(to, msg, z);
+  };
+  net.link(a, e);
+  for (let i = 0; i < 6; i++) net.step();
+  net.route(a, e, 'direct');
+  net.run();
+  same([a, e], 'a route that changed');
+  // Over signalling two strokes a piece (the first with the title and background too), then about ten.
+  const at = sizes.findIndex((n) => n > 4);
+  if (at < 4 || sizes.slice(0, at).some((n) => n > 4) || sizes.length > at + 5) fail(`pieces of ${sizes.join(', ')} entries`);
+  console.log(`a route that became direct: pieces of ${sizes.join(', ')} entries`);
+}
+
+// Where catching up stands ('sync'): alone; two members that open the doc together each catch up once the other
+// has answered (none had caught up before them); a joiner loads from the member asked, `have` going up to
+// `total` (the last piece's two strokes short of it), and has caught up once an answer from a member that had
+// ends, before the others answer; once every member has gone it is alone again, caught up still. With a member
+// that never answers, it stays loading.
+{
+  const net = new Net(26);
+  const a = net.node('a');
+  const fmt = (s) => `${s.state}${s.from ? ':' + s.from.slice(0, 1) : ''}`;
+  if (fmt(a.doc.sync) !== 'alone' || a.doc.synced) fail(`a doc opened alone: ${JSON.stringify(a.doc.sync)}, synced ${a.doc.synced}`);
+  const b = net.node('b');
+  const seen = { a: [], b: [] };
+  a.doc.on('sync', (s) => seen.a.push(fmt(s)));
+  b.doc.on('sync', (s) => seen.b.push(fmt(s)));
+  net.link(a, b);
+  net.run();
+  if (seen.a.join() !== 'loading:b,synced' || seen.b.join() !== 'loading:a,synced' || !a.doc.synced || !b.doc.synced) fail(`two members together: ${seen.a} and ${seen.b}`);
+  board(net, a);
+  const e = net.node('e');
+  for (const n of [a, b]) net.route(n, e, 'signaling');
+  const events = [];
+  e.doc.on('sync', (s) => {
+    events.push(s);
+    if (s.state === 'synced' && e.doc.members.get(b.self)?.answered) fail('the joiner caught up only once b had answered too');
+  });
+  net.link(e, a);
+  net.link(e, b);
+  net.run();
+  const loads = events.filter((s) => s.state === 'loading');
+  const counts = loads.map((s) => s.have);
+  if (loads.some((s) => s.from !== a.self || s.have > s.total || (s.total && s.total !== 42)) || counts.some((h, i) => i && h < counts[i - 1]) || counts.at(-1) < 40 || events.at(-1).state !== 'synced' || !e.doc.synced) fail(`a joiner: ${events.map((s) => `${fmt(s)} ${s.have}/${s.total}`).join(', ')}`);
+  net.unlink(e, a);
+  net.unlink(e, b);
+  if (fmt(e.doc.sync) !== 'alone' || !e.doc.synced || events.at(-1) !== e.doc.sync) fail(`everyone gone: ${JSON.stringify(e.doc.sync)}`);
+  const lone = net.node('l');
+  const m = net.node('f', { open: false });
+  net.link(lone, m);
+  net.run();
+  if (fmt(lone.doc.sync) !== `loading:${m.self.slice(0, 1)}` || lone.doc.synced) fail(`with a member that never answers: ${JSON.stringify(lone.doc.sync)}`);
+  console.log(`sync: a joiner ${[...new Set(events.map(fmt))].join(' -> ')}, ${loads.length} loading events up to ${loads.at(-1).have}/${loads.at(-1).total}; alone once everyone left`);
+}
+
+// A member that keeps its answer coming, a piece every 4 s, holds the turn for 60 s when another member waits,
+// then the other is asked; its answer goes on.
+{
+  const net = new Net(27);
+  const e = net.node('e');
+  const m = net.node('f', { open: false });
+  const b = net.node('b');
+  b.doc.set('s').add('b');
+  net.link(e, m);
+  net.link(e, b);
+  let toB = null;
+  let acked = 0;
+  const send = e.host.send;
+  e.host.send = (to, msg) => {
+    if (to === b.self && msg.t === 2 && toB === null) toB = net.now;
+    if (to === m.self && msg.t === 4) acked++;
+    send(to, msg);
+  };
+  const q = e.doc.members.get(m.self).ask.q;
+  const w = m.self + '00000001';
+  for (let i = 0; i < 20; i++) {
+    e.doc.receive(m.self, { d: 'board', t: 3, ws: [w], e: [[0, i + 1, i + 1, 's', 's', null, i]], q, i, n: 100 });
+    net.wait(4000);
+  }
+  if (toB !== 60000 || acked !== 20) fail(`a member trickling its answer: b asked at ${toB} ms, ${acked} pieces acknowledged`);
+}
+console.log('a member trickling its answer holds the turn for 60 s, and its pieces are still taken');
+
+// Deflated frames only to members that read them: an ask says so (z) if its host does, and what we send a member
+// says whether its last ask did. A member without the doc open answers an ask with nothing (unopened).
+{
+  const net = new Net(28);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x, { open: false }));
+  a.host.deflate = true;
+  const sent = [];
+  for (const n of [a, b]) {
+    const send = n.host.send;
+    n.host.send = (to, m, z) => {
+      sent.push([n === a ? 'a' : 'b', m.t, !!z]);
+      send(to, m, z);
+    };
+  }
+  net.mesh([a, b]);
+  for (const n of [a, b]) net.open(n);
+  net.run(); // the asks, crossing
+  a.doc.set('s').add('a');
+  b.doc.set('s').add('b');
+  net.run();
+  same([a, b], 'deflate asked for by one');
+  const fmt = (who, t) => [...new Set(sent.filter(([w, k]) => w === who && k === t).map(([, , z]) => z))].join();
+  if (fmt('a', 2) !== 'false' || fmt('b', 2) !== 'false' || fmt('b', 3) !== 'true' || fmt('b', 1) !== 'true' || fmt('a', 3) !== 'false' || fmt('a', 1) !== 'false') fail(`deflate: ${JSON.stringify(sent)}`);
+  const asks = sent.length;
+  const none = unopened({ d: 'other', t: 2, ws: [], r: [], q: 5 });
+  const bad = [{ d: 'other', t: 1, ws: [] }, { d: 'other', t: 2, ws: [], r: [] }, { d: '', t: 2, q: 5 }, { d: 'x'.repeat(MAX_NAME_LENGTH + 1), t: 2, q: 5 }, null, 'x'];
+  if (JSON.stringify(none) !== '{"d":"other","t":3,"ws":[],"q":5,"i":0,"n":0,"end":1}' || bad.some((m) => unopened(m) !== null) || sent.length !== asks) fail(`unopened: ${JSON.stringify(none)}`);
+}
+console.log('deflate: frames go deflated only to members whose ask said they read them; an unopened doc answers with nothing');
 
 // Stamps far ahead: a member moves the stamps by 2^32 in each of k deltas of its own (the earlier ones deleted,
 // or not), or to 2^53 - 1 at once, sent to a and b while c is cut off; then a, b and c write. Every member takes
@@ -793,7 +1259,7 @@ for (const via of ['delta', 'answer', 'ask']) {
   const claim = { d: 'board', ws: [w], x: [[0, a.doc.n + 1, a.doc.n + 1000]] };
   if (via === 'delta') b.doc.receive(m.self, { ...claim, t: 1 });
   else if (via === 'answer') b.doc.receive(m.self, { ...claim, t: 3 });
-  else a.doc.receive(m.self, { d: 'board', t: 2, ws: [w], r: [[0, 1, a.doc.n + 1000]] });
+  else a.doc.receive(m.self, { d: 'board', t: 2, ws: [w], r: [[0, 1, a.doc.n + 1000]], q: 1 });
   // A claim that reaches a itself moves it at once, before it writes.
   if (via !== 'ask') {
     const c = net.node('c');
@@ -820,7 +1286,7 @@ console.log('claims on our future dots: the doc moves to a new incarnation and i
   const [a, b, m] = ['a', 'b', 'f'].map((x) => net.node(x));
   net.mesh([a, b, m]);
   net.run();
-  for (let i = 0; i < 20; i++) a.doc.receive(m.self, { d: 'board', t: 2, ws: [a.doc.writer], r: [[0, 1, a.doc.n + 5]] });
+  for (let i = 0; i < 20; i++) a.doc.receive(m.self, { d: 'board', t: 2, ws: [a.doc.writer], r: [[0, 1, a.doc.n + 5]], q: i + 1 });
   if (a.doc.incarnations !== 16) fail(`20 claims moved a ${a.doc.incarnations} times`);
   net.run();
   const w = a.doc.writer;
@@ -989,7 +1455,7 @@ function killOwn(seed, cycles, ranges) {
   const m = net.node('f', { open: false });
   net.mesh([a, b, m]);
   net.run();
-  for (let i = 0; i < 20; i++) a.doc.receive(m.self, { d: 'board', t: 2, ws: [a.doc.writer], r: [[0, 1, a.doc.n + 5]] });
+  for (let i = 0; i < 20; i++) a.doc.receive(m.self, { d: 'board', t: 2, ws: [a.doc.writer], r: [[0, 1, a.doc.n + 5]], q: i + 1 });
   net.run();
   const w = a.doc.writer;
   a.doc.set('s').add('before');

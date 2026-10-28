@@ -6,7 +6,7 @@
 //   that isn't an array;
 // - RoomProof.checkHello with hostile meta;
 // - Room.onMessage: random frames from a proven member and from strangers, shared
-//   document frames among them, after which the two rooms still talk.
+//   document frames among them, plain and deflated, after which the two rooms still talk.
 // Nothing may throw out of a handler of untrusted input, and no promise may be
 // left rejected.
 //
@@ -14,6 +14,7 @@
 import { joinRoom, loadPeerwire, decodeEvent, toHex, fromHex, isPeerId, peerBytes, EventKind } from '../src/index.js';
 import { NostrSignaling, b64, unb64 } from '../src/nostr.js';
 import { RoomProof } from '../src/proof.js';
+import { deflateRawSync } from 'node:zlib';
 
 const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
 const SEED = Number(process.env.PW_FUZZ_SEED ?? 0x6e62);
@@ -231,15 +232,15 @@ const pw = await loadPeerwire(wasm);
   a.on('message', (data, from, info) => got.push([data, from, info.kind]));
   let threw = 0;
   const strangers = Array.from({ length: 4 }, () => toHex(r.bytes(32)));
-  // A doc open on a: frames for it (tag 7) go to doc.js, never to 'message'.
+  // A doc open on a: frames for it (tag 7, or 8 deflated) go to doc.js, never to 'message'.
   const doc = a.doc('fuzz');
   const w = `${b.self}0000000a`;
   const docFrame = () => {
     const t = r.pick(['m', 's', 'l']);
-    return { d: 'fuzz', t: r.pick([1, 2, 3]), ws: [w], e: [[0, 1 + r.below(500), 1, t, 'c', t === 'm' ? 'k' : null, { v: 1 }]], x: [[0, 1, 2]], r: [[0, 1, 3]], i: w };
+    return { d: r.pick(['fuzz', 'fuzz', 'closed']), t: r.pick([1, 2, 3, 4]), ws: [w], e: [[0, 1 + r.below(500), 1, t, 'c', t === 'm' ? 'k' : null, { v: 1 }]], x: [[0, 1, 2]], r: [[0, 1, 3]], q: 1 + r.below(3), i: r.below(3), n: 1 };
   };
   for (let i = 0; i < cases(5000); i++) {
-    const tag = r.pick([0, 1, 2, 3, 5, 6, 7, 7, 255]); // never 4 (Bye) from b: it would leave
+    const tag = r.pick([0, 1, 2, 3, 5, 6, 7, 7, 8, 8, 255]); // never 4 (Bye) from b: it would leave
     const body = r.pick([
       () => r.bytes(r.below(200)),
       () => enc.encode(JSON.stringify(r.pick([null, 1, 'x', [1, 2], { a: { b: [] } }, { name: 'z' }, { d: 'fuzz' }]))),
@@ -247,6 +248,8 @@ const pw = await loadPeerwire(wasm);
       () => enc.encode('['.repeat(r.below(3000))),
       () => r.mutate(enc.encode(JSON.stringify(docFrame()))),
       () => enc.encode(JSON.stringify(docFrame())),
+      () => deflateRawSync(enc.encode(JSON.stringify(docFrame()))),
+      () => r.mutate(deflateRawSync(enc.encode(JSON.stringify(docFrame())))),
     ])();
     const data = Uint8Array.from([tag, ...body]);
     const from = r.oneIn(3) ? r.pick(strangers) : b.self;
@@ -260,7 +263,7 @@ const pw = await loadPeerwire(wasm);
   check(threw === 0, `room: ${cases(5000)} frames, none throws`);
   check(got.length > 0 && got.every(([, f, k]) => f === b.self && ['bytes', 'text', 'json'].includes(k)), `room: ${got.length} messages, all from the member`);
   const held = [...doc.map('c').entries(), ...doc.set('c').entries(), ...doc.log('c').entries()];
-  check(held.length > 0 && held.every((e) => e.from === b.self), `room: doc frames (tag 7) reach the open doc, ${held.length} entries, all the member's`);
+  check(held.length > 0 && held.every((e) => e.from === b.self), `room: doc frames (tags 7 and 8) reach the open doc, ${held.length} entries, all the member's`);
   got.length = 0;
   b.send('still here');
   const heard = await until(() => got.some(([d]) => d === 'still here'), 5000);

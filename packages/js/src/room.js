@@ -38,8 +38,8 @@
 // numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
 //
 // room.doc(name) opens a shared document (doc.js) that every member holds and that
-// catches up members who join later. Its frames have their own tag, so they never show
-// as messages; an older peer drops a tag it doesn't know.
+// catches up members who join later. Its frames have their own tags, plain or deflated,
+// so they never show as messages; an older peer drops a tag it doesn't know.
 
 import { loadPeerwire, Lane, toHex, fromHex, isPeerId } from './peerwire.js';
 import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
@@ -47,13 +47,23 @@ import { NostrSignaling } from './nostr.js';
 import { LocalTransport } from './local.js';
 import { RoomProof } from './proof.js';
 import { DirectRetries } from './retry.js';
-import { Doc } from './doc.js';
+import { Doc, unopened } from './doc.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
 // Nudge carries nothing (peers ignore tags they don't know): see the 'open' handler. Doc
-// carries a shared document's frame as JSON (doc.js), on the reliable lane.
-const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6, Doc: 7 };
+// carries a shared document's frame as JSON (doc.js), on the reliable lane; DocZ the same,
+// deflated (raw deflate).
+const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6, Doc: 7, DocZ: 8 };
+// Doc frames of DEFLATE_MIN bytes or more go deflated to members whose doc reads them, where
+// this platform has 'deflate-raw' streams. One goes plain if it deflates to under 1/DEFLATE_RATIO
+// of its size, and one is inflated only to the lane's limit and DEFLATE_RATIO times its own size,
+// so what a member sends never makes us read more than that many times it. Inflating takes its
+// input INFLATE_SLICE bytes at a time, and stops past the limit, so a frame that would inflate
+// further holds at most one slice's output (raw deflate inflates 1032 times at most) past it.
+const DEFLATE_MIN = 1024;
+const DEFLATE_RATIO = 16;
+const INFLATE_SLICE = 1024;
 // Presence is re-announced this often, so a lost hello only delays a join.
 const HELLO_EVERY_MS = 15000;
 // A link must prove the room key this soon after it connects.
@@ -80,6 +90,67 @@ const tooLarge = (f) => new RangeError(`message of ${f.length - 1} bytes is too 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const modules = new Map(); // wasm source -> Promise<Peerwire>, shared by rooms
+
+// Whether this platform deflates and inflates (CompressionStream and DecompressionStream with
+// 'deflate-raw').
+const deflates = (() => {
+  try {
+    new CompressionStream('deflate-raw');
+    new DecompressionStream('deflate-raw');
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+// A stream's chunks as one array, or null if they come to more than `max` bytes or the stream fails.
+async function readAll(readable, max) {
+  const reader = readable.getReader();
+  const parts = [];
+  let n = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      n += value.length;
+      if (n > max) {
+        reader.cancel().catch(() => {});
+        return null;
+      }
+      parts.push(value);
+    }
+  } catch {
+    return null;
+  }
+  const out = new Uint8Array(n);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
+async function deflate(bytes) {
+  const cs = new CompressionStream('deflate-raw');
+  const w = cs.writable.getWriter();
+  w.write(bytes).catch(() => {});
+  w.close().catch(() => {});
+  return readAll(cs.readable, Infinity);
+}
+
+// `bytes` inflated, or null if it isn't raw deflate or inflates past `max` bytes.
+async function inflate(bytes, max) {
+  const ds = new DecompressionStream('deflate-raw');
+  const w = ds.writable.getWriter();
+  (async () => {
+    for (let i = 0; i < bytes.length; i += INFLATE_SLICE) await w.write(bytes.subarray(i, i + INFLATE_SLICE));
+    await w.close();
+  })().catch(() => {});
+  const out = await readAll(ds.readable, max);
+  if (!out) w.abort().catch(() => {});
+  return out;
+}
 
 function frame(tag, body) {
   const b = new Uint8Array(body.length + 1);
@@ -212,6 +283,9 @@ export class Room {
     this.paths = new Map(); // linked peer -> the endpoint's path to it
     this.fallingBack = new Set(); // peers we dial by fallback since WebRTC failed
     this.docs = new Map(); // name -> open Doc
+    this.docOut = new Map(); // peer -> the doc frames to it, in order, while one waits to be deflated
+    this.docIn = new Map(); // peer -> the doc frames from it, in order, while one waits to be inflated
+    this.deflated = new WeakMap(); // doc frame -> its deflated bytes, made once for all the members it goes to
     this.transport = makeTransport((peer, state, handle) => {
       if (state === 'closed') this.rtcClosed(peer, handle);
       else if (state === 'failed') this.rtcFailed(peer);
@@ -393,34 +467,76 @@ export class Room {
     d = new Doc(name, {
       self: this.self,
       peers: () => this.peers,
-      send: (peer, m) => this.writeDoc(peer, m),
+      send: (peer, m, z) => this.writeDoc(peer, m, z),
       after: (ms, fn) => {
         const t = setTimeout(fn, ms);
         return () => clearTimeout(t);
       },
       now: () => performance.now(),
       closed: (doc) => this.docs.get(name) === doc && this.docs.delete(name),
+      route: (peer) => this.routes.get(peer)?.kind ?? null,
+      deflate: deflates,
     });
     this.docs.set(name, d);
     d.open();
     return d;
   }
 
-  writeDoc(peer, m) {
+  // Doc frames go to a peer in order. One of DEFLATE_MIN bytes or more, to a member whose doc
+  // reads deflated frames (`z`), goes deflated where we can, which takes a moment: the frames
+  // after it wait for it.
+  writeDoc(peer, m, z) {
+    const body = enc.encode(JSON.stringify(m));
+    const zip = z && deflates && body.length >= DEFLATE_MIN;
+    const before = this.docOut.get(peer);
+    if (!zip && !before) return this.sendDoc(peer, T.Doc, body);
+    const next = (before ?? Promise.resolve()).then(async () => {
+      if (!zip) return this.sendDoc(peer, T.Doc, body);
+      let made = this.deflated.get(m);
+      if (!made) this.deflated.set(m, (made = deflate(body)));
+      const c = await made;
+      if (c && c.length * DEFLATE_RATIO >= body.length) this.sendDoc(peer, T.DocZ, c);
+      else this.sendDoc(peer, T.Doc, body);
+    }).catch(() => {});
+    this.docOut.set(peer, next);
+    next.then(() => this.docOut.get(peer) === next && this.docOut.delete(peer));
+  }
+
+  sendDoc(peer, tag, body) {
+    if (this.left) return;
     try {
-      this.write(peer, frame(T.Doc, enc.encode(JSON.stringify(m))), Lane.Reliable);
+      this.write(peer, frame(tag, body), Lane.Reliable);
     } catch {
       // A doc frame stays under half the lane's limit, and a peer gone meanwhile is no error here.
     }
   }
 
-  // A doc frame from a member: for the open doc it names, if any. It never throws into the room.
-  onDoc(peer, body) {
-    if (!this.docs.size) return;
+  // A doc frame from a member, in the order sent: one deflated waits to be inflated, and the
+  // frames after it wait for it. With no doc open, one deflated is dropped unread: a member
+  // deflates only for a doc whose ask said it reads them, so it is for a doc we closed.
+  onDoc(peer, tag, body) {
+    if (tag === T.DocZ && !this.docs.size) return;
+    const before = this.docIn.get(peer);
+    if (tag === T.Doc && !before) return this.docFrame(peer, body);
+    const data = body.slice(); // the endpoint's buffer is its own once this returns
+    const next = (before ?? Promise.resolve()).then(async () => {
+      const text = tag === T.Doc ? data : await inflate(data, Math.min(MAX_FRAME[Lane.Reliable], DEFLATE_RATIO * data.length));
+      if (text && !this.left && this.members.has(peer)) this.docFrame(peer, text);
+    }).catch(() => {});
+    this.docIn.set(peer, next);
+    next.then(() => this.docIn.get(peer) === next && this.docIn.delete(peer));
+  }
+
+  // A doc frame's JSON text, for the open doc it names. An ask for a doc we don't have open is
+  // answered with nothing (see unopened), and anything else for one is dropped. It never throws
+  // into the room.
+  docFrame(peer, text) {
     try {
-      const m = JSON.parse(dec.decode(body));
+      const m = JSON.parse(dec.decode(text));
       const d = typeof m?.d === 'string' ? this.docs.get(m.d) : undefined;
-      d?.receive(peer, m);
+      if (d) return d.receive(peer, m);
+      const none = unopened(m);
+      if (none) this.writeDoc(peer, none, false);
     } catch {
       // Malformed: dropped.
     }
@@ -450,6 +566,8 @@ export class Room {
     this.retries.close();
     for (const off of this.unwatch) off();
     for (const d of [...this.docs.values()]) d.close();
+    this.docOut.clear();
+    this.docIn.clear();
     const bye = Uint8Array.of(T.Bye);
     for (const p of this.linked) this.endpoint.send(p, bye, Lane.Unreliable);
     this.endpoint.pump();
@@ -542,7 +660,7 @@ export class Room {
     if (tag === T.Bye) return this.lost(peer, 'left');
     // Before its presence, a peer hasn't joined: only unreliable data can race it.
     if (!this.members.has(peer)) return;
-    if (tag === T.Doc) return this.onDoc(peer, body);
+    if (tag === T.Doc || tag === T.DocZ) return this.onDoc(peer, tag, body);
     let value;
     if (tag === T.Bytes) value = body;
     else if (tag === T.Text) value = dec.decode(body);
@@ -615,6 +733,7 @@ export class Room {
     if (!path || !this.linked.has(peer)) return;
     this.setRoute(peer, path);
     this.offerRelays();
+    for (const d of this.docs.values()) d.rerouted();
   }
 
   // Every proven member linked to us directly is offered as a relay for every proven
@@ -682,6 +801,8 @@ export class Room {
     this.paths.delete(peer);
     this.fallingBack.delete(peer);
     this.retries.forget(peer);
+    this.docOut.delete(peer);
+    this.docIn.delete(peer);
     // Out of the room before the session ends: disconnect() pumps, and a 'disconnected'
     // already queued (its sealed close came in the Bye's pipe batch) is not a second leave.
     const member = this.members.delete(peer);

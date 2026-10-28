@@ -142,7 +142,21 @@ chat.append({ text: 'hi' });
 meta.entries();                                  // [{ key, value, from }], by key
 strokes.entries(); chat.entries();               // [{ id, value, from }], oldest first, one order on every member
 doc.on('change', ({ name, type, key, id, value, deleted, from, local }) => render());
+doc.on('sync', ({ state, from, have, total }) => status()); // catching up: see below; doc.sync is the latest
 doc.close();                                     // room.leave() closes the room's docs too
+```
+
+A late joiner sees the doc fill in, newest entries first, and can say where it stands meanwhile:
+
+```js
+const show = ({ state, from, have, total }) => {
+  const percent = total ? Math.round((100 * have) / total) : 0;
+  if (state === 'alone') line.textContent = doc.synced ? "You're the last one here" : "You're the only one here";
+  else if (state === 'loading') line.textContent = `Loading from ${nameOf(from)}… ${percent}%`;
+  else line.textContent = '';
+};
+show(doc.sync);
+doc.on('sync', show);
 ```
 
 - **What wins:**
@@ -162,11 +176,44 @@ doc.close();                                     // room.leave() closes the room
     in `test/doc_crdt.mjs`), not once per member.
   - A member is answered 8 times at once, then once per 15 s, and our asks of it go at the same rate. What the
     answers carry is capped too: 8 Mi characters of JSON text at once (two full docs), then 64 Ki a second. An
-    ask past that waits rather than being dropped, so a doc closed and opened again (a component that remounts)
-    catches up every time: a small doc 8 times in a row at once, then each up to 15 s late.
+    answer's first piece takes one answer from that budget, and each piece its characters. An ask past that
+    waits rather than being dropped, so a doc closed and opened again (a component that remounts) catches up
+    every time: a small doc 8 times in a row at once, then each up to 15 s late.
   - Every frame stays under 512 KiB.
-  - Doc frames have their own tag, so they never reach `'message'` or `poll()`. Versions without `room.doc()`
+  - Doc frames have their own tags, so they never reach `'message'` or `poll()`. Versions without `room.doc()`
     (`@peerwire/js` 0.1.0 to 0.2.0) drop them.
+- **Catching up:**
+  - Members are asked in the order of their routes (`room.route()`): linked directly, then relayed by a member,
+    then over signalling. When one linked directly joins, or a member's route becomes direct, while an answer
+    comes over signalling, that member is asked at once, and the one over signalling again after it, for what is
+    still missing. A member gives up its turn this way once until an answer of its ends: after that, the better
+    routed one waits for the turn to pass.
+  - An answer comes in pieces, the newest entries first (the top of a whiteboard), then the writes it knows are
+    deleted. A piece is about 32 Ki characters of JSON over signalling or through a member, and 128 Ki linked
+    directly; it is sized as it is cut, so an answer that a route upgrade moves gets bigger pieces. Each piece
+    is applied as it lands and acknowledged, and at most 4 go unacknowledged, so an answer keeps the pace of its
+    route, and live writes don't queue behind the whole doc.
+  - The next member is asked once an answer has gone 5 s without a piece, or has taken 60 s while another
+    member waits. The slow answer goes on, and the next ask carries what its pieces brought, so it is answered
+    only with what is still missing.
+  - Doc frames of 1 KiB or more go deflated (raw deflate, where the platform has `CompressionStream`) to members
+    whose doc reads them. A whiteboard of 40 strokes of 1000 points, 508 K characters of JSON, reaches a late
+    joiner in about 200 KB, 2.5 times less (`test/room_doc.mjs`). A frame that would deflate more than 16 times
+    goes plain, and a member's frame is inflated only to 16 times its size and 1 MiB, so what a member sends
+    can't make us read more than 16 times it. A room with no doc open drops deflated frames unread.
+  - A member that doesn't have the doc open answers its asks with nothing, so it holds no one up.
+  - In `test/doc_catchup.mjs`, over the signalling pipe through relays that take 10 events a second, a late
+    joiner holds that whiteboard within 15 s of linking and its first strokes within 3 s (about 10 s and 0.2 s on
+    a loaded 4-core host), and within 30 s and 5 s when the member it catches up from is a background tab,
+    whose timers fire once a second (about 13 s and 1 s).
+- **Where catching up stands:** `doc.sync` is `{ state, from, have, total }`, and `'sync'` fires when it changes.
+  - `'alone'`: no other member to catch up from.
+  - `'loading'`: catching up from member `from`, which has sent `have` of the `total` entries its answer carries
+    (0 of 0 until its first piece lands). `have` may stop short of `total`: the last piece ends the answer.
+  - `'synced'`: caught up. An answer ended from a member that had caught up itself, or every member has answered
+    (none had: members that open the doc together hold all there is between them).
+  - `doc.synced` is true once caught up, and stays true, also once the others have gone (`'alone'`). So an app
+    can tell "you're the last one with the board" from "you're the first one here".
 - **Logs:** give `keep` the same value on every member, and call `doc.log()` right after `room.doc()`. A member
   that keeps fewer entries never trims another's log, but one that keeps more can miss the older entries another
   has trimmed, once it catches up from that member, directly or through a member that did.
@@ -197,6 +244,9 @@ doc.close();                                     // room.leave() closes the room
     starts with whole ones.
   - `from` is the writer as the doc was told. A member relaying a catch-up can name any writer, so use `from` to
     colour or group, not as proof of who wrote something. Check every field you render, as with messages.
+  - Where catching up stands is as good as the members that told us: a member can say it had caught up when it
+    hadn't, or carry fewer entries than it says, so a doc can show `'synced'` early or `total` too high. Use
+    `doc.sync` for a status line, not to decide what the doc holds; entries that come later still show.
 - **Not yet:** collaborative text (character sequences), and docs in Rust and Godot.
 
 ## Using with React
@@ -377,9 +427,12 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    when there is no other member to ask, Peerwire datagrams also go as signalling
    messages (a *pipe*). On Nostr each batch is sealed to the peer again
    (`'signaling'`). This works wherever the relays are reachable. It is slow, though: a
-   relay round trip per batch, 40 ms batching, and at most 3 batches a second for all
-   of a client's pipes together. That is within what public relays allow one client. A
-   relay that refuses events for its rate limit gets none for 30 s, doubling up to 10
+   relay round trip per batch, 40 ms batching (a batch's worth goes at once), and at most
+   3 batches a second for all of a client's pipes together. That is within what public
+   relays allow one client. A background tab fires its timers once a second at most: a
+   pipe timer that fires that late sends every batch the rate allows by then, and until
+   one fires on time again, pipes send what each task queued at its end, not 40 ms later.
+   A relay that refuses events for its rate limit gets none for 30 s, doubling up to 10
    min. The pause starts over at 30 s once the relay has gone 10 min without refusing.
 
 The core keeps the first path that completes the handshake, and the room's proofs,
@@ -524,7 +577,22 @@ Run these with Node and the Playwright install on this host:
   - frames: every one under 512 KiB;
   - 20,000 mutated frames, none of which throws;
   - answers per member: 8 at once, then one per 15 s, and an ask past that waits; what they carry to a member
-    that asks for a 2 Mi-character doc every second for a minute (6 sends, under the 8 Mi + 64 Ki/s bound);
+    that asks for a 2 Mi-character doc every second for a minute and acknowledges every piece (4 whole sends at
+    once, then pieces as the budget allows, within a piece of the 8 Mi + 64 Ki/s bound);
+  - answers in pieces: a whiteboard-sized doc (40 strokes of 1000 points) in 20 pieces over signalling and 4
+    linked directly, newest first, each applied as it lands, at most 4 unacknowledged; acknowledgements of a
+    piece not sent, sent twice or for another ask send nothing; a route that becomes direct mid-answer gets
+    bigger pieces;
+  - a slow answer taken up, not started again: the next member is asked 5 s after the last piece, not the ask,
+    and the joiner is sent each entry once; a member trickling its answer holds the turn 60 s at most, and one
+    that stalled holds it only until another can be asked; an older ask's answer ends nothing, also for a doc
+    opened again during it;
+  - routes: members linked directly asked first, then relayed, then over signalling, and a member that comes,
+    or whose route becomes direct, during an answer over signalling takes the turn, once until that answer ends
+    however often the better routed member is queued again;
+  - `'sync'`: alone, two members opening together, a joiner loading with `have` up to `total` and synced once a
+    caught-up member's answer ends, alone again once everyone has gone, and loading with a member that never
+    answers;
   - a doc closed and opened 12 times while a member stays catches up every time;
   - a member that never answers is asked once, however often it prompts us, until it answers;
   - Lamport stamps moved far ahead (by 2^32 four times, or to 2^53 - 1): a member cut off meanwhile and one that
@@ -540,7 +608,19 @@ Run these with Node and the Playwright install on this host:
     (within 3 to 5 times it).
 - `node packages/js/test/room_doc.mjs`: `room.doc()` with three members in a real `'local'` room: they converge, a
   doc opened late and a fourth member catch up, doc frames never show as messages, writes outlive their writer,
-  and leaving closes docs.
+  and leaving closes docs. A whiteboard-sized doc reaches a late joiner deflated (2.5 times less), members that
+  don't have a doc open answer its asks with nothing, a write that deflates 900 times goes plain, and deflated
+  frames are taken in order with plain ones, one past 16 times its size or 1 MiB, or not deflate, or from a
+  member gone meanwhile, dropped; a room with no doc open drops them unread.
+- `node packages/js/test/doc_catchup.mjs`: a late joiner's catch-up of a whiteboard-sized board (509 KB) over a
+  direct link, the signalling pipe through fake rate-limited relays, from a background tab, both at once, with
+  nobody online, and with two holders, one direct and one over the pipe (one whole answer, from the direct
+  one). It prints the time to the whole board, the frames, datagrams, retransmits, pipe batches and relay
+  events, and checks the bars: 15 s (30 s from a background tab over the pipe), first strokes within 3 s (5 s).
+- `node packages/js/test/pipe_batches.mjs`: a pipe's batches on a fake clock: datagrams queued together go 40
+  ms later as one, a batch's worth at once, 3 a second after a burst of 6, and with timers held to once a second
+  (a background tab), the batches a late timer finds go together, and what a task queued goes at its end, until
+  a timer fires on time again.
 - `node packages/js/test/room_welcome.mjs`: a message a `peer-join` handler sends to the
   newcomer reaches it, also when the newcomer's presence came while its link proof was
   being checked (forced in 20 joins); 200 two-member joins and 30 third members lose none.

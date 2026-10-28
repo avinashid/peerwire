@@ -234,6 +234,21 @@ export interface DocChange {
   local: boolean;
 }
 
+/** Where a doc's catching up stands: `doc.sync`, and what `doc.on('sync')` reports when it changes. As good as the
+ * members that told us: use it for a status line, not to decide what the doc holds. */
+export interface DocSync {
+  /** 'alone': no other member to catch up from. 'loading': catching up from `from`. 'synced': caught up (an
+   * answer ended from a member that had caught up itself, or every member has answered). */
+  readonly state: 'alone' | 'loading' | 'synced';
+  /** The member being caught up from, while 'loading'; null when it waits to ask one, and in the other states. */
+  readonly from: PeerId | null;
+  /** Entries of `from`'s answer that have landed, newest first, of the `total` it carries (as it says): 0 of 0
+   * until its first piece lands, and in the other states. `have` may stop short of `total`: the last piece ends
+   * the answer. */
+  readonly have: number;
+  readonly total: number;
+}
+
 /** One value per key. A `set` replaces the values its writer has seen; of values set at the same time, the one
  * with the later Lamport stamp shows, then the higher writer. A `delete` removes the values its writer has seen,
  * so a set made elsewhere at the same time wins. */
@@ -273,10 +288,15 @@ export interface DocLog {
 
 /** A shared document from `room.doc(name)`: maps, sets and logs that every member holds and that converge. Writes
  * reach every member at once on the reliable lane; members that join later, or come back after a partition, catch
- * up. Limits: 10,000 entries and 4 MiB of JSON text per doc; names 128 characters, keys 256, values 64 KiB as JSON.
- * Members are trusted alike: any member can overwrite, delete or fill a doc. */
+ * up, from the best-routed member first, in pieces, the newest entries first. Limits: 10,000 entries and 4 MiB of
+ * JSON text per doc; names 128 characters, keys 256, values 64 KiB as JSON. Members are trusted alike: any member
+ * can overwrite, delete or fill a doc. */
 export interface Doc {
   readonly name: string;
+  /** Where catching up stands now; `'sync'` fires when it changes. */
+  readonly sync: DocSync;
+  /** True once the doc has caught up, and from then on, also once the other members have gone ('alone'). */
+  readonly synced: boolean;
   map(name: string): DocMap;
   set(name: string): DocSet;
   /** `keep`: the newest entries kept, 1 to 10,000 (default 1000). Give every member the same, right after
@@ -284,7 +304,9 @@ export interface Doc {
   log(name: string, options?: { keep?: number }): DocLog;
   /** Subscribes; returns a function that unsubscribes. A handler that throws is reported on its own. */
   on(event: 'change', fn: (change: DocChange) => void): () => void;
+  on(event: 'sync', fn: (sync: DocSync) => void): () => void;
   off(event: 'change', fn: (change: DocChange) => void): void;
+  off(event: 'sync', fn: (sync: DocSync) => void): void;
   /** Stops syncing and forgets the doc; `room.doc(name)` later opens it afresh and catches up. Writes after it
    * throw. */
   close(): void;
