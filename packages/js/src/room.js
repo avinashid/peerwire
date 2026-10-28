@@ -522,8 +522,10 @@ export class Room {
   }
 
   // A doc frame from a member, in the order sent: one deflated waits to be inflated, and the
-  // frames after it wait for it.
+  // frames after it wait for it. With no doc open, one deflated is dropped unread: a member
+  // deflates only for a doc whose ask said it reads them, so it is for a doc we closed.
   onDoc(peer, tag, body) {
+    if (tag === T.DocZ && !this.docs.size) return;
     const before = this.docIn.get(peer);
     if (tag === T.Doc && !before) return this.docFrame(peer, body);
     const data = body.slice(); // the endpoint's buffer is its own once this returns

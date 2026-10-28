@@ -983,6 +983,43 @@ console.log('the window: 4 pieces unacknowledged, one more per piece acknowledge
 }
 console.log('a member whose route becomes direct takes the turn from one over signalling, which is asked again after');
 
+// A member over signalling gives the turn to a better routed one once until an answer of its ends: here c, linked
+// directly, joins during a's answer and is queued again during each of a's turns after, yet a is asked twice in
+// all, and its answer goes through whole, sent once.
+{
+  const net = new Net(33);
+  const a = net.node('a');
+  board(net, a);
+  const c = net.node('c');
+  c.doc.set('s').add('c');
+  const g = net.node('g');
+  const order = [];
+  const send = g.host.send;
+  g.host.send = (to, msg, z) => {
+    if (msg.t === 2) order.push(to === a.self ? 'a' : 'c');
+    send(to, msg, z);
+  };
+  net.route(a, g, 'signaling');
+  net.route(c, g, 'direct');
+  net.link(g, a);
+  const turns = new Set();
+  for (let n = 0; ; n++) {
+    if (n > 1e6) fail('a paused member: the network never went quiet');
+    const ask = g.doc.members.get(a.self)?.ask;
+    if (g.doc.asking === a.self && ask?.got && !turns.has(ask.q)) {
+      turns.add(ask.q);
+      if (!g.peers.has(c.self)) net.link(g, c);
+      else g.doc.startAsk(c.self);
+    }
+    if (net.step()) continue;
+    if (!net.fire(Infinity)) break;
+  }
+  const got = net.got.get(g.self);
+  for (const id of a.doc.entries.keys()) if (!g.doc.entries.has(id)) fail(`a paused member: g lacks ${id}`);
+  if (order.filter((x) => x === 'a').length !== 2 || turns.size !== 2 || got > a.doc.entries.size + 1 + 10) fail(`a paused member: asked ${order} over ${turns.size} turns of a's; sent ${got} entries for ${a.doc.entries.size + 1}`);
+  console.log(`a member over signalling paused once until its answer ended: asked ${order}, sent ${got} entries for ${a.doc.entries.size + 1}`);
+}
+
 // A member that stalled with no one else to ask keeps the turn, and gives it up as soon as one is: here b, which
 // joins 10 s on, is asked at once.
 {
