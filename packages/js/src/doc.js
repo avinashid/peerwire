@@ -498,6 +498,7 @@ export class Doc {
     }
     st.ask = null;
     st.answered = true;
+    st.preempted = false;
     if (f.s) this.synced = true;
     if (this.asking === peer) this.nextAsk(true);
     // A member whose turn passed as it stalled is asked again once it has answered, if it was due an ask meanwhile.
@@ -907,11 +908,12 @@ export class Doc {
   // A member's catch-up: when each of its budgets (BUDGETS) is whole again; its latest ask while it waits for
   // them (`theirs`, numbered `want`), our answer under way (`out`, see answerOf) and the wait for the budgets;
   // whether it reads deflated frames (`z`); our latest ask of it (`ask`) until its answer ends, the wait for our
-  // budget to ask it, whether it has answered one, and whether its turn passed as it stalled (`stalled`) and
-  // another ask is due once it answers.
+  // budget to ask it, whether it has answered one, whether its turn passed as it stalled (`stalled`) and
+  // another ask is due once it answers, and whether a better routed member took its turn since its last answer
+  // ended (`preempted`, see better).
   member(peer) {
     let st = this.members.get(peer);
-    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, chars: 0, theirs: null, want: 0, out: null, answerWait: null, z: false, ask: null, askWait: null, answered: false, stalled: false, askAgain: false }));
+    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, chars: 0, theirs: null, want: 0, out: null, answerWait: null, z: false, ask: null, askWait: null, answered: false, stalled: false, askAgain: false, preempted: false }));
     return st;
   }
 
@@ -1007,14 +1009,17 @@ export class Doc {
   // With a member waiting to be asked, the turn passes on if the member whose turn it is stalled or has had
   // TURN_MS, or the one waiting is better routed (linked directly, while the answer comes over signalling, say):
   // then the answer under way is paused, and its member asked again after, with what we hold by then.
+  // A member is paused so once until an answer of its ends (`preempted`): one better routed, queued again on each
+  // of its turns, waits for the turn to pass instead.
   better() {
     const p = this.asking;
     if (!p || !this.queue.length) return;
     const st = this.member(p);
     if (st.stalled || this.now() - st.ask.at >= TURN_MS) return this.nextAsk(true);
     const r = this.rank(p);
-    if (!this.queue.some((x) => this.rank(x) < r)) return;
+    if (st.preempted || !this.queue.some((x) => this.rank(x) < r)) return;
     st.ask.paused = true;
+    st.preempted = true;
     this.queue.push(p);
     this.nextAsk(true);
   }
@@ -1105,13 +1110,14 @@ export class Doc {
     }
   }
 
-  // An answer to ask `q`, whose context is `theirs`: the entries it lacks, the newest first, then every dot we
-  // know is dead. Pieces are numbered from 0 (`next`, the next one), and acknowledged up to `acked`.
+  // An answer to ask `q`, whose context is `theirs`: the ids of the entries it lacks, the newest first (ids, so
+  // an answer that waits holds none deleted meanwhile), then every dot we know is dead. Pieces are numbered from
+  // 0 (`next`, the next one), and acknowledged up to `acked`.
   answerOf(theirs, q) {
     const list = [];
     for (const e of this.entries.values()) if (!theirs.has(e.w, e.n)) list.push(e);
     list.sort((a, b) => byStamp(b, a));
-    return { q, list, i: 0, dead: this.dead(), j: 0, next: 0, acked: -1 };
+    return { q, list: list.map((e) => e.id), i: 0, dead: this.dead(), j: 0, next: 0, acked: -1 };
   }
 
   // Sends answer `o`'s next piece: its next entries still held, then its dead ranges, about the route's
@@ -1123,9 +1129,9 @@ export class Doc {
     const ranges = [];
     let chars = 0;
     for (; o.i < o.list.length; o.i++) {
-      const e = o.list[o.i];
-      // Gone since the ask: the member hears of that as the others did.
-      if (this.entries.get(e.id) !== e) continue;
+      const e = this.entries.get(o.list[o.i]);
+      // Gone since the ask (a dot is never used again): the member hears of that as the others did.
+      if (!e) continue;
       if (chars && chars + ENTRY_BYTES + e.len > size) break;
       entries.push(e);
       chars += ENTRY_BYTES + e.len;

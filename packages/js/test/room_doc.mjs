@@ -185,6 +185,20 @@ console.log(`d joined late and caught up; a left and its writes stayed (${(perfo
   b.members.set(d.self, presence);
   if (got.includes(8)) fail('a frame inflated after its member left was taken');
   console.log('deflated frames: taken in order with plain ones; one inflating past 16 times its size or 1 MiB, or not deflate, or from a member gone meanwhile, dropped');
+
+  // A room with no doc open drops deflated frames unread (one deflated is for a doc it closed); a plain one it
+  // still reads, as an ask it answers with nothing.
+  dc.close();
+  if (c.docs.size) fail(`c has ${c.docs.size} docs open`);
+  let read = 0;
+  const docFrame = c.docFrame.bind(c);
+  c.docFrame = (peer, text) => (read++, docFrame(peer, text));
+  c.onMessage(d.self, z(answer(9, 9, noisy)), 0);
+  c.onMessage(d.self, plain({ d: 'z', t: 2, ws: [], r: [], q: 1 }), 0);
+  await new Promise((r) => setTimeout(r, 100));
+  c.docFrame = docFrame;
+  if (read !== 1) fail(`a room with no doc open read ${read} of a deflated frame and a plain one`);
+  console.log('a room with no doc open dropped a deflated frame unread and read a plain one');
 }
 
 // Leaving closes the room's docs.

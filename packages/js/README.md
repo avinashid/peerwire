@@ -186,7 +186,8 @@ doc.on('sync', show);
   - Members are asked in the order of their routes (`room.route()`): linked directly, then relayed by a member,
     then over signalling. When one linked directly joins, or a member's route becomes direct, while an answer
     comes over signalling, that member is asked at once, and the one over signalling again after it, for what is
-    still missing.
+    still missing. A member gives up its turn this way once until an answer of its ends: after that, the better
+    routed one waits for the turn to pass.
   - An answer comes in pieces, the newest entries first (the top of a whiteboard), then the writes it knows are
     deleted. A piece is about 32 Ki characters of JSON over signalling or through a member, and 128 Ki linked
     directly; it is sized as it is cut, so an answer that a route upgrade moves gets bigger pieces. Each piece
@@ -199,7 +200,7 @@ doc.on('sync', show);
     whose doc reads them. A whiteboard of 40 strokes of 1000 points, 508 K characters of JSON, reaches a late
     joiner in about 200 KB, 2.5 times less (`test/room_doc.mjs`). A frame that would deflate more than 16 times
     goes plain, and a member's frame is inflated only to 16 times its size and 1 MiB, so what a member sends
-    can't make us read more than 16 times it.
+    can't make us read more than 16 times it. A room with no doc open drops deflated frames unread.
   - A member that doesn't have the doc open answers its asks with nothing, so it holds no one up.
   - In `test/doc_catchup.mjs`, over the signalling pipe through relays that take 10 events a second, a late
     joiner holds that whiteboard within 15 s of linking and its first strokes within 3 s (about 10 s and 0.2 s on
@@ -587,7 +588,8 @@ Run these with Node and the Playwright install on this host:
     that stalled holds it only until another can be asked; an older ask's answer ends nothing, also for a doc
     opened again during it;
   - routes: members linked directly asked first, then relayed, then over signalling, and a member that comes,
-    or whose route becomes direct, during an answer over signalling takes the turn;
+    or whose route becomes direct, during an answer over signalling takes the turn, once until that answer ends
+    however often the better routed member is queued again;
   - `'sync'`: alone, two members opening together, a joiner loading with `have` up to `total` and synced once a
     caught-up member's answer ends, alone again once everyone has gone, and loading with a member that never
     answers;
@@ -609,7 +611,7 @@ Run these with Node and the Playwright install on this host:
   and leaving closes docs. A whiteboard-sized doc reaches a late joiner deflated (2.5 times less), members that
   don't have a doc open answer its asks with nothing, a write that deflates 900 times goes plain, and deflated
   frames are taken in order with plain ones, one past 16 times its size or 1 MiB, or not deflate, or from a
-  member gone meanwhile, dropped.
+  member gone meanwhile, dropped; a room with no doc open drops them unread.
 - `node packages/js/test/doc_catchup.mjs`: a late joiner's catch-up of a whiteboard-sized board (509 KB) over a
   direct link, the signalling pipe through fake rate-limited relays, from a background tab, both at once, with
   nobody online, and with two holders, one direct and one over the pipe (one whole answer, from the direct
