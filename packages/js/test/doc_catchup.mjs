@@ -9,7 +9,7 @@
 //     way;
 // (c) a background tab answering: A in a worker whose timers fire no sooner than 1000 ms, as in
 //     room_throttled.mjs, over LocalTransport;
-// (d) A leaves before C joins;
+// (d) A, which keeps the board on its device (persist), leaves before C joins, and comes back later;
 // (e) (b) and (c) at once: A in the background on the fallback route, where the pipe's batching and rate waits
 //     are timers too;
 // (f) two members hold the board, B linked to C directly and A over the pipe: C asks B first and takes one whole
@@ -17,8 +17,9 @@
 // For each it prints how long after the link C held every entry (or what it held at the deadline), the doc
 // frames both sides sent (asks, answers, deltas and their bytes), what went on the wire (datagrams, core
 // packets and retransmits, pipe batches, relay events) and when C's ask of A was pending or timed out. C must
-// hold the whole doc within DEADLINE_MS of the link in (a) to (c) and (f), and within BACKGROUND_MS in (e); its
-// first entries within FIRST_MS in (b), and FIRST_BACKGROUND_MS in (e); (d) holds nothing.
+// hold the whole doc within DEADLINE_MS of the link in (a) to (d) and (f), and within BACKGROUND_MS in (e); its
+// first entries within FIRST_MS in (b), and FIRST_BACKGROUND_MS in (e). In (d) C holds nothing while alone, and A
+// comes back to its whole board from its device.
 //
 // It failed on main at 45c7cfd (NB-006d): (b) took 32 s and (e) held 26 of 42 entries after 120 s.
 //
@@ -27,7 +28,7 @@
 // --watch keeps watching a run that missed the deadline until that many seconds after the link, to see where
 // it ends up; --relay-rate sets RELAY_RATE.
 import { Worker, MessageChannel, isMainThread, parentPort, workerData, threadId } from 'node:worker_threads';
-import { joinRoom, Room } from '../src/index.js';
+import { joinRoom, Room, memoryStore } from '../src/index.js';
 import { WebRtcTransport, BroadcastSignaling } from '../src/webrtc.js';
 
 const APP = 'peerwire-test';
@@ -469,22 +470,33 @@ if (!isMainThread) {
   }
   if (RUNS.includes('c')) await background('c', `A's timers clamped to ${CLAMP_MS} ms (a background tab), LocalTransport`, false);
 
-  // (d) A leaves before C joins: nobody online holds the doc, so C gets nothing. That is by design today.
-  // NB-006f (each device keeps its doc) brings the board back to A when A returns; C, which never had it, needs
-  // a copy held while nobody is online (NB-006g). Flip this check when that lands.
+  // (d) A leaves before C joins: nobody online holds the doc, so C alone gets nothing (a copy held while nobody
+  // is online is NB-006g). A kept the board on its device (persist), so when A comes back the board is back from
+  // that copy, and C gets it from A.
   if (RUNS.includes('d')) {
     const roomId = `catchup-d-${process.pid}`;
+    const memory = memoryStore();
+    let kept = 0;
+    const store = { ...memory, set: (key, bytes) => ((kept = bytes.length), memory.set(key, bytes)) };
     const a = await joinRoom({ appId: APP, roomId, presence: { name: 'a' } });
-    draw(a.doc('board'));
+    draw(a.doc('board', { persist: store }));
     await a.leave();
+    console.log(`(d) A kept the board on its device in ${kb(kept)}, sealed`);
     const c = await joinRoom({ appId: APP, roomId, presence: { name: 'c' } });
     const dc = c.doc('board');
     await sleep(ALONE_MS);
     const n = held(dc);
     const asks = docLog.filter((f) => f.self === c.self && f.dir === 'out').length;
-    console.log(`(d) A left before C joined: C alone held ${n} of ${ENTRIES} entries ${s(ALONE_MS)} after opening the doc, with ${c.peers.length} members to ask and ${asks} doc frames sent (empty by design until NB-006f/NB-006g)`);
-    results.push({ key: 'd', ok: n === 0, line: n === 0 ? '(d) C alone holds nothing' : `(d) C alone holds ${n} entries` });
-    await c.leave();
+    console.log(`(d) A left before C joined: C alone held ${n} of ${ENTRIES} entries ${s(ALONE_MS)} after opening the doc, with ${c.peers.length} members to ask and ${asks} doc frames sent`);
+    const t0 = now();
+    const a2 = await joinRoom({ appId: APP, roomId, presence: { name: 'a' } });
+    const da = a2.doc('board', { persist: store });
+    const found = await da.loaded;
+    const back = held(da);
+    const w = await watch(c, dc, a2.self, t0);
+    report('d', `A came back, its board ${found} from its device (${back} of ${ENTRIES} entries ${s(now() - t0)} after joining), and C caught up from it`, w, { aId: a2.self, cId: c.self, aWire: wire.get(a2.self), cWire: wire.get(c.self), aCore: a2.stats(), cCore: c.stats() });
+    if (n !== 0 || found !== 'loaded' || back !== ENTRIES) results.push({ key: 'd', ok: false, line: `(d) C alone held ${n} entries; A came back to a board ${found} with ${back} entries` });
+    await Promise.all([a2.leave(), c.leave()]);
   }
 
   if (RUNS.includes('e')) await background('e', `A's timers clamped to ${CLAMP_MS} ms on the fallback route of (b) (${RELAY_LIMITS})`, true);

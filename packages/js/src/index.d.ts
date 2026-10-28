@@ -188,15 +188,16 @@ export declare class Room {
    * already or the peer didn't adopt within 5 s. When the channel closes, the link goes back to its fallback. */
   adoptChannel(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel): Promise<boolean>;
   /** The shared document `name` (1 to 128 characters), opened on the first call and the same object until it is
-   * closed: the same name on every member is the same document. Throws after `leave()`, which closes the room's
-   * docs. See {@link Doc}. */
-  doc(name: string): Doc;
+   * closed: the same name on every member is the same document. `options` count when it opens. Throws after
+   * `leave()`, which closes the room's docs, TypeError for a `persist` it can't use, and RangeError for a name with
+   * `persist` that isn't well-formed (a lone surrogate). See {@link Doc}. */
+  doc(name: string, options?: DocOptions): Doc;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
   /** Tells every peer we're going, then closes the links, all before it returns (so it works from `pagehide`,
-   * where it also runs): the promise is already settled. Reliable messages not yet acknowledged may not arrive:
-   * the goodbye can overtake them. */
+   * where it also runs); the promise resolves once docs kept on this device (`persist`) have saved. Reliable
+   * messages not yet acknowledged may not arrive: the goodbye can overtake them. */
   leave(): Promise<void>;
 }
 
@@ -286,6 +287,26 @@ export interface DocLog {
   entries(): readonly DocItem[];
 }
 
+/** Where a doc kept on this device keeps its copy: a store of bytes by key, e.g. over files. `get` gives back what
+ * `set` stored, undefined only when there is none, and rejects when it can't tell; `set` stores all of it or
+ * nothing (over files: a temp file, then a rename). */
+export interface DocStore {
+  get(key: string): Promise<Uint8Array | ArrayBuffer | undefined>;
+  set(key: string, bytes: Uint8Array): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
+export interface DocOptions {
+  /** Keeps a copy of the doc on this device, loaded when it opens, before members are asked: `true` for IndexedDB
+   * (browsers; TypeError where there is none), or a {@link DocStore}: make it once and pass the same object each
+   * time, as a doc closed and opened again at once loads what the closing one saved only through the same store.
+   * Saved when the page is hidden, on `close()` and `leave()`, and while the doc changes, one save at a time: a
+   * second after a change, and after the last save by its size at 256 KiB/s. The copy is sealed under a key from
+   * the room key, so the storage shows neither the room, the doc nor what it holds; anyone who knows the roomId
+   * can read it, as they could join the room. */
+  persist?: boolean | DocStore;
+}
+
 /** A shared document from `room.doc(name)`: maps, sets and logs that every member holds and that converge. Writes
  * reach every member at once on the reliable lane; members that join later, or come back after a partition, catch
  * up, from the best-routed member first, in pieces, the newest entries first. Limits: 10,000 entries and 4 MiB of
@@ -297,6 +318,11 @@ export interface Doc {
   readonly sync: DocSync;
   /** True once the doc has caught up, and from then on, also once the other members have gone ('alone'). */
   readonly synced: boolean;
+  /** What opening found on this device: 'loaded' (its copy is in the doc), 'empty' (none, or one that couldn't be
+   * read, which the next save replaces), 'blocked' (the storage refused, as in some private modes, hadn't loaded
+   * the copy within 5 s, or holds one from another version of this package: the copy is left as it is, and the doc
+   * goes on without one, with a warning) or 'off' (no `persist`). */
+  readonly loaded: Promise<'loaded' | 'empty' | 'blocked' | 'off'>;
   map(name: string): DocMap;
   set(name: string): DocSet;
   /** `keep`: the newest entries kept, 1 to 10,000 (default 1000). Give every member the same, right after
@@ -307,9 +333,13 @@ export interface Doc {
   on(event: 'sync', fn: (sync: DocSync) => void): () => void;
   off(event: 'change', fn: (change: DocChange) => void): void;
   off(event: 'sync', fn: (sync: DocSync) => void): void;
+  /** Deletes the copy this device keeps (`persist`), and keeps none until the doc is opened with `persist` again.
+   * What the doc holds stays. Rejects if the storage fails. */
+  forget(): Promise<void>;
   /** Stops syncing and forgets the doc; `room.doc(name)` later opens it afresh and catches up. Writes after it
-   * throw. */
-  close(): void;
+   * throw. A doc kept on this device saves first: the promise resolves once it has (closed while a store takes
+   * more than 5 s to load the copy, it resolves then, saving nothing). */
+  close(): Promise<void>;
 }
 
 /** Joins a room: `const room = await joinRoom({ appId: 'my-app', roomId: 'lobby' })`. */
@@ -317,6 +347,9 @@ export declare function joinRoom(options: JoinRoomOptions): Promise<Room>;
 
 /** 128 random bits, base64url (22 characters): a roomId nobody can guess. */
 export declare function randomRoomId(): string;
+
+/** A {@link DocStore} in this process's memory, for Node and tests: its copies go with the process. */
+export declare function memoryStore(): DocStore;
 
 export declare const DEFAULT_ICE_SERVERS: RTCIceServer[];
 export declare const DEFAULT_RELAYS: string[];

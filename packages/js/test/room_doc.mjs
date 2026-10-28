@@ -2,10 +2,11 @@
 // BroadcastChannel, the Peerwire core in wasm) write to one shared document and converge. A fourth joins
 // late and catches up; a member that opens the doc after the others wrote catches up when it opens; doc
 // frames never show as messages, to 'message' handlers or poll(); a member's writes outlive it; leaving
-// closes the room's docs.
+// closes the room's docs. A doc kept on this device (persist) is back when its member comes back.
 //
 //   node packages/js/test/room_doc.mjs
-import { joinRoom } from '../src/index.js';
+import { joinRoom, memoryStore } from '../src/index.js';
+import { docCopy, MAX_STORED } from '../src/store.js';
 
 const fail = (m) => {
   console.error(`FAIL ${m}`);
@@ -222,5 +223,167 @@ const dd2 = d.doc('board');
 if (dd2 === dd) fail('a closed doc came back');
 await until('a doc opened again to catch up', () => view(dd2) === view(db));
 for (const r of [b, c, d]) await r.leave();
+
+// A doc kept on this device (persist), in a room of its own. A writes, leaves (which saves), and comes back on
+// the same secret, so the same PeerId: the doc is back from the copy alone, and A's new writes go on from it.
+// B, which was never there, joins and gets it from A. The copy is sealed: its key and bytes show neither the
+// room, the doc, A nor what it holds; another room's doc of the same name finds nothing, and the bytes put under
+// another doc's key don't open. forget() deletes it. persist: true needs IndexedDB, and a store has three methods.
+{
+  const store = memoryStore();
+  const sets = [];
+  const spy = { get: (k) => store.get(k), set: (k, v) => (sets.push([k, v]), store.set(k, v)), delete: (k) => store.delete(k) };
+  const kopts = { appId: 'peerwire-test', roomId: `doc-kept-${process.pid}`, secret: crypto.getRandomValues(new Uint8Array(32)) };
+  const a1 = await joinRoom({ ...kopts, presence: { name: 'ana' } });
+  const k1 = a1.doc('board', { persist: spy });
+  if ((await k1.loaded) !== 'empty') fail('a first opening found a copy');
+  k1.map('meta').set('title', 'Kept plans');
+  const gone = k1.set('strokes').add({ points: [9, 9, 8, 8] });
+  for (let i = 0; i < 3; i++) k1.set('strokes').add({ points: [i, i, i + 1, i + 1] });
+  for (let i = 0; i < 25; i++) k1.log('chat', { keep: 20 }).append({ text: `k${i}` });
+  k1.set('strokes').delete(gone);
+  const before = view(k1);
+  await a1.leave();
+  if (!sets.length) fail('leaving did not save the doc');
+  const [key, bytes] = sets.at(-1);
+  const text = Buffer.from(bytes).toString('latin1');
+  for (const s of ['Kept plans', 'chat', 'board', kopts.roomId, 'peerwire-test', a1.self, 'points']) if (text.includes(s) || key.includes(s)) fail(`the stored copy shows ${s}`);
+  if (!/^[0-9a-f]{64}$/.test(key)) fail(`the copy's key ${key}`);
+  const a2 = await joinRoom({ ...kopts, presence: { name: 'ana' } });
+  const k2 = a2.doc('board', { persist: spy });
+  if (a2.self !== a1.self || (await k2.loaded) !== 'loaded' || view(k2) !== before) fail(`A came back to ${view(k2)}`);
+  k2.set('strokes').add({ points: [7, 7] });
+  const b2 = await joinRoom({ ...kopts, secret: undefined, presence: { name: 'bo' } });
+  const kb = b2.doc('board');
+  await until("B to get the doc from A's copy", () => view(kb) === view(k2) && kb.set('strokes').entries().length === 4);
+  const other = await joinRoom({ ...kopts, roomId: `doc-other-${process.pid}`, secret: undefined });
+  if ((await other.doc('board', { persist: spy }).loaded) !== 'empty') fail("another room's doc of the same name read the copy");
+  const notes = a2.doc('notes', { persist: spy });
+  await notes.loaded;
+  notes.map('m').set('x', 1);
+  await notes.close();
+  const notesKey = sets.at(-1)[0];
+  if (notesKey === key) fail('two docs share a key');
+  const warned = [];
+  const warn = console.warn;
+  console.warn = (m) => warned.push(m);
+  await store.set(notesKey, await store.get(key));
+  if ((await a2.doc('notes', { persist: spy }).loaded) !== 'empty' || (await docCopy(spy, a2.proof, 'notes').load()) !== null) fail("the board's copy opened under another doc's key");
+  // A record past MAX_STORED isn't even opened.
+  await store.set(notesKey, new Uint8Array(MAX_STORED + 1));
+  const decrypt = crypto.subtle.decrypt;
+  let opened = 0;
+  crypto.subtle.decrypt = (...x) => (opened++, decrypt.apply(crypto.subtle, x));
+  const huge = await docCopy(spy, a2.proof, 'notes').load();
+  crypto.subtle.decrypt = decrypt;
+  if (huge !== null || opened) fail(`a record of MAX_STORED + 1 bytes: ${opened} decrypts`);
+  // Sealed as version 1 || iv || ciphertext, with the version and the key it is kept under as additional data:
+  // a record sealed without either doesn't open (one sealed with both, as a control, does). One of another version
+  // is left as it is: 'blocked', and never saved over. Each refusal says why.
+  if (bytes[0] !== 1) fail(`the copy's version byte is ${bytes[0]}`);
+  const te = new TextEncoder();
+  const sealKey = await crypto.subtle.importKey('raw', await a2.proof.mac('pw-store-key', [te.encode('notes')]), 'AES-GCM', false, ['encrypt']);
+  const seal = async (ad) => {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, ...(ad && { additionalData: ad }) }, sealKey, te.encode('{"v":1,"c":1,"f":[]}')));
+    return Uint8Array.of(1, ...iv, ...ct);
+  };
+  const crafted = {};
+  for (const [what, ad] of [['with both', Uint8Array.of(1, ...te.encode(notesKey))], ['without additional data', null], ['without the version', te.encode(notesKey)]]) {
+    await store.set(notesKey, await seal(ad));
+    crafted[what] = await docCopy(spy, a2.proof, 'notes').load();
+  }
+  if (crafted['with both']?.v !== 1 || crafted['without additional data'] !== null || crafted['without the version'] !== null) fail(`crafted records: ${JSON.stringify(crafted)}`);
+  const v = a2.doc('versions', { persist: spy });
+  await v.loaded;
+  v.map('m').set('x', 1);
+  await v.close();
+  const [vKey, vBytes] = sets.at(-1);
+  const newer = Uint8Array.of(2, ...vBytes.subarray(1));
+  await store.set(vKey, newer);
+  const v2 = a2.doc('versions', { persist: spy });
+  const v2found = await v2.loaded;
+  v2.map('m').set('x', 2);
+  await v2.close();
+  if (v2found !== 'blocked' || Buffer.compare(await store.get(vKey), newer) !== 0) fail(`a copy of version 2: ${v2found}, and written over`);
+  // A save gives the bytes it stored, by which the doc paces the next.
+  const wrote = await docCopy(spy, a2.proof, 'sizes').save({ v: 1, c: 0, f: [] });
+  if (wrote !== sets.at(-1)[1].length) fail(`a save gave ${wrote} for a record of ${sets.at(-1)[1].length} bytes`);
+  for (const why of ['more than any doc takes', "didn't open under this room's key", 'of another version']) if (!warned.some((m) => m.includes(why))) fail(`no warning says the copy ${why}: ${warned.join(' | ')}`);
+  console.warn = warn;
+  // With persist, a doc name must be well-formed: lone surrogates would all encode as U+FFFD, one key for all.
+  for (const [name, ok] of [['\uD800', false], ['a\uDC00b', false], ['😀', true]]) {
+    let threw = null;
+    try {
+      a2.doc(name, { persist: spy }).close();
+    } catch (e) {
+      threw = e;
+    }
+    if (ok ? threw : !(threw instanceof RangeError)) fail(`persist with the name ${JSON.stringify(name)}: ${threw}`);
+    a2.doc(name).close();
+  }
+  // Closed and opened again at once (a component that remounts): the new doc loads what the closing one saved,
+  // also when it closed while its copy loaded, and one that closes with nothing written leaves the copy as it was.
+  const r1 = a2.doc('remount', { persist: spy });
+  r1.map('m').set('v', 1);
+  r1.close();
+  const r2 = a2.doc('remount', { persist: spy });
+  if ((await r2.loaded) !== 'loaded' || r2.map('m').get('v') !== 1) fail('a doc closed while its copy loaded, opened again at once, lost its write');
+  r2.map('m').set('v', 2);
+  r2.close();
+  a2.doc('remount', { persist: spy }).close();
+  const r4 = a2.doc('remount', { persist: spy });
+  if ((await r4.loaded) !== 'loaded' || r4.map('m').get('v') !== 2) fail(`a doc closed and opened again at once: ${r4.map('m').get('v')}`);
+  await k2.forget();
+  if ((await store.get(key)) !== undefined) fail('forget() left the copy');
+  for (const persist of [true, {}, { get() {}, set() {} }]) {
+    let threw = null;
+    try {
+      a2.doc(`p${String(persist)}`, { persist });
+    } catch (e) {
+      threw = e;
+    }
+    if (!(threw instanceof TypeError)) fail(`persist ${JSON.stringify(persist)} in Node: ${threw}`);
+  }
+  for (const r of [a2, b2, other]) await r.leave();
+  // The README's store over files. A copy it can't read (here a directory in its place: EISDIR) isn't "no copy":
+  // 'blocked', and that opening writes nothing over it. A save leaves no temp file.
+  const { readFile, writeFile, rename, rm, mkdtemp, mkdir, readdir } = await import('node:fs/promises');
+  const files = (dir) => ({
+    get: (key) => readFile(`${dir}/${key}`).then((b) => new Uint8Array(b), (e) => {
+      if (e.code !== 'ENOENT') throw e; // unreadable isn't absent
+    }),
+    // Whole or not at all: a crash mid-write leaves the last copy.
+    set: (key, bytes) => writeFile(`${dir}/${key}.tmp`, bytes)
+      .then(() => rename(`${dir}/${key}.tmp`, `${dir}/${key}`)),
+    delete: (key) => rm(`${dir}/${key}`, { force: true }),
+  });
+  const dir = await mkdtemp(`${(await import('node:os')).tmpdir()}/peerwire-docs-`);
+  const disk = files(dir);
+  const f1 = await joinRoom(kopts);
+  f1.doc('board', { persist: disk }).map('meta').set('title', 'On disk');
+  await f1.leave();
+  const [record, ...more] = await readdir(dir);
+  if (more.length) fail(`the README's file store left ${more}`);
+  await rename(`${dir}/${record}`, `${dir}/aside`);
+  await mkdir(`${dir}/${record}`);
+  console.warn = (m) => warned.push(m);
+  const f2 = await joinRoom(kopts);
+  const fb = f2.doc('board', { persist: disk });
+  const unread = await fb.loaded;
+  fb.map('meta').set('title', 'Over it');
+  await fb.close();
+  console.warn = warn;
+  if (unread !== 'blocked' || (await readdir(dir)).sort().join() !== ['aside', record].sort().join() || (await readdir(`${dir}/${record}`)).length) fail(`a file store that can't read the copy: ${unread}, ${await readdir(dir)}`);
+  await rm(`${dir}/${record}`, { recursive: true });
+  await rename(`${dir}/aside`, `${dir}/${record}`);
+  const fd = f2.doc('board', { persist: disk });
+  if ((await fd.loaded) !== 'loaded' || fd.map('meta').get('title') !== 'On disk' || (await readdir(dir)).length !== 1) fail("the README's file store");
+  await fd.forget();
+  if ((await readdir(dir)).length) fail("forget() with the README's file store left a file");
+  await f2.leave();
+  await rm(dir, { recursive: true });
+  console.log("a doc kept on this device: back when its member came back, a member never there got it, the copy sealed, forget() deletes it, also in files");
+}
 console.log('room_doc: 3 members converge, late joiners catch up, frames stay out of messages, leave closes docs: ok');
 process.exit(0);
