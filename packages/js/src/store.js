@@ -20,8 +20,9 @@ import { MESSAGE_BYTES, STORED_FRAMES } from './doc.js';
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 // The copy's format. A copy of another VERSION is never read nor written over, so bump it whenever an older
-// release's Doc.restore() would refuse what Doc.snapshot() now writes (a new `v`, a frame it doesn't read): one it
-// refuses counts as none, and its next save replaces it.
+// release's Doc.restore() would refuse, or read only in part, what Doc.snapshot() now writes (a new `v`, a frame it
+// doesn't read, a field it doesn't know): one it refuses counts as none, and its next save replaces it; one it reads
+// in part is saved back without what it skipped, as parseFrame and restore() ignore fields they don't know.
 const VERSION = 1;
 const IV_BYTES = 12;
 const TAG_BYTES = 16;

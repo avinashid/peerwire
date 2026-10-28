@@ -196,8 +196,9 @@ export declare class Room {
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
   /** Tells every peer we're going, then closes the links, all before it returns (so it works from `pagehide`,
-   * where it also runs); the promise resolves once docs kept on this device (`persist`) have saved. Reliable
-   * messages not yet acknowledged may not arrive: the goodbye can overtake them. */
+   * where it also runs); the promise resolves once docs kept on this device (`persist`) have saved, however long
+   * the store takes (one that never settles holds it; the links are closed by then). Reliable messages not yet
+   * acknowledged may not arrive: the goodbye can overtake them. */
   leave(): Promise<void>;
 }
 
@@ -337,8 +338,8 @@ export interface Doc {
    * What the doc holds stays. Rejects if the storage fails. */
   forget(): Promise<void>;
   /** Stops syncing and forgets the doc; `room.doc(name)` later opens it afresh and catches up. Writes after it
-   * throw. A doc kept on this device saves first: the promise resolves once it has (closed while a store takes
-   * more than 5 s to load the copy, it resolves then, saving nothing). */
+   * throw. A doc kept on this device saves first: the promise resolves once the store has the copy, however long
+   * that takes (closed while a store takes more than 5 s to load the copy, it resolves then, saving nothing). */
   close(): Promise<void>;
 }
 
