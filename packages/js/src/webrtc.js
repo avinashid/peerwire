@@ -31,9 +31,10 @@ export const RTC_FALLBACK_MS = 8000;
 // a DataChannel that opens after the fallback takes the link over (see dc.onopen).
 export const RTC_SAME_NAT_FALLBACK_MS = 3000;
 // Pipes: datagrams are batched for PIPE_FLUSH_MS into one signalling message of at
-// most PIPE_BATCH bytes. All pipes together send PIPE_RATE messages a second (burst
-// PIPE_BURST), within what public relays allow one client, and batch more while they
-// wait; past PIPE_QUEUE bytes waiting on a pipe, the oldest is dropped. close() sends
+// most PIPE_BATCH bytes, or sent at once when they fill one. All pipes together send
+// PIPE_RATE messages a second (burst PIPE_BURST), within what public relays allow one
+// client, and batch more while they wait; past PIPE_QUEUE bytes waiting on a pipe, the
+// oldest is dropped. close() sends
 // what waits as one last batch per pipe, past the budget, for at most PIPE_CLOSE_BATCHES
 // pipes, those that queued last first.
 export const PIPE_FLUSH_MS = 40;
@@ -43,6 +44,26 @@ export const PIPE_BURST = 6;
 export const PIPE_QUEUE = 64 * 1024;
 export const PIPE_CLOSE_BATCHES = 16;
 const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
+const full = (p) => p.bytes >= PIPE_BATCH || p.q.length >= MAX_PIPE_ITEMS; // a pipe's queue fills a batch
+const unflush = (p) => {
+  clearTimeout(p.timer?.id);
+  p.timer = null;
+};
+// A pipe timer that fires PIPE_LATE_MS late or more is a background tab's, held back to once
+// a second: until one fires on time again, the pipes gather datagrams for the rest of the task
+// rather than for PIPE_FLUSH_MS, and send batch after batch as the rate allows, so a background
+// tab answering over signalling isn't held to one batch a round trip of a second.
+const PIPE_LATE_MS = 250;
+// Runs `fn` in a task of its own after this one, which a background tab doesn't hold back as it
+// does timers.
+const nextTask = typeof setImmediate === 'function' ? setImmediate : (() => {
+  const fns = [];
+  const ch = new MessageChannel();
+  ch.port1.onmessage = () => {
+    for (const fn of fns.splice(0)) fn();
+  };
+  return (fn) => fns.push(fn) === 1 && ch.port2.postMessage(null);
+})();
 export const MAX_PIPE_PEERS = 256; // peers allowed to open a pipe to us
 // Without trickle, an offer or answer goes once ICE gathering is complete, or
 // GATHER_SETTLE_MS after the first public (srflx/relay) candidate, or at
@@ -268,6 +289,7 @@ export class WebRtcTransport {
     this.pipeByPeer = new Map(); // peer hex -> handle
     this.pipeAllowed = new Set(); // peers whose datagrams over signalling we take
     this.pipeTokens = PIPE_BURST; // the rate budget all pipes share
+    this.pipeLate = false; // a pipe timer fired late: see PIPE_LATE_MS
     this.pipeRefilled = Date.now();
     this.pipeQueued = 0; // datagrams queued on pipes so far; a pipe's `queued`: the count at its latest
     // Batches sent; datagrams received, dropped (queue full), and stale (from a peer whose
@@ -840,17 +862,33 @@ export class WebRtcTransport {
       p.bytes -= p.q.shift()[1];
       this.piped.dropped++;
     }
-    this.pipeFlushSoon(p, PIPE_FLUSH_MS);
+    // A full batch goes now, if the rate allows, not after PIPE_FLUSH_MS: a background tab
+    // fires that timer once a second at most.
+    if (!full(p)) return this.pipeFlushSoon(p);
+    unflush(p);
+    this.pipeFlush(p);
   }
 
+  // Flushes `p` in `ms`, unless a flush is due already. Without `ms`, once the datagrams
+  // queued in a moment are in: in PIPE_FLUSH_MS, or at the end of the task while the pipe
+  // timers fire late.
   pipeFlushSoon(p, ms) {
-    if (!p.timer) p.timer = setTimeout(() => this.pipeFlush(p), ms);
+    if (p.timer) return;
+    const t = (p.timer = { id: null });
+    const run = () => p.timer === t && this.pipeFlush(p);
+    if (ms === undefined && this.pipeLate) return void nextTask(run);
+    ms ??= PIPE_FLUSH_MS;
+    const due = Date.now() + ms;
+    t.id = setTimeout(() => {
+      this.pipeLate = Date.now() - due >= PIPE_LATE_MS;
+      run();
+    }, ms);
   }
 
   // Sends a batch from `p`'s queue. `last` (see close()): one batch now, past the rate
   // budget, of the newest datagrams if they don't all fit, as those are a leaving room's.
   pipeFlush(p, last = false) {
-    p.timer = null;
+    unflush(p);
     if (this.pipes.get(p.handle) !== p || !p.q.length) return;
     // A channel carries the peer's datagrams now (an adopted one, or its own that opened
     // late; see onTransmit): those queued before it opened go there too, not over signalling.
@@ -885,7 +923,7 @@ export class WebRtcTransport {
     } catch {
       // A closed signalling channel: the datagrams are lost, as on a dead path.
     }
-    if (p.q.length) this.pipeFlushSoon(p, PIPE_FLUSH_MS);
+    if (p.q.length) this.pipeFlushSoon(p);
   }
 
   pipeReceive(from, d) {
@@ -1025,7 +1063,7 @@ export class WebRtcTransport {
   dropPipe(peer) {
     const h = this.pipeByPeer.get(peer);
     if (h === undefined) return;
-    clearTimeout(this.pipes.get(h).timer);
+    unflush(this.pipes.get(h));
     this.pipes.delete(h);
     this.pipeByPeer.delete(peer);
   }
@@ -1038,7 +1076,7 @@ export class WebRtcTransport {
     // the peers of the rest see us go at their timeout, as before.
     const sent = this.piped.sent;
     for (const p of [...this.pipes.values()].sort((x, y) => y.queued - x.queued)) {
-      clearTimeout(p.timer);
+      unflush(p);
       if (this.piped.sent - sent < PIPE_CLOSE_BATCHES) this.pipeFlush(p, true);
     }
     this.checking.clear();

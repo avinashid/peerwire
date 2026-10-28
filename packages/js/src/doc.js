@@ -6,6 +6,7 @@
 //   const strokes = doc.set('strokes');              // const id = strokes.add(stroke); strokes.delete(id)
 //   const chat = doc.log('messages', { keep: 500 }); // chat.append({ text })
 //   doc.on('change', (ev) => render(ev));
+//   doc.on('sync', ({ state, from, have, total }) => status(state)); // 'alone', 'loading' or 'synced'
 //
 // Every write is a dot, (writer, n). The writer is our PeerId and a random incarnation, one per room.doc()
 // call, so a reloaded page never reuses a dot; n counts the writer's writes. A doc holds its live entries and
@@ -20,10 +21,15 @@
 // entries by (Lamport stamp, writer). Lamport stamps order writes, never wall time.
 //
 // Each write goes to every member as a delta: the new entry and the dots it replaces. A doc opened, and each
-// member that joins, is asked with our context, one member at a time, so a joiner gets the doc once rather
-// than from every member: the answer holds the entries we lack and the dots the member knows are dead. Every
-// frame is a piece of state joined into ours (delta-state CRDTs, Almeida et al. 2018), so frames apply in any
-// order and any number of times, and every member that has heard the same frames holds the same doc.
+// member that joins, is asked with our context, one member at a time and the best routed first (linked
+// directly, then relayed by a member, then over signalling), so a joiner gets the doc once rather than from
+// every member: the answer holds the entries we lack and the dots the member knows are dead. Every frame is a
+// piece of state joined into ours (delta-state CRDTs, Almeida et al. 2018), so frames apply in any order and
+// any number of times, and every member that has heard the same frames holds the same doc. So an answer goes
+// in pieces sized to the route, the newest entries first, each applied as it lands and acknowledged, a few
+// unacknowledged at a time; the next member is asked once an answer goes ASK_WAIT_MS without a piece, and its
+// ask, carrying what the pieces brought, is answered with only what is still missing. 'sync' says where this
+// stands: 'alone', 'loading' from a member with `have` of `total` entries, or 'synced'.
 //
 // Members are trusted alike to write, as in the room itself: any member can overwrite, delete or fill a doc,
 // and a member relaying a catch-up can claim any writer, so `from` is as good as the member that told us.
@@ -58,11 +64,13 @@ export const DEFAULT_KEEP = 1000; // entries a log keeps unless doc.log() says o
 export const MESSAGE_BYTES = 512 * 1024; // the most a doc frame takes as UTF-8, half room.send's 1 MiB
 // Catching up with a member: the answers it gets and the asks we send it each come from a budget of
 // CATCHUP_BURST that refills one per CATCHUP_EVERY_MS, and what our answers carry, as JSON text, from one of
-// CATCHUP_CHARS (two full docs) that refills CATCHUP_CHARS_PER_S. An answer or ask past a budget waits for it
-// rather than being dropped, so a doc closed and opened again (a component that remounts) catches up every
-// time, and an asker can't have us send more, whatever it claims to lack. The deletions a member's answers
-// have us send on to the others come from its CATCHUP_CHARS too, once for each member they go to; past it they
-// aren't sent on, and the others hear of them from that member or when they next catch up.
+// CATCHUP_CHARS (two full docs) that refills CATCHUP_CHARS_PER_S: an answer's first piece takes an answer,
+// and each piece its characters. An answer or ask past a budget waits for it rather than being dropped, so a
+// doc closed and opened again (a component that remounts) catches up every time, and an asker can't have us
+// send more, whatever it claims to lack or acknowledges: a piece past the chars budget waits for it, and an
+// acknowledgement only lets the answer asked for go on. The deletions a member's answers have us send on to the
+// others come from its CATCHUP_CHARS too, once for each member they go to; past it they aren't sent on, and
+// the others hear of them from that member or when they next catch up.
 const CATCHUP_BURST = 8;
 const CATCHUP_EVERY_MS = 15000;
 const CATCHUP_CHARS = 2 * MAX_DOC_LENGTH;
@@ -73,8 +81,18 @@ const BUDGETS = {
   asks: [CATCHUP_BURST, CATCHUP_EVERY_MS],
   chars: [CATCHUP_CHARS, 1000 / CATCHUP_CHARS_PER_S],
 };
-// How long an answer may take before the next member is asked.
+// An answer goes in pieces, its newest entries first and then the dots it knows are dead: each piece about
+// PIECE_CHARS of JSON text for the route to the asker (one entry at least), so a slow route gets small ones
+// and a route that changes, pieces to fit it. The asker acknowledges each piece it applies (MORE), and at most
+// WINDOW go unacknowledged, so the answer keeps pace with the route and live writes never wait behind all of it.
+const PIECE_CHARS = { direct: 128 * 1024, peer: 32 * 1024, signaling: 32 * 1024 };
+const WINDOW = 4;
+// Members are asked in the order of their routes: linked directly, relayed by a member, over signalling.
+const RANK = { direct: 0, peer: 1, signaling: 2 };
+// The turn of the member asked passes on once its answer has gone ASK_WAIT_MS without a piece (it stalled) or
+// taken TURN_MS, if another member is waiting to be asked. Its answer goes on all the same.
 const ASK_WAIT_MS = 5000;
+const TURN_MS = 60000;
 // Incarnations a doc moves through when members claim its future dots.
 const MAX_INCARNATIONS = 16;
 // The longest array a frame may hold: entries, dead ranges, writers.
@@ -83,6 +101,7 @@ const MAX_STAMP = Number.MAX_SAFE_INTEGER;
 const DELTA = 1;
 const ASK = 2;
 const ANSWER = 3;
+const MORE = 4;
 const TYPES = { m: 'map', s: 'set', l: 'log' };
 const WRITER = /^[0-9a-f]{72}$/;
 // Estimated UTF-8 bytes in a frame: 3 per character of JSON text, and room for numbers and punctuation (a
@@ -92,6 +111,7 @@ const RANGE_BYTES = 48;
 const ENTRY_BYTES = 96;
 
 const count = (n) => Number.isSafeInteger(n) && n >= 1;
+const index = (n) => Number.isSafeInteger(n) && n >= 0;
 const peerOf = (w) => w.slice(0, 64);
 // Whether entry a sorts after entry b: the later stamp, then the higher writer, then the later dot.
 const after = (a, b) => a.c > b.c || (a.c === b.c && (a.w > b.w || (a.w === b.w && a.n > b.n)));
@@ -252,11 +272,16 @@ class Context {
 }
 
 // A frame from `peer`, checked: null if any field is off. Entries come back with their length as JSON text.
+// An ask carries its number `q`, and `z` if its doc reads deflated frames; a piece of an answer, the ask's `q`,
+// its own number `i`, `n` the entries the whole answer carries, and on the last, `end` and `s` if the member
+// had caught up itself. A MORE acknowledges piece `i` of the answer to ask `q`.
 function parseFrame(m, peer) {
   if (m === null || typeof m !== 'object' || Array.isArray(m)) return null;
   const { t, ws } = m;
+  if (t === MORE) return count(m.q) && index(m.i) ? { t, q: m.q, i: m.i } : null;
   if (t !== DELTA && t !== ASK && t !== ANSWER) return null;
   if (!Array.isArray(ws) || ws.length > FRAME_ITEMS || !ws.every((w) => typeof w === 'string' && WRITER.test(w))) return null;
+  if (t === ASK && (!count(m.q) || (m.z !== undefined && m.z !== 1))) return null;
   const writer = (i) => (Number.isInteger(i) && i >= 0 && i < ws.length ? ws[i] : null);
   const ranges = [];
   const list = t === ASK ? m.r : m.x;
@@ -269,7 +294,9 @@ function parseFrame(m, peer) {
       ranges.push([w, r[1], r[2]]);
     }
   }
-  if (t === ASK) return { t, ranges };
+  if (t === ASK) return { t, ranges, q: m.q, z: m.z === 1 };
+  if (t === ANSWER && m.q !== undefined && (!count(m.q) || !index(m.i) || !index(m.n))) return null;
+  if (t === ANSWER && m.s !== undefined && (m.s !== 1 || m.end !== 1)) return null;
   const entries = [];
   if (m.e !== undefined) {
     if (!Array.isArray(m.e) || m.e.length > FRAME_ITEMS) return null;
@@ -287,12 +314,21 @@ function parseFrame(m, peer) {
     }
   }
   if (m.end !== undefined && m.end !== 1) return null;
-  return { t, entries, ranges, end: m.end === 1 };
+  const f = { t, entries, ranges, end: m.end === 1 };
+  return t === ANSWER && m.q !== undefined ? Object.assign(f, { q: m.q, i: m.i, n: m.n, s: m.s === 1 }) : f;
+}
+
+// The answer to `m`, a member's ask for a doc we don't have open: nothing, so that the asker counts us as
+// answered rather than waiting for us. Null if `m` isn't an ask. About the ask's size, and to its sender only.
+export function unopened(m) {
+  if (m?.t !== ASK || !validName(m.d) || !count(m.q)) return null;
+  return { d: m.d, t: ANSWER, ws: [], q: m.q, i: 0, n: 0, end: 1 };
 }
 
 // One doc, shared by every member that opens the same name. `host` is the room's side:
-// { self, peers() (joined members), send(peer, message), after(ms, fn) -> cancel, now() (ms), closed(doc),
-// incarnation() }.
+// { self, peers() (joined members), send(peer, message, deflate) (`deflate`: the member reads deflated frames),
+// after(ms, fn) -> cancel, now() (ms), closed(doc), incarnation(), route(peer) ('direct', 'peer' or
+// 'signaling'), deflate (we read deflated frames) }.
 export class Doc {
   constructor(name, host) {
     if (!validName(name)) throw new RangeError(`a doc name is 1 to ${MAX_NAME_LENGTH} characters`);
@@ -308,12 +344,19 @@ export class Doc {
     this.incarnations = 0;
     this.newIncarnation();
     this.handlers = new Set();
+    this.syncHandlers = new Set();
     this.touched = new Map(); // changes during one frame or write: collection -> ref -> { coll, ref, before }
     this.idle = new Set(); // writers the context holds with no live entry, longest idle first
-    this.members = new Map(); // peer -> { answers, asks, chars, theirs, answerWait, askWait, stalled, askAgain }
+    this.members = new Map(); // peer -> catch-up state, see member()
     this.queue = []; // members to ask, in turn
-    this.asking = null; // the member asked, until its answer ends or ASK_WAIT_MS passes
+    this.asking = null; // the member whose turn it is, see nextAsk
     this.cancelWait = null;
+    // Our asks are numbered from the incarnation's random bits, so a doc opened again never takes an answer to
+    // the asks of the one before it for its own.
+    this.askNo = (Number.parseInt(this.writer.slice(64, 72), 16) || 0) * 2 ** 20;
+    // Caught up: an answer from a member that had caught up itself ended, or every member had answered.
+    this.synced = false;
+    this.sync = Object.freeze(this.status());
     this.closed = false;
     // While a frame is applied: a claim on our own dots, the span of them its entries took, a sender's write
     // we count as seen and don't hold, and the dead ranges a catch-up has us send on.
@@ -346,14 +389,17 @@ export class Doc {
     return new DocLog(this, name);
   }
 
+  // 'change': a key or item changed. 'sync': where catching up stands changed (see status).
   on(event, fn) {
-    if (event !== 'change') throw new TypeError(`a doc has one event, 'change', not ${String(event)}`);
-    this.handlers.add(fn);
+    const set = event === 'change' ? this.handlers : event === 'sync' ? this.syncHandlers : null;
+    if (!set) throw new TypeError(`a doc's events are 'change' and 'sync', not ${String(event)}`);
+    set.add(fn);
     return () => this.off(event, fn);
   }
 
   off(event, fn) {
     if (event === 'change') this.handlers.delete(fn);
+    else if (event === 'sync') this.syncHandlers.delete(fn);
   }
 
   // Stops syncing and forgets the doc: room.doc(name) later opens it afresh and catches up again.
@@ -364,6 +410,7 @@ export class Doc {
     this.queue = [];
     this.asking = null;
     this.handlers.clear();
+    this.syncHandlers.clear();
     this.entries.clear();
     this.byWriter.clear();
     this.colls.clear();
@@ -377,9 +424,11 @@ export class Doc {
 
   // The room's side.
 
-  // Asks every member: the doc was just opened.
+  // Asks every member: the doc was just opened. (A store would load the doc's entries and context here, before
+  // the first ask, so the ask carries them and members send only what it lacks.)
   open() {
     for (const p of this.host.peers()) this.startAsk(p);
+    this.emitSync();
   }
 
   joined(peer) {
@@ -393,6 +442,12 @@ export class Doc {
     this.members.delete(peer);
     this.queue = this.queue.filter((p) => p !== peer);
     if (this.asking === peer) this.nextAsk(true);
+    this.emitSync();
+  }
+
+  // A member's route changed: one better routed than the member whose turn it is may take the turn.
+  rerouted() {
+    if (!this.closed) this.better();
   }
 
   // A doc frame from member `peer`, already parsed from JSON. One that is malformed is dropped.
@@ -401,6 +456,7 @@ export class Doc {
     const f = parseFrame(m, peer);
     if (!f) return;
     if (f.t === ASK) return this.onAsk(peer, f);
+    if (f.t === MORE) return this.onMore(peer, f);
     this.claimed = false;
     this.claim = null;
     this.unheard = false;
@@ -424,16 +480,35 @@ export class Doc {
     // A write of the sender's own that we count as seen yet don't hold: it was deleted before it reached us,
     // or a member claimed the sender's dots ahead of it. Our ask shows the sender our context.
     if (this.unheard) this.startAsk(peer);
-    if (f.t === ANSWER && f.end && this.asking === peer) this.nextAsk(true);
-    // A member whose ask timed out is asked again once it has answered, if it was due an ask meanwhile.
+    if (f.q !== undefined) this.landed(peer, f);
+  }
+
+  // A piece of an answer, applied: if it answers our latest ask of the member, it is acknowledged (unless a
+  // better routed member took the turn), and the last ends the ask.
+  landed(peer, f) {
     const st = this.members.get(peer);
-    if (f.t === ANSWER && f.end && st?.stalled) {
+    const a = st?.ask;
+    if (!a || f.q !== a.q) return;
+    a.got += f.entries.length;
+    a.n = f.n;
+    a.last = this.now();
+    if (!f.end) {
+      if (!a.paused) this.host.send(peer, { d: this.name, t: MORE, q: a.q, i: f.i }, st.z);
+      return this.emitSync();
+    }
+    st.ask = null;
+    st.answered = true;
+    if (f.s) this.synced = true;
+    if (this.asking === peer) this.nextAsk(true);
+    // A member whose turn passed as it stalled is asked again once it has answered, if it was due an ask meanwhile.
+    if (st.stalled) {
       st.stalled = false;
       if (st.askAgain) {
         st.askAgain = false;
         this.startAsk(peer);
       }
     }
+    this.emitSync();
   }
 
   // Local writes.
@@ -774,7 +849,7 @@ export class Doc {
   // Sends entries and dead ranges to every member but `except`, as one delta or a few.
   broadcast(entries, ranges, except) {
     const frames = this.pack(DELTA, entries, ranges, false);
-    for (const p of this.host.peers()) if (p !== except) for (const f of frames) this.host.send(p, f);
+    for (const p of this.host.peers()) if (p !== except) for (const f of frames) this.host.send(p, f, this.members.get(p)?.z);
   }
 
   // Sends dead ranges member `peer`'s answer named on to our other members, unless its `chars` budget is empty,
@@ -788,7 +863,7 @@ export class Doc {
     const frames = this.pack(DELTA, [], ranges, false);
     const chars = frames.reduce((s, f) => s + JSON.stringify(f).length, 0);
     this.spend(st, 'chars', chars * to.length, now);
-    for (const p of to) for (const f of frames) this.host.send(p, f);
+    for (const p of to) for (const f of frames) this.host.send(p, f, this.members.get(p)?.z);
   }
 
   // Frames of kind `t` holding `entries` and dead `ranges`, each under MESSAGE_BYTES as UTF-8, with `end`
@@ -829,12 +904,14 @@ export class Doc {
     return frames;
   }
 
-  // A member's catch-up: when each of its budgets (BUDGETS) is whole again, its latest ask (`theirs`) and the
-  // wait for its answer, the wait for our ask of it, and whether our last ask timed out (`stalled`) and another
-  // is due once it answers.
+  // A member's catch-up: when each of its budgets (BUDGETS) is whole again; its latest ask while it waits for
+  // them (`theirs`, numbered `want`), our answer under way (`out`, see answerOf) and the wait for the budgets;
+  // whether it reads deflated frames (`z`); our latest ask of it (`ask`) until its answer ends, the wait for our
+  // budget to ask it, whether it has answered one, and whether its turn passed as it stalled (`stalled`) and
+  // another ask is due once it answers.
   member(peer) {
     let st = this.members.get(peer);
-    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, chars: 0, theirs: null, answerWait: null, askWait: null, stalled: false, askAgain: false }));
+    if (!st) this.members.set(peer, (st = { answers: 0, asks: 0, chars: 0, theirs: null, want: 0, out: null, answerWait: null, z: false, ask: null, askWait: null, answered: false, stalled: false, askAgain: false }));
     return st;
   }
 
@@ -865,21 +942,29 @@ export class Doc {
 
   // Catching up.
 
-  // Queues an ask of `peer`. One that let an ask of ours time out isn't asked again until it answers, so a member
+  // Queues an ask of `peer`. One whose turn passed as it stalled isn't asked again until it answers, so a member
   // that never does holds the others' turns up once, not each time it prompts us.
   startAsk(peer) {
     const st = this.member(peer);
-    if (this.asking === peer || this.queue.includes(peer)) return;
     if (st.stalled) return void (st.askAgain = true);
+    if (this.asking === peer || this.queue.includes(peer)) return;
     const now = this.now();
     const wait = this.early(st, 'asks', now);
     if (wait > 0) return this.later(peer, st, 'askWait', wait, () => this.startAsk(peer));
     this.spend(st, 'asks', 1, now);
     this.queue.push(peer);
     if (!this.asking) this.nextAsk(false);
+    else this.better();
   }
 
-  // Asks the next member in the queue; `done` ends the ask under way.
+  // How a member is reached, as a rank (RANK): 0 linked directly or with a host that doesn't say, 1 relayed by a
+  // member, 2 over signalling.
+  rank(peer) {
+    return RANK[this.host.route?.(peer)] ?? 0;
+  }
+
+  // Gives the turn to the next member in the queue, the best routed (of those, the first queued), and asks it;
+  // `done` ends the turn under way.
   nextAsk(done) {
     if (done) {
       this.cancelWait?.();
@@ -888,23 +973,86 @@ export class Doc {
     }
     if (this.asking || this.closed) return;
     const peers = new Set(this.host.peers());
-    while (this.queue.length) {
-      const p = this.queue.shift();
-      if (!peers.has(p)) continue;
+    this.queue = this.queue.filter((p) => peers.has(p));
+    if (this.queue.length) {
+      let k = 0;
+      for (let j = 1; j < this.queue.length; j++) if (this.rank(this.queue[j]) < this.rank(this.queue[k])) k = j;
+      const [p] = this.queue.splice(k, 1);
+      const st = this.member(p);
+      const now = this.now();
       this.asking = p;
-      this.host.send(p, this.askFrame());
-      this.cancelWait = this.host.after(ASK_WAIT_MS, () => {
-        if (this.asking !== p) return;
-        this.member(p).stalled = true;
-        this.nextAsk(true);
-      });
-      return;
+      st.ask = { q: ++this.askNo, at: now, last: now, got: 0, n: 0, paused: false };
+      this.host.send(p, this.askFrame(st.ask.q), st.z);
+      this.watch(p, st.ask);
+    }
+    this.emitSync();
+  }
+
+  // Watches the turn of member `p`, whose answer to `ask` is under way: it passes on once the answer has gone
+  // ASK_WAIT_MS without a piece (the member stalled) or taken TURN_MS, if another member is waiting to be asked.
+  // A member that stalled with none waiting keeps the turn, until one is (see better).
+  watch(p, ask) {
+    const due = Math.min(ask.last + ASK_WAIT_MS, this.queue.length ? ask.at + TURN_MS : Infinity);
+    this.cancelWait = this.host.after(Math.ceil(due - this.now()), () => {
+      this.cancelWait = null;
+      const st = this.members.get(p);
+      if (this.closed || this.asking !== p || st?.ask !== ask) return;
+      const now = this.now();
+      if (now - ask.last >= ASK_WAIT_MS) st.stalled = true;
+      else if (!this.queue.length || now - ask.at < TURN_MS) return this.watch(p, ask);
+      if (this.queue.length) this.nextAsk(true);
+    });
+  }
+
+  // With a member waiting to be asked, the turn passes on if the member whose turn it is stalled or has had
+  // TURN_MS, or the one waiting is better routed (linked directly, while the answer comes over signalling, say):
+  // then the answer under way is paused, and its member asked again after, with what we hold by then.
+  better() {
+    const p = this.asking;
+    if (!p || !this.queue.length) return;
+    const st = this.member(p);
+    if (st.stalled || this.now() - st.ask.at >= TURN_MS) return this.nextAsk(true);
+    const r = this.rank(p);
+    if (!this.queue.some((x) => this.rank(x) < r)) return;
+    st.ask.paused = true;
+    this.queue.push(p);
+    this.nextAsk(true);
+  }
+
+  // Where catching up stands: 'alone' with no member to catch up from, 'synced' once caught up (see synced),
+  // else 'loading' from the member whose turn it is, with `have` of the `total` entries its answer carries
+  // (as it says; 0 of 0 until its first piece lands).
+  status() {
+    const peers = this.host.peers().length;
+    if (!peers || this.synced) return { state: peers ? 'synced' : 'alone', from: null, have: 0, total: 0 };
+    const a = this.asking ? this.members.get(this.asking)?.ask : null;
+    return { state: 'loading', from: this.asking, have: a ? Math.min(a.got, a.n) : 0, total: a?.n ?? 0 };
+  }
+
+  // Emits 'sync' if where catching up stands changed. Every member having answered counts as caught up: none
+  // had caught up itself (they opened the doc together), so what they hold is all there is.
+  emitSync() {
+    if (this.closed) return;
+    const peers = this.host.peers();
+    if (!this.synced && peers.length && peers.every((p) => this.members.get(p)?.answered)) this.synced = true;
+    const s = this.status();
+    const o = this.sync;
+    if (s.state === o.state && s.from === o.from && s.have === o.have && s.total === o.total) return;
+    this.sync = Object.freeze(s);
+    for (const fn of this.syncHandlers) {
+      try {
+        fn(this.sync);
+      } catch (e) {
+        setTimeout(() => {
+          throw e;
+        });
+      }
     }
   }
 
-  // Our context, so the member answers with what we lack. Under MESSAGE_BYTES at the caps; were it not, a
-  // shorter one only asks for more.
-  askFrame() {
+  // Our context, so the member answers with what we lack, and `q` for the answer to name. Under MESSAGE_BYTES at
+  // the caps; were it not, a shorter one only asks for more.
+  askFrame(q) {
     const ws = [];
     const r = [];
     let bytes = 3 * jsonLength(this.name) + 64 + WRITER_BYTES;
@@ -918,41 +1066,92 @@ export class Doc {
         bytes += RANGE_BYTES;
       }
     }
-    return { d: this.name, t: ASK, ws, r };
+    const f = { d: this.name, t: ASK, ws, r, q };
+    if (this.host.deflate) f.z = 1;
+    return f;
   }
 
   onAsk(peer, f) {
     if (f.ranges.some(([w, , b]) => w === this.writer && b > this.n)) this.newIncarnation();
     const st = this.member(peer);
-    // Answered now or, past the member's budgets, once they allow: only its latest ask waits.
+    st.z = f.z;
+    // Answered now or, past the member's budget, once it allows: only its latest ask waits, in place of the answer
+    // under way.
     st.theirs = Context.of(f.ranges);
-    this.answer(peer, st);
+    st.want = f.q;
+    st.out = null;
+    this.serve(peer, st);
     // It has seen dots we haven't: ask it back.
     if (f.ranges.some(([w, a, b]) => !this.ctx.covers(w, a, b))) this.startAsk(peer);
   }
 
-  // The entries the member's ask lacks, and every dot we know is dead, if its budgets allow. A wait may find
-  // its ask answered already, when a later one came as the budget did.
-  answer(peer, st) {
-    if (!st.theirs) return;
+  // Starts the answer to the member's latest ask once its answers budget allows, then sends pieces while the
+  // answer's window and the chars budget allow; past a budget, it waits for it. A wait may find the ask answered
+  // already, when a later one came as the budget did.
+  serve(peer, st) {
     const now = this.now();
-    const wait = Math.max(this.early(st, 'answers', now), this.early(st, 'chars', now));
-    if (wait > 0) return this.later(peer, st, 'answerWait', wait, () => this.answer(peer, st));
-    st.answerWait?.();
-    st.answerWait = null;
-    const theirs = st.theirs;
-    st.theirs = null;
+    if (st.theirs) {
+      const wait = this.early(st, 'answers', now);
+      if (wait > 0) return this.later(peer, st, 'answerWait', wait, () => this.serve(peer, st));
+      this.spend(st, 'answers', 1, now);
+      st.out = this.answerOf(st.theirs, st.want);
+      st.theirs = null;
+    }
+    const o = st.out;
+    while (o && st.out === o && o.next - o.acked - 1 < WINDOW) {
+      const wait = this.early(st, 'chars', this.now());
+      if (wait > 0) return this.later(peer, st, 'answerWait', wait, () => this.serve(peer, st));
+      this.piece(peer, st, o);
+    }
+  }
+
+  // An answer to ask `q`, whose context is `theirs`: the entries it lacks, the newest first, then every dot we
+  // know is dead. Pieces are numbered from 0 (`next`, the next one), and acknowledged up to `acked`.
+  answerOf(theirs, q) {
+    const list = [];
+    for (const e of this.entries.values()) if (!theirs.has(e.w, e.n)) list.push(e);
+    list.sort((a, b) => byStamp(b, a));
+    return { q, list, i: 0, dead: this.dead(), j: 0, next: 0, acked: -1 };
+  }
+
+  // Sends answer `o`'s next piece: its next entries still held, then its dead ranges, about the route's
+  // PIECE_CHARS as the chars budget counts them (one entry at least, in two frames if MESSAGE_BYTES can't hold
+  // it), charged to the member's budget. The last has `end`, and `s` if we have caught up.
+  piece(peer, st, o) {
+    const size = PIECE_CHARS[this.host.route?.(peer)] ?? PIECE_CHARS.direct;
     const entries = [];
+    const ranges = [];
     let chars = 0;
-    for (const e of this.entries.values()) {
-      if (theirs.has(e.w, e.n)) continue;
+    for (; o.i < o.list.length; o.i++) {
+      const e = o.list[o.i];
+      // Gone since the ask: the member hears of that as the others did.
+      if (this.entries.get(e.id) !== e) continue;
+      if (chars && chars + ENTRY_BYTES + e.len > size) break;
       entries.push(e);
       chars += ENTRY_BYTES + e.len;
     }
-    const dead = this.dead();
-    this.spend(st, 'answers', 1, now);
-    this.spend(st, 'chars', chars + RANGE_BYTES * dead.length, now);
-    for (const f of this.pack(ANSWER, entries, dead, true)) this.host.send(peer, f);
+    for (; o.i === o.list.length && o.j < o.dead.length && (!chars || chars + RANGE_BYTES <= size); o.j++) {
+      ranges.push(o.dead[o.j]);
+      chars += RANGE_BYTES;
+    }
+    const end = o.i === o.list.length && o.j === o.dead.length;
+    if (end) st.out = null;
+    this.spend(st, 'chars', chars, this.now());
+    const frames = this.pack(ANSWER, entries, ranges, end);
+    for (const f of frames) {
+      Object.assign(f, { q: o.q, i: o.next++, n: o.list.length });
+      if (f.end && this.synced) f.s = 1;
+    }
+    for (const f of frames) this.host.send(peer, f, st.z);
+  }
+
+  // Piece `i` of our answer to the member's ask `q` was applied: the window moves on.
+  onMore(peer, f) {
+    const st = this.members.get(peer);
+    const o = st?.out;
+    if (!o || f.q !== o.q || f.i <= o.acked || f.i >= o.next) return;
+    o.acked = f.i;
+    this.serve(peer, st);
   }
 
   // The dots we have seen and don't hold, as ranges.
