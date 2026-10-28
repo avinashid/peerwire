@@ -56,7 +56,8 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `41cc24a` (2026-10-26).**
+**Status as of main `41cc24a` (2026-10-26); the shared-doc rows (DOC-*) as of main
+`f40cffa` (2026-10-28).**
 
 | Finding | Status |
 |---|---|
@@ -91,6 +92,9 @@ that needs a change is tracked as an NB card.
 | RH-5 (Low), catch-up message size (Low), RH-6 (Info), N1 (nit) | **Fixed** by `12974c4`, merged `41cc24a`, in `@peerwire/react` 0.1.1 (a write members' data leaves no room for is dropped with a warning; catch-up messages capped at 512 KiB; versions kept instead of entries; a newer version an asker holds isn't sent), reviewed 2026-10-26, same section |
 | OUT-1 (Low) | Open, `@peerwire/js` 0.2.0 and main, [JS endpoint and rooms](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | RX-1 (Low), RX-2 (Info) | **Fixed** by `b0d354b` (the README's React example keeps string messages only, and only the last 100), reviewed 2026-10-24, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
+| DOC-1 (Medium), DOC-2, DOC-3 (Low) | **Fixed** by `979cdae`, `eaa2a22` and `a4fddfd`, with DOC-2a and DOC-3a by `d6b148c`, merged `c30ab0f`, before `room.doc()` was published (stamps taken however far ahead; no entry on our own writer that we didn't write; a frame costs about one pass over what it names), reviewed 2026-10-27, [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-5) |
+| DOC-2b (Low) | **Fixed** by `8b7946c`, merged `45c7cfd` (a catch-up's deletions passed on one range per range of it, charged to the sender's budget), reviewed 2026-10-27; residuals DOC-2c and I6, same section |
+| DOC-4, DOC-5 (Low) | **Fixed** by `f40cffa` (the merge of `ff51ce6`): a member over signalling is paused for a better routed one once per answer; a room with no doc open drops deflated doc frames unread. Reviewed 2026-10-28; residual I8, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -913,6 +917,180 @@ to c on its slow address, a packet relayed by c moved a's link from d to c, and 
 back to d. Fix: take that roam only when the packet came over a direct link
 (`if fast_from`), as the probe answer does; with it the core library tests pass. Open,
 suggested with Fast lane 3.
+
+### Shared docs, `room.doc()` (NB-006) — DOC-1…DOC-5
+
+`room.doc(name)` (`packages/js/src/doc.js`; room tag 7, and 8 when deflated) is a shared
+document of maps, sets and logs that every member holds. It is a delta-state CRDT: each
+write goes to every member as a delta, and a member that joins, or a doc opened again,
+asks one member at a time with its context and is answered with what it lacks. Members
+are trusted alike to write, as in the room: any member can overwrite, delete or fill a
+doc. What the doc defends is each member's app and resources:
+- Every frame is checked field by field and dropped whole if anything is off.
+- State lives in Maps.
+- Names, keys, values, entries, characters, writers and context ranges are capped
+  (`MAX_*`), and frames stay under 512 KiB.
+- What a member can have us send is budgeted per member:
+  - answers and asks: 8 at once, then one per 15 s;
+  - the characters our answers carry, and the deletions its answers have us pass on to
+    the others: 8 Mi at once, then 64 Ki a second.
+
+Reviewed by reading the code, with Node probes on fake networks of docs (no wasm):
+- NB-006 at `8ebea00`, then its fold-ins `d798c79` and `d6b148c` (merged `c30ab0f`,
+  2026-10-27);
+- NB-006c at `8b7946c` (merged `45c7cfd`, 2026-10-27);
+- NB-006e at `558f53c` and its fixes `ff51ce6` (merged `f40cffa`, 2026-10-28), by reading
+  the code and one mutant run of `doc_crdt.mjs`.
+
+**DOC-1 — A Lamport stamp far ahead was dropped for good (Medium).** NB-006 refused an
+entry whose stamp was more than 2^32 past our clock. Deltas aren't repeated, and an
+answer didn't resend it, so the entry never came again:
+- one such delta made a joiner miss later writes;
+- a few cut it off from everything newer;
+- two sent to one member alone muted that member at everyone else.
+
+**Fixed** by `979cdae`: every member takes any stamp up to 2^53 − 1. Residual: a member
+can move the stamps to 2^53 − 1 in one frame. From then on, values set at the same time,
+set items and log entries are ordered by writer (README, "Member data").
+
+**DOC-2 — An entry forged on our own next write corrupted the doc (Low).** Past
+`MAX_INCARNATIONS` (16) moves to a new writer, a member's answer could hold an entry on
+the dot our next write would take. The write then landed on it, which left the doc's
+index and length wrong, and the app's `delete()` threw a TypeError. **Fixed** by
+`eaa2a22`:
+- an entry on our own writer that we didn't write is never held;
+- writes skip dots our context has;
+- once every dot is claimed, writes return false or null with a warning until the doc
+  is opened again.
+
+**DOC-2a (Low)** was found in the re-check of `eaa2a22`: each forged dot was passed on to
+every other member as its own range, 3.7× what the forger sent with 6 other members and
+7.5× with 12. **Fixed** by `d6b148c`: one span per frame, from the lowest forged dot to
+the highest (0.01×).
+
+**DOC-2b — A catch-up's deletions were passed on one range per entry (Low).** An answer
+that names a writer's dots dead in one range had us send each other member one range
+for each entry it deleted here:
+- a 620-byte answer sent about 110 KB to each member (1000×);
+- a member's own items, deleted in cycles, sent 3.5× (6 others) to 7.0× (12).
+
+**Fixed** by `8b7946c` (merged `45c7cfd`):
+- each range of the answer that deleted entries goes on as one range, from the lowest
+  dot it deleted to the highest;
+- what a member's answers have us pass on is charged to its characters budget, once for
+  each member it goes to;
+- claims on our own writer's future dots are held as one span (I5), so our writer takes
+  at most two ranges of the context; the span is reset with each frame (I4).
+
+**DOC-3 — Frames that cost far more CPU than their size (Low).** On a loaded host:
+- `kill()` walked each copy of a range: a 246 KB frame took 3.0 s;
+- a full context churned in `makeRoom()`: a 1 MiB frame took 0.49 s;
+- trimming a log scanned per entry: a 490 KB frame took 0.27 s.
+
+**Fixed** by `a4fddfd`: dead ranges are merged per writer before the walk, idle writers
+are kept in insertion order, and logs keep a heap, so a frame costs about one pass over
+what it names (17–82 ms for the same cases).
+
+**DOC-3a (Low)** was found in the re-check: with 1024 live writers and a full context,
+`makeRoom()` scanned every writer once per range recorded (a 295 KB frame of separate
+ranges, about 0.4 s). **Fixed** by `d6b148c`, which evicts in batches (0.3–2.1× an empty
+context).
+
+**NB6-L1 — A doc opened again didn't catch up (lead's review).** In NB-006 as first
+written, catching up with a member was a budget per membership. So a doc closed and
+opened again, such as a component that remounts, wasn't caught up.
+
+The first fix, `26b7540`, made catching up a rate per member, and cleared what we had
+sent a member for each new incarnation of its doc. The asker picks its incarnation, so
+security's note showed that any member could then be sent the whole doc in every
+answer: theoretical, about 96 MB at once and 0.8 MB/s from each member.
+
+**Fixed** by `3564acf`: what answers carry has a budget of its own per member, the
+characters budget above. A doc that remounts catches up every time: a small doc 8 times
+in a row at once, then each up to 15 s late.
+
+**DOC-4 — A better routed member could pause a slower one's answer on every turn
+(Low).** NB-006e (`558f53c`) asks members by route: linked directly, then relayed, then
+over signalling. An answer coming over signalling is paused when a better routed member
+is queued, and its member is asked again after. Nothing limited how often:
+- a member linked directly that was queued again during each of the slower member's
+  turns paused that answer every cycle;
+- its asks budget refills at one per 15 s, faster than a 60 s turn passes;
+- so the slower member delivered at most 4 pieces a cycle, about 128 Ki characters a
+  minute, instead of its answer.
+
+**Fixed** by `ff51ce6` (merged `f40cffa`): a member is paused this way once until an
+answer of its ends. After that, the better routed member waits for the turn to pass (5 s
+without a piece, or 60 s with another waiting). The doc_crdt test: on `558f53c`, the
+member over signalling was asked 8 times over 7 turns, and 67 entries were sent for 44;
+on the fix, it was asked twice, and 47 were sent for 44.
+
+Test gap (Info): the test pins "once", not "again after the answer ends". A mutant that
+never clears the flag passes `doc_crdt.mjs`. Its cost would be time only: a route that
+becomes direct later waits for the turn to pass.
+
+**DOC-5 — Rooms with no doc open inflated deflated doc frames (Low).** NB-006e's `onDoc`
+stopped returning early with no doc open. So a room that never opens a doc (a game, a
+chat) inflated every deflated doc frame (tag 8) to as much as 16× its size, and parsed
+it. **Fixed** by `ff51ce6` (merged `f40cffa`): with no doc open, a deflated frame is
+dropped unread. A member deflates only for a doc whose ask said it reads deflated
+frames, so such a frame is for a doc we closed. Plain frames are still read at 1×,
+because an ask for a doc we don't have open gets an empty answer, to its sender only.
+The room_doc test reads 1 frame on the fix and 2 on `558f53c`.
+
+**NB-006e, checked with nothing found:**
+- **Answers in pieces.** An answer goes in pieces (32 Ki characters over signalling or
+  through a member, 128 Ki linked directly), at most 4 unacknowledged.
+  - A MORE moves only the window of the answer it names, and never past what was sent.
+  - Each piece is charged its characters before it goes, and an answer's first piece
+    takes one answer unit, so the bound is the one above.
+  - A piece is never empty unless it ends the answer.
+- **The turn.** A member that trickles pieces holds our turn at most 60 s per ask while
+  another member waits. One that stalls gives the turn up 5 s after its last piece, and
+  keeps it only while no other member can be asked.
+- **Inflating.** Inflate stops at min(1 MiB, 16× the compressed size), fed in 1 KiB
+  slices, so at most one slice's output is held past the cap. A truncated or junk stream
+  is dropped. Frames stay in order per member both ways, and one inflated after its
+  member left is dropped.
+- **The pipe.** Its budget is unchanged: 3 batches a second shared, burst 6.
+  - A full batch goes at once when a token is free.
+  - A pipe timer that fires 250 ms or more late (a background tab) moves flushes to the
+    end of the task, until one fires on time.
+  - Out of tokens, the pipe waits on a timer.
+- **Sync status.** `doc.sync` is as good as the members that told us (README).
+
+**Info:**
+- **I1–I3** (NB-006), addressed by `11cf2e6`:
+  - change notes were keyed so that map `a` key `b\0c` and map `a\0b` key `c` gave one
+    event;
+  - the README now says that versions without `room.doc()` (0.1.0 to 0.2.0) drop doc
+    frames;
+  - a member that let our ask time out is asked again only once it answers, so one that
+    never answers holds the others' turns up once.
+- **I4, I5** (NB-006c), fixed by `8b7946c`, under DOC-2b.
+- **I7** (NB-006e), fixed by `ff51ce6`: an answer under way held the entries the asker
+  lacked. A member that never acknowledged kept the doc as it was at its ask, deleted
+  values included, one copy per member. The answer now holds ids, and each is looked up
+  as its piece is cut.
+
+**Residuals (accepted; the README's "Member data" and "Logs" say them):**
+- **DOC-2c (Info):** a member that keeps a log longer than another can miss older
+  entries the other trimmed, once it catches up from that member, directly or through a
+  member that did (README `72548e2`). Give `keep` the same value on every member.
+- **I6 (Info):** the budgets are per member while it stays. A member that leaves and
+  joins again, or joins under a new id, starts with whole ones, so N ids get N budgets
+  (README `72548e2`).
+- **I8 (Info):** a member can make us inflate and parse up to 16× what it sends in
+  deflated doc frames (`DEFLATE_RATIO`). That is capped at 1 MiB a frame, plus at most
+  one 1 KiB slice's output past the cap, and holds only in rooms with a doc open
+  (DOC-5). A frame that would deflate more goes plain, by design.
+- **Member trust.** Any member can:
+  - claim another member's next writes, so the room ignores them; the claimed member
+    moves to a new writer, 16 times;
+  - move the stamps to 2^53 − 1;
+  - name any writer when it relays a catch-up (`from` is as good as the member that
+    told us);
+  - make `doc.sync` show `'synced'` early, or `total` too high.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6
 
