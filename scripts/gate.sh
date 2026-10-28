@@ -99,6 +99,7 @@ BROWSER=(
   "netlab birthday|node packages/js/test/netlab_birthday.mjs"
   "netlab carry|node packages/js/test/netlab_carry.mjs"
   "tab close|node packages/js/test/leave.mjs --runs=5 --crash=0"
+  "doc store|node packages/js/test/doc_store.mjs"
   "netlab|env RTC_OFF=2 node packages/js/test/netlab.mjs 3"
   "netlab rooms|node packages/js/test/netlab_rooms.mjs"
   "netlab mic|node packages/js/test/netlab_mic.mjs"

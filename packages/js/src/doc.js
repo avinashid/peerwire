@@ -31,6 +31,11 @@
 // ask, carrying what the pieces brought, is answered with only what is still missing. 'sync' says where this
 // stands: 'alone', 'loading' from a member with `have` of `total` entries, or 'synced'.
 //
+// A doc opened with a store (room.doc(name, { persist })) keeps a copy on this device: its entries and context,
+// saved at most every SAVE_MS while it changes and when it closes. Opening loads the copy before the first ask,
+// so the ask carries it and members send only what it lacks, and our answers wait for it. The copy joins the
+// doc as an answer from ourselves would, checked as member data, so a copy that is off anywhere is dropped whole.
+//
 // Members are trusted alike to write, as in the room itself: any member can overwrite, delete or fill a doc,
 // and a member relaying a catch-up can claim any writer, so `from` is as good as the member that told us.
 // What the doc defends is each member's app and resources. Frames are checked field by field and dropped
@@ -95,6 +100,10 @@ const ASK_WAIT_MS = 5000;
 const TURN_MS = 60000;
 // Incarnations a doc moves through when members claim its future dots.
 const MAX_INCARNATIONS = 16;
+// A doc kept on this device is saved at most once per SAVE_MS while it changes. Its copy is answer frames, as
+// pack() cuts them: a full doc takes about 30, and a copy of more than STORED_FRAMES isn't loaded.
+const SAVE_MS = 1000;
+export const STORED_FRAMES = 64;
 // The longest array a frame may hold: entries, dead ranges, writers.
 const FRAME_ITEMS = 16384;
 const MAX_STAMP = Number.MAX_SAFE_INTEGER;
@@ -328,7 +337,10 @@ export function unopened(m) {
 // One doc, shared by every member that opens the same name. `host` is the room's side:
 // { self, peers() (joined members), send(peer, message, deflate) (`deflate`: the member reads deflated frames),
 // after(ms, fn) -> cancel, now() (ms), closed(doc), incarnation(), route(peer) ('direct', 'peer' or
-// 'signaling'), deflate (we read deflated frames) }.
+// 'signaling'), deflate (we read deflated frames), store (the copy on this device, or none: load() -> the copy
+// saved, or null if there is none or it can't be read, save(copy) (`copy` may be a promise of it, or of null:
+// nothing to save), forget(), each a promise that rejects if the storage fails, and each taking effect in the
+// order called, as a doc closed and opened again at once loads what the closing one saved) }.
 export class Doc {
   constructor(name, host) {
     if (!validName(name)) throw new RangeError(`a doc name is 1 to ${MAX_NAME_LENGTH} characters`);
@@ -364,6 +376,20 @@ export class Doc {
     this.claim = null; // the lowest and highest of our dots that a frame's entries took
     this.unheard = false;
     this.dropped = null;
+    // The copy on this device: what opening found ('loaded', 'empty', 'blocked' or 'off'), whether it is still
+    // loading, the doc's changes (`version`, counted by insert, remove and record) as of the last save, the wait
+    // for the next save, and the last save or deletion asked of the store (each runs after the one before).
+    this.store = host.store ?? null;
+    this.rangeCap = MAX_RANGES; // ranges the context may hold: more while a copy joins (see restore)
+    this.loaded = Promise.resolve('off');
+    this.loading = false;
+    this.version = 0;
+    this.savedVersion = 0;
+    this.saveWait = null;
+    this.saving = Promise.resolve();
+    this.forgotten = false;
+    this.storeWarned = false;
+    this.closingCopy = null; // closed while the copy loaded: gives the save close() queued its copy (see load)
   }
 
   // Collections, made on first use. Calling again with the same name gives the same contents.
@@ -402,33 +428,97 @@ export class Doc {
     else if (event === 'sync') this.syncHandlers.delete(fn);
   }
 
-  // Stops syncing and forgets the doc: room.doc(name) later opens it afresh and catches up again.
+  // Stops syncing and forgets the doc: room.doc(name) later opens it afresh and catches up again. A doc kept on
+  // this device is saved first (one closed while its copy loads, once that is joined in: see load); the promise
+  // resolves once that is done.
   close() {
-    if (this.closed) return;
+    if (this.closed) return this.saving;
+    this.save();
+    if (this.loading && !this.forgotten) {
+      // Saved in its turn now, so a doc opened again at once loads it, with the copy that load() gives it.
+      const copy = new Promise((r) => (this.closingCopy = r));
+      const store = this.store;
+      this.saving = (async () => store.save(copy))().catch((e) => this.storeFailed(e));
+    }
     this.closed = true;
+    this.saveWait?.();
+    this.saveWait = null;
     this.cancelWait?.();
     this.queue = [];
     this.asking = null;
     this.handlers.clear();
     this.syncHandlers.clear();
-    this.entries.clear();
-    this.byWriter.clear();
-    this.colls.clear();
+    if (!this.loading) this.clear();
     for (const st of this.members.values()) {
       st.answerWait?.();
       st.askWait?.();
     }
     this.members.clear();
     this.host.closed?.(this);
+    return this.saving;
+  }
+
+  clear() {
+    this.entries.clear();
+    this.byWriter.clear();
+    this.colls.clear();
+  }
+
+  // Deletes the copy this device keeps and keeps none from now on, until the doc is opened with a store again.
+  // What the doc holds stays. Resolves once the copy is gone; rejects if the storage fails.
+  forget() {
+    if (!this.store) return Promise.resolve();
+    this.forgotten = true;
+    this.saveWait?.();
+    this.saveWait = null;
+    const store = this.store;
+    const gone = (async () => store.forget())();
+    this.saving = gone.catch(() => {});
+    return gone;
   }
 
   // The room's side.
 
-  // Asks every member: the doc was just opened. (A store would load the doc's entries and context here, before
-  // the first ask, so the ask carries them and members send only what it lacks.)
+  // Loads the copy this device keeps, if any, then asks every member: the doc was just opened.
   open() {
+    if (this.store) {
+      this.loading = true;
+      this.loaded = this.load();
+    }
     for (const p of this.host.peers()) this.startAsk(p);
     this.emitSync();
+  }
+
+  // The copy, joined into the doc before the first ask (see nextAsk), so the ask carries it and members send only
+  // what it lacks, and before our first answer (see serve), so answers carry it. What it found: 'loaded', 'empty'
+  // (none, or one that couldn't be read or was off) or 'blocked' (the storage failed: private browsing, say).
+  async load() {
+    let found = 'empty';
+    try {
+      const copy = await this.store.load();
+      // With nothing written or heard while it loaded, the doc is now the copy: no need to save it again.
+      const unchanged = this.version === this.savedVersion;
+      if (copy != null && this.restore(copy)) {
+        found = 'loaded';
+        if (unchanged) this.savedVersion = this.version;
+      }
+    } catch (e) {
+      found = 'blocked';
+      this.storeFailed(e);
+    }
+    this.loading = false;
+    // Closed while it loaded: what was written meanwhile is saved with the copy (see close), then the doc forgets
+    // it all.
+    if (this.closed) {
+      this.closingCopy?.(this.version !== this.savedVersion ? this.snapshot() : null);
+      this.clear();
+      return found;
+    }
+    this.nextAsk(false);
+    for (const [p, st] of this.members) if (st.theirs) this.serve(p, st);
+    // Writes and frames while it loaded weren't saved, so a copy of part of the doc never replaced it.
+    if (this.version !== this.savedVersion) this.dirty();
+    return found;
   }
 
   joined(peer) {
@@ -457,10 +547,16 @@ export class Doc {
     if (!f) return;
     if (f.t === ASK) return this.onAsk(peer, f);
     if (f.t === MORE) return this.onMore(peer, f);
+    this.join(f, peer);
+    if (f.q !== undefined) this.landed(peer, f);
+  }
+
+  // Joins frame `f`, a delta or an answer from member `peer`, or from the copy on this device (`peer` null).
+  join(f, peer) {
     this.claimed = false;
     this.claim = null;
     this.unheard = false;
-    this.dropped = f.t === ANSWER ? [] : null;
+    this.dropped = f.t === ANSWER && peer ? [] : null;
     this.apply(f, peer);
     // Entries on our own dots, from the lowest to the highest: all above n, as [1, n] is in our context, so the
     // span claims nothing a member couldn't claim with one dead range, and it is sent on as one.
@@ -471,7 +567,7 @@ export class Doc {
       this.dropped?.push([this.writer, a, b]);
     }
     if (this.claimed) this.newIncarnation();
-    this.flush(peer, false);
+    this.flush(peer ?? this.host.self, false);
     // Entries a catch-up told us are dead go from our other members too, as if we deleted them: they may
     // have missed the deletion as we did (a partition), or never been told (a member's claim sent to some).
     // One range for each range of the answer that dropped any (see kill), while the sender's budget allows.
@@ -480,7 +576,6 @@ export class Doc {
     // A write of the sender's own that we count as seen yet don't hold: it was deleted before it reached us,
     // or a member claimed the sender's dots ahead of it. Our ask shows the sender our context.
     if (this.unheard) this.startAsk(peer);
-    if (f.q !== undefined) this.landed(peer, f);
   }
 
   // A piece of an answer, applied: if it answers our latest ask of the member, it is acknowledged (unless a
@@ -591,11 +686,16 @@ export class Doc {
     return e;
   }
 
-  newIncarnation() {
+  // A writer for our next writes that isn't in `taken` (our context, or a copy's writers: see restore), drawn
+  // again a few times if it is (one chance in 2^32 for each writer of ours there).
+  newIncarnation(taken = this.ctx.writers) {
     if (this.incarnations >= MAX_INCARNATIONS) return;
     this.incarnations++;
-    const r = this.host.incarnation?.() ?? [...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, '0')).join('');
-    this.writer = this.host.self + r;
+    let w;
+    for (let i = 0; i < 4 && (w === undefined || taken.has(w)); i++) {
+      w = this.host.self + (this.host.incarnation?.() ?? [...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, '0')).join(''));
+    }
+    this.writer = w;
     this.n = 0;
   }
 
@@ -688,13 +788,14 @@ export class Doc {
     if (!this.room(w, a, b)) this.makeRoom(w);
     if (!this.room(w, a, b)) return false;
     this.ctx.add(w, a, b);
+    this.version++;
     if (!this.byWriter.has(w)) this.idle.add(w);
     return true;
   }
 
   room(w, a, b) {
     const writers = this.ctx.writers.has(w) || this.ctx.writers.size < MAX_WRITERS;
-    return writers && (this.ctx.size < MAX_RANGES || this.ctx.touches(w, a, b));
+    return writers && (this.ctx.size < this.rangeCap || this.ctx.touches(w, a, b));
   }
 
   // A full context forgets what matters least: first the writers with no live entry (longest idle first, kept
@@ -737,6 +838,7 @@ export class Doc {
     }
     held.set(e.n, e);
     this.length += e.len;
+    this.version++;
     if (e.t === 'm') {
       const list = coll.keys.get(e.k);
       if (list) list.push(e);
@@ -759,6 +861,7 @@ export class Doc {
       if (this.ctx.writers.has(e.w)) this.idle.add(e.w);
     }
     this.length -= e.len;
+    this.version++;
     if (e.t === 'm') {
       const list = coll.keys.get(e.k);
       list.splice(list.indexOf(e), 1);
@@ -797,8 +900,10 @@ export class Doc {
     if (!refs.has(ref)) refs.set(ref, { coll: { t: coll.t, name: coll.name }, ref, before: this.current(coll, ref) });
   }
 
-  // Emits 'change' for what a frame or write changed, now that all of it is in.
+  // Emits 'change' for what a frame or write changed, now that all of it is in, and saves a doc kept on this
+  // device soon if it changed.
   flush(from, local) {
+    if (this.version !== this.savedVersion) this.dirty();
     const touched = [...this.touched.values()].flatMap((refs) => [...refs.values()]);
     this.touched.clear();
     for (const { coll, ref, before } of touched) {
@@ -964,14 +1069,14 @@ export class Doc {
   }
 
   // Gives the turn to the next member in the queue, the best routed (of those, the first queued), and asks it;
-  // `done` ends the turn under way.
+  // `done` ends the turn under way. None is asked while the copy on this device loads (see load).
   nextAsk(done) {
     if (done) {
       this.cancelWait?.();
       this.cancelWait = null;
       this.asking = null;
     }
-    if (this.asking || this.closed) return;
+    if (this.asking || this.closed || this.loading) return;
     const peers = new Set(this.host.peers());
     this.queue = this.queue.filter((p) => peers.has(p));
     if (this.queue.length) {
@@ -1087,8 +1192,9 @@ export class Doc {
 
   // Starts the answer to the member's latest ask once its answers budget allows, then sends pieces while the
   // answer's window and the chars budget allow; past a budget, it waits for it. A wait may find the ask answered
-  // already, when a later one came as the budget did.
+  // already, when a later one came as the budget did. While the copy on this device loads, the ask waits for it.
   serve(peer, st) {
+    if (this.loading) return;
     const now = this.now();
     if (st.theirs) {
       const wait = this.early(st, 'answers', now);
@@ -1171,6 +1277,70 @@ export class Doc {
       }
     }
     return out;
+  }
+
+  // The copy on this device.
+
+  // The doc as this device keeps it: its entries and the dots it knows are dead, as the frames of an answer, and
+  // its Lamport clock.
+  snapshot() {
+    return { v: 1, c: this.clock, f: this.pack(ANSWER, [...this.entries.values()], this.dead(), false) };
+  }
+
+  // Joins `copy` (see snapshot) into the doc as an answer from ourselves, checked frame by frame as a member's:
+  // false, with nothing joined, if any of it is off. A writer of ours in it is an earlier incarnation of ours (a
+  // stable secret keeps our PeerId): if this opening drew one of them and hasn't written on it, it draws again,
+  // so the copy's dots stay that writer's and aren't taken for a claim on ours (see put).
+  restore(copy) {
+    if (copy === null || typeof copy !== 'object' || copy.v !== 1 || !index(copy.c) || !Array.isArray(copy.f) || copy.f.length > STORED_FRAMES) return false;
+    const frames = [];
+    for (const m of copy.f) {
+      const f = m?.d === this.name && m.t === ANSWER && m.q === undefined ? parseFrame(m, null) : null;
+      if (!f) return false;
+      frames.push(f);
+    }
+    if (!this.n && copy.f.some((m) => m.ws.includes(this.writer))) this.newIncarnation(new Set(copy.f.flatMap((m) => m.ws)));
+    // The frames hold the entries first, then the dead dots, so until those join, each live entry between dead
+    // dots takes a range of its own: the context may hold one more for each entry the doc can hold meanwhile,
+    // then forgets what is past MAX_RANGES, as ever (a copy of a doc that held at most that many loads as it was).
+    this.rangeCap = MAX_RANGES + MAX_ENTRIES;
+    for (const f of frames) this.join(f, null);
+    this.rangeCap = MAX_RANGES;
+    if (this.ctx.size >= MAX_RANGES) this.makeRoom(null);
+    if (copy.c > this.clock) this.clock = copy.c;
+    return true;
+  }
+
+  // Saves the doc SAVE_MS from now, unless a save is due already (see flush).
+  dirty() {
+    if (!this.store || this.forgotten || this.loading || this.closed || this.saveWait) return;
+    this.saveWait = this.host.after(SAVE_MS, () => {
+      this.saveWait = null;
+      this.save();
+    });
+  }
+
+  // Saves the doc now if it changed since the last save, unless its copy is still loading or it is closed.
+  // Resolves once saved; a save that fails is tried again with the next change.
+  save() {
+    if (!this.store || this.forgotten || this.loading || this.closed || this.version === this.savedVersion) return this.saving;
+    this.saveWait?.();
+    this.saveWait = null;
+    const copy = this.snapshot();
+    const version = (this.savedVersion = this.version);
+    const store = this.store;
+    this.saving = (async () => store.save(copy))().catch((e) => {
+      if (this.savedVersion === version) this.savedVersion = -1;
+      this.storeFailed(e);
+    });
+    return this.saving;
+  }
+
+  // Storage that fails (private browsing, a full disk) is said once; the doc goes on in memory.
+  storeFailed(e) {
+    if (this.storeWarned) return;
+    this.storeWarned = true;
+    console.warn(`@peerwire/js: doc ${JSON.stringify(this.name)}: this device can't keep a copy (${e?.message ?? e}); the doc goes on without one`);
   }
 }
 

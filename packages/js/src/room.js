@@ -48,6 +48,7 @@ import { LocalTransport } from './local.js';
 import { RoomProof } from './proof.js';
 import { DirectRetries } from './retry.js';
 import { Doc, unopened } from './doc.js';
+import { docCopy, storeOf } from './store.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
@@ -315,6 +316,12 @@ export class Room {
       for (const end = performance.now() + PAGEHIDE_GRACE_MS; linked && performance.now() < end;);
     };
     globalThis.addEventListener?.('pagehide', this.onPageHide);
+    // A page hidden may not come back (a phone ends background tabs): docs kept on this
+    // device save now.
+    this.onHidden = () => {
+      if (globalThis.document.visibilityState === 'hidden') for (const d of this.docs.values()) d.save();
+    };
+    globalThis.document?.addEventListener?.('visibilitychange', this.onHidden);
     // A network switch: links whose ICE dropped restart it now (only those, so a new
     // speed estimate, which fires 'change' too, costs nothing), and peers on a fallback
     // are retried (only on a new network: 'online', or a new connection type).
@@ -459,11 +466,13 @@ export class Room {
   }
 
   // The shared document `name`, opened on first call: the same name on every member is
-  // the same document. See doc.js.
-  doc(name) {
+  // the same document. See doc.js. `persist` keeps a copy on this device, loaded when it
+  // opens (store.js): true for IndexedDB, or a store. Options count when the doc opens.
+  doc(name, { persist } = {}) {
     if (this.left) throw new Error('left the room');
     let d = this.docs.get(name);
     if (d) return d;
+    const store = persist ? docCopy(storeOf(persist), this.proof, name) : null;
     d = new Doc(name, {
       self: this.self,
       peers: () => this.peers,
@@ -476,6 +485,7 @@ export class Room {
       closed: (doc) => this.docs.get(name) === doc && this.docs.delete(name),
       route: (peer) => this.routes.get(peer)?.kind ?? null,
       deflate: deflates,
+      store,
     });
     this.docs.set(name, d);
     d.open();
@@ -553,6 +563,7 @@ export class Room {
   // may be gone before either runs. The Bye goes on the unreliable lane, which no full
   // send window or unacknowledged reliable data holds back, and the core's sealed close
   // follows it; each is handed to the transport (dc.send) by the pump in the same call.
+  // The promise resolves once docs kept on this device have saved.
   async leave() {
     if (this.left) return;
     this.left = true;
@@ -561,9 +572,10 @@ export class Room {
     globalThis.removeEventListener?.('pagehide', this.onPageHide);
     globalThis.removeEventListener?.('online', this.onNetwork);
     globalThis.navigator?.connection?.removeEventListener?.('change', this.onNetwork);
+    globalThis.document?.removeEventListener?.('visibilitychange', this.onHidden);
     this.retries.close();
     for (const off of this.unwatch) off();
-    for (const d of [...this.docs.values()]) d.close();
+    const saved = [...this.docs.values()].map((d) => d.close());
     this.docOut.clear();
     this.docIn.clear();
     const bye = Uint8Array.of(T.Bye);
@@ -583,6 +595,7 @@ export class Room {
     this.routes.clear();
     this.paths.clear();
     this.fallingBack.clear();
+    await Promise.all(saved);
   }
 
   // Announces us on the room topic, with a proof of the room key.
