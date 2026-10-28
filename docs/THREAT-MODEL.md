@@ -1025,9 +1025,11 @@ without a piece, or 60 s with another waiting). The doc_crdt test: on `558f53c`,
 member over signalling was asked 8 times over 7 turns, and 67 entries were sent for 44;
 on the fix, it was asked twice, and 47 were sent for 44.
 
-Test gap (Info): the test pins "once", not "again after the answer ends". A mutant that
-never clears the flag passes `doc_crdt.mjs`. Its cost would be time only: a route that
-becomes direct later waits for the turn to pass.
+Test gap (Info), closed: the test pinned "once", not "again after the answer ends", so a
+mutant that never clears the flag passed `doc_crdt.mjs` (its cost would be time only: a
+route that becomes direct later waits for the turn to pass). A second doc_crdt test, "paused
+again once its answer ended", has the member's next answer give the turn up again: asked
+`a,c,a,a,c,a` on the fix, and `a,c,a,a,c` (a failure) with that mutant.
 
 **DOC-5 — Rooms with no doc open inflated deflated doc frames (Low).** NB-006e's `onDoc`
 stopped returning early with no doc open. So a room that never opens a doc (a game, a

@@ -1020,6 +1020,53 @@ console.log('a member whose route becomes direct takes the turn from one over si
   console.log(`a member over signalling paused once until its answer ended: asked ${order}, sent ${got} entries for ${a.doc.entries.size + 1}`);
 }
 
+// And once that answer has ended, the member's next answer gives the turn up again: here c, linked directly, takes
+// the turn from a's first answer, which then ends; g misses 10 strokes of a's (their deltas lost) and asks a again,
+// and c, queued again as that answer comes in, takes the turn from it too.
+{
+  const net = new Net(34);
+  const a = net.node('a');
+  board(net, a);
+  const c = net.node('c');
+  c.doc.set('s').add('c');
+  const g = net.node('g');
+  const order = [];
+  const send = g.host.send;
+  g.host.send = (to, msg, z) => {
+    if (msg.t === 2) order.push(to === a.self ? 'a' : 'c');
+    send(to, msg, z);
+  };
+  net.route(a, g, 'signaling');
+  net.route(c, g, 'direct');
+  // Runs the network, and `during` once, as the first piece of a's answer to g's ask lands.
+  const run = (during) => {
+    let done = false;
+    for (let n = 0; ; n++) {
+      if (n > 1e6) fail('paused again: the network never went quiet');
+      if (!done && g.doc.asking === a.self && g.doc.members.get(a.self)?.ask?.got) {
+        done = true;
+        during();
+      }
+      if (net.step()) continue;
+      if (!net.fire(Infinity)) break;
+    }
+  };
+  net.link(g, a);
+  run(() => net.link(g, c));
+  if (order.join() !== 'a,c,a') fail(`paused again: first asked ${order}`);
+  net.hold(a, g);
+  for (let i = 0; i < 10; i++) a.doc.set('strokes').add(stroke(net.r));
+  net.run();
+  net.parked = [];
+  net.release(a, g);
+  g.doc.startAsk(a.self);
+  run(() => g.doc.startAsk(c.self));
+  const got = net.got.get(g.self);
+  for (const id of a.doc.entries.keys()) if (!g.doc.entries.has(id)) fail(`paused again: g lacks ${id}`);
+  if (order.join() !== 'a,c,a,a,c,a' || got > a.doc.entries.size + 1 + 10) fail(`paused again: asked ${order}; sent ${got} entries for ${a.doc.entries.size + 1}`);
+  console.log(`a member over signalling paused again once its answer ended: asked ${order}, sent ${got} entries for ${a.doc.entries.size + 1}`);
+}
+
 // A member that stalled with no one else to ask keeps the turn, and gives it up as soon as one is: here b, which
 // joins 10 s on, is asked at once.
 {
