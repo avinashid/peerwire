@@ -338,9 +338,10 @@ export function unopened(m) {
 // { self, peers() (joined members), send(peer, message, deflate) (`deflate`: the member reads deflated frames),
 // after(ms, fn) -> cancel, now() (ms), closed(doc), incarnation(), route(peer) ('direct', 'peer' or
 // 'signaling'), deflate (we read deflated frames), store (the copy on this device, or none: load() -> the copy
-// saved, or null if there is none or it can't be read, save(copy) (`copy` may be a promise of it, or of null:
-// nothing to save), forget(), each a promise that rejects if the storage fails, and each taking effect in the
-// order called, as a doc closed and opened again at once loads what the closing one saved) }.
+// saved, null if there is none or it can't be read, or false for one of another version, to leave as it is;
+// save(copy), `copy` may be a promise of it, or of null: nothing to save; forget(); each a promise that rejects if
+// the storage fails, and each taking effect in the order called, as a doc closed and opened again at once loads
+// what the closing one saved) }.
 export class Doc {
   constructor(name, host) {
     if (!validName(name)) throw new RangeError(`a doc name is 1 to ${MAX_NAME_LENGTH} characters`);
@@ -388,6 +389,7 @@ export class Doc {
     this.saveWait = null;
     this.saving = Promise.resolve();
     this.forgotten = false;
+    this.foreign = false; // the copy is of another version (a newer release's): left as it is, none kept
     this.storeWarned = false;
     this.closingCopy = null; // closed while the copy loaded: gives the save close() queued its copy (see load)
   }
@@ -491,16 +493,22 @@ export class Doc {
 
   // The copy, joined into the doc before the first ask (see nextAsk), so the ask carries it and members send only
   // what it lacks, and before our first answer (see serve), so answers carry it. What it found: 'loaded', 'empty'
-  // (none, or one that couldn't be read or was off) or 'blocked' (the storage failed: private browsing, say).
+  // (none, or one that couldn't be read or was off) or 'blocked' (the storage failed, private browsing say, or
+  // holds a copy of another version, which the doc leaves as it is and keeps none meanwhile).
   async load() {
     let found = 'empty';
     try {
       const copy = await this.store.load();
       // With nothing written or heard while it loaded, the doc is now the copy: no need to save it again.
       const unchanged = this.version === this.savedVersion;
-      if (copy != null && this.restore(copy)) {
+      if (copy === false) {
+        found = 'blocked';
+        this.foreign = true;
+      } else if (copy != null && this.restore(copy)) {
         found = 'loaded';
         if (unchanged) this.savedVersion = this.version;
+      } else if (copy != null) {
+        console.warn(`@peerwire/js: doc ${JSON.stringify(this.name)}: the copy on this device isn't a doc this version reads; the next save replaces it`);
       }
     } catch (e) {
       found = 'blocked';
@@ -510,7 +518,7 @@ export class Doc {
     // Closed while it loaded: what was written meanwhile is saved with the copy (see close), then the doc forgets
     // it all.
     if (this.closed) {
-      this.closingCopy?.(this.version !== this.savedVersion ? this.snapshot() : null);
+      this.closingCopy?.(this.version !== this.savedVersion && !this.foreign ? this.snapshot() : null);
       this.clear();
       return found;
     }
@@ -1319,17 +1327,18 @@ export class Doc {
 
   // Saves the doc SAVE_MS from now, unless a save is due already (see flush).
   dirty() {
-    if (!this.store || this.forgotten || this.loading || this.closed || this.saveWait) return;
+    if (!this.store || this.forgotten || this.foreign || this.loading || this.closed || this.saveWait) return;
     this.saveWait = this.host.after(SAVE_MS, () => {
       this.saveWait = null;
       this.save();
     });
   }
 
-  // Saves the doc now if it changed since the last save, unless its copy is still loading or it is closed.
-  // Resolves once saved; a save that fails is tried again with the next change.
+  // Saves the doc now if it changed since the last save, unless its copy is still loading, is of another version
+  // (left as it is), or the doc is closed. Resolves once saved; a save that fails is tried again with the next
+  // change.
   save() {
-    if (!this.store || this.forgotten || this.loading || this.closed || this.version === this.savedVersion) return this.saving;
+    if (!this.store || this.forgotten || this.foreign || this.loading || this.closed || this.version === this.savedVersion) return this.saving;
     this.saveWait?.();
     this.saveWait = null;
     const copy = this.snapshot();

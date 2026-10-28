@@ -1578,6 +1578,7 @@ function copyStore() {
     s.loads++;
     if (s.gate) await s.gate.promise;
     if (s.fail) throw s.fail;
+    if (s.foreign) return false;
     return s.copy === null ? null : JSON.parse(s.copy);
   });
   s.save = (c) => run(async () => {
@@ -1807,6 +1808,63 @@ console.log('saves: one per SAVE_MS while it changes, none for nothing, on close
 }
 console.log("a reload drawing an incarnation in the copy draws again: the copy's entries stay ours, and new writes reach everyone");
 
+// A copy rolled back: an older one put back after the doc wrote more, which members hold. The doc opened on it
+// never takes up a writer of the copy or its n (here the incarnation drawn is the copy's, and it draws again),
+// so no dot is used twice: it converges with the members, each write once.
+{
+  const net = new Net(16);
+  const store = copyStore();
+  const draws = ['0000a11d', '0000a11d', '0000a11d', '0000b0b0'];
+  const a = net.node('a', { open: false });
+  a.host.store = store;
+  a.host.incarnation = () => draws.shift() ?? 'ffffffff';
+  net.open(a);
+  await a.doc.loaded;
+  const b = net.node('b');
+  net.mesh([a, b]);
+  for (let i = 0; i < 3; i++) a.doc.set('s').add(`saved ${i}`);
+  net.run();
+  await a.doc.saving;
+  const older = store.copy;
+  for (let i = 0; i < 2; i++) a.doc.set('s').add(`later ${i}`);
+  net.run();
+  await a.doc.close();
+  net.unlink(a, b);
+  store.copy = older;
+  net.open(a);
+  if ((await a.doc.loaded) !== 'loaded' || a.doc.set('s').entries().length !== 3) fail('the older copy did not load');
+  a.doc.set('s').add('after');
+  net.link(a, b);
+  net.run();
+  same([a, b], 'a copy rolled back');
+  const items = b.doc.set('s').entries();
+  const ids = new Set(items.map((e) => e.id));
+  if (items.length !== 6 || ids.size !== 6 || items.find((e) => e.value === 'after').id.slice(64, 72) !== '0000b0b0') fail(`a copy rolled back: ${JSON.stringify(items.map((e) => [e.id.slice(64), e.value]))}`);
+}
+console.log('a copy rolled back: no writer of the copy is taken up, so no dot is used twice');
+
+// A copy of another version (load() gives false): left as it is. The doc says 'blocked', saves nothing, also on
+// close, and forget() still deletes it.
+{
+  const net = new Net(17);
+  const store = copyStore();
+  store.copy = '"a newer copy"';
+  store.foreign = true;
+  const a = kept(net, 'a', store);
+  if ((await a.doc.loaded) !== 'blocked') fail("a copy of another version: not 'blocked'");
+  a.doc.set('s').add('x');
+  net.wait(5000);
+  await a.doc.close();
+  if (store.saves || store.copy !== '"a newer copy"') fail('a copy of another version was written over');
+  net.open(a);
+  a.doc.set('s').add('y');
+  a.doc.close();
+  net.open(a);
+  await a.doc.forget();
+  if (store.saves || store.copy !== null) fail("a copy of another version: forget() didn't delete it, or a close during the load saved");
+}
+console.log('a copy of another version: left as it is, nothing saved, forget() deletes it');
+
 // A copy that is off anywhere is dropped whole ('empty'), and the next save replaces it: not version 1, a bad
 // clock, too many frames, a frame of another doc, a delta, one with an ask's number, one malformed, and one
 // good frame then a bad one (nothing of it joined). A store that fails ('blocked') is said once, and the doc
@@ -1836,7 +1894,9 @@ console.log("a reload drawing an incarnation in the copy draws again: the copy's
     const store = copyStore();
     store.copy = JSON.stringify(copy);
     const n = kept(new Net(12), 'a', store);
+    const said = warnings.length;
     if ((await n.doc.loaded) !== 'empty' || n.doc.entries.size || n.doc.ctx.size) fail(`a copy with ${what}: ${n.doc.entries.size} entries joined`);
+    if (warnings.length !== said + 1 || !warnings.at(-1).includes("isn't a doc this version reads")) fail(`a copy with ${what}: refused without saying so`);
     n.doc.set('s').add('new');
     await n.doc.close();
     if (!store.copy.includes('"new"') || store.copy.includes('kept')) fail(`a copy with ${what} wasn't replaced`);

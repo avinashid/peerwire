@@ -189,7 +189,8 @@ export declare class Room {
   adoptChannel(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel): Promise<boolean>;
   /** The shared document `name` (1 to 128 characters), opened on the first call and the same object until it is
    * closed: the same name on every member is the same document. `options` count when it opens. Throws after
-   * `leave()`, which closes the room's docs, and TypeError for a `persist` it can't use. See {@link Doc}. */
+   * `leave()`, which closes the room's docs, TypeError for a `persist` it can't use, and RangeError for a name with
+   * `persist` that isn't well-formed (a lone surrogate). See {@link Doc}. */
   doc(name: string, options?: DocOptions): Doc;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   rtt(peer: PeerId): number | null;
@@ -315,8 +316,9 @@ export interface Doc {
   /** True once the doc has caught up, and from then on, also once the other members have gone ('alone'). */
   readonly synced: boolean;
   /** What opening found on this device: 'loaded' (its copy is in the doc), 'empty' (none, or one that couldn't be
-   * read), 'blocked' (the storage refused, as in some private modes: the doc goes on without a copy, with one
-   * warning) or 'off' (no `persist`). */
+   * read, which the next save replaces), 'blocked' (the storage refused, as in some private modes, or holds a copy
+   * from another version of this package, left as it is: the doc goes on without a copy, with a warning) or 'off'
+   * (no `persist`). */
   readonly loaded: Promise<'loaded' | 'empty' | 'blocked' | 'off'>;
   map(name: string): DocMap;
   set(name: string): DocSet;

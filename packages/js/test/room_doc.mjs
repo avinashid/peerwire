@@ -264,6 +264,9 @@ for (const r of [b, c, d]) await r.leave();
   await notes.close();
   const notesKey = sets.at(-1)[0];
   if (notesKey === key) fail('two docs share a key');
+  const warned = [];
+  const warn = console.warn;
+  console.warn = (m) => warned.push(m);
   await store.set(notesKey, await store.get(key));
   if ((await a2.doc('notes', { persist: spy }).loaded) !== 'empty' || (await docCopy(spy, a2.proof, 'notes').load()) !== null) fail("the board's copy opened under another doc's key");
   // A record past MAX_STORED isn't even opened.
@@ -274,6 +277,48 @@ for (const r of [b, c, d]) await r.leave();
   const huge = await docCopy(spy, a2.proof, 'notes').load();
   crypto.subtle.decrypt = decrypt;
   if (huge !== null || opened) fail(`a record of MAX_STORED + 1 bytes: ${opened} decrypts`);
+  // Sealed as version 1 || iv || ciphertext, with the version and the key it is kept under as additional data:
+  // a record sealed without either doesn't open (one sealed with both, as a control, does). One of another version
+  // is left as it is: 'blocked', and never saved over. Each refusal says why.
+  if (bytes[0] !== 1) fail(`the copy's version byte is ${bytes[0]}`);
+  const te = new TextEncoder();
+  const sealKey = await crypto.subtle.importKey('raw', await a2.proof.mac('pw-store-key', [te.encode('notes')]), 'AES-GCM', false, ['encrypt']);
+  const seal = async (ad) => {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, ...(ad && { additionalData: ad }) }, sealKey, te.encode('{"v":1,"c":1,"f":[]}')));
+    return Uint8Array.of(1, ...iv, ...ct);
+  };
+  const crafted = {};
+  for (const [what, ad] of [['with both', Uint8Array.of(1, ...te.encode(notesKey))], ['without additional data', null], ['without the version', te.encode(notesKey)]]) {
+    await store.set(notesKey, await seal(ad));
+    crafted[what] = await docCopy(spy, a2.proof, 'notes').load();
+  }
+  if (crafted['with both']?.v !== 1 || crafted['without additional data'] !== null || crafted['without the version'] !== null) fail(`crafted records: ${JSON.stringify(crafted)}`);
+  const v = a2.doc('versions', { persist: spy });
+  await v.loaded;
+  v.map('m').set('x', 1);
+  await v.close();
+  const [vKey, vBytes] = sets.at(-1);
+  const newer = Uint8Array.of(2, ...vBytes.subarray(1));
+  await store.set(vKey, newer);
+  const v2 = a2.doc('versions', { persist: spy });
+  const v2found = await v2.loaded;
+  v2.map('m').set('x', 2);
+  await v2.close();
+  if (v2found !== 'blocked' || Buffer.compare(await store.get(vKey), newer) !== 0) fail(`a copy of version 2: ${v2found}, and written over`);
+  for (const why of ['more than any doc takes', "didn't open under this room's key", 'of another version']) if (!warned.some((m) => m.includes(why))) fail(`no warning says the copy ${why}: ${warned.join(' | ')}`);
+  console.warn = warn;
+  // With persist, a doc name must be well-formed: lone surrogates would all encode as U+FFFD, one key for all.
+  for (const [name, ok] of [['\uD800', false], ['a\uDC00b', false], ['😀', true]]) {
+    let threw = null;
+    try {
+      a2.doc(name, { persist: spy }).close();
+    } catch (e) {
+      threw = e;
+    }
+    if (ok ? threw : !(threw instanceof RangeError)) fail(`persist with the name ${JSON.stringify(name)}: ${threw}`);
+    a2.doc(name).close();
+  }
   // Closed and opened again at once (a component that remounts): the new doc loads what the closing one saved,
   // also when it closed while its copy loaded, and one that closes with nothing written leaves the copy as it was.
   const r1 = a2.doc('remount', { persist: spy });

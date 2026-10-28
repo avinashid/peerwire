@@ -74,8 +74,17 @@ try {
     return v;
   });
   const recs = await records(page);
-  if (recs.length !== 1 || !/^[0-9a-f]{64}$/.test(recs[0][0])) fail(`IndexedDB holds ${JSON.stringify(recs.map((r) => r[0]))}`);
+  if (recs.length !== 1 || !/^[0-9a-f]{64}$/.test(recs[0][0]) || recs[0][1].charCodeAt(0) !== 1) fail(`IndexedDB holds ${JSON.stringify(recs.map((r) => [r[0], r[1].charCodeAt(0)]))}`);
   for (const s of ['Kept in IndexedDB', 'points', 'board', 'chat', roomId]) if (recs.some(([k, v]) => k.includes(s) || v.includes(s))) fail(`the record shows ${s}`);
+  // Nothing in clear beside it: one database and one store, of constant names.
+  const names = await page.evaluate(async () => {
+    const dbs = (await indexedDB.databases()).map((d) => d.name);
+    const db = await new Promise((r) => (indexedDB.open('peerwire').onsuccess = (e) => r(e.target.result)));
+    const stores = [...db.objectStoreNames];
+    db.close();
+    return { dbs, stores };
+  });
+  if (JSON.stringify(names) !== '{"dbs":["peerwire"],"stores":["docs"]}') fail(`IndexedDB names ${JSON.stringify(names)}`);
   await page.reload();
   if ((await open(page)) !== 'loaded') fail('the reloaded page found no copy');
   const after = await page.evaluate(() => window.view());
