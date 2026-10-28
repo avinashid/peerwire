@@ -57,7 +57,8 @@ Severity uses likelihood × impact for this software's threat model. Each findin
 that needs a change is tracked as an NB card.
 
 **Status as of main `41cc24a` (2026-10-26); the shared-doc rows (DOC-*) as of main
-`f40cffa` (2026-10-28).**
+`f40cffa`, and the rows for docs kept on this device (NB6F-*) as of `255ec0e`
+(2026-10-28).**
 
 | Finding | Status |
 |---|---|
@@ -95,6 +96,8 @@ that needs a change is tracked as an NB card.
 | DOC-1 (Medium), DOC-2, DOC-3 (Low) | **Fixed** by `979cdae`, `eaa2a22` and `a4fddfd`, with DOC-2a and DOC-3a by `d6b148c`, merged `c30ab0f`, before `room.doc()` was published (stamps taken however far ahead; no entry on our own writer that we didn't write; a frame costs about one pass over what it names), reviewed 2026-10-27, [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-5) |
 | DOC-2b (Low) | **Fixed** by `8b7946c`, merged `45c7cfd` (a catch-up's deletions passed on one range per range of it, charged to the sender's budget), reviewed 2026-10-27; residuals DOC-2c and I6, same section |
 | DOC-4, DOC-5 (Low) | **Fixed** by `f40cffa` (the merge of `ff51ce6`): a member over signalling is paused for a better routed one once per answer; a room with no doc open drops deflated doc frames unread. Reviewed 2026-10-28; residual I8, same section |
+| NB6F-1, NB6F-2, NB6F-3 (Low) | **Fixed** by `2e71dc5`, before `persist` was published (an opening that couldn't read the copy never writes it; one save at a time, paced at 256 KiB/s; a 5 s load deadline). The seal is security's call, in `52bb7e3`. Reviewed 2026-10-28; residuals R1–R4, [Docs kept on this device](#docs-kept-on-this-device-persist-nb-006f--nb6f-1nb6f-3) |
+| NB6F-2a, I3a (Info) | Open, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -1093,6 +1096,133 @@ The room_doc test reads 1 frame on the fix and 2 on `558f53c`.
   - name any writer when it relays a catch-up (`from` is as good as the member that
     told us);
   - make `doc.sync` show `'synced'` early, or `total` too high.
+
+### Docs kept on this device, `persist` (NB-006f) — NB6F-1…NB6F-3
+
+`room.doc(name, { persist })` (`packages/js/src/store.js`, `doc.js`) keeps a sealed copy
+of the doc on this device: in IndexedDB with `true`, or in any store of bytes
+`{ get, set, delete }`. Opening loads the copy before the first ask, so members send
+only what it lacks. The doc saves while it changes, when the page is hidden, and on
+`close()` and `leave()`. Nothing holds a room's docs while nobody is in it: a member who
+was never there gets the doc from one that kept it, once that one is online.
+
+Reviewed 2026-10-28, by reading the code:
+- the design, before it was built;
+- the code at `a4c228c` (`035e4d6`, and `52bb7e3` for the design call), with one timing
+  script;
+- its fixes, `2e71dc5`, at `255ec0e`, with backend's 78 mutants of `doc_crdt.mjs`,
+  `room_doc.mjs` and `doc_store.mjs`.
+
+**The seal (security's design call, `52bb7e3`):**
+- **Keys.** The room key is `proof.js`'s HMAC key. Each doc's key is
+  `HMAC-SHA256(room key, 'pw-store-key' ‖ name)`, and its copy is kept under the hex of
+  `HMAC-SHA256(room key, 'pw-store-id' ‖ name)`.
+  - Both labels differ from `pw-hello`, `pw-offer`, `pw-rtc-offer` and `pw-link` at
+    byte 3, and from each other at byte 9. So the id kept in clear is never a proof, and
+    no proof seen on the wire is a key or an id.
+  - Labels aren't length-prefixed, so none may be a prefix of another (`proof.js` says
+    so).
+- **The record** is `0x01 ‖ iv ‖ AES-256-GCM(copy)`, with additional data `0x01 ‖ id`, a
+  128-bit tag, and a new 12-byte IV from `getRandomValues` for each save. The key is
+  imported non-extractable, for encrypt and decrypt only.
+- **Nothing in clear** beside the bytes: database `peerwire`, store `docs`, the id as the
+  key and the record as the value.
+- **Another version.** A record whose first byte isn't 1 is neither decrypted nor written
+  over. The doc says `'blocked'` and keeps no copy, so an older release never destroys a
+  newer one's.
+- **Names.** With `persist`, a doc name with a lone surrogate throws RangeError: UTF-8
+  turns each into U+FFFD, so two names would share a key and a record.
+- **Loading.** A record over `MAX_STORED` (64 × 512 KiB + 1 KiB) isn't decrypted. A copy
+  that opens is joined as an answer from ourselves: each of at most 64 frames goes
+  through `parseFrame` with the doc's caps, and it forwards nothing and asks nobody. A
+  copy that is off anywhere is dropped whole, with a warning that says why, and the next
+  save replaces it.
+- **The writer.** An opening always draws a fresh incarnation with `n` 0, never one from
+  the copy, and draws again if the copy names the one it drew. So a copy put back after
+  newer writes makes no dot hold two values: the doc_crdt rollback test.
+
+**NB6F-1 — A copy the opening couldn't read was written over (Low).** When the store
+failed to load the copy, the doc said `'blocked'`, but its next save replaced the copy
+with what the doc held. That save came with the next change, or on a close during the
+load. So one stroke drawn after a storage error replaced the whole board. If no member
+held the board, the case persistence is for, it was gone. The README's file store
+answered "no copy" to every read error and wrote the record in place, so a crash
+mid-save left a truncated record, which the next opening replaced.
+
+**Fixed** by `2e71dc5`:
+- An opening is `blocked` when the store fails to load the copy, takes `LOAD_MS`, or
+  holds another version's. A `blocked` opening never writes the copy, with a change or
+  on close; `forget()` still deletes it.
+- In the README's file store, only ENOENT means "no copy", and a save writes a temp file,
+  then renames it.
+- Tests: `doc_crdt` (no write on a change, after the store is back, on close, or on a
+  close during a load that fails) and `room_doc` (a directory where the record was).
+
+**NB6F-2 — Every save wrote the whole doc, once a second (Low).** Any change started a
+save of the whole doc within `SAVE_MS` (1 s). A full doc is a 12.1 MiB record, and one
+save took 55 ms of main thread on a loaded host (`docCopy(memoryStore())`). So one small
+write a second from any member kept every member with `persist` writing about 12 MiB a
+second, some 43 GiB an hour. Saves also queued up behind a store slower than that.
+
+**Fixed** by `2e71dc5`:
+- One save at a time. The next waits `max(SAVE_MS, bytes / SAVE_RATE)` after the last
+  ends, with `SAVE_RATE` 256 KiB/s: 2 s for a 510 KB whiteboard, 48 s for a full doc. The
+  changes made during a save are saved once, after it.
+- Hiding the page, `close()` and `leave()` still save at once, behind any save in
+  flight.
+- The doc_crdt test: a full doc changed every 100 ms for 150 s saved at 1.0, 49.4, 97.8
+  and 146.2 s, then at once on close. With the first save held, 10 s of writes called
+  the store no more; once it ended, they were saved once, 1 s later.
+
+**NB6F-3 — A store that never answered held catch-up for good (Low).** The doc's asks
+and answers wait for the copy, and only the store's promise ended the load. With a store
+that never answered (a stuck network drive, an IndexedDB whose callbacks never fire), the
+doc never asked or answered anyone: it never reached `'synced'`, and members asking it
+got nothing.
+
+**Fixed** by `2e71dc5`: `LOAD_MS` (5 s) after opening, the doc goes on without the copy.
+It is `'blocked'`, so it never writes the copy (NB6F-1). It asks and answers, and drops a
+copy that comes later. A doc closed meanwhile closes then, where before its `close()`
+and `leave()` never resolved.
+
+**Info:**
+- **I1**, fixed by `2e71dc5`: operations are ordered per store object, and the README
+  made its file store inline, so a remount wasn't ordered after the closing save. The
+  README now makes the store once, and `DocOptions` says to pass the same object.
+- **I2**, fixed by `2e71dc5`: an IndexedDB connection the browser closed (site data
+  cleared) was never opened again. `onclose` now drops it.
+- **I3**, fixed by `2e71dc5`: a comment by `VERSION` says to bump it whenever an older
+  release's `restore()` would refuse what `snapshot()` now writes.
+  - **I3a**, open: `parseFrame` and `restore()` ignore fields they don't know, so the
+    comment should also say "or read only in part". An older release would save such a
+    copy back without them.
+- **NB6F-2a**, open: a store that keeps failing (a full disk) is retried every
+  `SAVE_MS` while the doc changes, and each retry builds and seals the whole doc before
+  the store refuses it: CPU only, about 60 ms a second for a full doc. Fix: back off
+  over consecutive failures.
+- **I4**, accepted: `close()` and `leave()` resolve only once a save in flight settles,
+  so a store whose save never settles holds them. `leave()` has closed the network by
+  then, and `@peerwire/react` doesn't await it.
+
+**Residuals (accepted; R1–R4 are in the README's "What a copy keeps secret, and from
+whom"):**
+- **R1.** A copy is exactly as secret as the roomId. An app that keeps the roomId in the
+  URL (history, bookmarks) or in `localStorage` gives it, and with it the copy, to anyone
+  who can read the device's browser profile. The seal protects a store taken on its own:
+  a copied IndexedDB, a file from a file store, a backup.
+- **R2.** A copy is authentic only against someone without the roomId. Any member can
+  make a copy that opens, as it can send an answer, so a copy is checked as member data.
+- **R3.** A copy's id is the same on every device for one app, room and doc: two stores
+  show they hold the same doc, but not which one.
+- **R4.** A copy's size and the time of its last save show. Someone who can write the
+  storage can put an older copy back; the doc then catches up from the members and
+  reuses no dot. `forget()` deletes the record, but storage can keep old bytes on disk or
+  in backups.
+- A store that works but takes over 5 s to load makes that opening `'blocked'`: its copy
+  isn't updated in that session, and isn't lost.
+- Two tabs of one browser in one room keep one copy of each doc, whichever saved last.
+- A page killed while visible loses its last few seconds of writes on this device: up to
+  48 s for a full doc. The members that heard them still have them.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6
 
