@@ -66,6 +66,7 @@ NODE=(
   "node room welcome|node packages/js/test/room_welcome.mjs"
   "node doc crdt|node packages/js/test/doc_crdt.mjs"
   "node room doc|node packages/js/test/room_doc.mjs"
+  # "node doc catchup|node packages/js/test/doc_catchup.mjs" joins once NB-006e lands: it fails on main by design (NB-006d)
   "node room fallback|node packages/js/test/room_fallback.mjs"
   "node room relay move|node packages/js/test/room_relay_move.mjs"
   "node room relay latency|node packages/js/test/room_relay_latency.mjs"

@@ -250,6 +250,7 @@ invite; decoding is now canonical (`b64::rejects_non_canonical_tails`, `invite::
 | Fuzzing is not coverage-guided (cargo-fuzz needs nightly) | — | qa, if the toolchain is approved |
 | `browser.mjs` reports round trips and throughput but asserts only that the mesh forms and data arrives | — | qa |
 | Planned crates (facade, sync, media, store, Godot binding) have no tests yet; each lands with its own, per the plans above | — | backend |
+| A late joiner's `room.doc()` catch-up of a whiteboard-sized board (509 KB) takes 32 s over the signalling pipe, and with the answering tab in the background the joiner holds 26 of 42 entries after 120 s; the bar is 15 s. Fails on `main` by design, so it is not in the gate until NB-006e lands (NB-006d) | `node packages/js/test/doc_catchup.mjs` | backend (NB-006e) |
 
 ## CI
 
