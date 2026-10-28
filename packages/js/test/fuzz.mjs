@@ -234,25 +234,27 @@ const pw = await loadPeerwire(wasm);
   const strangers = Array.from({ length: 4 }, () => toHex(r.bytes(32)));
   // A doc open on a: frames for it (tag 7, or 8 deflated) go to doc.js, never to 'message'.
   const doc = a.doc('fuzz');
-  const w = `${b.self}0000000a`;
-  const docFrame = () => {
+  // Each frame's writer is its sender's, so an entry from a stranger's frame shows by its writer.
+  // A mutated writer is another writer: doc.js takes entries a member passes on from anyone.
+  const docFrame = (w) => {
     const t = r.pick(['m', 's', 'l']);
     return { d: r.pick(['fuzz', 'fuzz', 'closed']), t: r.pick([1, 2, 3, 4]), ws: [w], e: [[0, 1 + r.below(500), 1, t, 'c', t === 'm' ? 'k' : null, { v: 1 }]], x: [[0, 1, 2]], r: [[0, 1, 3]], q: 1 + r.below(3), i: r.below(3), n: 1 };
   };
   for (let i = 0; i < cases(5000); i++) {
     const tag = r.pick([0, 1, 2, 3, 5, 6, 7, 7, 8, 8, 255]); // never 4 (Bye) from b: it would leave
+    const from = r.oneIn(3) ? r.pick(strangers) : b.self;
+    const w = `${from}0000000a`;
     const body = r.pick([
       () => r.bytes(r.below(200)),
       () => enc.encode(JSON.stringify(r.pick([null, 1, 'x', [1, 2], { a: { b: [] } }, { name: 'z' }, { d: 'fuzz' }]))),
       () => r.mutate(enc.encode('{"name":"bo","x":[1,2,3]}')),
       () => enc.encode('['.repeat(r.below(3000))),
-      () => r.mutate(enc.encode(JSON.stringify(docFrame()))),
-      () => enc.encode(JSON.stringify(docFrame())),
-      () => deflateRawSync(enc.encode(JSON.stringify(docFrame()))),
-      () => r.mutate(deflateRawSync(enc.encode(JSON.stringify(docFrame())))),
+      () => r.mutate(enc.encode(JSON.stringify(docFrame(w)))),
+      () => enc.encode(JSON.stringify(docFrame(w))),
+      () => deflateRawSync(enc.encode(JSON.stringify(docFrame(w)))),
+      () => r.mutate(deflateRawSync(enc.encode(JSON.stringify(docFrame(w))))),
     ])();
     const data = Uint8Array.from([tag, ...body]);
-    const from = r.oneIn(3) ? r.pick(strangers) : b.self;
     try {
       a.onMessage(from, data, r.below(2));
     } catch {
@@ -263,7 +265,9 @@ const pw = await loadPeerwire(wasm);
   check(threw === 0, `room: ${cases(5000)} frames, none throws`);
   check(got.length > 0 && got.every(([, f, k]) => f === b.self && ['bytes', 'text', 'json'].includes(k)), `room: ${got.length} messages, all from the member`);
   const held = [...doc.map('c').entries(), ...doc.set('c').entries(), ...doc.log('c').entries()];
-  check(held.length > 0 && held.every((e) => e.from === b.self), `room: doc frames (tags 7 and 8) reach the open doc, ${held.length} entries, all the member's`);
+  const mine = held.filter((e) => e.from === b.self).length;
+  const theirs = held.filter((e) => strangers.includes(e.from)).length;
+  check(mine > 0 && theirs === 0, `room: doc frames (tags 7 and 8) reach the open doc, ${held.length} entries, ${mine} by the member's writer, ${theirs} by a stranger's`);
   got.length = 0;
   b.send('still here');
   const heard = await until(() => got.some(([d]) => d === 'still here'), 5000);
