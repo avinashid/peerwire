@@ -36,6 +36,10 @@
 // Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
 // room.poll() / room.receive() return queued events as plain objects (strings,
 // numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
+//
+// room.doc(name) opens a shared document (doc.js) that every member holds and that
+// catches up members who join later. Its frames have their own tags, plain or deflated,
+// so they never show as messages; an older peer drops a tag it doesn't know.
 
 import { loadPeerwire, Lane, toHex, fromHex, isPeerId } from './peerwire.js';
 import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
@@ -43,17 +47,29 @@ import { NostrSignaling } from './nostr.js';
 import { LocalTransport } from './local.js';
 import { RoomProof } from './proof.js';
 import { DirectRetries } from './retry.js';
+import { Doc, unopened } from './doc.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
-// Nudge carries nothing (peers ignore tags they don't know): see the 'open' handler.
-const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6 };
+// Nudge carries nothing (peers ignore tags they don't know): see the 'open' handler. Doc
+// carries a shared document's frame as JSON (doc.js), on the reliable lane; DocZ the same,
+// deflated (raw deflate).
+const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6, Doc: 7, DocZ: 8 };
+// Doc frames of DEFLATE_MIN bytes or more go deflated to members whose doc reads them, where
+// this platform has 'deflate-raw' streams. One goes plain if it deflates to under 1/DEFLATE_RATIO
+// of its size, and one is inflated only to the lane's limit and DEFLATE_RATIO times its own size,
+// so what a member sends never makes us read more than that many times it. Inflating takes its
+// input INFLATE_SLICE bytes at a time, and stops past the limit, so a frame that would inflate
+// further holds at most one slice's output (raw deflate inflates 1032 times at most) past it.
+const DEFLATE_MIN = 1024;
+const DEFLATE_RATIO = 16;
+const INFLATE_SLICE = 1024;
 // Presence is re-announced this often, so a lost hello only delays a join.
 const HELLO_EVERY_MS = 15000;
 // A link must prove the room key this soon after it connects.
 const PROOF_MS = 10000;
 // In a fallback, members get this long to relay a peer before signalling, the
-// slowest path, joins the dial.
+// slowest path, joins the dial. With no other member that could, it is dialled at once.
 const PEER_FIRST_MS = 1000;
 // Frames held from one peer while its link proof is checked (and until our presence
 // has gone to it).
@@ -65,10 +81,76 @@ const PAGEHIDE_GRACE_MS = 20;
 const NOT_CONNECTED = -1;
 const TOO_LARGE = -2;
 const WOULD_BLOCK = -3;
+// The core's limit per lane on a message, here a frame (tag byte and data): reliable
+// Config::max_message, unreliable MAX_UNRELIABLE, urgent MAX_URGENT. write() checks it
+// itself, since a frame that waits in the outbox meets the core only in flush().
+const MAX_FRAME = { [Lane.Reliable]: 1 << 20, [Lane.Unreliable]: 1100, [Lane.Urgent]: 64 << 10 };
+const tooLarge = (f) => new RangeError(`message of ${f.length - 1} bytes is too large for this lane`);
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const modules = new Map(); // wasm source -> Promise<Peerwire>, shared by rooms
+
+// Whether this platform deflates and inflates (CompressionStream and DecompressionStream with
+// 'deflate-raw').
+const deflates = (() => {
+  try {
+    new CompressionStream('deflate-raw');
+    new DecompressionStream('deflate-raw');
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+// A stream's chunks as one array, or null if they come to more than `max` bytes or the stream fails.
+async function readAll(readable, max) {
+  const reader = readable.getReader();
+  const parts = [];
+  let n = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      n += value.length;
+      if (n > max) {
+        reader.cancel().catch(() => {});
+        return null;
+      }
+      parts.push(value);
+    }
+  } catch {
+    return null;
+  }
+  const out = new Uint8Array(n);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
+async function deflate(bytes) {
+  const cs = new CompressionStream('deflate-raw');
+  const w = cs.writable.getWriter();
+  w.write(bytes).catch(() => {});
+  w.close().catch(() => {});
+  return readAll(cs.readable, Infinity);
+}
+
+// `bytes` inflated, or null if it isn't raw deflate or inflates past `max` bytes.
+async function inflate(bytes, max) {
+  const ds = new DecompressionStream('deflate-raw');
+  const w = ds.writable.getWriter();
+  (async () => {
+    for (let i = 0; i < bytes.length; i += INFLATE_SLICE) await w.write(bytes.subarray(i, i + INFLATE_SLICE));
+    await w.close();
+  })().catch(() => {});
+  const out = await readAll(ds.readable, max);
+  if (!out) w.abort().catch(() => {});
+  return out;
+}
 
 function frame(tag, body) {
   const b = new Uint8Array(body.length + 1);
@@ -85,10 +167,24 @@ function encode(data) {
   return frame(T.Json, enc.encode(JSON.stringify(data)));
 }
 
+// A lane by name or number. Only the three named ones: the core sends any other
+// number as unreliable, but MAX_FRAME wouldn't know its limit.
 function laneOf(lane) {
   const n = typeof lane === 'number' ? lane : LANES[lane];
-  if (n === undefined) throw new TypeError(`unknown lane ${lane}: use 'reliable', 'unreliable' or 'urgent'`);
+  if (n !== Lane.Reliable && n !== Lane.Unreliable && n !== Lane.Urgent) throw new TypeError(`unknown lane ${String(lane)}: use 'reliable', 'unreliable' or 'urgent' (0, 1 or 2)`);
   return n;
+}
+
+// Our presence as a frame, checked before anything stores it: one over the reliable
+// lane's limit would fail every later welcome, and so every later join. JSON.stringify
+// gives undefined, not an error, for undefined, a function or a Symbol: that frame would
+// go out empty, no peer could parse it, and a room joining later would never list us.
+function presenceFrame(presence) {
+  const json = JSON.stringify(presence);
+  if (json === undefined) throw new TypeError('presence must be a JSON value');
+  const f = frame(T.Presence, enc.encode(json));
+  if (f.length > MAX_FRAME[Lane.Reliable]) throw tooLarge(f);
+  return f;
 }
 
 // A queued event: only strings, numbers, plain JSON values and ArrayBuffers.
@@ -123,6 +219,7 @@ export async function joinRoom({
   // A room dials every member, so relay-only (one WebRTC link, to the relay) can't apply.
   if (privacy !== 'direct' && privacy !== 'public-only') throw new TypeError(`joinRoom privacy must be 'direct' or 'public-only', not ${privacy}`);
   if (!['auto', 'peers', 'off'].includes(fallback)) throw new TypeError(`joinRoom fallback must be 'auto', 'peers' or 'off', not ${fallback}`);
+  presenceFrame(presence);
   const src = wasm ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url);
   const key = String(src);
   if (!modules.has(key)) modules.set(key, loadPeerwire(src).catch((e) => (modules.delete(key), Promise.reject(e))));
@@ -185,6 +282,10 @@ export class Room {
     this.routes = new Map(); // linked peer -> { kind: 'direct' | 'peer' | 'signaling', via?, adopted? }
     this.paths = new Map(); // linked peer -> the endpoint's path to it
     this.fallingBack = new Set(); // peers we dial by fallback since WebRTC failed
+    this.docs = new Map(); // name -> open Doc
+    this.docOut = new Map(); // peer -> the doc frames to it, in order, while one waits to be deflated
+    this.docIn = new Map(); // peer -> the doc frames from it, in order, while one waits to be inflated
+    this.deflated = new WeakMap(); // doc frame -> its deflated bytes, made once for all the members it goes to
     this.transport = makeTransport((peer, state, handle) => {
       if (state === 'closed') this.rtcClosed(peer, handle);
       else if (state === 'failed') this.rtcFailed(peer);
@@ -263,6 +364,7 @@ export class Room {
     const l = laneOf(lane);
     const f = encode(data);
     const targets = to === undefined ? this.peers : [to].flat().filter((p) => this.members.has(p));
+    // A message too large for the lane throws at the first target, before any is written.
     for (const p of targets) this.write(p, f, l);
     return targets.length;
   }
@@ -292,17 +394,18 @@ export class Room {
   }
 
   setPresence(presence) {
+    const f = presenceFrame(presence);
     this.me = presence;
-    const f = frame(T.Presence, enc.encode(JSON.stringify(presence)));
     for (const p of this.proven) this.write(p, f, Lane.Reliable);
   }
 
   // How `peer` is reached: { kind: 'direct' } (its own WebRTC link), { kind: 'direct',
   // adopted: true } (a channel handed to adoptChannel), { kind: 'peer', via } (relayed
   // by member `via`), { kind: 'signaling' } (over the signalling relays), or null while
-  // not linked.
+  // not linked; with `rttMs`, the round trip over that path (null until measured).
   route(peer) {
-    return this.routes.get(peer) ?? null;
+    const r = this.routes.get(peer);
+    return r ? { ...r, rttMs: this.endpoint.pathRttMs(peer) } : null;
   }
 
   // Tries WebRTC again, now, with `peer` (or every peer) that the room reaches only by
@@ -355,6 +458,90 @@ export class Room {
     return true;
   }
 
+  // The shared document `name`, opened on first call: the same name on every member is
+  // the same document. See doc.js.
+  doc(name) {
+    if (this.left) throw new Error('left the room');
+    let d = this.docs.get(name);
+    if (d) return d;
+    d = new Doc(name, {
+      self: this.self,
+      peers: () => this.peers,
+      send: (peer, m, z) => this.writeDoc(peer, m, z),
+      after: (ms, fn) => {
+        const t = setTimeout(fn, ms);
+        return () => clearTimeout(t);
+      },
+      now: () => performance.now(),
+      closed: (doc) => this.docs.get(name) === doc && this.docs.delete(name),
+      route: (peer) => this.routes.get(peer)?.kind ?? null,
+      deflate: deflates,
+    });
+    this.docs.set(name, d);
+    d.open();
+    return d;
+  }
+
+  // Doc frames go to a peer in order. One of DEFLATE_MIN bytes or more, to a member whose doc
+  // reads deflated frames (`z`), goes deflated where we can, which takes a moment: the frames
+  // after it wait for it.
+  writeDoc(peer, m, z) {
+    const body = enc.encode(JSON.stringify(m));
+    const zip = z && deflates && body.length >= DEFLATE_MIN;
+    const before = this.docOut.get(peer);
+    if (!zip && !before) return this.sendDoc(peer, T.Doc, body);
+    const next = (before ?? Promise.resolve()).then(async () => {
+      if (!zip) return this.sendDoc(peer, T.Doc, body);
+      let made = this.deflated.get(m);
+      if (!made) this.deflated.set(m, (made = deflate(body)));
+      const c = await made;
+      if (c && c.length * DEFLATE_RATIO >= body.length) this.sendDoc(peer, T.DocZ, c);
+      else this.sendDoc(peer, T.Doc, body);
+    }).catch(() => {});
+    this.docOut.set(peer, next);
+    next.then(() => this.docOut.get(peer) === next && this.docOut.delete(peer));
+  }
+
+  sendDoc(peer, tag, body) {
+    if (this.left) return;
+    try {
+      this.write(peer, frame(tag, body), Lane.Reliable);
+    } catch {
+      // A doc frame stays under half the lane's limit, and a peer gone meanwhile is no error here.
+    }
+  }
+
+  // A doc frame from a member, in the order sent: one deflated waits to be inflated, and the
+  // frames after it wait for it. With no doc open, one deflated is dropped unread: a member
+  // deflates only for a doc whose ask said it reads them, so it is for a doc we closed.
+  onDoc(peer, tag, body) {
+    if (tag === T.DocZ && !this.docs.size) return;
+    const before = this.docIn.get(peer);
+    if (tag === T.Doc && !before) return this.docFrame(peer, body);
+    const data = body.slice(); // the endpoint's buffer is its own once this returns
+    const next = (before ?? Promise.resolve()).then(async () => {
+      const text = tag === T.Doc ? data : await inflate(data, Math.min(MAX_FRAME[Lane.Reliable], DEFLATE_RATIO * data.length));
+      if (text && !this.left && this.members.has(peer)) this.docFrame(peer, text);
+    }).catch(() => {});
+    this.docIn.set(peer, next);
+    next.then(() => this.docIn.get(peer) === next && this.docIn.delete(peer));
+  }
+
+  // A doc frame's JSON text, for the open doc it names. An ask for a doc we don't have open is
+  // answered with nothing (see unopened), and anything else for one is dropped. It never throws
+  // into the room.
+  docFrame(peer, text) {
+    try {
+      const m = JSON.parse(dec.decode(text));
+      const d = typeof m?.d === 'string' ? this.docs.get(m.d) : undefined;
+      if (d) return d.receive(peer, m);
+      const none = unopened(m);
+      if (none) this.writeDoc(peer, none, false);
+    } catch {
+      // Malformed: dropped.
+    }
+  }
+
   rtt(peer) {
     return this.endpoint.rttMs(peer);
   }
@@ -378,6 +565,9 @@ export class Room {
     globalThis.navigator?.connection?.removeEventListener?.('change', this.onNetwork);
     this.retries.close();
     for (const off of this.unwatch) off();
+    for (const d of [...this.docs.values()]) d.close();
+    this.docOut.clear();
+    this.docIn.clear();
     const bye = Uint8Array.of(T.Bye);
     for (const p of this.linked) this.endpoint.send(p, bye, Lane.Unreliable);
     this.endpoint.pump();
@@ -464,11 +654,13 @@ export class Room {
       const joined = this.members.has(peer);
       this.members.set(peer, p);
       this.emit(joined ? 'presence' : 'peer-join', peer, p);
+      if (!joined) for (const d of this.docs.values()) d.joined(peer);
       return;
     }
     if (tag === T.Bye) return this.lost(peer, 'left');
     // Before its presence, a peer hasn't joined: only unreliable data can race it.
     if (!this.members.has(peer)) return;
+    if (tag === T.Doc || tag === T.DocZ) return this.onDoc(peer, tag, body);
     let value;
     if (tag === T.Bytes) value = body;
     else if (tag === T.Text) value = dec.decode(body);
@@ -541,15 +733,18 @@ export class Room {
     if (!path || !this.linked.has(peer)) return;
     this.setRoute(peer, path);
     this.offerRelays();
+    for (const d of this.docs.values()) d.rerouted();
   }
 
   // Every proven member linked to us directly is offered as a relay for every proven
-  // peer we reach over signalling: the core probes through it and moves the link there
-  // once the peer answers, which it does only if it would use that member too.
+  // peer we reach over signalling or through another member: the core probes through it
+  // and moves the link there once the peer answers (from signalling), or once it is
+  // clearly faster than the member relaying now; the peer answers only if it would use
+  // that member too.
   offerRelays() {
     const members = [...this.routes].filter(([p, r]) => r.kind === 'direct' && this.proven.has(p)).map(([p]) => p);
     for (const [p, r] of this.routes) {
-      if (r.kind === 'signaling' && this.proven.has(p)) for (const m of members) this.endpoint.addRelay(m, p);
+      if (r.kind !== 'direct' && this.proven.has(p)) for (const m of members) this.endpoint.addRelay(m, p);
     }
   }
 
@@ -567,7 +762,8 @@ export class Room {
   // WebRTC couldn't link `peer`. The side that dials (the smaller id) dials it again
   // through every member linked to us directly (and any that links later) and, unless
   // one answers within PEER_FIRST_MS, over signalling too; the core keeps the first
-  // path to answer. The other side just answers.
+  // path to answer. With no other member that could (two in the room, say: a laptop on
+  // a phone's hotspot), signalling is dialled at once. The other side just answers.
   rtcFailed(peer) {
     if (this.left || this.fallback === 'off' || this.self > peer || this.endpoint.isConnected(peer)) return;
     const vias = [...this.routes].filter(([p, r]) => p !== peer && r.kind === 'direct' && this.proven.has(p)).map(([p]) => p);
@@ -577,6 +773,10 @@ export class Room {
     this.fallingBack.add(peer);
     for (const v of vias) this.endpoint.connectVia(v, peer);
     if (pipe == null) return;
+    // Another peer we heard but haven't linked yet may still link and prove the key, and
+    // relayPending dial through it: only with no such peer either is signalling at once.
+    const others = [...this.greeted, ...this.linked].some((p) => p !== peer && (!this.linked.has(p) || this.routes.get(p)?.kind === 'direct'));
+    if (!others) return this.endpoint.connect(pipe, peer);
     setTimeout(() => !this.left && this.fallingBack.has(peer) && this.endpoint.connect(pipe, peer), Room.peerFirstMs);
   }
 
@@ -601,13 +801,25 @@ export class Room {
     this.paths.delete(peer);
     this.fallingBack.delete(peer);
     this.retries.forget(peer);
+    this.docOut.delete(peer);
+    this.docIn.delete(peer);
+    // Out of the room before the session ends: disconnect() pumps, and a 'disconnected'
+    // already queued (its sealed close came in the Bye's pipe batch) is not a second leave.
+    const member = this.members.delete(peer);
     // Its sealed close may never come now that its transport is gone: end the session
     // here, so links it relayed go back to signalling at once.
     if (reason === 'left') this.endpoint.disconnect(peer);
-    if (this.members.delete(peer)) this.emit('peer-leave', peer, reason);
+    if (member) {
+      for (const d of this.docs.values()) d.left(peer);
+      this.emit('peer-leave', peer, reason);
+    }
   }
 
+  // Throws RangeError for a frame over its lane's limit before queueing or sending it,
+  // whether or not the outbox holds frames for `peer`: flush() could only drop it. A
+  // frame sent to several peers throws at the first, so none of them is sent it.
   write(peer, f, lane) {
+    if (f.length > MAX_FRAME[lane]) throw tooLarge(f);
     const q = this.outbox.get(peer);
     if (q) return void q.push([f, lane]);
     const r = this.endpoint.sendRetry(peer, f, lane);
@@ -615,7 +827,7 @@ export class Room {
       this.outbox.set(peer, [[f, lane]]);
       this.flushSoon();
     } else if (r === TOO_LARGE) {
-      throw new RangeError(`message of ${f.length - 1} bytes is too large for this lane`);
+      throw tooLarge(f);
     } else if (r < 0 && r !== NOT_CONNECTED) {
       throw new Error(`send failed (${r})`);
     }

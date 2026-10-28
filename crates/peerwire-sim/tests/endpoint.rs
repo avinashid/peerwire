@@ -1,7 +1,7 @@
 //! Endpoint scenarios run in the deterministic simulator.
 #![allow(clippy::needless_range_loop)]
-use peerwire_core::{Config, DisconnectReason, Event, Lane, Path, MAX_DATAGRAM};
-use peerwire_sim::{NetConfig, Sim, SimAddr};
+use peerwire_core::{stun, Address, Config, DisconnectReason, Event, Lane, Path, PeerId, MAX_DATAGRAM};
+use peerwire_sim::{NatConfig, NetConfig, Sim, SimAddr};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use std::cell::RefCell;
@@ -650,4 +650,140 @@ fn slow_link_moves_through_a_relay_and_back_under_loss() {
     let got: Vec<u32> =
         messages(&eb, Lane::Reliable).iter().map(|m| u32::from_le_bytes(m[..4].try_into().unwrap())).collect();
     assert_eq!(got, (0..sent).collect::<Vec<_>>(), "every message once, in order");
+}
+
+/// Moves to another path counted in `e`, to `peer`'s link.
+fn moves(e: &[Event<SimAddr>], peer: PeerId) -> Vec<Path<SimAddr>> {
+    e.iter()
+        .filter_map(|e| match e {
+            Event::PathChanged { peer: p, path } if *p == peer => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Fast lane 3: a and b, on each other's slow address (200 ms more a hop), take
+/// relay c (`c_ms` more for what c sends), and are then offered relay d (5 ms
+/// more) too, under 20 ms of jitter a packet, both relays offered again every
+/// second (as a room does) and a message a→b every 100 ms for 60 s. Returns
+/// the paths a and b took after d was offered, whether every message came, in
+/// order, and d's PeerId.
+fn relay_race(c_ms: u64, seed: u64) -> (Vec<Path<SimAddr>>, Vec<Path<SimAddr>>, bool, PeerId) {
+    let mut sim = Sim::new(NetConfig { jitter: Duration::from_millis(20), ..NetConfig::default() }, seed);
+    for _ in 0..4 {
+        sim.add_node(Config::default());
+    }
+    sim.connect(0, 1).unwrap();
+    for r in [2, 3] {
+        sim.connect(r, 0).unwrap();
+        sim.connect(r, 1).unwrap();
+    }
+    let linked = |s: &mut Sim| connected(s, 0, 1) && (2..4).all(|r| connected(s, r, 0) && connected(s, r, 1));
+    assert!(sim.run_until(Duration::from_secs(20), linked), "never linked");
+    let (a, b, c, d) = (sim.peer_id(0), sim.peer_id(1), sim.peer_id(2), sim.peer_id(3));
+    let [at_a, at_b, at_c, at_d] = [0, 1, 2, 3].map(|i| sim.addr(i));
+    sim.delay = Some(Box::new(move |from, to| {
+        let ms = match from {
+            _ if [from, to] == [at_a, at_b] || [from, to] == [at_b, at_a] => 200,
+            f if f == at_c => c_ms,
+            f if f == at_d => 5,
+            _ => 0,
+        };
+        Duration::from_millis(ms)
+    }));
+    sim.nodes[0].endpoint.set_slow(&b, Some(at_b));
+    sim.nodes[1].endpoint.set_slow(&a, Some(at_a));
+    let offer = |sim: &mut Sim, relays: &[PeerId]| {
+        let now = sim.now;
+        for &r in relays {
+            sim.nodes[0].endpoint.add_relay(now, r, &b);
+            sim.nodes[1].endpoint.add_relay(now, r, &a);
+        }
+    };
+    offer(&mut sim, &[c]);
+    let on_c = |s: &mut Sim| s.path(0, 1) == Some(Path::Via(c)) && s.path(1, 0) == Some(Path::Via(c));
+    assert!(sim.run_until(Duration::from_secs(20), on_c), "never on c");
+    link_events(&mut sim, 0);
+    link_events(&mut sim, 1);
+    let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+    for k in 0..600u32 {
+        if k % 10 == 0 {
+            offer(&mut sim, &[c, d]);
+        }
+        sim.send(0, 1, Lane::Reliable, &k.to_le_bytes()).unwrap();
+        sim.run_for(Duration::from_millis(100));
+        got_a.extend(link_events(&mut sim, 0));
+        got_b.extend(link_events(&mut sim, 1));
+    }
+    sim.run_for(Duration::from_secs(2));
+    got_b.extend(link_events(&mut sim, 1));
+    assert!((0..2).all(|i| sim.nodes[i].endpoint.stats().path_probes > 0), "both ends raced c and d");
+    let got: Vec<u32> =
+        messages(&got_b, Lane::Reliable).iter().map(|m| u32::from_le_bytes(m[..4].try_into().unwrap())).collect();
+    (moves(&got_a, b), moves(&got_b, a), got == (0..600).collect::<Vec<_>>(), d)
+}
+
+/// Fast lane 3: the link takes d, 110 ms faster a round trip, once each end, and
+/// stays there under jitter; every message arrives once, in order.
+#[test]
+fn a_relayed_link_settles_on_the_faster_relay_under_jitter() {
+    let (a, b, whole, d) = relay_race(60, 21);
+    assert_eq!((a, b), (vec![Path::Via(d)], vec![Path::Via(d)]));
+    assert!(whole, "every message once, in order");
+}
+
+/// ...and d only 14 ms faster a round trip, inside the margin, isn't swapped in
+/// and out for jitter: the link takes it at most once and never goes back.
+#[test]
+fn relays_within_the_margin_dont_flap_under_jitter() {
+    for seed in [22, 23, 24] {
+        let (a, b, whole, d) = relay_race(12, seed);
+        assert!(a.len() <= 1 && a == b && a.iter().all(|p| *p == Path::Via(d)), "seed {seed}: {a:?} {b:?}");
+        assert!(whole, "seed {seed}");
+    }
+}
+
+/// The address node `i`'s NAT maps its socket to, as the STUN server at `stun` sees it.
+fn mapped(sim: &mut Sim, i: usize, stun_at: SimAddr) -> SimAddr {
+    let tx = [i as u8 + 1; 12];
+    sim.send_raw(i, stun_at, stun::binding_request(&tx));
+    sim.run_for(Duration::from_millis(200));
+    let (_, answer) = sim.nodes[i].stun_inbox.pop().expect("a STUN answer");
+    SimAddr::from_socket_addr(stun::parse_binding_response(&answer, &tx).unwrap()).unwrap()
+}
+
+/// Fast lane 3, LAN vs public: two peers behind one NAT that hairpins, linked over
+/// each other's public address (the NAT's mapping, 30 ms slower a packet here),
+/// then given each other's LAN address, move the link to the LAN, once each end.
+#[test]
+fn a_link_over_public_addresses_moves_to_the_lan() {
+    let mut sim = Sim::new(NetConfig::default(), 31);
+    let nat = sim.add_nat(NatConfig { hairpin: true, ..NatConfig::full_cone() }, None);
+    let (a, b) = (sim.add_node_behind(nat, Config::default()), sim.add_node_behind(nat, Config::default()));
+    let stun_at = sim.add_stun_server();
+    let (pub_a, pub_b) = (mapped(&mut sim, a, stun_at), mapped(&mut sim, b, stun_at));
+    let wan = sim.nat_ip(nat);
+    sim.delay = Some(Box::new(move |_, to| Duration::from_millis(if to.ip == wan { 30 } else { 0 })));
+    let (ida, idb) = (sim.peer_id(a), sim.peer_id(b));
+    let now = sim.now;
+    sim.nodes[a].endpoint.connect(now, pub_b, idb).unwrap();
+    assert!(sim.run_until(Duration::from_secs(5), |s| connected(s, a, b)));
+    assert_eq!((sim.path(a, b), sim.path(b, a)), (Some(Path::Direct(pub_b)), Some(Path::Direct(pub_a))));
+    link_events(&mut sim, a);
+    link_events(&mut sim, b);
+    let (lan_a, lan_b) = (sim.addr(a), sim.addr(b));
+    let now = sim.now;
+    sim.nodes[a].endpoint.add_candidates(now, &idb, &[lan_b]);
+    sim.nodes[b].endpoint.add_candidates(now, &ida, &[lan_a]);
+    sim.run_for(Duration::from_secs(30));
+    assert_eq!((sim.path(a, b), sim.path(b, a)), (Some(Path::Direct(lan_b)), Some(Path::Direct(lan_a))));
+    let (ea, eb) = (link_events(&mut sim, a), link_events(&mut sim, b));
+    assert_eq!((moves(&ea, idb), moves(&eb, ida)), (vec![Path::Direct(lan_b)], vec![Path::Direct(lan_a)]));
+    // The end that took the LAN timed it racing; the other, once data is acknowledged there.
+    let (lead, follow) = if ida < idb { (a, b) } else { (b, a) };
+    let rtt = |sim: &Sim, i: usize, j: usize| sim.nodes[i].endpoint.path_rtt(&sim.peer_id(j));
+    assert!(rtt(&sim, lead, follow).is_some_and(|r| r < Duration::from_millis(60)), "{:?}", rtt(&sim, lead, follow));
+    sim.send(follow, lead, Lane::Reliable, b"timed").unwrap();
+    sim.run_for(Duration::from_millis(500));
+    assert!(rtt(&sim, follow, lead).is_some_and(|r| r < Duration::from_millis(60)), "{:?}", rtt(&sim, follow, lead));
 }

@@ -3,9 +3,11 @@
 // in-page channel with 20 ms latency, no trickle, as over Nostr):
 // - a restart by the dialling side renegotiates with new ICE credentials while the
 //   DataChannel stays open, and datagrams flow after it;
-// - the other side asks for one ('restart'), so offers never cross;
+// - the other side asks for one ('restart'), so offers never cross; the dialling side
+//   heeds the ask only while its own ICE is down too (NB46-1);
 // - ICE 'disconnected' on a link that was open restarts it after RESTART_AFTER_MS,
-//   'failed' at once; at most MAX_RESTARTS until ICE connects again;
+//   'failed' at once; at most MAX_RESTARTS a minute, ICE connecting again doesn't
+//   start the count over (NB46-1);
 // - networkChanged() restarts only links whose ICE isn't connected;
 // - an offer carrying a port prediction makes the other side add 32 candidates
 //   around it ('guesses'), and the link still opens; a malformed one adds none.
@@ -104,9 +106,16 @@ try {
       ok(p.la.dc.readyState === 'open' && !p.a.states.includes('closed') && !p.b.states.includes('closed'), 'the DataChannel never closed');
       ok(await p.flows(2), 'datagrams flow after the restart');
       ok(p.a.tr.restarts === 1 && p.traces.some((t) => t.what === 'offer-received' && t.by === 'B' && t.d.restart), 'B saw a restart offer');
-      // 2. The other side asks: A restarts, B never offers.
+      // 2. The other side asks: A restarts, B never offers. Only while A's own ICE is down
+      // too (NB46-1): an ask while A's is connected is ignored.
       const before2 = p.ufrag();
       p.b.tr.restartIce(p.lb, 'test');
+      await sleep(500);
+      ok(p.restarts('A', 'asked') === 0 && p.ufrag() === before2, "B asked while A's ICE is connected: ignored");
+      Object.defineProperty(p.la.pc, 'iceConnectionState', { get: () => 'disconnected', configurable: true });
+      p.b.tr.restartIce(p.lb, 'test');
+      ok(await until(() => p.restarts('A', 'asked') === 1, 3000), "B asked while A's ICE is down: A restarts");
+      p.real(p.la);
       ok(await until(() => p.ufrag() !== before2 && p.connected()), 'B asked, A restarted');
       ok(p.b.tr.restarts === 0 && p.a.tr.restarts === 2 && p.restarts('A', 'asked') === 1, 'only the dialler offers');
       ok(await p.flows(3), 'datagrams flow after it');
@@ -134,7 +143,8 @@ try {
       p.close();
     }
 
-    // 4. At most MAX_RESTARTS while ICE stays down; connected again starts the count over.
+    // 4. At most MAX_RESTARTS a minute while ICE stays down; connected again doesn't start
+    // the count over (NB46-1).
     {
       const p = await pair();
       await p.flows(1);
@@ -149,9 +159,14 @@ try {
       await until(() => p.connected());
       p.la.pc.dispatchEvent(new Event('iceconnectionstatechange'));
       p.a.tr.restartIce(p.la, 'test');
-      ok(p.a.tr.restarts === MAX_RESTARTS + 1, 'connected again: a restart is allowed');
-      await until(() => p.connected() && p.la.pc.signalingState === 'stable');
-      // 5. networkChanged() restarts only links whose ICE is down.
+      ok(p.a.tr.restarts === MAX_RESTARTS, 'connected again: still no restart within the minute');
+      p.close();
+    }
+
+    // 5. networkChanged() restarts only links whose ICE is down.
+    {
+      const p = await pair();
+      await p.flows(1);
       const n = p.a.tr.restarts;
       p.a.tr.networkChanged();
       await sleep(300);

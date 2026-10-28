@@ -105,6 +105,12 @@ for (const c of ['c=IN IP4 10.0.0.170', 'c=IN IP6 2001:db8::5']) {
   ok(out === ['v=0', 'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'c=IN IP4 0.0.0.0', 'a=rtcp:9 IN IP4 0.0.0.0', 'a=mid:0', ''].join('\r\n'),
     `strip, a gathered SDP (${c}): no candidate, c= 0.0.0.0, port 9${out.includes('10.0.0.170') || out.includes('2001:db8') ? `; left: ${JSON.stringify(out)}` : ''}`);
 }
+// A rejected m-section (port 0) stays rejected; only a gathered port goes back to 9.
+{
+  const two = ['v=0', 'm=application 56167 UDP/DTLS/SCTP webrtc-datachannel', 'a=mid:0', 'm=application 0 UDP/DTLS/SCTP webrtc-datachannel', 'a=mid:1', ''].join('\r\n');
+  const out = stripCandidates(two);
+  ok(out === two.replace('56167', '9'), `strip, a rejected section keeps port 0${out === two.replace('56167', '9') ? '' : `: ${JSON.stringify(out)}`}`);
+}
 
 console.log(failed ? `${failed} FAILED` : 'all passed');
 process.exit(failed ? 1 : 0);

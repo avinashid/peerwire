@@ -55,8 +55,9 @@ room.send({ x: 1, y: 2 }, { lane: 'unreliable' }); // latest-wins, one datagram 
 room.send(bytes, { to: peer });                 // one peer, or an array of them
 room.setPresence({ name: 'Ana', typing: true });
 room.peers; room.self; room.getPresence(peer); room.rtt(peer);
-room.route(peer);                               // { kind: 'direct' (adopted?) | 'peer' (via) | 'signaling' }
+room.route(peer);                               // { kind: 'direct' (adopted?) | 'peer' (via) | 'signaling', rttMs }
 room.retryDirect();                             // try WebRTC again with peers on a fallback (see Through any NAT)
+const doc = room.doc('board');                  // a document every member holds (see Shared documents)
 await room.leave();                             // peers see 'peer-leave' at once
 ```
 
@@ -93,7 +94,9 @@ await room.leave();                             // peers see 'peer-leave' at onc
 - **Node:** Node has no WebRTC. `signaling: 'local'` rooms then carry their
   datagrams over the BroadcastChannel (peers in one process or its workers). For
   real networks pass `RTCPeerConnection` from a WebRTC package such as
-  node-datachannel's polyfill.
+  node-datachannel's polyfill. Known issue: on Node 26.7, a script can hang in
+  `process.exit()` on a busy machine while V8 is still optimising the wasm in the
+  background; run it with `node --no-wasm-tier-up` (the gate runs its tests that way).
 - **Identity:** `room.endpoint.secret()` returns 32 bytes; pass them back as
   `secret` to keep the same PeerId.
 
@@ -119,6 +122,132 @@ at the first `poll()` or `receive()`, so callback-only apps never build one up. 
 started queue grows until you drain it. `demo/poll.html` runs this way.
 
 Types are in `src/index.d.ts`.
+
+## Shared documents
+
+`room.doc(name)` opens a document that every member holds: maps, sets of items and logs. Writes reach every member
+at once, members who join later or come back after a partition catch up, and members that have heard the same
+writes hold the same document, whatever order they heard them in.
+
+```js
+const doc = room.doc('board');                   // the same name on every member is the same document
+const meta = doc.map('meta');                    // one value per key
+meta.set('title', 'Plans');                      // true; false, with a warning, if members have filled the doc
+meta.get('title'); meta.has('title'); meta.delete('title');
+const strokes = doc.set('strokes');              // items, each with its own id
+const id = strokes.add({ points, color });       // the id; null if the doc is full
+strokes.delete(id);                              // undo: delete your item
+const chat = doc.log('messages', { keep: 500 }); // append-only, keeps the newest `keep` (1000 if not given)
+chat.append({ text: 'hi' });
+meta.entries();                                  // [{ key, value, from }], by key
+strokes.entries(); chat.entries();               // [{ id, value, from }], oldest first, one order on every member
+doc.on('change', ({ name, type, key, id, value, deleted, from, local }) => render());
+doc.on('sync', ({ state, from, have, total }) => status()); // catching up: see below; doc.sync is the latest
+doc.close();                                     // room.leave() closes the room's docs too
+```
+
+A late joiner sees the doc fill in, newest entries first, and can say where it stands meanwhile:
+
+```js
+const show = ({ state, from, have, total }) => {
+  const percent = total ? Math.round((100 * have) / total) : 0;
+  if (state === 'alone') line.textContent = doc.synced ? "You're the last one here" : "You're the only one here";
+  else if (state === 'loading') line.textContent = `Loading from ${nameOf(from)}… ${percent}%`;
+  else line.textContent = '';
+};
+show(doc.sync);
+doc.on('sync', show);
+```
+
+- **What wins:**
+  - A `set` replaces the values its writer has seen.
+  - Two values set at the same time, where neither writer had seen the other's, are ordered by Lamport stamp and
+    then by writer, the same on every member.
+  - A `delete` removes the values its writer has seen, so a set made elsewhere at the same time survives it
+    (add-wins, as in Yjs and Automerge).
+  - Set items and log entries sort by Lamport stamp, then writer. A write made after seeing another sorts after
+    it, which gives a whiteboard one z-order and a chat one order. No wall clock is involved.
+- **Sync:**
+  - Each write goes to every member as a delta on the reliable lane: the new entry and the ids of the values it
+    replaces.
+  - A doc asks every member when it opens, and each member that joins. The ask carries its context: for each
+    writer, the ranges of writes it has seen.
+  - It asks one member at a time, so a joiner is sent each entry about once (at most 1.00× the entries it holds
+    in `test/doc_crdt.mjs`), not once per member.
+  - A member is answered 8 times at once, then once per 15 s, and our asks of it go at the same rate. What the
+    answers carry is capped too: 8 Mi characters of JSON text at once (two full docs), then 64 Ki a second. An
+    answer's first piece takes one answer from that budget, and each piece its characters. An ask past that
+    waits rather than being dropped, so a doc closed and opened again (a component that remounts) catches up
+    every time: a small doc 8 times in a row at once, then each up to 15 s late.
+  - Every frame stays under 512 KiB.
+  - Doc frames have their own tags, so they never reach `'message'` or `poll()`. Versions without `room.doc()`
+    (`@peerwire/js` 0.1.0 to 0.2.0) drop them.
+- **Catching up:**
+  - Members are asked in the order of their routes (`room.route()`): linked directly, then relayed by a member,
+    then over signalling. When one linked directly joins, or a member's route becomes direct, while an answer
+    comes over signalling, that member is asked at once, and the one over signalling again after it, for what is
+    still missing. A member gives up its turn this way once until an answer of its ends: after that, the better
+    routed one waits for the turn to pass.
+  - An answer comes in pieces, the newest entries first (the top of a whiteboard), then the writes it knows are
+    deleted. A piece is about 32 Ki characters of JSON over signalling or through a member, and 128 Ki linked
+    directly; it is sized as it is cut, so an answer that a route upgrade moves gets bigger pieces. Each piece
+    is applied as it lands and acknowledged, and at most 4 go unacknowledged, so an answer keeps the pace of its
+    route, and live writes don't queue behind the whole doc.
+  - The next member is asked once an answer has gone 5 s without a piece, or has taken 60 s while another
+    member waits. The slow answer goes on, and the next ask carries what its pieces brought, so it is answered
+    only with what is still missing.
+  - Doc frames of 1 KiB or more go deflated (raw deflate, where the platform has `CompressionStream`) to members
+    whose doc reads them. A whiteboard of 40 strokes of 1000 points, 508 K characters of JSON, reaches a late
+    joiner in about 200 KB, 2.5 times less (`test/room_doc.mjs`). A frame that would deflate more than 16 times
+    goes plain, and a member's frame is inflated only to 16 times its size and 1 MiB, so what a member sends
+    can't make us read more than 16 times it. A room with no doc open drops deflated frames unread.
+  - A member that doesn't have the doc open answers its asks with nothing, so it holds no one up.
+  - In `test/doc_catchup.mjs`, over the signalling pipe through relays that take 10 events a second, a late
+    joiner holds that whiteboard within 15 s of linking and its first strokes within 3 s (about 10 s and 0.2 s on
+    a loaded 4-core host), and within 30 s and 5 s when the member it catches up from is a background tab,
+    whose timers fire once a second (about 13 s and 1 s).
+- **Where catching up stands:** `doc.sync` is `{ state, from, have, total }`, and `'sync'` fires when it changes.
+  - `'alone'`: no other member to catch up from.
+  - `'loading'`: catching up from member `from`, which has sent `have` of the `total` entries its answer carries
+    (0 of 0 until its first piece lands). `have` may stop short of `total`: the last piece ends the answer.
+  - `'synced'`: caught up. An answer ended from a member that had caught up itself, or every member has answered
+    (none had: members that open the doc together hold all there is between them).
+  - `doc.synced` is true once caught up, and stays true, also once the others have gone (`'alone'`). So an app
+    can tell "you're the last one with the board" from "you're the first one here".
+- **Logs:** give `keep` the same value on every member, and call `doc.log()` right after `room.doc()`. A member
+  that keeps fewer entries never trims another's log, but one that keeps more can miss the older entries another
+  has trimmed, once it catches up from that member, directly or through a member that did.
+- **Limits:**
+  - Values are JSON: at most 64 KiB as JSON text and nested at most 64 deep. They come back frozen.
+  - A doc holds 10,000 entries and 4 MiB of JSON text.
+  - A value or key over its limit (keys: 256 characters; names: 128), a value that isn't JSON, or a write after
+    `close()` throws: these are the app's own mistakes.
+  - A doc that members have filled refuses writes with a warning, as every member refuses a write that doesn't
+    fit. Deleting frees room.
+- **Member data:**
+  - Members are trusted alike, as in the room itself: any member can overwrite, delete or fill a doc.
+  - What a member sends is checked and capped before it reaches you. A malformed frame is dropped whole.
+  - A member can make the room ignore another member's writes, by claiming it has seen them before they are
+    written. A doc that hears such a claim on its own writes moves on to new ones, 16 times; past that, it skips
+    every write from the lowest claimed to the highest, its writes are lost at the members that took a claim it
+    hasn't heard, and once every write is claimed they return false or null with a warning, until the doc is
+    closed and opened again.
+  - Every member takes a Lamport stamp however far ahead, as refusing one would split the room. So a member can
+    move the stamps to 2^53 - 1 at once; from then on, values set at the same time, and set items and log
+    entries, are ordered by writer, and a log keeps the highest writers' entries. A later set still wins.
+  - A member can ask for the whole doc as often as it likes, and its answers can name any writes deleted, which
+    we pass on to the other members, one range for each range of it that deleted something here. What it is sent,
+    and what we pass on for it (counted once for each member), is at most 8 Mi characters of JSON text at once and
+    64 Ki a second after, plus the send that went past that (theoretical, from those budgets; UTF-8 takes 1 to 3
+    bytes a character). Past it, the others hear of those deletions from that member or when they next catch up.
+    The budgets are per member while it stays: a member that leaves and joins again, or joins under a new id,
+    starts with whole ones.
+  - `from` is the writer as the doc was told. A member relaying a catch-up can name any writer, so use `from` to
+    colour or group, not as proof of who wrote something. Check every field you render, as with messages.
+  - Where catching up stands is as good as the members that told us: a member can say it had caught up when it
+    hadn't, or carry fewer entries than it says, so a doc can show `'synced'` early or `total` too high. Use
+    `doc.sync` for a status line, not to decide what the doc holds; entries that come later still show.
+- **Not yet:** collaborative text (character sequences), and docs in Rust and Godot.
 
 ## Using with React
 
@@ -197,6 +326,7 @@ function Chat() {
 |---|---|
 | `src/index.js` | The package entry: `joinRoom` and everything below. |
 | `src/room.js` | `joinRoom` and `Room`: mesh, presence, message framing, backpressure. |
+| `src/doc.js` | `room.doc()`: shared documents (maps, sets, logs), a delta-state CRDT, catch-up, limits on member data. |
 | `src/proof.js` | Room key and HMAC proofs (hello, offer, link), compatible with Rust's; `randomRoomId()`. |
 | `src/peerwire.js` | Loads the module; `Endpoint` (connect, send, events, stats, seal/open) and Nostr key helpers. Browser and Node. |
 | `src/webrtc.js` | `WebRtcTransport`: one negotiated, unordered, no-retransmit DataChannel per peer. `BroadcastSignaling` for tabs of one browser. |
@@ -204,6 +334,7 @@ function Chat() {
 | `src/local.js` | `LocalTransport`: datagrams over the BroadcastChannel, for Node and tests. |
 | `src/index.d.ts` | TypeScript types. |
 | `demo/index.html` | Mesh chat on the low-level API: every tab links to every other. |
+| `demo/chat.html` | Chat on `joinRoom`, mobile-friendly: a room per link (`#<room>`; New room makes one with `randomRoomId()`), an invite link with a copy button and a QR code (`demo/qr.js`, a small encoder), nicknames in presence (remembered in localStorage), members with their route (direct, relayed by a member, or over signalling) and RTT, a typing indicator on the unreliable lane that goes after 3 s, and messages on the reliable lane (up to 2000 characters). What members send is shown as text only (`textContent`), never as HTML. Nostr by default; `?signal=local` for tabs of one browser. A member sees messages sent while it is in the room. |
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
 | `demo/netlab.html` | Net Lab, a connection diagnostics page (not a game), mobile-friendly: join a room by any name you type (`office test` is the room `office-test`, shared as a `#room=` link, with recent rooms and a "make private" suffix), the global room, or a private one shared as a `#key=` link, and every member links to every other. An overview row sums up the room (peers, average and worst ping, packet loss, routes, WebRTC traffic, packets). Per peer: ping measured on the route in use (latest, min/avg/max, jitter, loss, with a sparkline), core and ICE round trips, WebRTC traffic, ICE restarts and port guesses, the route (direct, relayed by a member, or over signalling), the ICE candidate pair (IPv4/IPv6, UDP/TCP), the offer/answer exchange (times, resends, the addresses each carried), ICE connectivity checks sent, answered and received with a verdict on which way packets are blocked, time to link and the other side's NAT. Also this device's public addresses, IPv6 and a NAT mapping estimate, the signalling relays' state, chat, an event log with warnings and errors, and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it at `/`. |
@@ -232,9 +363,25 @@ it is given:
   path, and the relay is asked not to pass on your address. The relay sees both
   ends. There is no TURN: a peer not linked to the relay can't be reached.
 
+**With microphone or camera permission.** Until a page has it, browsers hide its local
+addresses (behind mDNS names; Android Chrome offers only its mobile-data interface).
+Connections made after the grant list every network interface (RFC 8828 mode 1), which
+affects every voice or video app. The grant is stored per origin, so it also applies on
+later visits and to pages of that origin that never ask:
+- `'direct'`: members get each interface's real address, LAN, hotspot and IPv6 ones.
+  That is also what lets a phone and a laptop on its hotspot link directly. In one field
+  test (October 2026: Android Chrome on mobile data, a laptop on its hotspot) the pair
+  linked direct in 1.2 s, at about 10 ms, when both pages had microphone permission, and
+  over the signalling relays in 5 to 6 s, at about 600 ms, when they didn't.
+- `'public-only'`: none of those, and so not that direct path either. Each interface's
+  public address as STUN sees it still goes (the Wi-Fi's and the mobile network's, or
+  the real network's under a VPN).
+
 ## Trying it
 
 - Same browser: open `demo/index.html` or the arena pages in several tabs.
+- Chat: open `demo/chat.html`, start a room, and send its invite link to another browser or scan its QR code with a
+  phone. Add `?signal=local` to keep it to tabs of one browser.
 - Different machines: add `?signal=nostr&room=<something only you know>` to every
   page. Peers meet through `wss://nos.lol`, `wss://relay.primal.net` and `wss://nostr.mom` and use
   Google's public STUN. Peers behind symmetric NATs on both sides still meet: see
@@ -259,9 +406,11 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
      `failed`, the dialling side renegotiates with new ICE credentials, so ICE gathers the
      new network's addresses and checks again; the other side asks it to. The DataChannel
      and the Peerwire session over it carry on, so the app sees no leave. At most 3 tries
-     (2, 4, 8 s apart) until ICE connects again. `online` and `navigator.connection`
+     a minute (2, 4, 8 s apart), whether or not ICE connects in between; while it stays
+     down, the next waits for the minute to free. `online` and `navigator.connection`
      changes restart links whose ICE is down at once. Each restart is an offer and an
-     answer over signalling.
+     answer over signalling, within the peer's publish budget (6 at once, then 1 per 5 s;
+     the candidates of an answer it refused wait with it).
 2. **Through another member.** When a link isn't open `fallbackMs` (8 s) after its
    offer, or its ICE fails, the dialling side dials the peer again through every member
    it has a direct link to, including members that link later. The core forwards for
@@ -270,17 +419,21 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
      addresses (a laptop on a phone's hotspot) gets `sameNatFallbackMs` (3 s) instead.
      Browsers find no direct path there unless they show their LAN addresses: mDNS hides
      them, and Android Chrome lists only its mobile-data interface. Waiting the full 8 s
-     rarely helps, so such a pair links over signalling about 4 s after hearing each
-     other, not 9 s. Strangers behind one carrier NAT match too, and seldom link direct
-     either. The transport traces `same-nat`.
-3. **Over the signalling relays.** If no member has answered within 1 s, Peerwire
-   datagrams also go as signalling messages (a *pipe*). On Nostr each batch is sealed
-   to the peer again (`'signaling'`). This works wherever the relays are reachable.
-   It is slow, though: a relay round trip per batch, 40 ms batching, and at most 3
-   batches a second for all of a client's pipes together. That is within what public
-   relays allow one client. A relay that refuses events for its rate limit gets none
-   for 30 s, doubling up to 10 min. The pause starts over at 30 s once the relay has
-   gone 10 min without refusing.
+     rarely helps, so such a pair links over signalling about 3 to 4 s after hearing
+     each other (the handshake crosses the relays), not 9 s. Strangers behind one
+     carrier NAT match too, and seldom link direct either. The transport traces
+     `same-nat`.
+3. **Over the signalling relays.** If no member has answered within 1 s, or at once
+   when there is no other member to ask, Peerwire datagrams also go as signalling
+   messages (a *pipe*). On Nostr each batch is sealed to the peer again
+   (`'signaling'`). This works wherever the relays are reachable. It is slow, though: a
+   relay round trip per batch, 40 ms batching (a batch's worth goes at once), and at most
+   3 batches a second for all of a client's pipes together. That is within what public
+   relays allow one client. A background tab fires its timers once a second at most: a
+   pipe timer that fires that late sends every batch the rate allows by then, and until
+   one fires on time again, pipes send what each task queued at its end, not 40 ms later.
+   A relay that refuses events for its rate limit gets none for 30 s, doubling up to 10
+   min. The pause starts over at 30 s once the relay has gone 10 min without refusing.
 
 The core keeps the first path that completes the handshake, and the room's proofs,
 presence and messages run unchanged on it. A pipe opens only for a peer whose hello
@@ -319,7 +472,8 @@ the fallback and the peer stay as they are. The room retries:
   estimate doesn't count);
 - **after a microphone or camera grant**, with privacy `'direct'`: browsers show their local
   addresses (mDNS hides them, Android Chrome lists only mobile data) only to connections
-  made after one, so a laptop on a phone's hotspot can then link to the phone directly.
+  made after one, so a laptop on a phone's hotspot can then link to the phone directly
+  (when both pages have the permission; see Privacy for what members then see).
   `retryOnGrant: false` turns this off. With `'public-only'`, retries offer no local
   address, as first dials don't;
 - **when the app asks:** `room.retryDirect(peer?)`, for every peer on a fallback or one.
@@ -375,8 +529,8 @@ Run these with Node and the Playwright install on this host:
   its own link proof after checking the peer's still joins on both sides, and one whose
   link is lost before that proof is sent leaves the peer unproven, with no `peer-join`.
 - `node packages/js/test/fuzz.mjs`: seeded random and mutated input to the JS parsers (Nostr
-  events and relay messages, hex and peer ids, room hello proofs, room frames): nothing throws
-  out of a handler of untrusted input and no promise is left rejected.
+  events and relay messages, hex and peer ids, room hello proofs, room frames and shared document
+  frames): nothing throws out of a handler of untrusted input and no promise is left rejected.
 - `node packages/js/test/webrtc_signals.mjs` (Chromium, loopback): malformed offers leave no
   link and no unhandled rejection, 300 random signals throw nothing, real offers are still
   answered, and each refused signal is counted in `WebRtcTransport.badSignals` (as Nostr's
@@ -387,10 +541,20 @@ Run these with Node and the Playwright install on this host:
   candidates, the 32 predicted candidates, and a peer's prediction refused unless it is an
   IPv4 address and ports in range (nothing can be spliced into a candidate line).
 - `node packages/js/test/ice_restart.mjs` (Chromium, loopback): an ICE restart by either side
-  renews the ICE credentials while the DataChannel stays open and datagrams flow; ICE
-  `disconnected` restarts after 2 s, `failed` at once; at most 3 while ICE stays down;
-  `networkChanged()` touches only links whose ICE is down; an offer's prediction adds 32
-  candidates, a malformed one none.
+  renews the ICE credentials while the DataChannel stays open and datagrams flow; the
+  other side's ask is ignored while the dialling side's own ICE is connected; ICE
+  `disconnected` restarts after 2 s, `failed` at once; at most 3 a minute, ICE reconnecting
+  or not; `networkChanged()` touches only links whose ICE is down; an offer's prediction adds
+  32 candidates, a malformed one none.
+- `node packages/js/test/restart_budget.mjs`: a peer can't keep us publishing to the
+  signalling relays. A peer looping `restart` asks (answering each, ICE reconnecting) gets
+  3 restarts; an offer and 200 copies of it, or 50 new offers from a linked peer, get 6
+  answers (the per-peer budget: 6 at once, then 1 per 5 s; the rest counted in
+  `throttled`), and only those answers' candidates (`ice` or `ice-batch`); a copy of the
+  offer releases a held answer, made again with the candidates found meanwhile; a copy of
+  a new offer never gets the last one's answer; a genuine ICE failure still restarts, on
+  either side; a minute after the 3rd restart a 4th goes through, by itself if ICE is
+  still down.
 - `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
   DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
   the outage still arrives after it, by retransmit.
@@ -404,6 +568,59 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_leave.mjs`: a room leaving with a full send window reaches
   its peers at once, before `leave()` returns; with the Bye lost, the core's close still does;
   the `pagehide` handler holds the page 20 ms after it, only if it had peers.
+- `node packages/js/test/doc_crdt.mjs`: shared documents on fake rooms, seeded. Members converge after frames
+  arrive in random order and twice (no catch-up needed), after drops healed by joining again, and after a
+  partition heals; a late joiner is sent each entry about once. It also checks:
+  - intent: a later set wins, a set beats a delete it didn't see, a reply sorts after what it saw;
+  - one `'change'` per change, also for a map whose name ends where another's key begins, and frozen values;
+  - limits, including a full doc;
+  - frames: every one under 512 KiB;
+  - 20,000 mutated frames, none of which throws;
+  - answers per member: 8 at once, then one per 15 s, and an ask past that waits; what they carry to a member
+    that asks for a 2 Mi-character doc every second for a minute and acknowledges every piece (4 whole sends at
+    once, then pieces as the budget allows, within a piece of the 8 Mi + 64 Ki/s bound);
+  - answers in pieces: a whiteboard-sized doc (40 strokes of 1000 points) in 20 pieces over signalling and 4
+    linked directly, newest first, each applied as it lands, at most 4 unacknowledged; acknowledgements of a
+    piece not sent, sent twice or for another ask send nothing; a route that becomes direct mid-answer gets
+    bigger pieces;
+  - a slow answer taken up, not started again: the next member is asked 5 s after the last piece, not the ask,
+    and the joiner is sent each entry once; a member trickling its answer holds the turn 60 s at most, and one
+    that stalled holds it only until another can be asked; an older ask's answer ends nothing, also for a doc
+    opened again during it;
+  - routes: members linked directly asked first, then relayed, then over signalling, and a member that comes,
+    or whose route becomes direct, during an answer over signalling takes the turn, once until that answer ends
+    however often the better routed member is queued again;
+  - `'sync'`: alone, two members opening together, a joiner loading with `have` up to `total` and synced once a
+    caught-up member's answer ends, alone again once everyone has gone, and loading with a member that never
+    answers;
+  - a doc closed and opened 12 times while a member stays catches up every time;
+  - a member that never answers is asked once, however often it prompts us, until it answers;
+  - Lamport stamps moved far ahead (by 2^32 four times, or to 2^53 - 1): a member cut off meanwhile and one that
+    joins after still converge, and so do a member's writes after a jump sent to it alone;
+  - claims on a member's future writes, also past its 16 moves: an entry forged on its next write is never held
+    and the doc stays whole, 12000 separate claims take one range of its context and new members are still heard,
+    and with every write claimed its writes warn and return false or null;
+  - a catch-up that deletes 3000 items is passed on as one range per writer; a member that sends us 9000 items of
+    its own, then deletes them, three times, has us pass on at most what it sent (12 other members), and with one
+    range per item, what we pass on for it stops at its 8 Mi budget and goes on once the budget is back;
+  - what one member frame costs: 16384 copies of a dead range over 9000 entries, 16384 entries into a log
+    that keeps 5000, and 16000 fresh writers into a full context, each timed against a frame of 16384 items
+    (within 3 to 5 times it).
+- `node packages/js/test/room_doc.mjs`: `room.doc()` with three members in a real `'local'` room: they converge, a
+  doc opened late and a fourth member catch up, doc frames never show as messages, writes outlive their writer,
+  and leaving closes docs. A whiteboard-sized doc reaches a late joiner deflated (2.5 times less), members that
+  don't have a doc open answer its asks with nothing, a write that deflates 900 times goes plain, and deflated
+  frames are taken in order with plain ones, one past 16 times its size or 1 MiB, or not deflate, or from a
+  member gone meanwhile, dropped; a room with no doc open drops them unread.
+- `node packages/js/test/doc_catchup.mjs`: a late joiner's catch-up of a whiteboard-sized board (509 KB) over a
+  direct link, the signalling pipe through fake rate-limited relays, from a background tab, both at once, with
+  nobody online, and with two holders, one direct and one over the pipe (one whole answer, from the direct
+  one). It prints the time to the whole board, the frames, datagrams, retransmits, pipe batches and relay
+  events, and checks the bars: 15 s (30 s from a background tab over the pipe), first strokes within 3 s (5 s).
+- `node packages/js/test/pipe_batches.mjs`: a pipe's batches on a fake clock: datagrams queued together go 40
+  ms later as one, a batch's worth at once, 3 a second after a burst of 6, and with timers held to once a second
+  (a background tab), the batches a late timer finds go together, and what a task queued goes at its end, until
+  a timer fires on time again.
 - `node packages/js/test/room_welcome.mjs`: a message a `peer-join` handler sends to the
   newcomer reaches it, also when the newcomer's presence came while its link proof was
   being checked (forced in 20 joins); 200 two-member joins and 30 third members lose none.
@@ -475,6 +692,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/wasm_url.mjs [shot-prefix]`: two tabs join with a root-relative `wasm`
   (`'/pkg/peerwire_ffi.wasm'`, the kind of URL a bundler's `?url` import gives) and chat; relative and
   absolute URLs load, and a 404 rejects with its status.
+- `node packages/js/test/chat.mjs [shot dir]`: the chat demo in two tabs: members and routes, nicknames,
+  the typing indicator, messages shown as text only, frames that aren't messages dropped, leaving and New room.
+- `node packages/js/test/qr.mjs`: the chat demo's QR encoder against known answers.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
   every tab must see every other, and a closed tab must leave.
 - `node packages/js/test/leave.mjs [--runs=10] [--stress=N] [--crash=1]`: closes a streaming

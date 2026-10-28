@@ -23,6 +23,9 @@ export interface SignalingAdapter {
   onHello: (peer: PeerId, meta?: unknown) => void;
   hello(meta?: unknown): void | Promise<void>;
   send(to: PeerId, body: unknown): void | Promise<void>;
+  /** `from` must be the sender's PeerId, authenticated by the adapter (as the Nostr adapter's sealed messages are;
+   * BroadcastChannel is same-origin): WebRTC offers, answers, ICE candidates and restarts, retry requests, and the
+   * signalling pipe and its stale drop all trust it. */
   onMessage(fn: (from: PeerId, body: any) => void): void;
   close(): void;
 }
@@ -50,7 +53,8 @@ export interface JoinRoomOptions {
    * - a factory returning your own adapter.
    */
   signaling?: 'local' | 'nostr' | ((ctx: SignalingContext) => SignalingAdapter);
-  /** Shared with every peer when it joins; change it with `room.setPresence`. Default `{}`. */
+  /** Shared with every peer when it joins; change it with `room.setPresence`. Default `{}`. `joinRoom` rejects
+   * one over 1 MiB as JSON (RangeError) or one JSON can't encode, such as a function or a BigInt (TypeError). */
   presence?: Presence;
   /** Queue events for `room.poll()`/`room.receive()` from the start; otherwise the first call starts the queue. */
   queue?: boolean;
@@ -68,7 +72,13 @@ export interface JoinRoomOptions {
    * `'public-only'`: no LAN or loopback (`host`) candidates, only what STUN reports (and no local address in
    * a candidate's related address or the SDP's `c=` line either), so tabs of one
    * machine with no STUN server can't link. Relay-only is not available for rooms: use
-   * `WebRtcTransport` with `privacy: 'relay-only'`. */
+   * `WebRtcTransport` with `privacy: 'relay-only'`.
+   * Once the origin has a stored microphone or camera grant (it lasts across visits and covers every page of the
+   * origin, even one that never asks), browsers list every network interface to connections made after the grant
+   * (RFC 8828 mode 1). With `'direct'`, members then get each one's real address (LAN, hotspot and IPv6 ones),
+   * which is what lets a phone and a laptop on its hotspot link directly. `'public-only'` withholds those, and that
+   * direct path with them, but still sends each interface's public address as STUN sees it (the Wi-Fi's and the
+   * mobile network's, or the real network's under a VPN). Voice and video apps ask for that permission anyway. */
   privacy?: 'direct' | 'public-only';
   /** What to do for a peer WebRTC can't link (symmetric NAT on both sides, no TURN):
    * - `'auto'` (default): dial it through every member linked to both of you, and over the
@@ -124,7 +134,8 @@ export interface RoomEvents {
 export interface SendOptions {
   /** One peer or several; default every joined peer. */
   to?: PeerId | PeerId[];
-  /** Default `'reliable'`. */
+  /** Default `'reliable'`. A number must be 0, 1 or 2 (reliable, unreliable, urgent); anything else throws
+   * TypeError. */
   lane?: LaneName | number;
 }
 
@@ -140,7 +151,8 @@ export declare class Room {
   on<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): () => void;
   off<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): void;
   /** Sends to every joined peer, or to `to`. Returns how many peers it was queued for.
-   * Throws RangeError if the message can't fit the lane (unreliable: one datagram; urgent: 64 KiB). */
+   * Throws RangeError if the message can't fit the lane (reliable: 1 MiB; unreliable: one datagram; urgent:
+   * 64 KiB), also while earlier messages wait for the send window, and then sends it to no one. */
   send(data: RoomData, options?: SendOptions): number;
   /** `send` with positional arguments; `peer` '' or null sends to everyone. */
   sendTo(peer: PeerId | '' | null, data: RoomData, lane?: LaneName | number): number;
@@ -150,14 +162,17 @@ export declare class Room {
   receive(): RoomEvent | null;
   /** Our presence, or a joined peer's. */
   getPresence(peer?: PeerId): Presence | undefined;
+  /** Throws RangeError for a presence over 1 MiB as JSON, TypeError for one JSON can't encode (`undefined`, a
+   * function, a Symbol, a BigInt, a cycle), and keeps the old one. */
   setPresence(presence: Presence): void;
-  /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   /** How `peer` is reached: its own WebRTC link, a channel handed to `adoptChannel` (`adopted`), relayed by
    * member `via`, or over the signalling relays; null while it isn't linked. A `'peer'` or `'signaling'` route
    * can become `'direct'` later, with the same session (no `peer-leave` or `peer-join`): ICE goes on checking,
    * the room retries WebRTC (see `retryDirect`), or a channel is adopted. A `'signaling'` route also moves to a
-   * member linked directly to both of you once that member is seen to relay both ways, and back if it goes. */
-  route(peer: PeerId): { kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' } | null;
+   * member linked directly to both of you once that member is seen to relay both ways, and back if it goes; a
+   * `'peer'` route to another such member once it is clearly faster (20 % and 15 ms, in 3 of 5 probe rounds 2 s
+   * apart). `rttMs`: the round trip over this path, measured since the link moved there; null until then. */
+  route(peer: PeerId): ({ kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' }) & { rttMs: number | null } | null;
   /** Tries WebRTC again, now, with `peer` (or every peer) the room reaches only by fallback: a new connection,
    * so one made after a network change, or a microphone or camera grant (privacy `'direct'`), offers the new
    * addresses. If its DataChannel opens, the link moves onto it and `route(peer)` says `'direct'`; if not, it
@@ -172,12 +187,129 @@ export declare class Room {
    * True once the channel carries the link; false, leaving the channel to the caller, if the link is direct
    * already or the peer didn't adopt within 5 s. When the channel closes, the link goes back to its fallback. */
   adoptChannel(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel): Promise<boolean>;
+  /** The shared document `name` (1 to 128 characters), opened on the first call and the same object until it is
+   * closed: the same name on every member is the same document. Throws after `leave()`, which closes the room's
+   * docs. See {@link Doc}. */
+  doc(name: string): Doc;
+  /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
   /** Tells every peer we're going, then closes the links, all before it returns (so it works from `pagehide`,
    * where it also runs): the promise is already settled. Reliable messages not yet acknowledged may not arrive:
    * the goodbye can overtake them. */
   leave(): Promise<void>;
+}
+
+/** A map key, set item or log entry as `entries()` lists it. Values come back frozen. A value is member data: check
+ * every field you render. `from` is the writer as the doc was told: a member relaying a catch-up can name any
+ * writer, so use it to colour or group, not as proof. */
+export interface DocMapEntry {
+  readonly key: string;
+  readonly value: unknown;
+  readonly from: PeerId;
+}
+export interface DocItem {
+  /** The item's id: opaque, the same on every member. */
+  readonly id: string;
+  readonly value: unknown;
+  readonly from: PeerId;
+}
+
+/** What `doc.on('change')` reports: one event per key or item a write or a member's frame changed. */
+export interface DocChange {
+  /** The collection's name, as given to `doc.map()`, `doc.set()` or `doc.log()`. */
+  name: string;
+  type: 'map' | 'set' | 'log';
+  /** A map's key. */
+  key?: string;
+  /** A set item's or log entry's id. */
+  id?: string;
+  /** What the key or item holds now; undefined once it is gone. */
+  value: unknown;
+  /** The key or item is gone: deleted, or trimmed from a log. */
+  deleted?: true;
+  /** The writer of the value now shown or, for a deletion, the member it came from (us for our own writes). */
+  from: PeerId;
+  /** Our own write. */
+  local: boolean;
+}
+
+/** Where a doc's catching up stands: `doc.sync`, and what `doc.on('sync')` reports when it changes. As good as the
+ * members that told us: use it for a status line, not to decide what the doc holds. */
+export interface DocSync {
+  /** 'alone': no other member to catch up from. 'loading': catching up from `from`. 'synced': caught up (an
+   * answer ended from a member that had caught up itself, or every member has answered). */
+  readonly state: 'alone' | 'loading' | 'synced';
+  /** The member being caught up from, while 'loading'; null when it waits to ask one, and in the other states. */
+  readonly from: PeerId | null;
+  /** Entries of `from`'s answer that have landed, newest first, of the `total` it carries (as it says): 0 of 0
+   * until its first piece lands, and in the other states. `have` may stop short of `total`: the last piece ends
+   * the answer. */
+  readonly have: number;
+  readonly total: number;
+}
+
+/** One value per key. A `set` replaces the values its writer has seen; of values set at the same time, the one
+ * with the later Lamport stamp shows, then the higher writer. A `delete` removes the values its writer has seen,
+ * so a set made elsewhere at the same time wins. */
+export interface DocMap {
+  /** True; false, with a warning, when members have filled the doc or claimed every write of ours (see the README).
+   * Throws RangeError for a key over 256 characters or a value over 64 KiB as JSON (or nested over 64 deep),
+   * TypeError for a value that isn't JSON. */
+  set(key: string, value: unknown): boolean;
+  get(key: string): unknown;
+  has(key: string): boolean;
+  /** False when the key holds nothing. */
+  delete(key: string): boolean;
+  /** By key. The same array until the map changes. */
+  entries(): readonly DocMapEntry[];
+}
+
+/** Items, each with its own id; `delete(id)` removes one (undo: delete your item). */
+export interface DocSet {
+  /** The new item's id; null, with a warning, when `DocMap.set` would return false. Throws as it does. */
+  add(value: unknown): string | null;
+  get(id: string): unknown;
+  has(id: string): boolean;
+  /** False when no such item is held. */
+  delete(id: string): boolean;
+  /** Oldest first, by Lamport stamp then writer: the same order on every member (a whiteboard's z-order). */
+  entries(): readonly DocItem[];
+}
+
+/** Append-only, keeping the newest `keep` entries. */
+export interface DocLog {
+  /** The new entry's id; null, with a warning, when `DocMap.set` would return false. Throws as it does. */
+  append(value: unknown): string | null;
+  get(id: string): unknown;
+  /** Oldest first, by Lamport stamp then writer: an entry appended after seeing another sorts after it. */
+  entries(): readonly DocItem[];
+}
+
+/** A shared document from `room.doc(name)`: maps, sets and logs that every member holds and that converge. Writes
+ * reach every member at once on the reliable lane; members that join later, or come back after a partition, catch
+ * up, from the best-routed member first, in pieces, the newest entries first. Limits: 10,000 entries and 4 MiB of
+ * JSON text per doc; names 128 characters, keys 256, values 64 KiB as JSON. Members are trusted alike: any member
+ * can overwrite, delete or fill a doc. */
+export interface Doc {
+  readonly name: string;
+  /** Where catching up stands now; `'sync'` fires when it changes. */
+  readonly sync: DocSync;
+  /** True once the doc has caught up, and from then on, also once the other members have gone ('alone'). */
+  readonly synced: boolean;
+  map(name: string): DocMap;
+  set(name: string): DocSet;
+  /** `keep`: the newest entries kept, 1 to 10,000 (default 1000). Give every member the same, right after
+   * `room.doc()`. Calling again with another `keep` trims to it. */
+  log(name: string, options?: { keep?: number }): DocLog;
+  /** Subscribes; returns a function that unsubscribes. A handler that throws is reported on its own. */
+  on(event: 'change', fn: (change: DocChange) => void): () => void;
+  on(event: 'sync', fn: (sync: DocSync) => void): () => void;
+  off(event: 'change', fn: (change: DocChange) => void): void;
+  off(event: 'sync', fn: (sync: DocSync) => void): void;
+  /** Stops syncing and forgets the doc; `room.doc(name)` later opens it afresh and catches up. Writes after it
+   * throw. */
+  close(): void;
 }
 
 /** Joins a room: `const room = await joinRoom({ appId: 'my-app', roomId: 'lobby' })`. */
@@ -276,8 +408,12 @@ export declare class Endpoint {
   /** Offers `relay`, a peer linked directly, to carry the link to `peer` while that link is on its slow address
    * (`setSlow`): a sealed probe goes through `relay` every half second for 5 s, and the link moves there
    * ('pathChanged') once `peer` answers through it, which it does only if it would use the relay too. The first
-   * probe goes out after the current task, with any others offered in it. Does nothing while relay-only, for a
-   * link not on its slow address, for a relay the link holds off (see `setSlow`), or after `close()`. */
+   * probe goes out after the current task, with any others offered in it. On a link relayed already, the relay
+   * is raced against the one it is on (a probe round every 2 s, 5 rounds), and the end with the smaller
+   * PeerId moves the link to it once it is clearly faster; the other follows. A relay that leaves the link's data
+   * unacknowledged for 5 s, on a link with no slow address, is held off as `setSlow` describes and raced at once,
+   * and either end moves the link to the relay that wins. Does nothing while relay-only, for a link that is
+   * direct, for a relay the link holds off (see `setSlow`), or after `close()`. */
   addRelay(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): void;
   /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
    * (reason 'closed') now rather than after its idle timeout. No local event for `peer`, though links it relayed
@@ -285,8 +421,10 @@ export declare class Endpoint {
   disconnect(peer: PeerId | Uint8Array): void;
   /** Relayed links never punch to a direct path, dials through a relay alone (given the relay before any
    * direct address of their own, or with a relay when this is turned on) send nothing direct, relays forward
-   * without our address, and a direct handshake is answered only from a peer we are dialling directly. A direct
-   * dial later given a relay keeps its direct addresses and may complete direct. */
+   * without our address, and a direct handshake is answered only from a peer we are dialling directly or already
+   * have a direct link with. A direct dial later given a relay keeps its direct addresses and may complete direct,
+   * until the next `setRelayOnly(true)`: every such call, even with relay-only already on, sends each dial that has
+   * a relay through it alone. */
   setRelayOnly(on: boolean): void;
   /** After `close()`, the counters as they were when it closed. */
   stats(): EndpointStats;
@@ -295,6 +433,9 @@ export declare class Endpoint {
   open(bytes: Uint8Array): { from: PeerId; data: Uint8Array } | null;
   isConnected(peer: PeerId | Uint8Array): boolean;
   rttMs(peer: PeerId | Uint8Array): number | null;
+  /** Round-trip time over the path the link to `peer` is on now, measured since it moved there; null until
+   * measured, or after `close()`. */
+  pathRttMs(peer: PeerId | Uint8Array): number | null;
   /** 0, or a negative PW_ERR code (-1 not connected, -2 too large: over 1100 B unreliable, 64 KiB urgent,
    * 1 MiB reliable; -3 would block).
    * Throws `Error('send: endpoint closed')` after `close()`: that is a bug in the app, not a lost packet. */
@@ -389,7 +530,17 @@ export declare class WebRtcTransport implements Transport {
   readonly badSignals: number;
   /** Offers sent again for want of an answer, and answers sent again for a repeated offer. */
   readonly resent: number;
-  /** ICE restarts begun as the dialling side (a link that was open lost ICE). */
+  /**
+   * Offers, answers, copies of either and `restart` asks not sent because the peer's publish budget was spent:
+   * 6 at once, then 1 per 5 s per peer, so no peer can keep us publishing to the signalling relays. The ICE
+   * candidates of an answer not sent wait with it, until a copy of its offer finds budget.
+   */
+  readonly throttled: number;
+  /**
+   * ICE restarts begun as the dialling side (a link that was open lost ICE). At most 3 per link a minute, whether
+   * or not ICE reconnects in between (while it stays down, the next is made once the minute frees); the other
+   * side's ask is heeded only while our own ICE is down too.
+   */
   readonly restarts: number;
   /** Retries begun as the dialling side (see `retry`). */
   readonly retried: number;
@@ -399,8 +550,9 @@ export declare class WebRtcTransport implements Transport {
    * `restart: true` for an ICE restart, `retry: true` for a retry's offer), retries (`retry` with `dialer`,
    * `retry-failed`), ICE (`ice-state` with `state`, `candidate-error` with the STUN server `url`,
    * `code`, `text`, `address`, `ice-restart` with `n`, `reason`, `dialer`), port prediction (`guesses` with the
-   * peer's `ip`, `next`, `step` and the `n` candidates added) and `same-nat` (the peer's candidates name our
-   * public IPv4 `ip`, so the link falls back after `ms`).
+   * peer's `ip`, `next`, `step` and the `n` candidates added), `same-nat` (the peer's candidates name our
+   * public IPv4 `ip`, so the link falls back after `ms`) and `throttled` (a message of `kind` not sent: see
+   * `throttled`).
    */
   trace: ((peer: PeerId, what: string, detail: Record<string, unknown>) => void) | null;
   /**

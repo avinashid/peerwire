@@ -374,7 +374,8 @@ impl RelSend {
         Ok(())
     }
 
-    pub(crate) fn on_ack(&mut self, now: Instant, cum: u32, bits: u64, urgent: bool) {
+    /// Returns when the fragment the ACK took an RTT sample of went out, if any.
+    pub(crate) fn on_ack(&mut self, now: Instant, cum: u32, bits: u64, urgent: bool) -> Option<Instant> {
         let u = urgent as usize;
         let st = &mut self.streams[u];
         let base = st.inflight.first_key_value().map(|(&s, _)| s);
@@ -406,7 +407,7 @@ impl RelSend {
                 };
                 highest = highest.max(Some(s));
                 if f.tries == 1 && !f.probed {
-                    sample = Some(now - f.sent_at);
+                    sample = Some((f.sent_at, now - f.sent_at));
                 }
             }
         }
@@ -430,7 +431,7 @@ impl RelSend {
             });
         }
         let mut queued_too_long = false;
-        if let Some(r) = sample {
+        if let Some((_, r)) = sample {
             self.update_rtt(r);
             let min = self.min_rtt.map_or(r, |m| m.min(r));
             self.min_rtt = Some(min);
@@ -472,6 +473,7 @@ impl RelSend {
             self.streams[u].probe_used = false;
             self.arm_probe(u, now);
         }
+        sample.map(|s| s.0)
     }
 
     /// Seeds the estimator from a handshake round trip, so the first

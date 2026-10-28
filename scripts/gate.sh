@@ -64,15 +64,22 @@ NODE=(
   "node fuzz|node packages/js/test/fuzz.mjs"
   "node room leave|node packages/js/test/room_leave.mjs"
   "node room welcome|node packages/js/test/room_welcome.mjs"
+  "node doc crdt|node packages/js/test/doc_crdt.mjs"
+  "node room doc|node packages/js/test/room_doc.mjs"
+  "node doc catchup|node packages/js/test/doc_catchup.mjs"
   "node room fallback|node packages/js/test/room_fallback.mjs"
+  "node pipe batches|node packages/js/test/pipe_batches.mjs"
   "node room relay move|node packages/js/test/room_relay_move.mjs"
+  "node room relay latency|node packages/js/test/room_relay_latency.mjs"
   "node room adopt|node packages/js/test/room_adopt.mjs"
   "node room same nat|node packages/js/test/room_same_nat.mjs"
   "node room retry|node packages/js/test/room_retry.mjs"
   "node retry backoff|node packages/js/test/retry_backoff.mjs"
   "node nat prediction|node packages/js/test/nat_predict.mjs"
   "node late ice|node packages/js/test/late_ice.mjs"
+  "node restart budget|node packages/js/test/restart_budget.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
+  "node qr|node packages/js/test/qr.mjs"
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
 )
@@ -84,6 +91,7 @@ BROWSER=(
   "readme chat|node packages/js/test/readme.mjs"
   "wasm url|node packages/js/test/wasm_url.mjs"
   "poll|node packages/js/test/poll.mjs 3"
+  "chat|node packages/js/test/chat.mjs"
   "webrtc signals|node packages/js/test/webrtc_signals.mjs"
   "ice restart|node packages/js/test/ice_restart.mjs"
   "retry direct|node packages/js/test/retry_direct.mjs"
@@ -233,9 +241,11 @@ browser_lane() {
   fi
 }
 
-# The Rust tests run from start to end; the Node tests beside them, then the browser tests. Some Node tests are
-# timing-sensitive (room_adopt.mjs failed once with Chromium running beside it), so the browser tests wait for
-# them and overlap only the Rust tests.
+# The Rust tests run from start to end; the Node tests beside them, then the browser tests, which overlap only the
+# Rust tests. That order came in when room_adopt.mjs failed beside Chromium and nextest ("batches still went over
+# signalling"). The flake is fixed: the test by 2c80929, its cause in webrtc.js by 5a7e4ba. On a4299d3 it passed
+# 66 of 66 runs: 20 in the gate's Node mix, 18 pinned to one core with a CPU burner, 16 beside cargo nextest and
+# 12 beside the browser tests.
 lanes() {
   if [ -z "$rust_skip" ]; then
     { step "cargo test" rust_tests; [ $strict = 0 ] || step "fuzz (debug)" fuzz_tests; } &

@@ -366,6 +366,13 @@ impl PeerwireMultiplayerPeer {
         self.stats(id).and_then(|s| s.rtt).map_or(-1.0, |d| d.as_secs_f64() * 1000.0)
     }
 
+    /// Round-trip time over the path the link to peer `id` is on now, in
+    /// milliseconds, measured since it moved there; -1 if unknown.
+    #[func]
+    fn get_peer_path_rtt_ms(&self, id: i32) -> f64 {
+        self.stats(id).and_then(|s| s.path_rtt).map_or(-1.0, |d| d.as_secs_f64() * 1000.0)
+    }
+
     /// Estimated packet loss to peer `id`, 0 to 1 (reliable traffic only), or -1 if unknown.
     #[func]
     fn get_peer_loss(&self, id: i32) -> f64 {

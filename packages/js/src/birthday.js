@@ -117,9 +117,10 @@ export function stripCandidates(sdp) {
   return sdp.split('\n').filter((l) => !/^\s*a=candidate:/i.test(l)).map(unaddressed).join('\n');
 }
 // An SDP line with the address gathering wrote into it put back: `c=`, the m-line port
-// and `a=rtcp:` as before gathering (webrtc.js does the same for its descriptions).
+// and `a=rtcp:` as before gathering (webrtc.js does the same for its descriptions). A port
+// of 0 marks a rejected m-section and is kept.
 function unaddressed(l) {
-  return l.replace(/^c=IN IP[46] [^\s]+/i, 'c=IN IP4 0.0.0.0').replace(/^(m=\S+ )\d+/, (_, m) => `${m}9`)
+  return l.replace(/^c=IN IP[46] [^\s]+/i, 'c=IN IP4 0.0.0.0').replace(/^(m=\S+ )[1-9]\d*/, (_, m) => `${m}9`)
     .replace(/^a=rtcp:\d+ IN IP[46] [^\s]+/i, 'a=rtcp:9 IN IP4 0.0.0.0');
 }
 

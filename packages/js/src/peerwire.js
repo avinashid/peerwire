@@ -227,7 +227,10 @@ export class Endpoint {
   // punch to a direct path, dials through a relay alone send nothing direct (a
   // direct dial later given a relay may still complete direct), relays forward
   // our packets without our address, and a direct handshake is answered only
-  // from a peer we are dialling directly.
+  // from a peer we are dialling directly or already have a direct link with.
+  // Every call with `true`, even with relay-only already on, sends each dial that
+  // has a relay through it alone (a direct dial given a relay since loses its
+  // direct addresses).
   setRelayOnly(on) {
     if (this.closed) return;
     this.pw.x.pw_set_relay_only(this.h, on ? 1 : 0);
@@ -258,10 +261,11 @@ export class Endpoint {
     if (this.closed) return;
     this.pw.x.pw_set_slow(this.h, this.setPeer(peer), addr ?? 0, addr == null ? 0 : 1);
   }
-  // Offers `relay`, a peer linked directly, to carry the link to `peer` while that link
-  // is on its slow address: probes go through `relay`, and the link moves there once
-  // `peer` answers through it. The probes go out after this task, with those of any other
-  // relays offered in it. Does nothing while relay-only or after close().
+  // Offers `relay`, a peer linked directly, to carry the link to `peer`. On its slow
+  // address, probes go through `relay`, and the link moves there once `peer` answers
+  // through it; on another relay, the two are raced, and `relay` is taken if clearly
+  // faster. The probes go out after this task, with those of any other relays offered
+  // in it. Does nothing while relay-only or after close().
   addRelay(relay, peer) {
     if (this.closed) return;
     const pp = this.setPeer(peer);
@@ -326,6 +330,13 @@ export class Endpoint {
   rttMs(peer) {
     if (this.closed) return null;
     const us = this.pw.x.pw_rtt_us(this.h, this.setPeer(peer));
+    return us < 0n ? null : Number(us) / 1000;
+  }
+  // Round-trip time over the path the link to `peer` is on now, in ms, measured since it
+  // moved there; null until measured.
+  pathRttMs(peer) {
+    if (this.closed) return null;
+    const us = this.pw.x.pw_path_rtt_us(this.h, this.setPeer(peer));
     return us < 0n ? null : Number(us) / 1000;
   }
   // Returns 0, or a negative PW_ERR code (-1 not connected, -2 too large, -3 would block).
