@@ -4308,8 +4308,9 @@ mod tests {
         let (got, took) = ask(t, 4, &wire::with_cookie(&hs[4], &c4));
         assert_eq!((kind(&got), took), (wire::COOKIE, 0));
         assert_eq!(ask(t, 4, &wire::with_cookie(&hs[4], &cookie_for(&got))).1, 1);
+        // Sent: 12 HS2s to the flood, then one answer to each of 14 asks.
         let s = ep.stats();
-        assert_eq!((s.cookies_sent, s.rx_auth_failed, s.rx_handshake_dropped), (11, 0, 0));
+        assert_eq!((s.cookies_sent, s.tx_packets, s.rx_auth_failed, s.rx_handshake_dropped), (11, 26, 0, 0));
     }
 
     /// Under load each source holds at most `PER_SOURCE` half-open handshakes, even
