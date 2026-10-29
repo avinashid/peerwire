@@ -4126,6 +4126,55 @@ mod tests {
         p[0] & 0x0f
     }
 
+    /// The type of packet `ep` answers the HS1 `p` from `from` with at `t`, after
+    /// sending it again with the cookie if it gives one; `None` if nothing.
+    fn answer(ep: &mut Endpoint<u32>, t: Instant, from: u32, p: &[u8]) -> Option<u8> {
+        let mut p = p.to_vec();
+        for _ in 0..2 {
+            ep.handle_datagram(t, from, &p);
+            let got = sent(ep, t).pop()?;
+            let Some(Packet::Cookie { cookie, .. }) = wire::parse(&got.payload) else { return Some(kind(&got.payload)) };
+            p = wire::with_cookie(&p, cookie);
+        }
+        panic!("a cookie twice");
+    }
+
+    /// A source's count follows the table: 4 half-open handshakes taken below the
+    /// mark count under load, and once they expire the source may open more and,
+    /// with none left, is forgotten. Validated handshakes still stop at the cap.
+    #[test]
+    fn a_source_may_open_more_once_its_half_open_handshakes_expire() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let b = ids[1].peer_id();
+        let config = Config { max_pending_handshakes: 64, ..Config::default() }; // the mark: 48
+        let mut ep = Endpoint::<u32>::new(&ids[1], config, [2; 32]);
+        let mut t = Instant::from_millis(1);
+        let hs = hs1s(&ids[0], &b, 1000..1006);
+        for p in &hs[..4] {
+            assert_eq!(answer(&mut ep, t, 1, p), Some(wire::HS2));
+        }
+        let flood = hs1s(&ids[2], &b, 0..48);
+        t = Instant::from_millis(5_001);
+        for (i, p) in flood[..44].iter().enumerate() {
+            ep.handle_datagram(t, 100 + i as u32, p);
+        }
+        sent(&mut ep, t);
+        assert_eq!(answer(&mut ep, t, 1, &hs[4]), None);
+        t = Instant::from_millis(10_001);
+        ep.handle_timeout(t);
+        assert_eq!((ep.half_open.len(), ep.by_source.len()), (44, 44));
+        for (i, p) in flood[44..].iter().enumerate() {
+            ep.handle_datagram(t, 144 + i as u32, p);
+        }
+        sent(&mut ep, t);
+        assert_eq!(answer(&mut ep, t, 1, &hs[5]), Some(wire::HS2));
+        for (i, p) in hs1s(&ids[0], &b, 2000..2016).iter().enumerate() {
+            assert_eq!(answer(&mut ep, t, 200 + i as u32, p), (i < 15).then_some(wire::HS2), "{i}");
+        }
+        let s = ep.stats();
+        assert_eq!((s.rx_handshake_dropped, ep.half_open.len(), s.cookies_sent), (2, 64, 18));
+    }
+
     /// SEC-4: 5000 valid HS1s a second, each with its own index and ephemeral key
     /// and from its own spoofed address, the 5000 sent again every second for 25 s.
     /// The half-open handshakes stay at the mark (3072 of 4096), the rest get only
@@ -4278,26 +4327,10 @@ mod tests {
         }
         sent(&mut ep, t);
         let hs = hs1s(&ids[0], &b, 1000..1020);
-        let mut answers = |from: u32, owner: Option<&PeerId>, p: &[u8]| -> Option<u8> {
-            let mut p = p.to_vec();
-            for _ in 0..2 {
-                match owner {
-                    Some(o) => ep.handle_datagram_from(t, from, o, &p),
-                    None => ep.handle_datagram(t, from, &p),
-                }
-                let got = sent(&mut ep, t).pop()?;
-                if kind(&got.payload) != wire::COOKIE {
-                    return Some(kind(&got.payload));
-                }
-                let Some(Packet::Cookie { cookie, .. }) = wire::parse(&got.payload) else { unreachable!() };
-                p = wire::with_cookie(&p, cookie);
-            }
-            panic!("a cookie twice");
-        };
         for (i, p) in hs[..5].iter().enumerate() {
-            assert_eq!(answers(1, None, p), (i < 4).then_some(wire::HS2), "{i}");
+            assert_eq!(answer(&mut ep, t, 1, p), (i < 4).then_some(wire::HS2), "{i}");
         }
-        assert_eq!(answers(2, None, &hs[5]), Some(wire::HS2));
+        assert_eq!(answer(&mut ep, t, 2, &hs[5]), Some(wire::HS2));
         // a's channel: an HS2 at once, as for the 4 first.
         for (i, p) in hs[6..11].iter().enumerate() {
             ep.handle_datagram_from(t, 7, &a, p);
@@ -4326,12 +4359,15 @@ mod tests {
     /// A dial takes a cookie only from an address it dials and for its own index.
     /// It sends the HS1 again with it there at once the first time; a later cookie
     /// there goes with the next retry, and the other targets still get the plain
-    /// HS1. A cookie is unauthenticated: `handle_datagram_direct` says false.
+    /// HS1. A cookie is unauthenticated: `handle_datagram_direct` says false. The
+    /// HS1 a winning simultaneous open sends back at once carries it too.
     #[test]
     fn a_dial_echoes_a_cookie_only_where_it_was_given() {
         let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
-        let (b, c) = (ids[1].peer_id(), ids[2].peer_id());
-        let mut a = Endpoint::<u32>::new(&ids[0], Config::default(), [1; 32]);
+        // a: the smaller PeerId, whose dial wins a simultaneous open.
+        let (ia, ib) = if ids[0].peer_id() < ids[1].peer_id() { (0, 1) } else { (1, 0) };
+        let (b, c) = (ids[ib].peer_id(), ids[2].peer_id());
+        let mut a = Endpoint::<u32>::new(&ids[ia], Config::default(), [1; 32]);
         let mut t = Instant::from_millis(1);
         a.connect_with(t, b, &[Path::Direct(2), Path::Direct(3)]).unwrap();
         let hs1 = sent(&mut a, t).remove(0).payload;
@@ -4352,6 +4388,11 @@ mod tests {
         t = t + Duration::from_millis(500);
         a.handle_timeout(t);
         let got: Vec<_> = sent(&mut a, t).into_iter().map(|x| (x.dst, x.payload)).collect();
-        assert_eq!(got, vec![(2, wire::with_cookie(&hs1, &[2; 16])), (3, hs1)]);
+        assert_eq!(got, vec![(2, wire::with_cookie(&hs1, &[2; 16])), (3, hs1.clone())]);
+        let mut eb = Endpoint::<u32>::new(&ids[ib], Config::default(), [2; 32]);
+        eb.connect(t, 1, ids[ia].peer_id()).unwrap();
+        a.handle_datagram(t, 2, &sent(&mut eb, t).remove(0).payload);
+        let got: Vec<_> = sent(&mut a, t).into_iter().map(|x| (x.dst, x.payload)).collect();
+        assert_eq!(got, vec![(2, wire::with_cookie(&hs1, &[2; 16]))]);
     }
 }
