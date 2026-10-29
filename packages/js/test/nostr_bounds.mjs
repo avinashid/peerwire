@@ -371,7 +371,21 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   const uneven = await pace(true, ['a', 'b']);
   check(Math.max(...uneven.each) - Math.min(...uneven.each) <= 1 && uneven.m > 0,
     `with two relays slowed and one not, each takes its turn: ${uneven.each.join(', ')}`);
+
+  // close(): a lossy event waiting on a relay held for its rate is there alone, so it goes through a free one;
+  // what else waits there went through each relay, and the held one is sent nothing.
+  reset();
+  tokens('c', 0);
+  for (let i = 0; i < 3; i++) await lossy();
+  const late = sock.c.q[0]?.id;
+  await s.publish(s.roomTag, `e${++n}`);
+  const each = sent.a.at(-1);
+  s.paused.set('c', { at: clock, until: clock + 1000, ms: 1000, took: false });
+  const heldAt = sent.c.length;
   s.close();
+  const once = ['a', 'b'].every((x) => sent[x].filter((id) => id === each).length === 1);
+  check(late && again(late) === 1 && once && sent.c.length === heldAt,
+    `close() sends a lossy event waiting on a held relay through a free one (${through(late)}), no other event twice, and the held one nothing`);
   delete performance.now;
 }
 

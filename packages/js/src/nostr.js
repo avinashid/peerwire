@@ -281,8 +281,8 @@ export class NostrSignaling {
     }
     const url = ws.relayUrl;
     const hold = Math.max(this.banned.get(url)?.until ?? 0, this.paused.get(url)?.until ?? 0) - now;
-    // Once closed, a held relay is sent nothing: what waits goes through the free ones,
-    // and there is always one (see release()).
+    // Once closed, a held relay is sent nothing: what waits goes through the free ones
+    // (close() moves lossy events there), and there is always one (see release()).
     if (hold > 0) return this.closed ? undefined : this.pumpIn(ws, hold);
     const r = this.rate(url, now);
     const inflight = (ws.inflight ??= new Map());
@@ -499,6 +499,15 @@ export class NostrSignaling {
     globalThis.removeEventListener?.('online', this.wake);
     globalThis.document?.removeEventListener?.('visibilitychange', this.wake);
     globalThis.navigator?.connection?.removeEventListener?.('change', this.wake);
+    // A lossy event waiting on a relay held for its rate is there alone: it goes through a
+    // free one instead, as the others waiting there already do.
+    const now = clock();
+    for (const ws of this.sockets) {
+      if (!(this.paused.get(ws.relayUrl)?.until > now) || !ws.q?.some((e) => e.lossy)) continue;
+      const moved = ws.q.filter((e) => e.lossy);
+      ws.q = ws.q.filter((e) => !e.lossy);
+      for (const e of moved) this.stripe(e);
+    }
     for (const ws of this.sockets) {
       ws.onmessage = null;
       this.pump(ws); // what waits for its relay's rate goes now

@@ -606,7 +606,8 @@ Run these with Node and the Playwright install on this host:
   what it refused again, in order. With every relay held, the hold that ends first is cut
   short, as it is when the one free relay closes. A ban stops a relay for 30 s, doubling.
   Queues drop their oldest past 64 events or 10 s, and `close()` sends what waits at once,
-  but not to a relay that holds or banned us. The pacing runs on a monotonic clock: the
+  but not to a relay that holds or banned us (a pipe batch waiting on a held one goes
+  through a free one). The pacing runs on a monotonic clock: the
   wall clock set back 60 s stalls nothing.
   Pipe batches go through one relay each, the relays taking turns, also one that can't
   send yet; one held for its rate, banned or closed is skipped, and with every relay held
