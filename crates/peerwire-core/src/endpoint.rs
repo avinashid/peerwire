@@ -4,13 +4,14 @@ use crate::identity::{Identity, PeerId};
 use crate::reliable::{PushError, RecoveryStats, RelRecv, RelSend, MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW};
 use crate::time::Instant;
 use crate::wire::{
-    self, Frame, Packet, FWD_OVERHEAD, MAX_DATAGRAM, MAX_PLAINTEXT, MAX_RELAYED_PACKET, MAX_UNRELIABLE,
+    self, Cookie, Frame, Packet, FWD_OVERHEAD, MAX_DATAGRAM, MAX_PLAINTEXT, MAX_RELAYED_PACKET, MAX_UNRELIABLE,
     RELAYED_OVERHEAD, RELAYED_PLAINTEXT, UNREL_OVERHEAD,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use snow::{HandshakeState, StatelessTransportState};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::IpAddr;
 use std::time::Duration;
 
 /// Most port guesses kept per link (see [`Endpoint::set_guesses`]).
@@ -59,6 +60,11 @@ const PATH_DWELL: Duration = Duration::from_secs(20);
 /// end that took it doesn't follow the peer's packets on others: they left before
 /// the peer moved too.
 const PATH_GRACE: Duration = Duration::from_secs(1);
+/// Under load (see `Config::max_pending_handshakes`), the cookie secret is new
+/// every `COOKIE_EPOCH`, and a cookie holds for the rest of its epoch and the next.
+const COOKIE_EPOCH: Duration = Duration::from_secs(120);
+/// Under load, the half-open handshakes one source may hold (see [`Source`]).
+const PER_SOURCE: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -75,7 +81,13 @@ pub struct Config {
     pub handshake_attempts: u8,
     /// How long a responder keeps a half-open handshake waiting for the first data packet.
     pub handshake_timeout: Duration,
-    /// Cap on half-open responder handshakes (flood protection).
+    /// Cap on half-open responder handshakes (flood protection). From three
+    /// quarters of it the endpoint is under load. An HS1 on an address anyone can
+    /// send from ([`Endpoint::handle_datagram`]) is then answered with a cookie
+    /// made for that HS1 and that address, and takes no state until it is sent
+    /// again with it, so a flood from spoofed addresses can't fill the rest. And
+    /// each source (an IPv4 address or IPv6 /64, a relay, a channel) may hold at
+    /// most 4 half-open handshakes. Below that nothing changes.
     pub max_pending_handshakes: usize,
     /// Cap on announced links. At it a new HS1 is dropped before the
     /// responder's DH, and an inbound handshake that completes once the cap is
@@ -298,6 +310,8 @@ pub struct Stats {
     pub path_probes: u64,
     /// Links moved to a faster path of the same kind.
     pub path_switches: u64,
+    /// Handshakes answered with a cookie under load (see `Config::max_pending_handshakes`).
+    pub cookies_sent: u64,
 }
 
 /// Per-link counters for one connected peer; see [`Endpoint::peer_stats`].
@@ -350,6 +364,36 @@ struct Dial<A> {
     /// When a peer's HS1 on a path we already dial may next be answered with
     /// ours (see `on_hs1`).
     echo_at: Instant,
+    /// The cookie a loaded responder gave at each address (see `on_cookie`).
+    cookies: Vec<(A, Cookie)>,
+}
+
+impl<A: Address> Dial<A> {
+    /// HS1 for `path`: with the cookie given there, if any.
+    fn hs1_to(&self, path: &Path<A>) -> Vec<u8> {
+        match self.cookies.iter().find(|(a, _)| path.direct() == Some(a)) {
+            Some((_, c)) => wire::with_cookie(&self.hs1, c),
+            None => self.hs1.clone(),
+        }
+    }
+}
+
+/// What half-open handshakes are counted against under load ([`PER_SOURCE`]): a
+/// UDP address's IPv4 address or IPv6 /64, any other address itself, or a relay.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Source<A> {
+    Net(IpAddr),
+    Path(Path<A>),
+}
+
+impl<A: Address> Source<A> {
+    fn of(path: &Path<A>) -> Self {
+        match path.direct().and_then(A::to_socket_addr).map(|s| s.ip().to_canonical()) {
+            Some(IpAddr::V6(ip)) => Source::Net(IpAddr::V6((u128::from(ip) >> 64 << 64).into())),
+            Some(ip) => Source::Net(ip),
+            None => Source::Path(path.clone()),
+        }
+    }
 }
 
 /// Probes, paced: of every port of one IP but the low ones, or of a given list.
@@ -744,8 +788,14 @@ pub struct Endpoint<A: Address> {
     /// Outstanding dials by peer.
     dialing: BTreeMap<PeerId, u32>,
     /// (initiator index, initiator ephemeral key) of half-open responder links,
-    /// for HS1 retransmits, which may arrive over several paths.
-    half_open: HashMap<(u32, [u8; 32]), u32>,
+    /// for HS1 retransmits, which may arrive over several paths; and the source
+    /// of the first.
+    half_open: HashMap<(u32, [u8; 32]), (u32, Source<A>)>,
+    /// How many half-open links each source holds.
+    by_source: HashMap<Source<A>, u32>,
+    /// The cookie secret of an epoch (see `check_cookie`), and the last epoch's
+    /// if it was made: none until the endpoint is first under load.
+    secrets: Option<(u64, [u8; 32], Option<[u8; 32]>)>,
     outbox: VecDeque<Transmit<A>>,
     ready: VecDeque<u32>,
     events: VecDeque<Event<A>>,
@@ -768,6 +818,8 @@ impl<A: Address> Endpoint<A> {
             peers: BTreeMap::new(),
             dialing: BTreeMap::new(),
             half_open: HashMap::new(),
+            by_source: HashMap::new(),
+            secrets: None,
             outbox: VecDeque::new(),
             ready: VecDeque::new(),
             events: VecDeque::new(),
@@ -1058,6 +1110,7 @@ impl<A: Address> Endpoint<A> {
             sent_at: now,
             resend_at: now + self.config.handshake_retry,
             echo_at: now,
+            cookies: Vec::new(),
         };
         self.sessions.insert(
             idx,
@@ -1470,9 +1523,10 @@ impl<A: Address> Endpoint<A> {
     /// packet on it for another peer's link, or a handshake from anyone else, is
     /// dropped unread ([`Stats::rx_wrong_peer`]). So a peer that relays for others
     /// can't send their packets on its own channel to move their links onto it.
-    /// Packets relayed through `peer` are unaffected. On addresses anyone can send
-    /// from (UDP), use `handle_datagram`: a link roams to wherever its peer's
-    /// packets come from.
+    /// Packets relayed through `peer` are unaffected. Under load a handshake here
+    /// needs no cookie (see `Config::max_pending_handshakes`): only `peer` sends
+    /// on it. On addresses anyone can send from (UDP), use `handle_datagram`: a
+    /// link roams to wherever its peer's packets come from.
     pub fn handle_datagram_from(&mut self, now: Instant, from: A, peer: &PeerId, data: &[u8]) {
         self.on_packet(now, Path::Direct(from), Some(*peer), data);
     }
@@ -1500,22 +1554,32 @@ impl<A: Address> Endpoint<A> {
                 self.stats.rx_malformed += 1;
                 None
             }
-            Some(Packet::Hs1 { sender, noise }) => self.on_hs1(now, from, owner, sender, noise),
+            Some(Packet::Hs1 { sender, cookie, noise }) => self.on_hs1(now, from, owner, sender, cookie, noise),
             Some(Packet::Hs2 { sender, receiver, noise }) => self.on_hs2(now, from, owner, sender, receiver, noise),
             Some(Packet::Data { receiver, nonce, ciphertext }) => {
                 self.on_data(now, from, owner, receiver, nonce, ciphertext)
             }
+            Some(Packet::Cookie { receiver, cookie }) => self.on_cookie(from, owner, receiver, cookie),
         }
     }
 
-    fn on_hs1(&mut self, now: Instant, from: Path<A>, owner: Option<PeerId>, sender: u32, noise: &[u8]) -> Option<u32> {
+    /// `cookie`: the one an HS1C echoes (see `check_cookie`).
+    fn on_hs1(
+        &mut self,
+        now: Instant,
+        from: Path<A>,
+        owner: Option<PeerId>,
+        sender: u32,
+        cookie: Option<&Cookie>,
+        noise: &[u8],
+    ) -> Option<u32> {
         if noise.len() < 32 {
             self.stats.rx_malformed += 1;
             return None;
         }
         let mut eph = [0u8; 32];
         eph.copy_from_slice(&noise[..32]);
-        if let Some(&idx) = self.half_open.get(&(sender, eph)) {
+        if let Some(&(idx, _)) = self.half_open.get(&(sender, eph)) {
             if self.on_others_channel(owner, idx) {
                 return None;
             }
@@ -1529,7 +1593,30 @@ impl<A: Address> Endpoint<A> {
             }
             return Some(idx);
         }
-        if self.half_open.len() >= self.config.max_pending_handshakes || self.peers.len() >= self.config.max_links {
+        if self.peers.len() >= self.config.max_links {
+            self.stats.rx_handshake_dropped += 1;
+            return None;
+        }
+        let max = self.config.max_pending_handshakes;
+        let source = Source::of(&from);
+        // Under load, before the DH: an address anyone can send from gets a cookie
+        // and no state until it echoes it, and each source holds a few at most.
+        // Packets on a peer's own channel, or through a relay, can't be spoofed.
+        if self.half_open.len() >= max - max / 4 {
+            if let (Path::Direct(a), None) = (&from, owner) {
+                if let Some(c) = self.check_cookie(now, a, sender, &eph, cookie) {
+                    self.stats.cookies_sent += 1;
+                    self.stats.tx_packets += 1;
+                    self.outbox.push_back(Transmit { dst: a.clone(), payload: wire::encode_cookie(sender, &c) });
+                    return None;
+                }
+            }
+            if self.by_source.get(&source).is_some_and(|&n| n >= PER_SOURCE) {
+                self.stats.rx_handshake_dropped += 1;
+                return None;
+            }
+        }
+        if self.half_open.len() >= max {
             self.stats.rx_handshake_dropped += 1;
             return None;
         }
@@ -1580,7 +1667,7 @@ impl<A: Address> Endpoint<A> {
                             // spray hit one of the host's extra sockets): answer now, not
                             // at the next retry, at most once per retry interval.
                             d.echo_at = now + retry;
-                            resend = Some(d.hs1.clone());
+                            resend = Some(d.hs1_to(&from));
                         }
                     }
                 }
@@ -1602,7 +1689,8 @@ impl<A: Address> Endpoint<A> {
         self.emit(from.clone(), peer, hs2.clone());
         let mut link = Link::new(false, sender, transport, now, self.config.relay_burst);
         link.hs2 = Some(hs2);
-        self.half_open.insert((sender, eph), idx);
+        self.half_open.insert((sender, eph), (idx, source.clone()));
+        *self.by_source.entry(source).or_default() += 1;
         let relay = match &from {
             Path::Via(r) => Some(*r),
             Path::Direct(_) => inherited.0,
@@ -1632,6 +1720,61 @@ impl<A: Address> Endpoint<A> {
         );
         self.start_punch(now, idx);
         Some(idx)
+    }
+
+    /// `None` if `echoed` is the cookie for an HS1 (`sender`, `eph`) from `addr`
+    /// made with this epoch's secret or the last one's; else this epoch's, to send.
+    fn check_cookie(
+        &mut self,
+        now: Instant,
+        addr: &A,
+        sender: u32,
+        eph: &[u8; 32],
+        echoed: Option<&Cookie>,
+    ) -> Option<Cookie> {
+        let epoch = now.as_micros() / COOKIE_EPOCH.as_micros() as u64;
+        let (secret, last) = match self.secrets {
+            Some((e, secret, last)) if e == epoch => (secret, last),
+            old => {
+                let last = old.and_then(|(e, s, _)| (e + 1 == epoch).then_some(s));
+                let secret = self.seed();
+                self.secrets = Some((epoch, secret, last));
+                (secret, last)
+            }
+        };
+        let mut a = Vec::new();
+        addr.encode(&mut a);
+        let cookie = crypto::cookie(&secret, sender, eph, &a);
+        let valid = |c: &Cookie| {
+            crypto::same(c, &cookie) || last.is_some_and(|s| crypto::same(c, &crypto::cookie(&s, sender, eph, &a)))
+        };
+        (!echoed.is_some_and(valid)).then_some(cookie)
+    }
+
+    /// A loaded responder's answer to our HS1 on `from`: the cookie to send it
+    /// with. Sent at once the first time, else on the next retry. Taken only for a
+    /// dial, from an address it dials; unauthenticated, so of no session.
+    fn on_cookie(&mut self, from: Path<A>, owner: Option<PeerId>, receiver: u32, cookie: &Cookie) -> Option<u32> {
+        if self.on_others_channel(owner, receiver) {
+            return None;
+        }
+        let Some(sess) = self.sessions.get_mut(&receiver) else {
+            self.stats.rx_unknown_session += 1;
+            return None;
+        };
+        let (State::Dialing(d), Path::Direct(a)) = (&mut sess.state, &from) else { return None };
+        if !d.targets.contains(&from) {
+            self.stats.rx_unknown_session += 1;
+            return None;
+        }
+        if let Some((_, c)) = d.cookies.iter_mut().find(|(b, _)| b == a) {
+            *c = *cookie;
+            return None;
+        }
+        d.cookies.push((a.clone(), *cookie));
+        let (peer, hs1) = (sess.peer, d.hs1_to(&from));
+        self.emit(from, peer, hs1);
+        None
     }
 
     fn on_hs2(
@@ -2056,20 +2199,37 @@ impl<A: Address> Endpoint<A> {
             link.ping_pending = true; // confirms the link to the initiator
             mark_ready(&mut self.ready, idx, link);
         }
-        self.half_open.retain(|_, &mut v| v != idx);
+        self.forget_half_open(idx);
         if let Some(old) = self.peers.insert(peer, idx) {
             if old != idx {
                 self.sessions.remove(&old);
-                self.half_open.retain(|_, &mut v| v != old);
+                self.forget_half_open(old);
                 self.events.push_back(Event::Disconnected { peer, reason: DisconnectReason::Replaced });
             }
         }
         self.events.push_back(Event::Connected { peer, path, initiator });
     }
 
+    /// Forgets session `idx`'s half-open handshake, if it has one.
+    fn forget_half_open(&mut self, idx: u32) {
+        let by_source = &mut self.by_source;
+        self.half_open.retain(|_, (i, source)| {
+            if *i != idx {
+                return true;
+            }
+            if let Some(n) = by_source.get_mut(source) {
+                *n -= 1;
+                if *n == 0 {
+                    by_source.remove(source);
+                }
+            }
+            false
+        });
+    }
+
     fn drop_link(&mut self, idx: u32, reason: Option<DisconnectReason>) {
         let Some(sess) = self.sessions.remove(&idx) else { return };
-        self.half_open.retain(|_, &mut v| v != idx);
+        self.forget_half_open(idx);
         if self.peers.get(&sess.peer) == Some(&idx) {
             self.peers.remove(&sess.peer);
             if let Some(reason) = reason {
@@ -2138,7 +2298,8 @@ impl<A: Address> Endpoint<A> {
                     let guessed = if sess.guess_probes > 0 { &sess.guesses[..] } else { &[] };
                     sess.guess_probes = sess.guess_probes.saturating_sub(1);
                     for t in d.targets.iter().cloned().chain(guessed.iter().cloned().map(Path::Direct)) {
-                        resend.push((t, sess.peer, d.hs1.clone()));
+                        let hs1 = d.hs1_to(&t);
+                        resend.push((t, sess.peer, hs1));
                     }
                 }
                 State::Live(link) => {
@@ -3939,5 +4100,258 @@ mod tests {
         let back = moved[1][2].0 - moved[1][1].0;
         let due = PATH_DWELL + PATH_GAP * PATH_WINS;
         assert!(back >= due && back < due + Duration::from_millis(10), "{back:?}");
+    }
+
+    /// Valid HS1s for `to` from `from`'s identity, one per number in `range`, each
+    /// with its own index and ephemeral key, as a flood that fills the half-open
+    /// table sends them.
+    fn hs1s(from: &Identity, to: &PeerId, range: std::ops::Range<u32>) -> Vec<Vec<u8>> {
+        range
+            .map(|i| {
+                let mut seed = [0x5a; 32];
+                seed[..4].copy_from_slice(&i.to_le_bytes());
+                let (_, msg) = initiator_hs(seed, &from.noise_private(), &from.peer_id(), to).unwrap();
+                wire::encode_hs1(0x7000_0000 + i, &msg)
+            })
+            .collect()
+    }
+
+    /// What `ep` sends at `t`.
+    fn sent(ep: &mut Endpoint<u32>, t: Instant) -> Vec<Transmit<u32>> {
+        std::iter::from_fn(|| ep.poll_transmit(t)).collect()
+    }
+
+    /// The type of packet `p` is (`wire::HS1`, ...).
+    fn kind(p: &[u8]) -> u8 {
+        p[0] & 0x0f
+    }
+
+    /// SEC-4: 5000 valid HS1s a second, each with its own index and ephemeral key
+    /// and from its own spoofed address, the 5000 sent again every second for 25 s.
+    /// The half-open handshakes stay at the mark (3072 of 4096), the rest get only
+    /// cookies, which go to the spoofed addresses, so a dial from a real address
+    /// links at once, a round trip later. Without cookies the table stays full,
+    /// refilled as it expires, and the dial fails.
+    #[test]
+    fn a_dial_links_through_a_flood_of_handshakes_from_spoofed_addresses() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let b = ids[1].peer_id();
+        let flood = hs1s(&ids[2], &b, 0..5000);
+        let mut eps: Vec<Endpoint<u32>> =
+            ids[..2].iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        let (mut n, mut most, mut dialled, mut linked) = (0, 0, t, None);
+        for tick in 0..2500 {
+            for _ in 0..50 {
+                let i = n % flood.len();
+                eps[1].handle_datagram(t, 10_000 + i as u32, &flood[i]);
+                n += 1;
+            }
+            most = most.max(eps[1].half_open.len());
+            if tick == 100 {
+                eps[0].connect(t, 2, b).unwrap();
+                dialled = t;
+            }
+            route(&mut eps, &mut t, 10, None);
+            for e in events(&mut eps[0]) {
+                match e {
+                    Event::Connected { .. } => linked = linked.or(Some(t - dialled)),
+                    Event::AddrObserved { .. } => {}
+                    e => panic!("{e:?} at {t:?}"),
+                }
+            }
+        }
+        assert!(linked.is_some_and(|d| d <= Duration::from_millis(20)), "{linked:?}");
+        assert!(eps[0].is_connected(&b));
+        assert_eq!(most, 3072);
+        // A cookie for each HS1 not half-open: 5000 - 3072 a second, for 25 s.
+        let s = eps[1].stats();
+        assert!((48_000..48_400).contains(&s.cookies_sent) && s.rx_auth_failed == 0, "{s:?}");
+    }
+
+    /// Below the mark nothing changes: a dial to an endpoint holding one half-open
+    /// handshake short of it takes an HS1 and an HS2, as to an idle one, and no
+    /// cookie. At the mark it takes a round trip more: a COOKIE, then an HS1C.
+    #[test]
+    fn below_the_mark_a_handshake_takes_no_cookie() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let b = ids[1].peer_id();
+        let config = Config { max_pending_handshakes: 8, ..Config::default() }; // the mark: 6
+        for (held, want) in [
+            (0, vec![wire::HS1, wire::HS2]),
+            (5, vec![wire::HS1, wire::HS2]),
+            (6, vec![wire::HS1, wire::COOKIE, wire::HS1C, wire::HS2]),
+        ] {
+            let mut eps: Vec<Endpoint<u32>> =
+                ids[..2].iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, config.clone(), [s; 32])).collect();
+            let mut t = Instant::from_millis(1);
+            for (i, p) in hs1s(&ids[2], &b, 0..held).iter().enumerate() {
+                eps[1].handle_datagram(t, 100 + i as u32, p);
+            }
+            sent(&mut eps[1], t);
+            eps[0].connect(t, 2, b).unwrap();
+            let kinds = std::cell::RefCell::new(Vec::new());
+            route_sized(&mut eps, &mut t, 100, |_, _, p| {
+                if kind(p) != wire::DATA {
+                    kinds.borrow_mut().push(kind(p));
+                }
+                false
+            });
+            assert!(eps[0].is_connected(&b), "{held}");
+            assert_eq!(kinds.into_inner(), want, "{held} held");
+            assert_eq!(eps[1].stats().cookies_sent, (held == 6) as u64);
+        }
+    }
+
+    /// A cookie holds only for the HS1 (index and ephemeral key) and the address it
+    /// was made for, in its epoch and the next: anything else is answered with a new
+    /// cookie, before any DH, and takes no state.
+    #[test]
+    fn a_cookie_holds_for_its_handshake_and_address_and_two_epochs() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let b = ids[1].peer_id();
+        let config = Config { max_pending_handshakes: 16, ..Config::default() }; // the mark: 12
+        let mut ep = Endpoint::<u32>::new(&ids[1], config, [2; 32]);
+        let mut t = Instant::from_millis(1);
+        for (i, p) in hs1s(&ids[2], &b, 0..12).iter().enumerate() {
+            ep.handle_datagram(t, 100 + i as u32, p);
+        }
+        sent(&mut ep, t);
+        let hs = hs1s(&ids[0], &b, 1000..1010);
+        // The packet `ep` answers `p` from `from` with, and whether it took state.
+        let mut ask = |t: Instant, from: u32, p: &[u8]| {
+            let n = ep.session_count();
+            ep.handle_datagram(t, from, p);
+            let out = sent(&mut ep, t);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].dst, from);
+            (out[0].payload.clone(), ep.session_count() - n)
+        };
+        let cookie_for = |p: &[u8]| -> Cookie {
+            let Some(Packet::Cookie { receiver, cookie }) = wire::parse(p) else { panic!("{p:?}") };
+            assert_eq!(receiver.to_le_bytes(), p[1..5]);
+            *cookie
+        };
+        let (got, _) = ask(t, 1, &hs[0]);
+        assert_eq!(&got[1..5], &hs[0][1..5]);
+        let c = cookie_for(&got);
+        let mut bad = c;
+        bad[15] ^= 1;
+        let index = wire::encode_hs1(0x7000_0000 + 1, &hs[0][5..]);
+        let eph = wire::encode_hs1(0x7000_0000 + 1000, &hs[1][5..]);
+        for (from, p) in [(9, &hs[0]), (1, &hs[1]), (1, &index), (1, &eph)] {
+            let (got, took) = ask(t, from, &wire::with_cookie(p, &c));
+            assert_eq!((kind(&got), took), (wire::COOKIE, 0), "from {from}");
+        }
+        let (got, took) = ask(t, 1, &wire::with_cookie(&hs[0], &bad));
+        assert_eq!((kind(&got), took), (wire::COOKIE, 0));
+        assert_eq!(ask(t, 1, &wire::with_cookie(&hs[0], &c)).1, 1);
+        // Made in epoch 0: good in epoch 1, not in epoch 2.
+        let (c2, c3) = (cookie_for(&ask(t, 2, &hs[2]).0), cookie_for(&ask(t, 3, &hs[3]).0));
+        t = Instant::from_millis(121_000);
+        assert_eq!(ask(t, 2, &wire::with_cookie(&hs[2], &c2)).1, 1);
+        t = Instant::from_millis(241_000);
+        let (got, took) = ask(t, 3, &wire::with_cookie(&hs[3], &c3));
+        assert_eq!((kind(&got), took), (wire::COOKIE, 0));
+        // Made in epoch 2, with no handshake in epoch 3: not good in epoch 4.
+        let c4 = cookie_for(&ask(t, 4, &hs[4]).0);
+        t = Instant::from_millis(481_000);
+        let (got, took) = ask(t, 4, &wire::with_cookie(&hs[4], &c4));
+        assert_eq!((kind(&got), took), (wire::COOKIE, 0));
+        assert_eq!(ask(t, 4, &wire::with_cookie(&hs[4], &cookie_for(&got))).1, 1);
+        let s = ep.stats();
+        assert_eq!((s.cookies_sent, s.rx_auth_failed, s.rx_handshake_dropped), (11, 0, 0));
+    }
+
+    /// Under load each source holds at most `PER_SOURCE` half-open handshakes, even
+    /// with good cookies: one more from it is dropped before the DH, one from
+    /// another source isn't. A peer's own channel needs no cookie, and is a source.
+    #[test]
+    fn under_load_a_source_holds_a_few_half_open_handshakes() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b) = (ids[0].peer_id(), ids[1].peer_id());
+        let config = Config { max_pending_handshakes: 64, ..Config::default() }; // the mark: 48
+        let mut ep = Endpoint::<u32>::new(&ids[1], config, [2; 32]);
+        let t = Instant::from_millis(1);
+        for (i, p) in hs1s(&ids[2], &b, 0..48).iter().enumerate() {
+            ep.handle_datagram(t, 100 + i as u32, p);
+        }
+        sent(&mut ep, t);
+        let hs = hs1s(&ids[0], &b, 1000..1020);
+        let mut answers = |from: u32, owner: Option<&PeerId>, p: &[u8]| -> Option<u8> {
+            let mut p = p.to_vec();
+            for _ in 0..2 {
+                match owner {
+                    Some(o) => ep.handle_datagram_from(t, from, o, &p),
+                    None => ep.handle_datagram(t, from, &p),
+                }
+                let got = sent(&mut ep, t).pop()?;
+                if kind(&got.payload) != wire::COOKIE {
+                    return Some(kind(&got.payload));
+                }
+                let Some(Packet::Cookie { cookie, .. }) = wire::parse(&got.payload) else { unreachable!() };
+                p = wire::with_cookie(&p, cookie);
+            }
+            panic!("a cookie twice");
+        };
+        for (i, p) in hs[..5].iter().enumerate() {
+            assert_eq!(answers(1, None, p), (i < 4).then_some(wire::HS2), "{i}");
+        }
+        assert_eq!(answers(2, None, &hs[5]), Some(wire::HS2));
+        // a's channel: an HS2 at once, as for the 4 first.
+        for (i, p) in hs[6..11].iter().enumerate() {
+            ep.handle_datagram_from(t, 7, &a, p);
+            let got: Vec<u8> = sent(&mut ep, t).iter().map(|x| kind(&x.payload)).collect();
+            assert_eq!(got, if i < 4 { vec![wire::HS2] } else { vec![] }, "{i}");
+        }
+        let s = ep.stats();
+        assert_eq!((s.cookies_sent, s.rx_handshake_dropped, ep.half_open.len()), (6, 2, 48 + 9));
+    }
+
+    /// Under load, an IPv4 address or an IPv6 /64 is one source, whatever the port;
+    /// any other address is a source of its own, and so is a relay.
+    #[test]
+    fn a_source_is_an_ipv4_address_or_an_ipv6_64() {
+        let s = |a: &str| Source::of(&Path::Direct(a.parse::<std::net::SocketAddr>().unwrap()));
+        assert!(s("1.2.3.4:5") == s("1.2.3.4:6"));
+        assert!(s("1.2.3.4:5") != s("1.2.3.5:5"));
+        assert!(s("[::ffff:1.2.3.4]:7") == s("1.2.3.4:5"));
+        assert!(s("[2001:db8:0:1::1]:5") == s("[2001:db8:0:1:ffff::2]:6"));
+        assert!(s("[2001:db8:0:1::1]:5") != s("[2001:db8:0:2::1]:5"));
+        let u = |p: Path<u32>| Source::of(&p);
+        assert!(u(Path::Direct(5)) != u(Path::Direct(6)));
+        assert!(u(Path::Via(PeerId([1; 32]))) != u(Path::Via(PeerId([2; 32]))));
+    }
+
+    /// A dial takes a cookie only from an address it dials and for its own index.
+    /// It sends the HS1 again with it there at once the first time; a later cookie
+    /// there goes with the next retry, and the other targets still get the plain
+    /// HS1. A cookie is unauthenticated: `handle_datagram_direct` says false.
+    #[test]
+    fn a_dial_echoes_a_cookie_only_where_it_was_given() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (b, c) = (ids[1].peer_id(), ids[2].peer_id());
+        let mut a = Endpoint::<u32>::new(&ids[0], Config::default(), [1; 32]);
+        let mut t = Instant::from_millis(1);
+        a.connect_with(t, b, &[Path::Direct(2), Path::Direct(3)]).unwrap();
+        let hs1 = sent(&mut a, t).remove(0).payload;
+        let idx = u32::from_le_bytes(hs1[1..5].try_into().unwrap());
+        for (from, i) in [(4, idx), (2, idx ^ 1)] {
+            a.handle_datagram(t, from, &wire::encode_cookie(i, &[1; 16]));
+            assert!(sent(&mut a, t).is_empty());
+        }
+        a.handle_datagram_from(t, 2, &c, &wire::encode_cookie(idx, &[1; 16]));
+        assert!(sent(&mut a, t).is_empty());
+        let s = a.stats();
+        assert_eq!((s.rx_unknown_session, s.rx_wrong_peer), (2, 1));
+        assert!(!a.handle_datagram_direct(t, 2, &wire::encode_cookie(idx, &[1; 16])));
+        let got: Vec<_> = sent(&mut a, t).into_iter().map(|x| (x.dst, x.payload)).collect();
+        assert_eq!(got, vec![(2, wire::with_cookie(&hs1, &[1; 16]))]);
+        a.handle_datagram(t, 2, &wire::encode_cookie(idx, &[2; 16]));
+        assert!(sent(&mut a, t).is_empty());
+        t = t + Duration::from_millis(500);
+        a.handle_timeout(t);
+        let got: Vec<_> = sent(&mut a, t).into_iter().map(|x| (x.dst, x.payload)).collect();
+        assert_eq!(got, vec![(2, wire::with_cookie(&hs1, &[2; 16])), (3, hs1)]);
     }
 }

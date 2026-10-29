@@ -5,6 +5,8 @@
 //!   HS1   = kind sender_idx(u32) noise_msg1
 //!   HS2   = kind sender_idx(u32) receiver_idx(u32) noise_msg2
 //!   DATA  = kind receiver_idx(u32) nonce(u64) aead(frames)
+//!   COOKIE = kind receiver_idx(u32) cookie(16)   a loaded responder's answer to an HS1
+//!   HS1C  = kind sender_idx(u32) cookie(16) noise_msg1   an HS1 that echoes it
 //! frames  = PING | ACK cum(u32) bits(u64) | REL seq(u32) flags(u8) len(u16) data
 //!         | UNREL len(u16) data | CLOSE
 //!         | OBSERVED alen(u8) addr          the address the sender sees us at
@@ -27,6 +29,9 @@ const VERSION: u8 = 1;
 pub(crate) const HS1: u8 = 1;
 pub(crate) const HS2: u8 = 2;
 pub(crate) const DATA: u8 = 3;
+pub(crate) const COOKIE: u8 = 4;
+pub(crate) const HS1C: u8 = 5;
+pub(crate) const COOKIE_LEN: usize = 16;
 
 pub(crate) const DATA_HEADER: usize = 1 + 4 + 8;
 pub(crate) const TAG: usize = 16;
@@ -67,14 +72,23 @@ pub(crate) const ACK_LEN: usize = 13;
 pub(crate) const REL_OVERHEAD: usize = 8;
 pub(crate) const UNREL_OVERHEAD: usize = 3;
 
+pub(crate) type Cookie = [u8; COOKIE_LEN];
+
 pub(crate) enum Packet<'a> {
-    Hs1 { sender: u32, noise: &'a [u8] },
+    /// An HS1, or an HS1C (`cookie`).
+    Hs1 { sender: u32, cookie: Option<&'a Cookie>, noise: &'a [u8] },
     Hs2 { sender: u32, receiver: u32, noise: &'a [u8] },
     Data { receiver: u32, nonce: u64, ciphertext: &'a [u8] },
+    Cookie { receiver: u32, cookie: &'a Cookie },
 }
 
 fn u32le(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// The cookie after a packet's kind and index.
+fn cookie(b: &[u8]) -> Option<&Cookie> {
+    b.get(5..5 + COOKIE_LEN)?.try_into().ok()
 }
 
 fn u64le(b: &[u8]) -> u64 {
@@ -88,10 +102,14 @@ pub(crate) fn parse(b: &[u8]) -> Option<Packet<'_>> {
         return None;
     }
     match b[0] & 0x0f {
-        HS1 if b.len() > 5 => Some(Packet::Hs1 { sender: u32le(&b[1..]), noise: &b[5..] }),
+        HS1 if b.len() > 5 => Some(Packet::Hs1 { sender: u32le(&b[1..]), cookie: None, noise: &b[5..] }),
         HS2 if b.len() > 9 => Some(Packet::Hs2 { sender: u32le(&b[1..]), receiver: u32le(&b[5..]), noise: &b[9..] }),
         DATA if b.len() >= DATA_HEADER + TAG => {
             Some(Packet::Data { receiver: u32le(&b[1..]), nonce: u64le(&b[5..]), ciphertext: &b[DATA_HEADER..] })
+        }
+        COOKIE if b.len() == 5 + COOKIE_LEN => Some(Packet::Cookie { receiver: u32le(&b[1..]), cookie: cookie(b)? }),
+        HS1C if b.len() > 5 + COOKIE_LEN => {
+            Some(Packet::Hs1 { sender: u32le(&b[1..]), cookie: Some(cookie(b)?), noise: &b[5 + COOKIE_LEN..] })
         }
         _ => None,
     }
@@ -106,6 +124,24 @@ pub(crate) fn encode_hs1(sender: u32, noise: &[u8]) -> Vec<u8> {
     v.push(kind(HS1));
     v.extend_from_slice(&sender.to_le_bytes());
     v.extend_from_slice(noise);
+    v
+}
+
+/// `hs1`, an encoded HS1, as an HS1C echoing `cookie`.
+pub(crate) fn with_cookie(hs1: &[u8], cookie: &Cookie) -> Vec<u8> {
+    let mut v = Vec::with_capacity(hs1.len() + COOKIE_LEN);
+    v.push(kind(HS1C));
+    v.extend_from_slice(&hs1[1..5]);
+    v.extend_from_slice(cookie);
+    v.extend_from_slice(&hs1[5..]);
+    v
+}
+
+pub(crate) fn encode_cookie(receiver: u32, cookie: &Cookie) -> Vec<u8> {
+    let mut v = Vec::with_capacity(5 + COOKIE_LEN);
+    v.push(kind(COOKIE));
+    v.extend_from_slice(&receiver.to_le_bytes());
+    v.extend_from_slice(cookie);
     v
 }
 
@@ -384,5 +420,14 @@ mod tests {
         assert!(parse(&[kind(DATA); DATA_HEADER + TAG - 1]).is_none());
         assert!(parse(&[0x20 | HS1, 0, 0, 0, 0, 1]).is_none()); // wrong version
         assert!(parse(&vec![kind(DATA); MAX_DATAGRAM + 1]).is_none());
+        let cookie = encode_cookie(7, &[9; COOKIE_LEN]);
+        assert!(matches!(parse(&cookie), Some(Packet::Cookie { receiver: 7, cookie: &[9, ..] })));
+        assert!(parse(&cookie[..cookie.len() - 1]).is_none());
+        assert!(parse(&[&cookie[..], &[0]].concat()).is_none());
+        let hs1c = with_cookie(&encode_hs1(8, b"n"), &[9; COOKIE_LEN]);
+        assert_eq!(hs1c.len(), 5 + COOKIE_LEN + 1);
+        let Some(Packet::Hs1 { sender: 8, cookie: Some(c), noise: b"n" }) = parse(&hs1c) else { panic!() };
+        assert_eq!(c, &[9; COOKIE_LEN]);
+        assert!(parse(&hs1c[..hs1c.len() - 1]).is_none()); // no noise message
     }
 }
