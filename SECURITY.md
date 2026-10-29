@@ -40,14 +40,17 @@ its trust boundaries, and the standing findings.
   for your IP candidates. Treat room names as secrets and don't publish PeerIds
   you want kept private. (THREAT-MODEL.md SEC-2, SEC-3, SEC-5.)
 - **Connection-setup DoS resistance** against an attacker with many real
-  addresses: 256 IPv4 addresses or IPv6 /64s, at 4 half-open handshakes each,
-  fill the quarter of the half-open table left above the mark (SEC-4).
+  addresses: 256 IPv4 addresses or IPv6 /64s (one IPv6 /56, which many ISPs and
+  hosts give a single customer), at 4 half-open handshakes each, fill the quarter
+  of the half-open table left above the mark (SEC-4).
 - **In-session forward secrecy refresh:** session keys are not rotated until a
   reconnect (SEC-7).
 
 The first review (NB-013, commit `cf9cbb0`) found no issues in the core wire,
 invite and STUN parsers, the relay gating, or the handshake authentication. It did
 find a memory-safety bug at the JS/FFI boundary (SEC-1) and the signaling-privacy
-and DoS items above; all are tracked as NB tasks. SEC-1 is fixed (NB-021), and
+and DoS items above; all are tracked as NB tasks. SEC-1 is fixed (NB-021),
 room-key proofs (NB-031, NB-037) stop room offers from strangers revealing your
-addresses (SEC-3, for rooms). THREAT-MODEL.md lists each finding's status.
+addresses (SEC-3, for rooms), and handshake cookies (NB-024) keep spoofed
+handshakes from filling the half-open table (SEC-4). THREAT-MODEL.md lists each
+finding's status.

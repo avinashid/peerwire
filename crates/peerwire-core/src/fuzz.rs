@@ -17,6 +17,7 @@ use crate::wire::{self, Frame, Packet, FRAGMENT, MAX_DATAGRAM, MAX_PLAINTEXT, MA
 use crate::{sealed, stun};
 use peerwire_sim::fuzz::{cases, hex, mutate, run, seed, Rng};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
@@ -697,4 +698,241 @@ fn fuzz_birthday_spray() {
         total += want;
     }
     println!("fuzz spray: {total} probes, every port once");
+}
+
+/// What `ep` sends at `now`: (destination, payload).
+fn drain(ep: &mut Endpoint<SocketAddr>, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+    std::iter::from_fn(|| ep.poll_transmit(now)).map(|t| (t.dst, t.payload)).collect()
+}
+
+#[test]
+fn fuzz_handshakes_under_load() {
+    // SEC-4 (NB-024): B holds at most 64 half-open handshakes, is under load from 48
+    // and dials no one. It is sent valid HS1s (new, again, or echoing a cookie it
+    // gave, from that address or another), the same with another cookie or
+    // mutated, and other packets, from a few sources and from anywhere, over UDP
+    // (`handle_datagram`, `handle_datagram_direct`) and over any peer's channel
+    // (`handle_datagram_from`), while time moves on past expiries and cookie
+    // epochs. B must not panic and holds at most 64; under load a plain HS1 over
+    // UDP takes none. B answers at once with a COOKIE or an HS2 only, to where the
+    // datagram came from, and no larger than it but for SEC-13 (below): a COOKIE
+    // only over UDP and under load, taking nothing, and `handle_datagram_direct`
+    // says false for it; an HS2 only to a handshake whose ephemeral key a real key
+    // made. Afterwards, during a flood from spoofed
+    // addresses, a dial over UDP (with a cookie) and one over a peer's channel link.
+    let keys = identities(6);
+    let ids: Vec<PeerId> = keys.iter().map(Identity::peer_id).collect();
+    let (b, h, o) = (0, 4, 5);
+    let b_addr = Net::addr(b);
+    let config = Config { max_pending_handshakes: 64, ..Config::default() }; // the mark: 48
+    let mut ep = Endpoint::new(&keys[b], config, [1; 32]);
+    let mut rng = Rng::for_target("handshakes");
+    // Valid HS1s for B from keys 1 to 3, each with its own index and ephemeral key,
+    // and whose key made each.
+    let made: Vec<(Vec<u8>, PeerId)> = (0..cases(160))
+        .map(|_| {
+            let k = 1 + rng.below(3);
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&rng.u64().to_le_bytes());
+            let mut d = Endpoint::new(&keys[k], Config::default(), seed);
+            d.connect(Instant::ZERO, b_addr, ids[b]).unwrap();
+            (d.poll_transmit(Instant::ZERO).unwrap().payload, ids[k])
+        })
+        .collect();
+    let pool: Vec<Vec<u8>> = made.iter().map(|(p, _)| p.clone()).collect();
+    // Their ephemeral keys (a handshake is known by its index and ephemeral key, and
+    // the index is not authenticated).
+    let real: HashMap<&[u8], PeerId> = made.iter().map(|(p, k)| (&p[5..37], *k)).collect();
+    let made_by = |noise: &[u8]| noise.get(..32).and_then(|e| real.get(e)).copied();
+    // A few sources: two ports of one IPv4 address and that address mapped to IPv6,
+    // another IPv4 address, two addresses in one IPv6 /64 and one in the next.
+    let few: Vec<SocketAddr> = [
+        "198.51.100.1:4000",
+        "198.51.100.1:4001",
+        "[::ffff:198.51.100.1]:4002",
+        "198.51.100.2:4000",
+        "[2001:db8:0:1::1]:4000",
+        "[2001:db8:0:1::2]:4000",
+        "[2001:db8:0:2::1]:4000",
+    ]
+    .iter()
+    .map(|s| s.parse().unwrap())
+    .collect();
+    // The last cookies B gave: to which address, for which HS1.
+    let mut given: Vec<(SocketAddr, Vec<u8>, [u8; wire::COOKIE_LEN])> = Vec::new();
+    let mut now = Instant::ZERO;
+    let (n, mut loaded_n, mut took, mut worst) = (cases(3_000), 0usize, 0usize, 0);
+    for i in 0..n {
+        let mut from = if rng.one_in(2) { *rng.pick(&few) } else { random_socket_addr(&mut rng) };
+        let mut p = rng.pick(&pool).clone();
+        match rng.below(12) {
+            0..=4 => {}
+            5 | 6 if !given.is_empty() => {
+                let (a, hs1, c) = rng.pick(&given).clone();
+                if rng.below(4) != 0 {
+                    from = a;
+                }
+                p = wire::with_cookie(&hs1, &c);
+                if rng.one_in(4) {
+                    mutate(&mut rng, &mut p, MAX_DATAGRAM);
+                }
+            }
+            7 => p = wire::with_cookie(&p, &rng.bytes(wire::COOKIE_LEN).try_into().unwrap()),
+            8 => {
+                let len = rng.below(200);
+                p = rng.bytes(len);
+            }
+            9 => p = wire::encode_cookie(rng.edgy_u32(), &rng.bytes(wire::COOKIE_LEN).try_into().unwrap()),
+            // Its index and ephemeral key, cut short or not.
+            10 => p.truncate(37 + rng.below(p.len() - 36)),
+            _ => mutate(&mut rng, &mut p, MAX_DATAGRAM),
+        }
+        let hs1 = match wire::parse(&p) {
+            Some(Packet::Hs1 { sender, cookie, noise }) => Some((sender, cookie.is_some(), noise)),
+            _ => None,
+        };
+        // Over UDP, as `handle_datagram_direct`, or over a channel: mostly of the
+        // peer whose key made the HS1, else of anyone.
+        let (api, owner) = match rng.below(5) {
+            0 | 1 => (0, None),
+            2 => (1, None),
+            _ => {
+                let maker = hs1.and_then(|(_, _, noise)| made_by(noise));
+                let anyone = match rng.one_in(2) {
+                    true => *rng.pick(&ids),
+                    false => PeerId(rng.bytes(32).try_into().unwrap()),
+                };
+                (2, Some(maker.filter(|_| !rng.one_in(3)).unwrap_or(anyone)))
+            }
+        };
+        let before = ep.session_count();
+        let loaded = before >= 48;
+        let step = panic::catch_unwind(AssertUnwindSafe(|| match (api, owner) {
+            (2, Some(o)) => {
+                ep.handle_datagram_from(now, from, &o, &p);
+                false
+            }
+            (1, _) => ep.handle_datagram_direct(now, from, &p),
+            _ => {
+                ep.handle_datagram(now, from, &p);
+                false
+            }
+        }));
+        let direct = step.unwrap_or_else(|e| {
+            eprintln!("fuzz handshakes: case {i} of seed {:#x} failed on {} from {from} ({owner:?})", seed(), hex(&p));
+            panic::resume_unwind(e)
+        });
+        let count = ep.session_count();
+        let out = drain(&mut ep, now);
+        let case = || format!("case {i}: {} from {from} ({owner:?}), {before} held", hex(&p));
+        assert!(count <= 64, "{}", case());
+        assert!(out.iter().all(|(dst, _)| *dst == from), "{}", case());
+        // SEC-13 (open): a half-open handshake's HS2 (57 bytes) is sent again for any
+        // HS1 with its index and ephemeral key, from 37 bytes. Drop `|| again` once
+        // only a whole HS1 is answered.
+        let sent: usize = out.iter().map(|(_, q)| q.len()).sum();
+        let again =
+            count == before && matches!(&out[..], [(_, q)] if matches!(wire::parse(q), Some(Packet::Hs2 { .. })));
+        assert!(sent <= p.len() || again, "{}", case());
+        if sent > p.len() {
+            worst = worst.max(sent * 100 / p.len());
+        }
+        for (_, q) in &out {
+            match wire::parse(q) {
+                Some(Packet::Cookie { cookie, .. }) => {
+                    assert!(loaded && owner.is_none() && !direct && count == before, "{}", case());
+                    let (sender, _, noise) = hs1.unwrap();
+                    if given.len() == 32 {
+                        given.remove(0);
+                    }
+                    given.push((from, wire::encode_hs1(sender, noise), *cookie));
+                }
+                Some(Packet::Hs2 { .. }) => {
+                    assert!(hs1.is_some_and(|(_, _, noise)| made_by(noise).is_some()), "{}", case())
+                }
+                _ => panic!("B answered with {}: {}", hex(q), case()),
+            }
+        }
+        if matches!(wire::parse(&p), Some(Packet::Cookie { .. })) {
+            assert!(!direct, "{}", case());
+        }
+        if loaded && owner.is_none() {
+            loaded_n += 1;
+            match hs1 {
+                Some((_, false, _)) => assert_eq!(count, before, "{}", case()),
+                Some((_, true, _)) => took += (count > before) as usize,
+                None => {}
+            }
+        }
+        // Mostly a few ms; now and then past some expiries, or into a later epoch.
+        let d = match rng.below(1000) {
+            0 => Duration::from_secs(60 + rng.below(70) as u64),
+            1..=8 => Duration::from_secs(1 + rng.below(12) as u64),
+            _ => Duration::from_millis(rng.below(10) as u64),
+        };
+        now = now + d;
+        ep.handle_timeout(now);
+        drain(&mut ep, now);
+    }
+    let st = ep.stats();
+    println!(
+        "fuzz handshakes: {n} datagrams, {loaded_n} over UDP under load, {took} taken with a cookie, \
+         largest answer {worst}% of what it answered (SEC-13), {st:?}"
+    );
+    assert!(
+        st.cookies_sent > 0 && took > 0 && st.rx_handshake_dropped > 0 && st.rx_wrong_peer > 0,
+        "the fuzzer must reach those paths"
+    );
+
+    // Everything B held expires. Spoofed HS1s bring it back to the mark and get
+    // cookies, while H dials over UDP and O over its own channel.
+    now = now + Duration::from_secs(11);
+    ep.handle_timeout(now);
+    drain(&mut ep, now);
+    assert_eq!(ep.session_count(), 0);
+    let (h_addr, o_chan): (SocketAddr, SocketAddr) =
+        ("203.0.113.1:4000".parse().unwrap(), "203.0.113.2:4000".parse().unwrap());
+    let mut dials = [h, o].map(|k| Endpoint::new(&keys[k], Config::default(), [k as u8; 32]));
+    let (mut flood, mut cookied, mut held) = (pool.iter().cycle(), [false; 2], 0);
+    for tick in 0..50 {
+        for _ in 0..16 {
+            ep.handle_datagram(now, random_socket_addr(&mut rng), flood.next().unwrap());
+        }
+        if tick == 5 {
+            held = ep.session_count();
+            for d in &mut dials {
+                d.connect(now, b_addr, ids[b]).unwrap();
+            }
+        }
+        for (j, d) in dials.iter_mut().enumerate() {
+            while let Some(t) = d.poll_transmit(now) {
+                assert_eq!(t.dst, b_addr);
+                match j {
+                    0 => ep.handle_datagram(now, h_addr, &t.payload),
+                    _ => ep.handle_datagram_from(now, o_chan, &ids[o], &t.payload),
+                }
+            }
+        }
+        for (dst, q) in drain(&mut ep, now) {
+            let j = match dst {
+                d if d == h_addr => 0,
+                d if d == o_chan => 1,
+                _ => continue,
+            };
+            cookied[j] |= matches!(wire::parse(&q), Some(Packet::Cookie { .. }));
+            match j {
+                0 => dials[0].handle_datagram(now, b_addr, &q),
+                _ => dials[1].handle_datagram_from(now, b_addr, &ids[b], &q),
+            }
+        }
+        now = now + Duration::from_millis(10);
+        ep.handle_timeout(now);
+        for d in &mut dials {
+            d.handle_timeout(now);
+        }
+    }
+    assert_eq!(held, 48, "the flood brings B to the mark");
+    assert_eq!(cookied, [true, false], "a cookie over UDP, none over a channel");
+    assert!(ep.is_connected(&ids[h]) && ep.is_connected(&ids[o]));
+    assert!(dials.iter().all(|d| d.is_connected(&ids[b])));
 }
