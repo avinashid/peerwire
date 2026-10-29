@@ -1576,7 +1576,8 @@ impl<A: Address> Endpoint<A> {
         cookie: Option<&Cookie>,
         noise: &[u8],
     ) -> Option<u32> {
-        if noise.len() < 32 {
+        // Before anything is sent again (SEC-13): a part of an HS1 draws nothing.
+        if noise.len() != wire::HS1_NOISE {
             self.stats.rx_malformed += 1;
             return None;
         }
@@ -4460,5 +4461,38 @@ mod tests {
         a.handle_datagram(t, 2, &sent(&mut eb, t).remove(0).payload);
         let got: Vec<_> = sent(&mut a, t).into_iter().map(|x| (x.dst, x.payload)).collect();
         assert_eq!(got, vec![(2, wire::with_cookie(&hs1, &[2; 16]))]);
+    }
+
+    /// A dial's HS1 is 128 bytes of Noise. While its handshake is half-open, the
+    /// whole HS1, sent again from anywhere, draws its HS2 again, as an HS1 or an
+    /// HS1C; cut to its kind, index and ephemeral key (37 bytes), a byte short or a
+    /// byte long, it draws nothing and is malformed (SEC-13).
+    #[test]
+    fn only_a_whole_hs1_draws_its_hs2_again() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let b = ids[1].peer_id();
+        let mut a = Endpoint::<u32>::new(&ids[0], Config::default(), [1; 32]);
+        let mut ep = Endpoint::<u32>::new(&ids[1], Config::default(), [2; 32]);
+        let t = Instant::from_millis(1);
+        a.connect(t, 2, b).unwrap();
+        let hs1 = sent(&mut a, t).remove(0).payload;
+        assert_eq!(hs1.len(), 5 + 128);
+        ep.handle_datagram(t, 1, &hs1);
+        let hs2 = sent(&mut ep, t).remove(0).payload;
+        assert_eq!((kind(&hs2), hs2.len()), (wire::HS2, 57));
+        let long = [&hs1[..], &[0]].concat();
+        for p in [&hs1[..37], &hs1[..132], &long[..]] {
+            for p in [p.to_vec(), wire::with_cookie(p, &[1; 16])] {
+                ep.handle_datagram(t, 9, &p);
+                assert!(sent(&mut ep, t).is_empty(), "{} bytes", p.len());
+            }
+        }
+        assert_eq!(ep.stats().rx_malformed, 6);
+        for p in [hs1.clone(), wire::with_cookie(&hs1, &[1; 16])] {
+            ep.handle_datagram(t, 9, &p);
+            let got: Vec<_> = sent(&mut ep, t).into_iter().map(|x| (x.dst, x.payload)).collect();
+            assert_eq!(got, vec![(9, hs2.clone())]);
+        }
+        assert_eq!((ep.session_count(), ep.stats().rx_malformed), (1, 6));
     }
 }
