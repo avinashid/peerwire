@@ -33,7 +33,8 @@ export const RTC_SAME_NAT_FALLBACK_MS = 3000;
 // Pipes: datagrams are batched for PIPE_FLUSH_MS into one signalling message of at
 // most PIPE_BATCH bytes, or sent at once when they fill one. All pipes together send
 // PIPE_RATE messages a second (burst PIPE_BURST), within what public relays allow one
-// client, and batch more while they wait; past PIPE_QUEUE bytes waiting on a pipe, the
+// client, and no sooner than the signalling can take one (its wait(), if it has one), and
+// batch more while they wait; past PIPE_QUEUE bytes waiting on a pipe, the
 // oldest is dropped. close() sends
 // what waits as one last batch per pipe, past the budget, for at most PIPE_CLOSE_BATCHES
 // pipes, those that queued last first.
@@ -900,6 +901,10 @@ export class WebRtcTransport {
       p.bytes = 0;
       return;
     }
+    // Signalling that paces its sends (NostrSignaling.wait()) says how long until it can take
+    // one: the batch waits and fills meanwhile, rather than going out small to wait there.
+    const wait = last ? 0 : this.sig.wait?.() ?? 0;
+    if (wait > 0) return this.pipeFlushSoon(p, wait);
     const now = Date.now();
     this.pipeTokens = Math.min(PIPE_BURST, this.pipeTokens + ((now - this.pipeRefilled) / 1000) * PIPE_RATE);
     this.pipeRefilled = now;

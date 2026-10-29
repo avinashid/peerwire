@@ -3,7 +3,7 @@
 // and base64 must handle bodies far larger than a signalling message. No relays:
 // events are fed straight into onRelay.
 import { loadPeerwire } from '../src/peerwire.js';
-import { BACKOFF_MS, MAX_BACKOFF_MS, RECONNECT_MS, NostrSignaling, MAX_SEEN, b64, unb64 } from '../src/nostr.js';
+import { BACKOFF_MS, MAX_BACKOFF_MS, RECONNECT_MS, NostrSignaling, MAX_SEEN, b64, unb64, RELAY_RATE, RELAY_BURST_S, RELAY_RAISE_MS, HOLD_MS, RELAY_TRIES, RELAY_QUEUE, RELAY_QUEUE_MS } from '../src/nostr.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
 const pw = await loadPeerwire(wasm);
@@ -100,29 +100,119 @@ for (const n of [100 * 1024, 1 << 20]) {
 }
 check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'AP+A', 'base64 of empty and short inputs');
 
-// 5. A relay that refuses an event for its rate limit gets nothing for BACKOFF_MS, doubling;
-//    refusals of events already sent during a pause don't double it again; others still get events.
+// 5. Each relay is paced by a token bucket of its own: a burst at once, then RELAY_RATE a second, the
+//    rest waiting on its queue. A relay that refuses an event for its rate ('rate-limited:') is held for
+//    HOLD_MS, its rate halved, and sent the event again in its place, while the other is still sent to;
+//    refusals of events sent before its hold began count for nothing more. Refused again before it takes
+//    one, the hold doubles; after it took one, it starts over. A relay isn't held while no other is free.
+//    A ban ('blocked:', 'banned') stops a relay for BACKOFF_MS, doubling. A fake clock keeps time.
 {
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
   const s5 = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/backoff', relays: [] });
   await s5.ready;
-  const sent = { a: 0, b: 0 };
-  for (const name of ['a', 'b']) s5.sockets.push({ relayUrl: name, readyState: WebSocket.OPEN, send: () => sent[name]++, close() {} });
-  await s5.publish(s5.roomTag, 'e30=');
-  s5.onRelay('a', JSON.stringify(['OK', 'x', false, 'rate-limited: slow down']));
-  s5.onRelay('a', JSON.stringify(['OK', 'y', false, 'banned: too many rate-limit violations, try again later']));
-  await s5.publish(s5.roomTag, 'e30=');
-  const first = s5.paused.get('a');
-  check(sent.a === 1 && sent.b === 2 && first?.ms === BACKOFF_MS && s5.stats.backoffs === 1, `a rate-limited relay is paused once, the other still sent to (${JSON.stringify(sent)})`);
-  s5.onRelay('b', JSON.stringify(['OK', 'z', false, 'invalid: bad signature']));
-  check(!s5.paused.has('b'), 'other refusals do not pause a relay');
-  first.until = Date.now() - 1; // the pause ran out
-  await s5.publish(s5.roomTag, 'e30=');
-  s5.onRelay('a', JSON.stringify(['OK', 'w', false, 'rate-limited: again']));
-  check(sent.a === 2 && s5.paused.get('a').ms === BACKOFF_MS * 2, 'after the pause it is tried again, and a second limit doubles the pause');
-  s5.paused.get('a').until = Date.now() - MAX_BACKOFF_MS - 1; // quiet for MAX_BACKOFF_MS since
-  s5.onRelay('a', JSON.stringify(['OK', 'v', false, 'rate-limited: much later']));
-  check(s5.paused.get('a').ms === BACKOFF_MS, 'a limit after a long quiet period starts the pause over');
+  const sent = { a: [], b: [] };
+  const sock = {};
+  for (const name of ['a', 'b']) s5.sockets.push((sock[name] = { relayUrl: name, readyState: WebSocket.OPEN, send: (m) => sent[name].push(JSON.parse(m)[1].id), close() {} }));
+  let n5 = 0; // events differ, as sealed ones do: the same content in the same second is the same event
+  const ok = (url, id, taken, why = '') => s5.onRelay(url, JSON.stringify(['OK', id, taken, why]));
+  const held = (url) => s5.paused.get(url)?.until > clock;
+  const ids = (url) => sock[url].q.map((e) => e.id);
+  const burst = RELAY_RATE * RELAY_BURST_S;
+  for (let i = 0; i < burst + 4; i++) await s5.publish(s5.roomTag, `e${++n5}`);
+  check(sent.a.length === burst && sent.b.length === burst && sock.a.q.length === 4, `a relay is sent a burst of ${burst} at once, the rest wait for its rate (${sent.a.length} sent, ${sock.a.q.length} waiting)`);
+  check(s5.wait() > 0, `the pipe is told to wait while no relay can take one (${s5.wait().toFixed(0)} ms)`);
+  clock += 500;
+  s5.pump(sock.a);
+  s5.pump(sock.b);
+  check(sent.a.length === burst + RELAY_RATE / 2 && sent.b.length === burst + RELAY_RATE / 2, `half a second later, ${RELAY_RATE / 2} more go (${sent.a.length}, ${sent.b.length})`);
+  // a refuses the last two it was sent, a moment later: the first refusal holds it, the second was on its way.
+  clock += 1;
+  const at = clock;
+  const [x, y] = sent.a.slice(-2);
+  ok('a', y, false, 'rate-limited: slow down');
+  ok('a', x, false, 'rate-limited: slow down');
+  check(s5.paused.get('a')?.ms === HOLD_MS && held('a') && !held('b') && s5.stats.backoffs === 1 && s5.rates.get('a').rate === RELAY_RATE / 2,
+    `a relay that refuses for its rate is held ${HOLD_MS} ms, once (backoffs ${s5.stats.backoffs}), at half its rate (${s5.rates.get('a').rate}); the other isn't held`);
+  check(ids('a').slice(0, 2).join() === `${x},${y}` && sock.a.q.length === 4 && s5.stats.resent === 2, 'what it refused goes back first on its queue, in order');
+  ok('a', sent.a[0], true); // taken, but sent before the hold: it took none since
+  ok('b', sent.b[0], false, 'invalid: bad signature');
+  check(!s5.paused.has('b') && !s5.banned.has('b') && sock.b.q.length === 2, 'other refusals hold nothing and are not sent again');
+  clock = at + HOLD_MS - 1;
+  s5.pump(sock.a);
+  check(sent.a.length === burst + RELAY_RATE / 2, 'nothing goes to it while held');
+  clock = at + HOLD_MS;
+  s5.pump(sock.a);
+  check(sent.a.slice(-2).join() === `${x},${y}` && sent.a.length === burst + RELAY_RATE / 2 + 2, `once the hold is over, they go again at its new rate (${sent.a.length - burst - RELAY_RATE / 2} in ${HOLD_MS} ms)`);
+  clock += 1;
+  const rate2 = (RELAY_RATE / 2 + (clock - at) / RELAY_RAISE_MS) / 2;
+  ok('a', y, false, 'rate-limited: still');
+  check(s5.paused.get('a').ms === HOLD_MS * 2 && Math.abs(s5.rates.get('a').rate - rate2) < 1e-9 && ids('a')[0] === y,
+    `refused again before it took one: the hold doubles, the rate halves again (${s5.rates.get('a').rate.toFixed(2)}), and it is sent again`);
+  clock = s5.paused.get('a').until;
+  const from = sent.a.length;
+  s5.pump(sock.a);
+  const w = sent.a.at(-1);
+  ok('a', w, true);
+  clock += 1;
+  ok('a', y, false, 'rate-limited: once more');
+  check(sent.a[from] === y && sent.a.length > from + 1 && s5.paused.get('a').ms === HOLD_MS && !ids('a').includes(y) && s5.stats.resent === 3,
+    `after it took one it starts over at ${HOLD_MS} ms, and an event refused ${RELAY_TRIES} times is not sent again`);
+
+  // b refuses too while a is held: of the two, the hold that ends first (a's) is cut short.
+  clock += 1;
+  ok('b', sent.b.at(-1), false, 'rate-limited: b too');
+  check(held('b') && !held('a') && s5.stats.backoffs === 4, `with every relay held, the one whose hold ends first goes on (a ${held('a') ? 'held' : 'free'}, b ${held('b') ? 'held' : 'free'})`);
+  // a, the one free, closes: b's hold is cut short.
+  s5.dial = () => {};
+  sock.a.readyState = WebSocket.CLOSED;
+  s5.lostSocket(sock.a);
+  check(!held('b'), 'the free relay closing frees the held one');
+  sock.a.readyState = WebSocket.OPEN;
+
+  // A ban, even one that speaks of a rate limit, stops a relay for BACKOFF_MS, doubling, and drops its queue.
+  s5.rate('a', clock).tokens = 0;
+  await s5.publish(s5.roomTag, `e${++n5}`);
+  const queued = sock.a.q.length;
+  ok('b', sent.b.at(-1), false, 'rate-limited: b again');
+  ok('a', 'q', false, 'banned: too many rate-limit violations, try again later');
+  ok('a', 'q', false, 'blocked: you are banned');
+  check(s5.banned.get('a')?.ms === BACKOFF_MS && !held('a') && queued === 1 && sock.a.q.length === 0 && !held('b'),
+    `a banned relay is stopped for ${BACKOFF_MS} ms, once, its queue dropped (${queued} waited); the held one is freed, as no other is`);
+  const before5 = sent.a.length;
+  await s5.publish(s5.roomTag, `e${++n5}`);
+  check(sent.a.length === before5 && sock.a.q.length === 0, 'a banned relay is sent nothing and queues nothing');
+  s5.banned.get('a').until = clock - 1;
+  ok('a', 'r', false, 'blocked: again');
+  check(s5.banned.get('a').ms === BACKOFF_MS * 2, 'a second ban doubles');
+  s5.banned.get('a').until = clock - MAX_BACKOFF_MS - 1;
+  ok('a', 's', false, 'blocked: much later');
+  check(s5.banned.get('a').ms === BACKOFF_MS, 'a ban after a long quiet period starts over');
+
+  // Bounds: RELAY_QUEUE events wait at most, for RELAY_QUEUE_MS at most.
+  s5.paused.delete('b');
+  sock.b.q.length = 0;
+  s5.rate('b', clock).tokens = 0;
+  const unsent = s5.stats.unsent;
+  for (let i = 0; i < RELAY_QUEUE + 3; i++) await s5.publish(s5.roomTag, `e${++n5}`);
+  check(sock.b.q.length === RELAY_QUEUE && s5.stats.unsent === unsent + 3, `past ${RELAY_QUEUE} waiting, the oldest is dropped (${sock.b.q.length} waiting)`);
+  const sentB = sent.b.length;
+  clock += RELAY_QUEUE_MS + 1;
+  s5.pump(sock.b);
+  check(sock.b.q.length === 0 && sent.b.length === sentB && s5.stats.unsent === unsent + 3 + RELAY_QUEUE, `what waited over ${RELAY_QUEUE_MS} ms is dropped, not sent`);
+  const cap = Math.max(1, s5.rates.get('b').rate * RELAY_BURST_S);
+  check(s5.rate('b', clock).tokens === cap, `idle for ${RELAY_QUEUE_MS} ms, a relay may still send only ${RELAY_BURST_S} s of its rate at once (${cap.toFixed(2)})`);
+  check(s5.wait() === 0, 'and the pipe is told it may send');
+  // close(): what waits goes at once, past the rate, but not to a banned relay.
+  s5.rate('b', clock).tokens = 0;
+  for (let i = 0; i < 3; i++) await s5.publish(s5.roomTag, `e${++n5}`);
+  const waiting = sock.b.q.length;
+  const sentA = sent.a.length;
+  s5.close();
+  check(waiting === 3 && sent.b.length === sentB + 3 && sent.a.length === sentA, `close() sends what waits at once (${sent.b.length - sentB} of ${waiting}), but not to a banned relay`);
   s5.sockets.length = 0;
+  Date.now = realNow;
 }
 
 // 6. A relay socket that closes (phone hotspot on, network switch, tab frozen) is redialled,

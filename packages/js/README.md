@@ -495,8 +495,16 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    relays allow one client. A background tab fires its timers once a second at most: a
    pipe timer that fires that late sends every batch the rate allows by then, and until
    one fires on time again, pipes send what each task queued at its end, not 40 ms later.
-   A relay that refuses events for its rate limit gets none for 30 s, doubling up to 10
-   min. The pause starts over at 30 s once the relay has gone 10 min without refusing.
+   Each relay connection is paced on its own: at most 4 events a second (a burst of 8),
+   the rest waiting on its queue for up to 10 s. While no relay can take one, a pipe
+   holds its batch, which fills meanwhile. Relays don't publish their rate (NIP-11 has no
+   field for it), so each relay's is learnt from its refusals. One that refuses an event
+   for its rate (`rate-limited:`) halves its rate, which grows back by one event a second
+   every 5 s. It is held for 1 s (doubling to 30 s while it refuses again before taking
+   one), and is sent the event again, 3 times in all. A relay isn't held while no other is
+   free, so a join or a pipe always has a relay to go through. One that bans us
+   (`blocked:`, `banned`) gets nothing for 30 s, doubling up to 10 min; the ban starts
+   over at 30 s once the relay has gone 10 min without one.
 
 The core keeps the first path that completes the handshake, and the room's proofs,
 presence and messages run unchanged on it. A pipe opens only for a peer whose hello
@@ -585,7 +593,12 @@ Run these with Node and the Playwright install on this host:
   drops a `from` that isn't 64 lowercase hex characters.
 - `node packages/js/test/nostr_bounds.mjs`: a flood of 12,000 distinct Nostr events
   keeps the de-duplication set at 4096 ids, malformed events don't throw, and base64
-  round-trips bodies up to 1 MB. No relays.
+  round-trips bodies up to 1 MB. Each relay is paced on its own; one that refuses for its
+  rate is held 1 s (2 s if it refuses again before taking one) at half its rate and sent
+  what it refused again, in order. With every relay held, the hold that ends first is cut
+  short, as it is when the one free relay closes. A ban stops a relay for 30 s, doubling.
+  Queues drop their oldest past 64 events or 10 s, and `close()` sends what waits at once.
+  No relays.
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's; a room that signs
@@ -696,9 +709,11 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/doc_catchup.mjs`: a late joiner's catch-up of a whiteboard-sized board (509 KB) over a
   direct link, the signalling pipe through fake rate-limited relays, from a background tab, both at once, from a
   member that kept the board on its device and comes back after nobody was online, and with two holders, one
-  direct and one over the pipe (one whole answer, from the direct one). It prints the time to the whole board,
-  the frames, datagrams, retransmits, pipe batches and relay events, and checks the bars: 15 s (30 s from a
-  background tab over the pipe), first strokes within 3 s (5 s), and nothing while nobody is online.
+  direct and one over the pipe (one whole answer, from the direct one); then over the pipe through relays that
+  take 3 events a second, then 2, which refuse part of every join's burst. It prints the time to the whole
+  board, the frames, datagrams, retransmits, pipe batches and relay events, and checks the bars: 15 s (30 s from
+  a background tab over the pipe, 60 s through relays that take 2 events a second), first strokes within 3 s (5 s,
+  6 s), and nothing while nobody is online.
 - `node packages/js/test/pipe_batches.mjs`: a pipe's batches on a fake clock: datagrams queued together go 40
   ms later as one, a batch's worth at once, 3 a second after a burst of 6, and with timers held to once a second
   (a background tab), the batches a late timer finds go together, and what a task queued goes at its end, until
