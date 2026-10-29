@@ -26,7 +26,9 @@ export interface SignalingAdapter {
    * rather than every way the adapter has (the Nostr adapter sends it through one relay, not each). */
   send(to: PeerId, body: unknown, options?: { lossy?: boolean }): void | Promise<void>;
   /** Milliseconds until the adapter can take one more message (0: it can now), for one that paces its sends, as the
-   * Nostr adapter does. A signalling pipe waits this long, at most a second at a time, so its batches fill meanwhile. */
+   * Nostr adapter does. A signalling pipe waits this long, at most a second at a time, so its batches fill meanwhile.
+   * Without it, the pipes send at their own rate, 6 batches a second with a burst of 12; an adapter that also ignores
+   * `lossy` and sends to several relays puts all of that on each of them. */
   wait?(): number;
   /** `from` must be the sender's PeerId, authenticated by the adapter (as the Nostr adapter's sealed messages are;
    * BroadcastChannel is same-origin): WebRTC offers, answers, ICE candidates and restarts, retry requests, and the
@@ -658,7 +660,7 @@ export declare class NostrSignaling implements SignalingAdapter {
   onReconnect: (url: string) => void;
   hello(meta?: unknown): Promise<void>;
   /** `lossy`: through one relay, the relays taking turns (one that holds us for its rate, has banned us or isn't open
-   * is skipped), not each. */
+   * is skipped, and so is one slowed behind what waits for it), not each. */
   send(to: PeerId, body: unknown, options?: { lossy?: boolean }): Promise<void>;
   /** Milliseconds until the relay the next lossy event goes to could take it (0: it can now). Each relay is paced on
    * its own, so lossy sends that wait this long move at about the relays' rates together. */

@@ -58,7 +58,8 @@ that needs a change is tracked as an NB card.
 
 **Status as of main `41cc24a` (2026-10-26); the shared-doc rows (DOC-*) as of main
 `f40cffa`, and the rows for docs kept on this device (NB6F-*) as of `1b0fc35`
-(2026-10-28).**
+(2026-10-28); the Nostr pacing rows (NB6H-*, NB6I-*) as of main `6a60ef0`
+(2026-10-29).**
 
 | Finding | Status |
 |---|---|
@@ -99,6 +100,8 @@ that needs a change is tracked as an NB card.
 | NB6F-1, NB6F-2, NB6F-3 (Low) | **Fixed** by `2e71dc5`, merged `8140998`, before `persist` was published (an opening that couldn't read the copy never writes it; one save at a time, paced at 256 KiB/s; a 5 s load deadline). The seal is security's call, in `52bb7e3`. Reviewed 2026-10-28; residuals R1–R4, [Docs kept on this device](#docs-kept-on-this-device-persist-nb-006f--nb6f-1nb6f-3) |
 | NB6F-2a (Info) | Open (NB-006f2), same section |
 | I3a (Info), I4 (accepted) | **Fixed** by `1b0fc35` (the `VERSION` comment covers a copy read only in part; `close()` and `leave()` say they wait for the store), same section |
+| NB6H-1 (Low), NB6H-2, I1, I2 (Info) | **Fixed** by `c1b3878`, merged `71f5c6e`, with NB6H-2's first half by `dc156a3` (relay pacing on a monotonic clock, with clamps; the pipe asks `wait()` again each second; a held relay is sent nothing at close; `wait?()` typed). Reviewed 2026-10-29, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
+| NB6I-1 (Low) | **Fixed** by `dc156a3`, merged `6a60ef0` (a relay slowed behind its queue gives up its turn), beside the lead's close fix `cf4a0a9`. Reviewed 2026-10-29; a relay that answers OK and delivers nothing gets 1/n of the pipe (accepted); residual NB-006j (a half-open relay), same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -1058,7 +1061,8 @@ The room_doc test reads 1 frame on the fix and 2 on `558f53c`.
   slices, so at most one slice's output is held past the cap. A truncated or junk stream
   is dropped. Frames stay in order per member both ways, and one inflated after its
   member left is dropped.
-- **The pipe.** Its budget is unchanged: 3 batches a second shared, burst 6.
+- **The pipe.** NB-006e left its budget unchanged: 3 batches a second shared, burst 6
+  (6 and 12 since NB-006i, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1)).
   - A full batch goes at once when a token is free.
   - A pipe timer that fires 250 ms or more late (a background tab) moves flushes to the
     end of the task, until one fires on time.
@@ -1224,6 +1228,176 @@ whom"):**
 - Two tabs of one browser in one room keep one copy of each doc, whichever saved last.
 - A page killed while visible loses its last few seconds of writes on this device: up to
   48 s for a full doc. The members that heard them still have them.
+
+### Nostr relay pacing and pipe striping (NB-006h, NB-006i) — NB6H-1, NB6H-2, NB6I-1
+
+`NostrSignaling` (`packages/js/src/nostr.js`) paces each relay on its own, and since
+NB-006i sends each pipe batch through one relay, the relays taking turns. Before, one
+`rate-limited:` refusal paused a relay for 30 s, doubling to 10 min, and every event
+went through every relay. So a join's burst against relays allowing 2–3 events a second
+paused all three, and the joiner never linked.
+
+Reviewed 2026-10-29 by reading the code, with fake-clock probes of our own code on fake
+sockets (no relay):
+- NB-006h: ui's `9f26bd1` and the lead's fold-in `c1b3878`, merged `71f5c6e`;
+- NB-006i: ui's `956f390` (striping) and `4d8f313` (the pipe's rate), the lead's
+  `cf4a0a9` (close) and `dc156a3` (NB6I-1, with one guard of the lead's), merged
+  `6a60ef0`.
+
+**Pacing:**
+- **Per relay.** Each socket publishes from its own queue, through a token bucket of
+  `RELAY_RATE` 4 a second with a burst of 8. A queue holds at most 64 events
+  (`RELAY_QUEUE`), dropping the oldest, and each waits at most 10 s. At most 64 sent
+  events wait for their OK.
+- **A rate refusal** (`rate-limited:`) halves that relay's rate, to no less than 0.5 a
+  second, and the rate grows back by one a second every 5 s. It holds that relay for
+  1 s, doubling to 30 s only while it refuses again before it takes one. The event is
+  sent again, up to `RELAY_TRIES` (3) times in all.
+- **A ban** (`blocked:`, `banned`) stops that relay for 30 s, doubling to 10 min,
+  starting over after 10 quiet minutes, and drops its queue.
+- **Never all held.** After each hold, ban and lost socket, `release()` cuts short the
+  hold that ends first if no open, unbanned relay is free. So a join or a pipe always has
+  a relay to go through, at that relay's rate.
+- **The clock.** All pacing runs on `performance.now()`. Wall time is used only for an
+  event's `created_at` and the REQ's `since` (NB6H-1).
+
+**Striping (NB-006i).** A lossy event goes through one relay. A lossy event is a pipe
+batch, whose datagrams the core resends if they are lost. Everything else goes through
+each relay: hellos, offers, answers, candidates, the Bye and the `close()` batches.
+- **The choice.** `next()` takes, from `turn` on, the first open relay that has neither
+  banned nor held us and can take the event within `HOLD_MS` (1 s). If there's none,
+  the open, unbanned one free soonest takes it. Once closed, any relay not holding us
+  takes it.
+- **`lossy` is a hint** (`opts?.lossy === true`). BroadcastSignaling, and any adapter
+  that ignores it, sends every way, as before.
+- **A refused lossy event** is one object with one count of tries, sent through the next
+  relay each time: at most 3 sends in all. Before NB-006i it was up to 3 per relay, 9 in
+  all. It keeps its id, so if a relay refused a copy yet delivered it, `seen` drops it.
+- **Lost events.** A lossy event queued on a relay that closes or bans us is lost, and
+  the core resends what it carried.
+
+**The pipe** (`webrtc.js`).
+- All pipes together send 6 batches a second, a burst of 12 (`PIPE_RATE`,
+  `PIPE_BURST`). Before `4d8f313` it was 3 and 6.
+- A batch holds at most 16 KiB or 64 datagrams, and waits on `wait()` first, at most a
+  second at a time.
+- Each pipe queues at most 128 KiB (`PIPE_QUEUE`; 64 KiB before), dropping the oldest.
+- With three relays, each carries about 2 pipe batches a second. When every batch went
+  through every relay, each carried 3, 9 in all.
+
+**Checked, with nothing found:**
+- **Relay-controlled input.** Only a relay's OK messages drive the pacing
+  (`answered()`), and holds, bans and buckets are keyed by our own socket's URL. A relay
+  can hold, slow or ban only itself. An OK for an id we don't know starts a hold only on
+  that relay, and only if none is running. So a relay can push its share of batches onto
+  the others, by refusing, banning us or closing, but can't pull more.
+- **Reconnects.** A redialled socket goes to the end of the list, which moves the turns
+  by one. A relay gets no turn while its socket is closed (at least `RECONNECT_MS`, 1 s),
+  so cycling its connection gains it nothing.
+- **Metadata.** Sizes, the `p` tag and timing are unchanged. Each relay sees about a
+  third of a pipe's batches instead of all of them (NB43-I4).
+- **Load.** The per-relay buckets bound every relay, whatever the pipe's rate. With one
+  relay open, `wait()` holds the pipe to that relay's 4 a second.
+- **`close()`.** What waits goes at once, past the buckets, but not to a relay that has
+  banned us or holds us.
+  - Lossy events waiting on a held relay are moved to a free one first (`cf4a0a9`).
+    They are moved, not copied, so none goes twice.
+  - With every relay held, a moved event lands on a held relay and stays unsent, as
+    before.
+
+**NB6H-1 — A wall clock set back stalled every relay (Low).** `9f26bd1` paced on
+`Date.now()`, and filled the buckets with `now − at` unclamped. A wall clock stepped
+back (NTP, the phone's network time, a restored VM) put every bucket in debt for as long
+as the step. Past a point it also made a relay's rate negative, and its pump timer then
+fired every millisecond and sent nothing. Repro (a scratch probe: a fake socket, a fake
+clock, no network): with the clock set 60 s back, 1 event was sent and the timer fired
+over 1200 times in 1.5 s, against 6 sent and 10 calls without the step. **Fixed** by
+`c1b3878`: the pacing runs on `performance.now()` (the pipe's tokens too), and `rate()`
+clamps elapsed time at 0 and the rate at 0.5 a second. The probe then gives 6 sent and
+11 calls, and `nostr_bounds` 5b steps the clock back.
+
+**NB6H-2 — The pipe asked `wait()` once per timer (Info).** Two effects:
+- (a) `wait()` charged the relay's whole queue, including events about to expire;
+- (b) while every open relay had banned us, the pipe waited out the ban (up to 10 min),
+  even after another relay opened.
+
+**Fixed:** (b) by `c1b3878`, since the pipe waits at most 1 s and then asks again; (a)
+went into NB6I-1.
+
+**Info, fixed by `c1b3878`:**
+- **I1:** `close()` sent what waited to a relay that held us for its rate, past its hold.
+  Once closed, a held relay is now sent nothing and arms no timer.
+- **I2:** `SignalingAdapter` in `index.d.ts` now has `wait?()`.
+
+**A pipe batch dropped at close (found in the lead's check, before merge).** With
+striping, a batch waiting on a relay held for its rate is the only copy. At `close()` a
+held relay is sent nothing (I1), so a leaving peer silently dropped that batch.
+**Fixed** by `cf4a0a9`: `close()` first moves such a batch with `stripe()` to a free
+relay.
+
+**NB6I-1 — The relay in turn held the pipe for its whole queue (Low).** On `956f390`,
+`wait()` was the time until the relay whose turn it was could take one more event: its
+queue at its own rate.
+- That queue holds a copy of every signalling event, and its rate is what its refusals
+  left it, down to 0.5 a second.
+- So one relay that refused an event now and then, strict or hostile, kept the pipe idle
+  behind it while the others were free, up to `RELAY_QUEUE_MS` (10 s) a turn.
+- A hostile relay could also black-hole what it did take.
+
+Repro: a scratch probe measuring our own code's cost.
+- Setup: a fake clock and timers, and three fake sockets that answer OK.
+- Load: a saturated pipe at 6 a second that asks `wait()` at least every second, and 8
+  signalling events every 5 s.
+- Relay c refuses every k-th event; 30 s simulated.
+
+| relay c refuses | `956f390` | with the fix |
+|---|---|---|
+| never | 6.37 batches/s, longest gap 0.41 s | 6.37/s, 0.41 s |
+| 1 in 6 | 2.80/s, 4.04 s | 5.83/s, 2.14 s |
+| 1 in 8 | 2.50/s, 4.81 s | 5.90/s, 2.21 s |
+| 1 in 12 | 4.17/s, 5.49 s | 5.90/s, 2.16 s |
+
+**Fixed** by `dc156a3`:
+- **Passing over.** `next()` passes over an unheld relay that can't take the event
+  within `HOLD_MS`, as it passes over a held one. With none left, the one free soonest
+  takes it.
+- **Push, not pull, still holds.** A relay is passed over only for its own hold, its own
+  lowered rate, or its own queue at that rate.
+- **At close** (the lead's guard), any relay not holding us takes the batch, however
+  long its queue, because everything goes at once and a held relay is sent nothing.
+  Without the guard, the batch could land on a relay held for less than `HOLD_MS` and be
+  dropped, as before `cf4a0a9`.
+- **Tests,** `nostr_bounds` 5c:
+  - with a relay at 0.5 a second and 8 queued, `wait()` is 250 ms, against 18 s without
+    the fix;
+  - at close, with that relay free and the other two held, the batch goes through it.
+
+**Residuals:**
+- **A relay that answers OK and delivers nothing** (accepted, by design) gets 1/n of the
+  pipe's batches, n being the number of open relays.
+  - It gets more only while the others are held, banned, closed or slowed, each by its
+    own doing. Nothing it does pulls more.
+  - The core resends what is lost. `doc_catchup` (h), with the joiner deaf to one of
+    three relays, takes 17.1 s in the gate on `6a60ef0` (8.3–19.1 s in earlier runs);
+    the bar is 60 s.
+  - Before NB-006i the other relays carried a copy of each batch, so such a relay cost
+    nothing.
+- **A half-open relay, NB-006j (Low).** A socket that is still `OPEN` but whose relay is
+  gone takes its turns until the browser closes it, and what it takes is lost.
+  Suggested fix: a relay whose oldest event has waited about 5 s for its OK counts as
+  held. NIP-01 relays answer within a round trip, so this needs no wire change.
+- **Relays of different rates** (accepted). While each can take the next batch within
+  `HOLD_MS`, they still take equal turns, so the pipe moves at about the slowest relay's
+  rate times n.
+- **Adapters without `wait()`.** One that ignores `lossy` and sends to several relays
+  puts the pipes' whole 6 a second, burst 12, on each (`index.d.ts` says so).
+- **Memory** (accepted). 256 pipes (`MAX_PIPE_PEERS`) of 128 KiB is 32 MiB raw, about
+  43 MiB as base64. Only our own core's paced sends fill it.
+- **The close burst.** At close, a relay gets its queue (at most 64) and the pipe
+  batches moved to it. The pipe's budget holds those to about 72: a burst of 12, plus
+  10 s at 6 a second. Before NB-006h, everything went out at once anyway.
+- **Every relay banned.** `wait()` lasts until the first ban ends, up to 10 min. Nothing
+  could be carried meanwhile.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6
 
@@ -1453,8 +1627,10 @@ and what it accepted. Values are from main `7b716a2`.
 - **Fallback pipes (NB-043).**
   - `MAX_PIPE_PEERS` 256, evicted oldest first. Since `a283a01` an evicted permission
     drops its pipe unless a session uses it (NB43-1).
-  - Outgoing pipes share 3 messages/s (burst 6), in batches of 16 KiB.
-  - Each pipe's queue is 64 KiB, dropping the oldest.
+  - Outgoing pipes share 6 batches/s (burst 12), in batches of 16 KiB, each through
+    one relay, the relays taking turns. Before NB-006i it was 3/s (burst 6), each batch
+    through every relay.
+  - Each pipe's queue is 128 KiB (64 KiB before NB-006i), dropping the oldest.
   - Incoming batches are capped at 64 items but not rate-limited.
   - Residuals:
     - **NB43-I1:** a relaying member can roam a link onto its own pipe, because a
@@ -1474,8 +1650,11 @@ and what it accepted. Values are from main `7b716a2`.
   - Content is capped at 64 KiB.
   - 4096 event ids are remembered (oldest forgotten), and each must be 64 hex
     characters.
-  - A relay that rate-limits us is paused from 30 s, doubling to 10 min, and the
-    pause starts over after 10 quiet minutes.
+  - Each relay is paced on its own, at 4 events a second with a burst of 8 (NB-006h).
+    One that refuses an event for its rate halves that rate (to no less than 0.5 a
+    second) and is held for 1 s, doubling to 30 s. One that bans us is sent nothing for
+    30 s, doubling to 10 min, and that starts over after 10 quiet minutes
+    ([Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1)).
   - Closed sockets are redialled from 1 s, doubling to 30 s.
   - Residual: JS checks neither the event id hash nor the signature, so a relay can
     present one event under many ids. Offers are sealed and hellos proven, and

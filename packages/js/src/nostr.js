@@ -46,10 +46,10 @@ export const DEFAULT_RELAYS = ['wss://nos.lol', 'wss://relay.primal.net', 'wss:/
 // core resends if it is lost) goes through one, the relays taking turns. A pipe loads each
 // with a share and moves at about their rates together while they keep pace, and a relay
 // that answers OK but delivers nothing loses no more than its share. A relay that holds us
-// for its rate, has banned us or isn't open is skipped; with every open, unbanned one held,
-// the one whose hold ends first takes it. One refused for its rate goes again through the
-// next relay, seldom the one that refused, now held; one on a relay that closes or bans us
-// is lost.
+// for its rate, has banned us or isn't open is skipped, and so is one slowed behind what
+// waits for it (see next()); with none left, the open, unbanned one free soonest takes it.
+// One refused for its rate goes again through the next relay, seldom the one that refused,
+// now held; one on a relay that closes or bans us is lost.
 export const RELAY_RATE = 4;
 export const RELAY_BURST_S = 2;
 export const MIN_RELAY_RATE = 0.5;
