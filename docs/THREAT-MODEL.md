@@ -70,6 +70,7 @@ and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 | SEC-5…SEC-8 | Open (NB-025…NB-028) |
 | SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 audit and N29-1 fix |
 | SEC-12 (Info) | Accepted, no card |
+| SEC-13 (Low) | Open, found 2026-10-30, on the board for an NB number: a 37-byte copy of a half-open handshake's HS1 draws its 57-byte HS2 from any address, [SEC-13](#sec-13--a-short-copy-of-a-half-open-handshakes-hs1-reflects-its-hs2-low) |
 | N38-1…N38-3 (port mapping) | **Fixed** in NB-038 (`71d83b2`) and NB-041 (`0dfdbc9`) |
 | NPM-1 (Low) | **Fixed** by `4cffbf9` (merged `14f463a`): no port mapping under `RelayOnly` |
 | NPM-2 (Low) | **Fixed** in `docs/GODOT.md` (`9be92d5`); the flood risk itself is SEC-4 |
@@ -328,15 +329,15 @@ Info from the review; none was needed for the merge:
   a relay: a relayed packet arrives as `Path::Via(relay)` and carries no origin.
   While the endpoint is loaded, a peer linked to relay `r` can take `r`'s 4 slots
   and keep out others who reach it through `r`.
-- **NB24-I3 — Reflection is at most 0.57× (Info, optional).** The smallest HS1 that
-  gets a cookie is 37 bytes (a 5-byte header and 32 bytes of noise), and the
+- **NB24-I3 — A cookie reflects at most 0.57× (Info, optional).** The smallest HS1
+  that gets a cookie is 37 bytes (a 5-byte header and 32 bytes of noise), and the
   `COOKIE` is 21. A valid HS1 is 133 bytes (0.16×), and its HS2 below the mark is
-  57 (0.43×). So no answer a responder sends is larger than the packet it answers.
-  (An endpoint that is itself dialling the sender answers that peer's valid HS1
-  with its own: 133 bytes, or 149 as an `HS1C` to an address it dials and holds a
-  cookie for.) Optional fix: under load, answer only an HS1 of exactly IK msg1's
-  length. That keeps it at 0.16×, and fewer probes could fingerprint the endpoint
-  (R5).
+  57 (0.43×). The exception is SEC-13: the HS2 of a handshake already half-open is
+  sent again for 37 bytes (1.54×). (An endpoint that is itself dialling the sender
+  answers that peer's valid HS1 with its own: 133 bytes, or 149 as an `HS1C` to an
+  address it dials and holds a cookie for.) Optional fix: answer only an HS1 of
+  exactly IK msg1's length. That keeps a cookie at 0.16×, closes SEC-13, and fewer
+  probes could fingerprint the endpoint (R5).
 - **NB24-I4 — Hosts with `u32` handles (Info, accepted).** A host that calls
   `pw_handle_datagram`, or `Peerwire.receive` without a peer, gets one source per
   handle, since a handle is no IP address. A UDP host that made one handle per IP
@@ -417,6 +418,35 @@ offer acted on, under the offer rate limits; each guess answers only "linked to 
 or not" and enumerates nothing; and X must actually relay to the holder, so X has
 to be linked to it. No fix planned; a stronger design (naming only links that
 agreed to relay) would be a separate card.
+
+### SEC-13 — A short copy of a half-open handshake's HS1 reflects its HS2 (Low)
+
+Found on 2026-10-30 by fuzzing a loaded endpoint, in the pass after NB-024; it
+predates NB-024 (it was there before the rename, `27a69c9`). `on_hs1` first looks
+an HS1 up by its index and ephemeral key, before any crypto, and if a half-open
+handshake has them it sends that handshake's HS2 again to wherever the packet came
+from. The lookup needs only those 36 bytes, and the length check before it only 32
+bytes of noise. So a 37-byte packet (the kind byte, the index and the ephemeral key)
+draws the 57-byte HS2, every time, from any source address: 1.54× in bytes, one
+packet for one. It runs before the cookie and the cap, so it works at any load.
+
+- Reproduction: an attacker sends the endpoint one valid HS1 of its own (it needs
+  only the endpoint's PeerId; under load, also a cookie at a real address of its
+  own). For the next `handshake_timeout` (10 s), each 37-byte packet with that HS1's
+  index and ephemeral key, from a victim's spoofed address, sends the victim the
+  57-byte HS2. Another valid HS1 renews it.
+- Impact: a small reflector for anyone who knows a PeerId whose node is reachable
+  over UDP (native, Godot, `peerwire-peer`). A peer's own channel
+  (`handle_datagram_from`) answers only that peer. It is the same early return as
+  NB44c-1, whose fix (report true only after crypto) doesn't change this.
+- Fix: count an HS1 whose Noise part isn't exactly 128 bytes as malformed. IK
+  message 1 with the 32-byte PeerId payload is always 32 + 48 + 48 bytes, and a
+  payload of any other length is refused already. The smallest packet answered is
+  then 133 bytes: 0.43× for an HS2, 0.16× for a `COOKIE`. That is NB24-I3's
+  optional fix too, and fewer probes could fingerprint a loaded endpoint (SEC-4
+  R5). Checked: with that one-line change, the 97 `peerwire-core` unit tests pass
+  in release, among them the fuzz target that found this, with its size check
+  holding for every answer.
 
 ### Router port mapping (NB-038, Godot switch) — N38-1…N38-3, NPM-1…NPM-3
 
