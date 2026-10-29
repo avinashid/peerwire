@@ -57,7 +57,7 @@ Severity uses likelihood × impact for this software's threat model. Each findin
 that needs a change is tracked as an NB card.
 
 **Status as of main `41cc24a` (2026-10-26); the shared-doc rows (DOC-*) as of main
-`f40cffa`, and the rows for docs kept on this device (NB6F-*) as of `255ec0e`
+`f40cffa`, and the rows for docs kept on this device (NB6F-*) as of `1b0fc35`
 (2026-10-28).**
 
 | Finding | Status |
@@ -96,8 +96,9 @@ that needs a change is tracked as an NB card.
 | DOC-1 (Medium), DOC-2, DOC-3 (Low) | **Fixed** by `979cdae`, `eaa2a22` and `a4fddfd`, with DOC-2a and DOC-3a by `d6b148c`, merged `c30ab0f`, before `room.doc()` was published (stamps taken however far ahead; no entry on our own writer that we didn't write; a frame costs about one pass over what it names), reviewed 2026-10-27, [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-5) |
 | DOC-2b (Low) | **Fixed** by `8b7946c`, merged `45c7cfd` (a catch-up's deletions passed on one range per range of it, charged to the sender's budget), reviewed 2026-10-27; residuals DOC-2c and I6, same section |
 | DOC-4, DOC-5 (Low) | **Fixed** by `f40cffa` (the merge of `ff51ce6`): a member over signalling is paused for a better routed one once per answer; a room with no doc open drops deflated doc frames unread. Reviewed 2026-10-28; residual I8, same section |
-| NB6F-1, NB6F-2, NB6F-3 (Low) | **Fixed** by `2e71dc5`, before `persist` was published (an opening that couldn't read the copy never writes it; one save at a time, paced at 256 KiB/s; a 5 s load deadline). The seal is security's call, in `52bb7e3`. Reviewed 2026-10-28; residuals R1–R4, [Docs kept on this device](#docs-kept-on-this-device-persist-nb-006f--nb6f-1nb6f-3) |
-| NB6F-2a, I3a (Info) | Open, same section |
+| NB6F-1, NB6F-2, NB6F-3 (Low) | **Fixed** by `2e71dc5`, merged `8140998`, before `persist` was published (an opening that couldn't read the copy never writes it; one save at a time, paced at 256 KiB/s; a 5 s load deadline). The seal is security's call, in `52bb7e3`. Reviewed 2026-10-28; residuals R1–R4, [Docs kept on this device](#docs-kept-on-this-device-persist-nb-006f--nb6f-1nb6f-3) |
+| NB6F-2a (Info) | Open (NB-006f2), same section |
+| I3a (Info), I4 (accepted) | **Fixed** by `1b0fc35` (the `VERSION` comment covers a copy read only in part; `close()` and `leave()` say they wait for the store), same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -1193,16 +1194,16 @@ and `leave()` never resolved.
   cleared) was never opened again. `onclose` now drops it.
 - **I3**, fixed by `2e71dc5`: a comment by `VERSION` says to bump it whenever an older
   release's `restore()` would refuse what `snapshot()` now writes.
-  - **I3a**, open: `parseFrame` and `restore()` ignore fields they don't know, so the
-    comment should also say "or read only in part". An older release would save such a
-    copy back without them.
-- **NB6F-2a**, open: a store that keeps failing (a full disk) is retried every
+  - **I3a**, fixed by `1b0fc35`: `parseFrame` and `restore()` ignore fields they don't
+    know, so an older release would save such a copy back without them. The comment now
+    also says "or read only in part".
+- **NB6F-2a**, open (NB-006f2): a store that keeps failing (a full disk) is retried every
   `SAVE_MS` while the doc changes, and each retry builds and seals the whole doc before
   the store refuses it: CPU only, about 60 ms a second for a full doc. Fix: back off
   over consecutive failures.
-- **I4**, accepted: `close()` and `leave()` resolve only once a save in flight settles,
-  so a store whose save never settles holds them. `leave()` has closed the network by
-  then, and `@peerwire/react` doesn't await it.
+- **I4**, accepted, documented in `index.d.ts` by `1b0fc35`: `close()` and `leave()`
+  resolve only once a save in flight settles, so a store whose save never settles holds
+  them. `leave()` has closed the network by then, and `@peerwire/react` doesn't await it.
 
 **Residuals (accepted; R1–R4 are in the README's "What a copy keeps secret, and from
 whom"):**
