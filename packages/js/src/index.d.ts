@@ -662,7 +662,8 @@ export declare class NostrSignaling implements SignalingAdapter {
   onReconnect: (url: string) => void;
   hello(meta?: unknown): Promise<void>;
   /** `lossy`: through one relay, the relays taking turns (one that holds us for its rate, has banned us or isn't open
-   * is skipped, and so is one slowed behind what waits for it), not each. */
+   * is skipped, and so is one slowed behind what waits for it, and one that has answered nothing for 5 s since it was
+   * sent an event while any that answers is left), not each. */
   send(to: PeerId, body: unknown, options?: { lossy?: boolean }): Promise<void>;
   /** Milliseconds until the relay the next lossy event goes to could take it (0: it can now). Each relay is paced on
    * its own, so lossy sends that wait this long move at about the relays' rates together. */

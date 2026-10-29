@@ -511,7 +511,12 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    share and moves at about their rates together, up to its own 6 batches a second,
    while they keep pace; a relay slowed by its refusals gives its turns to the others. A batch is lost when its relay drops it or the peer doesn't hear that relay,
    like a datagram on any path, and the core sends what it carried again: taking turns
-   keeps that to one batch in three when one of three relays drops them all. The last
+   keeps that to one batch in three when one of three relays drops them all. A relay
+   that has answered nothing for 5 s since we sent it an event (relays answer each one
+   with an OK within a round trip) is silent: a half-open socket, still open but dead,
+   would otherwise take its turns and lose them until it closes. It is skipped too, while
+   any relay that answers is left, and still sent every other signal; its next answer
+   gives it its turns back. The last
    batches a room sends as it leaves go through every relay, as nothing could send them
    again. A relay that bans us (`blocked:`, `banned`) gets nothing for 30 s, doubling up
    to 10 min; the ban starts over at 30 s once the relay has gone 10 min without one.
@@ -616,7 +621,13 @@ Run these with Node and the Playwright install on this host:
   backlog is skipped, and with none left the one free soonest takes it. One refused for
   its rate goes again through the next relay. Sent as `wait()` allows, pipe batches move
   at three relays' rates, other events at one's, and with relays of different rates each
-  takes about an equal share. No relays.
+  takes about an equal share. A relay that never answers loses its turns about 5 s after
+  the first event it left unanswered, and one that answers 4 s late keeps them; a silent
+  one is still sent every other event, `wait()` isn't its, and its next OK, taken or
+  refused, gives its turns back. With only silent relays they take turns; one that answers
+  but holds us is waited for rather than a silent one sent to; at `close()` a batch goes
+  through one that answers (one not slowed behind its backlog first), then a silent one,
+  and a held one last. No relays.
 - `node packages/js/test/rust_hello.mjs`: a Rust or Godot member's room hello, sealed with
   the nonce fixed, is the same base64 that `sealRoom` makes (the vector Rust asserts too),
   and opens to Rust's exact JSON. A `Room` that hears it through `NostrSignaling` doesn't
@@ -735,11 +746,13 @@ Run these with Node and the Playwright install on this host:
   direct link, the signalling pipe through fake rate-limited relays, from a background tab, both at once, from a
   member that kept the board on its device and comes back after nobody was online, and with two holders, one
   direct and one over the pipe (one whole answer, from the direct one); then over the pipe through relays that
-  take 3 events a second, then 2, which refuse part of every join's burst, and with the joiner deaf to one of the
-  three relays, which loses the batches sent through it. It prints the time to the whole board, the frames,
+  take 3 events a second, then 2, which refuse part of every join's burst, with the joiner deaf to one of the
+  three relays, which loses the batches sent through it, and with one relay going half-open as the joiner links
+  (it takes events but answers and delivers nothing). It prints the time to the whole board, the frames,
   datagrams, retransmits, pipe batches and relay events, and checks the bars: 15 s (30 s from a background tab
-  over the pipe, 60 s with the joiner deaf to a relay), first strokes within 3 s (5 s from a background tab over
-  the pipe), and nothing while nobody is online.
+  over the pipe or with a relay half-open, 60 s with the joiner deaf to a relay), first strokes within 3 s (5 s
+  from a background tab over the pipe, 6 s with a relay half-open), no batch put on the half-open relay over 5 s
+  after it stopped answering, and nothing while nobody is online.
 - `node packages/js/test/pipe_batches.mjs`: a pipe's batches on a fake clock: datagrams queued together go 40
   ms later as one, a batch's worth at once, 6 a second after a burst of 12, and with timers held to once a second
   (a background tab), the batches a late timer finds go together, and what a task queued goes at its end, until
