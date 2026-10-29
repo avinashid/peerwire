@@ -8,6 +8,16 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// `body` sealed for a room as members seal their hellos (NB-022b): nonce, then AES-256-GCM.
+fn seal(app: &str, room: &str, body: &str) -> Vec<u8> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use sha2::Digest;
+    let key: [u8; 32] = sha2::Sha256::digest(format!("peerwire/room-enc/{app}/{room}")).into();
+    let nonce = [7; 12];
+    let ct = aes_gcm::Aes256Gcm::new(&key.into()).encrypt(&nonce.into(), body.as_bytes()).unwrap();
+    [&nonce[..], &ct].concat()
+}
+
 /// Polls `nodes` for `ms`, returning every (node index, event).
 fn run(nodes: &mut [&mut Node], ms: u64, mut each: impl FnMut(&mut [&mut Node])) -> Vec<(usize, Event)> {
     let end = Instant::now() + Duration::from_millis(ms);
@@ -36,16 +46,21 @@ fn sec_room_topic_only() {
     let mut attacker = node();
     let mut side = hub.connect();
     let id = hex(attacker.peer_id().as_bytes());
-    // The old hello, and one with a made-up proof.
+    // The old hello, and one with a made-up proof; and that one fresh and sealed as a
+    // member seals it (NB-022b), so the proof check refuses it, not the seal.
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let p = "ab".repeat(32);
+    let forged = format!(r#"{{"t":"hello","from":"{id}","meta":{{"nb":1,"role":"host","ts":{ts},"p":"{p}"}}}}"#);
     let hellos = [
-        format!(r#"{{"t":"hello","from":"{id}","meta":{{"nb":1,"role":"host"}}}}"#),
-        format!(r#"{{"t":"hello","from":"{id}","meta":{{"nb":1,"role":"host","p":"{}"}}}}"#, "ab".repeat(32)),
+        format!(r#"{{"t":"hello","from":"{id}","meta":{{"nb":1,"role":"host"}}}}"#).into_bytes(),
+        format!(r#"{{"t":"hello","from":"{id}","meta":{{"nb":1,"role":"host","p":"{p}"}}}}"#).into_bytes(),
+        seal("my-game", "k3J9-xQ72-Lm0p-Zt8w-R4vB", &forged),
     ];
     let mut last = Instant::now() - Duration::from_secs(10);
     let events = run(&mut [&mut client, &mut attacker], 3000, |_| {
         if last.elapsed() > Duration::from_millis(500) {
             for h in &hellos {
-                side.publish(topic, h.as_bytes());
+                side.publish(topic, h);
             }
             last = Instant::now();
         }

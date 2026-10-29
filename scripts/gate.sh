@@ -55,6 +55,7 @@ NODE=(
   "node room|node packages/js/test/room_node.mjs"
   "node peer ids|node packages/js/test/peer_id.mjs"
   "node nostr bounds|node packages/js/test/nostr_bounds.mjs"
+  "node rust hello|node packages/js/test/rust_hello.mjs"
   "node room proof|node packages/js/test/room_proof.mjs"
   "node pump re-arm|node packages/js/test/pump_rearm.mjs"
   "node endpoint closed|node packages/js/test/endpoint_closed.mjs"

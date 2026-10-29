@@ -429,7 +429,7 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 with padding, as `btoa` writes it.
-fn b64(data: &[u8]) -> String {
+pub(crate) fn b64(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for c in data.chunks(3) {
         let n = u32::from(c[0]) << 16 | u32::from(*c.get(1).unwrap_or(&0)) << 8 | u32::from(*c.get(2).unwrap_or(&0));

@@ -615,6 +615,11 @@ Run these with Node and the Playwright install on this host:
   its rate goes again through the next relay. Sent as `wait()` allows, pipe batches move
   at three relays' rates, other events at one's, and with relays of different rates each
   takes about an equal share. No relays.
+- `node packages/js/test/rust_hello.mjs`: a Rust or Godot member's room hello, sealed with
+  the nonce fixed, is the same base64 that `sealRoom` makes (the vector Rust asserts too),
+  and opens to Rust's exact JSON. A `Room` that hears it through `NostrSignaling` doesn't
+  dial, pipe or answer that peer (`meta.nb`, or `meta.pw`); the same hello unmarked is
+  answered and dialled. No relays.
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's; a room that signs

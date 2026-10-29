@@ -28,7 +28,9 @@
 //! label, is known only to those given the name. Hellos and room offers carry an
 //! HMAC under that key, and a node in a room links only with peers that proved it
 //! (or that it dialled itself, from an invite). A room whose name can be guessed is
-//! a public lobby. Hellos carry the sender's clock and are dropped when stale.
+//! a public lobby. Hellos carry the sender's clock and are dropped when stale. They
+//! are sealed (AES-256-GCM) under a third key from the name, as `nostr.js` seals
+//! them, so a relay that sees the topic doesn't learn who is in the room (SEC-2).
 //!
 //! Outside rooms, a node acts on an offer only from a peer that holds its invite
 //! (the offer carries an HMAC under the invite's key) or that it dialled itself:
@@ -39,6 +41,8 @@
 //! only, or none (every link but the one to its relay goes through the relay).
 
 use crate::signaling::{hex, unhex, Topic};
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use peerwire_core::{sealed, stun, Address, Endpoint, Event, Identity, Instant, Path, PeerId, Transmit};
 use rand_chacha::ChaCha20Rng;
@@ -347,6 +351,8 @@ impl<A> Default for Remote<A> {
 struct Room {
     topic: Topic,
     key: [u8; 32],
+    /// What hellos are sealed under ([`room_enc_key`]).
+    enc: [u8; 32],
     role: Role,
     /// Link only with this peer (a client that knows its host's key).
     expect: Option<PeerId>,
@@ -553,10 +559,20 @@ impl<A: Address> Traversal<A> {
         self.leave_room();
         self.picked = None;
         let topic = Topic::room(app_id, room);
-        let key = room_key(app_id, room);
+        let (key, enc) = (room_key(app_id, room), room_enc_key(app_id, room));
         self.signals.push_back(Signal::Subscribe(topic));
-        self.signals.push_back(Signal::Publish(topic, hello(&key, &self.id, role, self.wall_ms(now))));
-        self.room = Some(Room { topic, key, role, expect: host, next_hello: now + HELLO_FIRST, interval: HELLO_FIRST });
+        self.room =
+            Some(Room { topic, key, enc, role, expect: host, next_hello: now + HELLO_FIRST, interval: HELLO_FIRST });
+        self.announce(now);
+    }
+
+    /// Publishes this node's hello on the room topic, sealed for the room.
+    fn announce(&mut self, now: Instant) {
+        let Some(r) = &self.room else { return };
+        let mut nonce = [0; NONCE_LEN];
+        self.rng.fill_bytes(&mut nonce);
+        let h = hello(&r.key, &self.id, r.role, self.wall_ms(now));
+        self.signals.push_back(Signal::Publish(r.topic, seal_room(&r.enc, nonce, &h)));
     }
 
     /// Stops announcing and answering in the current room. Links stay up.
@@ -615,7 +631,9 @@ impl<A: Address> Traversal<A> {
     /// Handles a message from the signaling carrier.
     pub fn handle_signal(&mut self, now: Instant, ep: &mut Endpoint<A>, topic: Topic, payload: &[u8]) {
         if let Some(room) = self.room.as_ref().filter(|r| r.topic == topic) {
-            let Some((from, role, ts, proof)) = parse_hello(payload) else { return };
+            // A hello that doesn't open under the room's key (plaintext, another room's, altered) is dropped.
+            let Some(body) = open_room(&room.enc, payload) else { return };
+            let Some((from, role, ts, proof)) = parse_hello(&body) else { return };
             let fresh = self.wall_ms(now).abs_diff(ts) <= FRESH_MS;
             if fresh && mac_ok(&room.key, &[b"pw-hello", from.as_bytes(), &[role as u8], &ts.to_le_bytes()], &proof) {
                 self.on_hello(now, ep, from, role);
@@ -749,8 +767,7 @@ impl<A: Address> Traversal<A> {
         if let Some(r) = self.room.as_mut().filter(|r| now >= r.next_hello) {
             r.interval = (r.interval * 2).min(HELLO_MAX);
             r.next_hello = now + r.interval;
-            let h = hello(&r.key, &self.id, r.role, self.unix_ms + now.as_micros() / 1000);
-            self.signals.push_back(Signal::Publish(r.topic, h));
+            self.announce(now);
         }
         self.start_plans(now, ep);
         self.remotes.retain(|p, r| now - r.seen_at < FORGET || ep.is_connected(p));
@@ -1148,6 +1165,33 @@ fn room_key(app_id: &str, room: &str) -> [u8; 32] {
     Sha256::digest(format!("peerwire/room-key/{app_id}/{room}")).into()
 }
 
+/// The key a room's hellos are sealed under, as `nostr.js` derives it: the name
+/// hashed under a third label, so only those given the name read who is in the room.
+fn room_enc_key(app_id: &str, room: &str) -> [u8; 32] {
+    Sha256::digest(format!("peerwire/room-enc/{app_id}/{room}")).into()
+}
+
+/// AES-GCM nonce and tag lengths.
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+
+/// `body` sealed for a room as `nostr.js` `sealRoom` seals it: the nonce, then the
+/// AES-256-GCM ciphertext and tag, with no associated data. The carrier base64s it.
+fn seal_room(key: &[u8; 32], nonce: [u8; NONCE_LEN], body: &[u8]) -> Vec<u8> {
+    let ct = Aes256Gcm::new(key.into()).encrypt(&nonce.into(), body).expect("a hello is far below GCM's limit");
+    [&nonce[..], &ct].concat()
+}
+
+/// The body of a [`seal_room`] payload, if it is one sealed under `key` and unaltered.
+/// Anything longer than a sealed hello is refused unread.
+fn open_room(key: &[u8; 32], b: &[u8]) -> Option<Vec<u8>> {
+    if !(NONCE_LEN + TAG_LEN..=NONCE_LEN + HELLO_MAX_LEN + TAG_LEN).contains(&b.len()) {
+        return None;
+    }
+    let (nonce, ct) = b.split_at(NONCE_LEN);
+    Aes256Gcm::new(key.into()).decrypt(Nonce::from_slice(nonce), ct).ok()
+}
+
 fn hmac(key: &[u8; 32], parts: &[&[u8]]) -> Hmac<Sha256> {
     let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
     for p in parts {
@@ -1179,11 +1223,22 @@ const HELLO_MID: &str = r#"","meta":{"nb":1,"role":""#;
 const HELLO_TS: &str = r#"","ts":"#;
 const HELLO_PROOF: &str = r#","p":""#;
 const HELLO_TAIL: &str = r#""}}"#;
+/// The longest hello: role `client`, a 19-digit `ts`.
+const HELLO_MAX_LEN: usize = HELLO_HEAD.len()
+    + 64
+    + HELLO_MID.len()
+    + "client".len()
+    + HELLO_TS.len()
+    + 19
+    + HELLO_PROOF.len()
+    + 64
+    + HELLO_TAIL.len();
 
-/// The room presence message, in the JSON shape `nostr.js` uses (`{t, from, meta}`).
-/// `meta.nb` marks a UDP peer, so browsers' WebRTC hellos are told apart; `meta.ts`
-/// is the sender's Unix time in ms; `meta.p` is the room proof, an HMAC under the
-/// room key over the sender, its role and `ts` (so a captured hello goes stale).
+/// The room presence message, in the JSON shape `nostr.js` uses (`{t, from, meta}`),
+/// before [`seal_room`] seals it. `meta.nb` marks a UDP peer, so each side tells the
+/// other's hellos apart (`room.js` doesn't dial it over WebRTC); `meta.ts` is the
+/// sender's Unix time in ms; `meta.p` is the room proof, an HMAC under the room key
+/// over the sender, its role and `ts` (so a captured hello goes stale).
 fn hello(key: &[u8; 32], id: &PeerId, role: Role, ts: u64) -> Vec<u8> {
     let proof = mac(key, &[b"pw-hello", id.as_bytes(), &[role as u8], &ts.to_le_bytes()]);
     let (id, name, proof) = (hex(id.as_bytes()), role_name(role), hex(&proof));
@@ -1401,6 +1456,94 @@ mod tests {
         assert_ne!(key, Topic::room("app", "room").0);
     }
 
+    /// NB-022b (SEC-2): a hello is sealed exactly as `nostr.js` `sealRoom` seals it, so
+    /// the Nostr `content` is the same bytes. The vector was made by `sealRoom` (nonce
+    /// 0..11) and is asserted again in packages/js/test/rust_hello.mjs: change both or neither.
+    #[test]
+    fn hello_seal_matches_nostr_js() {
+        const ENC: &str = "7e6a0b7e0ba0d5c263896aa5345c379c8bd23f796815a02a6282b076002fbb96";
+        const BODY: &str = concat!(
+            r#"{"t":"hello","from":"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c","#,
+            r#""meta":{"nb":1,"role":"peer","ts":1800000000123,"#,
+            r#""p":"e72685be158e95e099ef47af264ce803b7380a7e1204708b9c3e582dd43bb2b7"}}"#
+        );
+        const SEALED: &str = concat!(
+            "AAECAwQFBgcICQoLbW0PRSqiDrpAc6clOpp1LqmbpsEwi1V1wdARHJcaKrdJxmyODZ8iKLorORTIX6Vx",
+            "8SqfUhbwUB9d/uZyGAkxUyvvZjSlOtZMEp+2Mb2gIdnJdMv2G1Nt0R3eGuOeeypLbPIz3oSh0hb4d+DQ",
+            "MCqOucNUEwbFBqFZNWSPsHEajTFV5wIaTVagPhYhSq47vXbL5Yu6HVfna1kQ4yoOgiCbyoqB3bpRUtdn",
+            "5dBQT6nGdTxbCDzj7UYsZGHduNlouDgcziOF/y02ZiP4F4134j4u345c0SOyA1AU23udVOprOg==",
+        );
+        let (key, enc) = (room_key("demo", "lobby"), room_enc_key("demo", "lobby"));
+        assert_eq!(hex(&enc), ENC);
+        let body = hello(&key, &id(1).peer_id(), Role::Peer, 1_800_000_000_123);
+        assert_eq!(std::str::from_utf8(&body), Ok(BODY));
+        let sealed = seal_room(&enc, std::array::from_fn(|i| i as u8), &body);
+        assert_eq!(crate::nostr::b64(&sealed), SEALED);
+        assert_eq!(open_room(&enc, &sealed).as_deref(), Some(BODY.as_bytes()));
+    }
+
+    /// NB-022b (SEC-2): a member's hellos are sealed, each under a fresh nonce, with no
+    /// PeerId in the clear; and a hello that doesn't open under the room's key is dropped:
+    /// in plaintext, sealed for another room, with any byte altered, cut, or extended.
+    #[test]
+    fn hellos_are_sealed_and_only_sealed_ones_count() {
+        let me = id(1).peer_id();
+        let (key, enc, topic) = (room_key(ROOM.0, ROOM.1), room_enc_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1));
+        let unix_ms = 1_700_000_000_000;
+        let local: SocketAddr = "10.0.0.1:7000".parse().unwrap();
+        let mut t = Traversal::new(&id(1), [3; 32], unix_ms, vec![local], vec![]);
+        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
+        t.join_room(Instant::ZERO, ROOM.0, ROOM.1, Role::Host, None);
+        t.handle_timeout(Instant::ZERO + HELLO_FIRST, &mut ep);
+        let sent: Vec<Vec<u8>> = std::iter::from_fn(|| t.poll_signal())
+            .filter_map(|s| match s {
+                Signal::Publish(p, b) if p == topic => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent.len(), 2);
+        for (b, ts) in sent.iter().zip([unix_ms, unix_ms + 2000]) {
+            assert_eq!(open_room(&enc, b), Some(hello(&key, &me, Role::Host, ts)));
+            assert_eq!(open_room(&room_enc_key(ROOM.0, "other"), b), None);
+            let clear = String::from_utf8_lossy(b);
+            assert!(!b.windows(32).any(|w| w == me.as_bytes()) && !clear.contains(&hex(me.as_bytes())));
+            assert!(!clear.contains("hello"));
+        }
+        assert_ne!(sent[0][..NONCE_LEN], sent[1][..NONCE_LEN], "a fresh nonce each");
+
+        // The longest hello that parses fits the length bound; one byte more is refused unread.
+        let longest = hello(&key, &me, Role::Client, 9_999_999_999_999_999_999);
+        assert_eq!(longest.len(), HELLO_MAX_LEN);
+        assert!(open_room(&enc, &seal_room(&enc, [5; NONCE_LEN], &longest)).is_some_and(|b| parse_hello(&b).is_some()));
+        assert_eq!(open_room(&enc, &seal_room(&enc, [5; NONCE_LEN], &[0; HELLO_MAX_LEN + 1])), None);
+
+        let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        let now = Instant::from_millis(10);
+        let m = id(5).peer_id();
+        let plain = hello(&key, &m, Role::Peer, 0);
+        let good = room_hello(&key, &m, Role::Peer, 0);
+        let mut drops = vec![
+            plain.clone(),
+            seal_room(&room_enc_key(ROOM.0, "other"), [5; NONCE_LEN], &plain),
+            seal_room(&topic.0, [5; NONCE_LEN], &plain),
+            seal_room(&key, [5; NONCE_LEN], &plain),
+            [&good[..], &[0]].concat(),
+        ];
+        for i in 0..good.len() {
+            let mut b = good.clone();
+            b[i] ^= 1;
+            drops.push(b);
+            drops.push(good[..i].to_vec());
+        }
+        for b in &drops {
+            t.handle_signal(now, &mut ep, topic, b);
+        }
+        assert_eq!((published(&mut t), dials(&mut ep, now), t.room_role(&m)), (0, vec![], None));
+        // The same hello, sealed: answered.
+        t.handle_signal(now, &mut ep, topic, &good);
+        assert_eq!(published(&mut t), 1);
+    }
+
     #[test]
     fn offer_round_trips_and_rejects_garbage() {
         let o: Offer<SocketAddr> = Offer {
@@ -1476,6 +1619,11 @@ mod tests {
         (t, Endpoint::new(&ia, Config::default(), [1; 32]))
     }
 
+    /// A hello from `from` with a proof under `key`, sealed for `ROOM` as a member seals it.
+    fn room_hello(key: &[u8; 32], from: &PeerId, role: Role, ts: u64) -> Vec<u8> {
+        seal_room(&room_enc_key(ROOM.0, ROOM.1), [5; NONCE_LEN], &hello(key, from, role, ts))
+    }
+
     fn published(t: &mut Traversal<SocketAddr>) -> usize {
         std::iter::from_fn(|| t.poll_signal()).filter(|s| matches!(s, Signal::Publish(..))).count()
     }
@@ -1502,7 +1650,8 @@ mod tests {
         let ap = attacker.peer_id();
         let old = format!(r#"{{"t":"hello","from":"{}","meta":{{"nb":1,"role":"host"}}}}"#, hex(ap.as_bytes()));
         t.handle_signal(now, &mut ep, topic, old.as_bytes());
-        t.handle_signal(now, &mut ep, topic, &hello(&topic.0, &ap, Role::Host, 0));
+        t.handle_signal(now, &mut ep, topic, &seal_room(&room_enc_key(ROOM.0, ROOM.1), [5; NONCE_LEN], old.as_bytes()));
+        t.handle_signal(now, &mut ep, topic, &room_hello(&topic.0, &ap, Role::Host, 0));
         assert_eq!((dials(&mut ep, now), published(&mut t)), (vec![], 0));
         assert_eq!((t.room_role(&ap), t.admits(&ap)), (None, false));
         // A member's offer: dialled, answered, and its role is known.
@@ -1511,7 +1660,7 @@ mod tests {
         assert_eq!((dials(&mut ep, now), published(&mut t)), (vec![there], 1));
         assert_eq!((t.room_role(&host.peer_id()), t.admits(&host.peer_id())), (Some(Role::Host), true));
         // A member's hello in a role this client doesn't link with: no offer.
-        t.handle_signal(now, &mut ep, topic, &hello(&key, &id(3).peer_id(), Role::Client, 0));
+        t.handle_signal(now, &mut ep, topic, &room_hello(&key, &id(3).peer_id(), Role::Client, 0));
         assert_eq!(published(&mut t), 0);
         // Leaving the room forgets who proved what; outside a room, links are anyone's call.
         t.leave_room();
@@ -1520,9 +1669,9 @@ mod tests {
         // With an expected host, other members are ignored.
         let (mut t, mut ep) = in_room(Role::Client, Some(id(3).peer_id()), local);
         t.handle_signal(now, &mut ep, inbox, &offer_from(&host, &me, Some(&key), 4, Role::Host, vec![there]));
-        t.handle_signal(now, &mut ep, topic, &hello(&key, &host.peer_id(), Role::Host, 0));
+        t.handle_signal(now, &mut ep, topic, &room_hello(&key, &host.peer_id(), Role::Host, 0));
         assert_eq!((dials(&mut ep, now), published(&mut t)), (vec![], 0));
-        t.handle_signal(now, &mut ep, topic, &hello(&key, &id(3).peer_id(), Role::Host, 0));
+        t.handle_signal(now, &mut ep, topic, &room_hello(&key, &id(3).peer_id(), Role::Host, 0));
         assert_eq!(published(&mut t), 1);
         assert!(t.admits(&id(3).peer_id()) && !t.admits(&host.peer_id()));
     }
@@ -1594,12 +1743,12 @@ mod tests {
         let member = |n: u8| id(n.wrapping_add(10)).peer_id();
         // 200 forged hellos: nothing sent, no token spent.
         for n in 0..200u8 {
-            t.handle_signal(t0, &mut ep, topic, &hello(&topic.0, &member(n), Role::Peer, 0));
+            t.handle_signal(t0, &mut ep, topic, &room_hello(&topic.0, &member(n), Role::Peer, 0));
         }
         assert_eq!(published(&mut t), 0);
         // Real hellos from 100 members: a burst of answers, then none.
         for n in 0..100u8 {
-            t.handle_signal(t0, &mut ep, topic, &hello(&key, &member(n), Role::Peer, 0));
+            t.handle_signal(t0, &mut ep, topic, &room_hello(&key, &member(n), Role::Peer, 0));
         }
         assert_eq!(published(&mut t), BURST as usize);
         // Offers have their own budget: still acted on (each answered).
@@ -1625,7 +1774,7 @@ mod tests {
         // And the hello budget at one per REFILL.
         let later = t0 + REFILL * 3;
         for n in 100..150u8 {
-            t.handle_signal(later, &mut ep, topic, &hello(&key, &member(n), Role::Peer, 0));
+            t.handle_signal(later, &mut ep, topic, &room_hello(&key, &member(n), Role::Peer, 0));
         }
         assert_eq!(published(&mut t), 3);
     }
@@ -2166,10 +2315,10 @@ mod tests {
         let (key, topic) = (room_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1));
         let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
         let late = Instant::ZERO + Duration::from_millis(FRESH_MS + 1);
-        t.handle_signal(late, &mut ep, topic, &hello(&key, &id(5).peer_id(), Role::Peer, 0));
+        t.handle_signal(late, &mut ep, topic, &room_hello(&key, &id(5).peer_id(), Role::Peer, 0));
         assert_eq!(published(&mut t), 0);
         let ts = FRESH_MS + 1;
-        t.handle_signal(late, &mut ep, topic, &hello(&key, &id(5).peer_id(), Role::Peer, ts));
+        t.handle_signal(late, &mut ep, topic, &room_hello(&key, &id(5).peer_id(), Role::Peer, ts));
         assert_eq!(published(&mut t), 1);
     }
 
@@ -2724,15 +2873,23 @@ mod tests {
                     let ts =
                         ((now - Instant::ZERO).as_millis() as u64 + rng.below(120_000) as u64).saturating_sub(60_000);
                     hellos += 1;
-                    (room, hello(&key, &from.peer_id(), *rng.pick(&roles), ts))
+                    (room, room_hello(&key, &from.peer_id(), *rng.pick(&roles), ts))
                 }
                 1 => {
                     let n = rng.below(300);
                     let mut b = rng.bytes(n);
-                    if rng.one_in(2) {
+                    let topic = *rng.pick(&[room, inbox]);
+                    if rng.one_in(2) && topic == room {
+                        // Junk or a mutated hello that opens: parse_hello sees it.
+                        if rng.one_in(2) {
+                            b = hello(&key, &from.peer_id(), Role::Peer, (now - Instant::ZERO).as_millis() as u64);
+                            mutate(&mut rng, &mut b, 300);
+                        }
+                        b = seal_room(&room_enc_key(ROOM.0, ROOM.1), rng.bytes(NONCE_LEN).try_into().unwrap(), &b);
+                    } else if rng.one_in(2) {
                         b = sealed::seal(from, &me, rng.bytes(32).try_into().unwrap(), &b).unwrap();
                     }
-                    (*rng.pick(&[room, inbox]), b)
+                    (topic, b)
                 }
                 _ => {
                     let kinds = [Proof::None, Proof::Room, Proof::Invite];
