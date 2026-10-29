@@ -257,13 +257,15 @@ await doc.forget();                                // deletes this device's copy
   - A copy is about the size of the doc's JSON: 510 KB for the whiteboard above (`test/doc_catchup.mjs`), and
     12.1 MiB at most for a full doc of 3-byte characters (`test/doc_crdt.mjs`).
   - Storage that refuses (some private modes, a full disk) gives `'blocked'` or a failed save: one warning, and the
-    doc goes on in memory; a failed save is tried again with the next change. A store that hasn't loaded the copy
-    5 s after opening is `'blocked'` too: the doc asks and answers without it, and drops it if it comes later.
-    `'blocked'` leaves the copy as it is: that opening never writes it, as it may hold what it couldn't read
-    (`forget()` still deletes it). A copy that can't be read (too big, doesn't open, isn't JSON, isn't a doc)
-    counts as none, with a warning saying why, and the next save replaces it; one that reads is checked as member
-    data. A copy saved by another version of this package (a newer one) is left as it is: `'blocked'`, and the doc
-    keeps none until a version that reads it opens it.
+    doc goes on in memory. A failed save is tried again with the next change, a second after the failure, then 2,
+    4 … up to 64 s apart while the store keeps failing (each try builds the whole doc), until one succeeds; hiding
+    the page, `doc.close()` and `room.leave()` still save at once. A store that hasn't loaded the copy 5 s after
+    opening is `'blocked'` too: the doc asks and answers without it, and drops it if it comes later. `'blocked'`
+    leaves the copy as it is: that opening never writes it, as it may hold what it couldn't read (`forget()` still
+    deletes it). A copy that can't be read (too big, doesn't open, isn't JSON, isn't a doc) counts as none, with a
+    warning saying why, and the next save replaces it; one that reads is checked as member data. A copy saved by
+    another version of this package (a newer one) is left as it is: `'blocked'`, and the doc keeps none until a
+    version that reads it opens it.
   - Two tabs of one browser in one room keep one copy of each doc, whichever saved last. Each catches up from the
     other while both are open, but a copy can miss the other tab's latest writes until they reach a member.
   - **What a copy keeps secret, and from whom:**
@@ -509,7 +511,12 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    share and moves at about their rates together, up to its own 6 batches a second,
    while they keep pace; a relay slowed by its refusals gives its turns to the others. A batch is lost when its relay drops it or the peer doesn't hear that relay,
    like a datagram on any path, and the core sends what it carried again: taking turns
-   keeps that to one batch in three when one of three relays drops them all. The last
+   keeps that to one batch in three when one of three relays drops them all. A relay
+   that has answered nothing for 5 s since we sent it an event (relays answer each one
+   with an OK within a round trip) is silent: a half-open socket, still open but dead,
+   would otherwise take its turns and lose them until it closes. It is skipped too, while
+   any relay that answers is left, and still sent every other signal; its next answer
+   gives it its turns back. The last
    batches a room sends as it leaves go through every relay, as nothing could send them
    again. A relay that bans us (`blocked:`, `banned`) gets nothing for 30 s, doubling up
    to 10 min; the ban starts over at 30 s once the relay has gone 10 min without one.
@@ -614,7 +621,18 @@ Run these with Node and the Playwright install on this host:
   backlog is skipped, and with none left the one free soonest takes it. One refused for
   its rate goes again through the next relay. Sent as `wait()` allows, pipe batches move
   at three relays' rates, other events at one's, and with relays of different rates each
-  takes about an equal share. No relays.
+  takes about an equal share. A relay that never answers loses its turns about 5 s after
+  the first event it left unanswered, and one that answers 4 s late keeps them; a silent
+  one is still sent every other event, `wait()` isn't its, and its next OK, taken or
+  refused, gives its turns back. With only silent relays they take turns; one that answers
+  but holds us is waited for rather than a silent one sent to; at `close()` a batch goes
+  through one that answers (one not slowed behind its backlog first), then a silent one,
+  and a held one last. No relays.
+- `node packages/js/test/rust_hello.mjs`: a Rust or Godot member's room hello, sealed with
+  the nonce fixed, is the same base64 that `sealRoom` makes (the vector Rust asserts too),
+  and opens to Rust's exact JSON. A `Room` that hears it through `NostrSignaling` doesn't
+  dial, pipe or answer that peer (`meta.nb`, or `meta.pw`); the same hello unmarked is
+  answered and dialled. No relays.
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's; a room that signs
@@ -704,12 +722,14 @@ Run these with Node and the Playwright install on this host:
     one opened again at once gets them; one save a second while a small doc changes, none for a frame that
     changes nothing; one save at a time (10 s of writes behind a held save call it once, then save once; the page
     hidden or the doc closed meanwhile saves as it ends); a full doc changed every 100 ms saves every 48 s, its
-    12.1 MiB at 256 KiB/s; `forget()`; a reload that draws an incarnation in the copy draws again, and one on a copy
-    rolled back uses no write twice; a copy of another version is left as it is; copies that are off in 11 ways
-    are dropped whole, 5000 mutated ones never throw; a store that fails warns once, and that opening never writes
-    the copy (nor does one closed during a load that fails), while a failed save is tried again with the next
-    change; a store that never loads: at 5 s the doc asks and answers, saves nothing, closes without waiting, and
-    drops a copy that comes later; full docs' copies take at most 36 frames of the 64 a copy may hold.
+    12.1 MiB at 256 KiB/s, and with a store whose saves fail, tries them 1, 2, 4 … 64 s apart, then every 64 s,
+    until one succeeds and starts the pace again (the page hidden or the doc closed meanwhile saves at once);
+    `forget()`; a reload that draws an incarnation in the copy draws again, and one on a copy rolled back uses no
+    write twice; a copy of another version is left as it is; copies that are off in 11 ways are dropped whole, 5000
+    mutated ones never throw; a store that fails warns once, and that opening never writes the copy (nor does one
+    closed during a load that fails), while a failed save is tried again with the next change; a store that never
+    loads: at 5 s the doc asks and answers, saves nothing, closes without waiting, and drops a copy that comes
+    later; full docs' copies take at most 36 frames of the 64 a copy may hold.
 - `node packages/js/test/room_doc.mjs`: `room.doc()` with three members in a real `'local'` room: they converge, a
   doc opened late and a fourth member catch up, doc frames never show as messages, writes outlive their writer,
   and leaving closes docs. A whiteboard-sized doc reaches a late joiner deflated (2.5 times less), members that
@@ -726,11 +746,13 @@ Run these with Node and the Playwright install on this host:
   direct link, the signalling pipe through fake rate-limited relays, from a background tab, both at once, from a
   member that kept the board on its device and comes back after nobody was online, and with two holders, one
   direct and one over the pipe (one whole answer, from the direct one); then over the pipe through relays that
-  take 3 events a second, then 2, which refuse part of every join's burst, and with the joiner deaf to one of the
-  three relays, which loses the batches sent through it. It prints the time to the whole board, the frames,
+  take 3 events a second, then 2, which refuse part of every join's burst, with the joiner deaf to one of the
+  three relays, which loses the batches sent through it, and with one relay going half-open as the joiner links
+  (it takes events but answers and delivers nothing). It prints the time to the whole board, the frames,
   datagrams, retransmits, pipe batches and relay events, and checks the bars: 15 s (30 s from a background tab
-  over the pipe, 60 s with the joiner deaf to a relay), first strokes within 3 s (5 s from a background tab over
-  the pipe), and nothing while nobody is online.
+  over the pipe or with a relay half-open, 60 s with the joiner deaf to a relay), first strokes within 3 s (5 s
+  from a background tab over the pipe, 6 s with a relay half-open), no batch put on the half-open relay over 5 s
+  after it stopped answering, and nothing while nobody is online.
 - `node packages/js/test/pipe_batches.mjs`: a pipe's batches on a fake clock: datagrams queued together go 40
   ms later as one, a batch's worth at once, 6 a second after a burst of 12, and with timers held to once a second
   (a background tab), the batches a late timer finds go together, and what a task queued goes at its end, until

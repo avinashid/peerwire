@@ -47,9 +47,13 @@ export const DEFAULT_RELAYS = ['wss://nos.lol', 'wss://relay.primal.net', 'wss:/
 // with a share and moves at about their rates together while they keep pace, and a relay
 // that answers OK but delivers nothing loses no more than its share. A relay that holds us
 // for its rate, has banned us or isn't open is skipped, and so is one slowed behind what
-// waits for it (see next()); with none left, the open, unbanned one free soonest takes it.
-// One refused for its rate goes again through the next relay, seldom the one that refused,
-// now held; one on a relay that closes or bans us is lost.
+// waits for it (see next()), and one silent: it has answered nothing since an event sent to
+// it SILENT_MS ago (a half-open socket, still OPEN but dead, would take its turns and lose
+// them until it closes). With none left, the open, unbanned one free soonest takes it, silent
+// ones last; with only silent ones, they take turns the same way. A silent relay is still
+// sent every other event, and its next OK, taken or refused, gives it its turns back. One
+// refused for its rate goes again through the next relay, seldom the one that refused, now
+// held; one on a relay that closes or bans us is lost.
 export const RELAY_RATE = 4;
 export const RELAY_BURST_S = 2;
 export const MIN_RELAY_RATE = 0.5;
@@ -61,6 +65,8 @@ export const RELAY_QUEUE = 64;
 export const RELAY_QUEUE_MS = 10000;
 export const BACKOFF_MS = 30000;
 export const MAX_BACKOFF_MS = 600000;
+// NIP-01 relays answer each event with an OK within a round trip.
+export const SILENT_MS = 5000;
 // What a refusal's message asks: 'rate' (slow down), 'ban' (stop), or neither (null).
 const refusal = (why) => (/^rate-limited/i.test(why) ? 'rate' : /^blocked|banned/i.test(why) ? 'ban' : /rate.?limit/i.test(why) ? 'rate' : null);
 // A relay socket that closes (the phone switched networks or turned on its hotspot,
@@ -228,22 +234,35 @@ export class NostrSignaling {
     }
   }
 
-  // The socket the next lossy event goes to, from `turn` on: the first open one that has
-  // neither banned us nor holds us for its rate, and could take it within HOLD_MS (one slowed
-  // by its own refusals, behind what else waits there, is passed over like a held one), else
-  // the open, unbanned one free soonest; -1 if none. Once closed, what waits goes at once but
-  // not to a held relay, so any relay not holding us will do.
+  // The socket the next lossy event goes to, from `turn` on, of the open ones that haven't
+  // banned us: the first that neither holds us for its rate nor is silent (see silent()) and
+  // could take it within HOLD_MS (one slowed by its own refusals, behind what else waits there,
+  // is passed over like a held one), else the one of those free soonest; with only silent ones
+  // left, the same of them; -1 if none. Once closed, what waits goes at once, but a held relay
+  // is sent nothing: it comes last.
   next(now) {
-    let held = -1, soonest = Infinity;
+    let best = -1, rank = Infinity, soonest = Infinity;
     for (let i = 0; i < this.sockets.length; i++) {
       const k = (this.turn + i) % this.sockets.length;
-      const url = this.sockets[k].relayUrl;
-      if (this.sockets[k].readyState !== WebSocket.OPEN || this.banned.get(url)?.until > now) continue;
-      const f = this.free(this.sockets[k], now);
-      if (!(this.paused.get(url)?.until > now) && (this.closed || f <= HOLD_MS)) return k;
-      if (f < soonest) (held = k), (soonest = f);
+      const ws = this.sockets[k];
+      if (ws.readyState !== WebSocket.OPEN || this.banned.get(ws.relayUrl)?.until > now) continue;
+      const f = this.free(ws, now);
+      const held = this.paused.get(ws.relayUrl)?.until > now;
+      const ready = !held && f <= HOLD_MS;
+      const r = (this.closed && held ? 4 : 0) + (this.silent(ws, now) ? 2 : 0) + (ready ? 0 : 1);
+      if (r === 0) return k;
+      // The first ready one in turn, else the one free soonest.
+      if (r < rank || (r === rank && !ready && f < soonest)) (best = k), (rank = r), (soonest = f);
     }
-    return held;
+    return best;
+  }
+
+  // Whether `ws`'s relay has answered nothing, taken or refused, since an event sent to it
+  // SILENT_MS or more ago: its socket may be half-open, or the relay stalled. Its next OK ends
+  // it. The mark is the time of the first event sent since its last OK, kept beside `inflight`,
+  // so one pushed out of `inflight` unanswered (past RELAY_QUEUE) doesn't end it.
+  silent(ws, now) {
+    return now - (ws.asked ?? now) >= SILENT_MS;
   }
 
   // Queues `e` on the relay whose turn it is (see next()), and sends it if its rate allows.
@@ -295,6 +314,7 @@ export class NostrSignaling {
       // Kept until the relay answers OK, to send it again if refused for the rate.
       inflight.set(e.id, e);
       if (inflight.size > RELAY_QUEUE) inflight.delete(inflight.keys().next().value);
+      ws.asked ??= now;
       ws.send(e.msg);
     }
     if (q.length) this.pumpIn(ws, ((1 - r.tokens) * 1000) / r.rate);
@@ -341,7 +361,7 @@ export class NostrSignaling {
   // can now, or no relay is open); with every open relay banned, until the first ban ends.
   // The pipe waits this long before its next batch, so its batches fill rather than queue
   // here; with the relays taking turns, it moves at about their rates together while they
-  // keep pace, and one slowed behind its backlog gives up its turns (see next()).
+  // keep pace, and one slowed behind its backlog or silent gives up its turns (see next()).
   wait() {
     const now = clock();
     const k = this.next(now);
@@ -394,6 +414,7 @@ export class NostrSignaling {
     const ws = this.sockets.find((s) => s.relayUrl === url);
     const e = ws?.inflight?.get(id);
     ws?.inflight?.delete(id);
+    if (ws) ws.asked = null; // it answers (see silent())
     const now = clock();
     const p = this.paused.get(url);
     if (ok === true) {

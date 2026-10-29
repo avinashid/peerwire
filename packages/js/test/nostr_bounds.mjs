@@ -3,7 +3,7 @@
 // and base64 must handle bodies far larger than a signalling message. No relays:
 // events are fed straight into onRelay.
 import { loadPeerwire } from '../src/peerwire.js';
-import { BACKOFF_MS, MAX_BACKOFF_MS, RECONNECT_MS, NostrSignaling, MAX_SEEN, b64, unb64, RELAY_RATE, RELAY_BURST_S, RELAY_RAISE_MS, MIN_RELAY_RATE, HOLD_MS, RELAY_TRIES, RELAY_QUEUE, RELAY_QUEUE_MS } from '../src/nostr.js';
+import { BACKOFF_MS, MAX_BACKOFF_MS, RECONNECT_MS, NostrSignaling, MAX_SEEN, b64, unb64, RELAY_RATE, RELAY_BURST_S, RELAY_RAISE_MS, MIN_RELAY_RATE, HOLD_MS, RELAY_TRIES, RELAY_QUEUE, RELAY_QUEUE_MS, SILENT_MS } from '../src/nostr.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
 const pw = await loadPeerwire(wasm);
@@ -350,10 +350,11 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   await lossy();
   check(counts() === none && names.every((x) => !sock[x].q.length) && s.wait() === 700, `with every relay banned, none goes and wait() is until the first ban ends (${s.wait()} ms)`);
 
-  // Pacing: send whenever wait() says one can go, for 10 s from empty buckets. Lossy events take every relay's
-  // rate, about 3 * RELAY_RATE a second, in turns; others, one relay's. With a and b slowed to MIN_RELAY_RATE
-  // (growing back) and c not (one that never refuses), each still takes about a third: c only the odd turn a slowed
-  // one passes.
+  // Pacing: send whenever wait() says one can go, for 10 s from empty buckets, the relays answering OK at once.
+  // Lossy events take every relay's rate, about 3 * RELAY_RATE a second, in turns; others, one relay's. With a and b
+  // slowed to MIN_RELAY_RATE (growing back) and c not (one that never refuses), each still takes about a third: c
+  // only the odd turn a slowed one passes.
+  const answer = () => names.forEach((x) => [...(sock[x].inflight?.keys() ?? [])].forEach((id) => ok(x, id, true)));
   const pace = async (isLossy, slow = []) => {
     reset();
     for (const x of names) tokens(x, 0);
@@ -361,6 +362,7 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
     const from = names.map((x) => sent[x].length);
     let m = 0;
     for (const end = clock + 10000; clock < end;) {
+      answer();
       const ms = s.wait();
       if (ms > 0) clock += Math.ceil(ms);
       else (await s.publish(s.roomTag, `p${++n}`, isLossy), m++);
@@ -408,6 +410,118 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   const once = sent.a.filter((id) => id === each).length === 1;
   check(late && through(late) === 'a' && once && [sent.b.length, sent.c.length].join() === heldAt,
     `close() sends a lossy event waiting on a held relay through a free one (${through(late)}), no other event twice, and the held ones nothing`);
+  delete performance.now;
+}
+
+// 5d. NB-006j: a relay that has answered nothing, taken or refused, since an event sent to it SILENT_MS ago is silent
+//     (a half-open socket, still OPEN but dead, would take its turns and lose them until it closes). It is passed over
+//     for lossy events and wait() isn't its, but it is still sent every other event; its events leaving `inflight`
+//     unanswered leave it silent, and its next OK, taken or refused, gives it its turns back. One that answers each
+//     event 4 s late keeps its turns. With only silent ones left, they take turns. A relay that answers but holds us
+//     is waited for rather than a silent one sent to; once closed, a lossy event goes through one that answers and
+//     isn't slowed behind its backlog, then one slowed, then a silent one, and a held one last.
+{
+  let clock = 1e6;
+  performance.now = () => clock;
+  const s = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/silent', relays: [] });
+  await s.ready;
+  const names = ['a', 'b', 'c'];
+  const sent = { a: [], b: [], c: [] };
+  const sentAt = new Map(); // event id -> when b was sent it
+  const order = []; // [when, relay] of each event sent
+  const sock = {};
+  for (const name of names) {
+    const send = (m) => {
+      const id = JSON.parse(m)[1].id;
+      sent[name].push(id);
+      order.push([clock, name]);
+      if (name === 'b') sentAt.set(id, clock);
+    };
+    s.sockets.push((sock[name] = { relayUrl: name, readyState: WebSocket.OPEN, send, close() {} }));
+  }
+  let n = 0;
+  const lossy = () => s.publish(s.roomTag, `s${++n}`, true);
+  const ok = (url, id, taken = true, why = '') => s.onRelay(url, JSON.stringify(['OK', id, taken, why]));
+  const inflight = (x) => [...(sock[x].inflight?.keys() ?? [])];
+  const turns = (x, from = 0) => order.filter(([t, y]) => y === x && t >= from).map(([t]) => t);
+  const since = (k) => order.slice(k).map(([, x]) => x).join('');
+  const LATE_MS = 4000;
+
+  // A pipe sends a lossy event every 250 ms for 12 s: a answers each at once, b LATE_MS after it was sent, c never.
+  // c's turns come every 750 ms: its last is 4.25 to 5 s after its first unanswered one (about 5 s; not SILENT_MS,
+  // so that the constant itself is checked).
+  const start = clock;
+  s.turn = 0;
+  for (; clock < start + 12000; clock += 250) {
+    inflight('a').forEach((id) => ok('a', id));
+    inflight('b').filter((id) => clock - sentAt.get(id) >= LATE_MS).forEach((id) => ok('b', id));
+    await lossy();
+  }
+  const c = turns('c');
+  const after = c[0] + SILENT_MS;
+  const [toA, toB] = [turns('a', after).length, turns('b', after).length];
+  check(c.at(-1) - c[0] < 5000 && c.at(-1) - c[0] >= 4250 && !turns('c', after).length && Math.abs(toA - toB) <= 1 && toA > 10 && s.silent(sock.c, clock) && !s.silent(sock.b, clock),
+    `a relay that never answers takes its turns for ${c.at(-1) - c[0]} ms after its first, then none; a and b, which answers ${LATE_MS} ms late, take ${toA} and ${toB}`);
+
+  // c's turn and its bucket full, a and b able to take one in 1000 / RELAY_RATE ms: the pipe waits for a, not c.
+  s.turn = 2;
+  s.rate('a', clock).tokens = 0;
+  s.rate('b', clock).tokens = 0;
+  const w = s.wait();
+  await lossy();
+  check(s.free(sock.c, clock) === 0 && w === 1000 / RELAY_RATE && sock.a.q.at(-1)?.lossy && !sock.c.q?.length,
+    `wait() isn't a silent relay's (${w} ms, not ${s.free(sock.c, clock)}), and the event waits for the next in turn`);
+  const toC = sent.c.length;
+  await s.publish(s.roomTag, `e${++n}`);
+  check(sent.c.length === toC + 1, 'a silent relay is still sent every other event');
+  sock.c.inflight.clear(); // as when each is pushed out past RELAY_QUEUE, unanswered
+  check(s.silent(sock.c, clock), 'its events leaving `inflight` unanswered leave it silent');
+  ok('c', sent.c.at(-1), false, 'invalid: refused');
+  s.turn = 2;
+  let k = order.length;
+  await lossy();
+  check(!s.silent(sock.c, clock) && since(k) === 'c', `its next OK, here a refusal, gives it its turns back (${since(k)})`);
+
+  // Every relay silent: they take turns, also a, which can't send yet (its event waits on its queue) while c could.
+  names.forEach((x) => (s.rates.delete(x), (sock[x].q = [])));
+  await s.publish(s.roomTag, `e${++n}`);
+  clock += SILENT_MS;
+  s.rate('a', clock).tokens = 0;
+  s.turn = 0;
+  k = order.length;
+  for (let i = 0; i < 3; i++) await lossy();
+  check(names.every((x) => s.silent(sock[x], clock)) && sock.a.q.length === 1 && since(k) === 'bc', `with only silent relays, they take turns (a waits with ${sock.a.q.length}, then ${since(k)})`);
+
+  // a and b answer but hold us for their rate, c is silent: the event waits for the hold that ends first, not on c.
+  for (const x of ['a', 'b']) inflight(x).forEach((id) => ok(x, id));
+  names.forEach((x) => (s.rates.delete(x), (sock[x].q = [])));
+  s.paused.set('a', { at: clock, until: clock + 300, ms: 300, took: false });
+  s.paused.set('b', { at: clock, until: clock + 500, ms: 500, took: false });
+  s.turn = 2;
+  const held = s.wait();
+  await lossy();
+  const moved = sock.a.q.at(-1);
+  check(held === 300 && moved?.lossy && !sock.c.q.length, `a relay that answers but holds us is waited for rather than a silent one sent to (wait() ${held} ms)`);
+
+  // close(): the lossy event waiting on a, held, goes through b, which answers, though it is c's turn. Then, from a's
+  // turn: b, which answers; a, slowed behind its backlog (it may well refuse more, and nothing is sent again once
+  // closed); c, silent; and a held relay, which is sent nothing once closed, last.
+  s.paused.delete('b');
+  s.turn = 2;
+  k = order.length;
+  s.close();
+  const ladder = [];
+  s.turn = 0;
+  s.paused.delete('a');
+  Object.assign(s.rate('a', clock), { low: MIN_RELAY_RATE, lowAt: clock, rate: MIN_RELAY_RATE, tokens: 0 });
+  sock.a.q = Array.from({ length: 8 }, (_, i) => ({ id: `q${i}`, msg: '', at: clock, seq: 0, tries: 0, sent: 0 }));
+  ladder.push(s.next(clock));
+  s.paused.set('b', { at: clock, until: clock + 500, ms: 500, took: false });
+  ladder.push(s.next(clock));
+  s.paused.set('a', { at: clock, until: clock + 300, ms: 300, took: false });
+  ladder.push(s.next(clock));
+  check(sent.b.includes(moved.id) && !sent.c.includes(moved.id) && ladder.map((i) => names[i]).join('') === 'bac',
+    `once closed, a lossy event goes through a relay that answers (${since(k)}); then, held one by one: ${ladder.map((i) => names[i]).join(', ')}`);
   delete performance.now;
 }
 

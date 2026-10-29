@@ -607,8 +607,9 @@ export class Room {
 
   async onHello(peer, meta) {
     // A custom signalling adapter may pass anything along: only PeerIds are dialled.
-    // `meta.pw` marks a Rust UDP peer, which WebRTC can't dial.
-    if (this.left || !isPeerId(peer) || peer === this.self || meta?.pw) return;
+    // `meta.nb` marks a Rust UDP peer (traversal.rs `hello`), which WebRTC can't dial;
+    // `meta.pw`, which this once checked by mistake, is taken as the same mark.
+    if (this.left || !isPeerId(peer) || peer === this.self || meta?.nb || meta?.pw) return;
     // Knowing the topic isn't enough: only hellos that prove the room key count.
     if (!(await this.proof.checkHello(peer, meta))) return;
     // A member may reach us over signalling once WebRTC fails, whichever side dials.

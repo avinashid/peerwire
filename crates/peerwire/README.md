@@ -70,8 +70,9 @@ cargo run -p peerwire --features nostr --example nostr_relay -- 127.0.0.1:7447  
 - **Rooms:** `join_room(app_id, room)` finds and connects every peer in a room (a full mesh).
   `join_room_as` / `join_room_with` pick a `Role` (`Peer`, `Host` or `Client`) for star
   topologies. Rooms are closed by their name: hellos and offers carry an HMAC under a key
-  derived from it, so a relay that sees the room's topic still can't join. A room whose name
-  can be guessed is a public lobby.
+  derived from it, so a relay that sees the room's topic still can't join, and hellos are
+  sealed under another, so it can't read who is in the room. A room whose name can be guessed
+  is a public lobby.
 - **NAT traversal:** both sides dial at once and punch through their NATs, with port
   prediction for symmetric NATs. Where punching can't work, a peer linked to both relays,
   and `Node::failure` says which side was symmetric. See the `traversal` module.

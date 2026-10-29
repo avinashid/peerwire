@@ -251,7 +251,8 @@ read or changed on the way. Everything Godot does with those bytes is outside th
   can't.
   - **Rooms.** Relays only see a hash of the room name. Hellos and offers carry an HMAC under a key derived from
     the name, so a peer that doesn't know the name can't join the room or pose as its host. Links from such peers
-    are closed unseen.
+    are closed unseen. Hellos are also encrypted under another key from the name, so relays can't read who is in
+    a room.
   - **Give private games a room name with at least 128 random bits**, for example 22 or more random base64
     characters, or 32 hex digits from `Crypto.new().generate_random_bytes(16).hex_encode()`. Relays see the topic, an
     unsalted SHA-256 of the name, so anyone can test guesses against it offline at hash speed. A guessable name

@@ -56,10 +56,8 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `41cc24a` (2026-10-26); the shared-doc rows (DOC-*) as of main
-`f40cffa`, and the rows for docs kept on this device (NB6F-*) as of `1b0fc35`
-(2026-10-28); the Nostr pacing rows (NB6H-*, NB6I-*) as of main `6a60ef0`
-(2026-10-29).**
+**Status as of main `ddf8321` (2026-10-29).** Fixes merged after `@peerwire/js` 0.2.0
+and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
 |---|---|
@@ -80,19 +78,25 @@ that needs a change is tracked as an NB card.
 | NB48b-2 (Low) | **Fixed** by `de9efea` (the busy slot is held per peer), re-checked 2026-10-24 |
 | NB48b-1, NB48b-3 (Low) | **Fixed** by `de9efea` (the answer is stripped) and `695b38b` (Chrome's line model, checked after apply), re-checked 2026-10-24 |
 | NB48b-4, NB48b-7 (Low) | **Fixed** by `4b6c0f7`, `46a5da3` and `4c37bb7` (relay-only dials through a relay stay relayed, also when switched on mid-dial), re-checked 2026-10-24 |
-| NB44c-1, NB44c-2, NB46-1 (Low) | Open, same section |
+| NB44c-1, NB44c-2 (Low) | Open, same section |
+| NB46-1 (Low) | **Fixed** by `851a0e2`, merged `bae16c7` (a peer's `restart` ask heeded only while our ICE is down too; at most 3 restarts per link a minute; offers, answers and their copies to one peer under a budget), reviewed 2026-10-26, same section |
+| NB46-1a (Low), NB46-1b, NB46-1c, NB46-T1 (Info) | **Fixed** by `88bbf37`, merged `ee4cbe6` (an answer the budget refused holds its candidates; a copy of a new offer never gets the last answer; a refused restart is made when the window frees), reviewed 2026-10-26, same section |
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
 | NB48b-5, NB48b-6 (Info) | **Fixed** by `08425b8` (a stale link's close keeps the peer) and `2a00ecb` (CARRY replies bounded), re-checked 2026-10-24 |
 | MIC-1, MIC-3 (Low) | **Fixed** by `d78d046`, `877d02c` and `6303bd8` (Net Lab's global room and punch offers; `public-only` in `@peerwire/js` 0.1.1 and earlier), reviewed 2026-10-24; residual MIC-4 ([below](#bounds-and-residuals-from-reviews-nb-014nb-043)) |
 | MIC-2 (Info) | **Fixed** by `9282d36` (a punch that ended closes what it opened) and `691dec0` (one offer and one answer per punch, which also closes a Low NB48-1 bypass), reviewed 2026-10-24 |
 | MIC-4 (Low) | **Fixed** by `134fed3` (the button rejoins before it re-tests the network), reviewed 2026-10-24 |
-| MIC-5 (Info) | Open, same section |
+| MIC-5 (Info) | **Fixed** by `1385715`, merged `82be3bd` (an SDP with bare `\n` line ends is stripped too), reviewed 2026-10-26, [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | FL1-1 (Info), FL1-2 (Low) | **Fixed** by `4b131ee` (at most one new connection per peer per 2 s from retry offers; only the dialling side acts on a `retry` ask), reviewed 2026-10-24, [WebRTC retries](#webrtc-retries-fast-lane-1--fl1-1-fl1-2) |
 | FL2-1 (Low), FL2-2 (Low) | **Fixed** by `63e5b72` and `ddae245`, merged `8314aa8` (a member relay that stalls data hands the link back to the pipe and is held off; a datagram names the peer whose channel it came on), reviewed 2026-10-24; residuals R1, R2, [Member relays for pipe links](#member-relays-for-pipe-links-fast-lane-2--fl2-1-fl2-2) |
-| FL2F-1 (Info) | Open, same section |
+| FL2F-1 (Info) | **Fixed** by `0dcdff0`, merged `12fda2d` (a link roams from one member relay to another only through a member linked directly), reviewed 2026-10-26, same section |
+| FL3-1 (Info), FL3-2, FL3-3 (Low), FL3-N1, FL3-D1 (Info) | **Fixed** by `475c442`, `8958a23`, `af58aee`, `e995440` and `f4929d9`, merged `3ce181e` (a packet sealed before a punch roams nothing; a slow address is never raced; a relay that stalls data on a link with no slow address is held off and the others raced; race scores saturate; relay docs), reviewed 2026-10-26; NB43-I1 narrowed on native UDP, [Latency races](#latency-races-fast-lane-3--fl3-1fl3-3) |
 | RH-2 (Medium), RH-1, RH-3, RH-4 (Low) | **Fixed** by `78c4ebe` and `8126119`, merged `dec1554`, before `@peerwire/react` 0.1.0 was published (deep `accept` checks required, per-key clocks bounded by wall time, per-member quotas, catch-up by digest), reviewed 2026-10-24, [`@peerwire/react` hooks](#peerwirereact-hooks-nb-049--rh-1rh-6) |
 | RH-5 (Low), catch-up message size (Low), RH-6 (Info), N1 (nit) | **Fixed** by `12974c4`, merged `41cc24a`, in `@peerwire/react` 0.1.1 (a write members' data leaves no room for is dropped with a warning; catch-up messages capped at 512 KiB; versions kept instead of entries; a newer version an asker holds isn't sent), reviewed 2026-10-26, same section |
-| OUT-1 (Low) | Open, `@peerwire/js` 0.2.0 and main, [JS endpoint and rooms](#bounds-and-residuals-from-reviews-nb-014nb-043) |
+| OUT-1, OUT-1a, OUT-1b (Low) | **Fixed** by `324cb8f` and `131f9f5`, merged `8271f1f` (a message over its lane's limit throws whatever the outbox holds; lanes are 0, 1 or 2 only; a presence is checked before it is stored), reviewed 2026-10-26, [JS endpoint and rooms](#bounds-and-residuals-from-reviews-nb-014nb-043) |
+| OUT-1c (Low), OUT-1d (Info) | **Fixed** by `f5c1f45`, merged `f28f027` (a presence JSON can't encode throws `TypeError`), and `d29d200`, merged `7bf37e4` (`usePeerwireRoom` fails the join and leaves when that presence comes mid-join), reviewed 2026-10-26, same section |
+| PBF-1, PBF-2 (Info) | **Fixed** by `344e90e`, merged `fc94833` (at most 16 last pipe batches at close; a test that a closed Nostr transport reads nothing), reviewed 2026-10-26, [Fallback pipes](#bounds-and-residuals-from-reviews-nb-014nb-043) |
+| CHAT-1, CHAT-2 (Low), CHAT-3 (Info) | **Fixed** by `dfa8ea0`, merged `92dfa42` with the chat demo (a guessable room name is flagged; an oversized name or QR code fails visibly; the wording says messages may pass through a member or the relays), reviewed 2026-10-27, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | RX-1 (Low), RX-2 (Info) | **Fixed** by `b0d354b` (the README's React example keeps string messages only, and only the last 100), reviewed 2026-10-24, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | DOC-1 (Medium), DOC-2, DOC-3 (Low) | **Fixed** by `979cdae`, `eaa2a22` and `a4fddfd`, with DOC-2a and DOC-3a by `d6b148c`, merged `c30ab0f`, before `room.doc()` was published (stamps taken however far ahead; no entry on our own writer that we didn't write; a frame costs about one pass over what it names), reviewed 2026-10-27, [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-5) |
 | DOC-2b (Low) | **Fixed** by `8b7946c`, merged `45c7cfd` (a catch-up's deletions passed on one range per range of it, charged to the sender's budget), reviewed 2026-10-27; residuals DOC-2c and I6, same section |
@@ -751,6 +755,34 @@ Fix: honour `restart` only while our own ICE is not `connected` or `completed`, 
 allow at most 3 restarts per minute per link whether or not ICE reconnects. Put the
 answers and resends we publish to one peer under a budget (for example a burst of 6,
 then 1 per 5 s). Found by reading the code; no probe was run.
+**Fixed** by `851a0e2` (merged `bae16c7`), with the review's findings below fixed by
+`88bbf37` (merged `ee4cbe6`); both reviewed 2026-10-26.
+- A `restart` ask is heeded only while our own ICE isn't `connected` or `completed`
+  either. A link makes at most `MAX_RESTARTS` (3) restarts in `RESTART_WINDOW_MS`
+  (60 s), and ICE reconnecting no longer starts the count over.
+- Offers, answers, copies of either and `restart` asks to one peer go through a budget
+  per peer (`WebRtcTransport.publishBurst` 6, then 1 per `publishEveryMs`, 5 s); what
+  it refuses is counted in `throttled`. So one peer can make us publish 6 of these,
+  then 12 a minute, and NB-006h's pacing per relay bounds the total. ICE candidates,
+  pipe batches and the `retry` ask don't count; retry offers have their own floor
+  (FL1-2). An answer the budget refused waits for the dialler's next copy of the offer.
+- **NB46-1a (Low):** a refused answer's candidates still went out, trickled as `ice` or
+  late as `ice-batch`, so the budget didn't bound what a peer made us publish. Repro
+  (scratch, a fake RTCPeerConnection that finds candidates after each answer): 51
+  offers gave 6 answers but 153 `ice` messages, or 51 `ice-batch` in a room. **Fixed**:
+  a refused answer holds its candidates, and the copy that releases it rebuilds the
+  answer from the local description, candidates included. The same 51 offers give 6
+  answers and 18 `ice`, or 6 `ice-batch`.
+- **NB46-1b (Info, older than the fix):** a copy of a new offer got the last offer's
+  answer. **Fixed**: taking a new offer clears the last answer, and only an answer
+  already made is released, since the local description is still the last offer's
+  while the next one is made.
+- **NB46-1c (Info):** a restart refused for a full window was never made. **Fixed**: it
+  is made once the oldest restart leaves the window, if ICE is still down. Accepted: a
+  link whose ICE stays down while the session runs on a pipe or a member relay keeps
+  restarting 3 times a minute until it is dropped, within the budget.
+- **NB46-T1 (Info, test gap):** a mutant whose window never slid passed every check.
+  **Fixed**: `restart_budget.mjs` moves the clock past the window.
 
 **NB46-I1 — Port guesses aim at any IPv4 address (Info).** `checkPrediction` checks
 only the format of `nat.ip`. It doesn't have to be the peer's server-reflexive IP, or
@@ -809,8 +841,9 @@ already bounded, so a peer can keep at most about one connection gathering, made
 once per 2 s, and each new one closes the last. A legitimate retry the floor refuses is
 taken on its resend 3 s later, while the dialler's link waits 8 s (`fallbackMs`).
 `room_retry.mjs` (test 10): 20 offers made 1 connection and 1 answer, and 19 were
-refused. Still open: NB46-1's answer budget for restart offers on an open link, and a
-relay replaying a proven retry offer (SEC-6), which can take the 2 s slot. Test gap
+refused. NB46-1's answer budget, for restart offers on an open link, came with
+`851a0e2` (merged `bae16c7`). Still open: a relay replaying a proven retry offer
+(SEC-6), which can take the 2 s slot. Test gap
 FL-T1 (Info): test 10 starts while the answering side still holds its failed link, so
 it didn't reach the no-link case. Closed by `e451fc4` (merged `147537d`): in test 13,
 2 proven retry offers within the floor to a side with no link made 1 connection and 1
@@ -878,7 +911,8 @@ once, so both ends have a non-probe packet through it and follow each other back
 core test `a_relay_that_stalls_the_data_hands_the_link_back_and_is_held_off` is the
 repro's case: the link goes back to the pipe `RELAY_STALL` after the data went out, the
 data arrives there, and the member isn't taken again until its hold runs out. Native UDP
-links have no slow address, so the rule doesn't apply to them. Residuals:
+links have no slow address, so the rule didn't apply to them; since FL3-3 a link with no
+slow address holds the relay off and races the others. Residuals:
 - **R1 (Info, accepted):** the rule watches reliable and urgent data in flight. A member
   that drops only large unreliable datagrams, or delays everything by just under 5 s,
   keeps the link. The unreliable lane promises no delivery, so the ends can't tell those
@@ -911,7 +945,7 @@ data channels, pipes (the authenticated sender of the sealed signal), adopted ch
 and `LocalTransport`. Relay probes carry their own token (the direct one inverted), so a
 relayed PUNCH_ACK never counts as a direct punch answer. This also closes NB43-I1 in JS.
 A native UDP socket serves every peer, so it still uses `handle_datagram`, and NB43-I1
-stays as recorded there.
+stays there, narrowed by Fast lane 3 (below).
 
 **FL2F-1 — The relay-to-relay roam doesn't need a direct link to the new member
 (Info).** Found in the follow-up re-check. The other moves onto a member relay (a probe's
@@ -922,8 +956,98 @@ then runs over that pipe's shared budget until a newer packet through the other 
 moves it back. A held member is still refused. Repro (scratch core test): with a's link
 to c on its slow address, a packet relayed by c moved a's link from d to c, and later
 back to d. Fix: take that roam only when the packet came over a direct link
-(`if fast_from`), as the probe answer does; with it the core library tests pass. Open,
-suggested with Fast lane 3.
+(`if fast_from`), as the probe answer does; with it the core library tests pass.
+**Fixed** by `0dcdff0` (merged `12fda2d`), reviewed 2026-10-26: the roam from one member
+relay to another needs `fast_from` and a member not held off, as offers, moves and the
+fallback do. In the test `a_relay_linked_on_its_slow_address_is_not_roamed_to` (the
+repro's case), a packet of b's that c relays no longer moves a's link.
+
+### Latency races (Fast lane 3) — FL3-1…FL3-3
+
+A link now races the other paths of its kind and takes one clearly faster (`0a84b7d`,
+merged `4e42d88`; `f956535`, `475c442`, `75b5122` and `706a4f4`, with the fixes below,
+merged `3ce181e`). Reviewed 2026-10-26 by reading the code, with three scratch core
+repros; the fixes were re-checked the same day, and the repros pass unchanged on them.
+- **Roaming groundwork.** A packet holding only probes (PUNCH, PUNCH_ACK) moves no link.
+  A roam needs a packet newer than the newest non-probe one over the link's path, so a
+  late or kept packet doesn't take the link back. Of two ends on relays, the one with
+  the larger PeerId follows, and the smaller doesn't leave a relay it heard the peer on,
+  so they never chase each other. This narrows NB43-I1 on native UDP (FL3-1, below).
+- **What races.** A direct link races the peer's other direct addresses: the candidates
+  it punches anyway, at most `max_candidates` (8). A relayed link races the relays
+  offered with `add_relay` or seen carrying the peer's probes, at most `MAX_RELAYS` (8).
+  A round sends one sealed PUNCH down each and down the link's own path, with a new
+  token each round, at most every `PATH_GAP` (2 s). A race runs `PATH_ROUNDS` (5) rounds
+  when a path turns up or the link changes kind, and once more `PATH_DWELL` (20 s) after
+  a switch. An answer counts only for its round's token and for the path it came back
+  over. No races while relay-only.
+- **Who moves.** A path faster by 15 ms, or by a fifth if that is more, in 3 rounds is
+  taken by the end with the smaller PeerId, at most once per 20 s, with a ping so the
+  other follows. A peer answers a probe through a relay only if it would use that relay
+  too, and a held relay isn't raced. A path that has carried nothing for the keepalive
+  plus 2 s is raced again, and one that answers in a round where the link's own doesn't
+  wins that round (`75b5122`). Before, a native link on a relay that went silent could
+  only time out.
+- **No amplification.** Probes go only down paths the link already has: a candidate the
+  peer gave, or a relay linked to both ends, which forwards under its relay rate. A
+  PUNCH is answered with one PUNCH_ACK of the same size, and only the peer can seal one.
+  So a race sends at most 9 small probes a round, 45 a race.
+- **What a relay can do.** Probes are sealed under the link's session, so a relay can
+  only forward, drop or delay them. A relay that drops probes loses the race.
+- **What members learn.** A member offered as a relay already carries the link's
+  packets. The race adds probe timing, so it learns the pair's round trip through it.
+  `room.route(peer).rttMs`, `pw_path_rtt_us` and Godot's `get_peer_path_rtt_ms` give
+  the app the round trip it could measure with its own messages.
+
+**FL3-1 — A packet held back before a punch could roam the link (Info).** After a punch
+moved a link from a relay to a direct address, its newest-packet mark started empty. On
+native UDP, a relay that had held back one of the peer's relayed packets could send it
+from its own address, and the link roamed there until the peer's next non-probe packet
+over the direct path (a keepalive, within 10 s). This is NB43-I1, narrowed to that window by the
+roaming groundwork. Repro (scratch core test): one held-back packet moved the link to
+the relay's address. **Fixed** by `475c442`: after a punch, the mark is the answer's, so
+nothing the peer sealed before it roams the link. The test
+`a_packet_kept_from_before_an_upgrade_does_not_roam_the_link` is the repro's case, and
+a NAT rebinding still roams.
+
+**FL3-2 — A slow address could be raced and taken (Low, native).** Marking an address
+slow with `set_slow` left it in a running race, and marking the link's own path slow
+didn't end the race. So the slow address was probed and could be taken for being
+faster. Repro (scratch core test): 18 datagrams went to the slow address, and both ends
+ended on it. JS rooms race no direct addresses (theirs are local handles), so only
+native hosts that set a slow address were affected. **Fixed** by `8958a23`: marking an
+address slow takes it out of the race, and marking the link's own path slow ends the
+race (`an_address_marked_slow_during_a_race_is_raced_no_more`: no datagram to it).
+
+**FL3-3 — A relay that drops only data could hold a link with no slow address (Low).**
+`RELAY_STALL` (FL2-1) applied only to links with a slow address to go back to. Native
+UDP links have none, and neither do JS links on a member relay reached without a pipe
+(a fallback dial through a member). A member that forwards probes, pings and acks but
+drops data wins the race and keeps the link. Repro (scratch core test): 0 of 3000
+messages arrived, and the link was dropped as timed out at 129.5 s. **Fixed** by
+`af58aee`: on a relayed link with no slow address, data unacknowledged there for
+`RELAY_STALL` (5 s) holds that relay off (`RELAY_HOLD`, 60 s, doubling with each repeat
+up to 16 minutes) and races the others at once. Either end takes a winner off a held
+relay, past the dwell, and resends its data on the new path. In
+`a_relay_that_drops_data_is_left_for_one_that_carries_it` (the repro's case), either
+end leaves the relay in 11.1 s, all 3000 messages arrive, and the link stays up.
+`7e1160d` races a path taken for being faster once more after the dwell, so a move won
+on lost probes goes back.
+
+**FL3-N1 (Info):** a race's score and the round-trip smoothing were plain integers, so
+the huge round trip a host clock jump gives could wrap them (release) or panic (debug,
+an abort across the C ABI). **Fixed** by `e995440`: both saturate
+(`huge_rtts_saturate_in_a_race_and_in_smoothing`).
+
+**FL3-D1 (Info, docs):** `add_relay`, `pw_add_relay` and the FFI README still described
+a relay used only from the slow address. **Fixed** by `f4929d9`.
+
+Residuals:
+- **FL3-I1 (Info, accepted):** the race measures probes, which are small and look alike.
+  A relay that forwards them at once but delays data by just under `RELAY_STALL` wins
+  the race and keeps the link, as R1 for links with a slow address. Each message waits
+  at most about 5 s; any longer and the relay is held off.
+- **FL3-I2 (Info, accepted):** holds are per link and at most 8, as R2.
 
 ### Shared docs, `room.doc()` (NB-006) — DOC-1…DOC-5
 
@@ -1536,7 +1660,8 @@ changed the messages:
   64 KiB value under a 256-character key) under about 200 KiB. A probe with worst-case
   `€` keys and values, measured as the room frames it, found 394,963 bytes at most,
   against the 1,048,576 limit. The split on `RangeError` stays as a fallback. OUT-1
-  itself is still open in `room.js`.
+  itself is fixed in `room.js` by `324cb8f` (merged `8271f1f`), so `setLive`'s move to
+  the reliable lane gets the throw too.
 - **RH-6 (Info): catch-up records kept replaced values alive.** For each member the store
   kept the entries it last sent it (`sentShared`, `sentLive`). When a key was written
   again, the old value stayed in memory while that member stayed: at most one old value
@@ -1602,7 +1727,7 @@ and what it accepted. Values are from main `7b716a2`.
 - **Sends.** `sendRetry` keeps at most one message above the 16 KiB scratch buffer
   between tries. The room's outbox has no cap. It holds only what the local
   application sends, so that is application policy.
-  - **OUT-1 (Low, open; `@peerwire/js` 0.2.0 and main):** `room.send()` throws
+  - **OUT-1 (Low; `@peerwire/js` 0.2.0 and earlier):** `room.send()` throws
     `RangeError` for a message too large for its lane only when that peer's outbox is
     empty. When it holds frames (more than the 4 MiB send buffer unacknowledged to that
     peer: a slow or relayed link, or a burst), `write()` queues the frame unchecked and
@@ -1614,7 +1739,28 @@ and what it accepted. Values are from main `7b716a2`.
     outbox, and with 9 frames queued it didn't throw and never arrived. Fix: in
     `write()`, check the frame against the lane's limit before queueing and throw the
     same `RangeError`; for a broadcast, check once before writing to any member, so a
-    throw doesn't leave the message sent to some members only.
+    throw doesn't leave the message sent to some members only. **Fixed** by `324cb8f`
+    (merged `8271f1f`), reviewed 2026-10-26: `write()` checks the frame against
+    `MAX_FRAME` (reliable 1 MiB, unreliable 1100 B, urgent 64 KiB, the core's own
+    limits) before it queues, so the throw comes whatever the outbox holds. A broadcast
+    throws at its first member, before writing to any.
+  - **OUT-1a (Low):** a numeric lane other than 0, 1 or 2 skipped that check (the core
+    sends it unreliable), so it still dropped silently. **Fixed** by `131f9f5` (merged
+    `8271f1f`): any other lane throws `TypeError`.
+  - **OUT-1b (Low, older):** `setPresence()` and `joinRoom({ presence })` stored a
+    presence before checking its size. An oversized one then threw each time a member
+    joined later, so held frames and presence were lost both ways. **Fixed** by
+    `131f9f5`: the presence frame is built and checked first, and stored only if it
+    fits.
+  - **OUT-1c (Low, older):** a presence that JSON can't encode (`undefined`, a function,
+    a `Symbol`) went out as an empty body, which members dropped, so members who joined
+    later never listed us. **Fixed** by `f5c1f45` (merged `f28f027`): it throws
+    `TypeError`.
+  - **OUT-1d (Info, React):** with OUT-1b and OUT-1c, a presence changed during
+    `usePeerwireRoom`'s join to one the room refuses threw inside the join's handler.
+    The hook stayed `joining` with no room, the room stayed joined, and the rejection
+    went unhandled. **Fixed** by `d29d200` (merged `7bf37e4`): the hook leaves the room
+    and reports the error.
 - **Signals.**
   - Malformed or unproven signals are counted in `badSignals` (a counter only, with
     no action).
@@ -1631,13 +1777,31 @@ and what it accepted. Values are from main `7b716a2`.
     one relay, the relays taking turns. Before NB-006i it was 3/s (burst 6), each batch
     through every relay.
   - Each pipe's queue is 128 KiB (64 KiB before NB-006i), dropping the oldest.
+  - At close, each pipe's queue goes as one last batch past the budget, so a peer sees
+    our `Bye` at once instead of timing out (`414d69f`, merged `3ce0cba`). A closed
+    Nostr transport stops reading at once and closes its sockets after the publishes
+    already handed to it.
+    - **PBF-1 (Info):** that close burst was one batch per pipe, so up to 256 batches
+      of 16 KiB with pipes made by holders of the room key (NB43-I2). **Fixed** by
+      `344e90e` (merged `fc94833`): at most `PIPE_CLOSE_BATCHES` (16), from the pipes
+      that queued last; the rest time out at the peer as before.
+    - **PBF-2 (Info, test gap):** no test checked that a closed Nostr transport reads
+      nothing. **Fixed** by `344e90e` (`room_leave.mjs`).
+    - Residual: Nostr publishes are hashed asynchronously, so on `pagehide` the last
+      batch never goes out, and a tab closed over a Nostr pipe still times out at the
+      peer (30 s).
   - Incoming batches are capped at 64 items but not rate-limited.
   - Residuals:
     - **NB43-I1:** a relaying member can roam a link onto its own pipe, because a
       direct-to-direct roam needs no path validation. Since Fast lane 2 this reached
       pipe links too (FL2-2). **Fixed in JS** by `63e5b72` and `ddae245`: each datagram
       names the peer whose channel it came on, and a packet for another peer is dropped
-      before any roam. Still open on native UDP, where one socket serves every peer.
+      before any roam. Narrowed on native UDP, where one socket serves every peer, by
+      Fast lane 3 (`0a84b7d`, `475c442`): probes move no link, and a roam needs a packet
+      newer than the newest over the link's path, also right after a punch. What is
+      left: a party that holds back the peer's newest packet and sends it from its own
+      address moves the link there until the peer's next packet moves it back.
+      [Latency races](#latency-races-fast-lane-3--fl3-1fl3-3).
     - **NB43-I2:** an insider holding the room key can churn the pipe permissions,
       take the shared budget, and send 64 HS1s per batch. Card NB-043b; it supports
       SEC-4.
@@ -1704,11 +1868,18 @@ and what it accepted. Values are from main `7b716a2`.
     0.1.1 that use `public-only` to upgrade.
   - **Not covered:** `'direct'` gives out every local address the runtime shows. ICE
     checks leave from local sockets, so a peer on the same network can still see a
-    local address as a peer-reflexive candidate.
+    local address as a peer-reflexive candidate. Since `9f98608` and `dc85a1a`, the JS
+    docs say what a microphone or camera grant does to `'direct'` and `'public-only'`:
+    the grant is stored per origin, so it also shows the addresses on later visits and
+    on pages that never ask, and `'public-only'` still sends the public address of the
+    network under a VPN.
 - **MIC-5 (Info):** `withoutHostCandidates` splits on `\r\n` only, so an SDP with bare
   `\n` line ends comes out unchanged, host candidates and all. Browsers write `\r\n`;
   a custom `RTCPeerConnection` (Node, native) might not. Suggested: split on `\n` as
-  `stripCandidates` does (NB48b-3), and match `typ host` before any `\r`.
+  `stripCandidates` does (NB48b-3), and match `typ host` before any `\r`. **Fixed** by
+  `1385715` (merged `82be3bd`), reviewed 2026-10-26: `withoutHostCandidates` splits on
+  `\n` as `stripCandidates` does, and a rejected m-section keeps port 0 in both.
+  `privacy.mjs` runs the gathered-SDP case with both line ends.
 
 **Demos**
 - No CSP is sent by `crew-server.mjs`, which serves Net Lab and Crew. Only the Docker
@@ -1731,6 +1902,23 @@ and what it accepted. Values are from main `7b716a2`.
     without bound. **Fixed** by `b0d354b`: the hook keeps the last 100.
   - The ten-line chat writes messages with `textContent`, so an object only shows as
     text.
+- **Chat demo (`demo/chat.html`, NB-007, merged `92dfa42`, reviewed 2026-10-27).** A
+  room per invite link or QR code. The room key comes from the room's name, so anyone
+  who can guess the name can join and read along.
+  - **CHAT-1 (Low, privacy):** the demo took any name and gave one like `#family` the
+    same "only those with the link" hint as a random one. Such a room is a public
+    lobby. **Fixed** by `dfa8ea0`: a name that isn't at least 22 characters of
+    base64url is flagged as guessable in the invite hint, the header and the chat.
+  - **CHAT-2 (Low):** the QR code throws past its largest size (2331 bytes), and the
+    page called it with no catch while joining, so a long room name (or the whole query
+    copied into the link) left the page silently never joining, with the composer still
+    on. **Fixed** by `dfa8ea0`: a room name is capped at 256 bytes percent-encoded, with
+    a message when a link's is refused; the invite carries only `?signal=local` from the
+    query; a QR code that can't be drawn is left out; and anything joining throws shows
+    as an error with the composer off.
+  - **CHAT-3 (Info):** the welcome said messages go straight from peer to peer with no
+    server. **Fixed** by `dfa8ea0`: it says messages may pass through another member or
+    the signalling relays, end-to-end encrypted either way.
 - **Microphone permission (Net Lab's "Use microphone" button, `e450baf`).** Chrome
   hides a page's local addresses (mDNS names, the default route only) until the
   origin has microphone or camera permission. After that, every new connection lists

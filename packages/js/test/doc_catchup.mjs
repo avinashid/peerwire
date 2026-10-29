@@ -17,25 +17,30 @@
 // (g) (b) with relays that take 3 events a second, then 2: the join's burst draws a refusal from every relay, and
 //     the room must neither stop signalling nor lose what was refused;
 // (h) (b) with C deaf to one of the three relays: it delivers C nothing, so the pipe batches A sends through it
-//     (each goes through one relay) are lost, and the core sends what they carried again.
+//     (each goes through one relay) are lost, and the core sends what they carried again;
+// (i) (b) with one of the three relays going half-open as C links: its connections stay open, but it takes events
+//     and answers and delivers nothing, so A's batches through it are lost until A finds it silent (SILENT_MS).
 // For each it prints how long after the link C held every entry (or what it held at the deadline), the doc
 // frames both sides sent (asks, answers, deltas and their bytes), what went on the wire (datagrams, core
 // packets and retransmits, pipe batches, relay events) and when C's ask of A was pending or timed out. C must
-// hold the whole doc within DEADLINE_MS of the link in (a) to (d), (f) and (g), within BACKGROUND_MS in (e) and
-// DEAF_MS in (h); its first entries within FIRST_MS in (b), (g) and (h), and FIRST_BACKGROUND_MS in (e). In (d) C
-// holds nothing while alone, and A comes back to its whole board from its device.
+// hold the whole doc within DEADLINE_MS of the link in (a) to (d), (f) and (g), within BACKGROUND_MS in (e),
+// DEAF_MS in (h) and HALF_OPEN_MS in (i); its first entries within FIRST_MS in (b), (g) and (h), FIRST_BACKGROUND_MS
+// in (e) and FIRST_HALF_OPEN_MS in (i). In (d) C holds nothing while alone, and A comes back to its whole board from
+// its device. In (i) A puts no batch on the half-open relay over SILENT_MS after the first it left unanswered.
 //
 // It failed on main at 45c7cfd (NB-006d): (b) took 32 s and (e) held 26 of 42 entries after 120 s. (g) failed at
 // fe2a4e9: one refusal from each relay held all three for 30 s, and C never linked. At 9f26bd1, with each batch
-// sent through every relay, (g) at 2 a second took 33 to 39 s.
+// sent through every relay, (g) at 2 a second took 33 to 39 s. (i) failed at ddf8321: a third of A's batches went
+// to the half-open relay to the end, and C held the board after 32 and 39 s, or 28 of 42 entries after 60 s.
 //
-//   node packages/js/test/doc_catchup.mjs [--runs=abcdefgh] [--watch=60] [--relay-rate=10]
+//   node packages/js/test/doc_catchup.mjs [--runs=abcdefghi] [--watch=60] [--relay-rate=10]
 //
 // --watch keeps watching a run that missed the deadline until that many seconds after the link, to see where
 // it ends up; --relay-rate sets RELAY_RATE, the rate of every run's relays but (g)'s.
 import { Worker, MessageChannel, isMainThread, parentPort, workerData, threadId } from 'node:worker_threads';
 import { joinRoom, Room, memoryStore } from '../src/index.js';
 import { WebRtcTransport, BroadcastSignaling } from '../src/webrtc.js';
+import { SILENT_MS } from '../src/nostr.js';
 
 const APP = 'peerwire-test';
 const STROKES = 40;
@@ -50,6 +55,10 @@ const FIRST_BACKGROUND_MS = 5000; // (e)
 // (to 10 s), and the answer, in order, waits behind one lost three or four times: 15 to 19 s alone, over 30 s beside
 // other tests (27 s alone at 3 batches a second).
 const DEAF_MS = 60000;
+// (i): a third of A's batches are lost until A finds the relay silent (SILENT_MS), then none: 8.5 to 15 s alone (32 to
+// 39 s at ddf8321, which lost a third to the end). The first strokes may wait out a lost batch.
+const HALF_OPEN_MS = 30000;
+const FIRST_HALF_OPEN_MS = 6000;
 const LINK_MS = 30000; // for C to link to A at all
 const ALONE_MS = 2000; // (d): how long C waits alone
 const CLAMP_MS = 1000; // (c): a background tab's timers
@@ -251,11 +260,12 @@ if (!isMainThread) {
   parentPort.postMessage({ ready: a.self });
 } else {
   const arg = (name, dflt) => process.argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? dflt;
-  const RUNS = arg('runs', 'abcdefgh');
+  const RUNS = arg('runs', 'abcdefghi');
   const WATCH_MS = Math.max(DEADLINE_MS, Number(arg('watch', 0)) * 1000);
   const RELAY_RATE = Number(arg('relay-rate', 10));
   let relayRate = RELAY_RATE; // the relays made from now on: (g) sets its own
   let deafTo = null; // (h): a connection made to this relay from now on is delivered no events
+  let halfOpen = null; // (i): this relay takes events from now on, but answers and delivers nothing
   const RELAY_CONTENT = 64 * 1024;
   const RELAY_MS = 50;
   const RELAYS = ['wss://relay-1.test', 'wss://relay-2.test', 'wss://relay-3.test'];
@@ -266,7 +276,8 @@ if (!isMainThread) {
 
   // Fake NIP-01 relays: EVENT gets an OK, REQ subscribes by kind, '#p' and since. Each connection may publish
   // relayRate events a second (burst relayRate) of up to RELAY_CONTENT characters of content. A deaf one is
-  // delivered none (it counts them in `missed`).
+  // delivered none (it counts them in `missed`). A half-open relay's connections stay open, but nothing reaches it
+  // or comes back: each counts the events it took in `swallowed`, from `swallowedAt`.
   const sockets = new Set(); // open ones, every relay's
   class FakeRelaySocket {
     static CONNECTING = 0;
@@ -281,7 +292,7 @@ if (!isMainThread) {
       this.tokens = this.rate;
       this.refilled = Date.now();
       this.deaf = url === deafTo;
-      this.stats = { accepted: 0, limited: 0, tooLarge: 0, chars: 0, missed: 0 };
+      this.stats = { accepted: 0, limited: 0, tooLarge: 0, chars: 0, missed: 0, swallowed: 0 };
       setTimeout(() => {
         if (this.readyState !== 0) return;
         this.readyState = 1;
@@ -290,11 +301,12 @@ if (!isMainThread) {
       }, 5);
     }
     deliver(m) {
-      setTimeout(() => this.readyState === 1 && this.onmessage?.({ data: JSON.stringify(m) }), RELAY_MS);
+      setTimeout(() => this.readyState === 1 && this.url !== halfOpen && this.onmessage?.({ data: JSON.stringify(m) }), RELAY_MS);
     }
     send(raw) {
       if (this.readyState !== 1) return;
       const m = JSON.parse(raw);
+      if (this.url === halfOpen) return void (m[0] === 'EVENT' && (this.stats.swallowed++, (this.swallowedAt ??= now())));
       if (m[0] === 'REQ') return void this.subs.set(m[1], m[2]);
       if (m[0] === 'CLOSE') return void this.subs.delete(m[1]);
       if (m[0] !== 'EVENT') return;
@@ -421,8 +433,9 @@ if (!isMainThread) {
   }
 
   // (b) The fallback route: ICE never completes, so the link goes over the signalling pipe through the relays.
-  // (g) The same with relays that take `rate` events a second. (h) The same with C deaf to relay `deaf`.
-  async function fallback(key, rate, bars, deaf = null) {
+  // (g) The same with relays that take `rate` events a second. (h) The same with C deaf to relay `deaf`. (i) The
+  // same with relay `half` going half-open when C links to A.
+  async function fallback(key, rate, bars, { deaf = null, half = null } = {}) {
     iceHangs = true;
     relayRate = rate;
     const roomId = `catchup-${key}${rate}-${process.pid}`;
@@ -430,22 +443,46 @@ if (!isMainThread) {
     const opts = (name) => ({ appId: APP, roomId, presence: { name }, signaling: 'nostr', relays: RELAYS, fallbackMs: 300, RTCPeerConnection: fakePc(name) });
     const a = await joinRoom(opts('a'));
     draw(a.doc('board'));
+    // (i): [when, relay] of each lossy event (pipe batch) A's signalling puts on a relay's queue.
+    const striped = [];
+    if (half) {
+      const queue = a.signaling.queue.bind(a.signaling);
+      a.signaling.queue = (ws, e) => (e.lossy && striped.push([now(), ws.url]), queue(ws, e));
+    }
     const t0 = now();
     deafTo = deaf;
     const c = await joinRoom(opts('c'));
+    // (i): `half` goes half-open as C links to A, so A has sent it pipe batches by the time it is found silent.
+    let halfAt = Infinity;
+    const going = half && (async () => {
+      while (!c.peers.includes(a.self) && now() - t0 < LINK_MS) await sleep(5);
+      halfOpen = half;
+      halfAt = now();
+    })();
     const w = await watch(c, c.doc('board'), a.self, t0, Math.max(WATCH_MS, bars.deadline));
+    await going;
     const route = c.route(a.self)?.kind;
-    const lost = deaf && c.signaling.sockets.find((ws) => ws.url === deaf)?.stats.missed;
-    const through = deaf && a.signaling.sockets.find((ws) => ws.url === deaf)?.stats.accepted;
-    report(name, `fallback over the signalling pipe (${limits(rate)}${deaf ? `; C deaf to ${deaf}` : ''})`, w, {
+    const relay = (r, url) => r.signaling.sockets.find((ws) => ws.url === url);
+    const lost = deaf && relay(c, deaf)?.stats.missed;
+    const through = deaf && relay(a, deaf)?.stats.accepted;
+    const swallowed = half && relay(a, half)?.stats.swallowed;
+    const silent = half && a.signaling.silent?.(relay(a, half), performance.now());
+    // A puts no batch on it later than SILENT_MS after the first event it took unanswered: no OK came back after that.
+    const onHalf = striped.filter(([t, url]) => url === half && t >= halfAt).map(([t]) => t - relay(a, half)?.swallowedAt);
+    const others = striped.filter(([t, url]) => url !== half && t >= halfAt).length;
+    report(name, `fallback over the signalling pipe (${limits(rate)}${deaf ? `; C deaf to ${deaf}` : ''}${half ? `; ${half} half-open from the link` : ''})`, w, {
       aId: a.self, cId: c.self, aWire: wire.get(a.self), cWire: wire.get(c.self), aCore: a.stats(), cCore: c.stats(), ...bars,
       extra: [`route C->A: ${route}`, `A: ${pipe(a.transport.piped, a.signaling.stats, a.signaling.sockets[0]?.stats)}`, `C: ${pipe(c.transport.piped, c.signaling.stats, c.signaling.sockets[0]?.stats)}`,
-        ...(deaf ? [`${deaf} took ${through} events from A and kept ${lost} from C`] : [])],
+        ...(deaf ? [`${deaf} took ${through} events from A and kept ${lost} from C`] : []),
+        ...(half ? [`${half} took ${swallowed} events from A once half-open, and answered none (A counts it ${silent ? 'silent' : 'answering'}); A put ${onHalf.length} pipe batches on it (the last ${s(Math.max(...onHalf, 0))} after the first it took unanswered) and ${others} on the others`] : [])],
     });
     if (w.link !== null && route !== 'signaling') results.push({ key, ok: false, line: `(${name}) C reached A over ${route}, not the pipe` });
-    // Not vacuous: the relay C is deaf to carried some of what A sent it.
+    // Not vacuous: the relay C is deaf to carried some of what A sent it; the half-open one took some of A's batches.
     if (deaf && !(lost > 0)) results.push({ key, ok: false, line: `(${name}) ${deaf} kept nothing from C` });
+    if (half && !(swallowed > 0)) results.push({ key, ok: false, line: `(${name}) ${half} took nothing from A once half-open` });
+    if (half && onHalf.some((t) => t > SILENT_MS + 100)) results.push({ key, ok: false, line: `(${name}) A put ${onHalf.filter((t) => t > SILENT_MS + 100).length} pipe batches on ${half} over ${s(SILENT_MS)} after it stopped answering (the last at ${s(Math.max(...onHalf))})` });
     deafTo = null;
+    halfOpen = null;
     await Promise.all([a.leave(), c.leave()]);
     iceHangs = false;
     relayRate = RELAY_RATE;
@@ -564,7 +601,8 @@ if (!isMainThread) {
     await fallback('g', 2, { deadline: DEADLINE_MS, first: FIRST_MS });
   }
 
-  if (RUNS.includes('h')) await fallback('h', RELAY_RATE, { deadline: DEAF_MS, first: FIRST_MS }, RELAYS[2]);
+  if (RUNS.includes('h')) await fallback('h', RELAY_RATE, { deadline: DEAF_MS, first: FIRST_MS }, { deaf: RELAYS[2] });
+  if (RUNS.includes('i')) await fallback('i', RELAY_RATE, { deadline: HALF_OPEN_MS, first: FIRST_HALF_OPEN_MS }, { half: RELAYS[2] });
 
   const failed = results.filter((r) => !r.ok);
   for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.line}`);
