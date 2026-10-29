@@ -6,9 +6,11 @@
 // come from Peerwire on top; the signalling channel is untrusted, because the Noise
 // handshake over the DataChannel proves the remote holds the PeerId it claims.
 //
-// Signalling adapters implement { id, send(to, msg), onMessage(fn), close() };
+// Signalling adapters implement { id, send(to, msg, { lossy }), onMessage(fn), close() };
 // messages are JSON-able objects. See BroadcastSignaling below. close() may come
 // right after a send() (a leaving room's last pipe batch): that message should still go.
+// A `lossy` one (a pipe batch: the core resends what it carries) may go one way, not
+// every way the adapter has (NostrSignaling: through one relay).
 //
 // When WebRTC can't link two peers (symmetric NAT on both sides, no TURN), the
 // transport can carry Peerwire datagrams over the signalling channel itself: a
@@ -32,17 +34,19 @@ export const RTC_FALLBACK_MS = 8000;
 export const RTC_SAME_NAT_FALLBACK_MS = 3000;
 // Pipes: datagrams are batched for PIPE_FLUSH_MS into one signalling message of at
 // most PIPE_BATCH bytes, or sent at once when they fill one. All pipes together send
-// PIPE_RATE messages a second (burst PIPE_BURST), within what public relays allow one
-// client, and no sooner than the signalling can take one (its wait(), if it has one), and
-// batch more while they wait; past PIPE_QUEUE bytes waiting on a pipe, the
-// oldest is dropped. close() sends
-// what waits as one last batch per pipe, past the budget, for at most PIPE_CLOSE_BATCHES
-// pipes, those that queued last first.
+// PIPE_RATE messages a second (burst PIPE_BURST): through three relays, one each, 2 a
+// second a relay, within what public relays allow one client. They go no sooner than
+// the signalling can take one (its wait(), if it has one), and batch more while they
+// wait; past PIPE_QUEUE bytes waiting on a pipe (more than a second's batches: a
+// background tab's timers fire once a second), the oldest is dropped. Batches are sent
+// lossy. close() sends what waits as one last batch per pipe, past the budget, for at
+// most PIPE_CLOSE_BATCHES pipes, those that queued last first, and not lossy: nothing
+// can send them again.
 export const PIPE_FLUSH_MS = 40;
 export const PIPE_BATCH = 16 * 1024;
-export const PIPE_RATE = 3;
-export const PIPE_BURST = 6;
-export const PIPE_QUEUE = 64 * 1024;
+export const PIPE_RATE = 6;
+export const PIPE_BURST = 12;
+export const PIPE_QUEUE = 128 * 1024;
 export const PIPE_CLOSE_BATCHES = 16;
 const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
 const full = (p) => p.bytes >= PIPE_BATCH || p.q.length >= MAX_PIPE_ITEMS; // a pipe's queue fills a batch
@@ -927,7 +931,7 @@ export class WebRtcTransport {
     p.bytes -= n;
     this.piped.sent++;
     try {
-      Promise.resolve(this.sig.send(p.peer, { kind: 'dg', d })).catch(() => {});
+      Promise.resolve(this.sig.send(p.peer, { kind: 'dg', d }, { lossy: !last })).catch(() => {});
     } catch {
       // A closed signalling channel: the datagrams are lost, as on a dead path.
     }

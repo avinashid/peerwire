@@ -9,7 +9,7 @@
 //
 //   node packages/js/test/room_leave.mjs
 import { joinRoom, Lane, Room } from '../src/index.js';
-import { PIPE_BATCH, PIPE_CLOSE_BATCHES, WebRtcTransport } from '../src/webrtc.js';
+import { PIPE_BATCH, PIPE_BURST, PIPE_CLOSE_BATCHES, WebRtcTransport } from '../src/webrtc.js';
 
 let failed = 0;
 const check = (ok, what) => {
@@ -134,7 +134,8 @@ const leftFast = async (seen, a, t0, what) => {
   const [a, b] = await overPipe('pipe-full');
   const seen = leaves(b);
   const pipe = [...a.transport.pipes.values()][0];
-  a.send(new Uint8Array(100 << 10));
+  // More than the pipes' burst can carry at once.
+  for (let n = 0; n < (PIPE_BURST + 2) * PIPE_BATCH; n += 100 << 10) a.send(new Uint8Array(100 << 10));
   check(await until(() => pipe.bytes > PIPE_BATCH, 5000),
     `the pipe is backed up past a batch (${pipe.q.length} datagrams, ${pipe.bytes} bytes queued)`);
   const t0 = performance.now();
