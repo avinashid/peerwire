@@ -124,7 +124,7 @@ fn fuzz_packet_parse() {
         "packet",
         cases(50_000),
         |rng| {
-            let mut b = match rng.below(4) {
+            let mut b = match rng.below(6) {
                 0 => {
                     let n = rng.below(MAX_DATAGRAM + 40);
                     rng.bytes(n)
@@ -132,6 +132,12 @@ fn fuzz_packet_parse() {
                 1 => {
                     let n = rng.below(120);
                     wire::encode_hs1(rng.u32(), &rng.bytes(n))
+                }
+                4 => wire::encode_cookie(rng.u32(), &rng.bytes(wire::COOKIE_LEN).try_into().unwrap()),
+                5 => {
+                    let n = rng.below(120);
+                    let hs1 = wire::encode_hs1(rng.u32(), &rng.bytes(n));
+                    wire::with_cookie(&hs1, &rng.bytes(wire::COOKIE_LEN).try_into().unwrap())
                 }
                 2 => {
                     let n = rng.below(120);
@@ -162,11 +168,18 @@ fn fuzz_packet_parse() {
                             1 => b.len() > 5,
                             2 => b.len() > 9,
                             3 => b.len() >= wire::DATA_HEADER + wire::TAG,
+                            4 => b.len() == 5 + wire::COOKIE_LEN,
+                            5 => b.len() > 5 + wire::COOKIE_LEN,
                             _ => false,
                         };
                     return assert!(!ok, "a well-formed packet was rejected");
                 }
-                Some(Packet::Hs1 { sender, noise }) => wire::encode_hs1(sender, noise),
+                Some(Packet::Hs1 { sender, cookie: None, noise }) => wire::encode_hs1(sender, noise),
+                Some(Packet::Hs1 { sender, cookie: Some(c), noise }) => {
+                    assert!(!noise.is_empty());
+                    wire::with_cookie(&wire::encode_hs1(sender, noise), c)
+                }
+                Some(Packet::Cookie { receiver, cookie }) => wire::encode_cookie(receiver, cookie),
                 Some(Packet::Hs2 { sender, receiver, noise }) => wire::encode_hs2(sender, receiver, noise),
                 Some(Packet::Data { receiver, nonce, ciphertext }) => {
                     assert!(ciphertext.len() >= wire::TAG);

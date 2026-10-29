@@ -66,7 +66,12 @@ complete host loop on std UDP sockets.
   - A responder link is not announced until the initiator's first data packet arrives, so a
     replayed HS1 can't displace a live link.
   - A forged HS2 can't poison a dial: the handshake is rebuilt from its seed.
-  - Half-open responder handshakes are capped (`Config::max_pending_handshakes`, 4096).
+  - Half-open responder handshakes are capped (`Config::max_pending_handshakes`, 4096). From
+    three quarters of the cap, an HS1 from a UDP address takes no state until it echoes a
+    cookie (16 bytes of HMAC-BLAKE2s over its index, its ephemeral key and the address, under
+    a secret new every 2 minutes), and each IPv4 address, IPv6 /64, relay or channel holds at
+    most 4 half-open handshakes. Those a UDP address took below the mark don't count, as they
+    may have been spoofed.
 - **Simultaneous open** (both sides dialling, as in hole punching): the dial from the smaller
   PeerId wins, so exactly one link results.
 - **Data packets:**
@@ -169,6 +174,5 @@ Early development (v0.1). The wire format may still change.
 
 Not yet:
 - Rekeying.
-- Cookies against handshake floods (only the half-open cap so far).
 - A timer wheel: `poll_timeout` scans every session, O(sessions).
 - Relaying over more than one hop.

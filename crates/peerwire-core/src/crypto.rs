@@ -1,4 +1,5 @@
-//! Noise setup with a host-seeded RNG, and the anti-replay window for data packets.
+//! Noise setup with a host-seeded RNG, address-validation cookies, and the
+//! anti-replay window for data packets.
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -56,6 +57,26 @@ pub(crate) fn builder_for<'a>(
     snow::Builder::with_resolver(params, Box::new(SeededResolver { seed }))
         .prologue(prologue)?
         .local_private_key(local_private)
+}
+
+/// An address-validation cookie: HMAC-BLAKE2s under `secret` of an HS1's index
+/// and ephemeral key and the address it came from (encoded), cut to 16 bytes.
+pub(crate) fn cookie(secret: &[u8; 32], sender: u32, eph: &[u8; 32], addr: &[u8]) -> [u8; 16] {
+    let mut h = DefaultResolver.resolve_hash(&HashChoice::Blake2s).expect("BLAKE2s");
+    let mut data = Vec::with_capacity(4 + 32 + addr.len());
+    data.extend_from_slice(&sender.to_le_bytes());
+    data.extend_from_slice(eph);
+    data.extend_from_slice(addr);
+    let mut out = [0u8; 32];
+    h.hmac(secret, &data, &mut out);
+    let mut c = [0u8; 16];
+    c.copy_from_slice(&out[..16]);
+    c
+}
+
+/// Whether `a` and `b` are equal, in time that doesn't depend on where they differ.
+pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 const WINDOW: u64 = 2048;

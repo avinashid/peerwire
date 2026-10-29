@@ -109,7 +109,17 @@ workspace first and takes several times that. With no Rust change since `origin/
 
 ### peerwire-core (unit, `src/`)
 
-- `wire`: frame round trips, truncated frames fail once, frame parser survives garbage, packet bounds.
+- `wire`: frame round trips, truncated frames fail once, frame parser survives garbage, packet bounds (COOKIE
+  and HS1C too).
+- `endpoint`, handshake floods (SEC-4, NB-024): 5000 valid HS1s a second for 25 s, each with its own index and
+  ephemeral key, from spoofed addresses, leave half-open handshakes at the mark (3072 of 4096) and a dial from a
+  real address links 10 ms after it starts (on main it fails after 23.5 s, the table full); below the mark a
+  handshake is HS1 and HS2 alone, at it a COOKIE and an HS1C come between; a cookie holds only for its HS1's index
+  and ephemeral key and its address, in its epoch and the next; under load a source holds 4 half-open
+  handshakes, a peer's channel needs no cookie; 4 HS1s spoofed from an address below the mark don't count
+  against it (NB24-1), so a dial from there still links, while 4 taken there on a channel or through a relay do;
+  an IPv4 address and an IPv6 /64 are one source; a dial takes a cookie only for its index from an address it
+  dials, and `handle_datagram_direct` says false for it.
 - `reliable`: out-of-order reassembly, ACK and retransmit, tail-loss probe beats the RTO, urgent fragments are
   sent twice, urgent goes ahead of queued reliable data within the shared window and takes at most half of it,
   each stream stays within the receiver's window and has its own buffer, urgent fragments in flight span at
@@ -225,7 +235,7 @@ regression test.
 
 | Target | Test | Properties |
 |---|---|---|
-| Packets, frames | `peerwire-core` `fuzz::fuzz_packet_parse`, `fuzz_frames` | an accepted packet re-encodes to the same bytes and a well-formed one is never rejected; frames yielded re-encode to exactly the bytes consumed, a malformed tail yields one `Err` |
+| Packets, frames | `peerwire-core` `fuzz::fuzz_packet_parse`, `fuzz_frames` | an accepted packet (HS1, HS2, DATA, COOKIE, HS1C) re-encodes to the same bytes and a well-formed one is never rejected; frames yielded re-encode to exactly the bytes consumed, a malformed tail yields one `Err` |
 | Addresses | `fuzz_addresses`, `peerwire-sim` `fuzz_sim_addresses` | `SocketAddr`/`u32`/`u64`/`SimAddr` decoding accepts canonical encodings only |
 | STUN | `fuzz_stun` | requests and responses (extra attributes too); STUN never parses as a Peerwire packet |
 | Invites | `fuzz_invites` | bytes and `pw:` links: whatever parses survives its own round trip, ≤ 16 entries, and is the one encoding of what it decodes to (`to_link(parse(s)) == s`) |

@@ -180,9 +180,10 @@ peer.host_room("my-game", room)
     mapping; switching it back asks the router again.
 - **What it does to the player's network:** while the session runs, the router forwards one UDP port to the
   player's machine from anyone on the internet, not only from peers. Anyone who finds the port reaches only the
-  Noise endpoint, the same one peers dial, but it shows up in port scans. Until handshake cookies land (SEC-4 in
-  [`THREAT-MODEL.md`](THREAT-MODEL.md)), that endpoint can also be sent handshake floods directly. Turn it on only
-  when the player agrees, or behind a setting.
+  Noise endpoint, the same one peers dial, but it shows up in port scans. That endpoint can also be sent handshake
+  floods directly: under one, a handshake must echo a cookie sent to its address, so spoofed ones take nothing,
+  but an attacker with many real addresses can still keep others from connecting (SEC-4 in
+  [`THREAT-MODEL.md`](THREAT-MODEL.md)). Turn it on only when the player agrees, or behind a setting.
   - If the game crashes, the router keeps the mapping until its lease runs out (2 hours). With a router that
     only allows permanent UPnP leases, it keeps it until someone deletes it in the router's settings.
   - Any device on the player's LAN can answer the mapping requests. A rogue one can report a false address, and

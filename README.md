@@ -281,6 +281,8 @@ packet = kind(u8: version<<4 | type) ...
   HS1    kind  sender_idx(u32)                     noise_msg1
   HS2    kind  sender_idx(u32)  receiver_idx(u32)  noise_msg2
   DATA   kind  receiver_idx(u32) nonce(u64)        AEAD(frames)  +16 B tag
+  COOKIE kind  receiver_idx(u32) cookie(16)        a loaded responder's answer to an HS1
+  HS1C   kind  sender_idx(u32)  cookie(16)         noise_msg1    an HS1 that echoes it
 
 frames (inside DATA, several per packet):
   PING                                  keepalive / liveness probe

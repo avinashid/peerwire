@@ -28,6 +28,10 @@ its trust boundaries, and the standing findings.
 - **Replay- and flood-resistant data path.** A sliding nonce window drops replayed
   data packets; half-open handshakes and peer relaying are capped and
   rate-limited.
+- **Handshake floods from spoofed addresses.** From three quarters of the
+  half-open cap, a handshake from a UDP address takes no state until it echoes a
+  cookie sent to that address, and each IPv4 address or IPv6 /64 holds at most 4
+  half-open handshakes (SEC-4).
 
 ## What it does not give you yet
 
@@ -35,8 +39,9 @@ its trust boundaries, and the standing findings.
   name can see its members' PeerIds, and anyone who knows your PeerId can probe
   for your IP candidates. Treat room names as secrets and don't publish PeerIds
   you want kept private. (THREAT-MODEL.md SEC-2, SEC-3, SEC-5.)
-- **Connection-setup DoS resistance** against a source-address spoofer: there is
-  no address-validation cookie yet (SEC-4).
+- **Connection-setup DoS resistance** against an attacker with many real
+  addresses: 256 IPv4 addresses or IPv6 /64s, at 4 half-open handshakes each,
+  fill the quarter of the half-open table left above the mark (SEC-4).
 - **In-session forward secrecy refresh:** session keys are not rotated until a
   reconnect (SEC-7).
 
