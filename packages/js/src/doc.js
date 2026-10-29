@@ -32,11 +32,12 @@
 // stands: 'alone', 'loading' from a member with `have` of `total` entries, or 'synced'.
 //
 // A doc opened with a store (room.doc(name, { persist })) keeps a copy on this device: its entries and context,
-// saved while it changes, paced by the copy's size (SAVE_MS, SAVE_RATE), and when it closes. Opening loads the
-// copy before the first ask, so the ask carries it and members send only what it lacks, and our answers wait
-// for it, LOAD_MS at most. The copy joins the doc as an answer from ourselves would, checked as member data, so
-// a copy that is off anywhere is dropped whole. An opening that couldn't read the copy (the store failed or was
-// too slow, or the copy is another version's) never writes it: it goes on without one.
+// saved while it changes, paced by the copy's size (SAVE_MS, SAVE_RATE) or, while the store fails, slower with
+// each failure in a row (SAVE_DOUBLINGS), and when it closes. Opening loads the copy before the first ask, so
+// the ask carries it and members send only what it lacks, and our answers wait for it, LOAD_MS at most. The
+// copy joins the doc as an answer from ourselves would, checked as member data, so a copy that is off anywhere
+// is dropped whole. An opening that couldn't read the copy (the store failed or was too slow, or the copy is
+// another version's) never writes it: it goes on without one.
 //
 // Members are trusted alike to write, as in the room itself: any member can overwrite, delete or fill a doc,
 // and a member relaying a catch-up can claim any writer, so `from` is as good as the member that told us.
@@ -104,11 +105,15 @@ const TURN_MS = 60000;
 const MAX_INCARNATIONS = 16;
 // A doc kept on this device is saved SAVE_MS after it changes, one save at a time, each the whole doc: so the
 // next waits SAVE_MS, or the copy's bytes at SAVE_RATE if longer, after the one before ends (2 s for a 510 KB
-// whiteboard, 48 s for a full doc of 12 MiB; one costs about 5 ms a MiB of main thread). Its copy is answer
-// frames, as pack() cuts them: a full doc takes about 30, and a copy of more than STORED_FRAMES isn't loaded.
-// A store that hasn't loaded the copy LOAD_MS after opening is taken as stuck: the doc goes on without it.
+// whiteboard, 48 s for a full doc of 12 MiB; one costs about 5 ms a MiB of main thread). After a save that
+// failed (a full disk), the next waits SAVE_MS, doubled for each failure in a row before it, SAVE_DOUBLINGS
+// times at most (1, 2, 4 ... 64 s), until one succeeds: a store that keeps failing has a full doc built and
+// sealed once a minute, not once a second. Closing and hiding the page save at once all the same. Its copy is
+// answer frames, as pack() cuts them: a full doc takes about 30, and a copy of more than STORED_FRAMES isn't
+// loaded. A store that hasn't loaded the copy LOAD_MS after opening is taken as stuck: the doc goes on without it.
 export const SAVE_MS = 1000;
 export const SAVE_RATE = 256 * 1024; // bytes a second
+const SAVE_DOUBLINGS = 6;
 export const LOAD_MS = 5000;
 export const STORED_FRAMES = 64;
 // The longest array a frame may hold: entries, dead ranges, writers.
@@ -401,6 +406,7 @@ export class Doc {
     this.inFlight = false; // a save is with the store
     this.saveSoon = false; // a save asked at once (the page hidden) while one was in flight: goes as it ends
     this.nextSave = 0; // host.now() before which no paced save starts (see saved)
+    this.saveFails = 0; // saves that failed since the last that succeeded: each doubles the wait (see saved)
     this.forgotten = false;
     // This opening couldn't read the copy (the store failed or took LOAD_MS, or the copy is another version's):
     // it leaves the copy as it is and keeps none.
@@ -1360,7 +1366,7 @@ export class Doc {
     return true;
   }
 
-  // Saves the doc SAVE_MS from now, or once the last save's size allows (see saved), unless a save is due already
+  // Saves the doc SAVE_MS from now, or once the last save allows (see saved), unless a save is due already
   // (see flush) or with the store: then saved() sees to it.
   dirty() {
     if (!this.store || this.forgotten || this.blocked || this.loading || this.closed || this.saveWait || this.inFlight) return;
@@ -1398,10 +1404,14 @@ export class Doc {
 
   // A save of `bytes` ended: the next waits SAVE_MS, or `bytes` at SAVE_RATE if longer, and saves the changes
   // made meanwhile once; one asked at once meanwhile goes now. A save that failed is tried again with the next
-  // change. A promise of the save it started, if any, so `saving` resolves once both are done.
+  // change, SAVE_MS after it ended, twice that after two failures in a row, and so on up to SAVE_DOUBLINGS
+  // doublings; one that succeeds starts that again. A promise of the save it started, if any, so `saving`
+  // resolves once both are done.
   saved(bytes, ok) {
     this.inFlight = false;
-    this.nextSave = this.host.now() + Math.max(SAVE_MS, ((Number(bytes) || 0) * 1000) / SAVE_RATE);
+    const wait = ok ? ((Number(bytes) || 0) * 1000) / SAVE_RATE : SAVE_MS * 2 ** Math.min(this.saveFails, SAVE_DOUBLINGS);
+    this.saveFails = ok ? 0 : this.saveFails + 1;
+    this.nextSave = this.host.now() + Math.max(SAVE_MS, wait);
     if (this.saveSoon) {
       this.saveSoon = false;
       if (this.write()) return this.saving;
