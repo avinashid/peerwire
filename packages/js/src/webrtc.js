@@ -55,6 +55,8 @@ const unflush = (p) => {
 // rather than for PIPE_FLUSH_MS, and send batch after batch as the rate allows, so a background
 // tab answering over signalling isn't held to one batch a round trip of a second.
 const PIPE_LATE_MS = 250;
+// The pipes' pacing runs on a monotonic clock: a wall clock set back would stall them that long.
+const clock = () => performance.now();
 // Runs `fn` in a task of its own after this one, which a background tab doesn't hold back as it
 // does timers.
 const nextTask = typeof setImmediate === 'function' ? setImmediate : (() => {
@@ -291,7 +293,7 @@ export class WebRtcTransport {
     this.pipeAllowed = new Set(); // peers whose datagrams over signalling we take
     this.pipeTokens = PIPE_BURST; // the rate budget all pipes share
     this.pipeLate = false; // a pipe timer fired late: see PIPE_LATE_MS
-    this.pipeRefilled = Date.now();
+    this.pipeRefilled = clock();
     this.pipeQueued = 0; // datagrams queued on pipes so far; a pipe's `queued`: the count at its latest
     // Batches sent; datagrams received, dropped (queue full), and stale (from a peer whose
     // own DataChannel carries its datagrams now: sent before it opened).
@@ -879,9 +881,9 @@ export class WebRtcTransport {
     const run = () => p.timer === t && this.pipeFlush(p);
     if (ms === undefined && this.pipeLate) return void nextTask(run);
     ms ??= PIPE_FLUSH_MS;
-    const due = Date.now() + ms;
+    const due = clock() + ms;
     t.id = setTimeout(() => {
-      this.pipeLate = Date.now() - due >= PIPE_LATE_MS;
+      this.pipeLate = clock() - due >= PIPE_LATE_MS;
       run();
     }, ms);
   }
@@ -904,8 +906,9 @@ export class WebRtcTransport {
     // Signalling that paces its sends (NostrSignaling.wait()) says how long until it can take
     // one: the batch waits and fills meanwhile, rather than going out small to wait there.
     const wait = last ? 0 : this.sig.wait?.() ?? 0;
-    if (wait > 0) return this.pipeFlushSoon(p, wait);
-    const now = Date.now();
+    // Asked again at least once a second: a relay may have opened or come free meanwhile.
+    if (wait > 0) return this.pipeFlushSoon(p, Math.min(wait, 1000));
+    const now = clock();
     this.pipeTokens = Math.min(PIPE_BURST, this.pipeTokens + ((now - this.pipeRefilled) / 1000) * PIPE_RATE);
     this.pipeRefilled = now;
     if (this.pipeTokens < 1 && !last) return this.pipeFlushSoon(p, Math.ceil(((1 - this.pipeTokens) * 1000) / PIPE_RATE));

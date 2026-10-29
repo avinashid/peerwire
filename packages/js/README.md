@@ -597,8 +597,9 @@ Run these with Node and the Playwright install on this host:
   rate is held 1 s (2 s if it refuses again before taking one) at half its rate and sent
   what it refused again, in order. With every relay held, the hold that ends first is cut
   short, as it is when the one free relay closes. A ban stops a relay for 30 s, doubling.
-  Queues drop their oldest past 64 events or 10 s, and `close()` sends what waits at once.
-  No relays.
+  Queues drop their oldest past 64 events or 10 s, and `close()` sends what waits at once,
+  but not to a relay that holds or banned us. The pacing runs on a monotonic clock: the
+  wall clock set back 60 s stalls nothing. No relays.
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's; a room that signs

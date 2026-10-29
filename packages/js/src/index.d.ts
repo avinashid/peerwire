@@ -23,6 +23,9 @@ export interface SignalingAdapter {
   onHello: (peer: PeerId, meta?: unknown) => void;
   hello(meta?: unknown): void | Promise<void>;
   send(to: PeerId, body: unknown): void | Promise<void>;
+  /** Milliseconds until the adapter can take one more message (0: it can now), for one that paces its sends, as the
+   * Nostr adapter does. A signalling pipe waits this long, at most a second at a time, so its batches fill meanwhile. */
+  wait?(): number;
   /** `from` must be the sender's PeerId, authenticated by the adapter (as the Nostr adapter's sealed messages are;
    * BroadcastChannel is same-origin): WebRTC offers, answers, ICE candidates and restarts, retry requests, and the
    * signalling pipe and its stale drop all trust it. */

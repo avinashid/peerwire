@@ -3,7 +3,7 @@
 // and base64 must handle bodies far larger than a signalling message. No relays:
 // events are fed straight into onRelay.
 import { loadPeerwire } from '../src/peerwire.js';
-import { BACKOFF_MS, MAX_BACKOFF_MS, RECONNECT_MS, NostrSignaling, MAX_SEEN, b64, unb64, RELAY_RATE, RELAY_BURST_S, RELAY_RAISE_MS, HOLD_MS, RELAY_TRIES, RELAY_QUEUE, RELAY_QUEUE_MS } from '../src/nostr.js';
+import { BACKOFF_MS, MAX_BACKOFF_MS, RECONNECT_MS, NostrSignaling, MAX_SEEN, b64, unb64, RELAY_RATE, RELAY_BURST_S, RELAY_RAISE_MS, MIN_RELAY_RATE, HOLD_MS, RELAY_TRIES, RELAY_QUEUE, RELAY_QUEUE_MS } from '../src/nostr.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
 const pw = await loadPeerwire(wasm);
@@ -105,11 +105,10 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
 //    HOLD_MS, its rate halved, and sent the event again in its place, while the other is still sent to;
 //    refusals of events sent before its hold began count for nothing more. Refused again before it takes
 //    one, the hold doubles; after it took one, it starts over. A relay isn't held while no other is free.
-//    A ban ('blocked:', 'banned') stops a relay for BACKOFF_MS, doubling. A fake clock keeps time.
+//    A ban ('blocked:', 'banned') stops a relay for BACKOFF_MS, doubling. A fake monotonic clock keeps time.
 {
-  const realNow = Date.now;
-  let clock = realNow();
-  Date.now = () => clock;
+  let clock = 1e6;
+  performance.now = () => clock;
   const s5 = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/backoff', relays: [] });
   await s5.ready;
   const sent = { a: [], b: [] };
@@ -212,7 +211,55 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   s5.close();
   check(waiting === 3 && sent.b.length === sentB + 3 && sent.a.length === sentA, `close() sends what waits at once (${sent.b.length - sentB} of ${waiting}), but not to a banned relay`);
   s5.sockets.length = 0;
+  delete performance.now;
+}
+
+// 5b. The pacing runs on a monotonic clock (NB6H-1): the wall clock set back 60 s doesn't stall a relay. Should
+//     even that clock step back, a relay's bucket runs into no debt and its rate stays at least MIN_RELAY_RATE.
+//     Once closed, a relay held for its rate is sent nothing; the free one carries what waits.
+{
+  let clock = 1e6;
+  performance.now = () => clock;
+  const realNow = Date.now;
+  const s6 = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/clock', relays: [] });
+  await s6.ready;
+  const sent = { a: [], b: [] };
+  const sock = {};
+  for (const name of ['a', 'b']) s6.sockets.push((sock[name] = { relayUrl: name, readyState: WebSocket.OPEN, send: (m) => sent[name].push(JSON.parse(m)[1].id), close() {} }));
+  let n6 = 0;
+  const burst = RELAY_RATE * RELAY_BURST_S;
+  for (let i = 0; i < burst + 4; i++) await s6.publish(s6.roomTag, `c${++n6}`);
+  Date.now = () => realNow() - 60000;
+  clock += 500;
+  s6.pump(sock.a);
+  s6.pump(sock.b);
   Date.now = realNow;
+  check(sent.a.length === burst + RELAY_RATE / 2 && sent.b.length === burst + RELAY_RATE / 2,
+    `the wall clock set back 60 s, a relay still sends at its rate (${sent.a.length - burst} in 500 ms)`);
+  clock -= 60000;
+  s6.pump(sock.a);
+  const r = s6.rates.get('a');
+  check(r.rate >= MIN_RELAY_RATE && r.tokens >= 0 && s6.wait() >= 0 && s6.wait() <= 1000,
+    `the monotonic clock stepped back 60 s: no debt (tokens ${r.tokens.toFixed(2)}), rate ${r.rate} >= ${MIN_RELAY_RATE}, wait ${s6.wait().toFixed(0)} ms`);
+  clock += 500;
+  s6.pump(sock.a);
+  check(sent.a.length === burst + RELAY_RATE && sock.a.q.length === 0, `and its queue drains at its rate (${sent.a.length - burst - RELAY_RATE / 2} more in 500 ms)`);
+  // a refuses for its rate: held, while b is free. Closing sends b what waits, and a nothing.
+  await s6.onRelay('a', JSON.stringify(['OK', sent.a.at(-1), false, 'rate-limited: slow down']));
+  s6.rate('b', clock).tokens = 0;
+  for (let i = 0; i < 3; i++) await s6.publish(s6.roomTag, `c${++n6}`);
+  const sentA = sent.a.length;
+  const sentB = sent.b.length;
+  const waitB = sock.b.q.length;
+  check(s6.paused.get('a')?.until > clock && sock.a.q.length === 4 && waitB > 0, `a is held with ${sock.a.q.length} waiting, b free with ${waitB}`);
+  s6.sending = 1; // a send() still under way keeps the sockets open after close()
+  s6.close();
+  check(sent.a.length === sentA && sent.b.length === sentB + waitB && !sock.a.pumpTimer,
+    `close() sends the free relay what waits (${sent.b.length - sentB} of ${waitB}), and the held one nothing (${sent.a.length - sentA}), not even once its hold ends`);
+  s6.sending = 0;
+  s6.shut();
+  s6.sockets.length = 0;
+  delete performance.now;
 }
 
 // 6. A relay socket that closes (phone hotspot on, network switch, tab frozen) is redialled,

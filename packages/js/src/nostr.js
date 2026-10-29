@@ -63,6 +63,9 @@ export const RECONNECT_MS = 1000;
 export const MAX_RECONNECT_MS = 30000;
 // A socket still connecting this long when the network changes is given up and redialled.
 const CONNECT_TIMEOUT_MS = 5000;
+// The pacing (buckets, holds, bans, queue ages) runs on a monotonic clock: a wall clock
+// set back (NTP, the phone's network time, a restored VM) would stall every relay that long.
+const clock = () => performance.now();
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -150,7 +153,7 @@ export class NostrSignaling {
     ws.onerror = () => opened();
     ws.onclose = () => this.lostSocket(ws);
     ws.onmessage = (m) => void this.onRelay(url, m.data).catch(() => {});
-    ws.dialled = Date.now();
+    ws.dialled = clock();
     this.sockets.push(ws);
   }
 
@@ -183,7 +186,7 @@ export class NostrSignaling {
     if (this.closed) return;
     for (const ws of [...this.sockets]) {
       const open = ws.readyState === WebSocket.OPEN;
-      const stuck = ws.readyState === WebSocket.CONNECTING && Date.now() - ws.dialled < CONNECT_TIMEOUT_MS;
+      const stuck = ws.readyState === WebSocket.CONNECTING && clock() - ws.dialled < CONNECT_TIMEOUT_MS;
       if ((open && !all) || stuck) continue;
       clearTimeout(this.retry.get(ws.relayUrl)?.timer);
       this.retry.delete(ws.relayUrl);
@@ -205,7 +208,7 @@ export class NostrSignaling {
     const id = await sha256(enc.encode(JSON.stringify([0, this.pubkey, created_at, KIND, tags, content])));
     const sig = this.pw.nostrSign(this.key.secret, id);
     const ev = { id: hex(id), pubkey: this.pubkey, created_at, kind: KIND, tags, content, sig: hex(sig) };
-    const e = { id: ev.id, msg: JSON.stringify(['EVENT', ev]), at: Date.now(), seq: ++this.seq, tries: 0, sent: 0 };
+    const e = { id: ev.id, msg: JSON.stringify(['EVENT', ev]), at: clock(), seq: ++this.seq, tries: 0, sent: 0 };
     for (const ws of this.sockets) {
       if (ws.readyState !== WebSocket.OPEN || this.banned.get(ws.relayUrl)?.until > e.at) continue;
       this.queue(ws, { ...e });
@@ -229,20 +232,22 @@ export class NostrSignaling {
 
   // Sends what waits on `ws` as its relay's rate allows, and comes back when it allows more.
   // Once closed, all of it goes at once (a leaving room's last messages), but not to a relay
-  // that banned us.
+  // that banned us or holds us for its rate.
   pump(ws) {
     clearTimeout(ws.pumpTimer);
     ws.pumpTimer = null;
     const q = ws.q;
     if (!q?.length || ws.readyState !== WebSocket.OPEN) return;
-    const now = Date.now();
+    const now = clock();
     while (q.length && now - q[0].at > RELAY_QUEUE_MS) {
       q.shift();
       this.stats.unsent++;
     }
     const url = ws.relayUrl;
-    const hold = Math.max(this.banned.get(url)?.until ?? 0, this.closed ? 0 : this.paused.get(url)?.until ?? 0) - now;
-    if (hold > 0) return this.pumpIn(ws, hold);
+    const hold = Math.max(this.banned.get(url)?.until ?? 0, this.paused.get(url)?.until ?? 0) - now;
+    // Once closed, a held relay is sent nothing: what waits goes through the free ones,
+    // and there is always one (see release()).
+    if (hold > 0) return this.closed ? undefined : this.pumpIn(ws, hold);
     const r = this.rate(url, now);
     const inflight = (ws.inflight ??= new Map());
     while (q.length && (r.tokens >= 1 || this.closed)) {
@@ -267,8 +272,9 @@ export class NostrSignaling {
   rate(url, now) {
     let r = this.rates.get(url);
     if (!r) this.rates.set(url, (r = { tokens: RELAY_RATE * RELAY_BURST_S, at: now, rate: RELAY_RATE, low: RELAY_RATE, lowAt: now }));
-    r.rate = Math.min(RELAY_RATE, r.low + (now - r.lowAt) / RELAY_RAISE_MS);
-    r.tokens = Math.min(Math.max(1, r.rate * RELAY_BURST_S), r.tokens + ((now - r.at) / 1000) * r.rate);
+    // Clamped too, should the clock ever step back: no debt, and never below MIN_RELAY_RATE.
+    r.rate = Math.max(MIN_RELAY_RATE, Math.min(RELAY_RATE, r.low + Math.max(0, now - r.lowAt) / RELAY_RAISE_MS));
+    r.tokens = Math.min(Math.max(1, r.rate * RELAY_BURST_S), r.tokens + (Math.max(0, now - r.at) / 1000) * r.rate);
     r.at = now;
     return r;
   }
@@ -276,7 +282,7 @@ export class NostrSignaling {
   // While no open relay is free (none held or banned), the hold that ends first is cut
   // short: a join or a pipe always has a relay to go through, at that relay's rate.
   release() {
-    const now = Date.now();
+    const now = clock();
     const open = this.sockets.filter((ws) => ws.readyState === WebSocket.OPEN && !(this.banned.get(ws.relayUrl)?.until > now));
     if (!open.length || open.some((ws) => !(this.paused.get(ws.relayUrl)?.until > now))) return;
     const ws = open.reduce((a, b) => (this.paused.get(b.relayUrl).until < this.paused.get(a.relayUrl).until ? b : a));
@@ -287,7 +293,7 @@ export class NostrSignaling {
   // How long until an open relay could take one more event (0: one can now). The pipe
   // waits this long before its next batch, so its batches fill rather than queue here.
   wait() {
-    const now = Date.now();
+    const now = clock();
     let ms = Infinity;
     for (const ws of this.sockets) {
       if (ws.readyState !== WebSocket.OPEN) continue;
@@ -342,7 +348,7 @@ export class NostrSignaling {
     const ws = this.sockets.find((s) => s.relayUrl === url);
     const e = ws?.inflight?.get(id);
     ws?.inflight?.delete(id);
-    const now = Date.now();
+    const now = clock();
     const p = this.paused.get(url);
     if (ok === true) {
       // It took one sent since its last hold began: a refusal from now on starts over.

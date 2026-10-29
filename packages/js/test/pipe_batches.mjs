@@ -26,6 +26,7 @@ globalThis.clearTimeout = (t) => {
   if (t) t.fn = null;
 };
 Date.now = () => now;
+performance.now = () => now;
 const tick = () => new Promise((r) => setImmediate(r)); // the end of a task, which no clock holds back
 async function advance(ms) {
   const end = now + ms;
@@ -130,6 +131,29 @@ await advance(1);
 if (batches(from) !== '5') fail(`once it could, ${batches(from) || 'nothing'} went, not one batch of 5`);
 free = 0;
 console.log('paced signalling: a batch waits while the signalling can take none, then goes whole');
+
+// Signalling that says 30 s but comes free sooner (a relay opened, a hold was cut short): the pipe asks again at
+// least once a second, so the batch goes within a second of that, not 30 s later.
+await idle();
+from = out.length;
+free = now + 30000;
+send(2, 100);
+await advance(PIPE_FLUSH_MS);
+free = 0;
+await advance(1000);
+if (batches(from) !== '2') fail(`with signalling free again early, ${batches(from) || 'nothing'} went within a second, not one batch of 2`);
+console.log('paced signalling: the pipe asks the signalling again at least once a second');
+
+// The pipes' budget runs on a monotonic clock (NB6H-1): the wall clock set back 60 s doesn't stall them.
+await idle();
+await advance(2000);
+from = out.length;
+Date.now = () => now - 60000;
+send(2, 100);
+await advance(PIPE_FLUSH_MS);
+Date.now = () => now;
+if (batches(from) !== '2') fail(`with the wall clock set back 60 s, ${batches(from) || 'nothing'} went, not one batch of 2`);
+console.log('wall clock set back: the pipes still send');
 t.close();
 console.log('pipe batches: all passed');
 process.exit(0);
