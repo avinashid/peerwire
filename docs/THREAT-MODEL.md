@@ -56,13 +56,14 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `ddf8321` (2026-10-29).** Fixes merged after `@peerwire/js` 0.2.0
+**Status as of main `5ae3c4e` (2026-10-29).** Fixes merged after `@peerwire/js` 0.2.0
 and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
 |---|---|
 | SEC-1 (High) | **Fixed** in NB-021 (`ccc3b79`), with its review findings N21-1 and N21-2 |
-| SEC-2 (Medium) | **Fixed in JS** (NB-022): hello body encrypted to the room; open in Rust/Godot (NB-022b, before a native or Godot release) |
+| SEC-2 (Medium) | **Fixed** in JS by NB-022 (hello body encrypted to the room), and in Rust/Godot by NB-022b (below) |
+| NB22-1 (Medium), NB22-2 (Low) | **Fixed** by `4e3c146`, merged `e205792`, before any native or Godot release (Rust/Godot hellos sealed as `nostr.js` seals them; `room.js` skips a hello marked `meta.nb`), reviewed 2026-10-29; residual NB22-I1 (Info, accepted; docs `494a400`, merged `9159b08`), [SEC-2](#sec-2--room-hello-discloses-the-long-term-peerid-in-cleartext-medium--nb-022) |
 | SEC-3 (Medium) | Fixed for rooms (NB-031 Rust, NB-037 JS); open for a bare `WebRtcTransport` |
 | SEC-4…SEC-8 | Open (NB-024…NB-028) |
 | SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 audit and N29-1 fix |
@@ -102,10 +103,11 @@ and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 | DOC-2b (Low) | **Fixed** by `8b7946c`, merged `45c7cfd` (a catch-up's deletions passed on one range per range of it, charged to the sender's budget), reviewed 2026-10-27; residuals DOC-2c and I6, same section |
 | DOC-4, DOC-5 (Low) | **Fixed** by `f40cffa` (the merge of `ff51ce6`): a member over signalling is paused for a better routed one once per answer; a room with no doc open drops deflated doc frames unread. Reviewed 2026-10-28; residual I8, same section |
 | NB6F-1, NB6F-2, NB6F-3 (Low) | **Fixed** by `2e71dc5`, merged `8140998`, before `persist` was published (an opening that couldn't read the copy never writes it; one save at a time, paced at 256 KiB/s; a 5 s load deadline). The seal is security's call, in `52bb7e3`. Reviewed 2026-10-28; residuals R1–R4, [Docs kept on this device](#docs-kept-on-this-device-persist-nb-006f--nb6f-1nb6f-3) |
-| NB6F-2a (Info) | Open (NB-006f2), same section |
+| NB6F-2a (Info) | **Fixed** by `b45e15c`, merged `76bdd64` (each retry of a store that keeps failing waits twice as long, 1 s up to 64 s, until a save succeeds), reviewed 2026-10-29, same section |
 | I3a (Info), I4 (accepted) | **Fixed** by `1b0fc35` (the `VERSION` comment covers a copy read only in part; `close()` and `leave()` say they wait for the store), same section |
 | NB6H-1 (Low), NB6H-2, I1, I2 (Info) | **Fixed** by `c1b3878`, merged `71f5c6e`, with NB6H-2's first half by `dc156a3` (relay pacing on a monotonic clock, with clamps; the pipe asks `wait()` again each second; a held relay is sent nothing at close; `wait?()` typed). Reviewed 2026-10-29, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
-| NB6I-1 (Low) | **Fixed** by `dc156a3`, merged `6a60ef0` (a relay slowed behind its queue gives up its turn), beside the lead's close fix `cf4a0a9`. Reviewed 2026-10-29; a relay that answers OK and delivers nothing gets 1/n of the pipe (accepted); residual NB-006j (a half-open relay), same section |
+| NB6I-1 (Low) | **Fixed** by `dc156a3`, merged `6a60ef0` (a relay slowed behind its queue gives up its turn), beside the lead's close fix `cf4a0a9`. Reviewed 2026-10-29; a relay that answers OK and delivers nothing gets 1/n of the pipe (accepted), same section |
+| Half-open relay (Low) | **Fixed** by `659eb28`, merged `5ae3c4e` (NB-006j: a relay that has answered nothing for 5 s since it was sent an event gets no pipe turns while one that answers is left; its next OK gives them back), reviewed 2026-10-29; residuals NB6J-I1…I4 (Info, accepted), same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -175,28 +177,49 @@ hello and exchange the real PeerId inside the sealed channel; (c) at minimum
 document that room membership reveals every member's identity to anyone who knows
 the room name, so room names must be treated as secrets.
 
-**Status: fixed in JS (NB-022); open in Rust/Godot (NB-022b).** Two earlier steps
+**Status: fixed, in JS (NB-022) and in Rust/Godot (NB-022b).** Two earlier steps
 narrowed it: NB-031 (Rust) and NB-037 (JS) derive a room key, separate from the
 topic, from the name, and a hello is acted on only with its HMAC proof, so someone
 without the name can no longer get dialled. NB-022 then encrypts the JS hello body
 (AES-GCM, key `sha256("peerwire/room-enc/<room>")`, random 12-byte nonce), so a
 relay or kind-25059 subscriber without the room name can't read the PeerId. It
-still sees that a hello was posted (room tag, fixed ~304-char body), the ephemeral
-pubkey and `created_at`, and via the inbox tag (SEC-5) a stable per-PeerId handle.
-Freshness comes from the NB-037 proof (`meta.ts`, 60 s): a replayed hello is
-refused once it is older than that. The residual is inherent: a peer that holds the
-room name (a legitimate member, or anyone who learns it) can read and forge hellos
-and learns the PeerIds of everyone in the room, the same bar as joining. Option (c)
-is also done: the docs say private room names need at least 128 random bits
-(`randomRoomId()`), and a guessable name is a public lobby.
+still sees that a hello was posted (room tag, a body whose length shows its kind,
+NB22-I1), the ephemeral pubkey and `created_at`, and via the inbox tag (SEC-5) a
+stable per-PeerId handle. Freshness comes from the NB-037 proof (`meta.ts`, 60 s): a
+replayed hello is refused once it is older than that. The residual is inherent: a
+peer that holds the room name (a legitimate member, or anyone who learns it) can read
+and forge hellos and learns the PeerIds of everyone in the room, the same bar as
+joining. Option (c) is also done: the docs say private room names need at least 128
+random bits (`randomRoomId()`), and a guessable name is a public lobby.
 
-**Still open (NB-022b):** Rust/Godot hellos are still plaintext. Godot `join_room`
-uses the Rust `NostrSignaling` with the default public relays, so every native or
-Godot room member publishes its PeerId in the clear to any kind-25059 subscriber;
-this must be fixed before a native or Godot release (NB22-1). JS and Rust currently
-drop each other's hellos, but only because JS can't open a plaintext one: Rust marks
-its hello `meta.nb` while `room.js` checks `meta.pw`, so once Rust encrypts, JS
-would dial Rust peers unless the marker is reconciled (NB22-2).
+**NB22-1 — Rust/Godot hellos were plaintext (Medium).** Godot `join_room` uses the
+Rust `NostrSignaling` with the default public relays, so every native or Godot room
+member published its PeerId in the clear to any kind-25059 subscriber. **Fixed** by
+`4e3c146` (NB-022b), merged `e205792`, before any native or Godot release:
+- `traversal.rs` seals a hello byte for byte as `nostr.js` does: a 12-byte nonce,
+  then AES-256-GCM (no AAD) under `sha256("peerwire/room-enc/<app>/<room>")`.
+- A hello that doesn't open is dropped before it is parsed: plaintext, another
+  room's, altered or cut. One longer than the longest sealed hello is refused before
+  decrypting.
+- A cross-stack vector made by `sealRoom` is pinned in both stacks
+  (`hello_seal_matches_nostr_js`, `packages/js/test/rust_hello.mjs`).
+- `aes-gcm` is a dependency of the `peerwire` crate only; the wasm is unchanged.
+
+Native nodes from before `4e3c146` and after it don't find each other through room
+hellos. No native release has shipped, so this goes in the first one's notes.
+
+**NB22-2 — The native-hello marker (Low).** JS and Rust dropped each other's hellos
+only because JS couldn't open a plaintext one: Rust marks its hello `meta.nb` while
+`room.js` checked `meta.pw`, so once Rust sealed its hellos, a browser would have
+dialled native members over WebRTC. **Fixed** by `4e3c146`: `room.js` skips a hello
+marked `meta.nb` or `meta.pw`, and a test feeds it Rust's sealed hello.
+
+**NB22-I1 — A sealed hello's length shows what kind of member sent it (Info,
+accepted).** A native hello is 316 base64 characters (320 for a `client`), a
+browser's 304 (308). So a relay can tell a native member from a browser and a client
+from a host or peer, but not who it is. The fix, if it is ever wanted, is to pad both
+stacks' hellos to one length. Documented in NAT-TRAVERSAL and the README by
+`494a400`, merged `9159b08`.
 
 ### SEC-3 — Sealed-offer probe reveals IP candidates to anyone who knows your PeerId (Medium) — NB-023
 
@@ -246,8 +269,7 @@ The per-peer tag is `sha256("peerwire/peer/<PeerId>")`, a fixed function of the
 public PeerId. Anyone who knows a target's PeerId can compute the tag and
 subscribe to it on the public relays to learn whenever that identity is addressed,
 and to correlate activity across sessions and rooms. (SEC-2 hands out the PeerIds
-to room-name holders, and to anyone in Rust/Godot rooms until NB-022b; even
-without it, PeerIds are shared in invites.)
+to room-name holders; even without it, PeerIds are shared in invites.)
 
 **Fix.** Derive the routing tag from a rotating, room- or epoch-scoped secret
 rather than from the bare PeerId, so the tag is unlinkable to anyone who only
@@ -1325,10 +1347,18 @@ and `leave()` never resolved.
   - **I3a**, fixed by `1b0fc35`: `parseFrame` and `restore()` ignore fields they don't
     know, so an older release would save such a copy back without them. The comment now
     also says "or read only in part".
-- **NB6F-2a**, open (NB-006f2): a store that keeps failing (a full disk) is retried every
-  `SAVE_MS` while the doc changes, and each retry builds and seals the whole doc before
-  the store refuses it: CPU only, about 60 ms a second for a full doc. Fix: back off
-  over consecutive failures.
+- **NB6F-2a**, fixed by `b45e15c` (NB-006f2), merged `76bdd64`: a store that kept
+  failing (a full disk) was retried every `SAVE_MS` while the doc changed, and each
+  retry built and sealed the whole doc before the store refused it: CPU only, about
+  60 ms a second for a full doc.
+  - After a failed save, the next now waits `SAVE_MS` doubled for each failure in a row
+    before it, 6 times at most: 1, 2, 4 … 64 s, then every 64 s. A save that succeeds
+    resets the count.
+  - Hiding the page, `close()` and `leave()` still save at once.
+  - A member can't reset the count for us: that takes a save that succeeds, paced by
+    the doc's size, and refilling the doc costs the member the same bytes.
+  - The `doc_crdt` test: a full doc changed every 100 ms with saves failing is tried at
+    1, 2, 4, 8, 16, 32, 64, 128, 192 and 256 s in 300 s.
 - **I4**, accepted, documented in `index.d.ts` by `1b0fc35`: `close()` and `leave()`
   resolve only once a save in flight settles, so a store whose save never settles holds
   them. `leave()` has closed the network by then, and `@peerwire/react` doesn't await it.
@@ -1389,9 +1419,11 @@ sockets (no relay):
 batch, whose datagrams the core resends if they are lost. Everything else goes through
 each relay: hellos, offers, answers, candidates, the Bye and the `close()` batches.
 - **The choice.** `next()` takes, from `turn` on, the first open relay that has neither
-  banned nor held us and can take the event within `HOLD_MS` (1 s). If there's none,
-  the open, unbanned one free soonest takes it. Once closed, any relay not holding us
-  takes it.
+  banned nor held us, isn't silent (NB-006j, below) and can take the event within
+  `HOLD_MS` (1 s). If there's none, the open, unbanned relay that answers and is free
+  soonest takes it; with only silent relays left, the same rules pick among them. Once
+  closed, a relay that answers and isn't slowed comes first, then a slowed one, then a
+  silent one; one holding us comes last, since it is sent nothing.
 - **`lossy` is a hint** (`opts?.lossy === true`). BroadcastSignaling, and any adapter
   that ignores it, sends every way, as before.
 - **A refused lossy event** is one object with one count of tries, sent through the next
@@ -1490,7 +1522,8 @@ Repro: a scratch probe measuring our own code's cost.
 - **At close** (the lead's guard), any relay not holding us takes the batch, however
   long its queue, because everything goes at once and a held relay is sent nothing.
   Without the guard, the batch could land on a relay held for less than `HOLD_MS` and be
-  dropped, as before `cf4a0a9`.
+  dropped, as before `cf4a0a9`. NB-006j replaced the guard with its ranking, which
+  still puts a held relay last at close.
 - **Tests,** `nostr_bounds` 5c:
   - with a relay at 0.5 a second and 8 queued, `wait()` is 250 ms, against 18 s without
     the fix;
@@ -1506,10 +1539,7 @@ Repro: a scratch probe measuring our own code's cost.
     the bar is 60 s.
   - Before NB-006i the other relays carried a copy of each batch, so such a relay cost
     nothing.
-- **A half-open relay, NB-006j (Low).** A socket that is still `OPEN` but whose relay is
-  gone takes its turns until the browser closes it, and what it takes is lost.
-  Suggested fix: a relay whose oldest event has waited about 5 s for its OK counts as
-  held. NIP-01 relays answer within a round trip, so this needs no wire change.
+- **A half-open relay (Low)**, fixed by NB-006j, below.
 - **Relays of different rates** (accepted). While each can take the next batch within
   `HOLD_MS`, they still take equal turns, so the pipe moves at about the slowest relay's
   rate times n.
@@ -1522,6 +1552,55 @@ Repro: a scratch probe measuring our own code's cost.
   10 s at 6 a second. Before NB-006h, everything went out at once anyway.
 - **Every relay banned.** `wait()` lasts until the first ban ends, up to 10 min. Nothing
   could be carried meanwhile.
+
+**A half-open relay (Low).** With striping, a socket still `OPEN` whose relay was gone
+(a half-open connection, a stalled relay) took its turns until the browser closed it,
+and what it took was lost. Before NB-006i the other relays carried a copy of each batch.
+
+**Fixed** by `659eb28` (NB-006j), merged `5ae3c4e`:
+- **Silent.** A relay is silent once an event sent to it `SILENT_MS` (5 s) ago has had
+  no OK since, taken or refused. The mark (`ws.asked`) is the time of the first EVENT
+  sent since its last OK, on `performance.now()`. Any OK clears it, the REQ doesn't
+  set it, and a new socket starts without one.
+- **Turns.** While a relay that answers is left, `next()` and `wait()` pass over a
+  silent one. Its next OK gives its turns back. With only silent relays left (a frozen
+  tab waking with its OKs unread), they take turns as before, so nothing stalls.
+- **Nothing new is sent.** A silent relay still gets every non-lossy event, which is
+  also how it gets the chance to answer. There's no new timer, and the state is one
+  number per socket.
+- **A relay can only make itself silent.** It can't mark another relay silent or pull
+  more than its 1/n. An on-path attacker who drops honest relays' OKs could already
+  drop those relays.
+- **NIP-01 relays answer OK within a round trip,** so this needs no wire change. The
+  three default relays answered a hello in 0.2–1.2 s.
+- **Tests.**
+  - `nostr_bounds` 5d: a socket that never answers loses its turns 5 s after its first
+    event and gets them back on an OK; one answering at 4 s keeps them; the order at
+    close is pinned.
+  - `doc_catchup` (i): relay-3 goes half-open as the joiner links. No pipe batch lands
+    on it more than `SILENT_MS` after its first unanswered event, and the whole board
+    arrives in 8.5–15.1 s (bar 30 s), against 32 s, 39 s or a stall past 60 s on
+    `ddf8321`.
+  - 29 of 29 mutants caught.
+
+**Info, accepted:**
+- **NB6J-I1.** `release()` counts a silent relay as free. With every relay that answers
+  held and one silent, no hold is cut short: the pipe waits on the first hold to end
+  instead of writing into the silent relay. A relay holds us only by its own refusals:
+  1 s (`HOLD_MS`) after an OK that took an event, and up to 30 s (`MAX_HOLD_MS`) only
+  after refusals in a row. The core resends what is late.
+- **NB6J-I2, the receive side.** If our own socket is half-open, its subscription
+  delivers nothing, and senders can't tell. Their batches through that relay are lost
+  to us (1/n, as in `doc_catchup` (h)) until the socket closes. Our socket does show as
+  silent. Follow-up NB-006k: redial a silent relay, but only after its non-lossy events
+  also went unanswered, at most once per relay with back-off, and never in a loop
+  (relays ban an IP for too many connections).
+- **NB6J-I3.** A relay that never sends OK loses its pipe turns for good, though it
+  keeps every other event. One that dropped a single OK gets them back with the OK for
+  our next hello (`HELLO_EVERY_MS`, 15 s).
+- **NB6J-I4.** Any OK clears the mark, even one for an id we don't know. Taking only
+  OKs for ids still in flight would add nothing against a hostile relay, which knows
+  the ids it took: it is the accepted "answers OK, delivers nothing" relay above.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6
 
@@ -2133,7 +2212,7 @@ mappings that carry over and are already handled in Peerwire:
   window; nonce recorded only after authentication (SEC/THREAT items above).
 - **A7 stale/replayed signaling → partially: SEC-6.** Peerwire has no in-band
   signaling-replay guard; carry P0's lesson (bind a fresh session id) into the fix.
-- **A11 metadata / A12 forward secrecy → OPEN here too: SEC-2/3/5 and SEC-7.** The
+- **A11 metadata / A12 forward secrecy → OPEN here too: SEC-3/5 and SEC-7.** The
   same open problems (relay-visible timing/IP, static-key exposure) apply; Peerwire's
   per-session Nostr key and rotating-tag ideas mirror P0's mitigations.
 - **A5 spam / A13 Sybil → relevant to the signaling layer**; the half-open cap
