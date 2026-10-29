@@ -263,11 +263,12 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
 }
 
 // 5c. A lossy event (a pipe batch) goes through one relay, the relays taking turns; any other event goes through
-//     each. A relay that can't take one yet still gets its turn (it waits on its queue), so one that answers OK
-//     but delivers nothing gets no more than its share. One that holds us for its rate, has banned us or isn't
-//     open is skipped; with every open, unbanned one held, the hold that ends first takes it. A lossy event refused
-//     for the rate goes again through the next relay, not the one held. Lossy events sent as wait() allows move at
-//     the relays' rates together, others at one relay's; with relays of different rates, an equal share each.
+//     each. A relay that can't take one yet but can within HOLD_MS still gets its turn (it waits on its queue), so
+//     one that answers OK but delivers nothing gets no more than its share. One that holds us for its rate, has
+//     banned us or isn't open is skipped, and so is one slowed behind its backlog (NB6I-1); with none left, the one
+//     free soonest takes it. A lossy event refused for the rate goes again through the next relay, not the one
+//     held. Lossy events sent as wait() allows move at the relays' rates together, others at one relay's; with
+//     relays of different rates, about an equal share each.
 {
   let clock = 1e6;
   performance.now = () => clock;
@@ -323,9 +324,10 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   const heldC = sent.c.length;
   for (let i = 0; i < 4; i++) await lossy();
   check(sent.c.length === heldC && !sock.c.q.length, 'a relay held for its rate is skipped');
-  // Every relay held: the one whose hold ends first (b) takes it, and wait() says when.
+  // Every relay held: the one free soonest (b, whose hold ends first) takes it, and wait() says when.
   s.paused.set('a', { at: clock, until: clock + 500, ms: 500, took: false });
   s.paused.set('b', { at: clock, until: clock + 300, ms: 300, took: false });
+  s.turn = 0; // a's turn: it is held longer, so it is passed over
   const all = s.wait();
   await lossy();
   check(all === 300 && sock.b.q.length === 1 && !sock.a.q.length && !sock.c.q.length, `with every relay held, the hold that ends first takes it (wait() ${all} ms)`);
@@ -350,7 +352,8 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
 
   // Pacing: send whenever wait() says one can go, for 10 s from empty buckets. Lossy events take every relay's
   // rate, about 3 * RELAY_RATE a second, in turns; others, one relay's. With a and b slowed to MIN_RELAY_RATE
-  // (growing back) and c not (one that never refuses), each still takes a third.
+  // (growing back) and c not (one that never refuses), each still takes about a third: c only the odd turn a slowed
+  // one passes.
   const pace = async (isLossy, slow = []) => {
     reset();
     for (const x of names) tokens(x, 0);
@@ -369,23 +372,42 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   check(Math.abs(striped.m - 30 * RELAY_RATE) <= 3 && striped.each.every((k) => Math.abs(k - 10 * RELAY_RATE) <= 1) && Math.abs(full.m - 10 * RELAY_RATE) <= 1,
     `paced by wait() for 10 s, ${striped.m} lossy events go (${striped.each.join(', ')} per relay), ${full.m} others (each relay ${RELAY_RATE}/s)`);
   const uneven = await pace(true, ['a', 'b']);
-  check(Math.max(...uneven.each) - Math.min(...uneven.each) <= 1 && uneven.m > 0,
+  check(Math.max(...uneven.each) - Math.min(...uneven.each) <= 2 && uneven.each[2] === Math.max(...uneven.each) && uneven.m > 0,
     `with two relays slowed and one not, each takes its turn: ${uneven.each.join(', ')}`);
 
-  // close(): a lossy event waiting on a relay held for its rate is there alone, so it goes through a free one;
-  // what else waits there went through each relay, and the held one is sent nothing.
+  // NB6I-1: a relay whose turn it is but which is slowed behind other events (at MIN_RELAY_RATE, 8 waiting) would
+  // keep the pipe idle for seconds while the others are free: it is passed over, and wait() is the next one's.
   reset();
+  for (let i = 0; i < 8; i++) await s.publish(s.roomTag, `e${++n}`);
+  Object.assign(s.rate('a', clock), { low: MIN_RELAY_RATE, lowAt: clock, rate: MIN_RELAY_RATE, tokens: 0 });
+  sock.a.q = Array.from({ length: 8 }, (_, i) => ({ id: `q${i}`, msg: '', at: clock, seq: 0, tries: 0, sent: 0 }));
+  s.turn = 0;
+  const backlog = s.wait();
+  await lossy();
+  const on = names.filter((x) => sock[x].q.some((e) => e.lossy));
+  check(backlog <= HOLD_MS && on.join() === 'b' && sock.a.q.length === 8,
+    `a relay slowed behind its backlog is passed over (it waits on ${on.join()}; wait() ${Math.round(backlog)} ms, not ${Math.round(s.free(sock.a, clock))})`);
+
+  // close(): a lossy event waiting on a relay held for its rate is there alone, so it goes through a free one,
+  // even one slowed behind its backlog (once closed, all of it goes at once), rather than a held one free sooner;
+  // what else waits there went through each relay, and the held ones are sent nothing.
+  reset();
+  s.turn = 0;
   tokens('c', 0);
   for (let i = 0; i < 3; i++) await lossy();
   const late = sock.c.q[0]?.id;
   await s.publish(s.roomTag, `e${++n}`);
   const each = sent.a.at(-1);
+  Object.assign(s.rate('a', clock), { low: MIN_RELAY_RATE, lowAt: clock, rate: MIN_RELAY_RATE, tokens: 0 });
+  sock.a.q = Array.from({ length: 8 }, (_, i) => ({ id: `q${i}`, msg: '["EVENT",{"id":"q' + i + '"}]', at: clock, seq: 0, tries: 0, sent: 0 }));
+  s.paused.set('b', { at: clock, until: clock + 300, ms: 300, took: false });
   s.paused.set('c', { at: clock, until: clock + 1000, ms: 1000, took: false });
-  const heldAt = sent.c.length;
+  const heldAt = [sent.b.length, sent.c.length].join();
+  s.turn = 1; // b's turn: held for less than HOLD_MS, it is passed over all the same
   s.close();
-  const once = ['a', 'b'].every((x) => sent[x].filter((id) => id === each).length === 1);
-  check(late && again(late) === 1 && once && sent.c.length === heldAt,
-    `close() sends a lossy event waiting on a held relay through a free one (${through(late)}), no other event twice, and the held one nothing`);
+  const once = sent.a.filter((id) => id === each).length === 1;
+  check(late && through(late) === 'a' && once && [sent.b.length, sent.c.length].join() === heldAt,
+    `close() sends a lossy event waiting on a held relay through a free one (${through(late)}), no other event twice, and the held ones nothing`);
   delete performance.now;
 }
 

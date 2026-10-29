@@ -229,17 +229,19 @@ export class NostrSignaling {
   }
 
   // The socket the next lossy event goes to, from `turn` on: the first open one that has
-  // neither banned us nor holds us for its rate, else the open, unbanned one whose hold ends
-  // first; -1 if none.
+  // neither banned us nor holds us for its rate, and could take it within HOLD_MS (one slowed
+  // by its own refusals, behind what else waits there, is passed over like a held one), else
+  // the open, unbanned one free soonest; -1 if none. Once closed, what waits goes at once but
+  // not to a held relay, so any relay not holding us will do.
   next(now) {
-    let held = -1;
+    let held = -1, soonest = Infinity;
     for (let i = 0; i < this.sockets.length; i++) {
       const k = (this.turn + i) % this.sockets.length;
       const url = this.sockets[k].relayUrl;
       if (this.sockets[k].readyState !== WebSocket.OPEN || this.banned.get(url)?.until > now) continue;
-      const until = this.paused.get(url)?.until;
-      if (!(until > now)) return k;
-      if (held < 0 || until < this.paused.get(this.sockets[held].relayUrl).until) held = k;
+      const f = this.free(this.sockets[k], now);
+      if (!(this.paused.get(url)?.until > now) && (this.closed || f <= HOLD_MS)) return k;
+      if (f < soonest) (held = k), (soonest = f);
     }
     return held;
   }
@@ -339,7 +341,7 @@ export class NostrSignaling {
   // can now, or no relay is open); with every open relay banned, until the first ban ends.
   // The pipe waits this long before its next batch, so its batches fill rather than queue
   // here; with the relays taking turns, it moves at about their rates together while they
-  // keep pace, and at most at the slowest's times their number.
+  // keep pace, and one slowed behind its backlog gives up its turns (see next()).
   wait() {
     const now = clock();
     const k = this.next(now);

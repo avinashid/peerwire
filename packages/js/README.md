@@ -503,11 +503,11 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    every 5 s. It is held for 1 s (doubling to 30 s while it refuses again before taking
    one), and is sent the event again, 3 times in all. A relay isn't held while no other is
    free, so a join or a pipe always has a relay to go through. Each pipe batch goes
-   through one relay, the relays taking turns (one that holds us for its rate, banned us
-   or isn't open is skipped), and every other signal through each. A pipe loads each
-   relay with a share and moves at about their rates together, up to its own 6 batches
-   a second, while they keep pace; a slow relay slows it to its rate times the number of
-   relays. A batch is lost when its relay drops it or the peer doesn't hear that relay,
+   through one relay, the relays taking turns (one that holds us for its rate, banned us,
+   isn't open, or is slowed by its refusals so that it couldn't take the batch within
+   1 s is skipped), and every other signal through each. A pipe loads each relay with a
+   share and moves at about their rates together, up to its own 6 batches a second,
+   while they keep pace; a relay slowed by its refusals gives its turns to the others. A batch is lost when its relay drops it or the peer doesn't hear that relay,
    like a datagram on any path, and the core sends what it carried again: taking turns
    keeps that to one batch in three when one of three relays drops them all. The last
    batches a room sends as it leaves go through every relay, as nothing could send them
@@ -610,10 +610,11 @@ Run these with Node and the Playwright install on this host:
   through a free one). The pacing runs on a monotonic clock: the
   wall clock set back 60 s stalls nothing.
   Pipe batches go through one relay each, the relays taking turns, also one that can't
-  send yet; one held for its rate, banned or closed is skipped, and with every relay held
-  the hold that ends first takes it. One refused for its rate goes again through the next
-  relay. Sent as `wait()` allows, pipe batches move at three relays' rates, other events
-  at one's, and with relays of different rates each takes an equal share. No relays.
+  send yet but can within 1 s; one held for its rate, banned, closed or slowed behind its
+  backlog is skipped, and with none left the one free soonest takes it. One refused for
+  its rate goes again through the next relay. Sent as `wait()` allows, pipe batches move
+  at three relays' rates, other events at one's, and with relays of different rates each
+  takes about an equal share. No relays.
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's; a room that signs
