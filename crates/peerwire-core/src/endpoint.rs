@@ -87,7 +87,9 @@ pub struct Config {
     /// made for that HS1 and that address, and takes no state until it is sent
     /// again with it, so a flood from spoofed addresses can't fill the rest. And
     /// each source (an IPv4 address or IPv6 /64, a relay, a channel) may hold at
-    /// most 4 half-open handshakes. Below that nothing changes.
+    /// most 4 half-open handshakes, not counting those an address anyone can send
+    /// from took below the mark, which may have been spoofed. Below the mark
+    /// nothing changes.
     pub max_pending_handshakes: usize,
     /// Cap on announced links. At it a new HS1 is dropped before the
     /// responder's DH, and an inbound handshake that completes once the cap is
@@ -789,8 +791,8 @@ pub struct Endpoint<A: Address> {
     dialing: BTreeMap<PeerId, u32>,
     /// (initiator index, initiator ephemeral key) of half-open responder links,
     /// for HS1 retransmits, which may arrive over several paths; and the source
-    /// of the first.
-    half_open: HashMap<(u32, [u8; 32]), (u32, Source<A>)>,
+    /// of the first, if it is known (see `on_hs1`).
+    half_open: HashMap<(u32, [u8; 32]), (u32, Option<Source<A>>)>,
     /// The cookie secret of an epoch (see `check_cookie`), and the last epoch's
     /// if it was made: none until the endpoint is first under load.
     secrets: Option<(u64, [u8; 32], Option<[u8; 32]>)>,
@@ -1599,7 +1601,8 @@ impl<A: Address> Endpoint<A> {
         // Under load, before the DH: an address anyone can send from gets a cookie
         // and no state until it echoes it, and each source holds a few at most.
         // Packets on a peer's own channel, or through a relay, can't be spoofed.
-        if self.half_open.len() >= max - max / 4 {
+        let loaded = self.half_open.len() >= max - max / 4;
+        if loaded {
             if let (Path::Direct(a), None) = (&from, owner) {
                 if let Some(c) = self.check_cookie(now, a, sender, &eph, cookie) {
                     self.stats.cookies_sent += 1;
@@ -1608,7 +1611,7 @@ impl<A: Address> Endpoint<A> {
                     return None;
                 }
             }
-            if self.half_open.values().filter(|(_, s)| *s == source).count() >= PER_SOURCE {
+            if self.half_open.values().filter(|(_, s)| s.as_ref() == Some(&source)).count() >= PER_SOURCE {
                 self.stats.rx_handshake_dropped += 1;
                 return None;
             }
@@ -1686,7 +1689,10 @@ impl<A: Address> Endpoint<A> {
         self.emit(from.clone(), peer, hs2.clone());
         let mut link = Link::new(false, sender, transport, now, self.config.relay_burst);
         link.hs2 = Some(hs2);
-        self.half_open.insert((sender, eph), (idx, source));
+        // Counted against its source only if that is known: below the mark an
+        // address anyone can send from may be spoofed, and would use up its quota.
+        let known = loaded || owner.is_some() || matches!(from, Path::Via(_));
+        self.half_open.insert((sender, eph), (idx, known.then_some(source)));
         let relay = match &from {
             Path::Via(r) => Some(*r),
             Path::Direct(_) => inherited.0,
@@ -4125,9 +4131,10 @@ mod tests {
         panic!("a cookie twice");
     }
 
-    /// A source's count is the table's: 4 half-open handshakes taken below the
-    /// mark count under load, and once they expire the source may open more.
-    /// Validated handshakes still stop at the cap.
+    /// A source's count is the table's: under load, 4 half-open handshakes taken
+    /// with cookies fill a source's quota, and once they expire it may open more
+    /// the next time the endpoint is under load. Validated handshakes still stop
+    /// at the cap.
     #[test]
     fn a_source_may_open_more_once_its_half_open_handshakes_expire() {
         let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
@@ -4135,30 +4142,98 @@ mod tests {
         let config = Config { max_pending_handshakes: 64, ..Config::default() }; // the mark: 48
         let mut ep = Endpoint::<u32>::new(&ids[1], config, [2; 32]);
         let mut t = Instant::from_millis(1);
-        let hs = hs1s(&ids[0], &b, 1000..1006);
-        for p in &hs[..4] {
-            assert_eq!(answer(&mut ep, t, 1, p), Some(wire::HS2));
+        let flood = hs1s(&ids[2], &b, 0..96);
+        // Brings `ep` to the mark with the flood's HS1s `range`, each from its own address.
+        let fill = |ep: &mut Endpoint<u32>, t: Instant, range: std::ops::Range<usize>| {
+            for i in range {
+                ep.handle_datagram(t, 100 + i as u32, &flood[i]);
+            }
+            sent(ep, t);
+        };
+        fill(&mut ep, t, 0..48);
+        let hs = hs1s(&ids[0], &b, 1000..1005);
+        for (i, p) in hs.iter().enumerate() {
+            assert_eq!(answer(&mut ep, t, 1, p), (i < 4).then_some(wire::HS2), "{i}");
         }
-        let flood = hs1s(&ids[2], &b, 0..48);
-        t = Instant::from_millis(5_001);
-        for (i, p) in flood[..44].iter().enumerate() {
-            ep.handle_datagram(t, 100 + i as u32, p);
-        }
-        sent(&mut ep, t);
-        assert_eq!(answer(&mut ep, t, 1, &hs[4]), None);
+        assert_eq!(ep.half_open.len(), 52);
         t = Instant::from_millis(10_001);
         ep.handle_timeout(t);
-        assert_eq!(ep.half_open.len(), 44);
-        for (i, p) in flood[44..].iter().enumerate() {
-            ep.handle_datagram(t, 144 + i as u32, p);
-        }
-        sent(&mut ep, t);
-        assert_eq!(answer(&mut ep, t, 1, &hs[5]), Some(wire::HS2));
+        assert_eq!(ep.half_open.len(), 0);
+        fill(&mut ep, t, 48..96);
+        assert_eq!(answer(&mut ep, t, 1, &hs[4]), Some(wire::HS2));
         for (i, p) in hs1s(&ids[0], &b, 2000..2016).iter().enumerate() {
             assert_eq!(answer(&mut ep, t, 200 + i as u32, p), (i < 15).then_some(wire::HS2), "{i}");
         }
         let s = ep.stats();
-        assert_eq!((s.rx_handshake_dropped, ep.half_open.len(), s.cookies_sent), (2, 64, 18));
+        assert_eq!((s.rx_handshake_dropped, ep.half_open.len(), s.cookies_sent), (2, 64, 22));
+    }
+
+    /// NB24-1: below the mark a handshake from an address anyone can send from
+    /// takes state with no cookie, so that address may be spoofed: it isn't counted
+    /// against its source. A flood that brings b to the mark with 4 of its HS1s from
+    /// a's address doesn't keep a out: a's dial takes a cookie and links, as with
+    /// none from there.
+    #[test]
+    fn handshakes_spoofed_below_the_mark_dont_fill_a_source() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let b = ids[1].peer_id();
+        let config = Config { max_pending_handshakes: 64, ..Config::default() }; // the mark: 48
+        for spoofs in [0, 4] {
+            let mut eps: Vec<Endpoint<u32>> =
+                ids[..2].iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, config.clone(), [s; 32])).collect();
+            let mut t = Instant::from_millis(1);
+            for (i, p) in hs1s(&ids[2], &b, 0..48).iter().enumerate() {
+                eps[1].handle_datagram(t, if i < spoofs { 1 } else { 100 + i as u32 }, p);
+            }
+            sent(&mut eps[1], t);
+            eps[0].connect(t, 2, b).unwrap();
+            route(&mut eps, &mut t, 5_000, None);
+            assert!(eps[0].is_connected(&b), "{spoofs} spoofed");
+            let s = eps[1].stats();
+            assert_eq!((s.cookies_sent, s.rx_handshake_dropped), (1, 0), "{spoofs} spoofed");
+        }
+    }
+
+    /// Below the mark a handshake on a peer's own channel, or through a relay, is
+    /// counted against its source all the same, as neither can be spoofed: under
+    /// load, a channel or a relay that took 4 below it has no room left. Another
+    /// source still has, with a cookie.
+    #[test]
+    fn a_channel_or_a_relay_counts_what_it_took_below_the_mark() {
+        let config = Config { max_pending_handshakes: 64, ..Config::default() }; // the mark: 48
+        let ids: Vec<Identity> = (1..=4u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b, r) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id());
+        // a, b and r at addresses 1, 2 and 3, a and b linked to r.
+        let mut eps: Vec<Endpoint<u32>> =
+            ids[..3].iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, config.clone(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, 3, r).unwrap();
+        eps[1].connect(t, 3, r).unwrap();
+        route(&mut eps, &mut t, 100, None);
+        assert!(eps[0].is_connected(&r) && eps[1].is_connected(&r));
+        // The `i`th HS1 on a's channel to b, and the `i`th from d through r (what b
+        // answers either with is lost); how many half-open handshakes b took.
+        let (own, far) = (hs1s(&ids[0], &b, 1000..1005), hs1s(&ids[3], &b, 2000..2005));
+        let took = |eps: &mut [Endpoint<u32>], t: &mut Instant, i: usize| {
+            let n = eps[1].half_open.len();
+            eps[1].handle_datagram_from(*t, 7, &a, &own[i]);
+            eps[0].relay_out(r, &b, far[i].clone());
+            route(eps, t, 10, None);
+            eps[1].half_open.len() - n
+        };
+        for i in 0..4 {
+            assert_eq!(took(&mut eps, &mut t, i), 2, "{i}");
+        }
+        for (i, p) in hs1s(&ids[3], &b, 0..40).iter().enumerate() {
+            eps[1].handle_datagram(t, 100 + i as u32, p);
+        }
+        sent(&mut eps[1], t);
+        assert_eq!(eps[1].half_open.len(), 48);
+        let dropped = eps[1].stats().rx_handshake_dropped;
+        assert_eq!(took(&mut eps, &mut t, 4), 0);
+        assert_eq!(eps[1].stats().rx_handshake_dropped - dropped, 2);
+        assert_eq!(answer(&mut eps[1], t, 9, &hs1s(&ids[3], &b, 3000..3001)[0]), Some(wire::HS2));
+        assert_eq!(eps[1].stats().cookies_sent, 1);
     }
 
     /// SEC-4: 5000 valid HS1s a second, each with its own index and ephemeral key

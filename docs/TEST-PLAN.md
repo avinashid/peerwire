@@ -116,8 +116,10 @@ workspace first and takes several times that. With no Rust change since `origin/
   real address links 10 ms after it starts (on main it fails after 23.5 s, the table full); below the mark a
   handshake is HS1 and HS2 alone, at it a COOKIE and an HS1C come between; a cookie holds only for its HS1's index
   and ephemeral key and its address, in its epoch and the next; under load a source holds 4 half-open
-  handshakes, a peer's channel needs no cookie; an IPv4 address and an IPv6 /64 are one source; a dial takes a
-  cookie only for its index from an address it dials, and `handle_datagram_direct` says false for it.
+  handshakes, a peer's channel needs no cookie; 4 HS1s spoofed from an address below the mark don't count
+  against it (NB24-1), so a dial from there still links, while 4 taken there on a channel or through a relay do;
+  an IPv4 address and an IPv6 /64 are one source; a dial takes a cookie only for its index from an address it
+  dials, and `handle_datagram_direct` says false for it.
 - `reliable`: out-of-order reassembly, ACK and retransmit, tail-loss probe beats the RTO, urgent fragments are
   sent twice, urgent goes ahead of queued reliable data within the shared window and takes at most half of it,
   each stream stays within the receiver's window and has its own buffer, urgent fragments in flight span at

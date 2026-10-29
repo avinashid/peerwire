@@ -70,7 +70,8 @@ complete host loop on std UDP sockets.
     three quarters of the cap, an HS1 from a UDP address takes no state until it echoes a
     cookie (16 bytes of HMAC-BLAKE2s over its index, its ephemeral key and the address, under
     a secret new every 2 minutes), and each IPv4 address, IPv6 /64, relay or channel holds at
-    most 4 half-open handshakes.
+    most 4 half-open handshakes. Those a UDP address took below the mark don't count, as they
+    may have been spoofed.
 - **Simultaneous open** (both sides dialling, as in hole punching): the dial from the smaller
   PeerId wins, so exactly one link results.
 - **Data packets:**
