@@ -64,7 +64,7 @@ const PATH_GRACE: Duration = Duration::from_secs(1);
 /// every `COOKIE_EPOCH`, and a cookie holds for the rest of its epoch and the next.
 const COOKIE_EPOCH: Duration = Duration::from_secs(120);
 /// Under load, the half-open handshakes one source may hold (see [`Source`]).
-const PER_SOURCE: u32 = 4;
+const PER_SOURCE: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -380,7 +380,7 @@ impl<A: Address> Dial<A> {
 
 /// What half-open handshakes are counted against under load ([`PER_SOURCE`]): a
 /// UDP address's IPv4 address or IPv6 /64, any other address itself, or a relay.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq)]
 enum Source<A> {
     Net(IpAddr),
     Path(Path<A>),
@@ -791,8 +791,6 @@ pub struct Endpoint<A: Address> {
     /// for HS1 retransmits, which may arrive over several paths; and the source
     /// of the first.
     half_open: HashMap<(u32, [u8; 32]), (u32, Source<A>)>,
-    /// How many half-open links each source holds.
-    by_source: HashMap<Source<A>, u32>,
     /// The cookie secret of an epoch (see `check_cookie`), and the last epoch's
     /// if it was made: none until the endpoint is first under load.
     secrets: Option<(u64, [u8; 32], Option<[u8; 32]>)>,
@@ -818,7 +816,6 @@ impl<A: Address> Endpoint<A> {
             peers: BTreeMap::new(),
             dialing: BTreeMap::new(),
             half_open: HashMap::new(),
-            by_source: HashMap::new(),
             secrets: None,
             outbox: VecDeque::new(),
             ready: VecDeque::new(),
@@ -1611,7 +1608,7 @@ impl<A: Address> Endpoint<A> {
                     return None;
                 }
             }
-            if self.by_source.get(&source).is_some_and(|&n| n >= PER_SOURCE) {
+            if self.half_open.values().filter(|(_, s)| *s == source).count() >= PER_SOURCE {
                 self.stats.rx_handshake_dropped += 1;
                 return None;
             }
@@ -1689,8 +1686,7 @@ impl<A: Address> Endpoint<A> {
         self.emit(from.clone(), peer, hs2.clone());
         let mut link = Link::new(false, sender, transport, now, self.config.relay_burst);
         link.hs2 = Some(hs2);
-        self.half_open.insert((sender, eph), (idx, source.clone()));
-        *self.by_source.entry(source).or_default() += 1;
+        self.half_open.insert((sender, eph), (idx, source));
         let relay = match &from {
             Path::Via(r) => Some(*r),
             Path::Direct(_) => inherited.0,
@@ -2212,19 +2208,7 @@ impl<A: Address> Endpoint<A> {
 
     /// Forgets session `idx`'s half-open handshake, if it has one.
     fn forget_half_open(&mut self, idx: u32) {
-        let by_source = &mut self.by_source;
-        self.half_open.retain(|_, (i, source)| {
-            if *i != idx {
-                return true;
-            }
-            if let Some(n) = by_source.get_mut(source) {
-                *n -= 1;
-                if *n == 0 {
-                    by_source.remove(source);
-                }
-            }
-            false
-        });
+        self.half_open.retain(|_, (i, _)| *i != idx);
     }
 
     fn drop_link(&mut self, idx: u32, reason: Option<DisconnectReason>) {
@@ -4141,9 +4125,9 @@ mod tests {
         panic!("a cookie twice");
     }
 
-    /// A source's count follows the table: 4 half-open handshakes taken below the
-    /// mark count under load, and once they expire the source may open more and,
-    /// with none left, is forgotten. Validated handshakes still stop at the cap.
+    /// A source's count is the table's: 4 half-open handshakes taken below the
+    /// mark count under load, and once they expire the source may open more.
+    /// Validated handshakes still stop at the cap.
     #[test]
     fn a_source_may_open_more_once_its_half_open_handshakes_expire() {
         let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
@@ -4164,7 +4148,7 @@ mod tests {
         assert_eq!(answer(&mut ep, t, 1, &hs[4]), None);
         t = Instant::from_millis(10_001);
         ep.handle_timeout(t);
-        assert_eq!((ep.half_open.len(), ep.by_source.len()), (44, 44));
+        assert_eq!(ep.half_open.len(), 44);
         for (i, p) in flood[44..].iter().enumerate() {
             ep.handle_datagram(t, 144 + i as u32, p);
         }
