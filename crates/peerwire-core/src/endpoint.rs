@@ -398,6 +398,10 @@ impl<A: Address> Source<A> {
     }
 }
 
+/// A half-open responder handshake: its link's index, and the source it is
+/// counted against, if that is known.
+type HalfOpen<A> = (u32, Option<Source<A>>);
+
 /// Probes, paced: of every port of one IP but the low ones, or of a given list.
 struct Spray<A> {
     targets: Targets<A>,
@@ -792,7 +796,7 @@ pub struct Endpoint<A: Address> {
     /// (initiator index, initiator ephemeral key) of half-open responder links,
     /// for HS1 retransmits, which may arrive over several paths; and the source
     /// of the first, if it is known (see `on_hs1`).
-    half_open: HashMap<(u32, [u8; 32]), (u32, Option<Source<A>>)>,
+    half_open: HashMap<(u32, [u8; 32]), HalfOpen<A>>,
     /// The cookie secret of an epoch (see `check_cookie`), and the last epoch's
     /// if it was made: none until the endpoint is first under load.
     secrets: Option<(u64, [u8; 32], Option<[u8; 32]>)>,
