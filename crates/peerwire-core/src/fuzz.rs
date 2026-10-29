@@ -715,11 +715,11 @@ fn fuzz_handshakes_under_load() {
     // (`handle_datagram_from`), while time moves on past expiries and cookie
     // epochs. B must not panic and holds at most 64; under load a plain HS1 over
     // UDP takes none. B answers at once with a COOKIE or an HS2 only, to where the
-    // datagram came from, and no larger than it but for SEC-13 (below): a COOKIE
-    // only over UDP and under load, taking nothing, and `handle_datagram_direct`
-    // says false for it; an HS2 only to a handshake whose ephemeral key a real key
-    // made. Afterwards, during a flood from spoofed
-    // addresses, a dial over UDP (with a cookie) and one over a peer's channel link.
+    // datagram came from, and no larger than it (SEC-13): a COOKIE only over UDP
+    // and under load, taking nothing, and `handle_datagram_direct` says false for
+    // it; an HS2 only to a handshake whose ephemeral key a real key made.
+    // Afterwards, during a flood from spoofed addresses, a dial over UDP (with a
+    // cookie) and one over a peer's channel link.
     let keys = identities(6);
     let ids: Vec<PeerId> = keys.iter().map(Identity::peer_id).collect();
     let (b, h, o) = (0, 4, 5);
@@ -827,14 +827,9 @@ fn fuzz_handshakes_under_load() {
         let case = || format!("case {i}: {} from {from} ({owner:?}), {before} held", hex(&p));
         assert!(count <= 64, "{}", case());
         assert!(out.iter().all(|(dst, _)| *dst == from), "{}", case());
-        // SEC-13 (open): a half-open handshake's HS2 (57 bytes) is sent again for any
-        // HS1 with its index and ephemeral key, from 37 bytes. Drop `|| again` once
-        // only a whole HS1 is answered.
         let sent: usize = out.iter().map(|(_, q)| q.len()).sum();
-        let again =
-            count == before && matches!(&out[..], [(_, q)] if matches!(wire::parse(q), Some(Packet::Hs2 { .. })));
-        assert!(sent <= p.len() || again, "{}", case());
-        if sent > p.len() {
+        assert!(sent <= p.len(), "{}", case());
+        if sent > 0 {
             worst = worst.max(sent * 100 / p.len());
         }
         for (_, q) in &out {
@@ -877,7 +872,7 @@ fn fuzz_handshakes_under_load() {
     let st = ep.stats();
     println!(
         "fuzz handshakes: {n} datagrams, {loaded_n} over UDP under load, {took} taken with a cookie, \
-         largest answer {worst}% of what it answered (SEC-13), {st:?}"
+         largest answer {worst}% of what it answered, {st:?}"
     );
     assert!(
         st.cookies_sent > 0 && took > 0 && st.rx_handshake_dropped > 0 && st.rx_wrong_peer > 0,

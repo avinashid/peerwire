@@ -2,11 +2,11 @@
 //!
 //! ```text
 //! packet  = kind(1: version<<4 | type) ...
-//!   HS1   = kind sender_idx(u32) noise_msg1
+//!   HS1   = kind sender_idx(u32) noise_msg1(128)
 //!   HS2   = kind sender_idx(u32) receiver_idx(u32) noise_msg2
 //!   DATA  = kind receiver_idx(u32) nonce(u64) aead(frames)
 //!   COOKIE = kind receiver_idx(u32) cookie(16)   a loaded responder's answer to an HS1
-//!   HS1C  = kind sender_idx(u32) cookie(16) noise_msg1   an HS1 that echoes it
+//!   HS1C  = kind sender_idx(u32) cookie(16) noise_msg1(128)   an HS1 that echoes it
 //! frames  = PING | ACK cum(u32) bits(u64) | REL seq(u32) flags(u8) len(u16) data
 //!         | UNREL len(u16) data | CLOSE
 //!         | OBSERVED alen(u8) addr          the address the sender sees us at
@@ -32,6 +32,9 @@ pub(crate) const DATA: u8 = 3;
 pub(crate) const COOKIE: u8 = 4;
 pub(crate) const HS1C: u8 = 5;
 pub(crate) const COOKIE_LEN: usize = 16;
+/// An HS1's noise_msg1, Noise IK's first message with a PeerId as its payload: the
+/// ephemeral key, then the static key and the PeerId, each sealed (`e, es, s, ss`).
+pub(crate) const HS1_NOISE: usize = 32 + (32 + TAG) + (32 + TAG);
 
 pub(crate) const DATA_HEADER: usize = 1 + 4 + 8;
 pub(crate) const TAG: usize = 16;
