@@ -4133,7 +4133,9 @@ mod tests {
         for _ in 0..2 {
             ep.handle_datagram(t, from, &p);
             let got = sent(ep, t).pop()?;
-            let Some(Packet::Cookie { cookie, .. }) = wire::parse(&got.payload) else { return Some(kind(&got.payload)) };
+            let Some(Packet::Cookie { cookie, .. }) = wire::parse(&got.payload) else {
+                return Some(kind(&got.payload));
+            };
             p = wire::with_cookie(&p, cookie);
         }
         panic!("a cookie twice");

@@ -74,8 +74,8 @@ pub(crate) const UNREL_OVERHEAD: usize = 3;
 
 pub(crate) type Cookie = [u8; COOKIE_LEN];
 
+/// `Hs1` is an HS1, or an HS1C if it has a `cookie`.
 pub(crate) enum Packet<'a> {
-    /// An HS1, or an HS1C (`cookie`).
     Hs1 { sender: u32, cookie: Option<&'a Cookie>, noise: &'a [u8] },
     Hs2 { sender: u32, receiver: u32, noise: &'a [u8] },
     Data { receiver: u32, nonce: u64, ciphertext: &'a [u8] },
