@@ -56,7 +56,7 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `5ae3c4e` (2026-10-29).** Fixes merged after `@peerwire/js` 0.2.0
+**Status as of main `208659b` (2026-10-30).** Fixes merged after `@peerwire/js` 0.2.0
 and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
@@ -65,7 +65,9 @@ and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 | SEC-2 (Medium) | **Fixed** in JS by NB-022 (hello body encrypted to the room), and in Rust/Godot by NB-022b (below) |
 | NB22-1 (Medium), NB22-2 (Low) | **Fixed** by `4e3c146`, merged `e205792`, before any native or Godot release (Rust/Godot hellos sealed as `nostr.js` seals them; `room.js` skips a hello marked `meta.nb`), reviewed 2026-10-29; residual NB22-I1 (Info, accepted; docs `494a400`, merged `9159b08`), [SEC-2](#sec-2--room-hello-discloses-the-long-term-peerid-in-cleartext-medium--nb-022) |
 | SEC-3 (Medium) | Fixed for rooms (NB-031 Rust, NB-037 JS); open for a bare `WebRtcTransport` |
-| SEC-4…SEC-8 | Open (NB-024…NB-028) |
+| SEC-4 (Medium) | **Fixed** by NB-024 (`85b8460`), merged `208659b` (under load a handshake from a UDP address takes no state until it echoes a cookie, and each source holds at most 4 half-open handshakes), reviewed 2026-10-29; residuals R1–R5, [SEC-4](#sec-4--half-open-handshake-table-exhaustion-medium--nb-024) |
+| NB24-1 (Medium) | **Fixed** by `3e1cab3` (its type named in `ae34744`) before the merge `208659b`, so never on main (a handshake a UDP address took below the mark, which may be spoofed, isn't counted against that address), reviewed 2026-10-29; Info NB24-I1…I6 (accepted or optional), same section |
+| SEC-5…SEC-8 | Open (NB-025…NB-028) |
 | SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 audit and N29-1 fix |
 | SEC-12 (Info) | Accepted, no card |
 | N38-1…N38-3 (port mapping) | **Fixed** in NB-038 (`71d83b2`) and NB-041 (`0dfdbc9`) |
@@ -263,6 +265,91 @@ address-spoofers and keeps the table for validated peers. Until then, operators 
 always-on peers should size `max_pending_handshakes` and `handshake_timeout` for
 their exposure.
 
+**Status: fixed** by NB-024 (`85b8460`, with NB24-1's fix `3e1cab3`), merged
+`208659b`, reviewed 2026-10-29. Below three quarters of `max_pending_handshakes`
+(the mark: 3072 of the default 4096) a handshake is an HS1 and an HS2, byte for byte
+as before. From the mark the endpoint is under load:
+- An HS1 from a UDP address (`handle_datagram`) takes no state and costs no DH. It
+  is answered with a 21-byte `COOKIE`: HMAC-BLAKE2s over its index, its ephemeral
+  key and the address, cut to 16 bytes. Only an `HS1C` that echoes it from that
+  address goes on to the DH. The secret is new every 120 s, and a cookie holds for
+  the rest of its epoch and the next.
+- Each source holds at most 4 half-open handshakes. A source is an IPv4 address,
+  an IPv6 /64, a relay, or any other address (a channel). A handshake on a peer's
+  own channel (`handle_datagram_from`) or through a relay needs no cookie, since
+  neither can be spoofed, but it counts against its source.
+- So a flood from spoofed addresses fills the table to the mark at most, and a real
+  dial takes one round trip more. With 5000 valid HS1s a second from spoofed
+  addresses for 25 s, a dial from a real address links within 20 ms; before NB-024
+  it failed after 23.5 s. Test:
+  `a_dial_links_through_a_flood_of_handshakes_from_spoofed_addresses`.
+- A dialler takes a cookie only for its own index, from an address it dials, on a
+  direct path, and sends its HS1 there again with it. A cookie is unauthenticated,
+  so `handle_datagram_direct` says false for one.
+
+**NB24-1 — Handshakes spoofed below the mark used up a source's quota (Medium).**
+Found in the review of `354ed36`, before the merge. Every half-open handshake was
+counted against its source, also one that a UDP address took below the mark with no
+cookie, whose address may be spoofed. So a flood could send 4 of its HS1s from a
+victim's IPv4 address (any port) or /64 while it brought the endpoint to the mark.
+The victim's own dial was then refused at the per-source cap, cookie and all, for
+as long as the flood kept the endpoint loaded. **Fixed** by `3e1cab3` (the entry's
+type named in `ae34744`): a handshake counts against its source only if the source
+is known, that is, if it was taken under load (with a cookie), on a peer's channel
+or through a relay. Tests: `handshakes_spoofed_below_the_mark_dont_fill_a_source`
+(the reproduction) and `a_channel_or_a_relay_counts_what_it_took_below_the_mark`.
+
+Residuals (accepted):
+- **R1, many real addresses.** 256 IPv4 addresses or IPv6 /64s, at 4 each, fill
+  the 1024 slots above the mark (default sizes). A dial then waits for entries to
+  expire. SECURITY.md says so; see NB24-I1 for what 256 /64s cost.
+- **R2, old diallers.** A dialler from before NB-024 ignores a `COOKIE`, so it
+  can't reach a responder at or above the mark. Below the mark nothing changed. It
+  affects native UDP only: JS transports pass the peer (`handle_datagram_from`), and
+  a channel needs no cookie.
+- **R3, forged cookies.** An on-path attacker, or one who guesses a dial's 32-bit
+  index and spoofs the responder's address, can hand the dialler a false cookie. A
+  responder with NB-024 answers the bad `HS1C` with a new cookie, so it costs a
+  round trip. One without it drops `HS1C`, so that dial fails, which an on-path
+  attacker could do anyway by dropping packets.
+- **R4, below the mark.** A spoofed HS1 still costs the responder its DH and a
+  half-open entry, as before NB-024, up to the mark.
+- **R5, fingerprinting.** A loaded endpoint answers any HS1-shaped packet with a
+  `COOKIE` before the DH. That shows a Peerwire endpoint listens on the port, but
+  not its PeerId. Loading it already takes 3072 valid HS1s to that PeerId within
+  `handshake_timeout`.
+
+Info from the review; none was needed for the merge:
+- **NB24-I1 — On IPv6, R1 is one /56 (Info, optional).** 256 /64s are a single
+  /56, and many ISPs and hosts give one customer a /56 or a /48. Optional fix: a
+  second cap per /56 or /48, as nested rate limiters have.
+- **NB24-I2 — Shared sources (Info, accepted).** Under load, everyone behind one
+  source shares its 4 slots. A CGNAT address is one source, as in WireGuard. So is
+  a relay: a relayed packet arrives as `Path::Via(relay)` and carries no origin.
+  While the endpoint is loaded, a peer linked to relay `r` can take `r`'s 4 slots
+  and keep out others who reach it through `r`.
+- **NB24-I3 — Reflection is at most 0.57× (Info, optional).** The smallest HS1 that
+  gets a cookie is 37 bytes (a 5-byte header and 32 bytes of noise), and the
+  `COOKIE` is 21. A valid HS1 is 133 bytes (0.16×), and its HS2 below the mark is
+  57 (0.43×). So no answer a responder sends is larger than the packet it answers.
+  (An endpoint that is itself dialling the sender answers that peer's valid HS1
+  with its own: 133 bytes, or 149 as an `HS1C` to an address it dials and holds a
+  cookie for.) Optional fix: under load, answer only an HS1 of exactly IK msg1's
+  length. That keeps it at 0.16×, and fewer probes could fingerprint the endpoint
+  (R5).
+- **NB24-I4 — Hosts with `u32` handles (Info, accepted).** A host that calls
+  `pw_handle_datagram`, or `Peerwire.receive` without a peer, gets one source per
+  handle, since a handle is no IP address. A UDP host that made one handle per IP
+  address and port would give each port its own quota. No host in the repo does:
+  every JS transport passes the peer.
+- **NB24-I5 — Guessed and sprayed ports (Info, accepted).** A dialler takes a
+  cookie only from an address it dials. So a loaded responder reached only at a
+  guessed or sprayed port can't be linked until it drops below the mark. Taking
+  cookies from anywhere would widen what an unauthenticated cookie can do.
+- **NB24-I6 — Tiny caps (Info, optional).** With `max_pending_handshakes` below 4,
+  the mark is the cap. At 0, every HS1 gets a cookie that can never be used, where
+  before NB-024 it got no answer. Optional fix: send no cookie at the cap.
+
 ### SEC-5 — Deterministic, unsalted Nostr peer tag enables presence correlation (Low–Medium) — NB-025
 
 The per-peer tag is `sha256("peerwire/peer/<PeerId>")`, a fixed function of the
@@ -339,10 +426,11 @@ port. The mapped address is offered like a public one. This changes the attack
 surface in three ways:
 
 - **Unsolicited reachability.** While mapped, anyone on the internet can send to
-  the port, with no NAT filtering in front. It reaches only the Noise endpoint,
-  but that endpoint has no handshake-flood cookies yet, so SEC-4 applies directly.
-  It also shows up in port scans. `docs/GODOT.md` says this and advises asking
-  the player first (NPM-2).
+  the port, with no NAT filtering in front. It reaches only the Noise endpoint.
+  Under a handshake flood that endpoint takes no state for spoofed handshakes
+  (SEC-4, fixed by NB-024), but an attacker with many real addresses can still
+  keep others from connecting (SEC-4 R1). It also shows up in port scans.
+  `docs/GODOT.md` says this and advises asking the player first (NPM-2).
 - **The gateway and the LAN are trusted for the address only.** Any device on the
   LAN can answer the requests. A rogue responder can report a false address,
   which peers would then dial. It can't get into a session: no one finishes a
@@ -1789,7 +1877,9 @@ and what it accepted. Values are from main `7b716a2`.
   - An HS1 is refused before the DH when half-open handshakes reach
     `max_pending_handshakes` (4096) or links reach `max_links`.
   - An unannounced responder past the cap is dropped at its first data packet.
-  - Handshake floods are still SEC-4 (cookies, NB-024).
+  - From three quarters of `max_pending_handshakes` (3072), an HS1 from a UDP
+    address takes no state until it echoes a cookie, and each source holds at
+    most 4 half-open handshakes (SEC-4, NB-024, since `208659b`).
 - **Relay.**
   - 256 KiB/s with a 64 KiB burst per peer, and a 256-packet queue.
   - The total (`relay_total_rate`) is unlimited by default, and `peerwire-peer`
@@ -1915,7 +2005,8 @@ and what it accepted. Values are from main `7b716a2`.
   - **NB42-I1 and NB42-I2:** mapped `::ffff:` addresses compare as IPv4, and NAT64
     `64:ff9b::/96` is judged by its IPv4; fixed in NB-042b (`1529b54`).
   - **NB42-I3:** Godot always binds `[::]`, so a host with global IPv6 and no inbound
-    firewall is reachable unsolicited. That makes SEC-4 more urgent.
+    firewall is reachable unsolicited, so it meets handshake floods directly
+    (SEC-4, fixed by NB-024; R1 remains).
   - **Residual NB42b-I1:** `is_public` doesn't unwrap NAT64, so a NAT64 address
     embedding a private IPv4 still gets a guess window.
   - **Residual NB42b-I2:** the local-use prefix `64:ff9b:1::/48` isn't covered.
@@ -2216,8 +2307,9 @@ mappings that carry over and are already handled in Peerwire:
   same open problems (relay-visible timing/IP, static-key exposure) apply; Peerwire's
   per-session Nostr key and rotating-tag ideas mirror P0's mitigations.
 - **A5 spam / A13 Sybil → relevant to the signaling layer**; the half-open cap
-  (SEC-4) and relay rate limiting are the Peerwire analogues. A PoW-gated first
-  contact (as in P0 A5) is a candidate hardening if public rooms are abused.
+  with its handshake cookies (SEC-4) and relay rate limiting are the Peerwire
+  analogues. A PoW-gated first contact (as in P0 A5) is a candidate hardening if
+  public rooms are abused.
 
 ## Residual risks accepted for v0.1
 
