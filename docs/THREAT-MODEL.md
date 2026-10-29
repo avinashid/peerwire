@@ -56,7 +56,7 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `208659b` (2026-10-30).** Fixes merged after `@peerwire/js` 0.2.0
+**Status as of main `fe6854d` (2026-10-30).** Fixes merged after `@peerwire/js` 0.2.0
 and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
@@ -66,11 +66,11 @@ and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 | NB22-1 (Medium), NB22-2 (Low) | **Fixed** by `4e3c146`, merged `e205792`, before any native or Godot release (Rust/Godot hellos sealed as `nostr.js` seals them; `room.js` skips a hello marked `meta.nb`), reviewed 2026-10-29; residual NB22-I1 (Info, accepted; docs `494a400`, merged `9159b08`), [SEC-2](#sec-2--room-hello-discloses-the-long-term-peerid-in-cleartext-medium--nb-022) |
 | SEC-3 (Medium) | Fixed for rooms (NB-031 Rust, NB-037 JS); open for a bare `WebRtcTransport` |
 | SEC-4 (Medium) | **Fixed** by NB-024 (`85b8460`), merged `208659b` (under load a handshake from a UDP address takes no state until it echoes a cookie, and each source holds at most 4 half-open handshakes), reviewed 2026-10-29; residuals R1–R5, [SEC-4](#sec-4--half-open-handshake-table-exhaustion-medium--nb-024) |
-| NB24-1 (Medium) | **Fixed** by `3e1cab3` (its type named in `ae34744`) before the merge `208659b`, so never on main (a handshake a UDP address took below the mark, which may be spoofed, isn't counted against that address), reviewed 2026-10-29; Info NB24-I1…I6 (accepted or optional), same section |
+| NB24-1 (Medium) | **Fixed** by `3e1cab3` (its type named in `ae34744`) before the merge `208659b`, so never on main (a handshake a UDP address took below the mark, which may be spoofed, isn't counted against that address), reviewed 2026-10-29; Info NB24-I1…I6 (accepted or optional; I3 fixed by NB-050), same section |
 | SEC-5…SEC-8 | Open (NB-025…NB-028) |
 | SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 audit and N29-1 fix |
 | SEC-12 (Info) | Accepted, no card |
-| SEC-13 (Low) | Open, found 2026-10-30, on the board for an NB number: a 37-byte copy of a half-open handshake's HS1 draws its 57-byte HS2 from any address, [SEC-13](#sec-13--a-short-copy-of-a-half-open-handshakes-hs1-reflects-its-hs2-low) |
+| SEC-13 (Low) | **Fixed** by NB-050 (`2f0c823`), merged `fe6854d` (an HS1's Noise part must be exactly 128 bytes, so a short copy of a half-open handshake's HS1 no longer draws its 57-byte HS2), reviewed 2026-10-30; residual NB50-I1 (Info, accepted), [SEC-13](#sec-13--a-short-copy-of-a-half-open-handshakes-hs1-reflects-its-hs2-low) |
 | N38-1…N38-3 (port mapping) | **Fixed** in NB-038 (`71d83b2`) and NB-041 (`0dfdbc9`) |
 | NPM-1 (Low) | **Fixed** by `4cffbf9` (merged `14f463a`): no port mapping under `RelayOnly` |
 | NPM-2 (Low) | **Fixed** in `docs/GODOT.md` (`9be92d5`); the flood risk itself is SEC-4 |
@@ -315,10 +315,12 @@ Residuals (accepted):
   attacker could do anyway by dropping packets.
 - **R4, below the mark.** A spoofed HS1 still costs the responder its DH and a
   half-open entry, as before NB-024, up to the mark.
-- **R5, fingerprinting.** A loaded endpoint answers any HS1-shaped packet with a
+- **R5, fingerprinting.** A loaded endpoint answers an HS1-shaped packet with a
   `COOKIE` before the DH. That shows a Peerwire endpoint listens on the port, but
-  not its PeerId. Loading it already takes 3072 valid HS1s to that PeerId within
-  `handshake_timeout`.
+  not its PeerId. Since NB-050 (`2f0c823`, merged `fe6854d`) the probe must be as
+  long as a whole HS1, 133 bytes (149 as an `HS1C`); any other length is dropped as
+  malformed, where before any HS1 of 37 bytes or more drew a `COOKIE`. Loading it
+  already takes 3072 valid HS1s to that PeerId within `handshake_timeout`.
 
 Info from the review; none was needed for the merge:
 - **NB24-I1 — On IPv6, R1 is one /56 (Info, optional).** 256 /64s are a single
@@ -329,15 +331,15 @@ Info from the review; none was needed for the merge:
   a relay: a relayed packet arrives as `Path::Via(relay)` and carries no origin.
   While the endpoint is loaded, a peer linked to relay `r` can take `r`'s 4 slots
   and keep out others who reach it through `r`.
-- **NB24-I3 — A cookie reflects at most 0.57× (Info, optional).** The smallest HS1
-  that gets a cookie is 37 bytes (a 5-byte header and 32 bytes of noise), and the
-  `COOKIE` is 21. A valid HS1 is 133 bytes (0.16×), and its HS2 below the mark is
-  57 (0.43×). The exception is SEC-13: the HS2 of a handshake already half-open is
-  sent again for 37 bytes (1.54×). (An endpoint that is itself dialling the sender
-  answers that peer's valid HS1 with its own: 133 bytes, or 149 as an `HS1C` to an
-  address it dials and holds a cookie for.) Optional fix: answer only an HS1 of
-  exactly IK msg1's length. That keeps a cookie at 0.16×, closes SEC-13, and fewer
-  probes could fingerprint the endpoint (R5).
+- **NB24-I3 — A cookie reflects at most 0.16× (Info, fixed by NB-050).** Before
+  NB-050 the smallest HS1 that got a cookie was 37 bytes (a 5-byte header and 32
+  bytes of noise), for a 21-byte `COOKIE` (0.57×), and SEC-13 sent a half-open
+  handshake's HS2 again for 37 bytes (1.54×). Since NB-050 (`2f0c823`, merged
+  `fe6854d`) only an HS1 of exactly IK msg1's length is answered: 133 bytes, or 149
+  as an `HS1C`. So a `COOKIE` reflects 0.16× at most, and an HS2, new or sent again,
+  0.43× (NB50-I1). (An endpoint that is itself dialling the sender answers that
+  peer's valid HS1 with its own: 133 bytes, or 149 as an `HS1C` to an address it
+  dials and holds a cookie for.) This also narrows R5.
 - **NB24-I4 — Hosts with `u32` handles (Info, accepted).** A host that calls
   `pw_handle_datagram`, or `Peerwire.receive` without a peer, gets one source per
   handle, since a handle is no IP address. A UDP host that made one handle per IP
@@ -444,9 +446,27 @@ packet for one. It runs before the cookie and the cap, so it works at any load.
   payload of any other length is refused already. The smallest packet answered is
   then 133 bytes: 0.43× for an HS2, 0.16× for a `COOKIE`. That is NB24-I3's
   optional fix too, and fewer probes could fingerprint a loaded endpoint (SEC-4
-  R5). Checked: with that one-line change, the 97 `peerwire-core` unit tests pass
-  in release, among them the fuzz target that found this, with its size check
-  holding for every answer.
+  R5).
+
+**Status: fixed** by NB-050 (`2f0c823`), merged `fe6854d`, reviewed 2026-10-30.
+`on_hs1` counts an HS1 or `HS1C` whose Noise part isn't exactly `wire::HS1_NOISE`
+(128) bytes as malformed, before the lookup, on every path (UDP, a peer's channel,
+a relay). Every HS1 we send carries a 32-byte PeerId, so it is always 128 bytes of
+noise: no correct peer is refused, and the handshake bytes are unchanged. Tests:
+`only_a_whole_hs1_draws_its_hs2_again` (a half-open handshake's HS1 cut to 37
+bytes, a byte short or a byte long, as an HS1 or an `HS1C`, draws nothing from
+another address and counts as malformed; the whole HS1 still draws its HS2 again),
+and `fuzz_handshakes_under_load`, which found this, now checks that no answer is
+larger than its datagram, with no exception.
+
+Residual (accepted):
+- **NB50-I1 — A whole-length copy still draws the HS2 again (Info).** The lookup
+  still runs before any crypto. A 133-byte HS1 (or a 149-byte `HS1C`) with a
+  half-open handshake's index and ephemeral key, whatever its other 96 bytes, draws
+  that handshake's 57-byte HS2 from any address while it is half-open (up to
+  `handshake_timeout`): 0.43× (0.38× as an `HS1C`), one packet for one, so it
+  amplifies nothing. Matching the rest against the stored HS1 wouldn't help: the
+  attacker who sent that HS1 holds all of it.
 
 ### Router port mapping (NB-038, Godot switch) — N38-1…N38-3, NPM-1…NPM-3
 
