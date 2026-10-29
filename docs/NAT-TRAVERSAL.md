@@ -226,17 +226,26 @@ room needs a name with **at least 128 random bits**, such as 22 or more random b
 
 ## Messages
 
-**Hello** (room topic, plaintext). The JSON shape of `nostr.js`, with a marker for UDP peers and a room proof:
+**Hello** (room topic, sealed to the room, NB-022b). The JSON shape of `nostr.js`, with a marker for UDP peers and
+a room proof:
 
 ```json
 {"t":"hello","from":"<64 hex PeerId>","meta":{"nb":1,"role":"peer|host|client","ts":<Unix ms>,"p":"<64 hex>"}}
 ```
 
+- It is sealed as `nostr.js` `sealRoom` seals a browser's hello: the payload is a random 12-byte nonce, then
+  `AES-256-GCM(hello key, nonce, JSON)` with its 16-byte tag and no associated data, and the Nostr `content` is
+  its base64. The hello key is `sha256("peerwire/room-enc/" + app + "/" + room)`, a third label over the name, so
+  a relay that sees the topic can't read who is in the room. A test vector checks both stacks give the same bytes.
+- A payload that doesn't open under the hello key is dropped: a plaintext hello, one for another room, an altered
+  one, or one longer than the longest hello (215 bytes) sealed, which isn't decrypted at all.
 - `p = HMAC(room key, "pw-hello" || PeerId || role byte || ts u64 LE)`.
 - Parsing is strict: exact prefix, 64 hex digits, known role, 1 to 19 decimal digits of `ts`, 64 hex digits of
   proof, exact suffix.
 - A hello with a wrong or missing proof, or with `|ts - now| > 60 s`, is dropped before anything else happens.
-  Browser hellos lack `meta.nb` and are ignored.
+  Browser hellos lack `meta.nb` and are ignored; `room.js` doesn't dial a hello with `meta.nb` over WebRTC.
+- A sealed hello is 316 base64 characters (320 for `client`), a browser's 304 (308): its length, topic and timing
+  show a relay that a member announced itself, and whether it is native or a browser, but not who.
 - A hello can be replayed within its minute, but only as itself: it names its sender. The offer it triggers is
   sealed to that sender, and the dial authenticates the sender's key.
 
@@ -417,13 +426,14 @@ traversal privacy_modes_matrix -- --nocapture`:
 
 - **Relays and anyone watching them** see:
   - room topics and each peer's inbox topic (a hash of its public key);
-  - hello JSON, which carries each member's PeerId and role;
+  - sealed hellos: their length (native or browser), not the PeerId or role inside;
   - source IPs at the relay, and message timing.
 
-  They can't read offers, since addresses never leave sealed messages. Without the room name they can't join a
-  room or pose as its host. They can replay a member's hello, which only makes members offer to that member again.
-- **Knowing a PeerId is not enough** (NB-032, NB-033(b)). PeerIds appear in room hellos and invites, so treat
-  them as public. But a node acts on an offer, by dialling back and answering with its own, only if the offer
+  They can't read hellos or offers, and addresses never leave sealed messages. Without the room name they can't
+  join a room or pose as its host. They can replay a member's hello, which only makes members offer to that member
+  again.
+- **Knowing a PeerId is not enough** (NB-032, NB-033(b)). PeerIds appear in room hellos (to anyone with the
+  room's name) and invites, so treat them as public. But a node acts on an offer, by dialling back and answering with its own, only if the offer
   proves the room key, proves its invite key, or comes from a peer it dialled. Whoever does get an answer
   learns:
   - the node's candidate addresses, as its privacy mode allows (in `Direct`, **LAN addresses** too);
@@ -511,6 +521,8 @@ Crates added to `peerwire` by NAT traversal:
 
 - `crates/peerwire/src/traversal.rs` unit tests:
   - hello and offer round trips (versions 1 to 3), hello timestamps, truncation, browser hellos, roles;
+  - the hello seal: the same bytes as `nostr.js` for a fixed vector (also in `packages/js/test/rust_hello.mjs`), a
+    fresh nonce each and no PeerId in the clear; plaintext, other-room, altered, cut or extended hellos dropped;
   - offer contents in each privacy mode, the public-address classifier, relay-only dials going only through the
     relay (and the room host as the relay), a relay-only client dialling exactly one of two Hosts directly
     (the relay sticks), stale hellos, strangers' plain offers ignored, dialled peers answered
