@@ -1613,11 +1613,11 @@ console.log('context caps: writers and ranges stay capped and new writers are st
 }
 
 // The copy on this device (host.store). A store as the room's is to the doc, keeping the copy as JSON text and
-// running each call after the one before; save() gives the bytes it kept. `fail` makes each call reject, `hold()`
-// holds load() until released, `holdSaves()` each save. `calls`: when (`now()`) save() was called, `sizes`: the
-// bytes of each save.
+// running each call after the one before; save() gives the bytes it kept. `fail` makes each call reject,
+// `saveFail` each save (a full disk), `hold()` holds load() until released, `holdSaves()` each save. `calls`: when
+// (`now()`) save() was called, `sizes`: the bytes of each save.
 function copyStore(now = () => 0) {
-  const s = { copy: null, saves: 0, calls: [], sizes: [], loads: 0, deletes: 0, fail: null, gate: null, saveGate: null, last: Promise.resolve() };
+  const s = { copy: null, saves: 0, calls: [], sizes: [], loads: 0, deletes: 0, fail: null, saveFail: null, gate: null, saveGate: null, last: Promise.resolve() };
   const run = (op) => {
     const p = s.last.then(op);
     s.last = p.catch(() => {});
@@ -1635,7 +1635,7 @@ function copyStore(now = () => 0) {
     return run(async () => {
       c = await c;
       if (s.saveGate) await s.saveGate.promise;
-      if (s.fail) throw s.fail;
+      if (s.fail ?? s.saveFail) throw s.fail ?? s.saveFail;
       if (c === null) return;
       s.saves++;
       s.copy = JSON.stringify(c);
@@ -1901,6 +1901,14 @@ console.log('saves: one per SAVE_MS while it changes, none for nothing, on close
 }
 console.log('one save at a time: 10 s of writes behind a held save, then one save of all of them');
 
+// Fills `doc` from a member, as an answer: 10 entries short of MAX_ENTRIES, 12 MiB as UTF-8.
+function fill(doc) {
+  const peer = id('e');
+  const ws = Array.from({ length: 64 }, (_, i) => peer + i.toString(16).padStart(8, '0'));
+  const e = Array.from({ length: MAX_ENTRIES - 10 }, (_, i) => [i % 64, 2 + 2 * Math.floor(i / 64), 1, 's', 's', null, '€'.repeat(Math.floor(MAX_DOC_LENGTH / MAX_ENTRIES) - 13)]);
+  for (let i = 0, k = 0; i < e.length; i += 64, k++) doc.receive(peer, { d: 'board', t: 3, ws, e: e.slice(i, i + 64), x: ws.map((_, w) => [w, 2 * k + 1, 2 * k + 1]) });
+}
+
 // A full doc (12 MiB as UTF-8), changed every 100 ms for 150 s, saves no more often than its size allows at
 // SAVE_RATE (about every 48 s), each save the doc as it is then, and on close at once.
 {
@@ -1908,10 +1916,7 @@ console.log('one save at a time: 10 s of writes behind a held save, then one sav
   const store = copyStore(() => net.now);
   const a = kept(net, 'a', store);
   await a.doc.loaded;
-  const peer = id('e');
-  const ws = Array.from({ length: 64 }, (_, i) => peer + i.toString(16).padStart(8, '0'));
-  const e = Array.from({ length: MAX_ENTRIES - 10 }, (_, i) => [i % 64, 2 + 2 * Math.floor(i / 64), 1, 's', 's', null, '€'.repeat(Math.floor(MAX_DOC_LENGTH / MAX_ENTRIES) - 13)]);
-  for (let i = 0, k = 0; i < e.length; i += 64, k++) a.doc.receive(peer, { d: 'board', t: 3, ws, e: e.slice(i, i + 64), x: ws.map((_, w) => [w, 2 * k + 1, 2 * k + 1]) });
+  fill(a.doc);
   const m = a.doc.map('m');
   for (let i = 0; i < 1500; i++) {
     if (m.set('k', i) === false) fail('the full doc took no write');
@@ -1926,6 +1931,64 @@ console.log('one save at a time: 10 s of writes behind a held save, then one sav
   await a.doc.close();
   if (store.calls.length !== last + 1 || !store.copy.includes('"closing"')) fail('closing a full doc between paced saves did not save at once');
   console.log(`a full doc changed every 100 ms for 150 s: saved at ${calls.slice(0, last).map((t) => (t / 1000).toFixed(1)).join(', ')} s, ${(sizes[0] / 2 ** 20).toFixed(1)} MiB each, and on close at once`);
+}
+
+// A store that keeps failing (a full disk) under a full doc changed every 100 ms: the saves, each building the
+// whole doc, are tried 1, 2, 4 ... 64 s apart, then every 64 s, not every second (NB6F-2a), and it is said once.
+// The page hidden during a back-off saves at once, and a save that succeeds starts the pace again: the next waits
+// for its size and, when that one fails, the one after waits SAVE_MS. Closing during a back-off tries a last save
+// at once, and resolves.
+{
+  const net = new Net(20);
+  const store = copyStore(() => net.now);
+  const a = kept(net, 'a', store);
+  await a.doc.loaded;
+  fill(a.doc);
+  const m = a.doc.map('m');
+  const writes = async (ms) => {
+    for (const end = net.now + ms; net.now < end; ) {
+      if (m.set('k', net.now) === false) fail('the full doc took no write');
+      net.wait(100);
+      await settle();
+    }
+  };
+  const { calls, sizes } = store;
+  const gaps = (from) => calls.slice(from + 1).map((t, i) => t - calls[from + i]);
+  const secs = (ts) => ts.map((t) => (t / 1000).toFixed(1)).join(', ');
+  const said = warnings.length;
+  store.saveFail = new Error('the disk is full');
+  await writes(300000);
+  const failing = calls.length;
+  if (calls[0] !== SAVE_MS || gaps(0).join() !== [1, 2, 4, 8, 16, 32, 64, 64, 64].map((g) => g * SAVE_MS).join() || store.saves) fail(`a store that keeps failing, a full doc changed every 100 ms for 300 s: saves at ${secs(calls)} s`);
+  // At 300 s, 20 s before the next save is due, the store is back and the page hidden: saved at once.
+  store.saveFail = null;
+  m.set('k', 'hidden');
+  a.doc.save();
+  await a.doc.saving;
+  if (calls.length !== failing + 1 || calls.at(-1) !== 300000 || store.saves !== 1 || !store.copy.includes('"hidden"')) fail(`the page hidden at 300 s, during a back-off: saves at ${secs(calls.slice(failing))} s`);
+  await writes(10000);
+  store.saveFail = new Error('the disk is full');
+  await writes(60000);
+  // The next waits for the size of the one that succeeded (48 s) and fails: then 1, 2, 4, 8 s, by 370 s.
+  const pace = (sizes[0] * 1000) / SAVE_RATE;
+  const after = gaps(failing);
+  if (after.length !== 5 || Math.abs(after[0] - pace) > 1 || after[1] < SAVE_MS || after[1] >= SAVE_MS + 100 || after.slice(2).join() !== [2, 4, 8].map((g) => g * SAVE_MS).join()) fail(`a save that succeeded at 300 s, of ${(pace / 1000).toFixed(1)} s at SAVE_RATE, then a store failing: saves at ${secs(calls.slice(failing))} s`);
+  // At 370 s, 9.4 s before the next save is due, the page hidden twice, the first save held and failing: both go
+  // at once. Then closing.
+  const before = calls.length;
+  const release = store.holdSaves();
+  a.doc.save();
+  m.set('k', 'hidden while held');
+  a.doc.save();
+  release();
+  await a.doc.saving;
+  if (calls.length !== before + 2 || calls.at(-1) !== net.now) fail(`the page hidden twice at ${secs([net.now])} s during a back-off, the first save held and failing: saves at ${secs(calls.slice(before))} s`);
+  m.set('k', 'closing');
+  const closed = a.doc.close();
+  if (calls.length !== before + 3 || calls.at(-1) !== net.now) fail(`closed at ${secs([net.now])} s during a back-off, the store failing: no save at once`);
+  await closed;
+  if (warnings.length - said !== 1) fail(`a store that kept failing warned ${warnings.length - said} times`);
+  console.log(`a store that keeps failing, a full doc changed every 100 ms: saves tried at ${secs(calls.slice(0, failing))} s; hidden at 300 s, the store back: at once; failing again: at ${secs(calls.slice(failing + 1, before))} s (its size, then 1, 2, 4, 8 s); hidden twice, closed: at once`);
 }
 
 // A store that never loads the copy: LOAD_MS after opening, the doc goes on without it, 'blocked', with a

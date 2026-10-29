@@ -309,9 +309,11 @@ export interface DocOptions {
    * (browsers; TypeError where there is none), or a {@link DocStore}: make it once and pass the same object each
    * time, as a doc closed and opened again at once loads what the closing one saved only through the same store.
    * Saved when the page is hidden, on `close()` and `leave()`, and while the doc changes, one save at a time: a
-   * second after a change, and after the last save by its size at 256 KiB/s. The copy is sealed under a key from
-   * the room key, so the storage shows neither the room, the doc nor what it holds; anyone who knows the roomId
-   * can read it, as they could join the room. */
+   * second after a change, and after the last save by its size at 256 KiB/s. A save the store refuses (a full
+   * disk) is tried again with the next change, a second after, then 2, 4 … up to 64 s apart while it keeps
+   * refusing, until one succeeds; hiding the page, `close()` and `leave()` still save at once. The copy is sealed
+   * under a key from the room key, so the storage shows neither the room, the doc nor what it holds; anyone who
+   * knows the roomId can read it, as they could join the room. */
   persist?: boolean | DocStore;
 }
 
