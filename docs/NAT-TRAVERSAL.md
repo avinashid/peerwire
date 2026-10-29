@@ -245,7 +245,8 @@ a room proof:
 - A hello with a wrong or missing proof, or with `|ts - now| > 60 s`, is dropped before anything else happens.
   Browser hellos lack `meta.nb` and are ignored; `room.js` doesn't dial a hello with `meta.nb` over WebRTC.
 - A sealed hello is 316 base64 characters (320 for `client`), a browser's 304 (308): its length, topic and timing
-  show a relay that a member announced itself, and whether it is native or a browser, but not who.
+  show a relay that a member announced itself, whether it is native or a browser and whether it is a client, but
+  not who (NB22-I1, an accepted residual: hiding it would pad both stacks to one length).
 - A hello can be replayed within its minute, but only as itself: it names its sender. The offer it triggers is
   sealed to that sender, and the dial authenticates the sender's key.
 
@@ -426,16 +427,16 @@ traversal privacy_modes_matrix -- --nocapture`:
 
 - **Relays and anyone watching them** see:
   - room topics and each peer's inbox topic (a hash of its public key);
-  - sealed hellos: their length (native or browser), not the PeerId or role inside;
+  - sealed hellos: their length, which tells native from browser and a client from a host or peer, not the PeerId;
   - source IPs at the relay, and message timing.
 
   They can't read hellos or offers, and addresses never leave sealed messages. Without the room name they can't
   join a room or pose as its host. They can replay a member's hello, which only makes members offer to that member
   again.
 - **Knowing a PeerId is not enough** (NB-032, NB-033(b)). PeerIds appear in room hellos (to anyone with the
-  room's name) and invites, so treat them as public. But a node acts on an offer, by dialling back and answering with its own, only if the offer
-  proves the room key, proves its invite key, or comes from a peer it dialled. Whoever does get an answer
-  learns:
+  room's name) and invites, so treat them as public. But a node acts on an offer, by dialling back and answering
+  with its own, only if the offer proves the room key, proves its invite key, or comes from a peer it dialled.
+  Whoever does get an answer learns:
   - the node's candidate addresses, as its privacy mode allows (in `Direct`, **LAN addresses** too);
   - **up to 8 PeerIds** it is linked to (only its relay, under `RelayOnly`).
 
