@@ -5,28 +5,32 @@
 // (b) the fallback route: ICE never completes, so the link goes over the signalling pipe, here the real
 //     NostrSignaling over fake NIP-01 relays in this process (no network) that take RELAY_RATE events a second
 //     from each connection (burst RELAY_RATE) and RELAY_CONTENT characters of content an event, refuse what is
-//     past the rate with 'rate-limited:' as public relays do (nostr.js then backs off), and take RELAY_MS each
-//     way;
+//     past the rate with 'rate-limited:' as public relays do (nostr.js then slows down and sends it again), and
+//     take RELAY_MS each way;
 // (c) a background tab answering: A in a worker whose timers fire no sooner than 1000 ms, as in
 //     room_throttled.mjs, over LocalTransport;
 // (d) A, which keeps the board on its device (persist), leaves before C joins, and comes back later;
 // (e) (b) and (c) at once: A in the background on the fallback route, where the pipe's batching and rate waits
 //     are timers too;
 // (f) two members hold the board, B linked to C directly and A over the pipe: C asks B first and takes one whole
-//     answer, not one from each.
+//     answer, not one from each;
+// (g) (b) with relays that take 3 events a second, then 2: the join's burst draws a refusal from every relay, and
+//     the room must neither stop signalling nor lose what was refused.
 // For each it prints how long after the link C held every entry (or what it held at the deadline), the doc
 // frames both sides sent (asks, answers, deltas and their bytes), what went on the wire (datagrams, core
 // packets and retransmits, pipe batches, relay events) and when C's ask of A was pending or timed out. C must
-// hold the whole doc within DEADLINE_MS of the link in (a) to (d) and (f), and within BACKGROUND_MS in (e); its
-// first entries within FIRST_MS in (b), and FIRST_BACKGROUND_MS in (e). In (d) C holds nothing while alone, and A
+// hold the whole doc within DEADLINE_MS of the link in (a) to (d), (f) and (g) at 3 a second, within BACKGROUND_MS
+// in (e) and SLOW_MS in (g) at 2 a second; its first entries within FIRST_MS in (b) and (g) at 3 a second,
+// FIRST_BACKGROUND_MS in (e) and FIRST_SLOW_MS in (g) at 2 a second. In (d) C holds nothing while alone, and A
 // comes back to its whole board from its device.
 //
-// It failed on main at 45c7cfd (NB-006d): (b) took 32 s and (e) held 26 of 42 entries after 120 s.
+// It failed on main at 45c7cfd (NB-006d): (b) took 32 s and (e) held 26 of 42 entries after 120 s. (g) failed at
+// fe2a4e9: one refusal from each relay held all three for 30 s, and C never linked.
 //
-//   node packages/js/test/doc_catchup.mjs [--runs=abcdef] [--watch=60] [--relay-rate=10]
+//   node packages/js/test/doc_catchup.mjs [--runs=abcdefg] [--watch=60] [--relay-rate=10]
 //
 // --watch keeps watching a run that missed the deadline until that many seconds after the link, to see where
-// it ends up; --relay-rate sets RELAY_RATE.
+// it ends up; --relay-rate sets RELAY_RATE, the rate of every run's relays but (g)'s.
 import { Worker, MessageChannel, isMainThread, parentPort, workerData, threadId } from 'node:worker_threads';
 import { joinRoom, Room, memoryStore } from '../src/index.js';
 import { WebRtcTransport, BroadcastSignaling } from '../src/webrtc.js';
@@ -40,6 +44,10 @@ const DEADLINE_MS = 15000;
 const BACKGROUND_MS = 30000; // (e)
 const FIRST_MS = 3000; // (b): C's first entries
 const FIRST_BACKGROUND_MS = 5000; // (e)
+// (g) at 2 events a second: each side waits up to half a second for its relays to take a batch, so the core keeps
+// few packets in flight and sends some again; C held the board 33 to 39 s after the link (fe2a4e9 never linked).
+const SLOW_MS = 60000;
+const FIRST_SLOW_MS = 6000;
 const LINK_MS = 30000; // for C to link to A at all
 const ALONE_MS = 2000; // (d): how long C waits alone
 const CLAMP_MS = 1000; // (c): a background tab's timers
@@ -241,9 +249,10 @@ if (!isMainThread) {
   parentPort.postMessage({ ready: a.self });
 } else {
   const arg = (name, dflt) => process.argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? dflt;
-  const RUNS = arg('runs', 'abcdef');
+  const RUNS = arg('runs', 'abcdefg');
   const WATCH_MS = Math.max(DEADLINE_MS, Number(arg('watch', 0)) * 1000);
   const RELAY_RATE = Number(arg('relay-rate', 10));
+  let relayRate = RELAY_RATE; // the relays made from now on: (g) sets its own
   const RELAY_CONTENT = 64 * 1024;
   const RELAY_MS = 50;
   const RELAYS = ['wss://relay-1.test', 'wss://relay-2.test', 'wss://relay-3.test'];
@@ -253,7 +262,7 @@ if (!isMainThread) {
   });
 
   // Fake NIP-01 relays: EVENT gets an OK, REQ subscribes by kind, '#p' and since. Each connection may publish
-  // RELAY_RATE events a second (burst RELAY_RATE) of up to RELAY_CONTENT characters of content.
+  // relayRate events a second (burst relayRate) of up to RELAY_CONTENT characters of content.
   const sockets = new Set(); // open ones, every relay's
   class FakeRelaySocket {
     static CONNECTING = 0;
@@ -264,7 +273,8 @@ if (!isMainThread) {
       this.url = url;
       this.readyState = 0;
       this.subs = new Map();
-      this.tokens = RELAY_RATE;
+      this.rate = relayRate;
+      this.tokens = this.rate;
       this.refilled = Date.now();
       this.stats = { accepted: 0, limited: 0, tooLarge: 0, chars: 0 };
       setTimeout(() => {
@@ -285,7 +295,7 @@ if (!isMainThread) {
       if (m[0] !== 'EVENT') return;
       const ev = m[1];
       const t = Date.now();
-      this.tokens = Math.min(RELAY_RATE, this.tokens + ((t - this.refilled) / 1000) * RELAY_RATE);
+      this.tokens = Math.min(this.rate, this.tokens + ((t - this.refilled) / 1000) * this.rate);
       this.refilled = t;
       if (ev.content.length > RELAY_CONTENT) {
         this.stats.tooLarge++;
@@ -356,9 +366,10 @@ if (!isMainThread) {
     return `${l.length} (${kb(l.reduce((n, f) => n + f.bytes, 0))}${entries}${ends.length ? `, end at ${ends.join(', ')}` : ''}; first at ${s(l[0].at - w.at)})`;
   }
 
-  const RELAY_LIMITS = `relays: ${RELAY_RATE} events/s per connection, ${kb(RELAY_CONTENT)} an event, ${RELAY_MS} ms`;
+  const limits = (rate) => `relays: ${rate} events/s per connection, ${kb(RELAY_CONTENT)} an event, ${RELAY_MS} ms`;
+  const RELAY_LIMITS = limits(RELAY_RATE);
   // A member's pipe and Nostr counters, and what one of its relay connections took and refused.
-  const pipe = (p, st, relay = {}) => `${p.sent} pipe batches, ${p.dropped} datagrams dropped from a full pipe queue; ${st.published} Nostr events, relay-1 accepted ${relay.accepted} (${kb(relay.chars ?? 0)} of content), rate-limited ${relay.limited}, too large ${relay.tooLarge}; backoffs ${st.backoffs ?? 0}`;
+  const pipe = (p, st, relay = {}) => `${p.sent} pipe batches, ${p.dropped} datagrams dropped from a full pipe queue; ${st.published} Nostr events, relay-1 accepted ${relay.accepted} (${kb(relay.chars ?? 0)} of content), rate-limited ${relay.limited}, too large ${relay.tooLarge}; backoffs ${st.backoffs ?? 0}, sent again ${st.resent ?? 0}, unsent ${st.unsent ?? 0}`;
 
   const results = [];
   // Prints run `key` and records whether it met its bar: the whole board within `deadline` of the link, and
@@ -404,24 +415,29 @@ if (!isMainThread) {
   }
 
   // (b) The fallback route: ICE never completes, so the link goes over the signalling pipe through the relays.
-  if (RUNS.includes('b')) {
+  // (g) The same with relays that take `rate` events a second.
+  async function fallback(key, rate, bars) {
     iceHangs = true;
-    const roomId = `catchup-b-${process.pid}`;
+    relayRate = rate;
+    const roomId = `catchup-${key}${rate}-${process.pid}`;
+    const name = key === 'b' ? key : `${key} at ${rate}/s`;
     const opts = (name) => ({ appId: APP, roomId, presence: { name }, signaling: 'nostr', relays: RELAYS, fallbackMs: 300, RTCPeerConnection: fakePc(name) });
     const a = await joinRoom(opts('a'));
     draw(a.doc('board'));
     const t0 = now();
     const c = await joinRoom(opts('c'));
-    const w = await watch(c, c.doc('board'), a.self, t0);
+    const w = await watch(c, c.doc('board'), a.self, t0, Math.max(WATCH_MS, bars.deadline));
     const route = c.route(a.self)?.kind;
-    report('b', `fallback over the signalling pipe (${RELAY_LIMITS})`, w, {
-      aId: a.self, cId: c.self, aWire: wire.get(a.self), cWire: wire.get(c.self), aCore: a.stats(), cCore: c.stats(), first: FIRST_MS,
+    report(name, `fallback over the signalling pipe (${limits(rate)})`, w, {
+      aId: a.self, cId: c.self, aWire: wire.get(a.self), cWire: wire.get(c.self), aCore: a.stats(), cCore: c.stats(), ...bars,
       extra: [`route C->A: ${route}`, `A: ${pipe(a.transport.piped, a.signaling.stats, a.signaling.sockets[0]?.stats)}`, `C: ${pipe(c.transport.piped, c.signaling.stats, c.signaling.sockets[0]?.stats)}`],
     });
-    if (w.link !== null && route !== 'signaling') results.push({ key: 'b', ok: false, line: `(b) C reached A over ${route}, not the pipe` });
+    if (w.link !== null && route !== 'signaling') results.push({ key, ok: false, line: `(${name}) C reached A over ${route}, not the pipe` });
     await Promise.all([a.leave(), c.leave()]);
     iceHangs = false;
+    relayRate = RELAY_RATE;
   }
+  if (RUNS.includes('b')) await fallback('b', RELAY_RATE, { deadline: DEADLINE_MS, first: FIRST_MS });
 
   // (c) A answers from a background tab: its timers fire no sooner than CLAMP_MS. (e) The same over the
   // fallback route of (b): the pipe's batching and rate waits are timers too. A runs in a worker; for (e) its
@@ -528,6 +544,11 @@ if (!isMainThread) {
     if (fromA + fromB > ENTRIES + 8 || c.route(a.self)?.kind !== 'signaling' || c.route(b.self)?.kind !== 'direct') results.push({ key: 'f', ok: false, line: `(f) ${routes}; C was sent ${fromB} entries by B and ${fromA} by A, for ${ENTRIES}` });
     await Promise.all([a.leave(), b.leave(), c.leave()]);
     hangs.clear();
+  }
+
+  if (RUNS.includes('g')) {
+    await fallback('g', 3, { deadline: DEADLINE_MS, first: FIRST_MS });
+    await fallback('g', 2, { deadline: SLOW_MS, first: FIRST_SLOW_MS });
   }
 
   const failed = results.filter((r) => !r.ok);

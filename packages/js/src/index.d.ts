@@ -23,6 +23,9 @@ export interface SignalingAdapter {
   onHello: (peer: PeerId, meta?: unknown) => void;
   hello(meta?: unknown): void | Promise<void>;
   send(to: PeerId, body: unknown): void | Promise<void>;
+  /** Milliseconds until the adapter can take one more message (0: it can now), for one that paces its sends, as the
+   * Nostr adapter does. A signalling pipe waits this long, at most a second at a time, so its batches fill meanwhile. */
+  wait?(): number;
   /** `from` must be the sender's PeerId, authenticated by the adapter (as the Nostr adapter's sealed messages are;
    * BroadcastChannel is same-origin): WebRTC offers, answers, ICE candidates and restarts, retry requests, and the
    * signalling pipe and its stale drop all trust it. */
@@ -642,13 +645,19 @@ export declare class NostrSignaling implements SignalingAdapter {
   constructor(pw: Peerwire, endpoint: Endpoint, options: { room: string; relays?: string[] });
   readonly id: string;
   readonly ready: Promise<void>;
-  /** `relaysOpen` counts sockets open now; `reconnects` counts relays that opened again after a close. */
-  readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; reconnects: number; lastRejection?: string };
+  /**
+   * `relaysOpen` counts sockets open now; `reconnects` counts relays that opened again after a close; `backoffs`,
+   * relays held for their rate or stopped for a ban; `resent`, events sent to a relay again after it refused them
+   * for its rate; `unsent`, events dropped from a relay's queue (past 64 waiting, or waiting over 10 s).
+   */
+  readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; reconnects: number; backoffs: number; resent: number; unsent: number; lastRejection?: string };
   onHello: (peer: PeerId, meta?: unknown) => void;
   /** A relay opened again after its socket closed (it is redialled on its own, and at once on a network change or the page showing again; going online redials every relay). */
   onReconnect: (url: string) => void;
   hello(meta?: unknown): Promise<void>;
   send(to: PeerId, body: unknown): Promise<void>;
+  /** Milliseconds until an open relay could take another event (0: one can now). Each relay is paced on its own. */
+  wait(): number;
   onMessage(fn: (from: PeerId, body: any) => void): void;
   close(): void;
 }

@@ -2,7 +2,8 @@
 // batch after PIPE_FLUSH_MS, and a batch's worth goes at once; all pipes keep to PIPE_RATE batches a second, burst
 // PIPE_BURST. A background tab fires timers once a second at most: a timer that fires that late finds the batches
 // of the time it missed and sends them together, and until a timer fires on time again, a pipe sends what a task
-// queued at its end rather than PIPE_FLUSH_MS later (NB-006e).
+// queued at its end rather than PIPE_FLUSH_MS later (NB-006e). Signalling that paces its sends (NostrSignaling's
+// wait()) holds a batch while it can take none, and the batch fills meanwhile.
 //
 //   node packages/js/test/pipe_batches.mjs
 import { PIPE_BATCH, PIPE_BURST, PIPE_FLUSH_MS, PIPE_RATE, WebRtcTransport } from '../src/webrtc.js';
@@ -25,6 +26,7 @@ globalThis.clearTimeout = (t) => {
   if (t) t.fn = null;
 };
 Date.now = () => now;
+performance.now = () => now;
 const tick = () => new Promise((r) => setImmediate(r)); // the end of a task, which no clock holds back
 async function advance(ms) {
   const end = now + ms;
@@ -43,7 +45,8 @@ async function advance(ms) {
 }
 
 const out = []; // [time, datagrams, bytes]
-const sig = { send: (to, m) => m.kind === 'dg' && out.push([now, m.d.length, m.d.reduce((n, s) => n + Math.floor((s.length * 3) / 4), 0)]), onMessage() {}, close() {} };
+let free = 0; // when the signalling can take a message again
+const sig = { send: (to, m) => m.kind === 'dg' && out.push([now, m.d.length, m.d.reduce((n, s) => n + Math.floor((s.length * 3) / 4), 0)]), wait: () => Math.max(0, free - now), onMessage() {}, close() {} };
 const ep = { connect() {}, receive() {}, setRelayOnly() {}, isConnected: () => false };
 const t = new WebRtcTransport(ep, sig, { pipes: true });
 const h = t.pipe('ab'.repeat(32));
@@ -113,6 +116,44 @@ if (out.length !== from) fail(`timers on time again, a datagram went at the end 
 await advance(PIPE_FLUSH_MS);
 if (batches(from) !== '1') fail(`then ${batches(from)}`);
 console.log(`on time again: datagrams wait ${PIPE_FLUSH_MS} ms to be batched`);
+
+// Signalling that can take nothing for 500 ms: the batch waits for it, gathering what is queued meanwhile, and
+// goes whole once it can, not in small batches that would wait there.
+await idle();
+from = out.length;
+free = now + 500;
+send(2, 100);
+await advance(PIPE_FLUSH_MS);
+send(3, 100);
+await advance(499 - PIPE_FLUSH_MS);
+if (out.length !== from) fail(`with signalling busy for 500 ms, ${batches(from)} went before it could take one`);
+await advance(1);
+if (batches(from) !== '5') fail(`once it could, ${batches(from) || 'nothing'} went, not one batch of 5`);
+free = 0;
+console.log('paced signalling: a batch waits while the signalling can take none, then goes whole');
+
+// Signalling that says 30 s but comes free sooner (a relay opened, a hold was cut short): the pipe asks again at
+// least once a second, so the batch goes within a second of that, not 30 s later.
+await idle();
+from = out.length;
+free = now + 30000;
+send(2, 100);
+await advance(PIPE_FLUSH_MS);
+free = 0;
+await advance(1000);
+if (batches(from) !== '2') fail(`with signalling free again early, ${batches(from) || 'nothing'} went within a second, not one batch of 2`);
+console.log('paced signalling: the pipe asks the signalling again at least once a second');
+
+// The pipes' budget runs on a monotonic clock (NB6H-1): the wall clock set back 60 s doesn't stall them.
+await idle();
+await advance(2000);
+from = out.length;
+Date.now = () => now - 60000;
+send(2, 100);
+await advance(PIPE_FLUSH_MS);
+Date.now = () => now;
+if (batches(from) !== '2') fail(`with the wall clock set back 60 s, ${batches(from) || 'nothing'} went, not one batch of 2`);
+console.log('wall clock set back: the pipes still send');
 t.close();
 console.log('pipe batches: all passed');
 process.exit(0);
