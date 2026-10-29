@@ -34,17 +34,19 @@ export const RTC_FALLBACK_MS = 8000;
 export const RTC_SAME_NAT_FALLBACK_MS = 3000;
 // Pipes: datagrams are batched for PIPE_FLUSH_MS into one signalling message of at
 // most PIPE_BATCH bytes, or sent at once when they fill one. All pipes together send
-// PIPE_RATE messages a second (burst PIPE_BURST), within what public relays allow one
-// client, and no sooner than the signalling can take one (its wait(), if it has one), and
-// batch more while they wait; past PIPE_QUEUE bytes waiting on a pipe, the
-// oldest is dropped. Batches are sent lossy. close() sends
-// what waits as one last batch per pipe, past the budget, for at most PIPE_CLOSE_BATCHES
-// pipes, those that queued last first, and not lossy: nothing can send them again.
+// PIPE_RATE messages a second (burst PIPE_BURST): through three relays, one each, 2 a
+// second a relay, within what public relays allow one client. They go no sooner than
+// the signalling can take one (its wait(), if it has one), and batch more while they
+// wait; past PIPE_QUEUE bytes waiting on a pipe (more than a second's batches: a
+// background tab's timers fire once a second), the oldest is dropped. Batches are sent
+// lossy. close() sends what waits as one last batch per pipe, past the budget, for at
+// most PIPE_CLOSE_BATCHES pipes, those that queued last first, and not lossy: nothing
+// can send them again.
 export const PIPE_FLUSH_MS = 40;
 export const PIPE_BATCH = 16 * 1024;
-export const PIPE_RATE = 3;
-export const PIPE_BURST = 6;
-export const PIPE_QUEUE = 64 * 1024;
+export const PIPE_RATE = 6;
+export const PIPE_BURST = 12;
+export const PIPE_QUEUE = 128 * 1024;
 export const PIPE_CLOSE_BATCHES = 16;
 const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
 const full = (p) => p.bytes >= PIPE_BATCH || p.q.length >= MAX_PIPE_ITEMS; // a pipe's queue fills a batch

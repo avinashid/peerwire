@@ -491,8 +491,8 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    messages (a *pipe*). On Nostr each batch is sealed to the peer again
    (`'signaling'`). This works wherever the relays are reachable. It is slow, though: a
    relay round trip per batch, 40 ms batching (a batch's worth goes at once), and at most
-   3 batches a second for all of a client's pipes together. That is within what public
-   relays allow one client. A background tab fires its timers once a second at most: a
+   6 batches a second for all of a client's pipes together, each through one relay (see
+   below). That is within what public relays allow one client. A background tab fires its timers once a second at most: a
    pipe timer that fires that late sends every batch the rate allows by then, and until
    one fires on time again, pipes send what each task queued at its end, not 40 ms later.
    Each relay connection is paced on its own: at most 4 events a second (a burst of 8),
@@ -505,14 +505,14 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    free, so a join or a pipe always has a relay to go through. Each pipe batch goes
    through one relay, the relays taking turns (one that holds us for its rate, banned us
    or isn't open is skipped), and every other signal through each. A pipe loads each
-   relay with a share and moves at about their rates together, up to its own 3 batches
+   relay with a share and moves at about their rates together, up to its own 6 batches
    a second, while they keep pace; a slow relay slows it to its rate times the number of
    relays. A batch is lost when its relay drops it or the peer doesn't hear that relay,
    like a datagram on any path, and the core sends what it carried again: taking turns
-   keeps that to one batch in three when one of three relays drops them all. The last batches a room sends as it leaves go
-   through every relay, as nothing could send them again. A relay that bans us
-   (`blocked:`, `banned`) gets nothing for 30 s, doubling up to 10 min; the ban starts
-   over at 30 s once the relay has gone 10 min without one.
+   keeps that to one batch in three when one of three relays drops them all. The last
+   batches a room sends as it leaves go through every relay, as nothing could send them
+   again. A relay that bans us (`blocked:`, `banned`) gets nothing for 30 s, doubling up
+   to 10 min; the ban starts over at 30 s once the relay has gone 10 min without one.
 
 The core keeps the first path that completes the handshake, and the room's proofs,
 presence and messages run unchanged on it. A pipe opens only for a peer whose hello
@@ -730,7 +730,7 @@ Run these with Node and the Playwright install on this host:
   over the pipe, 60 s with the joiner deaf to a relay), first strokes within 3 s (5 s from a background tab over
   the pipe), and nothing while nobody is online.
 - `node packages/js/test/pipe_batches.mjs`: a pipe's batches on a fake clock: datagrams queued together go 40
-  ms later as one, a batch's worth at once, 3 a second after a burst of 6, and with timers held to once a second
+  ms later as one, a batch's worth at once, 6 a second after a burst of 12, and with timers held to once a second
   (a background tab), the batches a late timer finds go together, and what a task queued goes at its end, until
   a timer fires on time again. Batches go lossy (through one relay), the last one at `close()` not.
 - `node packages/js/test/room_welcome.mjs`: a message a `peer-join` handler sends to the

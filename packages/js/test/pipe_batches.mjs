@@ -95,6 +95,7 @@ send(per * PIPE_BURST + PIPE_RATE * per);
 await advance(999);
 if (out.length - from !== PIPE_BURST) fail(`a background tab sent ${out.length - from} batches before its timer`);
 await advance(1);
+for (let i = 0; i < PIPE_RATE; i++) await tick(); // late timers: a batch a task, back to back
 const late = out.slice(from + PIPE_BURST);
 if (late.length !== PIPE_RATE || late.some(([time]) => time !== late[0][0])) fail(`its timer a second late sent ${late.map(([time, n]) => `${n} at ${time - at}`).join(', ')}`);
 // Its timers are late now: a datagram goes at the end of the task, as the budget allows, not a second later.

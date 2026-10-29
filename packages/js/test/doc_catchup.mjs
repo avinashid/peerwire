@@ -47,7 +47,8 @@ const BACKGROUND_MS = 30000; // (e)
 const FIRST_MS = 3000; // (b): C's first entries
 const FIRST_BACKGROUND_MS = 5000; // (e)
 // (h): a third of A's batches are lost, so the core sends what they carried again. It backs each lost fragment off
-// (to 10 s), and the answer, in order, waits behind one lost three or four times: 27 s alone, more beside other tests.
+// (to 10 s), and the answer, in order, waits behind one lost three or four times: 15 to 19 s alone, over 30 s beside
+// other tests (27 s alone at 3 batches a second).
 const DEAF_MS = 60000;
 const LINK_MS = 30000; // for C to link to A at all
 const ALONE_MS = 2000; // (d): how long C waits alone
