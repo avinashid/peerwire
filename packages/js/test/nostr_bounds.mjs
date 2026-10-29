@@ -262,6 +262,119 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   delete performance.now;
 }
 
+// 5c. A lossy event (a pipe batch) goes through one relay, the relays taking turns; any other event goes through
+//     each. A relay that can't take one yet still gets its turn (it waits on its queue), so one that answers OK
+//     but delivers nothing gets no more than its share. One that holds us for its rate, has banned us or isn't
+//     open is skipped; with every open, unbanned one held, the hold that ends first takes it. A lossy event refused
+//     for the rate goes again through the next relay, not the one held. Lossy events sent as wait() allows move at
+//     the relays' rates together, others at one relay's; with relays of different rates, an equal share each.
+{
+  let clock = 1e6;
+  performance.now = () => clock;
+  const s = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/stripe', relays: [] });
+  await s.ready;
+  const names = ['a', 'b', 'c'];
+  const sent = { a: [], b: [], c: [] };
+  const sock = {};
+  const order = [];
+  for (const name of names) s.sockets.push((sock[name] = { relayUrl: name, readyState: WebSocket.OPEN, send: (m) => (sent[name].push(JSON.parse(m)[1].id), order.push(name)), close() {} }));
+  let n = 0;
+  const lossy = () => s.publish(s.roomTag, `l${++n}`, true);
+  const counts = () => names.map((x) => sent[x].length).join();
+  const tokens = (x, t) => (s.rate(x, clock).tokens = t);
+  const ok = (url, id, taken, why = '') => s.onRelay(url, JSON.stringify(['OK', id, taken, why]));
+  const through = (id) => names.filter((x) => sent[x].includes(id)).join();
+  // Every relay open, free and empty again, its bucket full.
+  const reset = () => names.forEach((x) => (s.paused.delete(x), s.banned.delete(x), s.rates.delete(x), (sock[x].q = []), (sock[x].readyState = WebSocket.OPEN)));
+
+  for (let i = 0; i < 6; i++) await lossy();
+  check(order.join('') === 'abcabc', `lossy events take turns, one relay each (${order.join('')})`);
+  await s.publish(s.roomTag, `e${++n}`);
+  check(counts() === '3,3,3' && sent.a.at(-1) === sent.b.at(-1) && sent.b.at(-1) === sent.c.at(-1), `any other event goes through each relay (${counts()})`);
+  await s.send(other.id, { kind: 'dg', d: [] }, { lossy: true });
+  check(counts() === '4,3,3', `send(to, body, { lossy: true }) goes through one (${counts()})`);
+  await s.send(other.id, { kind: 'dg', d: [] });
+  check(counts() === '5,4,4' && s.stats.published === 9, `send() without it, through each (${counts()}; ${s.stats.published} published)`);
+
+  // b's turn, with one token; c has three, a none: b and c send theirs, a's waits on its queue, and wait() is how
+  // long until b, next, can take one.
+  tokens('a', 0);
+  tokens('b', 1);
+  tokens('c', 3);
+  for (let i = 0; i < 3; i++) await lossy();
+  check(counts() === '5,5,5' && sock.a.q.length === 1 && s.wait() === 1000 / RELAY_RATE,
+    `every relay takes its turn, also one that can't send yet (a waits with ${sock.a.q.length}); wait() ${s.wait()} ms, until the next in turn can`);
+  clock += 1000 / RELAY_RATE;
+  s.pump(sock.a);
+  check(counts() === '6,5,5', 'and it sends it at its rate');
+
+  // c refuses the last two it was sent (the second was on its way when the first held it): both go again through
+  // the next relay in turn, not c; while c is held, it is skipped.
+  reset();
+  for (let i = 0; i < 6; i++) await lossy();
+  const [w, z] = sent.c.slice(-2);
+  const resent = s.stats.resent;
+  clock += 1;
+  ok('c', z, false, 'rate-limited: slow down');
+  ok('c', w, false, 'rate-limited: slow down');
+  const again = (id) => ['a', 'b'].filter((x) => sent[x].includes(id)).length;
+  check(s.paused.get('c')?.until > clock && s.stats.backoffs === 1 && s.stats.resent === resent + 2 && again(z) === 1 && again(w) === 1 && sent.c.filter((id) => id === z || id === w).length === 2,
+    `a lossy event refused for the rate goes again through the next relay, not the one held (z through ${through(z)}, w through ${through(w)})`);
+  const heldC = sent.c.length;
+  for (let i = 0; i < 4; i++) await lossy();
+  check(sent.c.length === heldC && !sock.c.q.length, 'a relay held for its rate is skipped');
+  // Every relay held: the one whose hold ends first (b) takes it, and wait() says when.
+  s.paused.set('a', { at: clock, until: clock + 500, ms: 500, took: false });
+  s.paused.set('b', { at: clock, until: clock + 300, ms: 300, took: false });
+  const all = s.wait();
+  await lossy();
+  check(all === 300 && sock.b.q.length === 1 && !sock.a.q.length && !sock.c.q.length, `with every relay held, the hold that ends first takes it (wait() ${all} ms)`);
+
+  // A banned relay, even one whose ban ends in a moment, and one that isn't open are skipped, whoever's turn.
+  reset();
+  s.banned.set('b', { until: clock + 1, ms: BACKOFF_MS });
+  const before = sent.b.length;
+  for (let i = 0; i < 3; i++) await lossy();
+  check(sent.b.length === before && !sock.b.q.length, 'a banned relay is sent no lossy event, however soon its ban ends');
+  reset();
+  sock.a.readyState = WebSocket.CLOSED;
+  const beforeA = sent.a.length;
+  for (let i = 0; i < 3; i++) await lossy();
+  check(sent.a.length === beforeA && !sock.a.q.length, 'nor is one that is not open');
+  // Every open relay banned: no lossy event goes, and wait() is until the first ban ends.
+  reset();
+  names.forEach((x, i) => s.banned.set(x, { until: clock + 700 + 100 * i, ms: BACKOFF_MS }));
+  const none = counts();
+  await lossy();
+  check(counts() === none && names.every((x) => !sock[x].q.length) && s.wait() === 700, `with every relay banned, none goes and wait() is until the first ban ends (${s.wait()} ms)`);
+
+  // Pacing: send whenever wait() says one can go, for 10 s from empty buckets. Lossy events take every relay's
+  // rate, about 3 * RELAY_RATE a second, in turns; others, one relay's. With a and b slowed to MIN_RELAY_RATE
+  // (growing back) and c not (one that never refuses), each still takes a third.
+  const pace = async (isLossy, slow = []) => {
+    reset();
+    for (const x of names) tokens(x, 0);
+    for (const x of slow) Object.assign(s.rates.get(x), { low: MIN_RELAY_RATE, lowAt: clock, rate: MIN_RELAY_RATE });
+    const from = names.map((x) => sent[x].length);
+    let m = 0;
+    for (const end = clock + 10000; clock < end;) {
+      const ms = s.wait();
+      if (ms > 0) clock += Math.ceil(ms);
+      else (await s.publish(s.roomTag, `p${++n}`, isLossy), m++);
+    }
+    return { m, each: names.map((x, i) => sent[x].length - from[i]) };
+  };
+  const striped = await pace(true);
+  const full = await pace(false);
+  check(Math.abs(striped.m - 30 * RELAY_RATE) <= 3 && striped.each.every((k) => Math.abs(k - 10 * RELAY_RATE) <= 1) && Math.abs(full.m - 10 * RELAY_RATE) <= 1,
+    `paced by wait() for 10 s, ${striped.m} lossy events go (${striped.each.join(', ')} per relay), ${full.m} others (each relay ${RELAY_RATE}/s)`);
+  const uneven = await pace(true, ['a', 'b']);
+  check(Math.max(...uneven.each) - Math.min(...uneven.each) <= 1 && uneven.m > 0,
+    `with two relays slowed and one not, each takes its turn: ${uneven.each.join(', ')}`);
+  s.close();
+  delete performance.now;
+}
+
 // 6. A relay socket that closes (phone hotspot on, network switch, tab frozen) is redialled,
 //    subscribes again and says so; a network change recycles open sockets; close() stops it.
 {

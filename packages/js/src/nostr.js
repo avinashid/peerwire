@@ -15,7 +15,7 @@
 //   same bar as computing the topic tag, so this keeps presence confidential to
 //   room members without changing who can join.
 //
-// Same interface as BroadcastSignaling: id, hello(meta), onHello, send(to, body),
+// Same interface as BroadcastSignaling: id, hello(meta), onHello, send(to, body, { lossy }),
 // onMessage(fn), close().
 
 import { isPeerId } from './peerwire.js';
@@ -42,6 +42,14 @@ export const DEFAULT_RELAYS = ['wss://nos.lol', 'wss://relay.primal.net', 'wss:/
 // 'banned') gets nothing for BACKOFF_MS, doubling to MAX_BACKOFF_MS. An event waits at
 // most RELAY_QUEUE_MS, and a relay holds RELAY_QUEUE of them: the oldest go first, as from
 // a full UDP buffer.
+// Every event goes through each relay, but a lossy one (a pipe batch, whose datagrams the
+// core resends if it is lost) goes through one, the relays taking turns. A pipe loads each
+// with a share and moves at about their rates together while they keep pace, and a relay
+// that answers OK but delivers nothing loses no more than its share. A relay that holds us
+// for its rate, has banned us or isn't open is skipped; with every open, unbanned one held,
+// the one whose hold ends first takes it. One refused for its rate goes again through the
+// next relay, seldom the one that refused, now held; one on a relay that closes or bans us
+// is lost.
 export const RELAY_RATE = 4;
 export const RELAY_BURST_S = 2;
 export const MIN_RELAY_RATE = 0.5;
@@ -95,6 +103,7 @@ export class NostrSignaling {
     this.banned = new Map(); // relay url -> { until, ms }: it banned us
     this.rates = new Map(); // relay url -> { tokens, at, rate, low, lowAt }: its token bucket
     this.seq = 0; // events published, numbering them so a refused one goes back in its place
+    this.turn = 0; // the socket whose turn it is to take a lossy event (see next())
     this.stats = { published: 0, received: 0, rejected: 0, relaysOpen: 0, reconnects: 0, backoffs: 0, resent: 0, unsent: 0 };
     this.closed = false;
     this.sending = 0; // send()s not yet published: close() leaves the sockets open for them
@@ -201,20 +210,47 @@ export class NostrSignaling {
     }
   }
 
-  async publish(tag, content) {
+  // `lossy`: through one relay, the relays taking turns (stripe), not each.
+  async publish(tag, content, lossy = false) {
     await this.ready;
     const created_at = Math.floor(Date.now() / 1000);
     const tags = [['p', tag]];
     const id = await sha256(enc.encode(JSON.stringify([0, this.pubkey, created_at, KIND, tags, content])));
     const sig = this.pw.nostrSign(this.key.secret, id);
     const ev = { id: hex(id), pubkey: this.pubkey, created_at, kind: KIND, tags, content, sig: hex(sig) };
-    const e = { id: ev.id, msg: JSON.stringify(['EVENT', ev]), at: clock(), seq: ++this.seq, tries: 0, sent: 0 };
+    const e = { id: ev.id, msg: JSON.stringify(['EVENT', ev]), at: clock(), seq: ++this.seq, tries: 0, sent: 0, lossy };
+    this.stats.published++;
+    if (lossy) return this.stripe(e);
     for (const ws of this.sockets) {
       if (ws.readyState !== WebSocket.OPEN || this.banned.get(ws.relayUrl)?.until > e.at) continue;
       this.queue(ws, { ...e });
       this.pump(ws);
     }
-    this.stats.published++;
+  }
+
+  // The socket the next lossy event goes to, from `turn` on: the first open one that has
+  // neither banned us nor holds us for its rate, else the open, unbanned one whose hold ends
+  // first; -1 if none.
+  next(now) {
+    let held = -1;
+    for (let i = 0; i < this.sockets.length; i++) {
+      const k = (this.turn + i) % this.sockets.length;
+      const url = this.sockets[k].relayUrl;
+      if (this.sockets[k].readyState !== WebSocket.OPEN || this.banned.get(url)?.until > now) continue;
+      const until = this.paused.get(url)?.until;
+      if (!(until > now)) return k;
+      if (held < 0 || until < this.paused.get(this.sockets[held].relayUrl).until) held = k;
+    }
+    return held;
+  }
+
+  // Queues `e` on the relay whose turn it is (see next()), and sends it if its rate allows.
+  stripe(e) {
+    const k = this.next(clock());
+    if (k < 0) return;
+    this.turn = k + 1;
+    this.queue(this.sockets[k], e);
+    this.pump(this.sockets[k]);
   }
 
   // Puts `e` on `ws`'s queue in its place (an event sent again goes before those published
@@ -290,18 +326,26 @@ export class NostrSignaling {
     this.pump(ws);
   }
 
-  // How long until an open relay could take one more event (0: one can now). The pipe
-  // waits this long before its next batch, so its batches fill rather than queue here.
+  // How long until `ws`'s relay could take one more event: its hold or ban, then its queue
+  // at its rate.
+  free(ws, now) {
+    const url = ws.relayUrl;
+    const hold = Math.max(this.banned.get(url)?.until ?? 0, this.paused.get(url)?.until ?? 0, now) - now;
+    const r = this.rate(url, now);
+    return hold + (Math.max(0, (ws.q?.length ?? 0) + 1 - r.tokens) * 1000) / r.rate;
+  }
+
+  // How long until the relay the next lossy event goes to (see next()) could take it (0: it
+  // can now, or no relay is open); with every open relay banned, until the first ban ends.
+  // The pipe waits this long before its next batch, so its batches fill rather than queue
+  // here; with the relays taking turns, it moves at about their rates together while they
+  // keep pace, and at most at the slowest's times their number.
   wait() {
     const now = clock();
+    const k = this.next(now);
+    if (k >= 0) return this.free(this.sockets[k], now);
     let ms = Infinity;
-    for (const ws of this.sockets) {
-      if (ws.readyState !== WebSocket.OPEN) continue;
-      const url = ws.relayUrl;
-      const hold = Math.max(this.banned.get(url)?.until ?? 0, this.paused.get(url)?.until ?? 0, now) - now;
-      const r = this.rate(url, now);
-      ms = Math.min(ms, hold + (Math.max(0, (ws.q?.length ?? 0) + 1 - r.tokens) * 1000) / r.rate);
-    }
+    for (const ws of this.sockets) if (ws.readyState === WebSocket.OPEN) ms = Math.min(ms, this.free(ws, now));
     return ms === Infinity ? 0 : ms;
   }
 
@@ -370,23 +414,26 @@ export class NostrSignaling {
       return void this.release();
     }
     if (kind !== 'rate') return;
-    if (e && ws && e.tries < RELAY_TRIES - 1 && !this.closed) {
+    const again = e && ws && e.tries < RELAY_TRIES - 1 && !this.closed;
+    if (again) {
       e.tries++;
       this.stats.resent++;
-      this.queue(ws, e);
     }
     // Events sent before its hold began were on their way: refused, they count for nothing
     // more (one we don't know counts unless a hold runs now).
-    if (e ? e.sent < p?.at : p?.until > now) return ws && this.pump(ws);
-    const ms = p && !p.took ? Math.min(p.ms * 2, MAX_HOLD_MS) : HOLD_MS;
-    this.paused.set(url, { at: now, until: now + ms, ms, took: false });
-    const r = this.rate(url, now);
-    r.low = Math.max(MIN_RELAY_RATE, r.rate / 2);
-    r.lowAt = now;
-    r.tokens = 0;
-    r.rate = r.low;
-    this.stats.backoffs++;
-    this.release();
+    if (!(e ? e.sent < p?.at : p?.until > now)) {
+      const ms = p && !p.took ? Math.min(p.ms * 2, MAX_HOLD_MS) : HOLD_MS;
+      this.paused.set(url, { at: now, until: now + ms, ms, took: false });
+      const r = this.rate(url, now);
+      r.low = Math.max(MIN_RELAY_RATE, r.rate / 2);
+      r.lowAt = now;
+      r.tokens = 0;
+      r.rate = r.low;
+      this.stats.backoffs++;
+      this.release();
+    }
+    // A lossy one goes again through the next relay, now that this one is held.
+    if (again) e.lossy ? this.stripe(e) : this.queue(ws, e);
     if (ws) this.pump(ws);
   }
 
@@ -424,14 +471,15 @@ export class NostrSignaling {
     this.publish(this.roomTag, await this.sealRoom({ t: 'hello', from: this.id, meta }));
   }
 
-  async send(to, body) {
+  // `lossy` (a pipe batch: the core resends what it carries if it is lost): through one relay.
+  async send(to, body, opts) {
     if (!isPeerId(to)) throw new TypeError('send: `to` must be a peer id (64 lowercase hex characters)');
     if (this.closed) return;
     const sealed = this.ep.seal(to, enc.encode(JSON.stringify(body)));
     if (!sealed) return;
     this.sending++;
     try {
-      await this.publish(hex(await sha256(enc.encode(`peerwire/peer/${to}`))), b64(sealed));
+      await this.publish(hex(await sha256(enc.encode(`peerwire/peer/${to}`))), b64(sealed), opts?.lossy === true);
     } finally {
       if (!--this.sending && this.closed) this.shut();
     }

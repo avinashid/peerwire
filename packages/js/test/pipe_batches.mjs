@@ -3,7 +3,8 @@
 // PIPE_BURST. A background tab fires timers once a second at most: a timer that fires that late finds the batches
 // of the time it missed and sends them together, and until a timer fires on time again, a pipe sends what a task
 // queued at its end rather than PIPE_FLUSH_MS later (NB-006e). Signalling that paces its sends (NostrSignaling's
-// wait()) holds a batch while it can take none, and the batch fills meanwhile.
+// wait()) holds a batch while it can take none, and the batch fills meanwhile. Batches go lossy (NostrSignaling sends
+// each through one relay), but not a last one at close(), which nothing can send again.
 //
 //   node packages/js/test/pipe_batches.mjs
 import { PIPE_BATCH, PIPE_BURST, PIPE_FLUSH_MS, PIPE_RATE, WebRtcTransport } from '../src/webrtc.js';
@@ -44,9 +45,9 @@ async function advance(ms) {
   await tick();
 }
 
-const out = []; // [time, datagrams, bytes]
+const out = []; // [time, datagrams, bytes, lossy]
 let free = 0; // when the signalling can take a message again
-const sig = { send: (to, m) => m.kind === 'dg' && out.push([now, m.d.length, m.d.reduce((n, s) => n + Math.floor((s.length * 3) / 4), 0)]), wait: () => Math.max(0, free - now), onMessage() {}, close() {} };
+const sig = { send: (to, m, o) => m.kind === 'dg' && out.push([now, m.d.length, m.d.reduce((n, s) => n + Math.floor((s.length * 3) / 4), 0), o?.lossy]), wait: () => Math.max(0, free - now), onMessage() {}, close() {} };
 const ep = { connect() {}, receive() {}, setRelayOnly() {}, isConnected: () => false };
 const t = new WebRtcTransport(ep, sig, { pipes: true });
 const h = t.pipe('ab'.repeat(32));
@@ -154,6 +155,13 @@ await advance(PIPE_FLUSH_MS);
 Date.now = () => now;
 if (batches(from) !== '2') fail(`with the wall clock set back 60 s, ${batches(from) || 'nothing'} went, not one batch of 2`);
 console.log('wall clock set back: the pipes still send');
+
+// Every batch so far went lossy; a last one at close() doesn't.
+if (out.some(([, , , lossy]) => lossy !== true)) fail(`${out.filter(([, , , lossy]) => lossy !== true).length} of ${out.length} batches went without lossy`);
+from = out.length;
+send(1, 100);
 t.close();
+if (batches(from) !== '1' || out.at(-1)[3] !== false) fail(`close() sent ${batches(from) || 'nothing'}, lossy ${out.at(-1)?.[3]}`);
+console.log(`lossy: ${from} batches went lossy, the last at close() not`);
 console.log('pipe batches: all passed');
 process.exit(0);

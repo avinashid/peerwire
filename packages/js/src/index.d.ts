@@ -22,7 +22,9 @@ export interface SignalingAdapter {
   /** Called with each peer that announces itself in the room. */
   onHello: (peer: PeerId, meta?: unknown) => void;
   hello(meta?: unknown): void | Promise<void>;
-  send(to: PeerId, body: unknown): void | Promise<void>;
+  /** `lossy`: the sender resends what `body` carries if it is lost (a signalling-pipe batch), so it may go one way
+   * rather than every way the adapter has (the Nostr adapter sends it through one relay, not each). */
+  send(to: PeerId, body: unknown, options?: { lossy?: boolean }): void | Promise<void>;
   /** Milliseconds until the adapter can take one more message (0: it can now), for one that paces its sends, as the
    * Nostr adapter does. A signalling pipe waits this long, at most a second at a time, so its batches fill meanwhile. */
   wait?(): number;
@@ -655,8 +657,11 @@ export declare class NostrSignaling implements SignalingAdapter {
   /** A relay opened again after its socket closed (it is redialled on its own, and at once on a network change or the page showing again; going online redials every relay). */
   onReconnect: (url: string) => void;
   hello(meta?: unknown): Promise<void>;
-  send(to: PeerId, body: unknown): Promise<void>;
-  /** Milliseconds until an open relay could take another event (0: one can now). Each relay is paced on its own. */
+  /** `lossy`: through one relay, the relays taking turns (one that holds us for its rate, has banned us or isn't open
+   * is skipped), not each. */
+  send(to: PeerId, body: unknown, options?: { lossy?: boolean }): Promise<void>;
+  /** Milliseconds until the relay the next lossy event goes to could take it (0: it can now). Each relay is paced on
+   * its own, so lossy sends that wait this long move at about the relays' rates together. */
   wait(): number;
   onMessage(fn: (from: PeerId, body: any) => void): void;
   close(): void;

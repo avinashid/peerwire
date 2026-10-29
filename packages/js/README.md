@@ -502,7 +502,15 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    for its rate (`rate-limited:`) halves its rate, which grows back by one event a second
    every 5 s. It is held for 1 s (doubling to 30 s while it refuses again before taking
    one), and is sent the event again, 3 times in all. A relay isn't held while no other is
-   free, so a join or a pipe always has a relay to go through. One that bans us
+   free, so a join or a pipe always has a relay to go through. Each pipe batch goes
+   through one relay, the relays taking turns (one that holds us for its rate, banned us
+   or isn't open is skipped), and every other signal through each. A pipe loads each
+   relay with a share and moves at about their rates together, up to its own 3 batches
+   a second, while they keep pace; a slow relay slows it to its rate times the number of
+   relays. A batch is lost when its relay drops it or the peer doesn't hear that relay,
+   like a datagram on any path, and the core sends what it carried again: taking turns
+   keeps that to one batch in three when one of three relays drops them all. The last batches a room sends as it leaves go
+   through every relay, as nothing could send them again. A relay that bans us
    (`blocked:`, `banned`) gets nothing for 30 s, doubling up to 10 min; the ban starts
    over at 30 s once the relay has gone 10 min without one.
 
@@ -599,7 +607,12 @@ Run these with Node and the Playwright install on this host:
   short, as it is when the one free relay closes. A ban stops a relay for 30 s, doubling.
   Queues drop their oldest past 64 events or 10 s, and `close()` sends what waits at once,
   but not to a relay that holds or banned us. The pacing runs on a monotonic clock: the
-  wall clock set back 60 s stalls nothing. No relays.
+  wall clock set back 60 s stalls nothing.
+  Pipe batches go through one relay each, the relays taking turns, also one that can't
+  send yet; one held for its rate, banned or closed is skipped, and with every relay held
+  the hold that ends first takes it. One refused for its rate goes again through the next
+  relay. Sent as `wait()` allows, pipe batches move at three relays' rates, other events
+  at one's, and with relays of different rates each takes an equal share. No relays.
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's; a room that signs
@@ -711,14 +724,15 @@ Run these with Node and the Playwright install on this host:
   direct link, the signalling pipe through fake rate-limited relays, from a background tab, both at once, from a
   member that kept the board on its device and comes back after nobody was online, and with two holders, one
   direct and one over the pipe (one whole answer, from the direct one); then over the pipe through relays that
-  take 3 events a second, then 2, which refuse part of every join's burst. It prints the time to the whole
-  board, the frames, datagrams, retransmits, pipe batches and relay events, and checks the bars: 15 s (30 s from
-  a background tab over the pipe, 60 s through relays that take 2 events a second), first strokes within 3 s (5 s,
-  6 s), and nothing while nobody is online.
+  take 3 events a second, then 2, which refuse part of every join's burst, and with the joiner deaf to one of the
+  three relays, which loses the batches sent through it. It prints the time to the whole board, the frames,
+  datagrams, retransmits, pipe batches and relay events, and checks the bars: 15 s (30 s from a background tab
+  over the pipe, 60 s with the joiner deaf to a relay), first strokes within 3 s (5 s from a background tab over
+  the pipe), and nothing while nobody is online.
 - `node packages/js/test/pipe_batches.mjs`: a pipe's batches on a fake clock: datagrams queued together go 40
   ms later as one, a batch's worth at once, 3 a second after a burst of 6, and with timers held to once a second
   (a background tab), the batches a late timer finds go together, and what a task queued goes at its end, until
-  a timer fires on time again.
+  a timer fires on time again. Batches go lossy (through one relay), the last one at `close()` not.
 - `node packages/js/test/room_welcome.mjs`: a message a `peer-join` handler sends to the
   newcomer reaches it, also when the newcomer's presence came while its link proof was
   being checked (forced in 20 joins); 200 two-member joins and 30 third members lose none.

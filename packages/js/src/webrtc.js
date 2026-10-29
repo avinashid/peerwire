@@ -6,9 +6,11 @@
 // come from Peerwire on top; the signalling channel is untrusted, because the Noise
 // handshake over the DataChannel proves the remote holds the PeerId it claims.
 //
-// Signalling adapters implement { id, send(to, msg), onMessage(fn), close() };
+// Signalling adapters implement { id, send(to, msg, { lossy }), onMessage(fn), close() };
 // messages are JSON-able objects. See BroadcastSignaling below. close() may come
 // right after a send() (a leaving room's last pipe batch): that message should still go.
+// A `lossy` one (a pipe batch: the core resends what it carries) may go one way, not
+// every way the adapter has (NostrSignaling: through one relay).
 //
 // When WebRTC can't link two peers (symmetric NAT on both sides, no TURN), the
 // transport can carry Peerwire datagrams over the signalling channel itself: a
@@ -35,9 +37,9 @@ export const RTC_SAME_NAT_FALLBACK_MS = 3000;
 // PIPE_RATE messages a second (burst PIPE_BURST), within what public relays allow one
 // client, and no sooner than the signalling can take one (its wait(), if it has one), and
 // batch more while they wait; past PIPE_QUEUE bytes waiting on a pipe, the
-// oldest is dropped. close() sends
+// oldest is dropped. Batches are sent lossy. close() sends
 // what waits as one last batch per pipe, past the budget, for at most PIPE_CLOSE_BATCHES
-// pipes, those that queued last first.
+// pipes, those that queued last first, and not lossy: nothing can send them again.
 export const PIPE_FLUSH_MS = 40;
 export const PIPE_BATCH = 16 * 1024;
 export const PIPE_RATE = 3;
@@ -927,7 +929,7 @@ export class WebRtcTransport {
     p.bytes -= n;
     this.piped.sent++;
     try {
-      Promise.resolve(this.sig.send(p.peer, { kind: 'dg', d })).catch(() => {});
+      Promise.resolve(this.sig.send(p.peer, { kind: 'dg', d }, { lossy: !last })).catch(() => {});
     } catch {
       // A closed signalling channel: the datagrams are lost, as on a dead path.
     }
