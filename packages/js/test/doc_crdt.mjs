@@ -558,6 +558,69 @@ console.log("'change': one event per change, local and remote alike; frozen valu
 }
 console.log('limits: our mistakes throw; a full doc refuses writes with a warning and takes them again as room frees');
 
+// Depth (NB-056): the walk takes own keys, as JSON.stringify does, and every branch. With an object on
+// Object.prototype, enumerable as a page's assignment makes it, every object would nest past the bound through it:
+// our objects and arrays are written and members' taken all the same, and 65 deep is still thrown or dropped, down
+// a middle branch beside shallow ones too. One a level shorter is kept: the bound is on depth, not on the
+// containers walked. Nulls inside are passed over, not walked.
+{
+  // `depth` objects and arrays, alternating (an array outermost with `array`), nested around 0.
+  const nest = (depth, array = false) => {
+    let v = 0;
+    for (let i = depth - 1 + array; i >= +array; i--) v = i % 2 ? [v] : { k: v };
+    return v;
+  };
+  const mid = (v, array) => (array ? [[], v, []] : { a: {}, b: v, c: {} });
+  const net = new Net(19);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x));
+  net.mesh([a, b]);
+  net.run();
+  Object.prototype.polluted = {};
+  try {
+    const ok = { plain: { a: { b: [null] }, n: null }, empty: [] };
+    for (const array of [false, true]) {
+      ok[`d64${array}`] = nest(64, array);
+      ok[`mid64${array}`] = mid(nest(63, array), array);
+      for (const [what, v] of [['', nest(65, array)], [' in a middle branch', mid(nest(64, array), array)]]) {
+        let e = null;
+        try {
+          a.doc.map('m').set('deep', v);
+        } catch (x) {
+          e = x;
+        }
+        if (!(e instanceof RangeError)) fail(`a value 65 deep${what} (array outermost: ${array}) did not throw a RangeError: ${e}`);
+      }
+    }
+    for (const [k, v] of Object.entries(ok)) {
+      try {
+        a.doc.map('m').set(k, v);
+      } catch (e) {
+        fail(`writing ${k} threw with Object.prototype.polluted: ${e}`);
+      }
+    }
+    net.run();
+    for (const [k, v] of Object.entries(ok)) {
+      if (JSON.stringify(b.doc.map('m').get(k)) !== JSON.stringify(v)) fail(`a member's ${k} was not taken with Object.prototype.polluted`);
+    }
+    // A member's past the bound: dropped. Its frame is good otherwise: with a value a level shorter it is taken.
+    const frame = (n, k, v) => ({ d: 'board', t: 1, ws: [a.doc.writer], e: [[0, n, 1, 'm', 'deep', k, v]] });
+    let n = 1e6;
+    for (const array of [false, true]) {
+      for (const [what, v] of [['', nest(65, array)], [' in a middle branch', mid(nest(64, array), array)]]) {
+        const before = state(b.doc);
+        b.doc.receive(a.self, frame(n++, `k${array}`, v));
+        if (state(b.doc) !== before) fail(`a member's value 65 deep${what} (array outermost: ${array}) was taken`);
+      }
+      const v = mid(nest(63, array), array);
+      b.doc.receive(a.self, frame(n++, `k${array}`, v));
+      if (JSON.stringify(b.doc.map('deep').get(`k${array}`)) !== JSON.stringify(v)) fail(`a member's value 64 deep in a middle branch (array outermost: ${array}) was dropped`);
+    }
+  } finally {
+    delete Object.prototype.polluted;
+  }
+}
+console.log('depth: own keys and every branch walked, 64 kept and 65 refused, with an object on Object.prototype');
+
 // Frames: none over MESSAGE_BYTES as UTF-8, a catch-up of a full doc of 3-byte characters included, and an
 // ask at the context's caps.
 {

@@ -420,11 +420,15 @@ const throws = (fn) => {
     if (e) fail(`a member's set or live value 100000 deep threw: ${e}`);
     if (read(a, 'deep') !== undefined || a.st.getLive('deep')[x.self] !== undefined) fail('a set or live value 100000 deep was kept');
     if (read(a, 'after') !== 1 || a.st.getLive('after')[x.self] !== 1) fail('the set or live after a value 100000 deep was lost');
-    // A value 65 deep down a middle branch, beside shallow ones: every branch is walked.
+    // A value 65 deep down a middle branch, beside shallow ones: every branch is walked. One a level shorter is
+    // kept: the bound is on depth, not on the containers walked.
     n.from(x, a, `{"$peerwire":"set","k":"mid","v":[[],${nest(64, true)},[]],"c":${now}}`);
     n.from(x, a, `{"$peerwire":"set","k":"midobj","v":{"a":{},"b":${nest(64)},"c":{}},"c":${now}}`);
+    n.from(x, a, `{"$peerwire":"set","k":"mid64","v":[[],${nest(63, true)},[]],"c":${now}}`);
+    n.from(x, a, `{"$peerwire":"set","k":"midobj64","v":{"a":{},"b":${nest(63)},"c":{}},"c":${now}}`);
     n.flush();
     if (read(a, 'mid') !== undefined || read(a, 'midobj') !== undefined) fail('a value 65 deep in a middle branch was kept');
+    if (read(a, 'mid64') === undefined || read(a, 'midobj64') === undefined) fail('a value 64 deep in a middle branch was ignored');
 
     const s = (k, v, w = x.self) => `["${k}",${v},${now},"${w}"]`;
     n.from(x, a, `{"$peerwire":"sync","ask":true,"s":[${s('sdeep', deep)},${s('safter', 2)}],"p":[["pdeep",${deep},3],["pafter",2,4]]}`);
@@ -476,7 +480,34 @@ const throws = (fn) => {
   } finally {
     JSON.stringify = stringify;
   }
-  console.log(`values nested past ${MAX_VALUE_DEPTH} ignored, the rest of a catch-up kept, ours past it throw`);
+
+  // NB-056: the walk takes own keys, as JSON.stringify does. With an object on Object.prototype, enumerable as a
+  // page's assignment makes it, every object would nest past the bound through it: members' objects and arrays are
+  // kept all the same, ours set, and 65 deep still dropped or thrown. Nulls inside are passed over, not walked.
+  Object.prototype.polluted = {};
+  try {
+    const n = net();
+    const [a, x] = [n.node('a'), n.raw('b')];
+    const now = Date.now();
+    n.from(x, a, `{"$peerwire":"set","k":"obj","v":{"a":{"b":[null]},"n":null},"c":${now}}`);
+    n.from(x, a, `{"$peerwire":"set","k":"arr","v":[],"c":${now}}`);
+    n.from(x, a, `{"$peerwire":"live","k":"obj","v":{},"n":1}`);
+    for (const array of [false, true]) {
+      for (const depth of [64, 65]) n.from(x, a, `{"$peerwire":"set","k":"d${depth}${array}","v":${nest(depth, array)},"c":${now}}`);
+    }
+    let e = throws(() => n.flush());
+    if (e) fail(`a member's value threw with Object.prototype.polluted: ${e}`);
+    if (JSON.stringify(read(a, 'obj')) !== '{"a":{"b":[null]},"n":null}' || JSON.stringify(read(a, 'arr')) !== '[]') fail("a member's object or array was ignored with Object.prototype.polluted");
+    if (JSON.stringify(a.st.getLive('obj')[x.self]) !== '{}') fail("a member's per-peer object was ignored with Object.prototype.polluted");
+    if (read(a, 'd64false') === undefined || read(a, 'd64true') === undefined) fail("a member's value 64 deep was ignored with Object.prototype.polluted");
+    if (read(a, 'd65false') !== undefined || read(a, 'd65true') !== undefined) fail("a member's value 65 deep was kept with Object.prototype.polluted");
+    e = throws(() => (a.st.setShared('mine', { a: [null] }), a.st.setLive('mine', { n: null })));
+    if (e) fail(`setting an object threw with Object.prototype.polluted: ${e}`);
+    if (!(throws(() => a.st.setShared('mine65', JSON.parse(nest(65)))) instanceof RangeError)) fail('setting a value 65 deep did not throw with Object.prototype.polluted');
+  } finally {
+    delete Object.prototype.polluted;
+  }
+  console.log(`values nested past ${MAX_VALUE_DEPTH} ignored, the rest of a catch-up kept, ours past it throw; own keys only`);
 }
 
 console.log('ok');

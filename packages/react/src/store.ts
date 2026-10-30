@@ -75,16 +75,25 @@ const stamp = (c: unknown): c is number => counter(c) && c <= Date.now() + MAX_C
 // Whether version `a` wins over `b`: the later clock, then the higher writer id. Every member compares alike.
 const newer = (a: Version, b: Version): boolean => a.c > b.c || (a.c === b.c && a.w > b.w);
 // Whether a value parsed from JSON nests no deeper than MAX_VALUE_DEPTH. A loop, not recursion, so no value can
-// overflow the stack: a member's value is checked with it before anything stringifies it.
+// overflow the stack: a member's value is checked with it before anything stringifies it. Arrays by index and
+// objects by their own keys, as JSON.stringify takes them: for…in makes a string of every index, and walks keys
+// a page put on Object.prototype.
 function shallow(v: unknown): boolean {
   if (v === null || typeof v !== 'object') return true;
   const stack: [object, number][] = [[v, 1]];
   while (stack.length) {
     const [o, depth] = stack.pop()!;
     if (depth > MAX_VALUE_DEPTH) return false;
-    for (const k in o) {
-      const x = (o as Record<string, unknown>)[k];
-      if (x !== null && typeof x === 'object') stack.push([x, depth + 1]);
+    if (Array.isArray(o)) {
+      for (let i = 0; i < o.length; i++) {
+        const x = o[i];
+        if (x !== null && typeof x === 'object') stack.push([x, depth + 1]);
+      }
+    } else {
+      for (const k of Object.keys(o)) {
+        const x = (o as Record<string, unknown>)[k];
+        if (x !== null && typeof x === 'object') stack.push([x, depth + 1]);
+      }
     }
   }
   return true;
