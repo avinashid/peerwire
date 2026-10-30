@@ -482,6 +482,7 @@ step({ op: 'close', node: 'd', doc: 'board' });
 step({ op: 'open', node: 'd', doc: 'board', copy: copyF });
 step({ op: 'open', node: 'c', doc: 'other', copyOf: 'a' });
 step({ op: 'open', node: 'c', doc: 'other', copy: '{"v":2,"c":0,"f":[]}' });
+step({ op: 'open', node: 'c', doc: 'other', copy: `{"v":1,"c":0,"f":[{"d":"other","t":3,"ws":["${'b'.repeat(72)}"],"e":[[0,1,1,["m"],"c","k",1]]}]}` });
 step({ op: 'open', node: 'c', doc: 'other', copy: '{"v":1,"c":0,"f":[{"d":"other","t":3,"ws":[],"q":1}]}' });
 step({ op: 'open', node: 'c', doc: 'other', copy: '{"v":1,"c":-0,"f":[{"d":"other","t":3,"ws":[]}]}' });
 settle();
@@ -719,9 +720,14 @@ for (const v of [[['[', 64], [']', 64]], [['[', 65], [']', 65]], ['"', ['x', 655
   ['"', ['\\u0001', 10923], '"'], ['1e400'], ['-0'], ['[1e21,5e-324]'], ['{"a":1,"a":2}']]) add(entry(v), 'a'.repeat(64));
 for (const k of [['"', ['x', 256], '"'], ['"', ['x', 257], '"'], ['"', ['\\ud800', 256], '"'], ['""'], [q('__proto__')]]) add(entry(['1'], k), 'a'.repeat(64));
 for (const c of [['"', ['x', 128], '"'], ['"', ['x', 129], '"'], [q('\udfff')], ['""']]) add(entry(['1'], ['"k"'], c), 'a'.repeat(64));
-// DOC-6 (NB-051): an entry typed ["m"], all else valid, is dropped (doc.js once took it for "m").
-for (const ty of ['["m"]', '{"m":1}', '1', 'null', '"M"', '""']) add([`{"d":"b","t":1,"ws":["${w0}"],"e":[[0,1,1,${ty},"c","k",1]]}`], 'a'.repeat(64));
-check(corpus.slice(-6).every((c) => c.verdict === null), 'an entry whose type is ["m"], or any other than "m", "s" or "l", drops its frame');
+// DOC-6 (NB-051): an entry typed ["m"], all else valid, drops its frame (doc.js once took it for "m"), in a delta
+// and in an answer piece; the session opens a copy holding one (refused).
+const DOC6 = ['["m"]', '["l"]', '{"m":1}', '1', 'null', '"M"', '""'];
+for (const ty of DOC6) add([`{"d":"b","t":1,"ws":["${w0}"],"e":[[0,1,1,${ty},"c","k",1]]}`], 'a'.repeat(64));
+for (const ty of DOC6) add([`{"d":"b","t":3,"ws":["${w0}"],"e":[[0,1,1,${ty},"c","k",1]],"q":5,"i":0,"n":1}`], 'f'.repeat(64));
+add([`{"d":"b","t":3,"ws":["${w0}"],"e":[[0,1,1,"m","c","k",1]],"q":5,"i":0,"n":1}`], 'f'.repeat(64));
+check(corpus.slice(-2 * DOC6.length - 1, -1).every((c) => c.verdict === null) && corpus.at(-1).verdict !== null,
+  'an entry whose type is ["m"], or any other than "m", "s" or "l", drops its frame; "m" keeps it');
 add([`{"d":"b","t":2,"ws":["${w0}"],"r":[`, ['[0,1,1],', 8192], '[0,1,1]],"q":1}'], w0.slice(0, 64));
 add([`{"d":"b","t":2,"ws":["${w0}"],"r":[`, ['[0,1,1],', 8191], '[0,1,1]],"q":1}'], w0.slice(0, 64));
 // A deep unknown field is ignored (the frame is kept); a deep value drops it.
