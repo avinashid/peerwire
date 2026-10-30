@@ -1,6 +1,7 @@
 # Keeping a room's data while nobody is online (`peerwire-store`, NB-006g)
 
-Status: design, 2026-10-30. No code yet. Measured on main `dbf0f7c`.
+Status: design, 2026-10-30, revised after security's review (NB-006g-1 to -7). No code
+yet. Measured on main `dbf0f7c`.
 
 ## The gap
 
@@ -60,36 +61,91 @@ from parity shards (its slowest case), on this host:
 
 **Route 1: a sealed snapshot of the doc on the relays the room already signals over.**
 Opt-in, `room.doc(name, { persist, relays: true })`, JS first, then Rust (NB-006b).
+`relays: true` throws at open unless the roomId has `randomRoomId()`'s shape (at least
+22 base64url characters): on a guessable roomId the relay copy is readable by anyone,
+offline and for good (see Threats). Our mistakes throw, as elsewhere in `doc.js`.
 
-- **Pieces.** The snapshot's frames, grouped so that each piece deflates to at most
-  44 KB: `{ v: 1, i, n, c, f }` (piece `i` of `n`, the Lamport clock `c`, frames `f`),
-  deflated and sealed as the device copy is, under its own key
-  `HMAC(room key, 'pw-snap-key' || doc)`, with `VERSION || d` as additional data.
-- **Pieces need no manifest.** Each frame is a piece of state joined into the doc
-  (delta-state CRDT), applied in any order, any number of times. A reader that gets
-  piece 1 of one save and piece 2 of the next holds a valid doc, missing at most what
-  the absent piece held, which the next member online sends. That is how catch-up
-  already applies an answer's pieces as they land.
-- **Addressing.** Kind 30078 (NIP-78 app data, addressable), one slot per piece:
-  `d = hex(HMAC(room key, 'pw-snap-id' || doc || i))`, signed with the key
-  `pw_nostr_keypair(HMAC(room key, 'pw-snap-sk' || doc))`: the wasm export takes a
-  seed already, only its JS wrapper draws one at random. Every member derives the same
-  key, so a save replaces the last one slot by slot and a doc
-  takes at most `n` events on a relay. Readers ask each relay once:
-  `{ kinds: [30078], authors: [that key], '#d': [slots 0..15] }`.
-- **Cap.** 16 pieces (about 700 KB deflated, about 2 to 4 MB of JSON for typical docs).
+**Keys.** All under the room key, with `e` the epoch as 4 bytes big-endian (0 for now),
+`b` the bank and `i` the slot as one byte each, and `doc` as UTF-8 (a doc name with a
+lone surrogate keeps no relay copy, as `store.js` already rules for the device copy):
+- seal: `HMAC(room key, 'pw-snap-key' || doc || e)`;
+- slot: `d = hex(HMAC(room key, 'pw-snap-id' || doc || e || b || i))`;
+- signer: `pw_nostr_keypair(seed)`, `seed = HMAC(room key, 'pw-snap-sk' || doc || e)`.
+  If the seed isn't a valid secret key (about 2^-128), use `HMAC(seed, 'pw-snap-sk')`
+  and repeat: deterministic, so every member gets the same key. The wasm export takes
+  a seed already; only its JS wrapper draws one at random.
+
+The labels are prefix-free among themselves and against `pw-hello`, `pw-rtc-offer`,
+`pw-link`, `pw-store-key`, `pw-store-id` and Rust's `pw-offer`; they join the label
+lists in `proof.js` and in Rust. The epoch lets members later move the relay copy to
+new keys and let the old slots expire, without a format change (its own card).
+Every member signs with the same key: BIP-340 signatures with fresh aux bytes, so no
+nonce is reused.
+
+**Pieces and saves.** A save is the snapshot's frames, grouped so that each piece
+deflates to at most 44 KB (and inflates to at most 1 MiB):
+`{ v: 1, s, i, n, c, f }`: the save id `s` (8 random bytes, hex), piece `i` of `n`, the
+Lamport clock `c`, the frames `f`. Deflated and sealed as the device copy is, with
+`VERSION || d` as additional data: a piece opens only with the `d` of the slot it was
+read from, and its `i` must equal that slot's.
+- **Joining needs no manifest; writing does.** Each piece goes through `restore()` and
+  `parseFrame(m, null)` as member data, so a mix of pieces holds no state a member
+  couldn't send. But slot `i` of two saves holds unrelated entries, and the dead
+  ranges sit in the last piece, so a reader that joins a save torn mid-write, then
+  saves, publishes a doc missing whole pieces, or with deleted entries live again
+  (security's loopback probe on `doc.js`: 194 of 470 entries lost; 20 of 20 deletions
+  undone). So readers join only **complete** saves: all `n` pieces of one `s`,
+  gathered from any relays. A complete save is a whole state, so joining every
+  complete save found is the CRDT join and safe. Pieces of incomplete saves are skipped.
+- **Two banks.** Slots come in two banks of 8 (`b` = 0, 1), 16 events per doc per relay
+  at most. A save writes the bank that doesn't hold the newest complete save, so one
+  complete save always stands while the other is being written. Slots a smaller save
+  doesn't use get an empty piece.
+- **Cap.** 8 pieces per save (about 350 KB deflated, 1 to 2 MB of JSON for typical
+  docs).
   A larger doc keeps no relay copy and warns once; its members still serve it.
-- **When to save.** Only once the doc is `synced`. After a change, wait for 10 s of
-  quiet plus a random 0 to 30 s, then read the relay copy, join it, and write only if
-  that added something of ours: at most one save per doc every 5 minutes per member,
-  plus a best-effort save when the page hides. Pieces go one a second per relay, and
-  slots freed by a smaller doc get an empty piece. Every piece expires (NIP-40) 30
-  days after its save, and each save renews it.
-- **When to read.** On opening, alongside the device copy, from every relay. Each
-  piece is checked as member data and joined; `sync` gains a source: from a member,
-  or from relays as of the snapshot's save time.
-- **Cost.** The whiteboard above: 3 pieces to each of 3 relays, 450 KB up per save at
-  most once per 5 minutes while it changes, and 150 KB down per relay for a joiner.
+
+**When to read.** On opening, alongside the device copy, from every relay:
+`{ kinds: [30078], authors: [the signer], '#d': [the 16 slots] }`, closed at EOSE or
+after a timeout. Bounds, since anyone with the roomId can write the slots and a relay
+can send anything:
+- keep only events of kind 30078 whose `pubkey` is the signer and whose `d` is a slot;
+  at most one per slot per relay, the newest; skip an event id already read from
+  another relay;
+- refuse `content` over 60 KiB of base64 before decoding it (as `nostr.js` does with
+  `MAX_CONTENT`); inflate with `room.js`'s streaming `inflate(bytes, max)` at 1 MiB per
+  piece, and at most `MAX_STORED` over one read;
+- a piece that doesn't open counts as absent; a piece of another `VERSION` means the
+  slots are left as they are and never saved over, as `store.js` does.
+Pieces are joined with a distinct origin: their changes, deletions included, are
+reported `from: 'relays'`, never as our own. `sync` gains a source: from a member, or
+from relays as of the save's time (the saver's claim, for display only).
+
+**When to save.** One saver per room at a time:
+- After a change, wait for 10 s of quiet plus a random 0 to 30 s. The member whose
+  timer fires first sends its members a small doc frame `{ d, t: 5, s }` ("saving"),
+  and members that get one push their own timer back 5 minutes. A `doc.js` or Rust
+  member without the store drops `t: 5` as a malformed frame, whole, as it does today.
+- A save starts only after a read that reached EOSE, found a complete save or nothing,
+  and joined it, whether the doc is `synced` or `'alone'` (so an author drawing alone
+  saves). It goes only to relays whose read reached EOSE, and only if the join left us
+  something the newest complete save lacks, or that save expires within 7 days (so
+  opening a doc daily keeps its copy alive).
+- Pieces go one a second per relay through `nostr.js`'s per-relay buckets, holds and
+  bans, behind signalling, so they never starve a join or a pipe.
+- `created_at` is the later of now and the newest `created_at` read for that slot,
+  plus 1: a clock that runs ahead (or a writer on purpose) can't pin a slot. A
+  refused write fails the save.
+- At most one save per doc every 5 minutes per member, and only the last member online
+  (`'alone'`) makes the best-effort save when the page hides.
+- Every piece expires (NIP-40) 30 days after its save.
+
+**Forgetting.** `forget()` also wipes the slots, best effort: an empty piece in each,
+then a NIP-09 deletion. The docs say that copies already archived may still be kept.
+
+**Cost.** The whiteboard above: 3 pieces to each of 3 relays, 450 KB up per save,
+about one save per room every 5 minutes while it changes; a read before each, and
+150 KB down per relay for a joiner.
 
 **Route 2 isn't for docs.** Its holders are offline exactly when they're needed; a full
 copy on each member (NB-006f) already serves the doc from any one member, where k of n
@@ -105,26 +161,44 @@ drop, proven live), with erasure only for payloads over one piece.
 
 ## Threats
 
-- **Who can read and write.** Anyone with the roomId, as for the room and the device
-  copy: a guessable roomId keeps nothing secret. Others see random bytes and can't
-  sign as the slot key. A member, or anyone who ever knew the roomId, can overwrite
-  the slots or save frames that mark every dot dead: the doc's existing trust model
-  (members are trusted alike to write). Read-then-join before each save means honest
-  members restore what an overwrite removed from the relay, not what it deleted in
-  the doc.
-- **Rollback and withholding.** A relay can serve an old save or none. Joining
-  is monotone, so an old piece can't undo a newer one from another relay; a joiner
-  that only reaches relays holding old saves sees an old doc until a member comes
-  online. Reading every relay limits this, and `sync` says the copy's age.
-- **Metadata.** A relay sees one stable key and up to 16 slots per doc, piece sizes,
-  save times and the saver's IP. It doesn't see the room, the doc's name or contents.
-  Signalling already shows a relay a stable tag per room and members' IPs (SEC-5 is the
-  same for a peer's tag), so the new exposure is the edit rhythm and the doc's size.
-  Padding pieces to 60 KB would hide the size for 2x the bytes, and is left off.
-- **Relay abuse.** Bounded by the cap: 16 events of 60 KB per doc per relay, at most
-  one save per member per 5 minutes. A relay that refuses for its rate limit pauses as
-  signalling does (NB-006h); a ban costs that relay for signalling too.
-- **Retention isn't promised.** A doc untouched for 30 days loses its relay copy by
+- **The roomId becomes a permanent, offline read key** (NB-006g-1). Relays serve stored
+  events to anyone (a `REQ` for kind 30078 with no authors lists every snapshot), and
+  mirrors and archives copy them; NIP-40 expiry and replacement bind only relays that
+  honour them. So:
+  - anything saved can be copied by anyone and kept; anyone who ever had the link can
+    read it later, without joining the room, with no member online and no trace in
+    the room; deleting from the doc doesn't remove old saves;
+  - there is no revoking: the only way to cut off a past link-holder is a new roomId
+    (or, later, a new epoch that old link-holders can't derive, which needs a key
+    they don't have);
+  - the signer's pubkey is a stored guessing oracle: anyone can compute it for a
+    guessed (app, roomId, doc) and match it offline against what relays hold.
+    Signalling's room tag is the same kind of oracle, but only on ephemeral events
+    while members signal. Hence the random-roomId rule above.
+  The `relays` option's docs (`index.d.ts`, README) say this plainly.
+- **Who can write.** Anyone with the roomId can overwrite the slots, save frames that
+  mark every dot dead, or delete the slots (NIP-09, with the shared signer): the
+  doc's existing trust model, where members are trusted alike to write. Joining only
+  complete saves, two banks, and a read-then-join before each save mean honest members
+  restore what an overwrite removed from the relay, not what it deleted in the doc.
+- **Rollback and withholding.** A relay can serve an old save or none. Joining is
+  monotone, so an old complete save can't undo a newer one from another relay; a
+  joiner that only reaches relays holding old saves sees an old doc until a member
+  comes online. Reading every relay limits this, and `sync` says the copy's age.
+- **Metadata.** Anyone who reads the relay sees one stable key and up to 16 slots per
+  doc, piece sizes and save times; the relay also sees the saver's IP. They don't see
+  the room, the doc's name or its contents. Signalling already shows a relay a stable
+  tag per room and members' IPs (SEC-5 is the same for a peer's tag), so the new
+  exposure is the edit rhythm and the doc's size. Padding pieces to 60 KB would hide
+  the size for 2x the bytes, and is left off.
+- **Reading is bounded** (NB-006g-3): a piece that inflates 1000x, a 1 MB event, or a
+  relay that ignores the filter, all stop at the bounds under "When to read".
+- **Relay abuse** (NB-006g-4). 16 events of 60 KB per doc per relay, about one save per
+  room every 5 minutes, through signalling's per-relay buckets. A relay that refuses
+  for its rate limit pauses as signalling does (NB-006h); a ban costs that relay for
+  signalling too, for every device behind the same IP.
+- **`created_at` pinning** (NB-006g-5): handled by the rule under "When to save".
+- **Retention isn't promised.** A doc nobody opens for 30 days loses its relay copy by
   design, and a relay may drop it sooner. Device copies are the primary store.
 
 ## Not chosen
@@ -135,12 +209,18 @@ drop, proven live), with erasure only for payloads over one piece.
 - **Mainline DHT (BEP 44)**: 1000-byte values, too small for a doc.
 - **One fresh key per save**: unlinkable saves, but events never replace each other, so
   a relay would keep every save and serve old ones alongside.
+- **Warning, not refusing, on a guessable roomId**: a console warning is easy to miss,
+  and what it warns of can't be undone.
 
 ## Next cards
 
-1. **NB-006l: relay snapshot of `room.doc` in JS**, as above: backend; security review
-   (parsing and the threats above); a test against a local strfry-like fake relay, plus
-   one minimal live check on our own test room.
-2. **NB-006b** (in progress) reads and writes the same pieces in Rust.
+1. **NB-006l: relay snapshot of `room.doc` in JS**, as above, with security's NB-006g-3
+   to -7 as requirements: security review (parsing and the threats above); tests
+   against a local strfry-like fake relay (torn saves, both banks, a bomb piece, a
+   relay that ignores the filter, `created_at` ahead), plus one minimal live check on
+   our own test room.
+2. **NB-006b** (in progress) reads and writes the same pieces in Rust, and drops `t: 5`
+   until then.
 3. **NB-019 rescoped**: one-to-one offline messages to a PeerId over relays.
-4. Re-read the retention probes at +30 days (2026-11-16).
+4. **Epoch rotation**: moving a relay copy to a new epoch, its own card, later.
+5. Re-read the retention probes at +30 days (2026-11-16).
