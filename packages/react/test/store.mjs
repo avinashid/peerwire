@@ -420,6 +420,11 @@ const throws = (fn) => {
     if (e) fail(`a member's set or live value 100000 deep threw: ${e}`);
     if (read(a, 'deep') !== undefined || a.st.getLive('deep')[x.self] !== undefined) fail('a set or live value 100000 deep was kept');
     if (read(a, 'after') !== 1 || a.st.getLive('after')[x.self] !== 1) fail('the set or live after a value 100000 deep was lost');
+    // A value 65 deep down a middle branch, beside shallow ones: every branch is walked.
+    n.from(x, a, `{"$peerwire":"set","k":"mid","v":[[],${nest(64, true)},[]],"c":${now}}`);
+    n.from(x, a, `{"$peerwire":"set","k":"midobj","v":{"a":{},"b":${nest(64)},"c":{}},"c":${now}}`);
+    n.flush();
+    if (read(a, 'mid') !== undefined || read(a, 'midobj') !== undefined) fail('a value 65 deep in a middle branch was kept');
 
     const s = (k, v, w = x.self) => `["${k}",${v},${now},"${w}"]`;
     n.from(x, a, `{"$peerwire":"sync","ask":true,"s":[${s('sdeep', deep)},${s('safter', 2)}],"p":[["pdeep",${deep},3],["pafter",2,4]]}`);
@@ -454,13 +459,17 @@ const throws = (fn) => {
     const off = a.st.subscribe('s:boom', () => {
       throw new Error('boom');
     });
+    const poff = a.st.subscribe('p:pboom', () => {
+      throw new Error('pboom');
+    });
     const answers = x.got.length;
-    n.from(x, a, { $peerwire: 'sync', ask: true, s: [['boom', 1, now + 1, x.self], ['next', 3, now + 1, x.self]], p: [['plive', 3, 9]] });
+    n.from(x, a, { $peerwire: 'sync', ask: true, s: [['boom', 1, now + 1, x.self], ['next', 3, now + 1, x.self]], p: [['pboom', 1, 8], ['plive', 3, 9]] });
     e = throws(() => n.flush());
     n.flush();
     off();
+    poff();
     if (e?.message !== 'boom') fail(`a listener's error: ${e}`);
-    if (read(a, 'boom') !== 1 || read(a, 'next') !== 3 || a.st.getLive('plive')[x.self] !== 3) fail("the entries after one whose listener threw were lost");
+    if (read(a, 'boom') !== 1 || read(a, 'next') !== 3 || a.st.getLive('pboom')[x.self] !== 1 || a.st.getLive('plive')[x.self] !== 3) fail("the entries after one whose listener threw were lost");
     const answer = x.got.slice(answers).filter((m) => m.$peerwire === 'sync' && m.re === true);
     if (!answer.length) fail('a catch-up whose listener threw went unanswered');
     if (answer.some((m) => m.s?.some(([k]) => k === 'boom' || k === 'next'))) fail('the answer sent back values the asker had just sent');

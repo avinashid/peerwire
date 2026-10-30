@@ -128,7 +128,7 @@ export type RoomEvent =
   | { type: 'message'; peer: PeerId; data: string | ArrayBuffer | any; kind: 'text' | 'bytes' | 'json'; lane: 'reliable' | 'unreliable' };
 
 export interface RoomEvents {
-  /** A peer connected and shared its presence. */
+  /** A peer connected and shared its presence (the member's JSON, which can nest deeply: see `message`). */
   'peer-join': (peer: PeerId, presence: Presence) => void;
   /** A peer left, timed out or lost its connection. A peer that leaves (`leave()`, or its tab closing) shows
    * as 'left' or 'closed' at once; one that crashes or loses its network shows as 'timeout' after the idle timeout (30 s). */
@@ -170,7 +170,7 @@ export declare class Room {
   poll(): RoomEvent[];
   /** The next queued event, or null. The first call starts queueing. */
   receive(): RoomEvent | null;
-  /** Our presence, or a joined peer's. */
+  /** Our presence, or a joined peer's (a member's JSON, which can nest deeply: see `message`). */
   getPresence(peer?: PeerId): Presence | undefined;
   /** Throws RangeError for a presence over 1 MiB as JSON, TypeError for one JSON can't encode (`undefined`, a
    * function, a Symbol, a BigInt, a cycle), and keeps the old one. */
