@@ -81,7 +81,7 @@ warm build: 163–174 s over four runs on `f253797`, against 273 s for the old o
 commit. The Rust tests take 27 s under cargo-nextest and the debug fuzz run about 30 s; the Node tests take 22 s,
 set by `room_adopt.mjs`; the browser tests take 130–145 s and set the total. A fresh worktree compiles the
 workspace first and takes several times that. With no Rust change since `origin/main`, the Rust steps are skipped.
-Since then `doc_catchup.mjs` (72 s) sets the Node tests' time, and starts first. `--strict` adds CI's 24 Node tests on
+Since NB-006d, `doc_catchup.mjs` (72 s) sets the Node tests' time, and starts first. `--strict` adds CI's 24 Node tests on
 Node 22 to the same pool: 88 s for the pool alone, against 59 s without them (four jobs, 30 Oct).
 
 **Release gate:** `scripts/gate.sh --strict` green on `main`, plus `--nostr` once per release, plus the CI matrix
