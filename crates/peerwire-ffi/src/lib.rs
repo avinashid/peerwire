@@ -25,6 +25,9 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+#[cfg(feature = "sync")]
+pub mod sync;
+
 use peerwire_core::{Config, DisconnectReason, Endpoint, Event, Identity, Instant, Lane, Path, PeerId, SendError};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;

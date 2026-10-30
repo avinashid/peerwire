@@ -9,8 +9,14 @@ description = "C ABI for peerwire-core: one surface for a zero-import WebAssembl
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+# Shared documents (pw_docs_*, pw_doc_*). Off by default: the wasm build leaves them out (browsers use doc.js), and
+# its size doesn't change. gate.sh and CI build, lint and test them on their own.
+sync = ["dep:peerwire-sync"]
+
 [dependencies]
 peerwire-core = { path = "../peerwire-core" }
+peerwire-sync = { path = "../peerwire-sync", optional = true }
 rand_core = "0.6"
 rand_chacha = "0.3"
 k256 = { version = "0.13", default-features = false, features = ["schnorr", "arithmetic"] }
