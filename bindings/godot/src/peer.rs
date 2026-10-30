@@ -1,9 +1,12 @@
+use crate::doc::{change_dict, status_dict, PeerwireDoc};
 use crate::session::{port_mapping_info, Mode, NetOptions, PeerEvent, PutError, Session, Status, DEFAULT_MAX_PEERS};
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
 use godot::prelude::*;
 use peerwire::{Failure, Invite, NatType, Node, PeerId, PortMapping, Privacy};
+use peerwire_sync::{DocId, Event as DocEvent};
+use std::collections::HashMap;
 
 /// A `MultiplayerPeer` over Peerwire: Godot's `@rpc`, `MultiplayerSynchronizer` and
 /// `MultiplayerSpawner` with no server. One instance hosts (peer 1); the others
@@ -28,6 +31,8 @@ pub struct PeerwireMultiplayerPeer {
     net: NetOptions,
     /// The port-mapping state last signalled.
     mapping: PortMapping,
+    /// Open shared docs, by id: kept until closed, so their signals have somewhere to go.
+    docs: HashMap<u32, Gd<PeerwireDoc>>,
 }
 
 #[godot_api]
@@ -205,6 +210,20 @@ impl PeerwireMultiplayerPeer {
     /// The `get_port_mapping()` state changed (`info` is the new one).
     #[signal]
     fn port_mapping_changed(info: VarDictionary);
+
+    /// Opens the shared doc `name` (see `PeerwireDoc`), the same doc on every peer that opens the name, or gives
+    /// the one open; null before `host` or `join`. It catches up from the peers linked now and later.
+    #[func]
+    fn open_doc(&mut self, name: GString) -> Option<Gd<PeerwireDoc>> {
+        self.open_doc_with(name, None)
+    }
+
+    /// `open_doc`, starting from `copy`, a `PeerwireDoc.snapshot()` kept from before: the peers then send only what
+    /// it lacks. Null, and the doc not opened, if the copy isn't this doc's.
+    #[func]
+    fn open_doc_from(&mut self, name: GString, copy: PackedByteArray) -> Option<Gd<PeerwireDoc>> {
+        self.open_doc_with(name, Some(copy.to_vec()))
+    }
 
     /// Hosts on UDP `port` (0: a free one) and announces this game in room `room` of
     /// application `app_id`, for `join_room`. Only peers that know the room name get
@@ -397,6 +416,38 @@ impl PeerwireMultiplayerPeer {
         }
     }
 
+    fn open_doc_with(&mut self, name: GString, copy: Option<Vec<u8>>) -> Option<Gd<PeerwireDoc>> {
+        let Some(s) = self.session.as_mut() else {
+            godot_error!("PeerwireMultiplayerPeer.open_doc: host or join first");
+            return None;
+        };
+        let id = match s.open_doc(&name.to_string(), copy.as_deref()) {
+            Ok(id) => id,
+            Err(e) => {
+                godot_error!("PeerwireMultiplayerPeer.open_doc: {e}");
+                return None;
+            }
+        };
+        if let Some(d) = self.docs.get(&id.0) {
+            return Some(d.clone());
+        }
+        let peer = self.base().instance_id();
+        let doc = PeerwireDoc::make(peer, id);
+        self.docs.insert(id.0, doc.clone());
+        Some(doc)
+    }
+
+    pub(crate) fn session_mut(&mut self) -> Option<&mut Session> {
+        self.session.as_mut()
+    }
+
+    pub(crate) fn close_doc(&mut self, id: DocId) {
+        if let Some(s) = self.session.as_mut() {
+            s.close_doc(id);
+        }
+        self.docs.remove(&id.0);
+    }
+
     fn install(&mut self, mut s: Session) {
         s.target = self.target;
         s.mode = self.mode;
@@ -452,6 +503,7 @@ impl IMultiplayerPeerExtension for PeerwireMultiplayerPeer {
             max_peers: DEFAULT_MAX_PEERS as i32,
             net: NetOptions::default(),
             mapping: PortMapping::Off,
+            docs: HashMap::new(),
         }
     }
 
@@ -529,6 +581,7 @@ impl IMultiplayerPeerExtension for PeerwireMultiplayerPeer {
         let Some(s) = self.session.as_mut() else { return };
         s.poll();
         let events: Vec<PeerEvent> = std::iter::from_fn(|| s.next_event()).collect();
+        let doc_events: Vec<DocEvent> = std::iter::from_fn(|| s.next_doc_event()).collect();
         let mapping = s.port_mapping();
         // Signal handlers call back into this peer; base_mut() allows that.
         if mapping != self.mapping {
@@ -542,12 +595,27 @@ impl IMultiplayerPeerExtension for PeerwireMultiplayerPeer {
             };
             self.base_mut().emit_signal(signal, &[i64::from(id).to_variant()]);
         }
+        let signals: Vec<(Gd<PeerwireDoc>, &str, VarDictionary)> = doc_events
+            .iter()
+            .filter_map(|e| match e {
+                DocEvent::Change(d, c) => Some((self.docs.get(&d.0)?.clone(), "changed", change_dict(c))),
+                DocEvent::Sync(d, st) => Some((self.docs.get(&d.0)?.clone(), "sync_changed", status_dict(st))),
+                DocEvent::Overflow(_) => None,
+            })
+            .collect();
+        // Handlers may write to the doc, which calls back into this peer: base_mut() allows that.
+        let _reentrant = self.base_mut();
+        for (doc, signal, arg) in signals {
+            let mut o: Gd<Object> = doc.upcast();
+            o.emit_signal(signal, &[arg.to_variant()]);
+        }
     }
 
     fn close(&mut self) {
         if let Some(mut s) = self.session.take() {
             s.close();
         }
+        self.docs.clear();
     }
 
     fn disconnect_peer(&mut self, peer: i32, _force: bool) {

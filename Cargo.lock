@@ -594,6 +594,7 @@ dependencies = [
  "k256",
  "peerwire-core",
  "peerwire-sim",
+ "peerwire-sync",
  "rand_chacha",
  "rand_core",
 ]
@@ -614,6 +615,8 @@ dependencies = [
  "godot",
  "peerwire",
  "peerwire-sim",
+ "peerwire-sync",
+ "rand_core",
 ]
 
 [[package]]
@@ -631,8 +634,21 @@ dependencies = [
  "peerwire",
  "peerwire-core",
  "peerwire-game",
+ "peerwire-sync",
  "rand_chacha",
  "rand_core",
+]
+
+[[package]]
+name = "peerwire-sync"
+version = "0.1.0"
+dependencies = [
+ "peerwire-core",
+ "peerwire-sim",
+ "rand_chacha",
+ "rand_core",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

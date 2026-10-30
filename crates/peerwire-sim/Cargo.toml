@@ -16,3 +16,5 @@ rand_chacha = "0.3"
 peerwire-game = { path = "../peerwire-game" }
 # The NAT traversal layer, driven over simulated NATs.
 peerwire = { path = "../peerwire" }
+# Shared documents over simulated links (tests/sync.rs).
+peerwire-sync = { path = "../peerwire-sync" }

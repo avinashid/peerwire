@@ -56,6 +56,7 @@ NODE=(
   "node peer ids|node packages/js/test/peer_id.mjs"
   "node nostr bounds|node packages/js/test/nostr_bounds.mjs"
   "node rust hello|node packages/js/test/rust_hello.mjs"
+  "node rust doc|node packages/js/test/rust_doc.mjs"
   "node room proof|node packages/js/test/room_proof.mjs"
   "node pump re-arm|node packages/js/test/pump_rearm.mjs"
   "node endpoint closed|node packages/js/test/endpoint_closed.mjs"
@@ -171,27 +172,38 @@ react_build() {
 
 nextest=0
 cargo nextest --version >/dev/null 2>&1 && nextest=1
-FUZZ=(--lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz)
+FUZZ=(--lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim -p peerwire-sync fuzz)
+# peerwire-ffi's shared docs (`sync`) are off in the wasm build and so in the workspace's: built, linted and tested
+# on their own, so they can't rot.
+FFI_SYNC=(-p peerwire-ffi --features sync --release)
+# The same in a debug build, beside the fuzzers: its length and buffer sums must not overflow either.
+FFI_SYNC_DEBUG=(-p peerwire-ffi --features sync --lib)
 
 # Every Rust test: nextest runs each test in its own process, many at once, but skips doctests.
 rust_tests() {
-  if [ $nextest = 0 ]; then
-    cargo test --workspace --release
-    return
-  fi
   local r=0
+  if [ $nextest = 0 ]; then
+    cargo test --workspace --release || r=1
+    cargo test "${FFI_SYNC[@]}" || r=1
+    return $r
+  fi
   cargo nextest run --workspace --release --profile gate || r=1
+  cargo nextest run "${FFI_SYNC[@]}" --profile gate || r=1
   cargo test --doc --workspace --release || r=1
   return $r
 }
 
 # Release builds wrap on integer overflow; the parser fuzzers must also run where it panics.
 fuzz_tests() {
+  local r=0
   if [ $nextest = 1 ]; then
-    cargo nextest run --profile gate "${FUZZ[@]}"
+    cargo nextest run --profile gate "${FUZZ[@]}" || r=1
+    cargo nextest run --profile gate "${FFI_SYNC_DEBUG[@]}" || r=1
   else
-    cargo test "${FUZZ[@]}"
+    cargo test "${FUZZ[@]}" || r=1
+    cargo test "${FFI_SYNC_DEBUG[@]}" || r=1
   fi
+  return $r
 }
 
 # Build every test binary, so the run phase doesn't wait on cargo's lock. A build error shows up again, and is
@@ -199,11 +211,17 @@ fuzz_tests() {
 rust_build() {
   if [ $nextest = 1 ]; then
     cargo nextest run --workspace --release --no-run
-    [ $strict = 0 ] || cargo nextest run "${FUZZ[@]}" --no-run
+    cargo nextest run "${FFI_SYNC[@]}" --no-run
+    [ $strict = 0 ] || { cargo nextest run "${FUZZ[@]}" --no-run; cargo nextest run "${FFI_SYNC_DEBUG[@]}" --no-run; }
   else
     cargo test --workspace --release --no-run
-    [ $strict = 0 ] || cargo test "${FUZZ[@]}" --no-run
+    cargo test "${FFI_SYNC[@]}" --no-run
+    [ $strict = 0 ] || { cargo test "${FUZZ[@]}" --no-run; cargo test "${FFI_SYNC_DEBUG[@]}" --no-run; }
   fi
+}
+
+clippy() {
+  cargo clippy --workspace --all-targets "$@" && cargo clippy -p peerwire-ffi --features sync --all-targets "$@"
 }
 
 # Skip the Rust steps when every file changed since GATE_BASE (committed, staged, unstaged or untracked) is on
@@ -272,9 +290,9 @@ if [ -n "$rust_skip" ]; then
   skip "cargo fmt" "$rust_skip"
 else
   if [ $strict = 1 ]; then
-    step "cargo clippy" cargo clippy --workspace --all-targets -- -D warnings
+    step "cargo clippy" clippy -- -D warnings
   else
-    step "cargo clippy" cargo clippy --workspace --all-targets
+    step "cargo clippy" clippy
   fi
   if cargo fmt --version >/dev/null 2>&1; then
     step "cargo fmt" cargo fmt --all -- --check
