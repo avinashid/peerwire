@@ -88,7 +88,7 @@ NODE=(
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
 )
-NODE_FIRST='^node[0-9]* (room adopt|room retry|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
+NODE_FIRST='^node[0-9]* (doc catchup|room adopt|room retry|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
 # Browser tests (headless Chromium on loopback): one at a time, as WebRTC timing suffers under load.
 BROWSER=(
   "browser|node packages/js/test/browser.mjs 2"
@@ -300,8 +300,9 @@ fi
 # --no-wasm-tier-up: on a busy host, Node 26.7 sometimes deadlocks in process.exit() while V8 is still tiering the
 # wasm up in the background (room_drain.mjs hung after "all passed" in 5 of 280 runs four at a time, 0 of 100 one at
 # a time, 0 of 360 four at a time with the flag). The tests run as fast without it.
-# The slowest (5-22 s) start first, so the pool doesn't end waiting on one of them. CI's tests on CI's Node
-# (--strict) share the pool and the flag.
+# The slowest (5-72 s) start first, so the pool doesn't end waiting on one of them. CI's tests on CI's Node
+# (--strict) share the pool and the flag. The pool alone on 30 Oct, 4 jobs: 92 s, then 59 s with doc catchup
+# (72 s) moved first; --strict 104 s, then 88 s.
 node_pool() {
   local s cmd first slow
   for first in 1 0; do
