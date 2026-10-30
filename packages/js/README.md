@@ -62,7 +62,9 @@ await room.leave();                             // peers see 'peer-leave' at onc
 ```
 
 - **Data:** strings arrive as strings, `Uint8Array`/`ArrayBuffer` as `Uint8Array`,
-  anything else as JSON.
+  anything else as JSON. A member's JSON, in a message or its presence, can nest
+  about 500000 levels deep in 1 MiB, and some engines' `JSON.stringify` throws past
+  a few thousand (Node 22's does): check its depth before you stringify it.
 - **Lanes:** `reliable` (default: ordered, retransmitted), `unreliable` (no
   retransmits, for positions and cursors), `urgent` (reliable, each fragment sent
   twice, ordered only among urgent messages so it overtakes queued `reliable`

@@ -28,6 +28,7 @@ export {
   MAX_PEER_KEYS,
   MAX_PEER_LENGTH,
   MAX_STORE_LENGTH,
+  MAX_VALUE_DEPTH,
   MAX_VALUE_LENGTH,
   SETTLE_MS,
 } from './store.js';
