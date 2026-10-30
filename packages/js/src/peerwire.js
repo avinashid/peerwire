@@ -121,18 +121,21 @@ class Peerwire {
   free(p, len) {
     this.x.pw_free(p, len);
   }
-  // A fresh secp256k1 key for signing Nostr events: { secret, pubkey } (32 bytes each).
-  nostrKeypair() {
+  // A fresh secp256k1 key for signing Nostr events: { secret, pubkey } (32 bytes each). With `seed` (32 bytes), the
+  // key it is, or null if it isn't a valid secret key (zero, or not below the curve order: about 2^-128).
+  nostrKeypair(seed) {
     const x = this.x;
+    if (seed !== undefined) exact(seed, 32, 'nostr seed');
     for (;;) {
-      const seed = this.put(crypto.getRandomValues(new Uint8Array(32)));
+      const p = this.put(seed ?? crypto.getRandomValues(new Uint8Array(32)));
       const out = x.pw_alloc(64);
-      const r = x.pw_nostr_keypair(seed, out, out + 32);
+      const r = x.pw_nostr_keypair(p, out, out + 32);
       const m = this.mem();
       const k = { secret: m.slice(out, out + 32), pubkey: m.slice(out + 32, out + 64) };
-      this.free(seed, 32);
+      this.free(p, 32);
       this.free(out, 64);
       if (r === 0) return k;
+      if (seed !== undefined) return null;
     }
   }
   // BIP-340 signature of a 32-byte message.

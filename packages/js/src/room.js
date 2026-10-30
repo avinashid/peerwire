@@ -49,6 +49,8 @@ import { RoomProof } from './proof.js';
 import { DirectRetries } from './retry.js';
 import { Doc, unopened } from './doc.js';
 import { docCopy, storeOf } from './store.js';
+import { deflate, inflate, deflates } from './zip.js';
+import { RelayCopy } from './relays.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
@@ -59,12 +61,10 @@ const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6,
 // Doc frames of DEFLATE_MIN bytes or more go deflated to members whose doc reads them, where
 // this platform has 'deflate-raw' streams. One goes plain if it deflates to under 1/DEFLATE_RATIO
 // of its size, and one is inflated only to the lane's limit and DEFLATE_RATIO times its own size,
-// so what a member sends never makes us read more than that many times it. Inflating takes its
-// input INFLATE_SLICE bytes at a time, and stops past the limit, so a frame that would inflate
-// further holds at most one slice's output (raw deflate inflates 1032 times at most) past it.
+// so what a member sends never makes us read more than that many times it (zip.js stops
+// inflating past the limit).
 const DEFLATE_MIN = 1024;
 const DEFLATE_RATIO = 16;
-const INFLATE_SLICE = 1024;
 // Presence is re-announced this often, so a lost hello only delays a join.
 const HELLO_EVERY_MS = 15000;
 // A link must prove the room key this soon after it connects.
@@ -91,67 +91,6 @@ const tooLarge = (f) => new RangeError(`message of ${f.length - 1} bytes is too 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const modules = new Map(); // wasm source -> Promise<Peerwire>, shared by rooms
-
-// Whether this platform deflates and inflates (CompressionStream and DecompressionStream with
-// 'deflate-raw').
-const deflates = (() => {
-  try {
-    new CompressionStream('deflate-raw');
-    new DecompressionStream('deflate-raw');
-    return true;
-  } catch {
-    return false;
-  }
-})();
-
-// A stream's chunks as one array, or null if they come to more than `max` bytes or the stream fails.
-async function readAll(readable, max) {
-  const reader = readable.getReader();
-  const parts = [];
-  let n = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      n += value.length;
-      if (n > max) {
-        reader.cancel().catch(() => {});
-        return null;
-      }
-      parts.push(value);
-    }
-  } catch {
-    return null;
-  }
-  const out = new Uint8Array(n);
-  let at = 0;
-  for (const p of parts) {
-    out.set(p, at);
-    at += p.length;
-  }
-  return out;
-}
-
-async function deflate(bytes) {
-  const cs = new CompressionStream('deflate-raw');
-  const w = cs.writable.getWriter();
-  w.write(bytes).catch(() => {});
-  w.close().catch(() => {});
-  return readAll(cs.readable, Infinity);
-}
-
-// `bytes` inflated, or null if it isn't raw deflate or inflates past `max` bytes.
-async function inflate(bytes, max) {
-  const ds = new DecompressionStream('deflate-raw');
-  const w = ds.writable.getWriter();
-  (async () => {
-    for (let i = 0; i < bytes.length; i += INFLATE_SLICE) await w.write(bytes.subarray(i, i + INFLATE_SLICE));
-    await w.close();
-  })().catch(() => {});
-  const out = await readAll(ds.readable, max);
-  if (!out) w.abort().catch(() => {});
-  return out;
-}
 
 function frame(tag, body) {
   const b = new Uint8Array(body.length + 1);
@@ -252,7 +191,7 @@ export async function joinRoom({
     throw new Error('no WebRTC in this runtime: pass RTCPeerConnection (e.g. from node-datachannel) or use signaling: \'local\'');
   }
   // A grant shows local addresses only to new connections, and only 'direct' offers them.
-  const room = new Room(endpoint, sig, transport, presence, proof, { fallback, grants: privacy === 'direct' && retryOnGrant });
+  const room = new Room(endpoint, sig, transport, presence, proof, { fallback, grants: privacy === 'direct' && retryOnGrant, roomId, pw });
   if (queue) room.queue = [];
   await sig.ready;
   await room.hello();
@@ -262,9 +201,11 @@ export async function joinRoom({
 export class Room {
   static proofMs = PROOF_MS; // tests shorten it
   static peerFirstMs = PEER_FIRST_MS;
-  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off', grants = false } = {}) {
+  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off', grants = false, roomId = null, pw = null } = {}) {
     this.endpoint = endpoint;
     this.signaling = signaling;
+    this.roomId = roomId; // for room.doc(name, { relays })
+    this.pw = pw;
     this.self = endpoint.id;
     this.me = presence;
     this.linked = new Set(); // peers with a Peerwire session
@@ -319,7 +260,11 @@ export class Room {
     // A page hidden may not come back (a phone ends background tabs): docs kept on this
     // device save now.
     this.onHidden = () => {
-      if (globalThis.document.visibilityState === 'hidden') for (const d of this.docs.values()) d.save();
+      if (globalThis.document.visibilityState !== 'hidden') return;
+      for (const d of this.docs.values()) {
+        d.save();
+        d.relays?.hidden();
+      }
     };
     globalThis.document?.addEventListener?.('visibilitychange', this.onHidden);
     // A network switch: links whose ICE dropped restart it now (only those, so a new
@@ -467,12 +412,23 @@ export class Room {
 
   // The shared document `name`, opened on first call: the same name on every member is
   // the same document. See doc.js. `persist` keeps a copy on this device, loaded when it
-  // opens (store.js): true for IndexedDB, or a store. Options count when the doc opens.
-  doc(name, { persist } = {}) {
+  // opens (store.js): true for IndexedDB, or a store. `relays: true` keeps one on the
+  // signalling relays (relays.js), only for a roomId of randomRoomId()'s shape: anyone with
+  // the roomId can read that copy, offline and for good. Options count when the doc opens.
+  doc(name, { persist, relays = false } = {}) {
     if (this.left) throw new Error('left the room');
     let d = this.docs.get(name);
     if (d) return d;
+    if (typeof relays !== 'boolean') throw new TypeError('relays is true or false');
+    if (relays && (typeof this.signaling.query !== 'function' || typeof this.signaling.store !== 'function' || !this.pw)) {
+      throw new TypeError("relays: true keeps the doc on the room's Nostr relays: it needs signaling: 'nostr'");
+    }
+    if (relays && !deflates) throw new TypeError("relays: true needs CompressionStream with 'deflate-raw', which this platform lacks");
+    if (relays && !/^[A-Za-z0-9_-]{22,}$/.test(this.roomId ?? '')) {
+      throw new RangeError('relays: true needs a roomId nobody can guess, from randomRoomId(): anyone with the roomId can read the copy on the relays');
+    }
     const store = persist ? docCopy(storeOf(persist), this.proof, name) : null;
+    const copy = relays ? new RelayCopy(this.signaling, this.pw, this.proof, name) : null;
     d = new Doc(name, {
       self: this.self,
       peers: () => this.peers,
@@ -486,6 +442,7 @@ export class Room {
       route: (peer) => this.routes.get(peer)?.kind ?? null,
       deflate: deflates,
       store,
+      relays: copy,
     });
     this.docs.set(name, d);
     d.open();

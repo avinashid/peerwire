@@ -16,7 +16,8 @@
 //   room members without changing who can join.
 //
 // Same interface as BroadcastSignaling: id, hello(meta), onHello, send(to, body, { lossy }),
-// onMessage(fn), close().
+// onMessage(fn), close(). A doc's copy on the relays (relays.js) also reads stored events with
+// query(filter) and writes them with store(ev, urls), behind signalling.
 
 import { isPeerId } from './peerwire.js';
 
@@ -67,6 +68,14 @@ export const BACKOFF_MS = 30000;
 export const MAX_BACKOFF_MS = 600000;
 // NIP-01 relays answer each event with an OK within a round trip.
 export const SILENT_MS = 5000;
+// Events to keep (store(): a doc's copy on the relays) go to each relay one every STORE_EVERY_MS
+// at most, and only while no other event waits there, so they never hold up a join or a pipe.
+// One waits STORE_QUEUE_MS at most to be sent, and STORE_OK_MS for its relay's OK, then counts as
+// refused. A read of stored events (query()) ends at the relay's EOSE, or after QUERY_MS.
+export const STORE_EVERY_MS = 1000;
+export const STORE_QUEUE_MS = 120000;
+export const STORE_OK_MS = 30000;
+export const QUERY_MS = 10000;
 // What a refusal's message asks: 'rate' (slow down), 'ban' (stop), or neither (null).
 const refusal = (why) => (/^rate-limited/i.test(why) ? 'rate' : /^blocked|banned/i.test(why) ? 'ban' : /rate.?limit/i.test(why) ? 'rate' : null);
 // A relay socket that closes (the phone switched networks or turned on its hotspot,
@@ -167,16 +176,21 @@ export class NostrSignaling {
     };
     ws.onerror = () => opened();
     ws.onclose = () => this.lostSocket(ws);
-    ws.onmessage = (m) => void this.onRelay(url, m.data).catch(() => {});
+    ws.onmessage = (m) => void this.onRelay(url, m.data, ws).catch(() => {});
     ws.dialled = clock();
     this.sockets.push(ws);
   }
 
-  // `ws` carries nothing more: what waited on it is lost, as on a dead path.
+  // `ws` carries nothing more: what waited on it is lost, as on a dead path. Events to keep on it
+  // count as refused, and its reads as cut short.
   forget(ws) {
     clearTimeout(ws.pumpTimer);
     ws.q = [];
+    for (const e of ws.low ?? []) e.done(false);
+    ws.low = [];
+    for (const e of ws.inflight?.values() ?? []) e.done?.(false);
     ws.inflight?.clear();
+    for (const r of [...(ws.queries?.values() ?? [])]) r.end(false);
   }
 
   lostSocket(ws) {
@@ -289,17 +303,20 @@ export class NostrSignaling {
 
   // Sends what waits on `ws` as its relay's rate allows, and comes back when it allows more.
   // Once closed, all of it goes at once (a leaving room's last messages), but not to a relay
-  // that banned us or holds us for its rate.
+  // that banned us or holds us for its rate. Events to keep (`low`, see store()) go after, one
+  // each STORE_EVERY_MS at most, and not once closed.
   pump(ws) {
     clearTimeout(ws.pumpTimer);
     ws.pumpTimer = null;
-    const q = ws.q;
-    if (!q?.length || ws.readyState !== WebSocket.OPEN) return;
+    const q = (ws.q ??= []);
+    const low = ws.low;
+    if ((!q.length && !low?.length) || ws.readyState !== WebSocket.OPEN) return;
     const now = clock();
     while (q.length && now - q[0].at > RELAY_QUEUE_MS) {
       q.shift();
       this.stats.unsent++;
     }
+    while (low?.length && now - low[0].at > STORE_QUEUE_MS) low.shift().done(false);
     const url = ws.relayUrl;
     const hold = Math.max(this.banned.get(url)?.until ?? 0, this.paused.get(url)?.until ?? 0) - now;
     // Once closed, a held relay is sent nothing: what waits goes through the free ones
@@ -307,17 +324,32 @@ export class NostrSignaling {
     if (hold > 0) return this.closed ? undefined : this.pumpIn(ws, hold);
     const r = this.rate(url, now);
     const inflight = (ws.inflight ??= new Map());
-    while (q.length && (r.tokens >= 1 || this.closed)) {
-      const e = q.shift();
+    const send = (e) => {
       r.tokens--;
       e.sent = now;
       // Kept until the relay answers OK, to send it again if refused for the rate.
       inflight.set(e.id, e);
-      if (inflight.size > RELAY_QUEUE) inflight.delete(inflight.keys().next().value);
+      if (inflight.size > RELAY_QUEUE) {
+        const [id, old] = inflight.entries().next().value;
+        inflight.delete(id);
+        old.done?.(false);
+      }
       ws.asked ??= now;
       ws.send(e.msg);
-    }
-    if (q.length) this.pumpIn(ws, ((1 - r.tokens) * 1000) / r.rate);
+    };
+    while (q.length && (r.tokens >= 1 || this.closed)) send(q.shift());
+    if (q.length) return this.pumpIn(ws, ((1 - r.tokens) * 1000) / r.rate);
+    if (!low?.length || this.closed) return;
+    const due = Math.max(((1 - r.tokens) * 1000) / r.rate, (ws.lowAt ?? -Infinity) + STORE_EVERY_MS - now);
+    if (due > 0) return this.pumpIn(ws, due);
+    ws.lowAt = now;
+    const e = low.shift();
+    send(e);
+    e.timer = setTimeout(() => {
+      if (inflight.get(e.id) === e) inflight.delete(e.id);
+      e.done(false);
+    }, STORE_OK_MS);
+    if (low.length) this.pumpIn(ws, STORE_EVERY_MS);
   }
 
   pumpIn(ws, ms) {
@@ -371,7 +403,8 @@ export class NostrSignaling {
     return ms === Infinity ? 0 : ms;
   }
 
-  async onRelay(url, raw) {
+  // A message from relay `url`, on socket `ws` (that relay's, if not given).
+  async onRelay(url, raw, ws = this.sockets.find((s) => s.relayUrl === url)) {
     let m;
     try {
       m = JSON.parse(raw);
@@ -381,6 +414,13 @@ export class NostrSignaling {
     // Relay messages are arrays; `null` and other JSON values are ignored, not dereferenced.
     if (!Array.isArray(m)) return;
     if (m[0] === 'OK') return this.answered(url, m[1], m[2], String(m[3]));
+    // A read of stored events (see query()): its events, and its end.
+    const read = typeof m[1] === 'string' ? ws?.queries?.get(m[1]) : undefined;
+    if (read) {
+      if (m[0] === 'EVENT') read.take(m[2]);
+      else if (m[0] === 'EOSE' || m[0] === 'CLOSED') read.end(m[0] === 'EOSE');
+      return;
+    }
     if (m[0] !== 'EVENT') return;
     const ev = m[2];
     if (!ev || ev.kind !== KIND || typeof ev.id !== 'string' || !EVENT_ID.test(ev.id) || this.seen.has(ev.id) || ev.pubkey === this.pubkey) return;
@@ -420,9 +460,9 @@ export class NostrSignaling {
     if (ok === true) {
       // It took one sent since its last hold began: a refusal from now on starts over.
       if (p && e?.sent >= p.at) p.took = true;
-      return;
+      return void e?.done?.(true);
     }
-    if (ok !== false) return;
+    if (ok !== false) return void e?.done?.(false);
     this.stats.rejected++;
     this.stats.lastRejection = `${url}: ${why}`;
     const kind = refusal(why);
@@ -433,10 +473,11 @@ export class NostrSignaling {
       const ms = b && now - b.until < MAX_BACKOFF_MS ? Math.min(b.ms * 2, MAX_BACKOFF_MS) : BACKOFF_MS;
       this.banned.set(url, { until: now + ms, ms });
       this.stats.backoffs++;
+      e?.done?.(false);
       if (ws) this.forget(ws);
       return void this.release();
     }
-    if (kind !== 'rate') return;
+    if (kind !== 'rate') return void e?.done?.(false);
     const again = e && ws && e.tries < RELAY_TRIES - 1 && !this.closed;
     if (again) {
       e.tries++;
@@ -455,9 +496,86 @@ export class NostrSignaling {
       this.stats.backoffs++;
       this.release();
     }
-    // A lossy one goes again through the next relay, now that this one is held.
-    if (again) e.lossy ? this.stripe(e) : this.queue(ws, e);
+    // A lossy one goes again through the next relay, now that this one is held; one to keep, at
+    // the head of what waits to be kept there.
+    if (again) e.stored ? (clearTimeout(e.timer), (ws.low ??= []).unshift(e)) : e.lossy ? this.stripe(e) : this.queue(ws, e);
+    else e?.done?.(false);
     if (ws) this.pump(ws);
+  }
+
+  // Reads stored events: `filter` (NIP-01) to every open relay that hasn't banned us, under a
+  // subscription of its own, closed at the relay's EOSE or after `ms`. `keep(ev)` names the slot an
+  // event goes in, or null to drop it (it gets the event as the relay sent it: any JSON value), and
+  // each relay keeps the newest event of each slot, by created_at and then the lower id, as relays
+  // replace them: so a relay that sends more than asked costs a check each, not memory. Resolves to
+  // a Map: relay url -> { complete, events: Map(slot -> event) }, `complete` once that relay sent
+  // EOSE in time; false for a relay that wasn't open, refused the read (CLOSED), closed or banned
+  // us meanwhile.
+  async query(filter, { ms = QUERY_MS, keep }) {
+    await this.ready;
+    const out = new Map();
+    const reads = [];
+    for (const ws of this.sockets) {
+      const r = { complete: false, events: new Map() };
+      out.set(ws.relayUrl, r);
+      if (this.closed || ws.readyState !== WebSocket.OPEN || this.banned.get(ws.relayUrl)?.until > clock()) continue;
+      const sub = hex(crypto.getRandomValues(new Uint8Array(8)));
+      reads.push(new Promise((resolve) => {
+        const timer = setTimeout(() => read.end(false), ms);
+        const read = {
+          take: (ev) => {
+            const slot = keep(ev);
+            if (slot === null || slot === undefined) return;
+            const old = r.events.get(slot);
+            if (!old || ev.created_at > old.created_at || (ev.created_at === old.created_at && ev.id < old.id)) r.events.set(slot, ev);
+          },
+          end: (complete) => {
+            if (ws.queries?.get(sub) !== read) return;
+            ws.queries.delete(sub);
+            clearTimeout(timer);
+            r.complete = complete;
+            try {
+              if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(['CLOSE', sub]));
+            } catch {}
+            resolve();
+          },
+        };
+        (ws.queries ??= new Map()).set(sub, read);
+        ws.send(JSON.stringify(['REQ', sub, filter]));
+      }));
+    }
+    await Promise.all(reads);
+    return out;
+  }
+
+  // Keeps `ev`, a signed event (a piece of a doc's copy), on the relays at `urls`: queued on each,
+  // behind what signalling sends there (see STORE_EVERY_MS). A Map: url -> a promise of true once
+  // that relay took it (OK true), or false once it refused it (one refused for its rate is sent
+  // again, RELAY_TRIES times in all), banned us, closed, held it STORE_QUEUE_MS or didn't answer
+  // within STORE_OK_MS, or the signalling closed.
+  store(ev, urls) {
+    const msg = JSON.stringify(['EVENT', ev]);
+    const out = new Map();
+    for (const url of urls) {
+      out.set(url, new Promise((resolve) => {
+        const ws = this.sockets.find((s) => s.relayUrl === url);
+        const now = clock();
+        if (this.closed || !ws || ws.readyState !== WebSocket.OPEN || this.banned.get(url)?.until > now) return resolve(false);
+        let settled = false;
+        const e = {
+          id: ev.id, msg, at: now, seq: ++this.seq, tries: 0, sent: 0, lossy: false, stored: true, timer: null,
+          done: (ok) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(e.timer);
+            resolve(ok);
+          },
+        };
+        (ws.low ??= []).push(e);
+        this.pump(ws);
+      }));
+    }
+    return out;
   }
 
   // Encrypts an object for the room: base64 of nonce (12 bytes) || AES-GCM ciphertext.
@@ -514,7 +632,8 @@ export class NostrSignaling {
 
   // Nothing is read from now on. A message handed to send() before (a leaving room's last
   // pipe batch, its Bye) is still being hashed and signed, which is asynchronous: the
-  // sockets close once it is published.
+  // sockets close once it is published, and with them reads of stored events end and events
+  // to keep count as refused (see forget()).
   close() {
     this.closed = true;
     for (const r of this.retry.values()) clearTimeout(r.timer);

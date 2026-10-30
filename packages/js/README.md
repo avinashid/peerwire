@@ -142,7 +142,7 @@ chat.append({ text: 'hi' });
 meta.entries();                                  // [{ key, value, from }], by key
 strokes.entries(); chat.entries();               // [{ id, value, from }], oldest first, one order on every member
 doc.on('change', ({ name, type, key, id, value, deleted, from, local }) => render());
-doc.on('sync', ({ state, from, have, total }) => status()); // catching up: see below; doc.sync is the latest
+doc.on('sync', ({ state, from, have, total, source, at }) => status()); // see below; doc.sync is the latest
 doc.close();                                     // room.leave() closes the room's docs too
 ```
 
@@ -165,6 +165,17 @@ A doc can be kept on each member's device, so it is back when that member comes 
 const doc = room.doc('board', { persist: true }); // IndexedDB; in Node, a store (see "On this device")
 await doc.loaded;                                  // 'loaded', 'empty', 'blocked' (storage refused) or 'off'
 await doc.forget();                                // deletes this device's copy, e.g. on sign-out
+```
+
+It can also keep a sealed copy on the room's Nostr relays, so someone who opens it while no member is online still
+gets it. Read "On the relays" below first: anyone with the roomId can read that copy, for good.
+
+```js
+const room = await joinRoom({ appId: 'my-app', roomId, signaling: 'nostr' }); // roomId from randomRoomId(), shared
+const doc = room.doc('board', { persist: true, relays: true });
+doc.on('sync', ({ source, at }) => {
+  if (source === 'relays') line.textContent = `As saved at ${new Date(at).toLocaleTimeString()}`;
+});
 ```
 
 - **What wins:**
@@ -214,7 +225,8 @@ await doc.forget();                                // deletes this device's copy
     joiner holds that whiteboard within 15 s of linking and its first strokes within 3 s (about 10 s and 0.2 s on
     a loaded 4-core host), and within 30 s and 5 s when the member it catches up from is a background tab,
     whose timers fire once a second (about 13 s and 1 s).
-- **Where catching up stands:** `doc.sync` is `{ state, from, have, total }`, and `'sync'` fires when it changes.
+- **Where catching up stands:** `doc.sync` is `{ state, from, have, total, source, at }`, and `'sync'` fires when
+  it changes.
   - `'alone'`: no other member to catch up from.
   - `'loading'`: catching up from member `from`, which has sent `have` of the `total` entries its answer carries
     (0 of 0 until its first piece lands). `have` may stop short of `total`: the last piece ends the answer.
@@ -222,6 +234,9 @@ await doc.forget();                                // deletes this device's copy
     (none had: members that open the doc together hold all there is between them).
   - `doc.synced` is true once caught up, and stays true, also once the others have gone (`'alone'`). So an app
     can tell "you're the last one with the board" from "you're the first one here".
+  - `source` is `'members'` once caught up from them; else `'relays'` once the doc joined a save from the relays
+    (`relays: true`), with `at` the time that save was made as its saver claims it (ms; for display only; one more
+    than 15 minutes past this device's clock counts as the time it was read); else null.
 - **On this device (`persist`):**
   - Opening loads the copy before members are asked, so the ask carries it and members send only what it lacks;
     their asks of us wait for it too. A member who was never there gets the doc from one that kept it, once that
@@ -279,6 +294,46 @@ await doc.forget();                                // deletes this device's copy
     - Its size and the time of its last save show. Someone who can write the storage can put an older copy back;
       the doc then catches up from the members, and never writes again as the writer the copy names, so no write
       is made twice. `doc.forget()` deletes the record, but storage can keep old bytes on disk or in backups.
+- **On the relays (`relays: true`):**
+  - **Anyone with the roomId can read this copy, for good, and nobody sees it.** Relays serve stored events to
+    anyone, and mirrors and archives copy them, whatever expiry or deletion asks. So anything saved can be copied
+    and kept by anyone; anyone who ever had the link can read the doc later, without joining the room, with no
+    member online; and deleting from the doc doesn't remove old saves. There is no revoking a link: only a new
+    roomId cuts off someone who once had it. The copy's key is also a stored test for a guessed roomId: anyone can
+    derive it for a guessed app, roomId and doc name and look for it on the relays. So `relays: true` throws
+    RangeError unless the roomId has `randomRoomId()`'s shape (22 or more base64url characters): **use
+    `randomRoomId()`**. The check catches mistakes, not a guessable roomId of that shape.
+  - **Anyone with the roomId can also write it**: overwrite it, mark everything deleted, or wipe it, as members can
+    the doc itself. Members put back what an overwrite took off the relays (not what it deleted in the doc) at their
+    next save, but someone set on it can keep the relay copy away for good. It is best effort: members' devices
+    (`persist`) are the main store.
+  - **What the relays hold:** up to 16 events per doc on each (two banks of 8 slots), kind 30078, all signed by one
+    key derived from the room key, each a piece of the doc deflated and sealed with AES-256-GCM under a key derived
+    from it. Anyone reading a relay sees one stable key per doc, up to 16 slots, the pieces' sizes and save times;
+    the relay also sees the IP of each member that saves or reads it. Not the room, the doc's name or what it
+    holds.
+  - **Reading:** opening reads every relay (until its EOSE, 10 s at most) beside the device copy, and joins every
+    save found whole (all its pieces, from any relays); a save torn mid-write is skipped. What it brings is checked
+    as member data, and a deletion it brings says `from: 'relays'`. A read is bounded whatever a relay sends: only
+    our key's events in our slots, the newest of each slot per relay, 60 Ki characters of content each, a piece
+    inflated to 1 MiB at most and a whole read to 32 MiB.
+  - **Saving:** one member at a time, behind signalling. A while after the doc changes (10 s without a change, then
+    a random 0 to 30 s, at most once in 5 minutes), a member reads, joins what it finds, and writes only to the
+    relays whose copy lacks something it holds or expires within 7 days. It tells the members first, and they hold
+    their saves back up to 5 minutes. Each relay keeps its newest whole save while the next goes into its other
+    bank, the pieces one a second. A save no relay took, or made while no relay answered (offline), goes again 5
+    minutes on. The last member online also saves when the page hides (at most once a minute);
+    from a closing tab that rarely finishes, so the relays can miss the last writes made alone.
+  - **Size:** at most 8 pieces of 44 KiB deflated each; a whiteboard of 1400 strokes of 20 points takes 4
+    (`test/doc_relays.mjs`). A larger doc, or one with an entry that won't deflate into one piece, keeps no relay
+    copy, with one warning; its members still serve it. A save writes each piece to each relay, and a joiner reads
+    each once from each relay.
+  - **Retention:** each piece expires (NIP-40) 30 days after its save, and opening the doc within a week of that
+    saves it again. Relays promise nothing: one may drop it sooner.
+  - **`doc.forget()`** also wipes the relay copy, best effort, for every member until another one saves: an empty
+    piece in each slot, then a NIP-09 deletion. Copies a relay or archive already made may stay.
+  - It needs `signaling: 'nostr'` (TypeError otherwise) and, as with `persist`, a doc name without a lone surrogate.
+    Members without `relays: true` (or on an older version) drop the frame that says a member is saving.
 - **Logs:** give `keep` the same value on every member, and call `doc.log()` right after `room.doc()`. A member
   that keeps fewer entries never trims another's log, but one that keeps more can miss the older entries another
   has trimmed, once it catches up from that member, directly or through a member that did.
@@ -312,7 +367,8 @@ await doc.forget();                                // deletes this device's copy
   - Where catching up stands is as good as the members that told us: a member can say it had caught up when it
     hadn't, or carry fewer entries than it says, so a doc can show `'synced'` early or `total` too high. Use
     `doc.sync` for a status line, not to decide what the doc holds; entries that come later still show.
-- **Not yet:** collaborative text (character sequences), and docs in Rust and Godot.
+- **Not yet:** collaborative text (character sequences), docs in Rust and Godot, and moving a relay copy to new
+  keys (to cut off old links without a new roomId).
 
 ## Using with React
 
@@ -627,7 +683,12 @@ Run these with Node and the Playwright install on this host:
   refused, gives its turns back. With only silent relays they take turns; one that answers
   but holds us is waited for rather than a silent one sent to; at `close()` a batch goes
   through one that answers (one not slowed behind its backlog first), then a silent one,
-  and a held one last. No relays.
+  and a held one last. Stored events (a doc's relay copy): `query()` reads each open relay
+  under its own subscription, keeps the newest of each slot, ends complete at EOSE and
+  incomplete on CLOSED, the socket closing or its timeout, and CLOSEs it; `store()` waits
+  behind signalling, goes one a second per relay, and resolves on the OK, a refusal (after
+  sending one refused for its rate again), a ban, 30 s without an answer, 120 s waiting,
+  or `close()`. No relays.
 - `node packages/js/test/rust_hello.mjs`: a Rust or Godot member's room hello, sealed with
   the nonce fixed, is the same base64 that `sealRoom` makes (the vector Rust asserts too),
   and opens to Rust's exact JSON. A `Room` that hears it through `NostrSignaling` doesn't
@@ -841,6 +902,20 @@ Run these with Node and the Playwright install on this host:
   page is hidden is saved then and outlives a crash; `forget()` deletes the record; once the browser closes the
   connection (site data cleared), the next save opens it again; with IndexedDB refusing, the doc says `'blocked'`,
   warns once and syncs.
+- `node packages/js/test/doc_relays.mjs`: `room.doc(name, { relays: true })` on relays in the process that keep
+  events as strfry does, members on a fake clock, and the real signer. An author alone saves and a joiner alone
+  loads it (`sync` from the relays, as of the save; nothing in clear). A whiteboard of 1400 strokes goes in 4
+  pieces, each under 60 Ki characters; a doc past 8 pieces, or with an entry past a piece, keeps none and warns
+  once. Each save writes the bank not holding the newest whole save; a reader joins only whole saves, and saving
+  after a torn read loses nothing; a relay that took part of a save keeps its own whole one. A 45 KiB piece of
+  45 MiB inflates to 1 MiB; 48 of them stop a read at 32 MiB; a piece holds 16 frames at most. A relay past the
+  filter, one serving `created_at` a year ahead (only it is skipped, and `sync.at` isn't moved), another version in
+  a bank or both. One saver per room; a member's "saving"
+  during our read means we write nothing; one that announces saves it never makes holds ours back once, 5 minutes
+  at most, then is ignored until it rejoins, and one whose save one relay took isn't; one naming a save already
+  made is ignored at once. A save no relay took, or whose read none completed, is tried again; renewal at 24 days; deletions `from: 'relays'`; the hide save; `forget()` (empty pieces, then
+  NIP-09). Then over the real `NostrSignaling` and fake sockets: the room's checks (signalling, roomId shape),
+  a 3-piece save one piece a second per relay, and a joiner alone getting it.
 - `node packages/js/test/browser.mjs [tabs] [shot.png]`: mesh of tabs, RTT and throughput.
 - `node packages/js/test/arena.mjs [players] [secs] [shot.png|-]`: the arena. `LOSS=0.1`
   drops datagrams. Checks that every island agrees on its lockstep state.

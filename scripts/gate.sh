@@ -67,6 +67,7 @@ NODE=(
   "node room leave|node packages/js/test/room_leave.mjs"
   "node room welcome|node packages/js/test/room_welcome.mjs"
   "node doc crdt|node packages/js/test/doc_crdt.mjs"
+  "node doc relays|node packages/js/test/doc_relays.mjs"
   "node room doc|node packages/js/test/room_doc.mjs"
   "node doc catchup|node packages/js/test/doc_catchup.mjs"
   "node room fallback|node packages/js/test/room_fallback.mjs"
