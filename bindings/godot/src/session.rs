@@ -17,15 +17,23 @@
 //! ```text
 //! data:    0x01 mode(u8) channel(u8) [seq(u32 LE), unreliable-ordered only] payload
 //! control: 0x00 op(u8) ...            op 1 = ASSIGN id(i32 LE), host -> joiner
+//! doc:     0x07 JSON                  a shared doc's frame (peerwire-sync, reliable lane)
 //! ```
+//!
+//! Shared docs ([`Session::open_doc`]) are peerwire-sync's, the frames of `@peerwire/js` `room.doc()`. Joiners
+//! link to the host alone, so the host runs each doc as the hub of the star: what a joiner's frame adds goes on
+//! to the others. One whose link stalls with OUTBOX_BYTES waiting for it is disconnected.
 
 use peerwire::{
     Event, Failure, Invite, Lane, MapProtocol, NatType, Node, NostrSignaling, PeerId, PeerStats, PortMapping, Privacy,
     Role, SendError, MAX_UNRELIABLE,
 };
+use peerwire_sync::{DocId, DocMut, Docs, Instant as DocTime, Options, Route, DOCZ_TAG, DOC_TAG};
+use rand_core::{OsRng, RngCore};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+use std::time::Instant;
 
 /// The host's Godot peer id.
 pub const HOST_ID: i32 = 1;
@@ -319,6 +327,11 @@ pub struct Session {
     events: VecDeque<PeerEvent>,
     out_seq: HashMap<(i32, u8), u32>,
     in_seq: Ordered,
+    /// Shared docs, made on the first [`Session::open_doc`], and their change and sync events for Godot.
+    docs: Option<Docs>,
+    doc_events: VecDeque<peerwire_sync::Event>,
+    /// The docs' clock.
+    epoch: Instant,
     /// Godot's `set_target_peer`: 0 all, `n > 0` that peer, `n < 0` all but `-n`.
     pub target: i32,
     pub mode: Mode,
@@ -342,6 +355,9 @@ impl Session {
             events: VecDeque::new(),
             out_seq: HashMap::new(),
             in_seq: Ordered::default(),
+            docs: None,
+            doc_events: VecDeque::new(),
+            epoch: Instant::now(),
             target: 0,
             mode: Mode::Reliable,
             channel: 0,
@@ -551,7 +567,8 @@ impl Session {
         while let Some(e) = self.node.try_recv_event() {
             self.on_event(e);
         }
-        // An ASSIGN or a refusal queued above goes out now, not a frame later.
+        self.pump_docs();
+        // An ASSIGN, a refusal or doc frames queued above go out now, not a frame later.
         self.node.poll();
     }
 
@@ -574,6 +591,7 @@ impl Session {
                     let id = self.ids.assign(peer);
                     let _ = self.node.send(&peer, Lane::Reliable, &encode_assign(id));
                     self.events.push_back(PeerEvent::Connected(id));
+                    self.doc_member(peer);
                 }
             }
             Event::Disconnected { peer, .. } => self.drop_peer(&peer),
@@ -588,6 +606,14 @@ impl Session {
     }
 
     fn on_message(&mut self, peer: PeerId, lane: Lane, data: &[u8]) {
+        if let Some(&(DOC_TAG | DOCZ_TAG)) = data.first() {
+            // A doc frame counts only in order, on the reliable lane, from a member (Docs checks that).
+            let now = self.doc_time();
+            if let (Some(docs), Lane::Reliable) = (self.docs.as_mut(), lane) {
+                docs.receive(now, peer, data);
+            }
+            return;
+        }
         match decode(data) {
             Some(Frame::Assign(id)) => {
                 if !self.host && Some(peer) == self.host_peer && self.my_id == 0 {
@@ -595,6 +621,7 @@ impl Session {
                     self.status = Status::Connected;
                     self.ids.insert(peer, HOST_ID);
                     self.events.push_back(PeerEvent::Connected(HOST_ID));
+                    self.doc_member(peer);
                 }
             }
             Some(Frame::Data { mode, channel, seq, payload }) => {
@@ -622,6 +649,10 @@ impl Session {
     fn drop_peer(&mut self, peer: &PeerId) {
         if !self.host && Some(*peer) == self.host_peer {
             self.status = Status::Disconnected; // even if the host never assigned an id
+        }
+        let now = self.doc_time();
+        if let Some(docs) = self.docs.as_mut() {
+            docs.left(now, *peer);
         }
         let Some(id) = self.ids.remove(peer) else { return };
         self.in_seq.forget(id);
@@ -696,6 +727,93 @@ impl Session {
         self.drop_peer(&peer);
     }
 
+    // Shared docs.
+
+    fn doc_time(&self) -> DocTime {
+        DocTime::from_micros(self.epoch.elapsed().as_micros() as u64)
+    }
+
+    fn route(&self, peer: &PeerId) -> Route {
+        match self.node.path(peer) {
+            Some(peerwire::Path::Via(_)) => Route::Peer,
+            _ => Route::Direct,
+        }
+    }
+
+    /// A Godot peer with an id is a member of the docs: the host's joiners, a joiner's host.
+    fn doc_member(&mut self, peer: PeerId) {
+        let (now, route) = (self.doc_time(), self.route(&peer));
+        if let Some(docs) = self.docs.as_mut() {
+            docs.joined(now, peer, route);
+        }
+    }
+
+    /// Opens shared doc `name`, the same doc on every peer that opens the name, or gives the one open, and
+    /// catches up from the members. `copy` is a [`DocMut::snapshot`] kept from before, to start from (refused,
+    /// and the doc not opened, if it isn't this doc's).
+    pub fn open_doc(&mut self, name: &str, copy: Option<&[u8]>) -> Result<DocId, peerwire_sync::Error> {
+        let now = self.doc_time();
+        if self.docs.is_none() {
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            let mut docs = Docs::new(self.node.peer_id(), seed);
+            for id in self.peer_ids() {
+                if let Some(p) = self.ids.peer(id) {
+                    docs.joined(now, p, self.route(&p));
+                }
+            }
+            self.docs = Some(docs);
+        }
+        let docs = self.docs.as_mut().expect("made");
+        let id = docs.open(now, name, Options { copy, hub: self.host })?;
+        self.pump_docs();
+        Ok(id)
+    }
+
+    /// Doc `id`, to read and write; `None` once closed. What a write sends goes on the next [`Session::poll`].
+    pub fn doc(&mut self, id: DocId) -> Option<DocMut<'_>> {
+        self.docs.as_mut()?.doc(id)
+    }
+
+    pub fn close_doc(&mut self, id: DocId) {
+        if let Some(docs) = self.docs.as_mut() {
+            docs.close(id);
+        }
+    }
+
+    /// The next change or sync of a doc, for Godot's signals.
+    pub fn next_doc_event(&mut self) -> Option<peerwire_sync::Event> {
+        self.doc_events.pop_front()
+    }
+
+    /// Runs the docs' timers and sends their frames; a member whose frames passed OUTBOX_BYTES waiting is
+    /// disconnected (it catches up when it joins again).
+    fn pump_docs(&mut self) {
+        let now = self.doc_time();
+        let Session { docs, node, doc_events, .. } = self;
+        let Some(docs) = docs.as_mut() else { return };
+        if docs.poll_timeout().is_some_and(|t| t <= now) {
+            docs.handle_timeout(now);
+        }
+        while let Some((p, m)) = docs.poll_transmit() {
+            if let Err(SendError::WouldBlock) = node.send(&p, Lane::Reliable, &m) {
+                docs.retry(p, m);
+            }
+        }
+        let mut stalled = Vec::new();
+        while let Some(e) = docs.poll_event() {
+            match e {
+                peerwire_sync::Event::Overflow(p) => stalled.push(p),
+                e => doc_events.push_back(e),
+            }
+        }
+        for p in stalled {
+            if let Some(id) = self.ids.id(&p) {
+                self.disconnect_peer(id);
+            }
+        }
+    }
+
     /// Closes every link. No events follow.
     pub fn close(&mut self) {
         let peers: Vec<PeerId> = self.node.peers().copied().collect();
@@ -706,6 +824,8 @@ impl Session {
         self.inbox.clear();
         self.inbox_bytes = 0;
         self.events.clear();
+        self.docs = None;
+        self.doc_events.clear();
         self.status = Status::Disconnected;
     }
 }
@@ -925,6 +1045,52 @@ mod tests {
         assert_eq!(host.status(), Status::Disconnected);
         assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Disconnected));
         assert_eq!(drain_events(&mut a), vec![PeerEvent::Disconnected(HOST_ID)]);
+    }
+
+    /// A shared doc across a star: joiners link to the host alone, which relays what each writes to the other;
+    /// one that opens the doc late catches up from the host, and app packets go on beside the doc frames.
+    #[test]
+    fn docs_converge_across_the_star() {
+        use peerwire_sync::{Event as DocEvent, Kind};
+        let mut host = Session::host(local());
+        let invite = host.invite();
+        let board = host.open_doc("board", None).unwrap();
+        host.doc(board).unwrap().map_set("meta", "title", r#""Plans""#).unwrap();
+        let mut a = Session::join(local(), &invite).unwrap();
+        let mut b = Session::join(local(), &invite).unwrap();
+        let da = a.open_doc("board", None).unwrap();
+        assert!(pump(&mut [&mut host, &mut a, &mut b], |s| s[1].status() == Status::Connected
+            && s[2].status() == Status::Connected));
+        a.doc(da).unwrap().map_set("meta", "by a", "1").unwrap();
+        let item = a.doc(da).unwrap().set_add("strokes", "[1,2]").unwrap().unwrap();
+        a.target = HOST_ID;
+        a.put(b"app").unwrap();
+        let db = b.open_doc("board", None).unwrap();
+        b.doc(db).unwrap().log_append("chat", r#""hi""#).unwrap();
+        let held = |s: &mut Session, d| {
+            let d = s.doc(d).unwrap();
+            [(Kind::Map, "meta"), (Kind::Set, "strokes"), (Kind::Log, "chat")]
+                .map(|(k, c)| d.entries_json(k, c))
+                .join(" ")
+        };
+        assert!(pump(&mut [&mut host, &mut a, &mut b], |s| {
+            let h = held(s[0], board);
+            h.contains("by a") && h.contains("hi") && held(s[1], da) == h && held(s[2], db) == h
+        }));
+        assert_eq!(
+            b.doc(db).unwrap().get(Kind::Set, "strokes", &item),
+            Some("[1,2]"),
+            "a's item reached b through the host"
+        );
+        assert_eq!(host.pop().map(|p| p.data), Some(b"app".to_vec()), "app packets go on beside");
+        let events: Vec<DocEvent> = std::iter::from_fn(|| b.next_doc_event()).collect();
+        assert!(events.iter().any(|e| matches!(e, DocEvent::Change(_, c) if c.key() == "title" && !c.local())));
+        assert!(events.iter().any(|e| matches!(e, DocEvent::Sync(_, s) if s.json().contains("synced"))));
+        // A doc frame on the unreliable lane is dropped.
+        let bad = b"\x07{\"d\":\"board\",\"t\":1,\"ws\":[],\"x\":[]}";
+        a.on_message(host.public_key(), Lane::Unreliable, bad);
+        host.close();
+        assert!(host.doc(board).is_none());
     }
 
     #[test]
