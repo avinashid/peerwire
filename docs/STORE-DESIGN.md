@@ -1,6 +1,6 @@
 # Keeping a room's data while nobody is online (`peerwire-store`, NB-006g)
 
-Status: design, 2026-10-30, revised after security's review (NB-006g-1 to -7). No code
+Status: design, 2026-10-30, revised after security's review (NB-006g-1 to -10). No code
 yet. Measured on main `dbf0f7c`.
 
 ## The gap
@@ -97,10 +97,17 @@ read from, and its `i` must equal that slot's.
   undone). So readers join only **complete** saves: all `n` pieces of one `s`,
   gathered from any relays. A complete save is a whole state, so joining every
   complete save found is the CRDT join and safe. Pieces of incomplete saves are skipped.
+  Complete means every piece of `s` states the same `n`, with 1 ≤ `n` ≤ 8 and `i` < `n`,
+  and all `n` are there; copies of one (`s`, `i`) from several relays may all be joined.
 - **Two banks.** Slots come in two banks of 8 (`b` = 0, 1), 16 events per doc per relay
-  at most. A save writes the bank that doesn't hold the newest complete save, so one
-  complete save always stands while the other is being written. Slots a smaller save
-  doesn't use get an empty piece.
+  at most. On each relay, a save writes the bank that doesn't hold **that relay's**
+  newest complete save, so one complete save always stands there while the other is
+  being written. Saves are ranked by `created_at` (the latest of their pieces' on that
+  relay), never by `c`, which anyone with the roomId could set to 2^53 − 1 to pin the
+  choice. So one save's pieces may sit in different banks on different relays; readers
+  gather by `s`. An empty piece (`n: 0`, which no complete save can include) goes only
+  into a slot of the bank being written that the read found holding another save's
+  piece, so a one-piece save costs one event, not eight.
 - **Cap.** 8 pieces per save (about 350 KB deflated, 1 to 2 MB of JSON for typical
   docs).
   A larger doc keeps no relay copy and warns once; its members still serve it.
@@ -115,33 +122,49 @@ can send anything:
 - refuse `content` over 60 KiB of base64 before decoding it (as `nostr.js` does with
   `MAX_CONTENT`); inflate with `room.js`'s streaming `inflate(bytes, max)` at 1 MiB per
   piece, and at most `MAX_STORED` over one read;
-- a piece that doesn't open counts as absent; a piece of another `VERSION` means the
-  slots are left as they are and never saved over, as `store.js` does.
-Pieces are joined with a distinct origin: their changes, deletions included, are
+- a piece that doesn't open counts as absent; a piece of another `VERSION` means that
+  bank on that relay is left as it is and never saved over, as `store.js` does. (A
+  reader can't tell a real one from a relay that flipped the clear VERSION byte, so
+  it is decided per relay: we write the other bank there, and stop on that relay only
+  if both banks hold one.)
+A read is **complete** on a relay when it reached EOSE within the timeout and no bound
+cut it short (`MAX_STORED` included); a read that found only incomplete pieces found
+"nothing". Pieces are joined with a distinct origin: their changes, deletions included, are
 reported `from: 'relays'`, never as our own. `sync` gains a source: from a member, or
 from relays as of the save's time (the saver's claim, for display only).
 
 **When to save.** One saver per room at a time:
 - After a change, wait for 10 s of quiet plus a random 0 to 30 s. The member whose
-  timer fires first sends its members a small doc frame `{ d, t: 5, s }` ("saving"),
-  and members that get one push their own timer back 5 minutes. A `doc.js` or Rust
-  member without the store drops `t: 5` as a malformed frame, whole, as it does today.
-- A save starts only after a read that reached EOSE, found a complete save or nothing,
+  timer fires first sends its members a small doc frame `{ d, t: 5, s }` ("saving").
+  A `doc.js` or Rust member without the store drops `t: 5` as a malformed frame,
+  whole, as it does today.
+- A `t: 5` defers our save to at most 5 minutes after it first deferred it; later ones
+  don't push it further, and we honour at most one per member per 5 minutes. When the
+  deferral ends we read as usual: if that member's save `s` isn't complete on the
+  relays that answered, we ignore its `t: 5`s until it joins again, and save. So a
+  member that announces saves it never makes can't stop the repair of a wipe.
+- A save starts only after a read that was complete, found a complete save or nothing,
   and joined it, whether the doc is `synced` or `'alone'` (so an author drawing alone
-  saves). It goes only to relays whose read reached EOSE, and only if the join left us
+  saves). It goes only to relays whose read was complete, and only if the join left us
   something the newest complete save lacks, or that save expires within 7 days (so
   opening a doc daily keeps its copy alive).
 - Pieces go one a second per relay through `nostr.js`'s per-relay buckets, holds and
   bans, behind signalling, so they never starve a join or a pipe.
-- `created_at` is the later of now and the newest `created_at` read for that slot,
-  plus 1: a clock that runs ahead (or a writer on purpose) can't pin a slot. A
-  refused write fails the save.
+- `created_at` is the later of now and the newest `created_at` read for that slot **on
+  that relay**, plus 1, ignoring events more than 15 minutes past our clock: a clock
+  that runs ahead (or a writer on purpose) can't pin a slot, and one relay serving a
+  `created_at` a year ahead (`nostr.js` doesn't check signatures) can't fail our
+  saves to the others. If an ignored event sits in a slot we must write, the save
+  fails on that relay only. A refused write fails the save on that relay.
 - At most one save per doc every 5 minutes per member, and only the last member online
   (`'alone'`) makes the best-effort save when the page hides.
 - Every piece expires (NIP-40) 30 days after its save.
 
 **Forgetting.** `forget()` also wipes the slots, best effort: an empty piece in each,
-then a NIP-09 deletion. The docs say that copies already archived may still be kept.
+then a NIP-09 deletion. Its docs say that this wipes the room's relay copy for every
+member until another member saves (today `forget()` touches only this device), and
+that copies already archived may still be kept. The `relays` option's docs say "use
+`randomRoomId()`": the shape check catches mistakes, not intent.
 
 **Cost.** The whiteboard above: 3 pieces to each of 3 relays, 450 KB up per save,
 about one save per room every 5 minutes while it changes; a read before each, and
@@ -180,7 +203,12 @@ drop, proven live), with erasure only for payloads over one piece.
   mark every dot dead, or delete the slots (NIP-09, with the shared signer): the
   doc's existing trust model, where members are trusted alike to write. Joining only
   complete saves, two banks, and a read-then-join before each save mean honest members
-  restore what an overwrite removed from the relay, not what it deleted in the doc.
+  restore what an overwrite removed from the relay, not what it deleted in the doc;
+  the `t: 5` rule (NB-006g-8) keeps a member that announces saves it never makes from
+  stopping that repair.
+- **Availability is best effort** against anyone with the roomId: they can stop the
+  relay copy for good, by putting another VERSION's pieces in both banks on every
+  relay or by overwriting it over and over. Device copies stay the main store.
 - **Rollback and withholding.** A relay can serve an old save or none. Joining is
   monotone, so an old complete save can't undo a newer one from another relay; a
   joiner that only reaches relays holding old saves sees an old doc until a member
@@ -197,7 +225,8 @@ drop, proven live), with erasure only for payloads over one piece.
   room every 5 minutes, through signalling's per-relay buckets. A relay that refuses
   for its rate limit pauses as signalling does (NB-006h); a ban costs that relay for
   signalling too, for every device behind the same IP.
-- **`created_at` pinning** (NB-006g-5): handled by the rule under "When to save".
+- **`created_at` pinning** (NB-006g-5) and **one relay deciding for all** (NB-006g-9):
+  handled by the per-relay rules for the bank, `created_at` and VERSION above.
 - **Retention isn't promised.** A doc nobody opens for 30 days loses its relay copy by
   design, and a relay may drop it sooner. Device copies are the primary store.
 
@@ -215,10 +244,11 @@ drop, proven live), with erasure only for payloads over one piece.
 ## Next cards
 
 1. **NB-006l: relay snapshot of `room.doc` in JS**, as above, with security's NB-006g-3
-   to -7 as requirements: security review (parsing and the threats above); tests
-   against a local strfry-like fake relay (torn saves, both banks, a bomb piece, a
-   relay that ignores the filter, `created_at` ahead), plus one minimal live check on
-   our own test room.
+   to -10 as requirements: security review (parsing and the threats above); tests
+   against a local strfry-like fake relay (torn saves, both banks, a relay that took
+   only part of a save, a bomb piece, a relay that ignores the filter, one serving
+   `created_at` a year ahead, another VERSION in one bank, a member sending `t: 5`
+   without saving), plus one minimal live check on our own test room.
 2. **NB-006b** (in progress) reads and writes the same pieces in Rust, and drops `t: 5`
    until then.
 3. **NB-019 rescoped**: one-to-one offline messages to a PeerId over relays.
