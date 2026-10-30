@@ -113,7 +113,7 @@ var copy := doc.snapshot()                  # keep it on the device (it holds wh
 | `map_set(coll, key, value) -> bool` / `map_get` / `map_erase` / `map_entries(coll)` | A map. A set made at the same time as a delete elsewhere wins |
 | `set_add(coll, value) -> String` / `set_get(coll, id)` / `set_erase` / `set_entries(coll)` | Items by id |
 | `log_append(coll, value) -> String` / `log_entries(coll)` / `log_keep(coll, keep) -> Error` | The newest `keep` entries (default 1000), by Lamport stamp |
-| `get_sync() -> Dictionary` | `{state, from, have, total}`; signal `sync_changed(status)` on each change |
+| `get_sync() -> Dictionary` | `{state, from, have, total, source, at}`, `source` "members" once caught up, else ""; signal `sync_changed(status)` on each change |
 | `snapshot() -> PackedByteArray` | The doc as a copy to keep, for `open_doc_from(name, copy)` |
 | `close()` | Stops syncing and forgets the doc |
 

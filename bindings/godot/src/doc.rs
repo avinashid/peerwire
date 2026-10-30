@@ -3,7 +3,7 @@ use crate::session::Session;
 use godot::classes::{Json, RefCounted};
 use godot::global::Error;
 use godot::prelude::*;
-use peerwire_sync::{Change, DocId, DocMut, Item, Kind, State, Status};
+use peerwire_sync::{Change, DocId, DocMut, Item, Kind, Source, State, Status};
 
 /// A shared document: maps, sets and logs every peer of the game holds, that converge, as `room.doc()` of
 /// `@peerwire/js`. Open it with `PeerwireMultiplayerPeer.open_doc(name)`; the same name on every peer is the same
@@ -70,7 +70,8 @@ pub(crate) fn change_dict(c: &Change) -> VarDictionary {
 }
 
 /// A `sync_changed` status as a Dictionary: `state` ("alone", "loading" or "synced"), `from` (hex, or ""),
-/// `have` and `total` (the entries of the answer under way).
+/// `have` and `total` (the entries of the answer under way), `source` ("members" once caught up, else "") and
+/// `at` (ms, for a save on the relays, which Godot doesn't keep: 0).
 pub(crate) fn status_dict(s: &Status) -> VarDictionary {
     let mut d = VarDictionary::new();
     let state = match s.state {
@@ -82,6 +83,13 @@ pub(crate) fn status_dict(s: &Status) -> VarDictionary {
     put(&mut d, "from", s.from.map_or(String::new(), |p| hex(&p.0)).to_variant());
     put(&mut d, "have", (s.have as i64).to_variant());
     put(&mut d, "total", (s.total as i64).to_variant());
+    let source = match s.source {
+        Some(Source::Members) => "members",
+        Some(Source::Relays) => "relays",
+        None => "",
+    };
+    put(&mut d, "source", source.to_variant());
+    put(&mut d, "at", (s.at.unwrap_or(0) as i64).to_variant());
     d
 }
 
@@ -201,7 +209,7 @@ impl PeerwireDoc {
         }
     }
 
-    /// Where catching up stands: `{state, from, have, total}` (see `status_dict`).
+    /// Where catching up stands: `{state, from, have, total, source, at}` (see `status_dict`).
     #[func]
     fn get_sync(&self) -> VarDictionary {
         self.with(|d| status_dict(&d.sync())).unwrap_or_default()

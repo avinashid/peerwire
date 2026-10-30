@@ -164,6 +164,16 @@ pub enum State {
     Synced,
 }
 
+/// Where a doc's contents came from (doc.js `doc.sync.source`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Caught up from members.
+    Members,
+    /// A save on the signalling relays (doc.js `relays: true`). This crate keeps no copy there, so it never
+    /// reports this one; it is here so that `Status` has doc.js's shape.
+    Relays,
+}
+
 /// Where catching up stands (doc.js `doc.sync`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -174,10 +184,15 @@ pub struct Status {
     pub have: u64,
     /// Entries the answer under way carries, as it says; 0 until its first piece lands.
     pub total: u64,
+    /// Where the doc came from: [`Source::Members`] once caught up (even after every member left), else none.
+    pub source: Option<Source>,
+    /// With [`Source::Relays`], the time (ms since the epoch) its saver claims for the save; else none.
+    pub at: Option<u64>,
 }
 
 impl Status {
-    /// As doc.js's 'sync' event gives it: `{"state":"loading","from":"<hex>","have":0,"total":0}`.
+    /// As doc.js's 'sync' event gives it:
+    /// `{"state":"loading","from":"<hex>","have":0,"total":0,"source":null,"at":null}`.
     pub fn json(&self) -> String {
         let state = match self.state {
             State::Alone => "alone",
@@ -193,7 +208,16 @@ impl Status {
             }
             None => s.push_str("null"),
         }
-        let _ = write!(s, ",\"have\":{},\"total\":{}}}", self.have, self.total);
+        let _ = write!(s, ",\"have\":{},\"total\":{},\"source\":", self.have, self.total);
+        s.push_str(match self.source {
+            Some(Source::Members) => "\"members\"",
+            Some(Source::Relays) => "\"relays\"",
+            None => "null",
+        });
+        let _ = match self.at {
+            Some(at) => write!(s, ",\"at\":{at}}}"),
+            None => write!(s, ",\"at\":null}}"),
+        };
         s
     }
 }

@@ -17,7 +17,7 @@
 //! Events, from `pw_docs_poll_event`:
 //! ```text
 //! {"doc":0,"change":{"name":"meta","type":"map","key":"title","value":"Plans","from":"<hex>","local":false}}
-//! {"doc":0,"sync":{"state":"loading","from":"<hex>","have":12,"total":40}}
+//! {"doc":0,"sync":{"state":"loading","from":"<hex>","have":12,"total":40,"source":null,"at":null}}
 //! {"overflow":"<hex>"}    the member's link took nothing for too long: close it
 //! ```
 
@@ -341,7 +341,9 @@ pub unsafe extern "C" fn pw_doc_entries(
     read(Some(d.entries_json(k, c).into_bytes()), buf, cap)
 }
 
-/// Where catching up stands, as JSON: `{"state":…,"from":…,"have":…,"total":…}`.
+/// Where catching up stands, as JSON, as doc.js's `doc.sync`:
+/// `{"state":…,"from":…,"have":…,"total":…,"source":…,"at":…}`. `source` is `"members"` once caught up, else
+/// `null`; `at` is `null`, as no copy is kept on the relays.
 #[no_mangle]
 pub unsafe extern "C" fn pw_doc_status(h: *mut PwDocs, doc: u32, buf: *mut u8, cap: usize) -> i32 {
     let Some(d) = (*h).docs.doc(DocId(doc)) else { return PW_ERR_INVALID };
@@ -466,7 +468,8 @@ mod tests {
         let n = unsafe { pw_doc_entries(a.h, a.doc, 1, s.as_ptr(), s.len(), buf.as_mut_ptr(), buf.len()) };
         assert!(String::from_utf8_lossy(&buf[..n as usize]).starts_with(r#"[{"id":"bbbb"#));
         let n = unsafe { pw_doc_status(a.h, a.doc, buf.as_mut_ptr(), buf.len()) };
-        assert_eq!(&buf[..n as usize], br#"{"state":"synced","from":null,"have":0,"total":0}"#);
+        let synced = br#"{"state":"synced","from":null,"have":0,"total":0,"source":"members","at":null}"#;
+        assert_eq!(&buf[..n as usize], synced);
         // A copy opens the doc again elsewhere.
         let n = unsafe { pw_doc_snapshot(a.h, a.doc, buf.as_mut_ptr(), buf.len()) };
         assert!(n > 0);
@@ -507,7 +510,8 @@ mod tests {
             let mut buf = [0u8; 15];
             assert_eq!(pw_doc_status(a.h, a.doc, buf.as_mut_ptr(), 15), PW_ERR_BUFFER);
             let mut buf = [0u8; 16];
-            assert_eq!(pw_doc_status(a.h, a.doc, buf.as_mut_ptr(), 16), -48);
+            let alone = r#"{"state":"alone","from":null,"have":0,"total":0,"source":null,"at":null}"#;
+            assert_eq!(pw_doc_status(a.h, a.doc, buf.as_mut_ptr(), 16), -(alone.len() as i32));
             assert_eq!(pw_doc_open(a.h, 0, b"x".as_ptr(), 1, b"{}".as_ptr(), 2, 0), PW_ERR_INVALID as i64);
             assert_eq!(pw_doc_open(a.h, 0, bad.as_ptr(), 2, std::ptr::null(), 0, 0), PW_ERR_INVALID as i64);
             assert_eq!(pw_doc_open(a.h, 0, b"board".as_ptr(), 5, std::ptr::null(), 0, 0), a.doc as i64, "open already");

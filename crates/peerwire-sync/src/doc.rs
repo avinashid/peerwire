@@ -10,8 +10,9 @@ use crate::frame::{self, Data, Entry, Frame, Id, Kind, Numbered, Range, ANSWER, 
 use crate::json::{json_length, utf16_len, write_number, write_str, Tree, Utf16};
 use crate::ordmap::OrdMap;
 use crate::{
-    Change, DocId, Error, Event, Item, Route, State, Status, DEFAULT_KEEP, FRAME_ITEMS, MAX_DOC_LENGTH, MAX_ENTRIES,
-    MAX_KEY_LENGTH, MAX_RANGES, MAX_VALUE_DEPTH, MAX_VALUE_LENGTH, MAX_WRITERS, MESSAGE_BYTES, STORED_FRAMES,
+    Change, DocId, Error, Event, Item, Route, Source, State, Status, DEFAULT_KEEP, FRAME_ITEMS, MAX_DOC_LENGTH,
+    MAX_ENTRIES, MAX_KEY_LENGTH, MAX_RANGES, MAX_VALUE_DEPTH, MAX_VALUE_LENGTH, MAX_WRITERS, MESSAGE_BYTES,
+    STORED_FRAMES,
 };
 use peerwire_core::PeerId;
 use std::cmp::Reverse;
@@ -353,7 +354,7 @@ pub(crate) struct Doc {
 
 impl Doc {
     pub(crate) fn new(h: &mut Host, name: Utf16, hub: bool) -> Doc {
-        let alone = Status { state: State::Alone, from: None, have: 0, total: 0 };
+        let alone = Status { state: State::Alone, from: None, have: 0, total: 0, source: None, at: None };
         let mut d = Doc {
             name,
             hub,
@@ -1204,12 +1205,14 @@ impl Doc {
         self.next_ask(h, true);
     }
 
-    /// Where catching up stands.
+    /// Where catching up stands, and where the doc came from: members once caught up, else nowhere yet (with no
+    /// copy on the relays, `at` is always none).
     fn status(&self, h: &Host) -> Status {
         let peers = h.peers.len();
+        let source = self.synced.then_some(Source::Members);
         if peers == 0 || self.synced {
             let state = if peers > 0 { State::Synced } else { State::Alone };
-            return Status { state, from: None, have: 0, total: 0 };
+            return Status { state, from: None, have: 0, total: 0, source, at: None };
         }
         let a = self.asking.and_then(|p| self.members.get(&p)?.ask.as_ref());
         Status {
@@ -1217,10 +1220,13 @@ impl Doc {
             from: self.asking,
             have: a.map_or(0, |a| a.got.min(a.n)),
             total: a.map_or(0, |a| a.n),
+            source,
+            at: None,
         }
     }
 
-    /// Emits a sync event if where catching up stands changed. Every member having answered counts as caught up.
+    /// Emits a sync event if where catching up stands, or where the doc came from, changed. Every member having
+    /// answered counts as caught up.
     fn emit_sync(&mut self, h: &mut Host) {
         if !self.synced
             && !h.peers.is_empty()
