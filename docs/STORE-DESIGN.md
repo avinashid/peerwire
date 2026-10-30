@@ -154,10 +154,11 @@ rewrite `created_at`, so one more than 15 minutes past our clock counts as the r
   don't all read at once): if that member's save `s` isn't complete on **at least one**
   relay that answered, we ignore its `t: 5`s until it joins again, and save; a `t: 5`
   it sent during that read then holds nothing back. A `t: 5` naming a save already
-  made (complete at our latest read, or our own) announces nothing new: we ignore its
-  member at once. So **one** member that announces saves it never makes can't stop the
-  repair of a wipe (someone set on it can stop the copy anyway: see "Availability"
-  below), and one whose save a relay refused for its rate isn't ignored.
+  made (complete at any read since the latest one a relay answered, or our own)
+  announces nothing new: we ignore its member at once. So **one** member that announces
+  saves it never makes can't stop the repair of a wipe (someone set on it can stop the
+  copy anyway: see "Availability" below), and one whose save a relay refused for its
+  rate isn't ignored.
 - A save starts only after a read that was complete, found a complete save or nothing,
   and joined it, whether the doc is `synced` or `'alone'` (so an author drawing alone
   saves). It goes only to relays whose read was complete, and only if the join left us

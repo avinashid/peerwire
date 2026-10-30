@@ -896,8 +896,8 @@ async function whole(net, relay, k, reader) {
   const at = net.relays[0].log.find(([ev]) => ev.pubkey === k.pubkey)?.[1] - WALL0;
   check(a.copy.honoured.get(m.self) > t0 && a.copy.ignoring.has(m.self) && a.copy.deferUntil === null && net.taken(k)[0].length === 3 && at - t0 <= DEFER_MS + JITTER_MS + 1000, `m announced again during the read as its deferral ended: a saved ${((at - t0) / 1000).toFixed(0)} s after m's first t: 5, not a deferral later`);
 }
-// A t: 5 naming a save already made (ours, or whole at our latest read) announces nothing new: its member is ignored
-// at once and defers nothing, also when it lands during our read.
+// A t: 5 naming a save already made (ours, or whole at any read since the latest that some relay completed) announces
+// nothing new: its member is ignored at once and defers nothing, also when it lands during our read.
 {
   const net = new Net();
   const a = net.node('a');
@@ -1027,6 +1027,49 @@ async function whole(net, relay, k, reader) {
   check(net.sig.queries === 2 && !a.copy.ignoring.has(m.self) && a.copy.announced.get(m.self) === 'facadefacadefaca' && net.taken(k)[0].length === 0, "no relay answered as m's deferral ended: m's announcements kept for the next read, the newer one checked");
   await net.pass(NEXT);
   check(a.copy.ignoring.has(m.self) && net.taken(k)[0].length === 3, 'that read finds its save never came: m ignored, and a saved');
+}
+// A read no relay completed says nothing of the saves already made: a replay of ours after it is still ignored at
+// once (NB6L-6).
+{
+  const net = new Net();
+  const a = net.node('a');
+  const m = net.node('9', { relays: false });
+  net.link(a, m);
+  await net.settle();
+  const k = await keysOf(a);
+  draw(a.doc, 5);
+  await net.pass(SAVE_WAIT);
+  const s1 = a.copy.last?.s;
+  draw(a.doc, 1);
+  for (const r of net.relays) r.down = true;
+  await net.pass(NEXT);
+  for (const r of net.relays) r.down = false;
+  m.host.send(a.self, { d: 'board', t: 5, s: s1 });
+  await net.settle();
+  check(s1 && net.taken(k)[0].length === 3 && a.copy.saved.has(s1) && a.copy.ignoring.has(m.self) && a.copy.deferUntil === null, "every relay down at a's next read, then m replays a's save: ignored at once, deferring nothing");
+  await net.pass(NEXT);
+  check(net.taken(k)[0].length === 6, 'and the save that read left due goes at the next slot');
+  // Two saves on, with r3 down, s1 is whole on no relay read: a read complete on some relays keeps only what it
+  // found whole (and ours since).
+  const s2 = a.copy.last?.s;
+  net.relays[2].down = true;
+  for (let i = 0; i < 2; i++) {
+    draw(a.doc, 1);
+    await net.pass(NEXT);
+  }
+  net.relays[2].down = false;
+  const s4 = a.copy.last?.s;
+  check(new Set([s1, s2, s4]).size === 3 && !a.copy.saved.has(s1) && a.copy.saved.has(s4), 'two saves on with r3 down, a read complete on r1 and r2 drops s1, overwritten there, from the saves a counts as made');
+  // b opens while no relay sends EOSE: the save it read whole there counts as made all the same.
+  for (const r of net.relays) r.noEose = true;
+  const b = net.node('b');
+  await net.settle();
+  for (const r of net.relays) r.noEose = false;
+  net.link(b, m);
+  await net.settle();
+  m.host.send(b.self, { d: 'board', t: 5, s: s4 });
+  await net.settle();
+  check(b.copy.saved.has(s4) && b.copy.ignoring.has(m.self) && b.copy.deferUntil === null, "b's read complete on no relay, then m replays a's save b read there: ignored at once");
 }
 
 // Renewal: opening a doc whose copy expires within 7 days saves it again.

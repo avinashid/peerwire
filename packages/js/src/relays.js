@@ -56,9 +56,9 @@
 // DEFER_MS. That save reads as ever, and a member whose save `s` wasn't whole on any relay whose read was complete
 // is ignored until it joins again (it announced a save it never made, as one would to hold the others' back after
 // wiping the slots: a save one relay refused for its rate is still whole on another); then we save if the doc
-// needs it. A t: 5 naming a save already made (whole at our latest read, or our own) announces nothing new: its
-// member is ignored at once. A doc of more than SLOTS pieces (or with an entry past a piece on its own) keeps no
-// relay copy, with a warning; its members still serve it.
+// needs it. A t: 5 naming a save already made (whole at any read since the latest that some relay completed, or
+// our own) announces nothing new: its member is ignored at once. A doc of more than SLOTS pieces (or with an entry
+// past a piece on its own) keeps no relay copy, with a warning; its members still serve it.
 
 import { toHex } from './peerwire.js';
 import { b64, unb64 } from './nostr.js';
@@ -167,7 +167,7 @@ export class RelayCopy {
     this.announced = new Map(); // peer -> its save `s`, for the next save to check
     this.honoured = new Map(); // peer -> host.now() of its last t: 5 we honoured
     this.ignoring = new Set(); // peers whose t: 5s we ignore until they join again
-    this.saved = new Set(); // saves already made: whole at our latest read, or ours since
+    this.saved = new Set(); // saves made: whole at any read since the latest some relay completed, or ours since
     this.jitter = null;
     this.timer = null; // cancels the wait for the next save
     this.waiting = false; // a save came due while the doc was loading from a member
@@ -317,7 +317,9 @@ export class RelayCopy {
       this.at = newest * 1000;
       this.doc.emitSync();
     }
-    this.saved = valid;
+    // A read no relay completed says nothing of the saves already made.
+    if ([...read.relays.values()].some((r) => r.complete)) this.saved = valid;
+    else for (const s of valid) this.saved.add(s);
     return valid;
   }
 
