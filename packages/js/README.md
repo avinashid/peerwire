@@ -910,12 +910,13 @@ Run these with Node and the Playwright install on this host:
   after a torn read loses nothing; a relay that took part of a save keeps its own whole one. A 45 KiB piece of
   45 MiB inflates to 1 MiB; 48 of them stop a read at 32 MiB; a piece holds 16 frames at most. A relay past the
   filter, one serving `created_at` a year ahead (only it is skipped, and `sync.at` isn't moved), another version in
-  a bank or both. One saver per room; a member's "saving"
-  during our read means we write nothing; one that announces saves it never makes holds ours back once, 5 minutes
-  at most, then is ignored until it rejoins, and one whose save one relay took isn't; one naming a save already
-  made is ignored at once. A save no relay took, or whose read none completed, is tried again; renewal at 24 days; deletions `from: 'relays'`; the hide save; `forget()` (empty pieces, then
-  NIP-09). Then over the real `NostrSignaling` and fake sockets: the room's checks (signalling, roomId shape),
-  a 3-piece save one piece a second per relay, and a joiner alone getting it.
+  a bank or both. One saver per room; a member's "saving" during our read means we write nothing; one that announces
+  saves it never makes holds ours back once, 5 minutes at most, then is ignored until it rejoins, and one whose save
+  one relay took isn't; one naming a save already made is ignored at once, also after a read no relay completed. A
+  save no relay took, or whose read none completed, is tried again; renewal at 24 days; deletions `from: 'relays'`;
+  the hide save; `forget()` (empty pieces, then NIP-09). Then over the real `NostrSignaling` and fake sockets: the
+  room's checks (signalling, roomId shape), a 3-piece save one piece a second per relay, and a joiner alone getting
+  it.
 - `node packages/js/test/browser.mjs [tabs] [shot.png]`: mesh of tabs, RTT and throughput.
 - `node packages/js/test/arena.mjs [players] [secs] [shot.png|-]`: the arena. `LOSS=0.1`
   drops datagrams. Checks that every island agrees on its lockstep state.
