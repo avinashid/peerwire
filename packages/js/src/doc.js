@@ -325,7 +325,7 @@ function parseFrame(m, peer) {
       if (!Array.isArray(x) || x.length !== 7) return null;
       const [i, n, c, type, coll, k, v] = x;
       const w = writer(i);
-      if (!w || !count(n) || !count(c) || !Object.hasOwn(TYPES, type) || !validName(coll)) return null;
+      if (!w || !count(n) || !count(c) || typeof type !== 'string' || !Object.hasOwn(TYPES, type) || !validName(coll)) return null;
       if (type === 'm' ? !validKey(k) : k !== null) return null;
       // A delta carries only its sender's writes.
       if (t === DELTA && peerOf(w) !== peer) return null;
