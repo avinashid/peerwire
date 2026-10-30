@@ -86,6 +86,48 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 The rest of the `MultiplayerPeer` API works as documented: `refuse_new_connections`, `disconnect_peer()`,
 `close()`, `transfer_mode`, `transfer_channel`, `get_unique_id()`.
 
+## Shared documents
+
+`open_doc(name)` opens a shared document. Every peer holds it, and it converges: the host, joiners, and a joiner
+that comes late or back after a drop. It is `room.doc()` of `@peerwire/js`: the same maps, sets and logs, the same
+frames ([`crates/peerwire-sync`](../crates/peerwire-sync)).
+
+```gdscript
+var doc := peer.open_doc("board")           # after host() or join(); the same name on every peer
+doc.changed.connect(_on_changed)            # {name, type, key or id, value or deleted, from, local}
+doc.sync_changed.connect(func(s): print(s.state))  # "alone", "loading" or "synced"
+doc.log_keep("chat", 200)                   # every peer the same, right after opening
+
+doc.map_set("meta", "title", "Plans")       # a key shows its latest write
+var id := doc.set_add("strokes", {"pts": [1, 2, 3]})
+doc.set_erase("strokes", id)
+doc.log_append("chat", {"text": "hi"})      # keeps the newest 200
+print(doc.map_get("meta", "title"), doc.log_entries("chat"))
+
+var copy := doc.snapshot()                  # keep it on the device (it holds what peers wrote)
+# next time: peer.open_doc_from("board", copy), and peers send only what it lacks
+```
+
+| `PeerwireDoc` | |
+|---|---|
+| `map_set(coll, key, value) -> bool` / `map_get` / `map_erase` / `map_entries(coll)` | A map. A set made at the same time as a delete elsewhere wins |
+| `set_add(coll, value) -> String` / `set_get(coll, id)` / `set_erase` / `set_entries(coll)` | Items by id |
+| `log_append(coll, value) -> String` / `log_entries(coll)` / `log_keep(coll, keep) -> Error` | The newest `keep` entries (default 1000), by Lamport stamp |
+| `get_sync() -> Dictionary` | `{state, from, have, total}`; signal `sync_changed(status)` on each change |
+| `snapshot() -> PackedByteArray` | The doc as a copy to keep, for `open_doc_from(name, copy)` |
+| `close()` | Stops syncing and forgets the doc |
+
+- **Values are JSON.** A value is what `JSON.stringify` writes of it, so numbers come back as floats. Entries list
+  oldest first (maps by key), each `{key or id, value, from}`. `from` is the writer's public key, in hex.
+- **Writes are refused, not thrown.** A write returns `false` (or `""`) when peers filled the doc (10,000 entries, or
+  4 Mi characters of JSON). A name or key past its cap, or a value that isn't JSON or is over 64 KiB, also prints an
+  error.
+- **The star.** Joiners link to the host alone. So the host passes on what each joiner writes, and a joiner catches
+  up from the host. Frames are messages `0x07` + JSON on the reliable lane, beside Godot's packets. A joiner whose
+  link takes nothing while 16 MiB of doc frames wait for it is disconnected. When it joins again, it catches up.
+- **Browsers and Godot don't share a doc live:** a browser doesn't dial a native peer. A copy, or a frame, reads in
+  both.
+
 ## Through NATs
 
 Most players sit behind a NAT, so neither side can simply dial the other. `peerwire` does the traversal (see
@@ -215,6 +257,8 @@ two networks still need testing on real devices.
   - data: `0x01 mode channel [seq u32 LE, unreliable-ordered only] payload`
     A frame whose mode doesn't match the lane it arrived on is dropped.
   - control: `0x00 0x01 id(i32 LE)`, the host's id assignment. Other control frames are ignored.
+  - doc: `0x07` and a shared doc's frame as JSON, reliable lane only (see [Shared documents](#shared-documents)).
+    `0x08` and other tags are dropped.
 
 ## Security
 
@@ -352,7 +396,9 @@ binary:
   `mapped`, offered in the invite and deleted when the session goes; a relay-only joiner asks the router nothing
   (`relay_only`) while a relay-only host still maps;
 - a room host found by two clients (and not by a client of another room) through in-process signaling; clients
-  link to the host only, and a refusing host stops being found.
+  link to the host only, and a refusing host stops being found;
+- a shared doc across the star over loopback: joiners' writes reach each other through the host, a late opener
+  catches up, app packets go on beside, and a doc frame on the unreliable lane is dropped.
 
 ## Limits
 

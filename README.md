@@ -53,11 +53,12 @@ Peerwire is **v0.1 and in early development**. The APIs will change, and nothing
 | Godot 4 `PeerwireMultiplayerPeer` (desktop) | ✅ Working, tested |
 | WebAssembly module and JS package (WebRTC transport, Nostr signaling) | ✅ Working, tested in headless browsers |
 | Shared documents in the JS package: `room.doc()` with maps, sets and logs (CRDT, catch-up for late joiners) | ✅ Working, tested |
+| Shared documents in Rust, Godot (`open_doc`) and the C ABI: `peerwire-sync`, frame for frame with `room.doc()` | ✅ Working, tested against doc.js's frames |
 | Deterministic network simulator and multiplayer arena benchmark | ✅ Working |
 | Game layer: fixed-point maths, Hilbert islands, desync detection, lockstep | ✅ Working |
 | Mesh size limit and super-peers in the `Node` facade | 🚧 Planned |
 | mDNS and DHT signaling | 🚧 Planned |
-| `peerwire-sync` (CRDTs in Rust and Godot), `peerwire-media` (audio and video), `peerwire-store` (offline store-and-forward) | 🚧 Planned |
+| `peerwire-media` (audio and video), `peerwire-store` (offline store-and-forward) | 🚧 Planned |
 | Godot on Android, iOS and web; mobile bindings | 🚧 Planned |
 
 NAT behaviour is verified in a simulator that models RFC 4787 NAT types, and over public Nostr relays and STUN on
@@ -216,7 +217,8 @@ sequenceDiagram
  │ game · whiteboard · meeting · chat                                         │
  ├───────────────────────────── building blocks ──────────────────────────────┤
  │ peerwire-game     fixed-point maths, Hilbert islands, desync detection       │
- │ peerwire-sync · peerwire-media · peerwire-store                    (planned)     │
+ │ peerwire-sync     shared docs: maps, sets, logs (doc.js's frames)            │
+ │ peerwire-media · peerwire-store                                (planned)     │
  ├───────────────────────────── hosts / facades ──────────────────────────────┤
  │ peerwire::Node    UDP socket, STUN, rooms, traversal (+ AsyncNode, tokio)    │
  │ peerwire-godot    PeerwireMultiplayerPeer (GDExtension)                        │
@@ -451,6 +453,7 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 | [`crates/peerwire-ffi`](crates/peerwire-ffi) | C ABI: one surface for WebAssembly and native FFI |
 | [`crates/peerwire-sim`](crates/peerwire-sim) | Deterministic network simulator (latency, jitter, loss, NAT types, uplink limits) and the arena benchmark |
 | [`crates/peerwire-game`](crates/peerwire-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep timing constants |
+| [`crates/peerwire-sync`](crates/peerwire-sync) | Shared documents (maps, sets, logs) for Rust, Godot and C, in the frames of `room.doc()`; sans-IO |
 | [`crates/peerwire-peer`](crates/peerwire-peer) | Optional always-on peer (binary): one identity across restarts, relays for linked peers; see [docs/DOCKER.md](docs/DOCKER.md) |
 | [`packages/js`](packages/js) | JavaScript package: wasm glue, WebRTC transport, Nostr signaling, browser demos |
 | [`packages/react`](packages/react) | React hooks over `@peerwire/js`, in TypeScript: rooms, members, chat, shared and per-peer state |

@@ -159,6 +159,36 @@ Assume a stroke update of 64 B sent 20 times a second while someone draws.
     For more viewers, use the tree fan-out in §6.
 - **Sync latency:** one network hop (RTT/2), plus one tick if updates are batched (≤ 50 ms at 20 Hz).
 
+### Shared documents in Rust (measured)
+
+`peerwire-sync` (the Rust port of `room.doc()`) on a doc of 10,000 map keys, each a 100-character value. Run it with:
+
+```sh
+cargo run --release -p peerwire-sim --example docs
+```
+
+The CPU figures use one thread on this 4-core aarch64 host, at a load average of 2 to 4. They change with the
+machine.
+
+| | Rate | Bytes |
+|---|---|---|
+| Local writes (`map_set`) | 89,000 / s | |
+| Member deltas applied | 129,000 / s | 240 per delta (one entry, its writer named in full) |
+| A late joiner catching up, both sides | 120,000 entries / s | 133 per entry: 1.33 MB for the doc |
+| Snapshot (the copy kept on a device) | | 133 per entry |
+
+- **Catch-up on the wire (simulator, virtual time):** the same doc to a member that links late takes **1.28 s**,
+  from the link's first packet. The link is 20 ms one way with 10 Mbit/s uplinks.
+  - 1.33 MB at 10 Mbit/s is 1.06 s, so the answer runs near the line rate: WINDOW = 4 pieces of 128K characters
+    are in flight, about 0.5 MB per 40 ms round trip.
+  - In the 32K pieces of a relayed route, it takes 1.26 s.
+- **Per-entry cost:** an answer names each writer once per frame, so an entry costs its value and key plus about 25
+  bytes. A delta carries one entry and its writer's 72-character id, so it costs about 140 bytes more than its
+  value.
+- **Bounds (from the caps, theoretical):** a full doc is 4 Mi characters of JSON, up to 12 MiB as UTF-8. A member
+  can make us send it at most two answers at once (CATCHUP_CHARS), then 64 Ki characters/s. In a star, what waits
+  for one member is capped at 16 MiB (OUTBOX_BYTES).
+
 ## 5. Chat (theoretical)
 
 - **Messages are tiny.** A 200 B message costs ~325 B on the wire per recipient.
