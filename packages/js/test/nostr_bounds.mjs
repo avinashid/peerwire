@@ -3,7 +3,7 @@
 // and base64 must handle bodies far larger than a signalling message. No relays:
 // events are fed straight into onRelay.
 import { loadPeerwire } from '../src/peerwire.js';
-import { BACKOFF_MS, MAX_BACKOFF_MS, RECONNECT_MS, NostrSignaling, MAX_SEEN, b64, unb64, RELAY_RATE, RELAY_BURST_S, RELAY_RAISE_MS, MIN_RELAY_RATE, HOLD_MS, RELAY_TRIES, RELAY_QUEUE, RELAY_QUEUE_MS, SILENT_MS } from '../src/nostr.js';
+import { BACKOFF_MS, MAX_BACKOFF_MS, RECONNECT_MS, NostrSignaling, MAX_SEEN, b64, unb64, RELAY_RATE, RELAY_BURST_S, RELAY_RAISE_MS, MIN_RELAY_RATE, HOLD_MS, RELAY_TRIES, RELAY_QUEUE, RELAY_QUEUE_MS, SILENT_MS, STORE_EVERY_MS, STORE_QUEUE_MS, STORE_OK_MS, QUERY_MS } from '../src/nostr.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
 const pw = await loadPeerwire(wasm);
@@ -522,6 +522,162 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   ladder.push(s.next(clock));
   check(sent.b.includes(moved.id) && !sent.c.includes(moved.id) && ladder.map((i) => names[i]).join('') === 'bac',
     `once closed, a lossy event goes through a relay that answers (${since(k)}); then, held one by one: ${ladder.map((i) => names[i]).join(', ')}`);
+  delete performance.now;
+}
+
+// 5e. NB-006l: the pacing of stored events, and of reads.
+check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30000 && QUERY_MS === 10000, 'stored events go 1 s apart, wait 120 s at most and 30 s for an OK; a read takes 10 s at most');
+
+// 5e. NB-006l: query() reads stored events from every open relay that hasn't banned us, each under a subscription of
+//     its own. The relay's events for it go to `keep`, which names their slot (or null), and each relay keeps the
+//     newest of each slot, by created_at and then the lower id; other events on the socket go on as ever. EOSE ends a
+//     relay's read complete; CLOSED, the socket closing, or `ms` without EOSE end it incomplete; it is CLOSEd either
+//     way. A relay that isn't open, or has banned us, is incomplete at once.
+{
+  let clock = 1e6;
+  performance.now = () => clock;
+  const s = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/query', relays: [] });
+  await s.ready;
+  const names = ['a', 'b', 'c', 'd', 'e'];
+  const sent = Object.fromEntries(names.map((x) => [x, []]));
+  const sock = {};
+  for (const x of names) s.sockets.push((sock[x] = { relayUrl: x, readyState: WebSocket.OPEN, send: (m) => sent[x].push(JSON.parse(m)), close() {} }));
+  sock.d.readyState = WebSocket.CLOSED;
+  s.banned.set('e', { until: clock + BACKOFF_MS, ms: BACKOFF_MS });
+  const keep = (ev) => (ev?.kind === 30078 && Number.isInteger(ev.created_at) ? ev.tags?.[0]?.[1] ?? null : null);
+  const ev = (slot, at, id) => ({ id, kind: 30078, created_at: at, tags: [['d', slot]] });
+  const tick = () => new Promise((r) => setImmediate(r));
+  const t0 = Date.now();
+  const read = s.query({ kinds: [30078], '#d': ['x', 'y'] }, { ms: 300, keep });
+  await tick();
+  const sub = (x) => sent[x].find((m) => m[0] === 'REQ')?.[1];
+  check(['a', 'b', 'c'].every((x) => sent[x].length === 1 && sent[x][0][0] === 'REQ' && sent[x][0][2].kinds[0] === 30078) && !sent.d.length && !sent.e.length && new Set(['a', 'b', 'c'].map(sub)).size === 3,
+    'a REQ under its own subscription to each open relay, none to one closed or banning us');
+  const relay = (x, m) => s.onRelay(x, JSON.stringify(m));
+  for (const e of [ev('x', 5, 'f1'), ev('x', 7, 'f2'), ev('x', 7, 'e9'), ev('x', 6, '01'), ev('y', 1, 'aa'), { kind: 1, created_at: 9, tags: [['d', 'x']] }, null, 'junk', 7]) await relay('a', ['EVENT', sub('a'), e]);
+  const received = s.stats.received;
+  await relay('a', ['EVENT', s.sub, { id: hid(7e9), kind: 25059, pubkey: 'x', tags: [['p', s.roomTag]], content: 'e30=' }]);
+  check(s.stats.received === received + 1, "signalling's events on the same socket go on as ever");
+  await relay('a', ['EOSE', sub('a')]);
+  await relay('b', ['CLOSED', sub('b'), 'auth-required: we only serve our users']);
+  const r = await read;
+  const ms = Date.now() - t0;
+  const ids = (x) => [...r.get(x).events].map(([k, e]) => `${k}:${e.id}`).join(' ');
+  check(r.get('a').complete && ids('a') === 'x:e9 y:aa', `a sent EOSE: complete, the newest of each slot kept, by created_at then the lower id (${ids('a')})`);
+  check(names.slice(1).every((x) => !r.get(x).complete && !r.get(x).events.size) && ms >= 290, `b refused it (CLOSED), c sent no EOSE in time (${ms} ms), d isn't open, e banned us: incomplete`);
+  check(sent.a.at(-1)?.[0] === 'CLOSE' && sent.a.at(-1)[1] === sub('a') && sent.b.at(-1)?.[0] === 'CLOSE' && sent.c.at(-1)?.[0] === 'CLOSE' && sent.c.at(-1)[1] === sub('c'), 'each subscription CLOSEd: at EOSE, CLOSED, and the timeout');
+  await relay('a', ['EVENT', sub('a'), ev('z', 99, 'ff')]);
+  check(!r.get('a').events.has('z'), 'an event for an ended read is dropped');
+  const t1 = Date.now();
+  const read2 = s.query({ kinds: [30078] }, { ms: 60000, keep });
+  await tick();
+  const sub2 = (x) => sent[x].filter((m) => m[0] === 'REQ').at(-1)[1];
+  await relay('b', ['EOSE', sub2('b')]);
+  await relay('c', ['EOSE', sub2('c')]);
+  s.forget(sock.a);
+  const r2 = await read2;
+  const forgot = Date.now() - t1;
+  const read3 = s.query({ kinds: [30078] }, { ms: 60000, keep });
+  await tick();
+  s.close();
+  const r3 = await read3;
+  check(!r2.get('a').complete && r2.get('b').complete && forgot < 2000 && [...r3.values()].every((x) => !x.complete) && Date.now() - t1 < 2000, "the socket closing ends that relay's read incomplete at once, and close() every read");
+  delete performance.now;
+}
+
+// 5f. NB-006l: store() keeps an event on the relays named, behind signalling: it waits while signalling's events wait
+//     on that relay, goes one each STORE_EVERY_MS at most, and counts in the relay's bucket. It resolves, per relay,
+//     true once the relay takes it, false once it refuses it (one refused for its rate is held and sent again, up to
+//     RELAY_TRIES in all), bans us, closes, holds it past STORE_QUEUE_MS or doesn't answer within STORE_OK_MS, or the
+//     signalling closes; a relay not open or banning us is false at once.
+{
+  let clock = 1e6;
+  performance.now = () => clock;
+  const oks = []; // STORE_OK_MS timers, fired by hand
+  const realTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...x) => (ms === STORE_OK_MS ? (oks.push(fn), { ok: true }) : realTimeout(fn, ms, ...x));
+  const s = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/store', relays: [] });
+  await s.ready;
+  const names = ['a', 'b', 'c', 'd'];
+  const order = { a: [], b: [], c: [], d: [] };
+  const sock = {};
+  for (const x of names) s.sockets.push((sock[x] = { relayUrl: x, readyState: WebSocket.OPEN, send: (m) => order[x].push(JSON.parse(m)[1].id), close() {} }));
+  sock.c.readyState = WebSocket.CLOSED;
+  s.banned.set('d', { until: clock + BACKOFF_MS, ms: BACKOFF_MS });
+  const keepEv = (n) => ({ id: hid(8e9 + n), kind: 30078, pubkey: 'k', created_at: 1, tags: [], content: '', sig: '' });
+  const ok = (x, id, taken = true, why = '') => s.onRelay(x, JSON.stringify(['OK', id, taken, why]));
+  const settled = new Map();
+  const watch = (m, n) => m.forEach((p, x) => p.then((v) => settled.set(`${n}${x}`, v)));
+  const tick = () => new Promise((r) => setImmediate(r));
+  // a's bucket is spent and two signalling events wait there (b closed meanwhile).
+  sock.b.readyState = WebSocket.CLOSED;
+  for (let i = 0; i < RELAY_RATE * RELAY_BURST_S + 2; i++) await s.publish(s.roomTag, `sig${i}`);
+  sock.b.readyState = WebSocket.OPEN;
+  const waiting = order.a.length;
+  const e1 = keepEv(1);
+  watch(s.store(e1, ['a', 'b', 'c', 'd']), 1);
+  await tick();
+  check(settled.get('1c') === false && settled.get('1d') === false && order.b.at(-1) === e1.id && !order.a.includes(e1.id) && waiting === RELAY_RATE * RELAY_BURST_S,
+    'c closed and d banning us: false at once; b, with nothing waiting, sent it; a, with signalling waiting, holds it');
+  clock += 1000;
+  s.pump(sock.a);
+  check(order.a.slice(waiting).join() === [...order.a.slice(waiting, waiting + 2), e1.id].join() && order.a.length === waiting + 3, 'a sends its waiting signalling first, then the event to keep');
+  ok('a', e1.id);
+  ok('b', e1.id, false, 'invalid: we keep no such events');
+  await tick();
+  check(settled.get('1a') === true && settled.get('1b') === false, 'taken on a (true), refused by b (false)');
+  // Kept events go STORE_EVERY_MS apart, behind one another.
+  const e2 = keepEv(2);
+  const e3 = keepEv(3);
+  watch(s.store(e2, ['b']), 2);
+  watch(s.store(e3, ['b']), 3);
+  const at = order.b.length - 1;
+  const first = order.b.slice(at).join();
+  clock += STORE_EVERY_MS - 1;
+  s.pump(sock.b);
+  const early = order.b.slice(at).join();
+  clock += 1;
+  s.pump(sock.b);
+  check(first === e2.id && early === e2.id && order.b.slice(at).join() === [e2.id, e3.id].join(), `two more to keep on b, ${STORE_EVERY_MS} ms after the last: the first at once, the next ${STORE_EVERY_MS} ms after it`);
+  // Refused for the rate: held, sent again, then taken.
+  ok('b', e2.id, false, 'rate-limited: slow down');
+  clock += HOLD_MS + STORE_EVERY_MS;
+  s.pump(sock.b);
+  const again = order.b.filter((id) => id === e2.id).length;
+  ok('b', e2.id);
+  await tick();
+  check(again === 2 && settled.get('2b') === true && s.stats.resent >= 1, 'refused for its rate: held, sent again, then taken');
+  // No answer within STORE_OK_MS: false. A ban: false, with what waits there.
+  for (const fn of oks.splice(0)) fn();
+  await tick();
+  check(settled.get('3b') === false, `no answer within ${STORE_OK_MS / 1000} s: false`);
+  const e4 = keepEv(4);
+  const e5 = keepEv(5);
+  watch(s.store(e4, ['b']), 4);
+  watch(s.store(e5, ['b']), 5);
+  clock += STORE_EVERY_MS;
+  s.pump(sock.b);
+  ok('b', e4.id, false, 'blocked: too many events');
+  await tick();
+  check(settled.get('4b') === false && settled.get('5b') === false, 'a ban: false, for it and for the one waiting behind it');
+  // Held past STORE_QUEUE_MS: false.
+  s.paused.set('a', { at: clock, until: clock + 10 * STORE_QUEUE_MS, ms: HOLD_MS, took: false });
+  const e6 = keepEv(6);
+  watch(s.store(e6, ['a']), 6);
+  clock += STORE_QUEUE_MS + 1;
+  s.pump(sock.a);
+  await tick();
+  check(settled.get('6a') === false && !order.a.includes(e6.id), `held past ${STORE_QUEUE_MS / 1000} s: false, never sent`);
+  // close(): what waits and what waits for an OK, false.
+  s.paused.delete('a');
+  const e7 = keepEv(7);
+  const e8 = keepEv(8);
+  watch(s.store(e7, ['a']), 7);
+  watch(s.store(e8, ['a']), 8);
+  s.close();
+  await tick();
+  check(settled.get('7a') === false && settled.get('8a') === false && order.a.includes(e7.id) && !order.a.includes(e8.id), 'close(): one sent and one waiting, both false; nothing more is sent');
+  globalThis.setTimeout = realTimeout;
   delete performance.now;
 }
 
