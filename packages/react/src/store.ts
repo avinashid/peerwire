@@ -16,6 +16,9 @@ export const MAX_KEY_LENGTH = 256;
 export const SETTLE_MS = 250;
 /** The largest value, as JSON text: one from a member past this is ignored, and setting one throws. */
 export const MAX_VALUE_LENGTH = 64 * 1024;
+/** How deeply a value's arrays and objects nest: one from a member past this is ignored, and setting one throws.
+ * Some engines' JSON.stringify recurses, and throws a few thousand levels down (Node 22). */
+export const MAX_VALUE_DEPTH = 64;
 /** What a store holds of shared values in all, as JSON text. */
 export const MAX_STORE_LENGTH = 1024 * 1024;
 /** Per-peer keys each member can have, ours included. */
@@ -71,13 +74,31 @@ const counter = (n: unknown): n is number => Number.isSafeInteger(n) && (n as nu
 const stamp = (c: unknown): c is number => counter(c) && c <= Date.now() + MAX_CLOCK_DRIFT;
 // Whether version `a` wins over `b`: the later clock, then the higher writer id. Every member compares alike.
 const newer = (a: Version, b: Version): boolean => a.c > b.c || (a.c === b.c && a.w > b.w);
-// What a peer will see: values go as JSON, so ours are kept as JSON gives them back.
+// Whether a value parsed from JSON nests no deeper than MAX_VALUE_DEPTH. A loop, not recursion, so no value can
+// overflow the stack: a member's value is checked with it before anything stringifies it.
+function shallow(v: unknown): boolean {
+  if (v === null || typeof v !== 'object') return true;
+  const stack: [object, number][] = [[v, 1]];
+  while (stack.length) {
+    const [o, depth] = stack.pop()!;
+    if (depth > MAX_VALUE_DEPTH) return false;
+    for (const k in o) {
+      const x = (o as Record<string, unknown>)[k];
+      if (x !== null && typeof x === 'object') stack.push([x, depth + 1]);
+    }
+  }
+  return true;
+}
+// What a peer will see: values go as JSON, so ours are kept as JSON gives them back. A value members would
+// ignore throws.
 function asJson(value: unknown): { v: unknown; len: number } {
   const text = JSON.stringify(value === undefined ? null : value);
   if (text.length > MAX_VALUE_LENGTH) throw new RangeError(`value of ${text.length} characters as JSON; at most ${MAX_VALUE_LENGTH}`);
-  return { v: JSON.parse(text), len: text.length };
+  const v = JSON.parse(text);
+  if (!shallow(v)) throw new RangeError(`value nested deeper than ${MAX_VALUE_DEPTH}`);
+  return { v, len: text.length };
 }
-// The length of a value a member sent (already parsed from JSON, so it serializes).
+// The length of a value a member sent (already parsed from JSON and checked with shallow(), so it serializes).
 const jsonLength = (v: unknown): number => JSON.stringify(v).length;
 
 export class RoomStore {
@@ -191,6 +212,7 @@ export class RoomStore {
     const cur = this.shared.get(k);
     if (cur && !newer({ c, w }, cur)) return;
     const value = v ?? null;
+    if (!shallow(value)) return;
     const len = jsonLength(value);
     if (!this.makeRoom(k, len, cur, this.listeners.has(`s:${k}`))) return;
     this.putShared(k, { v: value, c, w, len }, cur);
@@ -285,6 +307,7 @@ export class RoomStore {
     if (cur && n <= cur.n) return;
     const use = this.liveUse.get(peer) ?? { keys: 0, len: 0 };
     const value = v ?? null;
+    if (!shallow(value)) return;
     const len = jsonLength(value);
     if (len > MAX_VALUE_LENGTH || use.len - (cur?.len ?? 0) + len > MAX_PEER_LENGTH) return;
     if (!cur && use.keys >= MAX_PEER_KEYS) return;
@@ -414,17 +437,35 @@ export class RoomStore {
       if (![s, p, h].every((a) => Array.isArray(a) && a.length <= MAX_KEYS)) return;
       const cu = this.catchup(peer);
       if (m.re === true) cu.answered = true;
-      for (const e of s as unknown[]) {
-        if (!Array.isArray(e) || e.length !== 4 || !isPeerId(e[3])) continue;
-        this.merge(e[0], e[1], e[2], e[3]);
+      // Each entry on its own: one that throws (a listener's error) costs neither the others nor the answer. The
+      // first error is thrown once they are done.
+      const errors: unknown[] = [];
+      const each = (list: unknown, fn: (e: unknown[]) => void) => {
+        for (const e of list as unknown[]) {
+          if (!Array.isArray(e)) continue;
+          try {
+            fn(e);
+          } catch (err) {
+            errors.push(err);
+          }
+        }
+      };
+      each(s, (e) => {
+        if (e.length !== 4 || !isPeerId(e[3])) return;
         this.tell(cu, e[0], e[2], e[3], false);
-      }
-      for (const e of p as unknown[]) if (Array.isArray(e) && e.length === 3) this.mergeLive(peer, e[0], e[1], e[2]);
-      for (const e of h as unknown[]) if (Array.isArray(e) && e.length === 3 && isPeerId(e[2])) this.tell(cu, e[0], e[1], e[2], true);
+        this.merge(e[0], e[1], e[2], e[3]);
+      });
+      each(p, (e) => {
+        if (e.length === 3) this.mergeLive(peer, e[0], e[1], e[2]);
+      });
+      each(h, (e) => {
+        if (e.length === 3 && isPeerId(e[2])) this.tell(cu, e[0], e[1], e[2], true);
+      });
       if (m.ask === true && this.started && cu.answers < MAX_ANSWERS) {
         cu.answers++;
         this.answer(peer, cu);
       }
+      if (errors.length) throw errors[0];
     }
   }
 

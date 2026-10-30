@@ -112,8 +112,9 @@ joins gets everyone's current value. A value over one datagram (about 1 KB) goes
 
 - Members are trusted alike, as in the room itself: any member can write any shared key. A check keeps out values
   of the wrong type, not a member who writes well-typed nonsense.
-- Keys are up to 256 characters. A value is at most 64 KiB as JSON (`MAX_VALUE_LENGTH`): setting a larger one
-  throws a `RangeError`, and a larger one from a member is ignored. For more, split it across keys.
+- Keys are up to 256 characters. A value is at most 64 KiB as JSON (`MAX_VALUE_LENGTH`), with its arrays and
+  objects nested at most 64 deep (`MAX_VALUE_DEPTH`, as in `room.doc()`): setting a larger or deeper one throws a
+  `RangeError`, and one from a member is ignored. For more, split it across keys.
 - Shared state: at most 1024 keys (`MAX_KEYS`) and 1 MiB of values in all, as JSON (`MAX_STORE_LENGTH`). When
   it's full, a member's new key is ignored, unless a mounted hook reads it: then it takes the room of the oldest
   keys no hook reads. So does our own write, and one that still doesn't fit is dropped with a console warning,

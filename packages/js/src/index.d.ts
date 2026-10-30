@@ -133,8 +133,11 @@ export interface RoomEvents {
   /** A peer left, timed out or lost its connection. A peer that leaves (`leave()`, or its tab closing) shows
    * as 'left' or 'closed' at once; one that crashes or loses its network shows as 'timeout' after the idle timeout (30 s). */
   'peer-leave': (peer: PeerId, reason: 'left' | 'closed' | 'failed' | 'timeout' | 'replaced' | 'violation') => void;
-  /** A joined peer changed its presence. */
+  /** A joined peer changed its presence. It is the member's JSON, which can nest deeply: see `message`. */
   presence: (peer: PeerId, presence: Presence) => void;
+  /** What a joined peer sent: a string, a Uint8Array, or any other value as JSON. A member's JSON can nest about
+   * 500000 levels deep in 1 MiB, and some engines' JSON.stringify throws past a few thousand (Node 22's does):
+   * check its depth before you stringify it. */
   message: (data: any, peer: PeerId, info: MessageInfo) => void;
 }
 

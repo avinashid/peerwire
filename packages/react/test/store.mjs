@@ -2,8 +2,8 @@
 // that counts it and can lose a message, as room.js can lose the first one to a newcomer. Checks the caps
 // (values, shared state in all, each member's per-peer quota, keys a hook reads pushing out keys none reads),
 // the hybrid clock (a clock far ahead is ignored, a key can't be stamped out of reach), and catching up (a
-// join costs each value once, a lost first message, a member that asks over and over, writes that cross).
-// Needs the build: `npm run build` (packages/react).
+// join costs each value once, a lost first message, a member that asks over and over, writes that cross), and
+// values nested past MAX_VALUE_DEPTH. Needs the build: `npm run build` (packages/react).
 //
 //   node packages/react/test/store.mjs
 import { existsSync } from 'node:fs';
@@ -13,7 +13,7 @@ const fail = (m) => {
   process.exit(1);
 };
 if (!existsSync(new URL('../dist/store.js', import.meta.url))) fail('no dist/: run `npm run build` in packages/react');
-const { RoomStore, MAX_KEYS, MAX_VALUE_LENGTH, MAX_STORE_LENGTH, MAX_PEER_KEYS, MAX_PEER_LENGTH, MAX_CLOCK_DRIFT } = await import('../dist/store.js');
+const { RoomStore, MAX_KEYS, MAX_VALUE_LENGTH, MAX_STORE_LENGTH, MAX_PEER_KEYS, MAX_PEER_LENGTH, MAX_CLOCK_DRIFT, MAX_VALUE_DEPTH } = await import('../dist/store.js');
 
 const MAX_MESSAGE = 1 << 20; // room.send's limit for a reliable message
 const id = (c) => c.repeat(64);
@@ -59,7 +59,8 @@ function net() {
     nodes.set(self, raw);
     return raw;
   };
-  n.from = (a, b, m) => queue.push([a.self, b.self, JSON.stringify(m)]);
+  // `m` as JSON text when it is a string, so the test can send a value too deep for JSON.stringify.
+  n.from = (a, b, m) => queue.push([a.self, b.self, typeof m === 'string' ? m : JSON.stringify(m)]);
   n.join = (a, b) => {
     a.room.peers.push(b.self);
     b.room.peers.push(a.self);
@@ -376,6 +377,97 @@ const throws = (fn) => {
   n.flush();
   if (read(a, 'k') !== 1 || a.st.getLive('cursor')[x.self]?.x !== 9) fail('a valid catch-up after malformed ones');
   console.log('malformed catch-ups ignored');
+}
+
+// NB-054: a member's value nested past MAX_VALUE_DEPTH (64) is ignored before anything stringifies it, so it throws
+// nowhere: Node 22's JSON.stringify recurses and throws a few thousand levels down, and JSON.parse takes 100000. In
+// a catch-up, the entries after it still take and the ask is answered; an entry whose listener throws costs none
+// of the others either. Ours past it throws. JSON.stringify throws past 4000 levels here, as Node 22's does, so
+// this bites on engines whose JSON.stringify doesn't recurse.
+{
+  if (MAX_VALUE_DEPTH !== 64) fail(`MAX_VALUE_DEPTH is ${MAX_VALUE_DEPTH}, not 64 as doc.js has it`);
+  // JSON text of `depth` objects and arrays, alternating (an array outermost with `array`), nested around 0.
+  const nest = (depth, array = false) => {
+    const open = [];
+    const close = [];
+    for (let i = +array; i < depth + array; i++) {
+      open.push(i % 2 ? '[' : '{"k":');
+      close.push(i % 2 ? ']' : '}');
+    }
+    return `${open.join('')}0${close.reverse().join('')}`;
+  };
+  const stringify = JSON.stringify;
+  JSON.stringify = function (v, ...rest) {
+    for (const stack = [[v, 1]]; stack.length; ) {
+      const [o, depth] = stack.pop();
+      if (o === null || typeof o !== 'object') continue;
+      if (depth > 4000) throw new RangeError('Maximum call stack size exceeded');
+      for (const k in o) stack.push([o[k], depth + 1]);
+    }
+    return stringify.call(this, v, ...rest);
+  };
+  try {
+    if (!throws(() => JSON.stringify(JSON.parse(nest(4001))))) fail('the JSON.stringify stub let a value 4001 deep through');
+    const n = net();
+    const [a, x] = [n.node('a'), n.raw('b')];
+    const now = Date.now();
+    const deep = nest(100000);
+    n.from(x, a, `{"$peerwire":"set","k":"deep","v":${deep},"c":${now}}`);
+    n.from(x, a, { $peerwire: 'set', k: 'after', v: 1, c: now });
+    n.from(x, a, `{"$peerwire":"live","k":"deep","v":${deep},"n":1}`);
+    n.from(x, a, { $peerwire: 'live', k: 'after', v: 1, n: 2 });
+    let e = throws(() => n.flush());
+    if (e) fail(`a member's set or live value 100000 deep threw: ${e}`);
+    if (read(a, 'deep') !== undefined || a.st.getLive('deep')[x.self] !== undefined) fail('a set or live value 100000 deep was kept');
+    if (read(a, 'after') !== 1 || a.st.getLive('after')[x.self] !== 1) fail('the set or live after a value 100000 deep was lost');
+
+    const s = (k, v, w = x.self) => `["${k}",${v},${now},"${w}"]`;
+    n.from(x, a, `{"$peerwire":"sync","ask":true,"s":[${s('sdeep', deep)},${s('safter', 2)}],"p":[["pdeep",${deep},3],["pafter",2,4]]}`);
+    e = throws(() => n.flush());
+    if (e) fail(`a catch-up with values 100000 deep threw: ${e}`);
+    if (read(a, 'sdeep') !== undefined || a.st.getLive('pdeep')[x.self] !== undefined) fail('a catch-up value 100000 deep was kept');
+    if (read(a, 'safter') !== 2 || a.st.getLive('pafter')[x.self] !== 2) fail('the entries after a value 100000 deep in a catch-up were lost');
+    if (!x.got.some((m) => m.$peerwire === 'sync' && m.re === true)) fail('a catch-up with a value 100000 deep went unanswered');
+
+    // The bound, from both sides, for shared and per-peer values, a member's and ours, an object or an array
+    // outermost.
+    let seq = 10;
+    for (const array of [false, true]) {
+      for (const depth of [64, 65]) {
+        n.from(x, a, `{"$peerwire":"set","k":"d${depth}${array}","v":${nest(depth, array)},"c":${now}}`);
+        n.from(x, a, `{"$peerwire":"live","k":"d${depth}${array}","v":${nest(depth, array)},"n":${seq++}}`);
+      }
+      n.flush();
+      const k = `d64${array}`;
+      if (read(a, k) === undefined || a.st.getLive(k)[x.self] === undefined) fail(`a member's value 64 deep was ignored (${k})`);
+      if (!Array.isArray(read(a, k)) !== !array) fail(`${k} is not the value sent`);
+      if (read(a, `d65${array}`) !== undefined || a.st.getLive(`d65${array}`)[x.self] !== undefined) fail(`a member's value 65 deep was kept (d65${array})`);
+      for (const set of [(k, v) => a.st.setShared(k, v), (k, v) => a.st.setLive(k, v)]) {
+        if (throws(() => set('mine64', JSON.parse(nest(64, array))))) fail('setting a value 64 deep threw');
+        if (!(throws(() => set('mine65', JSON.parse(nest(65, array)))) instanceof RangeError)) fail(`setting a value 65 deep did not throw a RangeError (array outermost: ${array})`);
+      }
+    }
+    if (read(a, 'mine64') === undefined || read(a, 'mine65') !== undefined) fail('setShared kept the wrong value');
+
+    // A listener that throws for one entry: the entries after it take and the ask is answered, then its error is
+    // thrown.
+    const off = a.st.subscribe('s:boom', () => {
+      throw new Error('boom');
+    });
+    const answers = x.got.length;
+    n.from(x, a, { $peerwire: 'sync', ask: true, s: [['boom', 1, now + 1, x.self], ['next', 3, now + 1, x.self]], p: [['plive', 3, 9]] });
+    e = throws(() => n.flush());
+    n.flush();
+    off();
+    if (e?.message !== 'boom') fail(`a listener's error: ${e}`);
+    if (read(a, 'boom') !== 1 || read(a, 'next') !== 3 || a.st.getLive('plive')[x.self] !== 3) fail("the entries after one whose listener threw were lost");
+    const answer = x.got.slice(answers).filter((m) => m.$peerwire === 'sync' && m.re === true);
+    if (!answer.length) fail('a catch-up whose listener threw went unanswered');
+    if (answer.some((m) => m.s?.some(([k]) => k === 'boom' || k === 'next'))) fail('the answer sent back values the asker had just sent');
+  } finally {
+    JSON.stringify = stringify;
+  }
+  console.log(`values nested past ${MAX_VALUE_DEPTH} ignored, the rest of a catch-up kept, ours past it throw`);
 }
 
 console.log('ok');
