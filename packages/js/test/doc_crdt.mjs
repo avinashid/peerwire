@@ -596,6 +596,8 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
   // Each differs from `good` (a fresh write and a fresh dead dot) in one field, so a check left out lets it in.
   const E = (...x) => ({ ...good, e: [x] });
   const F = 2e6; // a dot b hasn't seen
+  let DEEP = 0;
+  for (let i = 0; i < 100000; i++) DEEP = [DEEP];
   const bad = [
     null, 1, 'x', [], { t: 9 }, { ...good, ws: 'w' }, { ...good, ws: [w.toUpperCase()] }, { ...good, ws: [w + '0'] },
     E(1, F, 1, 's', 's', null, 1), E(0, 0, 1, 's', 's', null, 1), E(0, F + 0.5, 1, 's', 's', null, 1), E(0, F, 2 ** 53, 's', 's', null, 1),
@@ -605,6 +607,7 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
     { ...good, end: true }, { d: 'board', t: 2, ws: [w], r: [[0, 2, 1]], q: 1 }, { d: 'board', t: 2, ws: [w], r: [[1, 1, 1]], q: 1 },
     { ...good, t: 1, ws: [id('c') + '00000000'] }, // a delta carrying another member's write
     E(0, F, 1, 's', 's', null, JSON.parse('['.repeat(MAX_VALUE_DEPTH + 1) + ']'.repeat(MAX_VALUE_DEPTH + 1))),
+    E(0, F, 1, 's', 's', null, DEEP), // deeper than JSON.stringify goes in some engines (Node 22): dropped, not thrown
     // Asks need their number; pieces of an answer need theirs whole, and `s` only on the last.
     { d: 'board', t: 2, ws: [w], r: [] }, { d: 'board', t: 2, ws: [w], r: [], q: 0 }, { d: 'board', t: 2, ws: [w], r: [], q: 1.5 },
     { d: 'board', t: 2, ws: [w], r: [], q: 1, z: true }, { ...good, q: 1, n: 1 }, { ...good, q: 1, i: -1, n: 1 }, { ...good, q: 1, i: 0 },
@@ -625,6 +628,15 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
     if (state(b.doc) !== before || sent) fail(`${JSON.stringify(m).slice(0, 120)} changed the doc or was answered`);
   }
   b.host.send = bsend;
+  // A copy (on this device or the relays) holding that value is refused, not thrown.
+  try {
+    const copyOf = (v) => ({ v: 1, c: 1, f: [{ ...good, e: [[0, F, 1, 's', 's', null, v]], x: undefined }] });
+    const fresh = () => new Doc('board', { ...a.host, self: id('c'), peers: () => [] });
+    if (!fresh().restore(copyOf([1]))) fail('the copy the deep one is made from was refused');
+    if (fresh().restore(copyOf(DEEP))) fail('a copy holding a value 100000 deep was taken');
+  } catch (e) {
+    fail(`a copy holding a value 100000 deep threw ${e}`);
+  }
   b.doc.receive(a.self, good);
   if (state(b.doc) === before) fail('the frame the bad ones are made from was not taken');
   // Random mutations of real frames: never a throw.
