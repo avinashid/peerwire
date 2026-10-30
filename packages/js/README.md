@@ -235,7 +235,8 @@ doc.on('sync', ({ source, at }) => {
   - `doc.synced` is true once caught up, and stays true, also once the others have gone (`'alone'`). So an app
     can tell "you're the last one with the board" from "you're the first one here".
   - `source` is `'members'` once caught up from them; else `'relays'` once the doc joined a save from the relays
-    (`relays: true`), with `at` the time that save was made as its saver claims it (ms; for display only); else null.
+    (`relays: true`), with `at` the time that save was made as its saver claims it (ms; for display only; one more
+    than 15 minutes past this device's clock counts as the time it was read); else null.
 - **On this device (`persist`):**
   - Opening loads the copy before members are asked, so the ask carries it and members send only what it lacks;
     their asks of us wait for it too. A member who was never there gets the doc from one that kept it, once that
@@ -309,7 +310,8 @@ doc.on('sync', ({ source, at }) => {
   - **What the relays hold:** up to 16 events per doc on each (two banks of 8 slots), kind 30078, all signed by one
     key derived from the room key, each a piece of the doc deflated and sealed with AES-256-GCM under a key derived
     from it. Anyone reading a relay sees one stable key per doc, up to 16 slots, the pieces' sizes and save times;
-    the relay also sees the saver's IP. Not the room, the doc's name or what it holds.
+    the relay also sees the IP of each member that saves or reads it. Not the room, the doc's name or what it
+    holds.
   - **Reading:** opening reads every relay (until its EOSE, 10 s at most) beside the device copy, and joins every
     save found whole (all its pieces, from any relays); a save torn mid-write is skipped. What it brings is checked
     as member data, and a deletion it brings says `from: 'relays'`. A read is bounded whatever a relay sends: only
@@ -319,7 +321,8 @@ doc.on('sync', ({ source, at }) => {
     a random 0 to 30 s, at most once in 5 minutes), a member reads, joins what it finds, and writes only to the
     relays whose copy lacks something it holds or expires within 7 days. It tells the members first, and they hold
     their saves back up to 5 minutes. Each relay keeps its newest whole save while the next goes into its other
-    bank, the pieces one a second. The last member online also saves when the page hides (at most once a minute);
+    bank, the pieces one a second. A save no relay took, or made while no relay answered (offline), goes again 5
+    minutes on. The last member online also saves when the page hides (at most once a minute);
     from a closing tab that rarely finishes, so the relays can miss the last writes made alone.
   - **Size:** at most 8 pieces of 44 KiB deflated each; a whiteboard of 1400 strokes of 20 points takes 4
     (`test/doc_relays.mjs`). A larger doc, or one with an entry that won't deflate into one piece, keeps no relay
@@ -905,11 +908,12 @@ Run these with Node and the Playwright install on this host:
   pieces, each under 60 Ki characters; a doc past 8 pieces, or with an entry past a piece, keeps none and warns
   once. Each save writes the bank not holding the newest whole save; a reader joins only whole saves, and saving
   after a torn read loses nothing; a relay that took part of a save keeps its own whole one. A 45 KiB piece of
-  45 MiB inflates to 1 MiB; 48 of them stop a read at 32 MiB. A relay past the filter, one serving `created_at` a
-  year ahead (only it is skipped), another version in a bank or both. One saver per room; a member's "saving"
+  45 MiB inflates to 1 MiB; 48 of them stop a read at 32 MiB; a piece holds 16 frames at most. A relay past the
+  filter, one serving `created_at` a year ahead (only it is skipped, and `sync.at` isn't moved), another version in
+  a bank or both. One saver per room; a member's "saving"
   during our read means we write nothing; one that announces saves it never makes holds ours back once, 5 minutes
-  at most, then is ignored until it rejoins, and one whose save one relay took isn't. A save no relay took is
-  tried again; renewal at 24 days; deletions `from: 'relays'`; the hide save; `forget()` (empty pieces, then
+  at most, then is ignored until it rejoins, and one whose save one relay took isn't; one naming a save already
+  made is ignored at once. A save no relay took, or whose read none completed, is tried again; renewal at 24 days; deletions `from: 'relays'`; the hide save; `forget()` (empty pieces, then
   NIP-09). Then over the real `NostrSignaling` and fake sockets: the room's checks (signalling, roomId shape),
   a 3-piece save one piece a second per relay, and a joiner alone getting it.
 - `node packages/js/test/browser.mjs [tabs] [shot.png]`: mesh of tabs, RTT and throughput.

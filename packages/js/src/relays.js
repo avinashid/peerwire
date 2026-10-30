@@ -47,16 +47,18 @@
 //   others); a slot holding one of those can't be written, so the save fails on that relay;
 // - one piece after another, through nostr.js (behind signalling, STORE_EVERY_MS apart); one refused ends the save
 //   on that relay.
-// A save that no relay took whole is tried again, SAVE_EVERY_MS on. The last member online also saves when the page
-// hides, if the doc changed since its last save that a relay took (the same way: a read, then t: 5 and the pieces),
-// in place of one waiting, past SAVE_EVERY_MS but not more than once each HIDE_EVERY_MS.
+// A save that no relay took whole is tried again, SAVE_EVERY_MS on, as is one whose read was complete on no relay
+// (offline, or the sockets reconnecting). The last member online also saves when the page hides, if the doc changed
+// since its last save that a relay took (the same way: a read, then t: 5 and the pieces), in place of one waiting,
+// past SAVE_EVERY_MS but not more than once each HIDE_EVERY_MS.
 // A member's { t: 5 } defers our next save (one is then due, changed or not) to DEFER_MS after the first that
 // deferred it: later ones don't push it further until that save has run, and we honour one per member per
 // DEFER_MS. That save reads as ever, and a member whose save `s` wasn't whole on any relay whose read was complete
 // is ignored until it joins again (it announced a save it never made, as one would to hold the others' back after
 // wiping the slots: a save one relay refused for its rate is still whole on another); then we save if the doc
-// needs it. A doc of more than SLOTS pieces (or with an entry past a piece on
-// its own) keeps no relay copy, with a warning; its members still serve it.
+// needs it. A t: 5 naming a save already made (whole at our latest read, or our own) announces nothing new: its
+// member is ignored at once. A doc of more than SLOTS pieces (or with an entry past a piece on its own) keeps no
+// relay copy, with a warning; its members still serve it.
 
 import { toHex } from './peerwire.js';
 import { b64, unb64 } from './nostr.js';
@@ -85,7 +87,7 @@ const IV_BYTES = 12;
 const TAG_BYTES = 16;
 // Grouping pieces aims this far under PIECE_DEFLATED, as a piece is deflated again once n is known.
 const MARGIN = 256;
-// Frames a piece may hold: what PIECE_INFLATED takes, cut by doc.js's pack(), is a few.
+// Frames a piece may hold: what PIECE_INFLATED takes, cut by doc.js's pack(), is a few. pieces() holds to it too.
 const PIECE_FRAMES = 16;
 const SAVE_ID = /^[0-9a-f]{16}$/;
 const EVENT_ID = /^[0-9a-f]{64}$/;
@@ -120,7 +122,8 @@ function expiryOf(ev) {
 }
 
 // Whole saves among `slots` (the slots of one or more relays): s -> { s, n, pieces: Map(i -> Set of pieces), at
-// (seconds: the latest created_at of its pieces there), banks (the banks holding them), expires (the soonest) }.
+// (seconds: the latest created_at of its pieces there), made (the same, of those not ahead of our clock, or 0),
+// banks (the banks holding them), expires (the soonest) }.
 function wholeSaves(slotLists) {
   const saves = new Map();
   for (const slots of slotLists) {
@@ -128,12 +131,13 @@ function wholeSaves(slotLists) {
       const p = slot?.piece;
       if (!p || !p.n) return;
       let sv = saves.get(p.s);
-      if (!sv) saves.set(p.s, (sv = { s: p.s, n: p.n, bad: false, pieces: new Map(), at: 0, banks: new Set(), expires: Infinity }));
+      if (!sv) saves.set(p.s, (sv = { s: p.s, n: p.n, bad: false, pieces: new Map(), at: 0, made: 0, banks: new Set(), expires: Infinity }));
       if (p.n !== sv.n) sv.bad = true;
       let set = sv.pieces.get(p.i);
       if (!set) sv.pieces.set(p.i, (set = new Set()));
       set.add(p);
       sv.at = Math.max(sv.at, slot.at);
+      if (!slot.ahead) sv.made = Math.max(sv.made, slot.at);
       sv.banks.add(Math.floor(j / SLOTS));
       sv.expires = Math.min(sv.expires, slot.expires ?? -Infinity);
     });
@@ -163,6 +167,7 @@ export class RelayCopy {
     this.announced = new Map(); // peer -> its save `s`, for the next save to check
     this.honoured = new Map(); // peer -> host.now() of its last t: 5 we honoured
     this.ignoring = new Set(); // peers whose t: 5s we ignore until they join again
+    this.saved = new Set(); // saves already made: whole at our latest read, or ours since
     this.jitter = null;
     this.timer = null; // cancels the wait for the next save
     this.waiting = false; // a save came due while the doc was loading from a member
@@ -304,12 +309,15 @@ export class RelayCopy {
       const pieces = [...sv.pieces.values()].flatMap((set) => [...set]);
       if (!this.doc.joinRelays(pieces)) continue;
       valid.add(sv.s);
-      newest = Math.max(newest, sv.at);
+      // A relay can rewrite a piece's created_at (nothing here checks the signature): one more than AHEAD_S past our
+      // clock says only that the save was made by now.
+      newest = Math.max(newest, sv.made || read.now);
     }
     if (valid.size && newest * 1000 > (this.at ?? -Infinity)) {
       this.at = newest * 1000;
       this.doc.emitSync();
     }
+    this.saved = valid;
     return valid;
   }
 
@@ -346,6 +354,8 @@ export class RelayCopy {
   // A member's { t: 5, s }: it is saving.
   saving(peer, s) {
     if (this.off || this.ignoring.has(peer)) return;
+    // A save already made isn't one being made now.
+    if (this.saved.has(s)) return void this.ignoring.add(peer);
     const now = this.now();
     if (now - (this.honoured.get(peer) ?? -Infinity) < DEFER_MS) return;
     for (const [p, t] of this.honoured) if (now - t >= DEFER_MS) this.honoured.delete(p);
@@ -357,6 +367,11 @@ export class RelayCopy {
 
   // A member joined (again): its t: 5s count again.
   joined(peer) {
+    this.ignoring.delete(peer);
+  }
+
+  // A member left: it can't send t: 5 before it joins again, which clears it anyway.
+  left(peer) {
     this.ignoring.delete(peer);
   }
 
@@ -418,7 +433,16 @@ export class RelayCopy {
     if (this.off) return;
     const valid = this.join(read);
     const answered = [...read.relays.values()].filter((r) => r.complete).map((r) => wholeSaves([r.slots]));
-    if (answered.length) for (const [peer, s] of announced) if (!valid.has(s) || !answered.some((w) => w.has(s))) this.ignoring.add(peer);
+    // No relay answered (offline, reconnecting): the save, and the check of who announced one, wait for the next.
+    if (!answered.length) {
+      this.pending = true;
+      for (const [peer, s] of announced) if (!this.announced.has(peer)) this.announced.set(peer, s);
+      return;
+    }
+    for (const [peer, s] of announced) if (!valid.has(s) || !answered.some((w) => w.has(s))) this.ignoring.add(peer);
+    // A deferral set during our read by members now ignored holds nothing back.
+    for (const peer of this.announced.keys()) if (this.ignoring.has(peer)) this.announced.delete(peer);
+    if (!this.announced.size) this.deferUntil = null;
     const needs = this.needs(read, valid);
     if (!needs.size) return;
     const s = randomHex(8);
@@ -432,6 +456,7 @@ export class RelayCopy {
     // A member said it was saving while we read: it saves, and ours waits out the deferral.
     if (!plans.size || this.deferUntil !== null) return;
     for (const p of this.doc.host.peers()) this.doc.host.send(p, { d: this.name, t: 5, s }, this.doc.members.get(p)?.z);
+    this.saved.add(s);
     const wrote = await this.write(plans, zs, s, read.now);
     this.last = { s, n: zs.length, wrote };
     if (![...wrote.values()].some(Boolean)) this.pending = true;
@@ -439,7 +464,7 @@ export class RelayCopy {
 
   // The doc as pieces of save `s`: the deflated JSON of each, or null (with a warning, once) if it takes more than
   // SLOTS. Its entries, then its dead ranges, in order, each piece taking as many as keep its JSON within
-  // PIECE_INFLATED and its deflated bytes within PIECE_DEFLATED.
+  // PIECE_INFLATED, its frames within PIECE_FRAMES and its deflated bytes within PIECE_DEFLATED.
   async pieces(s) {
     const { c, entries, ranges, pack } = this.doc.relayItems();
     const list = [...entries.map((e) => [e, null]), ...ranges.map((r) => [null, r])];
@@ -451,8 +476,9 @@ export class RelayCopy {
       let k = Math.min(guess, list.length - at);
       for (;;) {
         const part = list.slice(at, at + k);
-        const json = enc.encode(JSON.stringify(piece(part, parts.length, SLOTS)));
-        let over = json.length / PIECE_INFLATED;
+        const p = piece(part, parts.length, SLOTS);
+        const json = enc.encode(JSON.stringify(p));
+        let over = Math.max(json.length / PIECE_INFLATED, p.f.length / PIECE_FRAMES);
         if (over <= 1) over = (await deflate(json)).length / (PIECE_DEFLATED - MARGIN);
         if (over <= 1) {
           parts.push(part);

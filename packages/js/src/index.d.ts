@@ -261,8 +261,9 @@ export interface DocSync {
   /** Where the doc came from: 'members' once caught up from them; else 'relays' once it joined a save from the relays
    * (`relays: true`), as of `at`; null before either. */
   readonly source: 'members' | 'relays' | null;
-  /** With `source` 'relays': when the newest save joined was made (ms since the epoch), as its saver claims it. For
-   * display only ("as of 10:42"). Null otherwise. */
+  /** With `source` 'relays': when the newest save joined was made (ms since the epoch), as its saver claims it (one
+   * more than 15 minutes past this device's clock counts as the time it was read). For display only ("as of
+   * 10:42"). Null otherwise. */
   readonly at: number | null;
 }
 

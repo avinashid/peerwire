@@ -604,6 +604,7 @@ export class Doc {
   }
 
   left(peer) {
+    this.relays?.left(peer);
     const st = this.members.get(peer);
     st?.answerWait?.();
     st?.askWait?.();

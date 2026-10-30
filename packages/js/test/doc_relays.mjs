@@ -5,16 +5,18 @@
 // doc_crdt.mjs, and the real wasm signer. Checks:
 // - an author alone saves; a joiner alone loads it, 'sync' saying from the relays and as of when; nothing in clear;
 // - sizes: a whiteboard in a few pieces each within 60 KiB of content and 1 MiB inflated; a doc of more than 8
-//   pieces, or with one entry past a piece, keeps no relay copy and warns once;
+//   pieces, or with one entry past a piece, keeps no relay copy and warns once; a piece holds 16 frames at most;
 // - both banks: each save writes the bank not holding the newest whole save, which stands meanwhile;
 // - torn saves: a reader joins only whole saves, and saving after a torn read loses nothing;
 // - a relay that took only part of a save keeps its own newest whole save while the next is written (NB-006g-9a);
 // - bomb pieces: one inflates to 1 MiB at most, and a read stops at MAX_STORED;
 // - a relay that ignores the filter: one event per slot kept, the newest;
-// - a relay serving created_at a year ahead fails our save on that relay only (NB-006g-9b);
+// - a relay serving created_at a year ahead fails our save on that relay only (NB-006g-9b), and can't set sync.at;
 // - another VERSION in a bank: that bank is left alone on that relay, and a relay with one in both is skipped;
 // - a member sending t: 5 without saving holds a save back once, 5 min at most, then is ignored until it rejoins
-//   (NB-006g-8); one saver per room; t: 5 dropped by a doc without relays;
+//   (NB-006g-8), and its t: 5 during our read then holds nothing back; one naming a save already made is ignored
+//   at once; one saver per room; t: 5 dropped by a doc without relays;
+// - a save whose read no relay completed stays due: saved at the next slot, or when the page hides;
 // - renewal: opening a doc whose copy expires within 7 days saves it again;
 // - a deletion joined from the relays is reported from 'relays';
 // - the last member online saves when the page hides, once a minute at most;
@@ -439,6 +441,21 @@ async function whole(net, relay, k, reader) {
   warnings.length = 0;
   await one.pass(SAVE_WAIT);
   check(one.taken(ky)[0].length === 0 && /an entry too large for a piece/.test(warnings[0] ?? ''), 'one entry that deflates past a piece: no relay copy, a warning');
+  // A pack() that cuts a frame per entry: a piece still holds 16 frames at most, as readers take no more.
+  const many = new Net();
+  const z = many.node('4');
+  await many.settle();
+  const items = z.doc.relayItems.bind(z.doc);
+  z.doc.relayItems = () => {
+    const it = items();
+    return { ...it, pack: (entries, ranges) => [...entries.flatMap((e) => it.pack([e], [])), ...(ranges.length ? it.pack([], ranges) : [])] };
+  };
+  draw(z.doc, 17);
+  await many.pass(SAVE_WAIT);
+  const zr = many.node('3');
+  await many.settle();
+  const zs = (await zr.copy.read()).relays.get(many.relays[0].url).slots.filter((slot) => slot?.piece);
+  check(z.copy.last?.n === 2 && zs.length === 2 && zs.every((slot) => slot.piece.f.length <= 16) && view(zr.doc) === view(z.doc), `a pack() of one frame per entry: 17 strokes in ${z.copy.last?.n} pieces of ${zs.map((slot) => slot.piece.f.length).join(', ')} frames, and a reader holds them all`);
 }
 
 // Both banks: each save writes the bank that doesn't hold the newest whole save.
@@ -706,6 +723,29 @@ async function whole(net, relay, k, reader) {
   check([r1, r2].every((r) => r.slots(k).get(0)?.created_at <= at + 1), 'their pieces are created_at now, not past the year-ahead one');
   check(r2.slots(k).get(SLOTS + 3)?.created_at > at + 86400, "r2's year-ahead event in the other bank is left as it is");
 }
+// A relay serving our pieces with created_at rewritten a year ahead can't set a joiner's sync.at: that is the other
+// relays' time, or the read's at most.
+{
+  const net = new Net();
+  const [r1, r2, r3] = net.relays;
+  const a = net.node('a');
+  await net.settle();
+  const k = await keysOf(a);
+  draw(a.doc, 5);
+  await net.pass(SAVE_WAIT);
+  const made = r2.slots(k).get(0)?.created_at;
+  for (const ev of r1.slots(k).values()) r1.put({ ...ev, created_at: ev.created_at + 365 * 86400 });
+  a.doc.close();
+  await net.pass(60000);
+  const b = net.node('b');
+  await net.settle();
+  check(b.doc.set('strokes').entries().length === 5 && b.doc.sync.at === made * 1000, `r1 serves the save a year ahead: a joiner's sync.at is the save's time all the same (${new Date(b.doc.sync.at).toISOString()})`);
+  b.doc.close();
+  r2.down = r3.down = true;
+  const c = net.node('c');
+  await net.settle();
+  check(c.doc.set('strokes').entries().length === 5 && c.doc.sync.source === 'relays' && c.doc.sync.at > made * 1000 && c.doc.sync.at <= net.wall(), `only r1 reached: the read's time, not a year ahead (${new Date(c.doc.sync.at).toISOString()})`);
+}
 
 // Another VERSION in a bank: left alone on that relay; a relay with one in both banks is skipped.
 {
@@ -776,6 +816,7 @@ async function whole(net, relay, k, reader) {
   await net.settle();
   check(a.copy.deferUntil === null && b.copy.deferUntil === null, 'an ignored t: 5 defers nothing');
   net.unlink(a, m);
+  check(!a.copy.ignoring.has(m.self) && b.copy.ignoring.has(m.self), 'm left a: a no longer keeps it among those it ignores; b, still linked, does');
   net.link(a, m);
   m.host.send(a.self, { d: 'board', t: 5, s: 'nothex' });
   m.host.send(a.self, { d: 'board', t: 5 });
@@ -830,6 +871,72 @@ async function whole(net, relay, k, reader) {
   const at = net.relays[0].log.find(([ev]) => ev.pubkey === k.pubkey)?.[1] - WALL0;
   check(net.taken(k)[0].length === 3 && at - t0 >= DEFER_MS && a.copy.ignoring.has(b.self), `a saved ${((at - t0) / 1000).toFixed(0)} s on, once the deferral ended, and ignores b, whose save never came`);
 }
+// A member that announced a save it never made announces another during our read as its deferral ends: once it is
+// ignored, that one holds nothing back, so we save then, not a deferral later.
+{
+  const net = new Net();
+  const a = net.node('a');
+  const m = net.node('9', { relays: false });
+  net.link(a, m);
+  await net.settle();
+  const k = await keysOf(a);
+  draw(a.doc, 5);
+  await net.settle();
+  const t0 = net.now;
+  m.host.send(a.self, { d: 'board', t: 5, s: 'feedfacefeedface' });
+  await net.settle();
+  const query = net.sig.query.bind(net.sig);
+  net.sig.query = async (...x) => {
+    m.host.send(a.self, { d: 'board', t: 5, s: 'facadefacadefaca' });
+    while (net.step());
+    return query(...x);
+  };
+  await net.pass(DEFER_MS + JITTER_MS + 1000);
+  net.sig.query = query;
+  const at = net.relays[0].log.find(([ev]) => ev.pubkey === k.pubkey)?.[1] - WALL0;
+  check(a.copy.honoured.get(m.self) > t0 && a.copy.ignoring.has(m.self) && a.copy.deferUntil === null && net.taken(k)[0].length === 3 && at - t0 <= DEFER_MS + JITTER_MS + 1000, `m announced again during the read as its deferral ended: a saved ${((at - t0) / 1000).toFixed(0)} s after m's first t: 5, not a deferral later`);
+}
+// A t: 5 naming a save already made (ours, or whole at our latest read) announces nothing new: its member is ignored
+// at once and defers nothing, also when it lands during our read.
+{
+  const net = new Net();
+  const a = net.node('a');
+  const m = net.node('9', { relays: false });
+  net.link(a, m);
+  await net.settle();
+  const k = await keysOf(a);
+  draw(a.doc, 5);
+  await net.pass(SAVE_WAIT);
+  const s1 = a.copy.last?.s;
+  m.host.send(a.self, { d: 'board', t: 5, s: s1 });
+  await net.settle();
+  check(s1 && a.copy.ignoring.has(m.self) && a.copy.deferUntil === null, "m replays the t: 5 of a's own save: a ignores m at once, deferring nothing");
+  const b = net.node('b');
+  await net.settle();
+  net.link(b, m);
+  await net.settle();
+  m.host.send(b.self, { d: 'board', t: 5, s: s1 });
+  await net.settle();
+  check(b.copy.saved.has(s1) && b.copy.ignoring.has(m.self) && b.copy.deferUntil === null, 'b, which read that save whole as it opened, ignores the same t: 5 at once');
+  net.unlink(b, m);
+  b.doc.close();
+  net.unlink(a, m);
+  net.link(a, m);
+  draw(a.doc, 1);
+  const query = net.sig.query.bind(net.sig);
+  let during = true;
+  net.sig.query = async (...x) => {
+    if (during) {
+      during = false;
+      m.host.send(a.self, { d: 'board', t: 5, s: s1 });
+      while (net.step());
+    }
+    return query(...x);
+  };
+  await net.pass(NEXT);
+  net.sig.query = query;
+  check(!during && a.copy.ignoring.has(m.self) && net.taken(k)[0].length === 6 && a.copy.last.s !== s1, 'the same t: 5 during our next read: m ignored, and a saved all the same');
+}
 {
   const net = new Net();
   const [r1, r2, r3] = net.relays;
@@ -871,6 +978,55 @@ async function whole(net, relay, k, reader) {
   a.copy.hidden();
   await net.settle();
   check(net.taken(k)[0].length === 6, 'refused again, then the page hidden: saved at once');
+}
+// No relay's read completes at the save (offline, the sockets reconnecting): the save stays due, at the next slot or
+// at once when the page hides, and so does the check of a member that announced one (NB6L-1).
+{
+  const net = new Net();
+  const a = net.node('a');
+  await net.settle();
+  const k = await keysOf(a);
+  draw(a.doc, 5);
+  for (const r of net.relays) r.noEose = true;
+  await net.pass(SAVE_WAIT);
+  for (const r of net.relays) r.noEose = false;
+  check(net.sig.queries === 2 && net.taken(k)[0].length === 0 && a.copy.pending, 'no relay sent EOSE at the save: nothing written, and the save stays due');
+  await net.pass(NEXT);
+  check(net.taken(k)[0].length === 3, 'saved at the next slot, once they answer');
+  draw(a.doc, 1);
+  for (const r of net.relays) r.down = true;
+  await net.pass(NEXT);
+  for (const r of net.relays) r.down = false;
+  const down = net.taken(k)[0].length;
+  a.copy.hidden();
+  await net.settle();
+  check(down === 3 && net.taken(k)[0].length === 6, 'every relay down at the next save, then the page hidden: saved at once');
+}
+{
+  const net = new Net();
+  const a = net.node('a');
+  const m = net.node('9', { relays: false });
+  net.link(a, m);
+  await net.settle();
+  const k = await keysOf(a);
+  draw(a.doc, 5);
+  await net.settle();
+  m.host.send(a.self, { d: 'board', t: 5, s: 'feedfacefeedface' });
+  await net.settle();
+  for (const r of net.relays) r.noEose = true;
+  // m announces again during that read: the next read checks the newer, whose deferral it waits out.
+  const query = net.sig.query.bind(net.sig);
+  net.sig.query = async (...x) => {
+    m.host.send(a.self, { d: 'board', t: 5, s: 'facadefacadefaca' });
+    while (net.step());
+    return query(...x);
+  };
+  await net.pass(DEFER_MS + JITTER_MS + 1000);
+  net.sig.query = query;
+  for (const r of net.relays) r.noEose = false;
+  check(net.sig.queries === 2 && !a.copy.ignoring.has(m.self) && a.copy.announced.get(m.self) === 'facadefacadefaca' && net.taken(k)[0].length === 0, "no relay answered as m's deferral ended: m's announcements kept for the next read, the newer one checked");
+  await net.pass(NEXT);
+  check(a.copy.ignoring.has(m.self) && net.taken(k)[0].length === 3, 'that read finds its save never came: m ignored, and a saved');
 }
 
 // Renewal: opening a doc whose copy expires within 7 days saves it again.
