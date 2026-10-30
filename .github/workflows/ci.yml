@@ -37,7 +37,9 @@ jobs:
       - run: cargo test --workspace --release
       - run: cargo test -p peerwire-ffi --features sync --release
       - name: Fuzz tests in a debug build (integer overflow panics there, wraps in release)
-        run: cargo test --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim -p peerwire-sync fuzz
+        run: |
+          cargo test --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim -p peerwire-sync fuzz
+          cargo test --lib -p peerwire-ffi --features sync
 
   wasm:
     name: wasm + node

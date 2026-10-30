@@ -176,6 +176,8 @@ FUZZ=(--lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim -p peer
 # peerwire-ffi's shared docs (`sync`) are off in the wasm build and so in the workspace's: built, linted and tested
 # on their own, so they can't rot.
 FFI_SYNC=(-p peerwire-ffi --features sync --release)
+# The same in a debug build, beside the fuzzers: its length and buffer sums must not overflow either.
+FFI_SYNC_DEBUG=(-p peerwire-ffi --features sync --lib)
 
 # Every Rust test: nextest runs each test in its own process, many at once, but skips doctests.
 rust_tests() {
@@ -193,11 +195,15 @@ rust_tests() {
 
 # Release builds wrap on integer overflow; the parser fuzzers must also run where it panics.
 fuzz_tests() {
+  local r=0
   if [ $nextest = 1 ]; then
-    cargo nextest run --profile gate "${FUZZ[@]}"
+    cargo nextest run --profile gate "${FUZZ[@]}" || r=1
+    cargo nextest run --profile gate "${FFI_SYNC_DEBUG[@]}" || r=1
   else
-    cargo test "${FUZZ[@]}"
+    cargo test "${FUZZ[@]}" || r=1
+    cargo test "${FFI_SYNC_DEBUG[@]}" || r=1
   fi
+  return $r
 }
 
 # Build every test binary, so the run phase doesn't wait on cargo's lock. A build error shows up again, and is
@@ -206,11 +212,11 @@ rust_build() {
   if [ $nextest = 1 ]; then
     cargo nextest run --workspace --release --no-run
     cargo nextest run "${FFI_SYNC[@]}" --no-run
-    [ $strict = 0 ] || cargo nextest run "${FUZZ[@]}" --no-run
+    [ $strict = 0 ] || { cargo nextest run "${FUZZ[@]}" --no-run; cargo nextest run "${FFI_SYNC_DEBUG[@]}" --no-run; }
   else
     cargo test --workspace --release --no-run
     cargo test "${FFI_SYNC[@]}" --no-run
-    [ $strict = 0 ] || cargo test "${FUZZ[@]}" --no-run
+    [ $strict = 0 ] || { cargo test "${FUZZ[@]}" --no-run; cargo test "${FFI_SYNC_DEBUG[@]}" --no-run; }
   fi
 }
 

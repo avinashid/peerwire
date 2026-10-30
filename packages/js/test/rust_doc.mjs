@@ -728,6 +728,11 @@ for (const ty of DOC6) add([`{"d":"b","t":3,"ws":["${w0}"],"e":[[0,1,1,${ty},"c"
 add([`{"d":"b","t":3,"ws":["${w0}"],"e":[[0,1,1,"m","c","k",1]],"q":5,"i":0,"n":1}`], 'f'.repeat(64));
 check(corpus.slice(-2 * DOC6.length - 1, -1).every((c) => c.verdict === null) && corpus.at(-1).verdict !== null,
   'an entry whose type is ["m"], or any other than "m", "s" or "l", drops its frame; "m" keeps it');
+// A frame whose t is 5 (STORE-DESIGN's "saving", which a member without the store drops), or any other outside 1
+// to 4, all else valid, is dropped; t:1 keeps it.
+for (const t of [5, 0, 6, 1]) add([`{"d":"b","t":${t},"ws":["${w0}"],"e":[[0,1,1,"m","c","k",1]]}`], 'a'.repeat(64));
+check(corpus.slice(-4, -1).every((c) => c.verdict === null) && corpus.at(-1).verdict !== null,
+  'a frame whose t is 5, 0 or 6 is dropped; the same frame with t:1 is kept');
 add([`{"d":"b","t":2,"ws":["${w0}"],"r":[`, ['[0,1,1],', 8192], '[0,1,1]],"q":1}'], w0.slice(0, 64));
 add([`{"d":"b","t":2,"ws":["${w0}"],"r":[`, ['[0,1,1],', 8191], '[0,1,1]],"q":1}'], w0.slice(0, 64));
 // A deep unknown field is ignored (the frame is kept); a deep value drops it.

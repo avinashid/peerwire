@@ -3,7 +3,7 @@
 //! integer overflow panics.
 
 use crate::json::Tree;
-use crate::{Docs, Kind, Options, Route, DOC_TAG, MAX_DOC_LENGTH, MAX_ENTRIES};
+use crate::{Docs, Event, Kind, Options, Route, DOC_TAG, MAX_DOC_LENGTH, MAX_ENTRIES};
 use peerwire_core::{Instant, PeerId};
 use peerwire_sim::fuzz::{cases, mutate, run, Rng};
 use serde_json::Value;
@@ -50,37 +50,61 @@ fn fuzz_json_reader() {
     );
 }
 
-/// One member's docs take mutated frames from a member, an ask now and then, and stay within their caps.
+/// One member's docs take mutated frames from a member, an ask now and then, and stay within their caps. Half
+/// the frames are for "b", which this member runs as a hub, so what it relays (and charges) is fuzzed too: half
+/// of those are seeds as they are, which a hub opened afresh every 100 frames takes and relays, so that the mutated
+/// ones land on what they brought.
 #[test]
 fn fuzz_doc_frames() {
     let seeds = seeds();
-    let (me, peer) = (PeerId([0xcc; 32]), PeerId([0xaa; 32]));
+    let to_hub: Vec<Vec<u8>> = seeds
+        .iter()
+        .map(|s| String::from_utf8(s.clone()).unwrap().replacen("\"d\":\"board\"", "\"d\":\"b\"", 1).into_bytes())
+        .collect();
+    let (me, peer, other) = (PeerId([0xcc; 32]), PeerId([0xaa; 32]), PeerId([0xbb; 32]));
     let mut docs = Docs::new(me, [9; 32]);
     let mut t = 0;
+    let hub = Options { hub: true, ..Options::default() };
     let board = docs.open(Instant::from_millis(t), "board", Options::default()).unwrap();
-    docs.open(Instant::from_millis(t), "b", Options { hub: true, ..Options::default() }).unwrap();
+    let mut b_id = docs.open(Instant::from_millis(t), "b", hub).unwrap();
     docs.joined(Instant::from_millis(t), peer, Route::Peer);
-    docs.joined(Instant::from_millis(t), PeerId([0xbb; 32]), Route::Direct);
+    docs.joined(Instant::from_millis(t), other, Route::Direct);
+    let mut relays = 0;
     run(
         "sync frames",
         cases(20_000),
-        |rng| gen(rng, &seeds),
+        |rng| match rng.below(4) {
+            0 => rng.pick(&to_hub).clone(),
+            1 => gen(rng, &to_hub),
+            _ => gen(rng, &seeds),
+        },
         |b| {
             t += 7;
             let now = Instant::from_millis(t);
+            if t % 700 == 0 {
+                docs.close(b_id);
+                b_id = docs.open(now, "b", hub).unwrap();
+            }
             let mut m = vec![DOC_TAG];
             m.extend_from_slice(b);
             assert!(docs.receive(now, peer, &m));
             if docs.poll_timeout().is_some_and(|d| d <= now) {
                 docs.handle_timeout(now);
             }
-            while let Some((_, out)) = docs.poll_transmit() {
+            while let Some((to, out)) = docs.poll_transmit() {
                 let f = Tree::parse(&out[1..]).expect("our frames are JSON");
                 assert!(f.field(f.root(), "d").is_some());
+                relays += (to == other && f.field(f.root(), "q").is_none()) as usize;
             }
-            while docs.poll_event().is_some() {}
+            while let Some(e) = docs.poll_event() {
+                // Cut for what it had relayed, it joins again, so the frames after are read too.
+                if e == Event::Overflow(peer) {
+                    docs.joined(now, peer, Route::Peer);
+                }
+            }
         },
     );
+    assert!(relays > cases(20_000) / 100, "{relays} frames relayed");
     let d = docs.doc(board).unwrap();
     let held: usize =
         [Kind::Map, Kind::Set, Kind::Log].iter().map(|&k| d.entries(k, "c").len() + d.entries(k, "meta").len()).sum();
