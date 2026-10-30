@@ -7,7 +7,7 @@
 
 use peerwire_core::{Config, Event as Net, Instant, Lane, PeerId, SendError};
 use peerwire_sim::{NetConfig, Sim};
-use peerwire_sync::{DocId, Docs, Event, Kind, Options, Route, MESSAGE_BYTES, OUTBOX_BYTES};
+use peerwire_sync::{DocId, Docs, Event, Kind, Options, Route, MESSAGE_BYTES, OUTBOX_BYTES, RELAY_BYTES};
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
 use std::cell::Cell;
@@ -24,7 +24,9 @@ fn ms(n: u64) -> Duration {
 /// What member `d` holds of the doc, as doc.js lists it.
 fn held(docs: &mut Docs, id: DocId) -> String {
     let d = docs.doc(id).unwrap();
-    [(Kind::Map, "meta"), (Kind::Set, "strokes"), (Kind::Log, "chat")].map(|(k, c)| d.entries_json(k, c)).join("\n")
+    [(Kind::Map, "meta"), (Kind::Set, "strokes"), (Kind::Log, "chat"), (Kind::Map, "big")]
+        .map(|(k, c)| d.entries_json(k, c))
+        .join("\n")
 }
 
 /// A random write by member `d`; `big` writes 50 KB values, on ten keys.
@@ -55,6 +57,16 @@ fn write(rng: &mut ChaCha8Rng, docs: &mut Docs, id: DocId, big: bool) {
     }
 }
 
+/// A link that takes `bytes_per_s` from member `from` to `to`, counted from `since`: what it refuses goes back
+/// with retry(), as a link that would block does.
+struct Pace {
+    from: usize,
+    to: PeerId,
+    bytes_per_s: u64,
+    since: Instant,
+    sent: u64,
+}
+
 /// Members on simulated endpoints, each with the doc "board" open, its host loop driven here.
 struct Room {
     sim: Sim,
@@ -65,6 +77,7 @@ struct Room {
     overflows: Vec<(usize, PeerId)>,
     /// The most a member had waiting for another, in bytes.
     most_queued: usize,
+    pace: Option<Pace>,
 }
 
 impl Room {
@@ -77,6 +90,7 @@ impl Room {
             rng: ChaCha8Rng::seed_from_u64(seed),
             overflows: Vec::new(),
             most_queued: 0,
+            pace: None,
         };
         for i in 0..n {
             r.add(hub == Some(i));
@@ -138,6 +152,14 @@ impl Room {
                 }
             }
             while let Some((p, m)) = docs.poll_transmit() {
+                if let Some(pace) = self.pace.as_mut().filter(|x| x.from == i && x.to == p) {
+                    let takes = pace.bytes_per_s * (now - pace.since).as_micros() as u64 / 1_000_000;
+                    if pace.sent + m.len() as u64 > takes {
+                        docs.retry(p, m);
+                        continue;
+                    }
+                    pace.sent += m.len() as u64;
+                }
                 match self.sim.send(i, self.index[&p], Lane::Reliable, &m) {
                     Ok(()) | Err(SendError::NotConnected) => {}
                     Err(SendError::WouldBlock) => docs.retry(p, m),
@@ -337,7 +359,7 @@ fn frames_in_any_order_and_any_number_of_times_converge() {
 }
 
 /// A Godot room: every member linked to the host alone, which runs the doc as a hub. Members' writes reach each
-/// other through it. Then one member's link stalls (none of its packets get through) while a member writes a
+/// other through it. Then one member's link stalls (none of its packets get through) while the host writes a
 /// lot: the host never holds more than OUTBOX_BYTES for it, cuts it, and once it links again it catches up.
 #[test]
 fn a_star_converges_through_its_hub_and_a_stalled_member_is_cut() {
@@ -359,14 +381,14 @@ fn a_star_converges_through_its_hub_and_a_stalled_member_is_cut() {
     let (addr, s) = (r.sim.addr(4), stalled.clone());
     r.sim.hook = Some(Box::new(move |from, _, _| !(s.get() && from == addr)));
     // 30 MB, more than the host's link (4 MiB) and its outbox (16 MiB) can hold for it, well within the 30 s a
-    // silent link takes to time out.
+    // silent link takes to time out. The host's own writes: a member's would be cut first (RELAY_BYTES).
     for _ in 0..60 {
         for _ in 0..10 {
-            r.write(1, true);
+            r.write(0, true);
         }
         r.pump(ms(250));
     }
-    assert_eq!(r.overflows.iter().filter(|(i, _)| *i == 0).map(|(_, p)| *p).collect::<Vec<_>>(), [r.sim.peer_id(4)]);
+    assert_eq!(r.overflows, [(0, r.sim.peer_id(4))]);
     assert!(r.most_queued <= OUTBOX_BYTES + MESSAGE_BYTES, "{} bytes waited", r.most_queued);
     assert_eq!(r.docs[0].queued(&r.sim.peer_id(4)), 0);
     r.pump(ms(2000));
@@ -377,6 +399,41 @@ fn a_star_converges_through_its_hub_and_a_stalled_member_is_cut() {
     r.link(4, 0);
     r.pump(ms(20_000));
     assert!(r.converged(&[0, 1, 2, 3, 4]));
+}
+
+/// In the same star, a member writes 2 MB/s, which the host relays to three members, while the host's link to
+/// one of them takes a quarter of that (500 KB/s). What the host relays for the writer is charged to it: past
+/// RELAY_BYTES the writer is cut, not the slow member, which never has more than that waiting. Once the writer's
+/// budget is whole again (RELAY_BYTES_PER_S), it links again and catches the room up on what it wrote meanwhile.
+#[test]
+fn a_star_cuts_a_member_flooding_its_hub_not_a_slow_reader() {
+    let mut r = Room::new(5, NetConfig::default(), 12, Some(0));
+    for i in 1..5 {
+        r.link(i, 0);
+    }
+    r.pump(ms(1000));
+    let (writer, slow) = (r.sim.peer_id(1), r.sim.peer_id(2));
+    r.pace = Some(Pace { from: 0, to: slow, bytes_per_s: 500_000, since: r.sim.now, sent: 0 });
+    let mut most = 0;
+    // 30 MB: without the budget, more than the slow member's outbox (16 MiB) by the end.
+    for _ in 0..60 {
+        for _ in 0..10 {
+            r.write(1, true);
+        }
+        r.pump(ms(250));
+        most = most.max(r.docs[0].queued(&slow));
+    }
+    assert_eq!(r.overflows, [(0, writer)]);
+    assert!(most > 1_000_000 && most <= RELAY_BYTES, "{most} bytes waited for the slow member");
+    r.pump(ms(20_000));
+    assert!(r.converged(&[0, 2, 3, 4]));
+    assert!(!r.converged(&[0, 1]), "it went on writing alone");
+    // RELAY_BYTES refills in 128 s.
+    r.pump(ms(130_000));
+    r.link(1, 0);
+    r.pump(ms(20_000));
+    assert!(r.converged(&[0, 1, 2, 3, 4]));
+    assert_eq!(r.overflows, [(0, writer)]);
 }
 
 /// A hub sends what a member's frame added to its other members, never back to that member.

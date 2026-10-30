@@ -33,7 +33,7 @@ while let Some(e) = docs.poll_event() {
     match e {
         Event::Change(doc, c) => render(c.collection(), c.key(), c.value()),
         Event::Sync(doc, s) => status(s.state),             // Alone, Loading or Synced
-        Event::Overflow(peer) => node.disconnect(&peer),    // its link took nothing for too long
+        Event::Overflow(peer) => node.disconnect(&peer),    // its link stalled, or it flooded a hub
     }
 }
 // and docs.handle_timeout(now) once docs.poll_timeout() has passed.
@@ -64,6 +64,12 @@ answer with no number. It never sends a frame back to its source.
 
 Each member's messages wait, in order, until its link takes them. Past `OUTBOX_BYTES` (16 MiB) the member is
 forgotten as if it left (`Event::Overflow`), and the host should close its link. It catches up when it joins again.
+
+A hub charges what it relays for a member's frame to that member: the messages it queued, once for each member they
+go to. Values go on as this crate writes them, which can be longer than the member sent them (`1e20` is 21 digits).
+Past `RELAY_BYTES` (8 MiB) beyond what refilled at `RELAY_BYTES_PER_S` (64 KiB/s), the member writing is forgotten
+the same way, not the members it would fill the queues of. Its budget is kept when it leaves, so coming back doesn't
+refill it.
 
 ## The copy
 

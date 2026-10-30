@@ -92,6 +92,12 @@ pub const STORED_FRAMES: usize = 64;
 /// What a member's messages may hold waiting to be sent, retried ones included: past it, the member's link is
 /// taken as stalled, and [`Docs`] forgets it as if it left ([`Event::Overflow`]). Four full docs as JSON text.
 pub const OUTBOX_BYTES: usize = 16 * 1024 * 1024;
+/// What a hub ([`Options::hub`]) may relay of one member's frames at once, as queued for its other members: past
+/// it, [`Docs`] forgets the member as if it left ([`Event::Overflow`]), so the member writing pays rather than
+/// the members it would fill the queues of. Half of [`OUTBOX_BYTES`]: one member alone never fills a queue.
+pub const RELAY_BYTES: usize = OUTBOX_BYTES / 2;
+/// How fast [`RELAY_BYTES`] refills, in bytes a second: the rate doc.js lets a member have us send it catch-up.
+pub const RELAY_BYTES_PER_S: usize = 64 * 1024;
 /// The longest array a frame may hold: entries, dead ranges, writers.
 const FRAME_ITEMS: usize = 16384;
 
@@ -118,7 +124,7 @@ pub struct Options<'a> {
     /// A copy from [`DocMut::snapshot`], joined before the first ask, so members send only what it lacks.
     pub copy: Option<&'a [u8]>,
     /// This member is the hub of a star (a Godot room's host, which every other member links to alone): what a
-    /// member's frame adds goes on to the others.
+    /// member's frame adds goes on to the others, charged to that member ([`RELAY_BYTES`]).
     pub hub: bool,
 }
 
@@ -318,7 +324,9 @@ pub struct Item {
 pub enum Event {
     Change(DocId, Change),
     Sync(DocId, Status),
-    /// This member's messages passed [`OUTBOX_BYTES`] waiting for its link: [`Docs`] forgot it as if it left, and
-    /// takes nothing more from it until [`Docs::joined`] again. Close its link (it catches up when it comes back).
+    /// This member's messages passed [`OUTBOX_BYTES`] waiting for its link, or, at a hub, it had more than
+    /// [`RELAY_BYTES`] of its frames relayed beyond what refilled: [`Docs`] forgot it as if it left, and takes
+    /// nothing more from it until [`Docs::joined`] again. Close its link (it catches up when it comes back; its
+    /// relay budget doesn't refill by coming back).
     Overflow(PeerId),
 }

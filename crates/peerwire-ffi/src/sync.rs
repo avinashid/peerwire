@@ -18,7 +18,7 @@
 //! ```text
 //! {"doc":0,"change":{"name":"meta","type":"map","key":"title","value":"Plans","from":"<hex>","local":false}}
 //! {"doc":0,"sync":{"state":"loading","from":"<hex>","have":12,"total":40,"source":null,"at":null}}
-//! {"overflow":"<hex>"}    the member's link took nothing for too long: close it
+//! {"overflow":"<hex>"}    the member's link took nothing for too long, or a hub relayed too much for it: close it
 //! ```
 
 use crate::{bytes, now, peer, PW_ERR_BUFFER, PW_ERR_INVALID};

@@ -81,6 +81,8 @@ pub(crate) struct Host<'a> {
     pub(crate) events: &'a mut VecDeque<Event>,
     pub(crate) incarnation: &'a mut dyn FnMut() -> u32,
     pub(crate) id: DocId,
+    /// Bytes a hub relayed of a member's frame, as queued for its other members: what [`crate::Docs`] charges it.
+    pub(crate) relayed: usize,
 }
 
 impl Host<'_> {
@@ -481,12 +483,15 @@ impl Doc {
         if let (Some(peer), Some((entries, ranges))) = (peer, self.relay.take()) {
             // A hub sends what the frame added on to its other members, as an answer with no number (a delta
             // carries only its sender's writes): its members reach each other only through it. It stands in for
-            // forward(), which would send them the same dead dots again.
+            // forward(), which would send them the same dead dots again. Values go on as written here, which can be
+            // longer than the frame had them (1e20 is 21 digits), so the member is charged what was queued: each
+            // message, its tag and closing brace included, once for each member it goes to.
             if !entries.is_empty() || !ranges.is_empty() {
                 let refs: Vec<&Entry> = entries.iter().collect();
                 let frames = self.pack(ANSWER, &refs, &ranges, false);
                 for &p in h.peers.iter().filter(|&&p| p != peer) {
                     for f in &frames {
+                        h.relayed += f.len() + 2;
                         h.send(p, format!("{f}}}"));
                     }
                 }

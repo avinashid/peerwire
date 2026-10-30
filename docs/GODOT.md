@@ -123,8 +123,14 @@ var copy := doc.snapshot()                  # keep it on the device (it holds wh
   4 Mi characters of JSON). A name or key past its cap, or a value that isn't JSON or is over 64 KiB, also prints an
   error.
 - **The star.** Joiners link to the host alone. So the host passes on what each joiner writes, and a joiner catches
-  up from the host. Frames are messages `0x07` + JSON on the reliable lane, beside Godot's packets. A joiner whose
-  link takes nothing while 16 MiB of doc frames wait for it is disconnected. When it joins again, it catches up.
+  up from the host. Frames are messages `0x07` + JSON on the reliable lane, beside Godot's packets. The host
+  disconnects a joiner in two cases. When it joins again, it catches up.
+  - **Its link stalls:** it takes nothing while 16 MiB of doc frames wait for it.
+  - **It writes faster than the host may pass on:** what the host sends on for one joiner is charged to it, once
+    for each joiner it goes to, as the host writes it (a number can take longer than the joiner sent it). The
+    budget is 8 MiB at once, then 64 KiB/s. With 7 joiners that is about 1.3 MiB of new entries at once, then
+    11 KiB/s. A joiner that brings a large copy the host lacks counts too. Coming back doesn't refill the
+    budget; 128 s refill it whole.
 - **Browsers and Godot don't share a doc live:** a browser doesn't dial a native peer. A copy, or a frame, reads in
   both.
 

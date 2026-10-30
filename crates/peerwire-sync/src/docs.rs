@@ -4,7 +4,9 @@
 use crate::doc::{Doc, Host};
 use crate::frame::{valid_name, Kind, ASK, MAX_SAFE};
 use crate::json::{lossy, write_str, Tree, Utf16};
-use crate::{DocId, Error, Event, Item, Options, Route, Status, DOCZ_TAG, DOC_TAG, OUTBOX_BYTES};
+use crate::{
+    DocId, Error, Event, Item, Options, Route, Status, DOCZ_TAG, DOC_TAG, OUTBOX_BYTES, RELAY_BYTES, RELAY_BYTES_PER_S,
+};
 use peerwire_core::{Instant, PeerId};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -33,7 +35,15 @@ pub struct Docs {
     out: BTreeMap<PeerId, Outbox>,
     /// Members whose link refused a message since poll_transmit last ran dry.
     held: BTreeSet<PeerId>,
+    /// When each member's relay budget is whole again, in µs. Kept when it leaves (so coming back doesn't refill
+    /// it) until it is whole.
+    relays: BTreeMap<PeerId, u64>,
     events: VecDeque<Event>,
+}
+
+/// The µs a relay budget takes to refill `bytes`.
+fn relay_us(bytes: usize) -> u64 {
+    u64::try_from((bytes as u128 * 1_000_000).div_ceil(RELAY_BYTES_PER_S as u128)).unwrap_or(u64::MAX)
 }
 
 /// An ask for a doc we don't have open is answered with nothing, so that the asker counts us as answered rather
@@ -69,6 +79,7 @@ impl Docs {
             routes: BTreeMap::new(),
             out: BTreeMap::new(),
             held: BTreeSet::new(),
+            relays: BTreeMap::new(),
             events: VecDeque::new(),
         }
     }
@@ -85,6 +96,17 @@ impl Docs {
 
     /// Runs `f` with the host lent to the docs, then queues what they sent.
     fn with_host<R>(&mut self, id: u32, f: impl FnOnce(&mut Host, &mut BTreeMap<u32, Doc>) -> R) -> R {
+        let (r, sent, _) = self.lend(id, f);
+        self.queue(sent);
+        r
+    }
+
+    /// Runs `f` with the host lent to the docs: what it gave, what the docs sent, and what a hub relayed of it.
+    fn lend<R>(
+        &mut self,
+        id: u32,
+        f: impl FnOnce(&mut Host, &mut BTreeMap<u32, Doc>) -> R,
+    ) -> (R, Vec<(PeerId, String)>, usize) {
         let mut sent = Vec::new();
         let Docs { me, rng, fixed, now_us, seq, docs, members, routes, events, .. } = self;
         let mut incarnation = || fixed.pop_front().unwrap_or_else(|| rng.next_u32());
@@ -98,10 +120,11 @@ impl Docs {
             events,
             incarnation: &mut incarnation,
             id: DocId(id),
+            relayed: 0,
         };
         let r = f(&mut h, docs);
-        self.queue(sent);
-        r
+        let relayed = h.relayed;
+        (r, sent, relayed)
     }
 
     fn run<R>(&mut self, id: u32, f: impl FnOnce(&mut Doc, &mut Host) -> R) -> Option<R> {
@@ -134,6 +157,22 @@ impl Docs {
     /// A member whose messages passed OUTBOX_BYTES waiting is forgotten, as if it left.
     fn cap(&mut self, p: PeerId) {
         if self.out.get(&p).is_some_and(|ob| ob.bytes > OUTBOX_BYTES) {
+            self.forget(p);
+            self.events.push_back(Event::Overflow(p));
+        }
+    }
+
+    /// Charges member `p` the `bytes` a hub relayed of its frame to the others. One that has had more than
+    /// RELAY_BYTES relayed beyond what refilled is forgotten, as if it left: the member writing pays, not those it
+    /// would fill the queues of.
+    fn charge(&mut self, p: PeerId, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let now = self.now_us;
+        let whole = self.relays.entry(p).or_insert(0);
+        *whole = (*whole).max(now).saturating_add(relay_us(bytes));
+        if *whole - now > relay_us(RELAY_BYTES) {
             self.forget(p);
             self.events.push_back(Event::Overflow(p));
         }
@@ -215,6 +254,8 @@ impl Docs {
         self.routes.remove(&peer);
         self.out.remove(&peer);
         self.held.remove(&peer);
+        let now = self.now_us;
+        self.relays.retain(|_, whole| *whole > now);
         self.each(|d, h| d.left(h, peer));
     }
 
@@ -236,7 +277,15 @@ impl Docs {
         let open = t.field(root, "d").and_then(|d| t.str(d)).and_then(|d| self.names.get(d)).copied();
         match open {
             Some(id) => {
-                self.run(id, |d, h| d.receive(h, peer, &t, root));
+                let ((), sent, relayed) = self.lend(id, |h, docs| {
+                    if let Some(d) = docs.get_mut(&id) {
+                        d.receive(h, peer, &t, root);
+                    }
+                });
+                // Charged before anything is queued: one cut has nothing more queued for it, and what was relayed
+                // goes on to the others anyway.
+                self.charge(peer, relayed);
+                self.queue(sent);
             }
             None => {
                 if let Some(reply) = unopened(&t, root) {
@@ -497,5 +546,134 @@ mod tests {
         // Joined again, it is asked and sent the doc again.
         da.joined(now, b, Route::Direct);
         assert!(da.poll_transmit().is_some_and(|(p, _)| p == b));
+    }
+
+    /// A hub with members `a`, `b` and `c`; `a` writes through `leaf`, its own docs, linked to the hub alone.
+    fn star() -> (Docs, Docs, DocId, [PeerId; 3]) {
+        let (h, a, b, c) = (PeerId([0x11; 32]), PeerId([0xaa; 32]), PeerId([0xbb; 32]), PeerId([0xcc; 32]));
+        let now = Instant::from_millis(0);
+        let mut hub = Docs::new(h, [1; 32]);
+        hub.open(now, "board", Options { hub: true, ..Options::default() }).unwrap();
+        for p in [a, b, c] {
+            hub.joined(now, p, Route::Direct);
+        }
+        let mut leaf = Docs::new(a, [2; 32]);
+        let lid = leaf.open(now, "board", Options::default()).unwrap();
+        leaf.joined(now, h, Route::Direct);
+        while hub.poll_transmit().is_some() {}
+        while leaf.poll_transmit().is_some() {}
+        (hub, leaf, lid, [a, b, c])
+    }
+
+    /// `a`'s next frames: it adds a set item of a thousand 1e20s, 5 bytes each as written here where
+    /// JSON.stringify writes 21 digits and a comma, then deletes it.
+    fn flood(leaf: &mut Docs, lid: DocId) -> Vec<Vec<u8>> {
+        let mut d = leaf.doc(lid).unwrap();
+        let id = d.set_add("s", &format!("[{}1]", "1e20,".repeat(1000))).unwrap().unwrap();
+        assert!(d.set_delete("s", &id).unwrap());
+        std::iter::from_fn(|| leaf.poll_transmit())
+            .map(|(_, m)| String::from_utf8(m).unwrap().replace("100000000000000000000", "1e20").into_bytes())
+            .collect()
+    }
+
+    /// A hub charges the member whose frame it relays what it queued for the others, each message's tag and
+    /// closing brace included: over 4 times the frame here, as values go on as JSON.stringify writes them.
+    #[test]
+    fn a_hub_charges_a_member_what_it_queued_for_the_others() {
+        let (mut hub, mut leaf, lid, [a, b, c]) = star();
+        let now = Instant::from_millis(0);
+        let frames = flood(&mut leaf, lid);
+        assert!(hub.receive(now, a, &frames[0]));
+        let (qb, qc) = (hub.queued(&b), hub.queued(&c));
+        assert!(qb == qc && qb > frames[0].len() * 4, "{qb} queued for a frame of {}", frames[0].len());
+        assert_eq!(hub.relays[&a], relay_us(qb + qc));
+        assert_eq!(hub.queued(&a), 0, "nothing goes back to it");
+        // Its delete is charged too, and nothing else is.
+        assert!(hub.receive(now, a, &frames[1]));
+        assert_eq!(hub.relays[&a], relay_us(qb + qc) + relay_us(hub.queued(&b) + hub.queued(&c) - qb - qc));
+        assert_eq!(overflows(&mut hub), []);
+    }
+
+    fn overflows(docs: &mut Docs) -> Vec<Event> {
+        std::iter::from_fn(|| docs.poll_event()).filter(|e| matches!(e, Event::Overflow(_))).collect()
+    }
+
+    /// A member that has had more than RELAY_BYTES relayed is forgotten, and the members it filled the queues of
+    /// are kept. Coming back doesn't refill its budget; time does, and a budget whole again is let go.
+    #[test]
+    fn a_member_past_its_relay_budget_is_forgotten_not_its_readers() {
+        let (mut hub, mut leaf, lid, [a, b, c]) = star();
+        let mut now = Instant::from_millis(0);
+        let relayed = |hub: &Docs| hub.queued(&b) + hub.queued(&c);
+        let mut cut = None;
+        for round in 0.. {
+            for f in flood(&mut leaf, lid) {
+                let before = relayed(&hub);
+                assert!(hub.receive(now, a, &f));
+                if let Some(e) = overflows(&mut hub).pop() {
+                    assert_eq!(e, Event::Overflow(a));
+                    assert!(before <= RELAY_BYTES && relayed(&hub) > RELAY_BYTES, "{before} then {}", relayed(&hub));
+                    cut = Some(round);
+                }
+            }
+            if cut.is_some() {
+                break;
+            }
+        }
+        assert!(overflows(&mut hub).is_empty(), "b and c are kept");
+        assert!(cut.unwrap() > 150, "{cut:?} rounds");
+        // The frame that overdrew it went on anyway; what it sends now is dropped.
+        let held = relayed(&hub);
+        for f in flood(&mut leaf, lid) {
+            assert!(hub.receive(now, a, &f));
+        }
+        assert_eq!(relayed(&hub), held);
+        while hub.poll_transmit().is_some() {}
+        // Back at once: an ask, which has nothing relayed, isn't charged; its first relayed frame overdraws it again.
+        hub.joined(now, a, Route::Direct);
+        assert!(hub.receive(now, a, &[&[DOC_TAG][..], br#"{"d":"board","t":2,"ws":[],"r":[],"q":9}"#].concat()));
+        assert!(hub.queued(&a) > 0 && overflows(&mut hub).is_empty(), "answered, kept");
+        let f = flood(&mut leaf, lid);
+        assert!(hub.receive(now, a, &f[0]));
+        assert_eq!(overflows(&mut hub), [Event::Overflow(a)]);
+        // Once its budget is whole again it writes as before, and that budget is let go when a member leaves.
+        now = Instant::from_micros(hub.relays[&a]);
+        hub.joined(now, a, Route::Direct);
+        for f in flood(&mut leaf, lid) {
+            assert!(hub.receive(now, a, &f));
+        }
+        assert_eq!(overflows(&mut hub), []);
+        hub.left(now, c);
+        assert!(hub.relays.contains_key(&a), "not whole yet");
+        hub.left(Instant::from_micros(hub.relays[&a]), b);
+        assert!(hub.relays.is_empty());
+    }
+
+    /// The budget refills at RELAY_BYTES_PER_S: a member that has 90% of that relayed is never cut, and one that
+    /// has 110% is cut once the 10% over it adds up to RELAY_BYTES.
+    #[test]
+    fn a_relay_budget_refills_at_its_rate() {
+        for (pct, cut_s) in [(90, None), (110, Some(RELAY_BYTES as f64 / (RELAY_BYTES_PER_S as f64 / 10.0)))] {
+            let (mut hub, mut leaf, lid, [a, ..]) = star();
+            let mut us = 0u64;
+            let mut cut = None;
+            while us < 1_500_000_000 && cut.is_none() {
+                for f in flood(&mut leaf, lid) {
+                    assert!(hub.receive(Instant::from_micros(us), a, &f));
+                }
+                let bytes: usize =
+                    std::iter::from_fn(|| hub.poll_transmit()).filter(|(p, _)| *p != a).map(|(_, m)| m.len()).sum();
+                if !overflows(&mut hub).is_empty() {
+                    cut = Some(us as f64 / 1e6);
+                }
+                us += bytes as u64 * 1_000_000 * 100 / (RELAY_BYTES_PER_S as u64 * pct);
+            }
+            match (cut, cut_s) {
+                (None, None) => {}
+                // Each round is charged before its time passes: a round (under a second) early.
+                (Some(s), Some(want)) => assert!((s - want).abs() < 10.0, "{pct}%: cut at {s} s, not {want} s"),
+                _ => panic!("{pct}%: cut at {cut:?} s"),
+            }
+        }
     }
 }
