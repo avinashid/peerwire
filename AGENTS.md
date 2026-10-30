@@ -42,7 +42,8 @@ runs share this host's 4 cores, so running it on every branch as well costs more
 
   ```sh
   scripts/gate.sh --quick            # Rust tests, clippy, wasm build, size and imports, Node tests; no browser tests
-  scripts/gate.sh --quick --strict   # the same with clippy -D warnings and the debug fuzz run: use it if you changed Rust
+  scripts/gate.sh --quick --strict   # the same with clippy -D warnings, the debug fuzz run and CI's Node tests on Node 22:
+                                     # use it if you changed Rust
   node packages/js/test/<name>.mjs   # each browser test next to what you changed, e.g. netlab_*.mjs for Net Lab
   ```
 

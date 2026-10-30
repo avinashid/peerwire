@@ -5,8 +5,9 @@
 #   scripts/gate.sh             Rust tests, clippy, wasm build and checks, @peerwire/react build and types, Node glue,
 #                               browser tests (loopback)
 #   scripts/gate.sh --quick     skip the browser tests: an author's run before handing a branch over (see AGENTS.md)
-#   scripts/gate.sh --strict    clippy with -D warnings, and the fuzz tests again in a debug build (overflow checks):
-#                               the lead's one full run on the merged main, before a push
+#   scripts/gate.sh --strict    clippy with -D warnings, the fuzz tests again in a debug build (overflow checks), and
+#                               CI's Node tests again on CI's Node (22): the lead's one full run on the merged main,
+#                               before a push
 #   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch nos.lol, relay.primal.net, nostr.mom,
 #                               public STUN)
 #   scripts/gate.sh --full      run the Rust steps (tests, clippy, fmt, fuzz) even when no Rust changed: they are
@@ -19,7 +20,8 @@
 #
 # Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs),
 #      GATE_JOBS (Node tests at once, default 4), GATE_BASE (what "changed" is measured against, default origin/main),
-#      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 300).
+#      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 300),
+#      NODE_CI (the node binary --strict runs CI's Node tests on, default the newest ~/.nvm/versions/node/v<CI's>.*).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -86,7 +88,7 @@ NODE=(
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
 )
-NODE_FIRST='^node (room adopt|room retry|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
+NODE_FIRST='^node[0-9]* (room adopt|room retry|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
 # Browser tests (headless Chromium on loopback): one at a time, as WebRTC timing suffers under load.
 BROWSER=(
   "browser|node packages/js/test/browser.mjs 2"
@@ -137,6 +139,66 @@ step() {
 skip() {
   echo "SKIP  $1 ($2)" >"$LOGS/$(slug "$1").res"
 }
+
+# bad NAME REASON [LOG]: a step that failed before it could run.
+bad() {
+  echo "FAIL  $1 ($2)" >"$LOGS/$(slug "$1").res"
+  printf '%s\n' "${3:-$2}" >"$LOGS/$(slug "$1").log"
+}
+
+# --strict: CI's `wasm + node` tests again, on the Node CI runs them on (NB-055: Node 22's JSON.stringify recurses
+# and 26's doesn't, so NB-053 failed only in CI). Both come from CI's wasm job, so neither can drift from it: its
+# `run: node packages/<pkg>/test/<file>.mjs` steps, named as in NODE but tagged ("node22 room drain"), and its
+# node-version. They run in the Node pool, against the wasm and React builds above. No such Node here is a SKIP;
+# a job with no test this can read, or a test line it can't, is a FAIL.
+CI_YML=.github/workflows/ci.yml
+CI_TESTS=() CI_NAMES=() CI_NODE=""
+ci_tests() {
+  local job major tag bin v line p name s missed=""
+  local re='^ *(- )?run: node (packages/[A-Za-z0-9_-]+/test/[A-Za-z0-9_.-]+\.mjs( [A-Za-z0-9=._/-]+)*) *$'
+  job=$(awk '/^  wasm:/ { on = 1; next } on && /^  [^ ]/ { exit } on' "$CI_YML" 2>/dev/null)
+  major=$(sed -nE 's/^ *node-version: *([0-9]+) *$/\1/p' <<<"$job" | head -1)
+  if [ -z "$major" ]; then
+    CI_NAMES=("node ci")
+    bad "node ci" "no node-version in the wasm job of $CI_YML"
+    return
+  fi
+  tag=node$major
+  bin=${NODE_CI:-$(ls -d "$HOME/.nvm/versions/node/v$major".*/bin/node 2>/dev/null | sort -V | tail -1)}
+  if [ -z "$bin" ] || ! v=$("$bin" --version 2>/dev/null); then
+    CI_NAMES=("$tag")
+    skip "$tag" "no Node $major, CI's, here: nvm install $major, or set NODE_CI"
+    return
+  fi
+  if [[ $v != v$major.* ]]; then
+    CI_NAMES=("$tag")
+    skip "$tag" "NODE_CI=$bin is $v, not CI's $major"
+    return
+  fi
+  CI_NODE="$bin ($v)"
+  while IFS= read -r line; do
+    if ! [[ $line =~ $re ]]; then
+      missed+="$line"$'\n'
+      continue
+    fi
+    p=${BASH_REMATCH[2]} name=""
+    for s in "${NODE[@]}"; do [ "${s#*|}" = "node $p" ] && name=${s%%|*}; done
+    if [ -z "$name" ]; then
+      name=${p%% *} name=${name##*/} name="node ${name%.mjs}"
+    fi
+    CI_TESTS+=("$tag ${name#node }|$bin $p")
+    CI_NAMES+=("$tag ${name#node }")
+  done < <(grep -vE '^ *#' <<<"$job" | grep -E '/test/[^ ]*\.mjs')
+  if [ ${#CI_TESTS[@]} = 0 ] || [ -n "$missed" ]; then
+    CI_NAMES+=("$tag list")
+    if [ -n "$missed" ]; then
+      bad "$tag list" "CI test steps this can't read" "$missed"
+    else
+      bad "$tag list" "no run: node packages/<pkg>/test/<file>.mjs step in the wasm job of $CI_YML"
+    fi
+  fi
+}
+[ $strict = 0 ] || ci_tests
 
 # entry "name|command": one step from the NODE or BROWSER list. A step that runs past GATE_STEP_TIMEOUT fails.
 entry() {
@@ -238,16 +300,18 @@ fi
 # --no-wasm-tier-up: on a busy host, Node 26.7 sometimes deadlocks in process.exit() while V8 is still tiering the
 # wasm up in the background (room_drain.mjs hung after "all passed" in 5 of 280 runs four at a time, 0 of 100 one at
 # a time, 0 of 360 four at a time with the flag). The tests run as fast without it.
-# The slowest (5-22 s) start first, so the pool doesn't end waiting on one of them.
+# The slowest (5-22 s) start first, so the pool doesn't end waiting on one of them. CI's tests on CI's Node
+# (--strict) share the pool and the flag.
 node_pool() {
-  local s first slow
+  local s cmd first slow
   for first in 1 0; do
-    for s in "${NODE[@]}"; do
+    for s in "${NODE[@]}" "${CI_TESTS[@]}"; do
       slow=0
       [[ ${s%%|*} =~ $NODE_FIRST ]] && slow=1
       [ $slow = $first ] || continue
       while [ "$(jobs -rp | wc -l)" -ge "$GATE_JOBS" ]; do wait -n; done
-      entry "${s%%|*}|node --no-wasm-tier-up ${s#*|node }" &
+      cmd=${s#*|}
+      entry "${s%%|*}|${cmd%% *} --no-wasm-tier-up ${cmd#* }" &
     done
   done
   wait
@@ -277,6 +341,7 @@ lanes() {
 }
 
 echo "logs: $LOGS/   rust tests: $([ $nextest = 1 ] && echo cargo-nextest || echo cargo test)   node jobs: $GATE_JOBS"
+[ ${#CI_TESTS[@]} = 0 ] || echo "CI's Node tests: ${#CI_TESTS[@]}, on $CI_NODE"
 
 # 1. Builds, one after another: they share target/ and cargo's lock.
 step "wasm build" ./packages/js/build.sh
@@ -318,7 +383,9 @@ fi
 order=("cargo test" "cargo clippy")
 [ $strict = 0 ] || order+=("fuzz (debug)")
 order+=("cargo fmt" "wasm build" "wasm size+imports" "react build+types")
-for s in "${NODE[@]}" "${BROWSER[@]}"; do order+=("${s%%|*}"); done
+for s in "${NODE[@]}"; do order+=("${s%%|*}"); done
+order+=("${CI_NAMES[@]}")
+for s in "${BROWSER[@]}"; do order+=("${s%%|*}"); done
 order+=("nostr" "nostr (rust)")
 
 failed=0
