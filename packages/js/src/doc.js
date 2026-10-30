@@ -333,8 +333,10 @@ function parseFrame(m, peer) {
       if (type === 'm' ? !validKey(k) : k !== null) return null;
       // A delta carries only its sender's writes.
       if (t === DELTA && peerOf(w) !== peer) return null;
+      // Depth first: JSON.stringify recurses in some engines (Node 22's throws on a value 100000 deep).
+      if (!freezeJson(v)) return null;
       const text = JSON.stringify(v);
-      if (text === undefined || text.length > MAX_VALUE_LENGTH || !freezeJson(v)) return null;
+      if (text === undefined || text.length > MAX_VALUE_LENGTH) return null;
       entries.push({ w, n, c, t: type, coll, k, v, len: text.length + jsonLength(k) + jsonLength(coll) });
     }
   }
