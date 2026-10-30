@@ -56,7 +56,7 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `6c5af8f` (2026-10-30).** Fixes merged after `@peerwire/js` 0.2.0
+**Status as of main `e43391c` (2026-10-30).** Fixes merged after `@peerwire/js` 0.2.0
 and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
@@ -95,17 +95,20 @@ and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 | FL2-1 (Low), FL2-2 (Low) | **Fixed** by `63e5b72` and `ddae245`, merged `8314aa8` (a member relay that stalls data hands the link back to the pipe and is held off; a datagram names the peer whose channel it came on), reviewed 2026-10-24; residuals R1, R2, [Member relays for pipe links](#member-relays-for-pipe-links-fast-lane-2--fl2-1-fl2-2) |
 | FL2F-1 (Info) | **Fixed** by `0dcdff0`, merged `12fda2d` (a link roams from one member relay to another only through a member linked directly), reviewed 2026-10-26, same section |
 | FL3-1 (Info), FL3-2, FL3-3 (Low), FL3-N1, FL3-D1 (Info) | **Fixed** by `475c442`, `8958a23`, `af58aee`, `e995440` and `f4929d9`, merged `3ce181e` (a packet sealed before a punch roams nothing; a slow address is never raced; a relay that stalls data on a link with no slow address is held off and the others raced; race scores saturate; relay docs), reviewed 2026-10-26; NB43-I1 narrowed on native UDP, [Latency races](#latency-races-fast-lane-3--fl3-1fl3-3) |
-| RH-2 (Medium), RH-1, RH-3, RH-4 (Low) | **Fixed** by `78c4ebe` and `8126119`, merged `dec1554`, before `@peerwire/react` 0.1.0 was published (deep `accept` checks required, per-key clocks bounded by wall time, per-member quotas, catch-up by digest), reviewed 2026-10-24, [`@peerwire/react` hooks](#peerwirereact-hooks-nb-049--rh-1rh-6) |
+| RH-2 (Medium), RH-1, RH-3, RH-4 (Low) | **Fixed** by `78c4ebe` and `8126119`, merged `dec1554`, before `@peerwire/react` 0.1.0 was published (deep `accept` checks required, per-key clocks bounded by wall time, per-member quotas, catch-up by digest), reviewed 2026-10-24, [`@peerwire/react` hooks](#peerwirereact-hooks-nb-049--rh-1rh-6-nb53-1) |
 | RH-5 (Low), catch-up message size (Low), RH-6 (Info), N1 (nit) | **Fixed** by `12974c4`, merged `41cc24a`, in `@peerwire/react` 0.1.1 (a write members' data leaves no room for is dropped with a warning; catch-up messages capped at 512 KiB; versions kept instead of entries; a newer version an asker holds isn't sent), reviewed 2026-10-26, same section |
+| NB53-1 (Low), NB54-T1, NB54-I2 (Info) | **Fixed** by `0af9af3` and `5edfff0` (NB-054), merged `fd9d5fd` (a member's value nested past 64 is dropped before anything stringifies it, and ours throws; a catch-up entry that throws costs none of the others), reviewed 2026-10-30; residuals: apps on `@peerwire/react` 0.1.1 or earlier until they upgrade, NB53-I2 (Info, documented), same section |
+| NB54-I1 (Info) | **Fixed** by `d6e66f3` (NB-056), merged `e43391c`, before either walk was published (the depth checks of the store and of `room.doc()` walk arrays by index and objects by their own keys, as `JSON.stringify` does: a 1 MiB array of numbers costs a tenth or less, and keys a page put on a prototype no longer count), reviewed 2026-10-30, same section |
 | OUT-1, OUT-1a, OUT-1b (Low) | **Fixed** by `324cb8f` and `131f9f5`, merged `8271f1f` (a message over its lane's limit throws whatever the outbox holds; lanes are 0, 1 or 2 only; a presence is checked before it is stored), reviewed 2026-10-26, [JS endpoint and rooms](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | OUT-1c (Low), OUT-1d (Info) | **Fixed** by `f5c1f45`, merged `f28f027` (a presence JSON can't encode throws `TypeError`), and `d29d200`, merged `7bf37e4` (`usePeerwireRoom` fails the join and leaves when that presence comes mid-join), reviewed 2026-10-26, same section |
 | PBF-1, PBF-2 (Info) | **Fixed** by `344e90e`, merged `fc94833` (at most 16 last pipe batches at close; a test that a closed Nostr transport reads nothing), reviewed 2026-10-26, [Fallback pipes](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | CHAT-1, CHAT-2 (Low), CHAT-3 (Info) | **Fixed** by `dfa8ea0`, merged `92dfa42` with the chat demo (a guessable room name is flagged; an oversized name or QR code fails visibly; the wording says messages may pass through a member or the relays), reviewed 2026-10-27, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | RX-1 (Low), RX-2 (Info) | **Fixed** by `b0d354b` (the README's React example keeps string messages only, and only the last 100), reviewed 2026-10-24, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
-| DOC-1 (Medium), DOC-2, DOC-3 (Low) | **Fixed** by `979cdae`, `eaa2a22` and `a4fddfd`, with DOC-2a and DOC-3a by `d6b148c`, merged `c30ab0f`, before `room.doc()` was published (stamps taken however far ahead; no entry on our own writer that we didn't write; a frame costs about one pass over what it names), reviewed 2026-10-27, [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-6) |
+| DOC-1 (Medium), DOC-2, DOC-3 (Low) | **Fixed** by `979cdae`, `eaa2a22` and `a4fddfd`, with DOC-2a and DOC-3a by `d6b148c`, merged `c30ab0f`, before `room.doc()` was published (stamps taken however far ahead; no entry on our own writer that we didn't write; a frame costs about one pass over what it names), reviewed 2026-10-27, [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-7) |
 | DOC-2b (Low) | **Fixed** by `8b7946c`, merged `45c7cfd` (a catch-up's deletions passed on one range per range of it, charged to the sender's budget), reviewed 2026-10-27; residuals DOC-2c and I6, same section |
 | DOC-4, DOC-5 (Low) | **Fixed** by `f40cffa` (the merge of `ff51ce6`): a member over signalling is paused for a better routed one once per answer; a room with no doc open drops deflated doc frames unread. Reviewed 2026-10-28; residual I8, same section |
 | DOC-6 (Medium) | **Fixed** by `0374cb8` (NB-051), merged `b968f8c` (a doc entry whose type isn't a string drops its frame, so a member can no longer put an entry in a named map or log that makes the app's own calls on it throw), reviewed 2026-10-30; residual R1 (accepted), I9, I10 (Info), same section |
+| DOC-7 (Info) | **Fixed** by `0358c1d` (NB-053), merged `907b771`, before `room.doc()` was published (a frame value's depth is checked before `JSON.stringify`, which recurses on Node 22, so a value 100000 deep is dropped, not thrown, also in a copy on this device or the relays), reviewed 2026-10-30; NB53-I1 (Info, the test's FAIL line) fixed by `8be53e8`, merged `6e998db`, same section |
 | NB6F-1, NB6F-2, NB6F-3 (Low) | **Fixed** by `2e71dc5`, merged `8140998`, before `persist` was published (an opening that couldn't read the copy never writes it; one save at a time, paced at 256 KiB/s; a 5 s load deadline). The seal is security's call, in `52bb7e3`. Reviewed 2026-10-28; residuals R1–R4, [Docs kept on this device](#docs-kept-on-this-device-persist-nb-006f--nb6f-1nb6f-3) |
 | NB6F-2a (Info) | **Fixed** by `b45e15c`, merged `76bdd64` (each retry of a store that keeps failing waits twice as long, 1 s up to 64 s, until a save succeeds), reviewed 2026-10-29, same section |
 | I3a (Info), I4 (accepted) | **Fixed** by `1b0fc35` (the `VERSION` comment covers a copy read only in part; `close()` and `leave()` say they wait for the store), same section |
@@ -1213,7 +1216,7 @@ Residuals:
   at most about 5 s; any longer and the relay is held off.
 - **FL3-I2 (Info, accepted):** holds are per link and at most 8, as R2.
 
-### Shared docs, `room.doc()` (NB-006) — DOC-1…DOC-6
+### Shared docs, `room.doc()` (NB-006) — DOC-1…DOC-7
 
 `room.doc(name)` (`packages/js/src/doc.js`; room tag 7, and 8 when deflated) is a shared
 document of maps, sets and logs that every member holds. It is a delta-state CRDT: each
@@ -1237,7 +1240,11 @@ Reviewed by reading the code, with Node probes on fake networks of docs (no wasm
 - NB-006e at `558f53c` and its fixes `ff51ce6` (merged `f40cffa`, 2026-10-28), by reading
   the code and one mutant run of `doc_crdt.mjs`;
 - NB-051's fix `0374cb8` (merged `b968f8c`, 2026-10-30), with Node probes on `dbf0f7c`
-  with and without it.
+  with and without it;
+- NB-053's fix `0358c1d` (merged `907b771`, 2026-10-30), with `doc_crdt.mjs` run on
+  Node 22 and 26 with and without it;
+- NB-056's `d6e66f3` (merged `e43391c`, 2026-10-30), with a Node probe of `freezeJson`
+  as before and after it.
 
 **DOC-1 — A Lamport stamp far ahead was dropped for good (Medium).** NB-006 refused an
 entry whose stamp was more than 2^32 past our clock. Deltas aren't repeated, and an
@@ -1434,6 +1441,45 @@ Info (optional, not filed):
   would reset it. Nothing reaches that path with the fix in.
 - **I10.** The test sends deltas only: a `restore()` of a copy with a bad entry isn't
   pinned. It is the same line, so the delta test catches its mutant.
+
+**DOC-7 — A value nested deeply was stringified before its depth was checked (Info).**
+Found when CI, which runs Node 22, failed `rust_doc.mjs` on `6c5af8f`. `parseFrame`
+measured each entry's value with `JSON.stringify`, and only then checked that it nests
+at most `MAX_VALUE_DEPTH` (64) deep. `JSON.stringify` recurses in some engines: Node
+22.23 throws `RangeError` on a value 3000 to 5000 deep, where Node 26.7 and Chromium 153
+don't at 100000 (measured). `JSON.parse` is iterative in all three, so a member can send
+a value far deeper than that: theoretical, 1 MiB / 2 bytes a level (`[` and `]`) ≈
+524000 levels. On Node 22, by reading the code:
+- a delta or an answer holding one threw out of `parseFrame`. `room.js` drops a doc
+  frame that throws, so it cost what any malformed frame costs;
+- a whole save on the relays holding one, which anyone with the room key can make, threw
+  out of `joinRelays`. That ended the opening's read of the relays: the saves after it
+  weren't joined, and no save was made to the relays whose copy lacked what the doc
+  holds or expired within a week, until the doc next changed;
+- a copy on this device holding one made `restore()` throw, and the opening
+  `'blocked'`. No engine saves such a value, since it was dropped on the way in, so only
+  a tampered store gets there.
+
+Info: of the engines measured, only Node 22 throws; it needs a member or a key holder,
+who can already overwrite, delete or fill a doc; nothing outlasted the opening; and
+`room.doc()` hasn't been published. `peerwire-sync` parses JSON with a loop of its own
+and checks a value's depth before anything else (NB-006b), so it never had this.
+
+**Status: fixed** by `0358c1d` (NB-053), merged `907b771`, reviewed 2026-10-30.
+`parseFrame` checks the depth first, with `freezeJson` (a loop, so no value can overflow
+the stack), and stringifies only a value that passed. Deltas, answers, `restore()`,
+`joinRelays()` and `lacks()` all go through it, so a copy holding such a value is
+refused, not thrown. The doc_crdt test sends a value 100000 deep in a member's frame and
+in a copy; with the fix reverted it fails on Node 22, not on Node 26. Since NB-055
+(`6e998db`) the strict gate also runs CI's Node tests on Node 22, `rust_doc.mjs` among
+them, so a regression like this one fails before a push, not only in CI.
+`freezeJson` walked with `for…in` until NB-056: see NB54-I1, under
+[`@peerwire/react` hooks](#peerwirereact-hooks-nb-049--rh-1rh-6-nb53-1).
+
+Info (fixed):
+- **NB53-I1.** The test's FAIL line stringified the frame, so on Node 22 a regression
+  printed a bare stack trace instead. **Fixed** by `8be53e8` (NB-055, merged `6e998db`):
+  FAIL lines print frames through `show()`, which catches the throw.
 
 ### Docs kept on this device, `persist` (NB-006f) — NB6F-1…NB6F-3
 
@@ -1899,7 +1945,7 @@ when none is left.
 `crates/peerwire-sync` is `room.doc()` in Rust, for Godot (`open_doc`) and native apps
 (the C ABI's `pw_doc_*` and `pw_docs_*`, behind the `sync` feature, off by default). It
 speaks `doc.js`'s frames (room tag 7, JSON) with the same caps and budgets, so the
-threats and residuals of [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-6) apply as
+threats and residuals of [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-7) apply as
 written there. What differs:
 - **The star.** In Godot, joiners link to the host alone, so the host (the hub) passes
   on what each joiner's frame added, once to each other member, never back to its
@@ -2014,7 +2060,7 @@ applying it, and cut it again.
 - The snapshot is plain JSON, as designed: whoever can read where an app keeps it reads
   the doc.
 
-### `@peerwire/react` hooks (NB-049) — RH-1…RH-6
+### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
 `@peerwire/react` (`packages/react`, 0.1.0 published from `dec1554`) wraps a room in
 React hooks. Its store (`store.ts`, one per room) keeps shared keys (one value per key
@@ -2166,6 +2212,82 @@ changed the messages:
   version only when it wasn't newer than ours. **Fixed**: `tell()` records it either way,
   so the answer carries only that key's version. It still asks back only for a digest
   version we lack, and still keeps at most 1024 told versions per member.
+
+**NB53-1 — A member's value nested deeply could throw out of the store (Low).** Found in
+the review of NB-053 (DOC-7), with Node probes on the store's build. `merge` and
+`mergeLive` measured a member's shared or per-peer value with `JSON.stringify`, and
+nothing checked its depth, so a member could send one about 500000 deep (DOC-7). On Node
+22.23 (measured):
+- a `set`, `live` or `sync` holding a value 100000 deep (about 200 KB as JSON, under the
+  reliable lane's 1 MiB) threw `RangeError` out of the store's message listener.
+  `room.js` catches a listener's throw and throws it again from a `setTimeout`, so it is
+  an uncaught exception: a Node process ends, and a browser logs it;
+- in a `sync`, the entries after it and the answer to its ask were lost;
+- on Node 26.7, whose `JSON.stringify` doesn't recurse, a value 6000 deep (about 12 KB)
+  was kept and sent on to each joiner in catch-up. A joiner on Node 22 then threw the
+  same way, so the value outlived its sender.
+
+Low: it needs a member, and of the engines measured only Node 22's `JSON.stringify`
+throws (Chromium 153 doesn't; Firefox and Safari weren't measured). Where it throws, any
+member of a room can end a Node app in it.
+
+**Status: fixed** by `0af9af3` and `5edfff0` (NB-054), merged `fd9d5fd`, reviewed
+2026-10-30, by reading the code and re-running the probes on Node 22 and 26 against a
+build of `0af9af3`: nothing threw, the entry after the deep one was kept, and the value
+6000 deep was neither kept nor sent on.
+- `shallow()` checks a member's value with `doc.js`'s depth rule (the top level is 1; 64
+  deep is kept, 65 dropped), in a loop, before anything stringifies it. A value past it
+  is dropped like any value that is off.
+- Our own value past 64 throws `RangeError` from `setShared` and `setLive`, since
+  members would drop it. `MAX_VALUE_DEPTH` is exported.
+- Each entry of a catch-up is merged on its own, so one that throws costs none of the
+  others. A listener's error is thrown again once the answer is sent.
+- `store.mjs` stubs `JSON.stringify` to throw past 4000 levels, so its checks bite on
+  Node 26 too. With `5edfff0` it also sends the deep value down a middle branch of an
+  array and of an object, and has a per-peer listener throw in a catch-up (NB54-T1, a
+  test gap: three mutants of the walk and of the catch-up passed without them).
+- `5edfff0` also notes in `index.d.ts` that `peer-join`'s presence and `getPresence()`
+  are member JSON, which can nest deeply (NB54-I2).
+
+Residuals (accepted):
+- **Old versions.** Apps on `@peerwire/react` 0.1.1 or earlier, and on the
+  `@peerwire/js` 0.2.0 or earlier they run on, stay exposed until they upgrade: to
+  NB53-1 on Node 22, and to NB53-I2 without its note. The first release of each after
+  `fd9d5fd` should say so in its notes. `room.doc()` hasn't been published, so no
+  release has DOC-7.
+- **NB53-I2 (Info).** Room `message` and `presence` values reach the app as parsed, up
+  to about 500000 deep (DOC-7). The js README and `index.d.ts` say so since `0af9af3`:
+  an app that stringifies member data, or walks it by recursion, must bound its depth
+  first.
+
+**NB54-I1 — The depth checks walked with `for…in` (Info).** Found in the review of
+NB-054. `shallow()` and `doc.js`'s `freezeJson` walked each array and object with
+`for…in`:
+- it makes a string of every array index. Timing each walk as it was and as it is, on a
+  freshly parsed 1 MiB `[0,0,…]` (Node 22.23, median of 7): `freezeJson` took 60.5 ms
+  and `shallow()` 55.4 ms, against 9.9 ms to parse it. A member's value costs that
+  before the 64 KiB cap drops it;
+- it walks the enumerable keys an object inherits, which `JSON.stringify` skips. On a
+  page whose own script put an enumerable object on `Object.prototype`, every object
+  nested past 64 through it. The store dropped every member's object or array value,
+  the doc every frame holding one, our own `setShared({})` and `map(…).set(k, {})`
+  threw, and `freezeJson` froze the page's object. A key under a number on
+  `Array.prototype` or `Object.prototype`, holding a value nested past 64, made `[]` or
+  `{"a":0}` drop.
+
+Info: the cost is linear and needs a member. The keys need the page's own script, since
+a member's JSON can't put one on a prototype (`"__proto__"` parses as an own key). And
+neither walk had been published.
+
+**Status: fixed** by `d6e66f3` (NB-056), merged `e43391c`, reviewed 2026-10-30. Both
+walks go over arrays by index and objects by `Object.keys`, as `JSON.stringify` does, so
+they see what will be serialized; the depth rule is unchanged. The same 1 MiB array now
+takes 5.5 ms in `freezeJson` and 0.5 ms in `shallow()`. An array of empty arrays or
+objects costs 30 to 80% less than it did, and a wide object the same. A `null` inside
+is passed over as before; that check is now load-bearing (`Object.keys(null)` throws),
+and the tests hold nested `null`s. `store.mjs` and `doc_crdt.mjs` put an object on
+`Object.prototype` for a run, and check that a 64-deep middle branch is kept. A probe of
+both walks found an own `"__proto__"` key 65 deep still dropped.
 
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
