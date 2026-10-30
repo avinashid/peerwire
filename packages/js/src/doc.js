@@ -179,7 +179,8 @@ function collection(name) {
 const jsonLength = (s) => JSON.stringify(s).length;
 
 // Freezes a value parsed from JSON, unless it nests deeper than MAX_VALUE_DEPTH: then false. A loop, not
-// recursion, so no value can overflow the stack.
+// recursion, so no value can overflow the stack. Arrays by index and objects by their own keys, as JSON.stringify
+// takes them: for…in makes a string of every index, and walks keys a page put on Object.prototype.
 function freezeJson(v) {
   if (v === null || typeof v !== 'object') return true;
   const stack = [[v, 1]];
@@ -187,9 +188,16 @@ function freezeJson(v) {
     const [o, depth] = stack.pop();
     if (depth > MAX_VALUE_DEPTH) return false;
     Object.freeze(o);
-    for (const k in o) {
-      const x = o[k];
-      if (x !== null && typeof x === 'object') stack.push([x, depth + 1]);
+    if (Array.isArray(o)) {
+      for (let i = 0; i < o.length; i++) {
+        const x = o[i];
+        if (x !== null && typeof x === 'object') stack.push([x, depth + 1]);
+      }
+    } else {
+      for (const k of Object.keys(o)) {
+        const x = o[k];
+        if (x !== null && typeof x === 'object') stack.push([x, depth + 1]);
+      }
     }
   }
   return true;
