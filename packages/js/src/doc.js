@@ -123,6 +123,10 @@ const DELTA = 1;
 const ASK = 2;
 const ANSWER = 3;
 const MORE = 4;
+// "Saving": a member is writing the doc's copy on the relays, save `s` (relays.js). Only a doc kept on the relays
+// reads it; any other drops it as malformed.
+const SAVING = 5;
+const SAVE_ID = /^[0-9a-f]{16}$/;
 const TYPES = { m: 'map', s: 'set', l: 'log' };
 const WRITER = /^[0-9a-f]{72}$/;
 // Estimated UTF-8 bytes in a frame: 3 per character of JSON text, and room for numbers and punctuation (a
@@ -339,6 +343,18 @@ function parseFrame(m, peer) {
   return t === ANSWER && m.q !== undefined ? Object.assign(f, { q: m.q, i: m.i, n: m.n, s: m.s === 1 }) : f;
 }
 
+// The frames of a copy (`f`: the one on this device, or a piece of the one on the relays), each checked as a member's
+// answer to no ask, for doc `name`: null if any is off.
+export function copyFrames(name, f) {
+  const frames = [];
+  for (const m of f) {
+    const x = m?.d === name && m.t === ANSWER && m.q === undefined ? parseFrame(m, null) : null;
+    if (!x) return null;
+    frames.push(x);
+  }
+  return frames;
+}
+
 // The answer to `m`, a member's ask for a doc we don't have open: nothing, so that the asker counts us as
 // answered rather than waiting for us. Null if `m` isn't an ask. About the ask's size, and to its sender only.
 export function unopened(m) {
@@ -354,12 +370,18 @@ export function unopened(m) {
 // save(copy) -> the bytes it wrote, `copy` may be a promise of it, or of null: nothing to save; forget(); each
 // a promise that rejects if
 // the storage fails, and each taking effect in the order called, as a doc closed and opened again at once loads
-// what the closing one saved) }.
+// what the closing one saved), relays (the copy on the relays, a RelayCopy, or none), wall() (ms since the epoch,
+// for the relays; Date.now() if not given) }.
 export class Doc {
   constructor(name, host) {
     if (!validName(name)) throw new RangeError(`a doc name is 1 to ${MAX_NAME_LENGTH} characters`);
     this.name = name;
     this.host = host;
+    // The copy on the relays: the doc tells it of changes (not those it joined itself: `fromRelays`, while it does)
+    // and members' saves, and it joins whole saves from the relays (see joinRelays).
+    this.relays = host.relays ?? null;
+    this.fromRelays = false;
+    this.relaySeen = 0; // `version` as the copy on the relays last heard of it
     this.entries = new Map(); // id -> entry { id, w, n, c, t, coll, k, v, len }
     this.byWriter = new Map(); // writer -> Map(n -> entry)
     this.ctx = new Context();
@@ -467,6 +489,7 @@ export class Doc {
       this.write();
     }
     this.closed = true;
+    this.relays?.close();
     this.saveWait?.();
     this.saveWait = null;
     this.cancelWait?.();
@@ -490,17 +513,20 @@ export class Doc {
     this.colls.clear();
   }
 
-  // Deletes the copy this device keeps and keeps none from now on, until the doc is opened with a store again.
-  // What the doc holds stays. Resolves once the copy is gone; rejects if the storage fails.
+  // Deletes the copy this device keeps and keeps none from now on, until the doc is opened with a store again;
+  // and wipes the copy on the relays (for every member, until one saves again), best effort, saving none there
+  // either. What the doc holds stays. Resolves once the copy is gone and the relays have answered; rejects if the
+  // storage fails.
   forget() {
-    if (!this.store) return Promise.resolve();
+    const wipe = this.relays?.forget() ?? null;
+    if (!this.store) return wipe ?? Promise.resolve();
     this.forgotten = true;
     this.saveWait?.();
     this.saveWait = null;
     const store = this.store;
     const gone = (async () => store.forget())();
     this.saving = gone.catch(() => {});
-    return gone;
+    return wipe ? Promise.all([gone, wipe]).then(() => {}) : gone;
   }
 
   // The room's side.
@@ -517,6 +543,7 @@ export class Doc {
       });
       this.load();
     }
+    this.relays?.open(this);
     for (const p of this.host.peers()) this.startAsk(p);
     this.emitSync();
   }
@@ -571,7 +598,9 @@ export class Doc {
   }
 
   joined(peer) {
-    if (!this.closed) this.startAsk(peer);
+    if (this.closed) return;
+    this.relays?.joined(peer);
+    this.startAsk(peer);
   }
 
   left(peer) {
@@ -592,6 +621,10 @@ export class Doc {
   // A doc frame from member `peer`, already parsed from JSON. One that is malformed is dropped.
   receive(peer, m) {
     if (this.closed) return;
+    if (m?.t === SAVING) {
+      if (this.relays && typeof m.s === 'string' && SAVE_ID.test(m.s)) this.relays.saving(peer, m.s);
+      return;
+    }
     const f = parseFrame(m, peer);
     if (!f) return;
     if (f.t === ASK) return this.onAsk(peer, f);
@@ -600,8 +633,9 @@ export class Doc {
     if (f.q !== undefined) this.landed(peer, f);
   }
 
-  // Joins frame `f`, a delta or an answer from member `peer`, or from the copy on this device (`peer` null).
-  join(f, peer) {
+  // Joins frame `f`, a delta or an answer from member `peer`, or from a copy (`peer` null): the one on this device,
+  // whose changes come from ourselves, or on the relays (`origin` 'relays').
+  join(f, peer, origin) {
     this.claimed = false;
     this.claim = null;
     this.unheard = false;
@@ -616,7 +650,7 @@ export class Doc {
       this.dropped?.push([this.writer, a, b]);
     }
     if (this.claimed) this.newIncarnation();
-    this.flush(peer ?? this.host.self, false);
+    this.flush(origin ?? peer ?? this.host.self, false);
     // Entries a catch-up told us are dead go from our other members too, as if we deleted them: they may
     // have missed the deletion as we did (a partition), or never been told (a member's claim sent to some).
     // One range for each range of the answer that dropped any (see kill), while the sender's budget allows.
@@ -951,9 +985,13 @@ export class Doc {
   }
 
   // Emits 'change' for what a frame or write changed, now that all of it is in, and saves a doc kept on this
-  // device soon if it changed.
+  // device soon if it changed, and on the relays (unless it came from there).
   flush(from, local) {
     if (this.version !== this.savedVersion) this.dirty();
+    if (this.version !== this.relaySeen) {
+      this.relaySeen = this.version;
+      if (!this.fromRelays) this.relays?.changed();
+    }
     const touched = [...this.touched.values()].flatMap((refs) => [...refs.values()]);
     this.touched.clear();
     for (const { coll, ref, before } of touched) {
@@ -1180,12 +1218,15 @@ export class Doc {
 
   // Where catching up stands: 'alone' with no member to catch up from, 'synced' once caught up (see synced),
   // else 'loading' from the member whose turn it is, with `have` of the `total` entries its answer carries
-  // (as it says; 0 of 0 until its first piece lands).
+  // (as it says; 0 of 0 until its first piece lands). And where the doc came from: 'members' once caught up,
+  // else 'relays' once it joined a save on the relays, `at` (ms) the time its saver claims, or null.
   status() {
     const peers = this.host.peers().length;
-    if (!peers || this.synced) return { state: peers ? 'synced' : 'alone', from: null, have: 0, total: 0 };
+    const source = this.synced ? 'members' : this.relays?.at != null ? 'relays' : null;
+    const at = source === 'relays' ? this.relays.at : null;
+    if (!peers || this.synced) return { state: peers ? 'synced' : 'alone', from: null, have: 0, total: 0, source, at };
     const a = this.asking ? this.members.get(this.asking)?.ask : null;
-    return { state: 'loading', from: this.asking, have: a ? Math.min(a.got, a.n) : 0, total: a?.n ?? 0 };
+    return { state: 'loading', from: this.asking, have: a ? Math.min(a.got, a.n) : 0, total: a?.n ?? 0, source, at };
   }
 
   // Emits 'sync' if where catching up stands changed. Every member having answered counts as caught up: none
@@ -1196,7 +1237,7 @@ export class Doc {
     if (!this.synced && peers.length && peers.every((p) => this.members.get(p)?.answered)) this.synced = true;
     const s = this.status();
     const o = this.sync;
-    if (s.state === o.state && s.from === o.from && s.have === o.have && s.total === o.total) return;
+    if (s.state === o.state && s.from === o.from && s.have === o.have && s.total === o.total && s.source === o.source && s.at === o.at) return;
     this.sync = Object.freeze(s);
     for (const fn of this.syncHandlers) {
       try {
@@ -1207,6 +1248,7 @@ export class Doc {
         });
       }
     }
+    this.relays?.synced();
   }
 
   // Our context, so the member answers with what we lack, and `q` for the answer to name. Under MESSAGE_BYTES at
@@ -1348,22 +1390,64 @@ export class Doc {
   // so the copy's dots stay that writer's and aren't taken for a claim on ours (see put).
   restore(copy) {
     if (copy === null || typeof copy !== 'object' || copy.v !== 1 || !index(copy.c) || !Array.isArray(copy.f) || copy.f.length > STORED_FRAMES) return false;
-    const frames = [];
-    for (const m of copy.f) {
-      const f = m?.d === this.name && m.t === ANSWER && m.q === undefined ? parseFrame(m, null) : null;
-      if (!f) return false;
-      frames.push(f);
-    }
-    if (!this.n && copy.f.some((m) => m.ws.includes(this.writer))) this.newIncarnation(new Set(copy.f.flatMap((m) => m.ws)));
+    const frames = copyFrames(this.name, copy.f);
+    if (!frames) return false;
+    this.joinCopy(frames, copy.f, copy.c, null);
+    return true;
+  }
+
+  // Joins `frames`, a copy's checked frames (`f` as they came), and its Lamport clock `c`; `origin` as in join.
+  joinCopy(frames, f, c, origin) {
+    if (!this.n && f.some((m) => m.ws.includes(this.writer))) this.newIncarnation(new Set(f.flatMap((m) => m.ws)));
     // The frames hold the entries first, then the dead dots, so until those join, each live entry between dead
     // dots takes a range of its own: the context may hold one more for each entry the doc can hold meanwhile,
     // then forgets what is past MAX_RANGES, as ever (a copy of a doc that held at most that many loads as it was).
     this.rangeCap = MAX_RANGES + MAX_ENTRIES;
-    for (const f of frames) this.join(f, null);
+    for (const x of frames) this.join(x, null, origin);
     this.rangeCap = MAX_RANGES;
     if (this.ctx.size >= MAX_RANGES) this.makeRoom(null);
-    if (copy.c > this.clock) this.clock = copy.c;
+    if (c > this.clock) this.clock = c;
+  }
+
+  // The copy on the relays (relays.js).
+
+  // Joins the pieces of a whole save from the relays ({ c, f } each), as one copy, with the origin 'relays': its
+  // deletions say they came from there. False, with nothing joined, if any frame is off.
+  joinRelays(pieces) {
+    const f = pieces.flatMap((p) => p.f);
+    const frames = copyFrames(this.name, f);
+    if (!frames) return false;
+    this.fromRelays = true;
+    try {
+      this.joinCopy(frames, f, Math.max(...pieces.map((p) => p.c)), 'relays');
+    } finally {
+      this.fromRelays = false;
+    }
     return true;
+  }
+
+  // Whether the doc holds something the whole save of `pieces` lacks: a dot it hasn't seen, or a deletion (a dot it
+  // holds that we have seen and don't hold). True if its frames are off.
+  lacks(pieces) {
+    const frames = copyFrames(this.name, pieces.flatMap((p) => p.f));
+    if (!frames) return true;
+    const ranges = [];
+    const live = [];
+    for (const x of frames) {
+      for (const e of x.entries) {
+        ranges.push([e.w, e.n, e.n]);
+        live.push(e);
+      }
+      ranges.push(...x.ranges);
+    }
+    const theirs = Context.of(ranges);
+    for (const [w, l] of this.ctx.writers) for (const [a, b] of l) if (!theirs.covers(w, a, b)) return true;
+    return live.some((e) => !this.entries.has(`${e.w}.${e.n}`) && this.ctx.has(e.w, e.n));
+  }
+
+  // The doc for a save on the relays: its clock, entries, dead ranges, and how they go in answer frames.
+  relayItems() {
+    return { c: this.clock, entries: [...this.entries.values()], ranges: this.dead(), pack: (entries, ranges) => this.pack(ANSWER, entries, ranges, false) };
   }
 
   // Saves the doc SAVE_MS from now, or once the last save allows (see saved), unless a save is due already

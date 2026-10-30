@@ -196,8 +196,9 @@ export declare class Room {
   adoptChannel(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel): Promise<boolean>;
   /** The shared document `name` (1 to 128 characters), opened on the first call and the same object until it is
    * closed: the same name on every member is the same document. `options` count when it opens. Throws after
-   * `leave()`, which closes the room's docs, TypeError for a `persist` it can't use, and RangeError for a name with
-   * `persist` that isn't well-formed (a lone surrogate). See {@link Doc}. */
+   * `leave()`, which closes the room's docs, TypeError for a `persist` it can't use or `relays: true` without Nostr
+   * signalling, and RangeError for a name with `persist` or `relays` that isn't well-formed (a lone surrogate) or for
+   * `relays: true` with a roomId that hasn't `randomRoomId()`'s shape. See {@link Doc}. */
   doc(name: string, options?: DocOptions): Doc;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   rtt(peer: PeerId): number | null;
@@ -237,8 +238,9 @@ export interface DocChange {
   value: unknown;
   /** The key or item is gone: deleted, or trimmed from a log. */
   deleted?: true;
-  /** The writer of the value now shown or, for a deletion, the member it came from (us for our own writes). */
-  from: PeerId;
+  /** The writer of the value now shown or, for a deletion, the member it came from (us for our own writes), or
+   * 'relays' for one in a save joined from the relays (`relays: true`). */
+  from: PeerId | 'relays';
   /** Our own write. */
   local: boolean;
 }
@@ -256,6 +258,12 @@ export interface DocSync {
    * the answer. */
   readonly have: number;
   readonly total: number;
+  /** Where the doc came from: 'members' once caught up from them; else 'relays' once it joined a save from the relays
+   * (`relays: true`), as of `at`; null before either. */
+  readonly source: 'members' | 'relays' | null;
+  /** With `source` 'relays': when the newest save joined was made (ms since the epoch), as its saver claims it. For
+   * display only ("as of 10:42"). Null otherwise. */
+  readonly at: number | null;
 }
 
 /** One value per key. A `set` replaces the values its writer has seen; of values set at the same time, the one
@@ -315,6 +323,25 @@ export interface DocOptions {
    * under a key from the room key, so the storage shows neither the room, the doc nor what it holds; anyone who
    * knows the roomId can read it, as they could join the room. */
   persist?: boolean | DocStore;
+  /** Keeps a sealed copy of the doc on the Nostr relays the room signals over (`signaling: 'nostr'`), so a member that
+   * opens it while no other member is online still gets it: from the relays, then live from members as ever.
+   *
+   * **Use a roomId from `randomRoomId()`.** Anyone with the roomId can read this copy at any time, from any relay,
+   * without joining the room and with no member online: nobody sees it read. Relays serve stored events to anyone,
+   * and mirrors and archives may keep them, whatever expiry or deletion asks, so anything saved can be copied and
+   * kept, and deleting from the doc doesn't remove old saves. There is no revoking a link: only a new roomId cuts off
+   * someone who once had it. Its key is also a stored test for a guessed roomId. So `relays: true` throws RangeError
+   * for a roomId that hasn't `randomRoomId()`'s shape (22 or more base64url characters); the check catches mistakes,
+   * not a guessable roomId of that shape. Anyone with the roomId can also overwrite or wipe the copy: members
+   * restore it at their next save, and it is best effort, the copies on members' devices (`persist`) being the main
+   * store. Relays keep it 30 days after its last save (opening the doc within a week of that saves it again), or
+   * less.
+   *
+   * Saved by one member at a time, behind signalling: a while after the doc changes (10 s without a change, then up
+   * to 30 s more, at most once in 5 minutes, after reading what the relays hold), and by the last member online
+   * when the page hides. At most 8 pieces of 44 KiB deflated (a few MB of JSON); a larger doc keeps none, with a
+   * warning. Throws TypeError without Nostr signalling, or where there is no `CompressionStream('deflate-raw')`. */
+  relays?: boolean;
 }
 
 /** A shared document from `room.doc(name)`: maps, sets and logs that every member holds and that converge. Writes
@@ -344,7 +371,9 @@ export interface Doc {
   off(event: 'change', fn: (change: DocChange) => void): void;
   off(event: 'sync', fn: (sync: DocSync) => void): void;
   /** Deletes the copy this device keeps (`persist`), and keeps none until the doc is opened with `persist` again.
-   * What the doc holds stays. Rejects if the storage fails. */
+   * With `relays: true`, also wipes the copy on the relays, best effort, **for every member** until another member
+   * saves (a relay or archive may still keep what it copied), and saves none there from now on. What the doc holds
+   * stays. Resolves once the copy is gone and the relays have answered; rejects if the storage fails. */
   forget(): Promise<void>;
   /** Stops syncing and forgets the doc; `room.doc(name)` later opens it afresh and catches up. Writes after it
    * throw. A doc kept on this device saves first: the promise resolves once the store has the copy, however long

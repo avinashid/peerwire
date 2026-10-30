@@ -1,7 +1,8 @@
 # Keeping a room's data while nobody is online (`peerwire-store`, NB-006g)
 
-Status: design, 2026-10-30, revised after security's review (NB-006g-1 to -10). No code
-yet. Measured on main `dbf0f7c`.
+Status: design, 2026-10-30, revised after security's review (NB-006g-1 to -10). Built in
+JS (`packages/js/src/relays.js`, NB-006l), with the rules under "When to save" settled
+while building it. Measured on main `dbf0f7c`.
 
 ## The gap
 
@@ -135,14 +136,24 @@ from relays as of the save's time (the saver's claim, for display only).
 
 **When to save.** One saver per room at a time:
 - After a change, wait for 10 s of quiet plus a random 0 to 30 s. The member whose
-  timer fires first sends its members a small doc frame `{ d, t: 5, s }` ("saving").
-  A `doc.js` or Rust member without the store drops `t: 5` as a malformed frame,
-  whole, as it does today.
-- A `t: 5` defers our save to at most 5 minutes after it first deferred it; later ones
-  don't push it further, and we honour at most one per member per 5 minutes. When the
-  deferral ends we read as usual: if that member's save `s` isn't complete on the
-  relays that answered, we ignore its `t: 5`s until it joins again, and save. So a
-  member that announces saves it never makes can't stop the repair of a wipe.
+  timer fires first reads and joins (below), and once it knows it writes to at least
+  one relay, just before its first piece, sends its members a small doc frame
+  `{ d, t: 5, s }` ("saving"). Not at the timer: a member that announced, then found
+  nothing to write, would be ignored as one that announces saves it never makes. If
+  another member's `t: 5` comes during our read, before our first piece, we write
+  nothing and wait out that deferral. Two members announcing within the same second
+  can both save: on each relay the other bank keeps its complete save, and the next
+  round repairs it. A `doc.js` or Rust member without the store drops `t: 5` as a
+  malformed frame, whole, as it does today.
+- A `t: 5` defers our save to at most 5 minutes after it first deferred it, and a save
+  is then due whether or not the doc changed; later ones don't push it further until
+  that save has run (one deferral per save, so a `t: 5` sent just as a deferral ends
+  can't start another), and we honour at most one per member per 5 minutes. When the
+  deferral ends we read as usual (after the same random 0 to 30 s, so the members
+  don't all read at once): if that member's save `s` isn't complete on **at least one**
+  relay that answered, we ignore its `t: 5`s until it joins again, and save. So a
+  member that announces saves it never makes can't stop the repair of a wipe, and one
+  whose save a relay refused for its rate isn't ignored.
 - A save starts only after a read that was complete, found a complete save or nothing,
   and joined it, whether the doc is `synced` or `'alone'` (so an author drawing alone
   saves). It goes only to relays whose read was complete, and only if the join left us
@@ -156,8 +167,13 @@ from relays as of the save's time (the saver's claim, for display only).
   `created_at` a year ahead (`nostr.js` doesn't check signatures) can't fail our
   saves to the others. If an ignored event sits in a slot we must write, the save
   fails on that relay only. A refused write fails the save on that relay.
-- At most one save per doc every 5 minutes per member, and only the last member online
-  (`'alone'`) makes the best-effort save when the page hides.
+- At most one save per doc every 5 minutes per member. A save that no relay took is
+  due again at the next one.
+- Only the last member online (`'alone'`) makes the best-effort save when the page
+  hides, if the doc changed since its last save that a relay took, at most once a
+  minute: past the 5-minute limit, so an author who saved a minute ago, drew more and
+  switched away still saves, in place of a timer save waiting. It goes the same way as
+  any save: a complete read and join, then `t: 5` per the first rule.
 - Every piece expires (NIP-40) 30 days after its save.
 
 **Forgetting.** `forget()` also wipes the slots, best effort: an empty piece in each,

@@ -12,8 +12,9 @@
 //   recipient ids, so a link made any other way still has to prove the key.
 //
 // store.js derives a doc's copy key and id under the room key with 'pw-store-key' and
-// 'pw-store-id' (Rust adds 'pw-offer'). Labels aren't length-prefixed, so no label may be
-// a prefix of another: each MAC then names its use.
+// 'pw-store-id', and relays.js the key, slots and signer of a doc's copy on the relays with
+// 'pw-snap-key', 'pw-snap-id' and 'pw-snap-sk' (Rust adds 'pw-offer'). Labels aren't
+// length-prefixed, so no label may be a prefix of another: each MAC then names its use.
 //
 // A room whose name can be guessed is a public lobby: use roomIds with at least
 // 128 random bits (randomRoomId()).
