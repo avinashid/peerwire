@@ -15,6 +15,14 @@ const fail = (m) => {
   console.error(`FAIL ${m}`);
   process.exit(1);
 };
+// A frame for a FAIL line, its first n characters. JSON.stringify throws on some (Node 22's on a value 100000 deep).
+const show = (m, n) => {
+  try {
+    return String(JSON.stringify(m)).slice(0, n);
+  } catch (e) {
+    return `(a frame JSON.stringify can't print: ${e})`;
+  }
+};
 const id = (c) => c.repeat(64);
 const KEEP = 6;
 
@@ -623,9 +631,9 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
     try {
       b.doc.receive(a.self, m);
     } catch (e) {
-      fail(`${JSON.stringify(m)?.slice(0, 80)} threw ${e}`);
+      fail(`${show(m, 80)} threw ${e}`);
     }
-    if (state(b.doc) !== before || sent) fail(`${JSON.stringify(m).slice(0, 120)} changed the doc or was answered`);
+    if (state(b.doc) !== before || sent) fail(`${show(m, 120)} changed the doc or was answered`);
   }
   b.host.send = bsend;
   // A copy (on this device or the relays) holding that value is refused, not thrown.

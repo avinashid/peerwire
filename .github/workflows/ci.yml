@@ -57,6 +57,8 @@ jobs:
         with:
           node-version: 22
       - run: ./packages/js/build.sh
+      # scripts/gate.sh --strict reads this job's node-version and its `- run: node packages/<pkg>/test/<file>.mjs`
+      # steps, and runs those again on that Node: keep a test step in that form (a FAIL there says which isn't).
       - name: Size (<= WASM_MAX_BYTES) and zero imports
         run: node .github/scripts/wasm-check.mjs packages/js/pkg/peerwire_ffi.wasm "$WASM_MAX_BYTES"
       - run: node packages/js/test/node_pair.mjs

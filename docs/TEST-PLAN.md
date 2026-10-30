@@ -9,7 +9,7 @@ One command runs it:
 ```sh
 scripts/gate.sh             # everything below that stays on loopback
 scripts/gate.sh --quick     # skip the browser tests (no Playwright needed)
-scripts/gate.sh --strict    # clippy with -D warnings, and the fuzz tests again in a debug build
+scripts/gate.sh --strict    # clippy with -D warnings, the fuzz tests again in a debug build, CI's Node tests on Node 22
 scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a change touches signaling
 scripts/gate.sh --full      # the Rust steps even when no Rust changed since origin/main (GATE_BASE)
 ```
@@ -24,6 +24,7 @@ browser tests.
 | Rust tests | `cargo nextest run --workspace --release --profile gate` and `cargo test --doc --workspace --release` (`cargo test --workspace --release` without cargo-nextest) | every test passes (ignored tests are known gaps, below) |
 | Lints | `cargo clippy --workspace --all-targets` (`-- -D warnings` with `--strict`) | no errors; `--strict` is clean today |
 | Fuzz, debug build (`--strict`) | `cargo nextest run --profile gate --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz` (or `cargo test` with the same arguments) | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
+| Node tests on CI's Node (`--strict`) | CI's `wasm + node` job's `node packages/<pkg>/test/<file>.mjs` steps again, on its `node-version` (22): the newest `~/.nvm/versions/node/v22.*`, or `NODE_CI`. Both are read from `.github/workflows/ci.yml`, so neither drifts from CI; each is its own step, `node22 <name>` | each passes (NB-055: Node 22's `JSON.stringify` recurses and 26's doesn't, so NB-053 failed only in CI); no Node 22 is one SKIP with its reason, a CI test step it can't read a FAIL (`node22 list`) |
 | Format | `cargo fmt --all -- --check` | no diff (skipped if rustfmt is not installed) |
 | wasm build | `packages/js/build.sh` | builds `packages/js/pkg/peerwire_ffi.wasm` |
 | wasm size and imports | `WebAssembly.Module.imports` in Node | ≤ `WASM_MAX_BYTES` (350 KB) and 0 imports |
@@ -80,6 +81,8 @@ warm build: 163–174 s over four runs on `f253797`, against 273 s for the old o
 commit. The Rust tests take 27 s under cargo-nextest and the debug fuzz run about 30 s; the Node tests take 22 s,
 set by `room_adopt.mjs`; the browser tests take 130–145 s and set the total. A fresh worktree compiles the
 workspace first and takes several times that. With no Rust change since `origin/main`, the Rust steps are skipped.
+Since NB-006d, `doc_catchup.mjs` (72 s) sets the Node tests' time, and starts first. `--strict` adds CI's 24 Node
+tests on Node 22 to the same pool: 88 s for the pool alone, against 59 s without them (four jobs, 30 Oct).
 
 **Release gate:** `scripts/gate.sh --strict` green on `main`, plus `--nostr` once per release, plus the CI matrix
 (below) green on all three OSes.

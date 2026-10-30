@@ -471,7 +471,7 @@ cargo build --workspace --release
 cargo test  --workspace --release
 scripts/gate.sh              # tests, clippy, wasm build + size check, JS glue, headless browser tests
 scripts/gate.sh --quick      # skip the browser tests
-scripts/gate.sh --strict     # clippy with -D warnings
+scripts/gate.sh --strict     # clippy with -D warnings, debug fuzz run, CI's Node tests on Node 22
 scripts/gate.sh --nostr      # also the opt-in tests against public Nostr relays and STUN
 ```
 
