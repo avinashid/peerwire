@@ -656,6 +656,39 @@ console.log('limits: our mistakes throw; a full doc refuses writes with a warnin
 }
 console.log('member data: malformed frames dropped whole without a throw; 20000 mutated frames never threw');
 
+// An entry's type must be a string. ['m'] once passed, since Object.hasOwn turns a key into a string. The entry
+// it let in was held outside its collection, or made a collection that threw on every write to it later, the
+// app's own and its members' alike (DOC-6). Each is dropped whole, its dot unseen, before and after the map exists.
+{
+  const net = new Net(7);
+  const [a, b] = ['a', 'b'].map((x) => net.node(x));
+  net.mesh([a, b]);
+  net.run();
+  const w = a.doc.writer;
+  let F = 3e6;
+  for (const type of [['m'], ['s'], ['l'], [['m']]]) {
+    for (const coll of [`fresh${F}`, 'meta']) {
+      if (coll === 'meta') b.doc.map('meta').set('title', 'Plans');
+      const held = b.doc.entries.size;
+      const m = { d: 'board', t: 1, ws: [w], e: [[0, ++F, 1, type, coll, null, 1]] };
+      try {
+        b.doc.receive(a.self, m);
+      } catch (e) {
+        fail(`an entry typed ${JSON.stringify(type)} threw ${e}`);
+      }
+      if (b.doc.entries.size !== held || b.doc.ctx.has(w, F)) fail(`an entry typed ${JSON.stringify(type)} on ${coll} was taken`);
+      try {
+        b.doc.map(coll).set('k', 2);
+        b.doc.receive(a.self, { d: 'board', t: 1, ws: [w], e: [[0, ++F, 1, 'm', coll, 'j', 3]] });
+      } catch (e) {
+        fail(`after an entry typed ${JSON.stringify(type)}, a write to map ${coll} threw ${e}`);
+      }
+      if (b.doc.map(coll).get('k') !== 2 || b.doc.map(coll).get('j') !== 3) fail(`after an entry typed ${JSON.stringify(type)}, map ${coll} lost a write`);
+    }
+  }
+}
+console.log('member data: an entry whose type is not a string (["m"]) is dropped whole; writes to its collection go on');
+
 // A member that asks over and over is answered 8 times at once, then once per 15 s, each time with all it
 // lacks. An ask past the budget waits for it, and only the latest one waits.
 {
