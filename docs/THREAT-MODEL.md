@@ -1,11 +1,11 @@
 # Threat model
 
 Scope of this document: `peerwire-core` (handshake, wire format, lanes, relay, NAT
-traversal, STUN, invites, sealed messages), the C ABI (`peerwire-ffi`), the
-JavaScript glue and transport (`packages/js`), the React hooks (`packages/react`),
-and the Nostr / BroadcastChannel signaling adapters. It records what Peerwire
-defends against, what it does not, and the findings of the first security review
-(M5, NB-013) and of every review since.
+traversal, STUN, invites, sealed messages), the C ABI (`peerwire-ffi`), shared docs
+in Rust (`peerwire-sync`), the JavaScript glue and transport (`packages/js`), the
+React hooks (`packages/react`), and the Nostr / BroadcastChannel signaling adapters.
+It records what Peerwire defends against, what it does not, and the findings of the
+first security review (M5, NB-013) and of every review since.
 
 Status: pre-1.0, no external audit. See [SECURITY.md](../SECURITY.md).
 
@@ -56,7 +56,7 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `fe6854d` (2026-10-30).** Fixes merged after `@peerwire/js` 0.2.0
+**Status as of main `6c5af8f` (2026-10-30).** Fixes merged after `@peerwire/js` 0.2.0
 and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
@@ -102,15 +102,19 @@ and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 | PBF-1, PBF-2 (Info) | **Fixed** by `344e90e`, merged `fc94833` (at most 16 last pipe batches at close; a test that a closed Nostr transport reads nothing), reviewed 2026-10-26, [Fallback pipes](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | CHAT-1, CHAT-2 (Low), CHAT-3 (Info) | **Fixed** by `dfa8ea0`, merged `92dfa42` with the chat demo (a guessable room name is flagged; an oversized name or QR code fails visibly; the wording says messages may pass through a member or the relays), reviewed 2026-10-27, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | RX-1 (Low), RX-2 (Info) | **Fixed** by `b0d354b` (the README's React example keeps string messages only, and only the last 100), reviewed 2026-10-24, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
-| DOC-1 (Medium), DOC-2, DOC-3 (Low) | **Fixed** by `979cdae`, `eaa2a22` and `a4fddfd`, with DOC-2a and DOC-3a by `d6b148c`, merged `c30ab0f`, before `room.doc()` was published (stamps taken however far ahead; no entry on our own writer that we didn't write; a frame costs about one pass over what it names), reviewed 2026-10-27, [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-5) |
+| DOC-1 (Medium), DOC-2, DOC-3 (Low) | **Fixed** by `979cdae`, `eaa2a22` and `a4fddfd`, with DOC-2a and DOC-3a by `d6b148c`, merged `c30ab0f`, before `room.doc()` was published (stamps taken however far ahead; no entry on our own writer that we didn't write; a frame costs about one pass over what it names), reviewed 2026-10-27, [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-6) |
 | DOC-2b (Low) | **Fixed** by `8b7946c`, merged `45c7cfd` (a catch-up's deletions passed on one range per range of it, charged to the sender's budget), reviewed 2026-10-27; residuals DOC-2c and I6, same section |
 | DOC-4, DOC-5 (Low) | **Fixed** by `f40cffa` (the merge of `ff51ce6`): a member over signalling is paused for a better routed one once per answer; a room with no doc open drops deflated doc frames unread. Reviewed 2026-10-28; residual I8, same section |
+| DOC-6 (Medium) | **Fixed** by `0374cb8` (NB-051), merged `b968f8c` (a doc entry whose type isn't a string drops its frame, so a member can no longer put an entry in a named map or log that makes the app's own calls on it throw), reviewed 2026-10-30; residual R1 (accepted), I9, I10 (Info), same section |
 | NB6F-1, NB6F-2, NB6F-3 (Low) | **Fixed** by `2e71dc5`, merged `8140998`, before `persist` was published (an opening that couldn't read the copy never writes it; one save at a time, paced at 256 KiB/s; a 5 s load deadline). The seal is security's call, in `52bb7e3`. Reviewed 2026-10-28; residuals R1–R4, [Docs kept on this device](#docs-kept-on-this-device-persist-nb-006f--nb6f-1nb6f-3) |
 | NB6F-2a (Info) | **Fixed** by `b45e15c`, merged `76bdd64` (each retry of a store that keeps failing waits twice as long, 1 s up to 64 s, until a save succeeds), reviewed 2026-10-29, same section |
 | I3a (Info), I4 (accepted) | **Fixed** by `1b0fc35` (the `VERSION` comment covers a copy read only in part; `close()` and `leave()` say they wait for the store), same section |
 | NB6H-1 (Low), NB6H-2, I1, I2 (Info) | **Fixed** by `c1b3878`, merged `71f5c6e`, with NB6H-2's first half by `dc156a3` (relay pacing on a monotonic clock, with clamps; the pipe asks `wait()` again each second; a held relay is sent nothing at close; `wait?()` typed). Reviewed 2026-10-29, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
 | NB6I-1 (Low) | **Fixed** by `dc156a3`, merged `6a60ef0` (a relay slowed behind its queue gives up its turn), beside the lead's close fix `cf4a0a9`. Reviewed 2026-10-29; a relay that answers OK and delivers nothing gets 1/n of the pipe (accepted), same section |
 | Half-open relay (Low) | **Fixed** by `659eb28`, merged `5ae3c4e` (NB-006j: a relay that has answered nothing for 5 s since it was sent an event gets no pipe turns while one that answers is left; its next OK gives them back), reviewed 2026-10-29; residuals NB6J-I1…I4 (Info, accepted), same section |
+| NB6L-1 (Low), NB6L-2…NB6L-6 (Info) | **Fixed** by `564e68a` and `8d6d24a`, merged `55b47c5` with the relay copy (NB-006l), before `relays: true` was published (a save whose read no relay completed stays due; a `t: 5` naming a save already made, or from a member now ignored, holds nothing back; a relay can't date `sync.at` ahead; a piece holds at most 16 frames), reviewed 2026-10-30; residuals accepted, [Docs kept on the relays](#docs-kept-on-the-signalling-relays-relays-nb-006l--nb6l-1nb6l-6) |
+| NB6B-1 (Low), NB6B-3 (Info) | **Fixed** by `834ef90` and `4d6f9a2`, merged `6c5af8f` with `peerwire-sync` (NB-006b), before any native or Godot release (a Godot host charges what it passes on to the joiner writing, and cuts that joiner, not its readers; the host's relay is fuzzed), reviewed 2026-10-30; NB6B-2 (Info) accepted, [Shared docs in Rust](#shared-docs-in-rust-peerwire-sync-nb-006b--nb6b-1nb6b-4) |
+| NB6B-4 (Low) | Open (NB-052): to be fixed or accepted before the first native or Godot release, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -1209,7 +1213,7 @@ Residuals:
   at most about 5 s; any longer and the relay is held off.
 - **FL3-I2 (Info, accepted):** holds are per link and at most 8, as R2.
 
-### Shared docs, `room.doc()` (NB-006) — DOC-1…DOC-5
+### Shared docs, `room.doc()` (NB-006) — DOC-1…DOC-6
 
 `room.doc(name)` (`packages/js/src/doc.js`; room tag 7, and 8 when deflated) is a shared
 document of maps, sets and logs that every member holds. It is a delta-state CRDT: each
@@ -1231,7 +1235,9 @@ Reviewed by reading the code, with Node probes on fake networks of docs (no wasm
   2026-10-27);
 - NB-006c at `8b7946c` (merged `45c7cfd`, 2026-10-27);
 - NB-006e at `558f53c` and its fixes `ff51ce6` (merged `f40cffa`, 2026-10-28), by reading
-  the code and one mutant run of `doc_crdt.mjs`.
+  the code and one mutant run of `doc_crdt.mjs`;
+- NB-051's fix `0374cb8` (merged `b968f8c`, 2026-10-30), with Node probes on `dbf0f7c`
+  with and without it.
 
 **DOC-1 — A Lamport stamp far ahead was dropped for good (Medium).** NB-006 refused an
 entry whose stamp was more than 2^32 past our clock. Deltas aren't repeated, and an
@@ -1385,6 +1391,49 @@ The room_doc test reads 1 frame on the fix and 2 on `558f53c`.
   - name any writer when it relays a catch-up (`from` is as good as the member that
     told us);
   - make `doc.sync` show `'synced'` early, or `total` too high.
+
+**DOC-6 — An entry type that wasn't a string broke a named map or log (Medium).** Found
+by backend while porting the doc to Rust (NB-006b). `parseFrame` checked an entry's
+type with `Object.hasOwn(TYPES, type)`, which turns its key into a string, so an array
+`["m"]` (or `["l"]`, `[["m"]]`) passed. `collection()` keys by type and name, so `["m"]`
+on `c` took the place of map `c`. One delta of about 150 B from any member did this at
+every member that took it in:
+- sent before map `c` existed, the app's own `map('c').get`, `.entries()`, `.set()` and
+  `.delete()` threw `TypeError`, as did members' writes to `c`, and no call could remove
+  the entry;
+- `["l"]` entries made `log('c').append` throw; on a log with `keep: 2`, three of them
+  pushed out the app's own entry, and every later append threw;
+- the rest of its frame was lost: a later entry's dot went unseen, and an answer piece
+  was never acknowledged;
+- answers and `snapshot()` carried it on, so it reached joiners and outlived its sender;
+- a device copy holding map `c` and an `["m"]` entry on `c` made `restore()` throw: the
+  opening was `'blocked'`, so that device never saved the doc again until `forget()`.
+
+Medium, the class of DOC-1: it lasts, can't be removed, and makes the app's own calls
+throw. Not High: it needs a member, which can already overwrite, delete or fill a doc;
+the room and the other collections survive, and nothing leaks.
+
+**Status: fixed** by `0374cb8` (NB-051), merged `b968f8c`, reviewed 2026-10-30. An entry
+type must be a string before it is looked up, or the frame is dropped whole. Deltas,
+answers and `restore()` all go through `parseFrame`. The doc_crdt test sends `["m"]`,
+`["s"]`, `["l"]` and `[["m"]]`, on a new collection and on an existing map, and fails on
+`dbf0f7c`. No other check in `parseFrame` or `unopened` looks up a table with member
+data. `peerwire-sync` (NB-006b) takes only the JSON strings `"m"`, `"s"` and `"l"`, and
+its frame corpus holds `["m"]`.
+
+Residual (accepted):
+- **R1.** A room poisoned before the fix. A fixed member drops whole any frame holding
+  such an entry, so an older member's answer piece holding one is never acknowledged,
+  and the entries packed with it never come from that member; a device copy holding one
+  is dropped whole like any copy that is off, and the next save replaces it. It clears
+  as members update, or with `forget()` or a new doc name. Found by reading the code,
+  not probed.
+
+Info (optional, not filed):
+- **I9.** If `restore()` ever threw, `rangeCap` would stay raised; a `try`/`finally`
+  would reset it. Nothing reaches that path with the fix in.
+- **I10.** The test sends deltas only: a `restore()` of a copy with a bad entry isn't
+  pinned. It is the same line, so the delta test catches its mutant.
 
 ### Docs kept on this device, `persist` (NB-006f) — NB6F-1…NB6F-3
 
@@ -1739,6 +1788,231 @@ and what it took was lost. Before NB-006i the other relays carried a copy of eac
 - **NB6J-I4.** Any OK clears the mark, even one for an id we don't know. Taking only
   OKs for ids still in flight would add nothing against a hostile relay, which knows
   the ids it took: it is the accepted "answers OK, delivers nothing" relay above.
+
+### Docs kept on the signalling relays, `relays` (NB-006l) — NB6L-1…NB6L-6
+
+`room.doc(name, { relays: true })` (`packages/js/src/relays.js`; `nostr.js` `query()`
+and `store()`) keeps a sealed copy of the doc on the room's Nostr signalling relays, so
+a member who opens it while no other member is online still gets it. The design is
+route 1 of [STORE-DESIGN.md](STORE-DESIGN.md), with security's design review (NB-006g-1
+to -10) written into it. Its "Threats" are the copy's threat model, and the README and
+`index.d.ts` state them for apps.
+
+Reviewed 2026-10-30, by reading the code, with Node probes on the test's own fake relays
+(loopback, no public relay):
+- the design at `d31fffa`, then its revision `a6e1897`;
+- the code at `87697c0`, then its fixes `564e68a` and `8d6d24a` (merged `55b47c5`).
+
+**Checked and holding:**
+- **Keys and seal.** The keys follow STORE-DESIGN's byte layout, with prefix-free
+  labels, and the signer's fallback is deterministic. A piece is sealed with additional
+  data `VERSION ‖ d` and its slot, and the VERSION byte is checked before decrypting.
+- **Reading is bounded whatever a relay sends.** Kind, pubkey and slot are filtered, and
+  the newest event per slot per relay is kept. Content is at most 60 KiB, and inflating
+  stops at the lesser of 1 MiB a piece and what is left of the read's `MAX_STORED`; a
+  read cut there isn't complete. Identical content is opened once. A read ends at EOSE,
+  CLOSED, its 10 s timeout, socket loss, a ban or close.
+- **Joining.** Only whole saves are joined, each frame through `parseFrame` (DOC-6's
+  guard included), all or nothing. Deletions joined from the relays aren't passed on.
+- **Writing, per relay.** The bank, the `created_at` floor (which skips events more than
+  15 minutes ahead) and a VERSION hand-off are decided per relay from its own events.
+  Empty pieces go only into occupied slots.
+- **`store()`** writes behind signalling, at most one event a second per relay, and each
+  write settles exactly once: OK, refusal, rate retry, ban, timeouts, eviction, socket
+  loss or close.
+- **`forget()`** stops saving, waits for a save under way, then wipes the slots and
+  sends a NIP-09 deletion.
+- **`room.js`** takes `relays` only with `signaling: 'nostr'`, deflate support and a
+  roomId shaped like `randomRoomId()`'s, and refuses a doc name with a lone surrogate.
+
+**NB6L-1 — A save whose read no relay completed was dropped (Low).** `cycle()` cleared
+`pending` before the read. When no relay's read completed (offline, the sockets
+reconnecting after a network change, or no EOSE within 10 s), it found nothing to write
+and returned with nothing due. Nothing saved again until the doc changed, and the
+page-hide save skipped it too. In the probe, an author alone drew 5 strokes, and every
+relay withheld EOSE at the save timer, then recovered: no event an hour later, nor
+after a page hide. Low: it costs the copy's durability, not its secrecy, and a roomId
+holder can't cause it; but a phone switching networks at the timer is common.
+
+**Status: fixed** by `564e68a`, merged `55b47c5`, reviewed 2026-10-30. With no relay
+complete, the save stays due, with the announcements it was checking, and goes at the
+next 5-minute slot or on a page hide. Tests: every relay withholds EOSE at the save,
+and the next slot saves; every relay is down, and a page hide saves.
+
+The lead's review found a twin in the same spot (Info), fixed with it: a `t: 5` during
+our read, from a member the read then found had never saved, still stopped that save.
+In the probe the save came 620 s after the member's first `t: 5`, and 305 s with the
+fix. Members now ignored are dropped from the announcements, and the deferral ends
+when none is left.
+
+**Info, fixed by `564e68a` and `8d6d24a`:**
+- **NB6L-2.** The check at a deferral's end asked only whether the announced save `s`
+  was whole on a relay, not whether it was new. A member could read the current save's
+  `s` and announce it; each time its `t: 5` landed during our read, we wrote nothing,
+  and it was never ignored (no event in an hour, in the probe). Now a `t: 5` naming a
+  save our latest read found whole, or our own, has its member ignored at once. A fresh
+  `s` is 64 random bits, so an honest saver's is never caught.
+- **NB6L-3.** The reader doesn't check signatures, so a relay could serve an honest
+  piece with `created_at` a year ahead, and every joiner's `sync.at` stayed there.
+  `sync.at` now leaves out events more than 15 minutes ahead (it is the read's time when
+  every piece is). Each relay's bank ranking is unchanged.
+- **NB6L-4.** The set of ignored members lost a member only when it joined again, so one
+  that left for good stayed in it for the doc's life. It is pruned on leave.
+- **NB6L-5.** The writer didn't hold a piece to the 16 frames readers take (packing
+  makes about 9 today). `pieces()` now splits past it, so a change to packing can't
+  write saves no reader takes.
+- **NB6L-6**, found in the re-check of `564e68a` and fixed by `8d6d24a`. A read no relay
+  completed emptied the list of saves already made, our own included, so one replay of
+  our last save's `t: 5` deferred our next save by up to 5 minutes. Such a read now adds
+  to the list instead of replacing it.
+
+**Residuals (accepted):**
+- **Availability** (STORE-DESIGN "Threats", README): anyone with the roomId can stop the
+  relay copy for good, by putting another VERSION's pieces in both banks on every relay,
+  or by overwriting it over and over. Device copies (`persist`) stay the main store.
+- **The design's other threats** stand as STORE-DESIGN states them:
+  - the roomId is a permanent, offline read key to every save a relay or an archive
+    keeps, and can't be revoked;
+  - anyone with it can write or delete the copy;
+  - a relay can serve an old save or none;
+  - relays see one stable key per doc, piece sizes, save times, and the IP of each
+    member that saves or reads.
+- A page-hide save on a closing tab rarely finishes (it reads first), so the relays can
+  miss the last writes made alone. `leave()` and `close()` don't save to the relays.
+- Each opening reads every relay once, so a component that remounts `room.doc()` reads
+  again each time.
+- Entries joined from the relays aren't pushed to the members online: they reach a
+  member through its own read, or when it asks us.
+- A member that never answers keeps the doc `'loading'`, and no relay save happens until
+  that ends.
+- Two members announcing within the same second can both save. On each relay the other
+  bank keeps its complete save, and the next round repairs it.
+- An honest member's `t: 5` that arrives after our read already found its save whole
+  (its lane backed up) has us ignore that member until it rejoins. We may then save
+  beside it; nothing is lost.
+- A member that announced, then left mid-save, is checked at the next read, so it is
+  added to the ignored set after it left: one stale entry per such member until it
+  rejoins.
+
+### Shared docs in Rust, `peerwire-sync` (NB-006b) — NB6B-1…NB6B-4
+
+`crates/peerwire-sync` is `room.doc()` in Rust, for Godot (`open_doc`) and native apps
+(the C ABI's `pw_doc_*` and `pw_docs_*`, behind the `sync` feature, off by default). It
+speaks `doc.js`'s frames (room tag 7, JSON) with the same caps and budgets, so the
+threats and residuals of [Shared docs](#shared-docs-roomdoc-nb-006--doc-1doc-6) apply as
+written there. What differs:
+- **The star.** In Godot, joiners link to the host alone, so the host (the hub) passes
+  on what each joiner's frame added, once to each other member, never back to its
+  sender.
+- **No deflate and no store.** Tag 8 is dropped unread, and `t: 5` drops its frame
+  (NB-006l's relay copy is JS only). The snapshot is plain JSON, and the docs say to
+  keep it private.
+- **A queue per member.** Frames wait in `Docs` until the host sends them. A member
+  whose queue passes `OUTBOX_BYTES` (16 MiB) is forgotten and reported as `Overflow`,
+  which the Godot binding answers with a disconnect.
+
+Reviewed 2026-10-30, by reading the code, with in-process release probes on archives of
+the branch: `eb85263..24a01a7` and `6be6ad6`, then the fixes `14e67e8..4d6f9a2` (merged
+`6c5af8f`).
+
+**Checked and holding:**
+- **Parsing.** The JSON reader parses, writes and drops with loops over a flat node
+  list, so no input can overflow the stack. It slices only at character starts and
+  reads bytes as `TextDecoder` does; a 1 MiB frame takes 26–76 ms. An entry type is
+  only the JSON string `"m"`, `"s"` or `"l"` (DOC-6), a `t` outside 1–4 drops the frame,
+  and a delta's writers must be its sender's.
+- **Caps and budgets** match `doc.js`: asks and answers, 8, then one per 15 s;
+  characters, 8 Mi, then 64 Ki a second; 4 pieces unacknowledged. Making room holds the
+  range and writer caps, `kill()` walks the fewer of the dots and the entries, and
+  timers re-arm at least 1 ms ahead.
+- **The hub** takes doc frames from joined members only. After `Overflow`, a member's
+  frames are dropped until it joins again.
+- **The C ABI** checks strings as UTF-8 and returns `PW_ERR_INVALID` for a closed or
+  unknown doc. An id is at most 89 bytes, into a buffer of at least 96. A needed size
+  comes back as −16 or lower, so it never reads as a `PW_ERR_*` code, and a buffer too
+  short keeps the message or event for the next call.
+- **Godot** takes tag 7 on the reliable lane only, and only from members (the host and
+  its joiners); it can't collide with Godot's own tags 0 and 1.
+
+**NB6B-1 — One joiner could get every other joiner disconnected (Low).** The hub passed
+on what a member's frame added with no budget. A member receiving the relay was cut once
+16 MiB waited for it, but the writer never was: nothing goes back to it. Values go on in
+canonical form, so the relay can outgrow the frame: `1e20,` (5 bytes) goes on as 22.
+- In the probe, a hub with 7 members whose links took nothing, and one writer
+  alternating a kill frame with about 1 MB of new set entries, cut all 7 after 5.0 MB
+  in (4.2× queued per member per byte), and after 17.6 MB with values `0`.
+- A link that drains is cut too, once the relay outruns the host's uplink for long
+  enough. Theoretical: with 20 Mbit/s (2.5 MB/s) up and 7 joiners, one joiner writing
+  200 KB/s asks for 200 KB/s × 4.2 × 6 ≈ 5.0 MB/s, so each of the other 6 queues about
+  0.42 MB/s and passes 16 MiB in about 40 s. The writer stays in.
+
+**Status: fixed** by `834ef90`, merged `6c5af8f`, reviewed 2026-10-30. The hub charges
+what it queues for a member's frame, once per recipient and as written, to that member's
+relay budget (`RELAY_BYTES`, 8 MiB at once, then `RELAY_BYTES_PER_S`, 64 KiB/s, kept in
+integer µs), before queuing it. Once the budget is overdrawn, the writer is forgotten
+and reported as `Overflow`: the host cuts the writer, and its readers stay.
+- Asks and the host's own writes aren't charged. A budget is kept across a rejoin and
+  pruned once whole. `OUTBOX_BYTES` stays for a link that stalls.
+- The sim test: a writer at 2 MB/s is cut alone, a reader taking 500 KB/s keeps at most
+  `RELAY_BYTES` queued, and all converge.
+- GODOT.md says when the host cuts a joiner, including one that brings a large copy the
+  host lacks.
+
+**NB6B-2 (Info, accepted).** A map key's values are a `Vec` that a removal scans, so
+removals are O(n²): 10,000 values on one key (one 249 KB delta), then one kill range,
+cost 93 ms, where parsing any 1 MiB frame costs 26–76 ms. Left as is on purpose:
+`doc.js` holds them the same way, and their order goes into deltas byte for byte as
+`doc.js` writes them. An ordered set that keeps it would cost about 13 MB more at 10,000
+keys. Optional, with NB-052.
+
+**NB6B-3 (Info, test gaps), fixed by `4d6f9a2`:** the frame fuzzer now reaches the hub's
+doc, so the relay is fuzzed (655 relays in 20,000 cases, with rejoins after a cut);
+frames with `t` 5, 0 and 6 are in the vectors, dropped by both sides; and the debug fuzz
+run, where integer overflow panics, builds `peerwire-ffi --features sync`, in the gate
+and in CI.
+
+**NB6B-4 — A joiner that rejoins, or brings fresh keys, still gets stalled readers cut
+(Low).** Found in the re-check of `834ef90`, a gap in the fix security asked for: the
+frame that overdraws a budget is applied and relayed before it is charged, and budgets
+are per key. So each join lands up to a doc's worth (`MAX_DOC_LENGTH`, about 4 MiB) on
+every reader. With 7 readers whose links take nothing:
+- one key coming back at once, each time sending set adds and a kill of its last items
+  in one frame, cut all 7 after 7 rejoins and 7.52 MB in;
+- fresh keys, each sending about 0.94 MB of `1e20`s and killing the last key's items (a
+  kill may name any writer), cut all 7 after 5 keys and 4.70 MB in;
+- one key with no rejoin holds: 3.94 MiB reaches each of 7 readers, and 11.82 MiB a lone
+  one, both under 16 MiB.
+
+Nothing paces rejoins (`PER_SOURCE` caps only half-open handshakes, and only under
+load), and a host keeps up to 32 joiners by default, so holding the invite is enough.
+
+**Status: open**, NB-052, to be fixed or accepted before the first native or Godot
+release (`sync` is off by default and unreleased). The recommended fix: don't drop a
+reader's link over the relay.
+- When a member's queue passes a threshold, drop the queue and re-ask that member at
+  the doc layer (`left`, then `joined`, with no `Overflow`). Its `on_ask` finds the hub
+  holds dots it lacks and asks back, so it catches up on the paced path at its link's
+  speed.
+- Keep `Overflow` for a link that takes nothing across several resyncs.
+- The test: the 7-rejoin and 5-key floods above leave every reader linked, and they
+  converge.
+
+A narrower fix covers one key only: drop a frame from a member still overdrawn before
+applying it, and cut it again.
+
+**Info, with NB-052:**
+- An honest joiner that answers a host lacking a big copy pays for that relay: with 7
+  joiners it is cut after about 1.3 MiB, and each rejoin while in debt delivers one more
+  piece (GODOT.md says so). The recommended fix helps here too.
+- `lib.rs`'s "one member alone never fills a queue" holds per join (8 MiB plus one frame
+  of up to about 4 MiB, under 16 MiB), not across rejoins, and GODOT.md's "about 1.3 MiB
+  at once" leaves out the frame that goes past it.
+
+**Residuals (accepted):**
+- Parsing a 1 MiB frame briefly holds 16–50× its size in memory.
+- A host can hold 16 MiB of doc queue for each joiner before it cuts it.
+- The snapshot is plain JSON, as designed: whoever can read where an app keeps it reads
+  the doc.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6
 
