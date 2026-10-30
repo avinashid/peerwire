@@ -59,6 +59,27 @@ fn kind_of(t: &str) -> Kind {
     }
 }
 
+/// rust_doc.mjs `flood`: a frame of many writers or many ranges, from its parameters.
+fn flood(what: &str, n: u64, offset: u64) -> String {
+    let w = |i: u64| format!("\"{i:064x}0000000f\"");
+    let list = |f: &dyn Fn(u64) -> String, n: u64| (0..n).map(f).collect::<Vec<_>>().join(",");
+    let one = ["ranges", "unranges", "big", "unbig"].contains(&what);
+    let ws = list(&|i| w(offset + i), if one { 1 } else { n });
+    let body = match what {
+        "writers" => format!("\"e\":[{}]", list(&|i| format!("[{i},1,1,\"s\",\"fw\",null,{}]", offset + i), n)),
+        "dead" => format!("\"x\":[{}]", list(&|i| format!("[{i},1,1]"), n)),
+        "late" => format!("\"x\":[{}]", list(&|i| format!("[{i},5,5]"), n)),
+        "unranges" => format!("\"x\":[[0,1,{}]]", 2 * n),
+        "unbig" => format!("\"x\":[[0,1,{n}]]"),
+        "big" => {
+            let v = "x".repeat(1000);
+            format!("\"e\":[{}]", list(&|k| format!("[0,{},1,\"m\",\"fb\",\"k{k}\",\"{v}\"]", k + 1), n))
+        }
+        _ => format!("\"e\":[{}]", list(&|k| format!("[0,{},1,\"s\",\"fr\",null,{k}]", 2 * k + 1), n)),
+    };
+    format!("{{\"d\":\"board\",\"t\":3,\"ws\":[{ws}],{body}}}")
+}
+
 struct Node {
     rust: bool,
     docs: Docs,
@@ -77,6 +98,8 @@ struct Net {
     links: BTreeMap<(String, String), VecDeque<String>>,
     held: BTreeSet<String>,
     step: usize,
+    /// Each Rust member's last snapshot.
+    snapshots: BTreeMap<String, Vec<u8>>,
 }
 
 impl Net {
@@ -114,50 +137,47 @@ impl Net {
         }
     }
 
-    /// Delivers rounds as doc.js did, checking that the Rust members sent what doc.js's sent.
+    /// Delivers rounds as doc.js did, checking that the Rust members sent what doc.js's sent, link by link.
     fn rounds(&mut self, rounds: &[Value]) {
         for (r, round) in rounds.iter().enumerate() {
             self.drain();
-            let expected: Vec<(String, String, String)> = round
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|f| (f[0].as_str().unwrap().into(), f[1].as_str().unwrap().into(), f[2].as_str().unwrap().into()))
-                .collect();
+            let at = format!("step {} round {r}", self.step);
+            // [from, to, frames]: a doc.js-only member's frames whole, a Rust member's as short() of their JSON.
+            let expected = round.as_array().unwrap();
             let mut keys: BTreeSet<(String, String)> =
                 self.links.iter().filter(|(_, q)| !q.is_empty()).map(|(k, _)| k.clone()).collect();
-            keys.extend(expected.iter().filter(|f| !self.nodes[&f.0].rust).map(|f| (f.0.clone(), f.1.clone())));
-            let mut actual = Vec::new();
-            for (from, to) in keys {
-                if self.held.contains(&format!("{from}>{to}")) {
-                    continue;
-                }
-                if self.nodes[&from].rust {
-                    for text in self.links.get_mut(&(from.clone(), to.clone())).unwrap().drain(..) {
-                        actual.push((from.clone(), to.clone(), text));
-                    }
+            for x in expected {
+                keys.insert((x[0].as_str().unwrap().into(), x[1].as_str().unwrap().into()));
+            }
+            let mut deliver = Vec::new();
+            for (k, (from, to)) in
+                keys.into_iter().filter(|(f, t)| !self.held.contains(&format!("{f}>{t}"))).enumerate()
+            {
+                let x = expected.get(k).filter(|x| x[0] == from.as_str() && x[1] == to.as_str());
+                let texts: Vec<String> = if self.nodes[&from].rust {
+                    let sent: Vec<String> =
+                        self.links.get_mut(&(from.clone(), to.clone())).unwrap().drain(..).collect();
+                    let json = serde_json::to_string(&sent).unwrap();
+                    let want = x.map(|x| x[2].as_str().unwrap().to_string());
+                    assert!(
+                        want.as_ref().is_some_and(|w| same(w, &json)),
+                        "{at}: {from}>{to} sent\n  {sent:?}\ndoc.js sent {want:?}"
+                    );
+                    sent
                 } else {
-                    actual.extend(expected.iter().filter(|f| f.0 == from && f.1 == to).cloned());
-                }
+                    let x = x
+                        .unwrap_or_else(|| panic!("{at}: {from}>{to}: the Rust members sent on links doc.js's didn't"));
+                    x[2].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect()
+                };
+                deliver.extend(texts.into_iter().map(|t| (from.clone(), to.clone(), t)));
             }
-            let at = format!("step {} round {r}", self.step);
             assert_eq!(
-                actual.len(),
+                deliver.iter().map(|f| (&f.0, &f.1)).collect::<BTreeSet<_>>().len(),
                 expected.len(),
-                "{at}: frames {:?}",
-                actual.iter().map(|f| (&f.0, &f.1, short(&f.2))).collect::<Vec<_>>()
+                "{at}: links {:?}",
+                deliver.iter().map(|f| (&f.0, &f.1)).collect::<BTreeSet<_>>()
             );
-            for (a, e) in actual.iter().zip(&expected) {
-                assert!(
-                    a.0 == e.0 && a.1 == e.1 && same(&e.2, &a.2),
-                    "{at}: {}>{} sent\n  {}\ndoc.js sent\n  {}",
-                    a.0,
-                    a.1,
-                    a.2,
-                    e.2
-                );
-            }
-            for (from, to, text) in actual {
+            for (from, to, text) in deliver {
                 self.deliver(&from, &to, &text);
             }
         }
@@ -205,14 +225,8 @@ impl Net {
             let at = format!("step {} member {name}", self.step);
             let want = &state[name];
             let events: Vec<(String, String, String)> = std::mem::take(&mut n.events);
-            let expected = want["events"].as_array().unwrap();
-            assert_eq!(events.len(), expected.len(), "{at}: events {events:#?}");
-            for (e, x) in events.iter().zip(expected) {
-                assert!(
-                    e.0 == x[0] && e.1 == x[1] && same(x[2].as_str().unwrap(), &e.2),
-                    "{at}: event {e:?}, doc.js {x}"
-                );
-            }
+            let json = serde_json::to_string(&events).unwrap();
+            assert!(same(want["events"].as_str().unwrap(), &json), "{at}: events {events:#?}");
             let docs = want["docs"].as_object().unwrap();
             assert_eq!(docs.keys().collect::<BTreeSet<_>>(), n.open.keys().collect::<BTreeSet<_>>(), "{at}: open docs");
             for (doc, w) in docs {
@@ -236,9 +250,11 @@ impl Net {
         let now = self.at();
         match op {
             "open" if rust => {
-                let n = self.nodes.get_mut(node.unwrap()).unwrap();
                 let name = s["doc"].as_str().unwrap();
-                let copy = s["copy"].as_str().map(str::as_bytes);
+                // A Rust member's copy is its own last snapshot, which the snapshot step checked.
+                let own = s["copyOf"].as_str().map(|m| self.snapshots[m].clone());
+                let copy = own.as_deref().or(s["copy"].as_str().map(str::as_bytes));
+                let n = self.nodes.get_mut(node.unwrap()).unwrap();
                 let r = n.docs.open(now, name, Options { copy, hub: false });
                 assert_eq!(r.is_ok(), s["result"].as_bool().unwrap(), "step {}: open {name}", self.step);
                 if let Ok(id) = r {
@@ -282,6 +298,15 @@ impl Net {
                 let got = self.result(node.unwrap(), s).unwrap();
                 assert_eq!(got, s["result"], "step {}: {s}", self.step);
             }
+            "flood" => {
+                let (what, n, offset) =
+                    (s["what"].as_str().unwrap(), s["n"].as_u64().unwrap(), s["offset"].as_u64().unwrap());
+                let mut m = vec![DOC_TAG];
+                m.extend(flood(what, n, offset).into_bytes());
+                if let Some(node) = self.nodes.get_mut(s["to"].as_str().unwrap()).filter(|n| n.rust) {
+                    node.docs.receive(now, id_of(s["from"].as_str().unwrap()), &m);
+                }
+            }
             "raw" => {
                 let mut m = vec![DOC_TAG];
                 m.extend(unhex(s["hex"].as_str().unwrap()));
@@ -292,8 +317,10 @@ impl Net {
             "snapshot" if rust => {
                 let n = &mut self.nodes.get_mut(node.unwrap()).unwrap();
                 let id = n.open[s["doc"].as_str().unwrap()];
-                let text = String::from_utf8(n.docs.doc(id).unwrap().snapshot()).unwrap();
+                let copy = n.docs.doc(id).unwrap().snapshot();
+                let text = String::from_utf8(copy.clone()).unwrap();
                 assert!(same(s["result"].as_str().unwrap(), &text), "step {}: snapshot {text}", self.step);
+                self.snapshots.insert(node.unwrap().to_string(), copy);
             }
             "settle" => self.rounds(s["rounds"].as_array().unwrap()),
             "advance" => {
@@ -344,6 +371,7 @@ fn session_replays_doc_js() {
         links: BTreeMap::new(),
         held: BTreeSet::new(),
         step: 0,
+        snapshots: BTreeMap::new(),
     };
     for (name, n) in v["nodes"].as_object().unwrap() {
         let mut docs = Docs::new(id_of(name), [0; 32]);

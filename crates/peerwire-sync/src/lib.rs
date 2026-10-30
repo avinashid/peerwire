@@ -49,15 +49,18 @@ mod context;
 mod doc;
 mod docs;
 mod frame;
+#[cfg(test)]
+mod fuzz;
 mod json;
 mod ordmap;
 
 pub use docs::{DocMut, Docs};
 pub use frame::Kind;
+/// The core's time and identity, as the host passes them in.
+pub use peerwire_core::{Instant, PeerId};
 
 use frame::Id;
 use json::{lossy, write_str, Utf16};
-use peerwire_core::PeerId;
 use std::fmt::Write as _;
 
 /// The first byte of a doc message: room.js's `T.Doc`.

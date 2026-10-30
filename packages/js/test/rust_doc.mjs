@@ -4,9 +4,9 @@
 // and applies to doc.js the frames a Rust session sent (rust.json, which golden.rs writes). golden.rs replays them:
 // - session.json: doc.js members in fake rooms in one process, scripted and then seeded at random. Frames go
 //   through per-link queues, delivered in rounds (each round every link's queue, links in name order) until none
-//   is left; timers fire in time order, member by member. It records every frame delivered, round by round, each
-//   op's result, and at checkpoints each member's change and sync events and each doc's snapshot, entries and
-//   sync. Rust replays the members marked `rust` and must send the same frames, byte for byte, and hold the same
+//   is left; timers fire in time order, member by member. It records the frames delivered on each link, round by
+//   round, each op's result, and at checkpoints each member's change and sync events and each doc's snapshot,
+//   entries and sync. Rust replays the members marked `rust` and must send the same frames, byte for byte, and hold the same
 //   docs. The others are doc.js only (`e` reads deflated frames, so its asks carry z; `f` writes keys and names
 //   with lone surrogates): Rust is handed what they sent here, so it applies doc.js's frames, and the frames doc.js
 //   applied from the Rust members are the ones Rust must send. A text longer than 96 bytes that Rust only compares
@@ -54,6 +54,22 @@ const short = (s) => {
   return FULL || b.length <= 96 ? s : `sha256:${createHash('sha256').update(b).digest('hex').slice(0, 32)}:${b.length}`;
 };
 
+// A frame of many writers or many ranges, to take a doc to its caps, made from its parameters (golden.rs makes
+// the same): `writers`, n writers with an item each; `dead`, their dots dead; `late`, a dot of each they haven't
+// written, dead; `ranges`, one writer's odd dots; `unranges`, that writer's dots dead; `big`, one writer's n map
+// keys of 1000 characters; `unbig`, those dead.
+const floodWriter = (i) => `${i.toString(16).padStart(64, '0')}0000000f`;
+function flood(what, n, offset) {
+  const ws = Array.from({ length: ['ranges', 'unranges', 'big', 'unbig'].includes(what) ? 1 : n }, (_, i) => floodWriter(offset + i));
+  if (what === 'writers') return JSON.stringify({ d: 'board', t: 3, ws, e: ws.map((_, i) => [i, 1, 1, 's', 'fw', null, offset + i]) });
+  if (what === 'dead') return JSON.stringify({ d: 'board', t: 3, ws, x: ws.map((_, i) => [i, 1, 1]) });
+  if (what === 'late') return JSON.stringify({ d: 'board', t: 3, ws, x: ws.map((_, i) => [i, 5, 5]) });
+  if (what === 'unranges') return JSON.stringify({ d: 'board', t: 3, ws, x: [[0, 1, 2 * n]] });
+  if (what === 'unbig') return JSON.stringify({ d: 'board', t: 3, ws, x: [[0, 1, n]] });
+  if (what === 'big') return JSON.stringify({ d: 'board', t: 3, ws, e: Array.from({ length: n }, (_, k) => [0, k + 1, 1, 'm', 'fb', `k${k}`, 'x'.repeat(1000)]) });
+  return JSON.stringify({ d: 'board', t: 3, ws, e: Array.from({ length: n }, (_, k) => [0, 2 * k + 1, 1, 's', 'fr', null, k]) });
+}
+
 // The session.
 
 class Net {
@@ -65,6 +81,7 @@ class Net {
     this.held = new Set(); // links whose frames wait
     this.steps = [];
     this.delivered = []; // every frame delivered, whole
+    this.snapshots = new Map(); // node -> its last snapshot step's copy
   }
 
   node(name, { rust = true, deflate = false } = {}) {
@@ -117,17 +134,23 @@ class Net {
   settle() {
     const rounds = [];
     for (;;) {
-      const round = [];
+      const round = []; // [from, to, the frames on that link]
       for (const k of [...this.links.keys()].sort()) {
         if (this.held.has(k)) continue;
         const [f, t] = k.split('>');
-        for (const text of this.links.get(k).splice(0)) round.push([f, t, text]);
+        const texts = this.links.get(k).splice(0);
+        if (texts.length) round.push([f, t, texts]);
       }
       if (!round.length) return rounds;
       if (rounds.length > 2000) throw new Error('the network never settles');
-      rounds.push(round.map(([f, t, text]) => [f, t, this.nodes.get(f).rust ? short(text) : text]));
-      this.delivered.push(...round);
-      for (const [f, t, text] of round) this.receive(this.nodes.get(t), this.nodes.get(f), enc.encode(text));
+      // A Rust member's frames on a link, which Rust only compares, as one text; a doc.js-only member's, whole.
+      rounds.push(round.map(([f, t, texts]) => [f, t, this.nodes.get(f).rust ? short(JSON.stringify(texts)) : texts]));
+      for (const [f, t, texts] of round) {
+        for (const text of texts) {
+          this.delivered.push([f, t, text]);
+          this.receive(this.nodes.get(t), this.nodes.get(f), enc.encode(text));
+        }
+      }
     }
   }
 
@@ -186,7 +209,7 @@ class Net {
           entries: colls.map(([t, c]) => [t, c, short(JSON.stringify(d.list(t, c)))]),
         };
       }
-      out[n.name] = { docs, events: n.events.splice(0).map(([k, doc, json]) => [k, doc, short(json)]) };
+      out[n.name] = { docs, events: short(JSON.stringify(n.events.splice(0))) };
     }
     return out;
   }
@@ -205,8 +228,9 @@ class Net {
       }
     };
     switch (s.op) {
+      // A copy from a Rust member is named (`copyOf`): Rust takes its own, which the snapshot step checked.
       case 'open':
-        s.result = this.open(n, s.doc, s.copy ?? null);
+        s.result = this.open(n, s.doc, s.copyOf ? this.snapshots.get(s.copyOf) : (s.copy ?? null));
         break;
       case 'close':
         d.close();
@@ -272,10 +296,14 @@ class Net {
       case 'raw':
         this.receive(this.nodes.get(s.to), this.nodes.get(s.from), Buffer.from(s.hex, 'hex'));
         break;
+      case 'flood':
+        this.receive(this.nodes.get(s.to), this.nodes.get(s.from), enc.encode(flood(s.what, s.n, s.offset)));
+        break;
       case 'snapshot': {
         // The copy goes back to the script, for an open step to hold whole; the vector holds its digest.
         const text = JSON.stringify(d.snapshot());
         s.result = short(text);
+        this.snapshots.set(s.node, text);
         this.steps.push(s);
         return { ...s, text };
       }
@@ -296,6 +324,10 @@ class Net {
   }
 }
 
+// doc.js warns once per write a full doc refuses: counted, not printed.
+const warned = [];
+const warn = console.warn;
+console.warn = (m) => warned.push(String(m));
 const net = new Net();
 const nodes = { a: net.node('a'), b: net.node('b'), c: net.node('c'), d: net.node('d'), e: net.node('e', { rust: false, deflate: true }), f: net.node('f', { rust: false }) };
 const step = (s) => net.run(s);
@@ -310,6 +342,7 @@ const raw = (from, to, m) => step({ op: 'raw', from, to, hex: Buffer.from(typeof
 
 // 1. One member writes alone: every kind of write, odd values, a log trimmed, deletes.
 step({ op: 'open', node: 'a', doc: 'board' });
+const firstA = writerOf('a');
 op('a', 'keep', 'chat', 3);
 op('a', 'set', 'meta', 'title', '"Plans"');
 op('a', 'set', 'meta', 'n', '[-0, 1E21, 1e-7, 5e-324, 0.000001, 12345678901234567890, 0.1e1]');
@@ -400,6 +433,18 @@ raw('e', 'a', '{"d":"board","t":1,"ws":[]');
 raw('e', 'a', '{"d":"nope","t":2,"ws":[],"r":[],"q":3}');
 raw('e', 'a', '{"d":"nope","t":2,"q":0}');
 settle();
+// A write of e's that a counts as dead (the delta above named it), sent again: a asks e.
+raw('e', 'a', { d: 'board', t: 1, ws: [nodes.e.docs.get('board').writer], e: [[0, 1, 1, 'm', 'meta', 'again', 1]] });
+settle();
+// Claims on a's next dots, past the incarnations it may move through (16): then they pile up on its last writer,
+// as one span, and a writes after them; once every dot is claimed, its writes are refused.
+for (let i = 0; i < 18; i++) raw('e', 'a', { d: 'board', t: 3, ws: [writerOf('a')], e: [[0, 100 + 10 * i, 1, 'm', 'meta', 'c', 1]] });
+op('a', 'set', 'meta', 'after claims', '1');
+settle();
+checkpoint();
+raw('e', 'a', { d: 'board', t: 3, ws: [writerOf('a')], x: [[0, 1, 2 ** 53 - 1]] });
+op('a', 'set', 'meta', 'all claimed', '1');
+settle();
 checkpoint();
 
 // 7. Catching up under budgets and turns: a member opens the doc again and again (an answer per opening, 8 at once
@@ -423,13 +468,19 @@ checkpoint();
 
 // 8. The copy: a's, opened again from it (its writer is in it, so it draws another); f's, made by doc.js, opened
 //    by a Rust member; and copies that are off.
-const copyA = step({ op: 'snapshot', node: 'a', doc: 'board' }).text;
+// a asks its members by route when it opens the doc again: linked directly (f, d), then relayed (b), then over
+// signaling (e, queued before b). It draws the incarnation of its first writer, whose entries are in its copy, so
+// it draws again (else it would take them for claims on its own dots).
+step({ op: 'route', a: 'a', b: 'b', kind: 'peer' });
+step({ op: 'route', a: 'a', b: 'e', kind: 'signaling' });
+step({ op: 'snapshot', node: 'a', doc: 'board' });
+nodes.a.incs[nodes.a.used] = Number.parseInt(firstA.slice(64), 16);
 step({ op: 'close', node: 'a', doc: 'board' });
-step({ op: 'open', node: 'a', doc: 'board', copy: copyA });
+step({ op: 'open', node: 'a', doc: 'board', copyOf: 'a' });
 const copyF = step({ op: 'snapshot', node: 'f', doc: 'board' }).text;
 step({ op: 'close', node: 'd', doc: 'board' });
 step({ op: 'open', node: 'd', doc: 'board', copy: copyF });
-step({ op: 'open', node: 'c', doc: 'other', copy: copyA });
+step({ op: 'open', node: 'c', doc: 'other', copyOf: 'a' });
 step({ op: 'open', node: 'c', doc: 'other', copy: '{"v":2,"c":0,"f":[]}' });
 step({ op: 'open', node: 'c', doc: 'other', copy: '{"v":1,"c":0,"f":[{"d":"other","t":3,"ws":[],"q":1}]}' });
 step({ op: 'open', node: 'c', doc: 'other', copy: '{"v":1,"c":-0,"f":[{"d":"other","t":3,"ws":[]}]}' });
@@ -437,7 +488,89 @@ settle();
 advance(20000);
 checkpoint();
 
-// 9. At random: writes, links cut and made, routes, and time.
+// 9. The caps: a doc that is full by length, then by entries, refuses our writes; three answers of a full doc
+//    to one member take its chars budget past empty (the third waits for it); a doc that holds MAX_WRITERS
+//    writers forgets idle ones for new ones, and one past MAX_RANGES forgets the highest ranges.
+step({ op: 'route', a: 'a', b: 'b', kind: 'direct' });
+step({ op: 'route', a: 'b', b: 'c', kind: 'signaling' });
+op('a', 'fill', 'huge', 4140, 1000);
+step({ op: 'flood', from: 'e', to: 'a', what: 'big', n: 5, offset: 9000 });
+settle();
+// e asks twice for all of it: two full answers take e's chars budget at a; then deletions e's answer names don't
+// go on from a to the others (a's own dots: the last three it wrote).
+for (const q of [900, 901]) {
+  raw('e', 'a', { d: 'board', t: 2, ws: [], r: [], q });
+  for (let i = 3; i < 160; i += 4) raw('e', 'a', { d: 'board', t: 4, q, i });
+}
+settle();
+const na = nodes.a.docs.get('board').n;
+raw('e', 'a', { d: 'board', t: 3, ws: [writerOf('a')], x: [[0, na - 2, na]] });
+settle();
+// b opens the doc three times: the third answer of the full doc waits on b's chars budget, a piece every 2 s, so
+// it takes TURN_MS and the turn passes on to c, waiting (over signaling, c is asked after a).
+for (let i = 0; i < 3; i++) {
+  step({ op: 'close', node: 'b', doc: 'board' });
+  step({ op: 'open', node: 'b', doc: 'board' });
+  settle();
+}
+advance(70000);
+checkpoint();
+op('a', 'unfill', 'huge', 4140);
+settle();
+op('a', 'fill', 'many', 10010, 1);
+settle();
+checkpoint();
+op('a', 'unfill', 'many', 10010);
+settle();
+// The context's caps: a writer with a few ranges, then one with 8500 (past MAX_RANGES: the highest ranges of the
+// writers with the most go); a copy of that opened elsewhere; then 1100 writers (past MAX_WRITERS), their dots
+// dead (idle), 1100 more (idle ones go for them), and new dead dots for the idle ones.
+step({ op: 'flood', from: 'e', to: 'a', what: 'ranges', n: 3, offset: 4000 });
+step({ op: 'flood', from: 'e', to: 'a', what: 'ranges', n: 8500, offset: 5000 });
+settle();
+checkpoint();
+// A writer whose dots are all dead (idle: the first a may forget, its own aside), the context full to the range,
+// then a new dead dot of that writer: the context makes room without forgetting it.
+{
+  const d = nodes.a.docs.get('board');
+  step({ op: 'flood', from: 'e', to: 'a', what: 'writers', n: 1, offset: 7000 });
+  step({ op: 'flood', from: 'e', to: 'a', what: 'dead', n: 1, offset: 7000 });
+  step({ op: 'flood', from: 'e', to: 'a', what: 'ranges', n: 8192 - d.ctx.size, offset: 4500 });
+  const idle = floodWriter(7000);
+  check(d.ctx.size === 8192 && [...d.idle].filter((w) => w !== d.writer)[0] === idle, 'a holds MAX_RANGES ranges, and one idle writer not its own');
+  raw('e', 'a', { d: 'board', t: 3, ws: [idle], x: [[0, 9999, 9999]] });
+  check(d.ctx.writers.get(idle)?.length === 2, "a made room and kept the idle writer's ranges");
+  settle();
+  checkpoint();
+}
+step({ op: 'snapshot', node: 'a', doc: 'board' });
+step({ op: 'close', node: 'd', doc: 'board' });
+step({ op: 'open', node: 'd', doc: 'board', copyOf: 'a' });
+settle();
+checkpoint();
+step({ op: 'close', node: 'd', doc: 'board' });
+step({ op: 'open', node: 'd', doc: 'board' });
+step({ op: 'flood', from: 'e', to: 'a', what: 'writers', n: 1100, offset: 0 });
+settle();
+checkpoint();
+step({ op: 'flood', from: 'e', to: 'a', what: 'dead', n: 1100, offset: 0 });
+step({ op: 'flood', from: 'e', to: 'a', what: 'writers', n: 1100, offset: 2000 });
+settle();
+checkpoint();
+step({ op: 'flood', from: 'e', to: 'a', what: 'late', n: 1100, offset: 0 });
+settle();
+checkpoint();
+// What the floods left goes, so the members converge again from here.
+step({ op: 'flood', from: 'e', to: 'a', what: 'unranges', n: 3, offset: 4000 });
+step({ op: 'flood', from: 'e', to: 'a', what: 'unranges', n: 8192, offset: 4500 });
+step({ op: 'flood', from: 'e', to: 'a', what: 'unranges', n: 8500, offset: 5000 });
+step({ op: 'flood', from: 'e', to: 'a', what: 'dead', n: 1100, offset: 2000 });
+step({ op: 'flood', from: 'e', to: 'a', what: 'unbig', n: 5, offset: 9000 });
+settle();
+advance(70000);
+checkpoint();
+
+// 10. At random: writes, links cut and made, routes, and time.
 const RUST = ['a', 'b', 'c', 'd'];
 const KEYS = ['k1', 'k2', 'k3', 'ключ', '😀', '', 'a"b', '\u2028'];
 const COLLS = ['meta', 'm2'];
@@ -493,6 +626,10 @@ const kinds = new Set(frames.map(([, , t]) => {
 check(['1', '2q', '2qz', '3q', '3qe', '3qes', '4q'].every((k) => kinds.has(k)), `the session sends every kind of frame (${[...kinds].sort()})`);
 check(docs(net.steps.at(-1)).length >= 8, 'every member holds the doc at the end');
 const session = { nodes: Object.fromEntries(Object.values(nodes).map((n) => [n.name, { id: n.id, rust: n.rust, incarnations: n.incs }])), steps: net.steps };
+
+console.warn = warn;
+check(warned.some((m) => m.includes('is full')) && warned.some((m) => m.includes('claimed every write')) && warned.every((m) => /is full|claimed every write/.test(m)),
+  `doc.js refused ${warned.length} writes to a full doc or one with every dot claimed`);
 
 // The frame corpus: frames the session sent, the shortest of each kind, and those mutated, each judged by
 // parseFrame. A frame is given as parts, each a text or [text, times], so that long ones stay short here.
@@ -576,7 +713,7 @@ for (const [peer, text] of byKind.values()) {
 check(confused === 0, 'doc.js drops every frame whose entry type isn\'t a string (NB-051), as Rust does');
 // Values, keys and names at the edges of the caps; an ask with more ranges than a context holds.
 const w0 = 'a'.repeat(72);
-const entry = (v, k = ['k'], coll = ['c']) => ['{"d":"b","t":1,"ws":["', w0, '"],"e":[[0,1,1,"m",', ...coll, ',', ...k, ',', ...v, ']]}'];
+const entry = (v, k = ['"k"'], coll = ['"c"']) => ['{"d":"b","t":1,"ws":["', w0, '"],"e":[[0,1,1,"m",', ...coll, ',', ...k, ',', ...v, ']]}'];
 const q = (s) => JSON.stringify(s);
 for (const v of [[['[', 64], [']', 64]], [['[', 65], [']', 65]], ['"', ['x', 65534], '"'], ['"', ['x', 65535], '"'], ['"', ['\\u0001', 10922], '"'],
   ['"', ['\\u0001', 10923], '"'], ['1e400'], ['-0'], ['[1e21,5e-324]'], ['{"a":1,"a":2}']]) add(entry(v), 'a'.repeat(64));

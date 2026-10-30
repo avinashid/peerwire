@@ -127,10 +127,15 @@ impl Docs {
             let ob = self.out.entry(p).or_default();
             ob.bytes += m.len();
             ob.messages.push_back(m);
-            if ob.bytes > OUTBOX_BYTES {
-                self.forget(p);
-                self.events.push_back(Event::Overflow(p));
-            }
+            self.cap(p);
+        }
+    }
+
+    /// A member whose messages passed OUTBOX_BYTES waiting is forgotten, as if it left.
+    fn cap(&mut self, p: PeerId) {
+        if self.out.get(&p).is_some_and(|ob| ob.bytes > OUTBOX_BYTES) {
+            self.forget(p);
+            self.events.push_back(Event::Overflow(p));
         }
     }
 
@@ -270,10 +275,12 @@ impl Docs {
         let ob = self.out.entry(peer).or_default();
         ob.bytes += message.len();
         ob.messages.push_front(message);
-        if ob.bytes > OUTBOX_BYTES {
-            self.forget(peer);
-            self.events.push_back(Event::Overflow(peer));
-        }
+        self.cap(peer);
+    }
+
+    /// Bytes of messages waiting for member `peer`, retried ones included (at most [`OUTBOX_BYTES`]).
+    pub fn queued(&self, peer: &PeerId) -> usize {
+        self.out.get(peer).map_or(0, |ob| ob.bytes)
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -414,5 +421,81 @@ mod tests {
             assert_eq!(ask(bad), None, "{bad}");
         }
         assert_eq!(ask(&format!(r#"{{"d":"{}","t":2,"q":1}}"#, "x".repeat(129))), None);
+    }
+
+    fn pair() -> (Docs, Docs, DocId, PeerId, PeerId) {
+        let (a, b) = (PeerId([0xaa; 32]), PeerId([0xbb; 32]));
+        let now = Instant::from_millis(0);
+        let mut da = Docs::new(a, [1; 32]);
+        let mut db = Docs::new(b, [2; 32]);
+        let id = da.open(now, "board", Options::default()).unwrap();
+        db.open(now, "board", Options::default()).unwrap();
+        (da, db, id, a, b)
+    }
+
+    /// Doc messages from a peer that hasn't joined are taken (they are doc messages) and dropped: no reply, no
+    /// change. App messages are left to the app, a deflated frame is dropped, and so is one that isn't JSON.
+    #[test]
+    fn messages_are_taken_from_members_only() {
+        let (mut da, mut db, id, a, b) = pair();
+        let now = Instant::from_millis(0);
+        db.joined(now, a, Route::Direct);
+        db.doc(DocId(0)).unwrap().map_set("meta", "k", "1").unwrap();
+        // Its ask, then its delta.
+        let delta: Vec<Vec<u8>> = std::iter::from_fn(|| db.poll_transmit()).map(|(_, m)| m).collect();
+        let ask = br#"{"d":"other","t":2,"ws":[],"r":[],"q":9}"#;
+        for m in delta.iter().chain([[&[DOC_TAG][..], ask].concat()].iter()) {
+            assert!(da.receive(now, b, m));
+        }
+        assert!(da.poll_transmit().is_none() && da.poll_event().is_none());
+        assert_eq!(da.doc(id).unwrap().get(Kind::Map, "meta", "k"), None);
+        da.joined(now, b, Route::Direct);
+        while da.poll_transmit().is_some() {}
+        for m in &delta {
+            assert!(da.receive(now, b, m));
+        }
+        assert_eq!(da.doc(id).unwrap().get(Kind::Map, "meta", "k"), Some("1"));
+        // Its ask came with the delta: answered now that it is a member.
+        assert!(std::iter::from_fn(|| da.poll_transmit()).count() > 0);
+        assert!(!da.receive(now, b, b"\x01app") && !da.receive(now, b, b""));
+        for m in [&b"\x08junk"[..], b"\x07{", b"\x07[]", b"\x07{\"d\":5}"] {
+            assert!(da.receive(now, b, m));
+        }
+        // A deflated frame is dropped unread, even one that reads as JSON: never inflated, never taken as plain.
+        assert!(da.receive(now, b, &[&[DOCZ_TAG][..], ask].concat()));
+        assert!(da.poll_transmit().is_none());
+        assert!(da.receive(now, b, &[&[DOC_TAG][..], ask].concat()));
+        assert!(da.poll_transmit().is_some(), "the same frame, plain, is answered (unopened)");
+    }
+
+    /// A member whose link takes nothing is forgotten once OUTBOX_BYTES wait for it, retried ones too.
+    #[test]
+    fn a_member_past_the_outbox_cap_is_forgotten() {
+        let (mut da, _, id, _, b) = pair();
+        let now = Instant::from_millis(0);
+        da.joined(now, b, Route::Direct);
+        let value = format!("\"{}\"", "x".repeat(60_000));
+        let mut written = 0;
+        while da.queued(&b) + 70_000 <= OUTBOX_BYTES {
+            da.doc(id).unwrap().map_set("big", &format!("k{}", written % 10), &value).unwrap();
+            written += 1;
+        }
+        assert!(da.poll_event().iter().all(|e| !matches!(e, Event::Overflow(_))));
+        // The link refuses one: retried, it goes first, and takes the queue past the cap.
+        let (p, m) = da.poll_transmit().unwrap();
+        assert_eq!(p, b);
+        da.retry(b, m.clone());
+        assert!(da.poll_transmit().is_none(), "held until poll_transmit has run dry");
+        da.doc(id).unwrap().map_set("big", "k0", &value).unwrap();
+        da.doc(id).unwrap().map_set("big", "k1", &value).unwrap();
+        let events: Vec<Event> = std::iter::from_fn(|| da.poll_event()).collect();
+        assert!(events.contains(&Event::Overflow(b)), "{} written", written);
+        assert_eq!(da.queued(&b), 0);
+        assert!(da.poll_transmit().is_none());
+        da.retry(b, m);
+        assert_eq!(da.queued(&b), 0, "nothing is kept for a member that isn't one");
+        // Joined again, it is asked and sent the doc again.
+        da.joined(now, b, Route::Direct);
+        assert!(da.poll_transmit().is_some_and(|(p, _)| p == b));
     }
 }
