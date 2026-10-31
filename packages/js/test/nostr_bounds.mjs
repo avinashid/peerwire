@@ -685,10 +685,12 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
 //     relay is lost. A socket that has heard nothing at all since an event sent through every relay (not a pipe batch,
 //     nor one to keep) 10 s ago is deaf: it is closed and its relay dialled again, and the new socket takes no pipe
 //     batch until its relay answers. Each next redial of that relay waits twice as long, to 30 s, and after 3 there are
-//     none until it answers an event within 5 s; a late answer doesn't count. A relay that answers, even 9 s late, or
-//     sends no OK but events, is never redialled; one that answers 12 s late, once. A deaf socket that closes is
-//     redialled as any closed one. The numbers are written out, so that the constants themselves are checked. Fake
-//     sockets, and a fake clock that runs the timers.
+//     none until it answers an event within 5 s on a socket open 30 s; a late answer, or one on a younger socket,
+//     doesn't count. A relay that answers, even 9 s late, or sends no OK but events, is never redialled; one that
+//     answers 12 s late, once. A deaf socket that closes is redialled as any closed one. The numbers are written out,
+//     so that the constants themselves are checked. Fake sockets, and a fake clock that runs the timers. The fakes
+//     don't echo what is sent on them; real relays echo our own hellos (our subscription has the room's tag), and the
+//     echo clears the mark as an OK does.
 {
   let clock = 1e6;
   performance.now = () => clock;
@@ -842,6 +844,49 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
     const m = of(N).slice(3); // the socket that answered in time, and those dialled after it
     const again = m.slice(1).map((w, i) => w.at - (i ? m[i].events[0][0] : T));
     check(again.join() === '10000,20000,30000', `it answers one within 5 s: its 3 redials come back (${again.map((g) => g / 1000).join(', ')} s)`);
+    s.close();
+  }
+
+  // A relay that answers the first signal on each new socket, then nothing: those answers come on young sockets, so
+  // it is redialled 3 times, then not again. An answer in time on a socket open 29.999 s doesn't give the relay's
+  // redials back; one on a socket open 30 s does.
+  {
+    const [A, F] = ['wss://a4', 'wss://f4'];
+    lag[A] = lag[F] = 100;
+    const s = await start('redial/flap', [A, F]);
+    await signal(s, clock + 300000, () => of(F).forEach((w) => (w.dead ||= w.events.length > 0)));
+    const f = of(F);
+    const gaps = f.slice(1).map((w, i) => w.at - f[i].events[1][0]);
+    check(f.length === 4 && gaps.join() === '10000,20000,30000' && s.stats.redials === 3,
+      `a relay that answers each new socket's first signal, then nothing: redialled ${f.length - 1} times in 5 min, ${gaps.map((g) => g / 1000).join(', ')} s after each socket's first unanswered one`);
+    s.close();
+  }
+  {
+    const [A, H] = ['wss://a5', 'wss://h5'];
+    lag[A] = lag[H] = 100;
+    const s = await start('redial/young', [A, H]);
+    // `w` stops answering, then one signal: how long until its relay is dialled again.
+    const deafen = async (w) => {
+      w.dead = true;
+      await s.publish(s.roomTag, 'sig');
+      const T = clock;
+      run(T + 30000);
+      return of(H).at(-1).at - T;
+    };
+    // One signal on `w`, answered (in 0.1 s) when `w` has been open `age`.
+    const answer = async (w, age) => {
+      run(w.at + age - 100);
+      await s.publish(s.roomTag, 'sig');
+      run(clock + 200);
+      return w.events.length === 1 && w.events[0][0] - w.at === age - 100;
+    };
+    const first = await deafen(of(H)[0]);
+    const young = await answer(of(H)[1], 29999);
+    const kept = await deafen(of(H)[1]);
+    const old = await answer(of(H)[2], 30000);
+    const back = await deafen(of(H)[2]);
+    check(first === 10000 && young && kept === 20000 && old && back === 10000 && s.stats.redials === 3,
+      `a timely answer on a socket open 29.999 s: the next redial still waits ${kept / 1000} s; on one open 30 s, ${back / 1000} s again`);
     s.close();
   }
 

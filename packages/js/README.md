@@ -618,8 +618,9 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    send us through that relay is lost: a socket that has heard nothing at all for 10 s
    since a signal went through it is closed and dialled again, and the new one takes no
    batch until its relay answers. Relays ban an IP that opens too many connections, so
-   the same relay is redialled so after 20 s, then 30 s, and at most 3 times until it
-   answers within 5 s again; one that answers late, or never, isn't redialled in a loop. The last
+   the same relay is redialled after 20 s, then 30 s, and at most 3 times until it
+   answers within 5 s again on a socket open 30 s; one that answers late, never, or only
+   on each new socket, isn't redialled in a loop. The last
    batches a room sends as it leaves go through every relay, as nothing could send them
    again. A relay that bans us (`blocked:`, `banned`) gets nothing for 30 s, doubling up
    to 10 min; the ban starts over at 30 s once the relay has gone 10 min without one.
@@ -738,8 +739,10 @@ Run these with Node and the Playwright install on this host:
   or `close()`. A socket that has heard nothing at all for 10 s after a signal (pipe batches and
   events to keep don't count) is closed and its relay dialled again, not 1 ms sooner, and the new one takes
   no batch until its relay answers; a relay that never answers is redialled 10, 20 and 30 s after each
-  socket's first unanswered signal, then not again until it answers one within 5 s (5 s is late). Relays
-  answering 0.1, 4 or 9 s late, or sending events but no OK, are never redialled, and one 12 s late once.
+  socket's first unanswered signal, then not again until it answers one within 5 s (5 s is late) on a
+  socket open 30 s (29.999 s is too young); one answering each new socket's first signal only is redialled
+  3 times too. Relays answering 0.1, 4 or 9 s late, or sending events but no OK, are never redialled, and
+  one 12 s late once.
   No relays.
 - `node packages/js/test/inbox.mjs`: `openInbox` on fake strfry-like relays and a fake clock. A recipient
   offline when a message was left gets it once (from three relays, and not again in a later session); a

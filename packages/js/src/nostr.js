@@ -73,8 +73,9 @@ export const SILENT_MS = 5000;
 // is lost. A socket that has heard nothing at all (no OK, no event) since an event sent through every relay (not a
 // pipe batch, nor one to keep) REDIAL_SILENT_MS ago is deaf: it is closed and its relay dialled again, and the new
 // socket is silent (see silent()) until its relay answers. Each next redial of that relay waits twice as long, to
-// MAX_RECONNECT_MS, and after REDIAL_TRIES there are none until it answers an event within SILENT_MS: one that never
-// answers, or answers late, isn't dialled again and again (relays ban an IP for too many connections, see start()).
+// MAX_RECONNECT_MS, and after REDIAL_TRIES there are none until it answers an event within SILENT_MS on a socket open
+// MAX_RECONNECT_MS or more: one that never answers, answers late, or answers each new socket only to go deaf again,
+// isn't dialled again and again (relays ban an IP for too many connections, see start()).
 export const REDIAL_SILENT_MS = 2 * SILENT_MS;
 export const REDIAL_TRIES = 3;
 // Events to keep (store(): a doc's copy on the relays) go to each relay one every STORE_EVERY_MS
@@ -510,8 +511,9 @@ export class NostrSignaling {
     ws?.inflight?.delete(id);
     if (ws) ws.asked = null; // it answers (see silent())
     const now = clock();
-    // In time: its redials start over (see deafAfter()).
-    if (e && now - e.sent < SILENT_MS) this.redialled.delete(url);
+    // In time, on a socket open MAX_RECONNECT_MS or more: its redials start over (see deafAfter()). A relay that answers
+    // each new socket at first, then goes deaf again, only ever answers on young ones.
+    if (e && now - e.sent < SILENT_MS && now - ws.dialled >= MAX_RECONNECT_MS) this.redialled.delete(url);
     const p = this.paused.get(url);
     if (ok === true) {
       // It took one sent since its last hold began: a refusal from now on starts over.

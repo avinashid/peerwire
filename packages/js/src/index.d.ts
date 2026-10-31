@@ -745,11 +745,11 @@ export declare class NostrSignaling implements SignalingAdapter {
   readonly id: string;
   readonly ready: Promise<void>;
   /**
-   * `relaysOpen` counts sockets open now; `reconnects` counts relays that opened again after a close; `backoffs`,
-   * relays held for their rate or stopped for a ban; `resent`, events sent to a relay again after it refused them
-   * for its rate; `unsent`, events dropped from a relay's queue (past 64 waiting, or waiting over 10 s); `redials`,
-   * sockets closed and dialled again for hearing nothing at all for 10 s after a signal (20 s, then 30 s, for the
-   * same relay; at most 3 until it answers within 5 s).
+   * `relaysOpen` counts sockets open now; `reconnects` counts relays that opened again after a close or a redial;
+   * `backoffs`, relays held for their rate or stopped for a ban; `resent`, events sent to a relay again after it
+   * refused them for its rate; `unsent`, events dropped from a relay's queue (past 64 waiting, or waiting over 10 s);
+   * `redials`, sockets closed and dialled again for hearing nothing at all for 10 s after a signal (20 s, then 30 s,
+   * for the same relay; at most 3 until it answers within 5 s on a socket open 30 s).
    */
   readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; reconnects: number; backoffs: number; resent: number; unsent: number; redials: number; lastRejection?: string };
   onHello: (peer: PeerId, meta?: unknown) => void;
