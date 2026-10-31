@@ -136,7 +136,9 @@ class FakePc {
     }
     this.gather();
   }
+  // A browser applies a description more slowly than a candidate: two turns here, a candidate one.
   async setRemoteDescription(d) {
+    await tick();
     await tick();
     if (this.signalingState === 'closed') throw new Error('InvalidStateError: closed');
     if (d.sdp.includes('a=bad')) throw new Error('OperationError: unparsable');
@@ -149,6 +151,7 @@ class FakePc {
         this.signalingState = 'stable';
       } else if (this.signalingState !== 'stable') throw new Error(`InvalidStateError: offer in ${this.signalingState}`);
       this.remoteRestarted = this.remoteUfrag !== null && this.remoteUfrag !== ufrag;
+      this.remoteOffers = (this.remoteOffers ?? 0) + 1;
     } else if (this.signalingState !== 'have-local-offer') throw new Error(`InvalidStateError: answer in ${this.signalingState}`);
     for (const s of sections) {
       let t = this.ts.find((x) => x.mid === s.mid);
@@ -320,6 +323,7 @@ async function connected(...ms) {
   const c = (o) => ok({ t: 'ice', c: { candidate: HOST, sdpMid: '0', sdpMLineIndex: 0, ...o } });
   check(c({})?.c.candidate === HOST && c({ sdpMid: null })?.c.sdpMLineIndex === 0 && c({ sdpMLineIndex: undefined })?.c.sdpMid === '0', 'ice: kept with a mid, an index, or both');
   check(c({ sdpMid: null, sdpMLineIndex: null }) === null, 'ice: neither mid nor index: dropped');
+  check(c({ sdpMLineIndex: undefined, usernameFragment: 'u' })?.c.sdpMLineIndex === null && Object.keys(c({ extra: 1 }).c).join() === 'candidate,sdpMid,sdpMLineIndex', 'ice: only candidate, sdpMid and sdpMLineIndex copied, one missing as null');
   check(c({ candidate: `candidate:${'x'.repeat(MAX_CANDIDATE - 10)}` }) !== null && c({ candidate: `candidate:${'x'.repeat(MAX_CANDIDATE - 9)}` }) === null, `ice: a candidate of ${MAX_CANDIDATE} characters kept, one more dropped`);
   check(c({ candidate: 'a=candidate:1 1 udp 1 1.2.3.4 5 typ host' }) === null && c({ candidate: '' }) === null && c({ candidate: 7 }) === null, "ice: one not starting 'candidate:', empty, or not a string: dropped");
   check(c({ sdpMid: 'x'.repeat(32) }) !== null && c({ sdpMid: 'x'.repeat(33) }) === null && c({ sdpMid: 3 }) === null, 'ice: a mid of 32 characters kept, 33 or a number dropped');
@@ -434,6 +438,13 @@ async function connected(...ms) {
   check(lb.tx.video.sender.replaced.join() === ',video' && lb.tx.video.sender.track === sb.getTracks()[1], 'glare: the polite side set its video track again, after null');
   check(evs(a, 'state').length === 2 && a.call.state(b.id) === 'connected', 'glare: no state change');
   check(evs(a, 'stream').length === 1 && evs(b, 'stream').length === 1, "glare: no second 'stream'");
+  // An offer that comes while ours is being made, before our signalling state changes, collides too.
+  const applied = la.pc.remoteOffers ?? 0;
+  la.makingOffer = true;
+  a.calls.receive(b.id, bytes({ t: 'sdp', d: { type: 'offer', sdp: lb.pc.localDescription.sdp } }));
+  await settle();
+  la.makingOffer = false;
+  check((la.pc.remoteOffers ?? 0) === applied && la.pc.signalingState === 'stable', 'the impolite side ignores an offer that comes while it makes its own');
 
   // An offer with an extra m-section (a newer version's): inactive here, the stream unchanged.
   reset();
@@ -453,6 +464,22 @@ async function connected(...ms) {
   const dirs = ly.pc.getTransceivers().map((t) => t.direction).join();
   check(dirs === 'sendrecv,sendrecv,inactive' && y.call.stream(x.id).getTracks().map((t) => t.kind).join() === 'audio,video', `an offer with three m-sections: the third inactive (${dirs}), the stream one audio and one video`);
   check(sentBy(y.id, 'sdp')[0]?.msg.d.type === 'answer' && sentBy(y.id, 'sdp')[0].msg.d.sdp.includes('a=inactive'), 'and the answer says so');
+
+  // The first video section inactive, a later one sending: that one's track is left out like any extra one.
+  reset();
+  const [o1, o2] = [member(ID('1')), member(ID('2'))];
+  meet(o1, o2);
+  join(o2);
+  await settle();
+  const odd = new FakePc({});
+  odd.addTransceiver('audio');
+  odd.addTransceiver('video', { direction: 'inactive' });
+  odd.addTransceiver('video');
+  await odd.setLocalDescription();
+  o2.calls.receive(o1.id, bytes({ t: 'join', age: 0 }));
+  o2.calls.receive(o1.id, bytes({ t: 'sdp', d: { type: 'offer', sdp: odd.localDescription.sdp } }));
+  await settle();
+  check(o2.call.stream(o1.id)?.getTracks().map((t) => t.kind).join() === 'audio', 'the first video section inactive and a later one sending: the stream has the audio track only');
 
   // An offer that sends nothing: no track comes, so no 'stream', and call.stream(peer) is null.
   reset();
@@ -590,6 +617,7 @@ async function connected(...ms) {
   iceUp();
   await settle();
   check(six.every((m) => m.call.peers.length === 5 && m.call.peers.every((p) => m.call.state(p) === 'connected')), '6 in the call, each connected to the 5 others');
+  clock.t += 5000;
   const g = member(ID('7'));
   meet(g);
   await settle();
@@ -607,6 +635,8 @@ async function connected(...ms) {
   iceUp();
   await settle();
   check(evs(h, 'full').length === 1 && h.call.left, "an 8th that called before learning who is in: 'full'");
+  const told = sentBy(six[0].id, 'join').find((x) => x.to === h.id)?.msg.age;
+  check(told === Math.round(clock.t - six[0].call.started) && told >= 5000, `a member tells a newcomer how long it has been in the call (${told} ms)`);
   check(sentBy(h.id, 'leave').length === 7, 'and it tells the room it left');
   check(six.every((m) => m.call.peers.length === 5 && !m.call.peers.includes(h.id) && !evs(m, 'ended').length && !evs(m, 'full').length), 'the 6 never linked it and keep their 5');
   check(six.every((m) => sentBy(m.id, 'full').some((x) => x.to === h.id)), "each of the 6 answered it 'full'");
