@@ -443,44 +443,51 @@ if (!isMainThread) {
     const opts = (name) => ({ appId: APP, roomId, presence: { name }, signaling: 'nostr', relays: RELAYS, fallbackMs: 300, RTCPeerConnection: fakePc(name) });
     const a = await joinRoom(opts('a'));
     draw(a.doc('board'));
-    // (i): [when, relay] of each lossy event (pipe batch) A's signalling puts on a relay's queue.
+    // (i): [when, socket] of each lossy event (pipe batch) A's signalling puts on a relay's queue.
     const striped = [];
     if (half) {
       const queue = a.signaling.queue.bind(a.signaling);
-      a.signaling.queue = (ws, e) => (e.lossy && striped.push([now(), ws.url]), queue(ws, e));
+      a.signaling.queue = (ws, e) => (e.lossy && striped.push([now(), ws]), queue(ws, e));
     }
     const t0 = now();
     deafTo = deaf;
     const c = await joinRoom(opts('c'));
-    // (i): `half` goes half-open as C links to A, so A has sent it pipe batches by the time it is found silent.
+    const relay = (r, url) => r.signaling.sockets.find((ws) => ws.url === url);
+    // (i): `half` goes half-open as C links to A, so A has sent it pipe batches by the time it is found silent. A dials
+    // it again once that socket has heard nothing for a while (deaf), so the socket counted is the one that went
+    // half-open.
     let halfAt = Infinity;
+    let halfWs = null;
     const going = half && (async () => {
       while (!c.peers.includes(a.self) && now() - t0 < LINK_MS) await sleep(5);
       halfOpen = half;
       halfAt = now();
+      halfWs = relay(a, half);
     })();
     const w = await watch(c, c.doc('board'), a.self, t0, Math.max(WATCH_MS, bars.deadline));
     await going;
     const route = c.route(a.self)?.kind;
-    const relay = (r, url) => r.signaling.sockets.find((ws) => ws.url === url);
     const lost = deaf && relay(c, deaf)?.stats.missed;
     const through = deaf && relay(a, deaf)?.stats.accepted;
-    const swallowed = half && relay(a, half)?.stats.swallowed;
+    const swallowed = half && halfWs?.stats.swallowed;
     const silent = half && a.signaling.silent?.(relay(a, half), performance.now());
-    // A puts no batch on it later than SILENT_MS after the first event it took unanswered: no OK came back after that.
-    const onHalf = striped.filter(([t, url]) => url === half && t >= halfAt).map(([t]) => t - relay(a, half)?.swallowedAt);
-    const others = striped.filter(([t, url]) => url !== half && t >= halfAt).length;
+    // A puts no batch on it later than SILENT_MS after the first event it took unanswered (no OK came back after that),
+    // and none on a socket it dialled again to that relay, which takes none until the relay answers.
+    const onHalf = striped.filter(([t, ws]) => ws === halfWs && t >= halfAt).map(([t]) => t - halfWs.swallowedAt);
+    const onRedialled = striped.filter(([t, ws]) => ws.url === half && ws !== halfWs && t >= halfAt).length;
+    const others = striped.filter(([t, ws]) => ws.url !== half && t >= halfAt).length;
     report(name, `fallback over the signalling pipe (${limits(rate)}${deaf ? `; C deaf to ${deaf}` : ''}${half ? `; ${half} half-open from the link` : ''})`, w, {
       aId: a.self, cId: c.self, aWire: wire.get(a.self), cWire: wire.get(c.self), aCore: a.stats(), cCore: c.stats(), ...bars,
       extra: [`route C->A: ${route}`, `A: ${pipe(a.transport.piped, a.signaling.stats, a.signaling.sockets[0]?.stats)}`, `C: ${pipe(c.transport.piped, c.signaling.stats, c.signaling.sockets[0]?.stats)}`,
         ...(deaf ? [`${deaf} took ${through} events from A and kept ${lost} from C`] : []),
-        ...(half ? [`${half} took ${swallowed} events from A once half-open, and answered none (A counts it ${silent ? 'silent' : 'answering'}); A put ${onHalf.length} pipe batches on it (the last ${s(Math.max(...onHalf, 0))} after the first it took unanswered) and ${others} on the others`] : [])],
+        ...(half ? [`${half} took ${swallowed} events from A once half-open, and answered none (A counts it ${silent ? 'silent' : 'answering'}); A put ${onHalf.length} pipe batches on it (the last ${s(Math.max(...onHalf, 0))} after the first it took unanswered) and ${others} on the others; A redialled ${a.signaling.stats.redials} deaf sockets (${onRedialled} batches on them), C ${c.signaling.stats.redials}`] : [])],
     });
     if (w.link !== null && route !== 'signaling') results.push({ key, ok: false, line: `(${name}) C reached A over ${route}, not the pipe` });
     // Not vacuous: the relay C is deaf to carried some of what A sent it; the half-open one took some of A's batches.
     if (deaf && !(lost > 0)) results.push({ key, ok: false, line: `(${name}) ${deaf} kept nothing from C` });
     if (half && !(swallowed > 0)) results.push({ key, ok: false, line: `(${name}) ${half} took nothing from A once half-open` });
     if (half && onHalf.some((t) => t > SILENT_MS + 100)) results.push({ key, ok: false, line: `(${name}) A put ${onHalf.filter((t) => t > SILENT_MS + 100).length} pipe batches on ${half} over ${s(SILENT_MS)} after it stopped answering (the last at ${s(Math.max(...onHalf))})` });
+    if (half && onRedialled) results.push({ key, ok: false, line: `(${name}) A put ${onRedialled} pipe batches on ${half} through a socket dialled again to it, before it answered` });
     deafTo = null;
     halfOpen = null;
     await Promise.all([a.leave(), c.leave()]);

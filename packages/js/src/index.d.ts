@@ -741,11 +741,13 @@ export declare class NostrSignaling implements SignalingAdapter {
   /**
    * `relaysOpen` counts sockets open now; `reconnects` counts relays that opened again after a close; `backoffs`,
    * relays held for their rate or stopped for a ban; `resent`, events sent to a relay again after it refused them
-   * for its rate; `unsent`, events dropped from a relay's queue (past 64 waiting, or waiting over 10 s).
+   * for its rate; `unsent`, events dropped from a relay's queue (past 64 waiting, or waiting over 10 s); `redials`,
+   * sockets closed and dialled again for hearing nothing at all for 10 s after a signal (20 s, then 30 s, for the
+   * same relay; at most 3 until it answers within 5 s).
    */
-  readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; reconnects: number; backoffs: number; resent: number; unsent: number; lastRejection?: string };
+  readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; reconnects: number; backoffs: number; resent: number; unsent: number; redials: number; lastRejection?: string };
   onHello: (peer: PeerId, meta?: unknown) => void;
-  /** A relay opened again after its socket closed (it is redialled on its own, and at once on a network change or the page showing again; going online redials every relay). */
+  /** A relay opened again after its socket closed or heard nothing (see `stats.redials`); it is redialled on its own, and at once on a network change or the page showing again; going online redials every relay. */
   onReconnect: (url: string) => void;
   hello(meta?: unknown): Promise<void>;
   /** `lossy`: through one relay, the relays taking turns (one that holds us for its rate, has banned us or isn't open

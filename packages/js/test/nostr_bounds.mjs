@@ -681,6 +681,191 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
   delete performance.now;
 }
 
+// 5g. NB-006k: our own socket may be half-open, its subscription hearing nothing, so what peers send us through that
+//     relay is lost. A socket that has heard nothing at all since an event sent through every relay (not a pipe batch,
+//     nor one to keep) 10 s ago is deaf: it is closed and its relay dialled again, and the new socket takes no pipe
+//     batch until its relay answers. Each next redial of that relay waits twice as long, to 30 s, and after 3 there are
+//     none until it answers an event within 5 s; a late answer doesn't count. A relay that answers, even 9 s late, or
+//     sends no OK but events, is never redialled; one that answers 12 s late, once. A deaf socket that closes is
+//     redialled as any closed one. The numbers are written out, so that the constants themselves are checked. Fake
+//     sockets, and a fake clock that runs the timers.
+{
+  let clock = 1e6;
+  performance.now = () => clock;
+  const [realTimeout, realClear, Real] = [globalThis.setTimeout, globalThis.clearTimeout, globalThis.WebSocket];
+  const timers = new Map(); // id -> { at, fn }
+  let ids = 0;
+  // As in browsers and Node, a delay past 2^31 - 1 ms is 1 ms.
+  globalThis.setTimeout = (fn, ms = 0) => (timers.set(++ids, { at: clock + (ms > 2 ** 31 - 1 ? 1 : Math.max(0, ms)), fn }), ids);
+  globalThis.clearTimeout = (id) => void timers.delete(id);
+  // Runs the clock to `to`, each timer at its time, the earliest (then the first set) first.
+  const run = (to) => {
+    for (;;) {
+      let next = null;
+      for (const [id, t] of timers) if (t.at <= to && (!next || t.at < next[1].at)) next = [id, t];
+      if (!next) break;
+      timers.delete(next[0]);
+      clock = Math.max(clock, next[1].at);
+      next[1].fn();
+    }
+    clock = to;
+  };
+  const lag = {}; // relay url -> how long it takes to answer an event with OK; null: it sends no OK
+  const made = []; // every socket dialled
+  class Fake {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    constructor(url) {
+      Object.assign(this, { url, at: clock, readyState: Fake.CONNECTING, dead: false, events: [] });
+      made.push(this);
+      setTimeout(() => this.readyState === Fake.CONNECTING && ((this.readyState = Fake.OPEN), this.onopen?.()), 50);
+    }
+    // [when, content] of each event sent on it. A dead socket (half-open) takes them and answers nothing.
+    send(m) {
+      const [type, ev] = JSON.parse(m);
+      if (type !== 'EVENT') return;
+      this.events.push([clock, ev.content]);
+      if (!this.dead && lag[this.url] != null) setTimeout(() => this.hear(['OK', ev.id, true, '']), lag[this.url]);
+    }
+    hear(m) {
+      if (this.readyState === Fake.OPEN) this.onmessage?.({ data: JSON.stringify(m) });
+    }
+    close() {
+      this.readyState = Fake.CLOSED;
+      this.onclose?.();
+    }
+  }
+  globalThis.WebSocket = Fake;
+  const of = (url) => made.filter((w) => w.url === url);
+  const start = async (room, urls) => {
+    const s = new NostrSignaling(pw, pw.endpoint(), { room, relays: urls });
+    // start() dials once its keys are derived: wait for the sockets, then let them open.
+    for (let i = 0; i < 1000 && urls.some((u) => !of(u).length); i++) await new Promise((r) => realTimeout(r, 5));
+    run(clock + 50);
+    await s.ready;
+    s.back = [];
+    s.onReconnect = (url) => s.back.push(url);
+    return s;
+  };
+  // A signal (an event through every relay) each `every` ms until `to`, the clock running between them; `also` first.
+  const signal = async (s, to, also = () => {}, every = 1000) => {
+    while (clock + every <= to) {
+      run(clock + every);
+      await also();
+      await s.publish(s.roomTag, 'sig');
+    }
+    run(to);
+  };
+  const batch = (s) => s.publish(s.roomTag, 'batch', true);
+  const batches = (w) => w.events.filter(([, c]) => c === 'batch').length;
+
+  // b's socket goes half-open. Pipe batches and an event to keep only, for 60 s: b loses its turns, but isn't
+  // redialled. Then one signal: b is redialled 10 s after it, not 1 ms before.
+  {
+    const [A, B, C] = ['wss://a1', 'wss://b1', 'wss://c1'];
+    for (const u of [A, B, C]) lag[u] = 100;
+    const s = await start('redial/once', [A, B, C]);
+    await signal(s, clock + 5000);
+    run(clock + 200); // the last signal's OKs: nothing is left unanswered
+    const b = of(B)[0];
+    b.dead = true;
+    s.store({ id: hid(9e9), kind: 30078, pubkey: 'k', created_at: 1, tags: [], content: 'keep', sig: '' }, [B]);
+    for (const end = clock + 60000; clock < end;) {
+      run(clock + 250);
+      await batch(s);
+    }
+    check(made.length === 3 && s.stats.redials === 0 && batches(b) > 0 && b.events.some(([, c]) => c === 'keep') && s.silent(b, clock),
+      `a socket sent only pipe batches (${batches(b)}) and an event to keep, unanswered for 60 s, is silent but not redialled`);
+    await s.publish(s.roomTag, 'sig');
+    const T = clock;
+    const early = s.deaf(b, T + 9999);
+    run(T + 9999);
+    const before = made.length;
+    check(!early && s.deaf(b, T + 10000) && before === 3, 'a signal unanswered for 9.999 s: not deaf yet');
+    run(T + 10000);
+    const nb = made.at(-1);
+    check(made.length === 4 && nb.url === B && nb.at === T + 10000 && b.readyState === Fake.CLOSED && !s.sockets.includes(b) && s.stats.redials === 1,
+      `a signal unanswered for 10 s: the socket is closed and the relay dialled again (at ${nb.at - T} ms)`);
+    run(clock + 50);
+    s.turn = s.sockets.indexOf(nb);
+    await batch(s);
+    check(s.back.join() === B && s.stats.reconnects === 1 && s.stats.relaysOpen === 3 && s.silent(nb, clock) && batches(nb) === 0,
+      `the new socket opens (onReconnect ${s.back.join()}, ${s.stats.relaysOpen} open), and takes no pipe batch until its relay answers`);
+    await s.publish(s.roomTag, 'sig');
+    run(clock + 100);
+    s.turn = s.sockets.indexOf(nb);
+    await batch(s);
+    check(!s.silent(nb, clock) && batches(nb) === 1, 'once its relay answers, it takes its turns');
+    let k = 0;
+    await signal(s, clock + 300000, () => ++k % 4 || batch(s));
+    run(clock + 200); // the last signal's OKs
+    check(made.length === 4 && s.stats.redials === 1 && of(A).length === 1 && of(C).length === 1 && !s.deaf(of(A)[0], clock + 1e9),
+      `5 min more of signals and batches, all answered: no more redials (${made.length - 3} in all), none of a or c`);
+    // c's socket stops answering, then closes: it is redialled once, as any closed socket, and not again when the
+    // closed socket would have been deaf.
+    of(C)[0].dead = true;
+    await s.publish(s.roomTag, 'sig');
+    of(C)[0].close();
+    await signal(s, clock + 60000);
+    check(of(C).length === 2 && s.stats.redials === 1 && s.stats.reconnects === 2,
+      `a deaf socket that closes is redialled once (${of(C).length - 1}), as a closed one`);
+    s.close();
+  }
+
+  // A relay that never answers: redialled 10, 20 and 30 s after the first signal each socket left unanswered, then
+  // not again. An answer 5 s after its event doesn't give its redials back; one within 5 s does.
+  {
+    const [A, N] = ['wss://a2', 'wss://n2'];
+    lag[A] = 100;
+    lag[N] = null;
+    const s = await start('redial/never', [A, N]);
+    await signal(s, clock + 600000);
+    const n = of(N);
+    const gaps = n.slice(1).map((w, i) => w.at - n[i].events[0][0]);
+    check(n.length === 4 && gaps.join() === '10000,20000,30000' && of(A).length === 1 && s.stats.redials === 3,
+      `a relay that never answers is redialled ${n.length - 1} times in 10 min, ${gaps.map((g) => g / 1000).join(', ')} s after the first signal each socket left unanswered`);
+    lag[N] = 5000;
+    await s.publish(s.roomTag, 'sig');
+    run(clock + 5000);
+    lag[N] = null;
+    await signal(s, clock + 120000);
+    check(of(N).length === 4 && s.stats.redials === 3 && n[3].unheard != null && !timers.has(n[3].deafTimer),
+      'it answers one 5 s after it was sent (late): 2 min more unanswered, no redial, and no timer for one');
+    lag[N] = 4999;
+    await s.publish(s.roomTag, 'sig');
+    run(clock + 5000);
+    lag[N] = null;
+    await s.publish(s.roomTag, 'sig');
+    const T = clock;
+    await signal(s, T + 120000);
+    const m = of(N).slice(3); // the socket that answered in time, and those dialled after it
+    const again = m.slice(1).map((w, i) => w.at - (i ? m[i].events[0][0] : T));
+    check(again.join() === '10000,20000,30000', `it answers one within 5 s: its 3 redials come back (${again.map((g) => g / 1000).join(', ')} s)`);
+    s.close();
+  }
+
+  // Relays that answer 0.1, 4 and 9 s after each event, and one that sends no OK but delivers events, are never
+  // redialled; one answering 12 s after, once.
+  {
+    const [P, Q, R, L, E] = ['wss://p3', 'wss://q3', 'wss://r3', 'wss://l3', 'wss://e3'];
+    Object.assign(lag, { [P]: 100, [Q]: 4000, [R]: 9000, [L]: 12000, [E]: null });
+    const s = await start('redial/answer', [P, Q, R, L, E]);
+    let k = 0;
+    const deliver = () => ++k % 2 || of(E).at(-1).hear(['EVENT', s.sub, { id: hid(k), kind: 1, pubkey: 'x', created_at: 1, tags: [], content: '' }]);
+    await signal(s, clock + 600000, deliver);
+    const l = of(L);
+    check([P, Q, R, E].every((u) => of(u).length === 1) && l.length === 2 && l[1].at - l[0].events[0][0] === 10000 && s.stats.redials === 1,
+      `answering 0.1, 4 and 9 s late, or sending events but no OK: never redialled in 10 min; 12 s late: ${l.length - 1} redial`);
+    s.close();
+  }
+
+  globalThis.setTimeout = realTimeout;
+  globalThis.clearTimeout = realClear;
+  globalThis.WebSocket = Real;
+  delete performance.now;
+}
+
 // 6. A relay socket that closes (phone hotspot on, network switch, tab frozen) is redialled,
 //    subscribes again and says so; a network change recycles open sockets; close() stops it.
 {

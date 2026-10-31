@@ -70,6 +70,7 @@ jobs:
       - run: node packages/js/test/inbox.mjs
       - run: node packages/js/test/rust_hello.mjs
       - run: node packages/js/test/rust_doc.mjs
+      - run: node packages/js/test/doc_crdt.mjs
       - run: node packages/js/test/room_proof.mjs
       - run: node packages/js/test/pump_rearm.mjs
       - run: node packages/js/test/endpoint_closed.mjs
