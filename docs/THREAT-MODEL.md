@@ -56,8 +56,9 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `f6b5189` (2026-10-31): NB-052 (`1113cac`) merged in `143923f`,
-NB-019 (`fa25c82`) in `e6c9684`.** Fixes merged after `@peerwire/js` 0.2.0 and
+**Status as of main `4f681b4` (2026-10-31): NB-058 (`4609955`) merged in `2f68aa8`,
+NB-016 (`6107674`) in `888e0d6`, NB-010 (`41f4021`) in `869e4cf` and NB-010a
+(`0ac7547`) in `4f681b4`.** Fixes merged after `@peerwire/js` 0.2.0 and
 `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
@@ -124,6 +125,8 @@ NB-019 (`fa25c82`) in `e6c9684`.** Fixes merged after `@peerwire/js` 0.2.0 and
 | NB52-1, NB52-2 (Low), NB52-I1, NB52-I2 (Info) | **Fixed** by `3749a67`, `ba693d0`, `1113cac` and `da4fe8b` before NB-052 merged, so never on main (a catch-up afresh keeps the joiner's budgets; our replies to its asks for docs not open go again; one that alone queues over 8 MiB cuts the joiner), reviewed 2026-10-31, same section |
 | NB19-1, NB19-3, NB19-4, NB19-5 (Low), NB19-I1, NB19-I2 (Info) | **Fixed** by `5a3fb65` and `c173890` before NB-019 merged, so never on main, before `openInbox` was published (a read opens each content once, whichever relay states its id; JSON nested past 64 is dropped; the envelope names the app; every read asks `until`; listeners get the message's id; `since` is rounded down to 10 min), reviewed 2026-10-31, [Offline messages](#offline-messages-to-a-peerid-openinbox-nb-019--nb19-1nb19-5) |
 | NB19-2 (Low) | Accepted (the lead's call, documented in the README and `index.d.ts`): 100 drops or more in a message's second, ordered before it, hide it on that relay, same section |
+| NB10-1, NB10-2 (Low), NB10-I1, NB10-I2 (Info) | **Fixed** by `c578263` and `41f4021` before NB-010 merged, so never on main (merged `869e4cf`), before `room.call()` was published (a member's `full` turns a joiner away only when the joiner's own roster has no seat for it either; 'stream' comes for every peer once its description applies, whatever it sends; a description with more than 64 candidates is dropped; the docs say call frames on a pipe go inside it), reviewed 2026-10-31; NB10-I1a, NB10-I3 (Info) and the residuals accepted, [Calls](#calls-roomcall-nb-010-nb-010a--nb10-1-nb10-2-nb10a-1) |
+| NB10a-1 (Low) | **Fixed** by `f979384` before NB-010a merged, so never on main (merged `4f681b4`): in the meet page, a camera or microphone request still pending at Leave is turned off when it lands, reviewed 2026-10-31, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -2267,6 +2270,131 @@ fails with its fix undone.
 - **What a relay sees:** the IP and rhythm of senders and readers, and the app's volume.
   Rounding `since` narrows linking by timing; it doesn't remove it. Outer event
   signatures and ids aren't checked, and nothing trusts them: Noise X authenticates.
+
+### Calls, `room.call()` (NB-010, NB-010a) — NB10-1, NB10-2, NB10a-1
+
+`room.call(stream, { max })` in `@peerwire/js` (`src/call.js`) is a voice and video
+call among a room's members, each linked to every other (a mesh): `max` is 6 by default
+and 16 at most. The meet demo (`demo/meet.html`, NB-010a) is built on it. The design:
+- **Signalled over the room's link.** Each peer in the call gets an `RTCPeerConnection`
+  for media alone. Its descriptions and candidates are room frames of tag 9, JSON on
+  the reliable lane, sealed and authenticated like any room message. They act only from
+  a proven member, and `sdp` and `ice` only from one we linked. No call frame is a
+  relay event of its own: on a pipe they go inside it, sealed. Old JS peers drop tag 9.
+- **Media bound to the PeerId.** Each DTLS fingerprint travels in a description sealed
+  by that peer's session, so neither a signalling relay nor another member can sit in
+  the middle of a call.
+- **Fixed transceivers.** The smaller PeerId offers one audio and one video transceiver,
+  and descriptions follow perfect negotiation. Extra m-sections in a remote description
+  are set inactive before we answer, and only the first audio and first video
+  transceiver reach the app. A stream set later replaces tracks and never renegotiates.
+- **Caps** (`parseCall`). A frame of 64 KiB; a description of 32 KiB with at most 4
+  m-sections and 64 `a=candidate:` lines; a candidate of 512 characters starting
+  `candidate:`; a mid of 32 characters; an index from 0 to 3. Only known fields are
+  copied. A malformed frame is dropped and counted, and spends no budget.
+- **Budgets per peer** (`BUDGETS`, on `performance.now()`). `join` 6, then 1 per 5 s
+  (each makes a connection, whose ICE asks STUN); `sdp` 8, then 1 per 3 s; `ice` 64,
+  then 4 a second. Past them a frame is dropped and counted.
+- **Privacy.** `joinRoom` refuses `'relay-only'`, so a call runs under `'direct'` or
+  `'public-only'`. Under `'public-only'`, descriptions go through
+  `withoutHostCandidates` and trickled candidates through `candidateFor`, the data
+  links' MIC-1 and MIC-5 filters.
+- **No retry loop.** A peer whose media hasn't connected 20 s (`CONNECT_MS`) after its
+  link was made fails (`'no-path'`) and stays failed until one side joins again. One
+  that lost ICE gets 2 restarts in 60 s, then fails.
+- **Seats.** A member in the call tells every room member (`join`, with how long it has
+  been in, `age`), so each knows who is in (the roster). Joining with `max` in already
+  is `'full'` at once. A member is seated once a link has connected and none to a
+  member that was in before it is still connecting. One not seated gives way at
+  capacity to a member that joined before it; a seated one never does.
+
+Reviewed 2026-10-31 by reading `888e0d6..78a464b`, then the fixes `78a464b..41f4021`,
+and the meet page `c578263..97bdf7d`, then its fix `97bdf7d..f979384`. Probes ran in
+headless Chromium with fake devices, on loopback with local signalling (Node 22).
+
+**Checked and holding:**
+- `parseCall` parses JSON in a `try`, checks every cap before use and copies only known
+  fields, so no prototype key reaches a connection; `age` must be a safe integer. Its
+  m-line count is at least the number of sections Chromium splits.
+- Budgets go when a peer leaves the room, a link's timers clear when it closes, and
+  nothing is sent after we leave the call.
+- The meet page writes names and reasons as text. It asks for media only from a click;
+  mute disables a track, and turning the camera off stops it. A member's presence
+  (`{name, mic, cam}`) speaks only for its own media, and tiles are bounded by the
+  call's seats.
+
+**NB10-1 — One room member could keep every newcomer out of the call (Low).** A joiner
+not yet seated left on a `full` from any roster member claiming an earlier start, and it
+is never seated when that `full` lands: `full` answers its `join` in one hop, while a
+seat needs an answer, ICE and DTLS (up to 20 s against a member that never answers). So
+any member, which is anyone with the invite, could answer each joiner `full` and lock
+the call to whoever was in it. The joiner saw `'full'` and couldn't tell who sent it.
+In the probe, a joiner got `'full'` 19 ms after calling, both links still connecting.
+Fix: a `full` counts only when the joiner's own roster has no seat for it either
+(`roster.size >= max`, the test `start()` makes). The joiner then stays and connects (in
+45 ms in the probe), and a claimed `age` matters only at capacity.
+
+**NB10-2 — A member that sent nothing got our media unseen (Low).** `'stream'` came
+only from `ontrack`, which a browser fires only for m-sections the remote sends on. A
+modified client with recvonly transceivers got every member's audio and video, yet no
+member got `'stream'` for it, and `call.stream(peer)` stayed null: an app drawing tiles
+on `'stream'`, as the README did, showed nobody there. In the probe it decoded 88 or 89
+of a member's video frames and about 300 audio packets in 6 s, unseen. Fix: `show()`
+builds the stream from the first audio and first video transceiver's `receiver.track`
+once the peer's description applies, whatever it sends, and the README draws a tile on
+the first `'state'`.
+
+**NB10a-1 — A camera asked for before Leave came on after it (Low).** The meet page's
+`acquire()` awaited `getUserMedia`, then added what it got to whatever stream was
+current. Leave wasn't disabled meanwhile, and `stopMedia()` put in a new stream, so a
+grant that landed after Leave turned the camera on behind "Your camera and microphone
+are off", and Rejoin sent it to the call. In the probe (`getUserMedia` held until after
+Leave), the camera was live 2.5 s after Leave and went out on Rejoin. Fix: `stopMedia()`
+bumps `mediaEpoch`, and `acquire()` stops what it got if the epoch moved.
+
+**Status: fixed** by `c578263` (NB10-1, NB10-2, NB10-I2) and `41f4021` (NB10-I1) before
+NB-010 merged, so never on main (`backend/NB-010-calls` at `41f4021`, merged in
+`869e4cf`), and by `f979384` (NB10a-1) before NB-010a merged (`ui/NB-010a-meet` at
+`0ac7547`, merged in `4f681b4`). Reviewed 2026-10-31. Each fix has a test: `call.mjs`,
+`call_browser.mjs` part 4, and `meet.mjs` with `getUserMedia` held past Leave. None of
+the three probes reproduces on the fixed heads.
+
+**Info:**
+- **NB10-I1 (fixed).** The `ice` budget didn't count candidates inside a description,
+  and 32 KiB holds about 760 minimal `a=candidate` lines (*theoretical*: 32,768 / 43
+  bytes). A description with more than 64 is now dropped and counted. 64 leaves room
+  for one made again after a rollback on a host with many interfaces.
+- **NB10-I1a (accepted).** With that cap, a member can add remote candidates to our
+  connection at most 64 (the `ice` burst) + 8 × 64 (the `sdp` burst) = 576 at once,
+  then 4/s + 64 / 3 s ≈ 25 a second (*theoretical*, from `BUDGETS` and the cap). Before
+  the cap it was about 8 × 760 at once. The browser paces its connectivity checks, so
+  the STUN it sends doesn't grow with that count: no amplification.
+- **NB10-I2 (fixed).** The docs said nothing went through the signalling relays. That
+  holds on a direct or member-relayed link, not on a pipe, where call frames go inside
+  it, sealed, and a relay sees their sizes and timing (a burst of descriptions when
+  someone joins). The header and README now say so.
+- **NB10-I3 (accepted).** A member with several PeerIds in the room (the room key is
+  all it takes) can send `join` from each and fill the roster, so every newcomer gets
+  `'full'` at once. Members are trusted alike under the room key.
+
+**Residuals (accepted):**
+- **Trust between members.** Any member can refuse to link a newcomer (that pair fails
+  `'no-path'`) or fill the call with its own PeerIds (NB10-I3), but can't take a linked
+  member's seat. A claimed `age` counts only at capacity and between members not
+  seated.
+- **The last seat.** Two joining for the last seat at the same moment may both go, or
+  one stay unlinked from a member that turned it away (that pair fails `'no-path'`).
+- **Calls that meet.** After a room splits and joins again, its two calls stay partial
+  meshes, each member linking at most `max − 1`.
+- **No TURN.** A pair with no direct path fails `'no-path'` after 20 s and isn't retried
+  until one of them joins again. An app can pass a TURN server in `iceServers`.
+- **Addresses.** Under `'direct'` with a microphone or camera grant, call members get
+  every local address, as data links do. Under `'public-only'`, a member on the same
+  network can still see a local address as a peer-reflexive candidate from our ICE
+  checks, as for data links ("Not covered" in
+  [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043)).
+- **What the room learns.** Every room member, in the call or not, learns who is in it.
+  A relay carrying a pipe sees the sizes and timing of the call frames inside it.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
