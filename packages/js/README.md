@@ -574,7 +574,12 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    with an OK within a round trip) is silent: a half-open socket, still open but dead,
    would otherwise take its turns and lose them until it closes. It is skipped too, while
    any relay that answers is left, and still sent every other signal; its next answer
-   gives it its turns back. The last
+   gives it its turns back. Our own half-open socket hears nothing either, so what peers
+   send us through that relay is lost: a socket that has heard nothing at all for 10 s
+   since a signal went through it is closed and dialled again, and the new one takes no
+   batch until its relay answers. Relays ban an IP that opens too many connections, so
+   the same relay is redialled so after 20 s, then 30 s, and at most 3 times until it
+   answers within 5 s again; one that answers late, or never, isn't redialled in a loop. The last
    batches a room sends as it leaves go through every relay, as nothing could send them
    again. A relay that bans us (`blocked:`, `banned`) gets nothing for 30 s, doubling up
    to 10 min; the ban starts over at 30 s once the relay has gone 10 min without one.
@@ -690,7 +695,12 @@ Run these with Node and the Playwright install on this host:
   incomplete on CLOSED, the socket closing or its timeout, and CLOSEs it; `store()` waits
   behind signalling, goes one a second per relay, and resolves on the OK, a refusal (after
   sending one refused for its rate again), a ban, 30 s without an answer, 120 s waiting,
-  or `close()`. No relays.
+  or `close()`. A socket that has heard nothing at all for 10 s after a signal (pipe batches and
+  events to keep don't count) is closed and its relay dialled again, not 1 ms sooner, and the new one takes
+  no batch until its relay answers; a relay that never answers is redialled 10, 20 and 30 s after each
+  socket's first unanswered signal, then not again until it answers one within 5 s (5 s is late). Relays
+  answering 0.1, 4 or 9 s late, or sending events but no OK, are never redialled, and one 12 s late once.
+  No relays.
 - `node packages/js/test/rust_hello.mjs`: a Rust or Godot member's room hello, sealed with
   the nonce fixed, is the same base64 that `sealRoom` makes (the vector Rust asserts too),
   and opens to Rust's exact JSON. A `Room` that hears it through `NostrSignaling` doesn't
@@ -815,7 +825,7 @@ Run these with Node and the Playwright install on this host:
   datagrams, retransmits, pipe batches and relay events, and checks the bars: 15 s (30 s from a background tab
   over the pipe or with a relay half-open, 60 s with the joiner deaf to a relay), first strokes within 3 s (5 s
   from a background tab over the pipe, 6 s with a relay half-open), no batch put on the half-open relay over 5 s
-  after it stopped answering, and nothing while nobody is online.
+  after it stopped answering (nor on a socket redialled to it), and nothing while nobody is online.
 - `node packages/js/test/pipe_batches.mjs`: a pipe's batches on a fake clock: datagrams queued together go 40
   ms later as one, a batch's worth at once, 6 a second after a burst of 12, and with timers held to once a second
   (a background tab), the batches a late timer finds go together, and what a task queued goes at its end, until
