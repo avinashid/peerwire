@@ -770,11 +770,11 @@ mod tests {
         for n in 0..=UNOPENED {
             ask(&mut d, &format!("n{n}"), 1);
         }
-        ask(&mut d, "n1", 2);
+        ask(&mut d, "n5", 2);
         resync(&mut d, b);
         let end = |n: usize, q: u64| format!(r#"{{"d":"n{n}","t":3,"ws":[],"q":{q},"i":0,"n":0,"end":1}}"#);
-        let mut want: Vec<String> = (2..=UNOPENED).map(|n| end(n, 1)).collect();
-        want.push(end(1, 2));
+        let mut want: Vec<String> = (1..=UNOPENED).filter(|&n| n != 5).map(|n| end(n, 1)).collect();
+        want.push(end(5, 2));
         assert_eq!(waiting(&d, &b)[..UNOPENED], want[..]);
         assert!(waiting(&d, &b)[UNOPENED..].iter().all(|m| m.starts_with(r#"{"d":"board","#)));
     }
