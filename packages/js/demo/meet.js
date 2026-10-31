@@ -47,6 +47,7 @@ let session = 0; // bumped on every join and leave, so a join that finishes afte
 let sentPresence = '';
 let audioCtx = null;
 let selfMeter = null;
+let mediaEpoch = 0; // bumped when stopMedia() turns everything off, so a camera or mic request still pending is dropped
 const tiles = new Map(); // member (or SELF) -> its tile
 
 // An element whose `text` goes in as textContent, so markup in it stays text.
@@ -117,6 +118,7 @@ async function acquire(kinds, { keep = false } = {}) {
   if (!navigator.mediaDevices?.getUserMedia) return report(NO_MEDIA, 'bad');
   const busy = [$('allow'), $('pre-mic'), $('pre-cam'), $('mic'), $('cam')];
   for (const b of busy) b.disabled = true;
+  const epoch = mediaEpoch;
   const got = [];
   const failed = [];
   try {
@@ -136,6 +138,11 @@ async function acquire(kinds, { keep = false } = {}) {
     }
   } finally {
     for (const b of busy) b.disabled = false;
+  }
+  // Everything was turned off while the browser asked (Leave): what it gave now goes straight off again.
+  if (epoch !== mediaEpoch) {
+    for (const t of got) t.stop();
+    return;
   }
   for (const t of got) {
     for (const old of stream.getTracks().filter((o) => o.kind === t.kind)) {
@@ -171,6 +178,7 @@ function stopVideo() {
   tracksChanged();
 }
 function stopMedia() {
+  mediaEpoch++;
   for (const t of stream.getTracks()) t.stop();
   stream = new MediaStream();
   selfMeter?.close();
@@ -439,6 +447,7 @@ function renderTile(peer) {
   t.name.textContent = peer === SELF ? `${name} (you)` : name;
   t.av.textContent = initial(name);
   t.box.classList.toggle('nomic', !mic);
+  if (!mic) t.box.classList.remove('speaking'); // at once, not at the next speaking() tick
   t.box.classList.toggle('nocam', !cam);
   t.box.dataset.state = t.state;
   t.badge.replaceChildren(...(t.state === 'connecting' ? [el('span', 'spinner'), 'connecting…']

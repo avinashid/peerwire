@@ -1042,7 +1042,8 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/qr.mjs`: the chat demo's QR encoder against known answers.
 - `node packages/js/test/meet.mjs [tabs] [shot dir]`: the meet demo in 2 to 4 tabs (default 3) with Chromium's fake
   camera and microphone: no camera before a click, a refused one explained, every tab's video playing on the others,
-  mute and camera-off shown there, leave removing the tile, names as text only, a full call, the grid on a phone.
+  mute and camera-off shown there, leave removing the tile (and a camera given only after Leave turned straight off),
+  names as text only, a full call, the grid on a phone.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
   every tab must see every other, and a closed tab must leave.
 - `node packages/js/test/leave.mjs [--runs=10] [--stress=N] [--crash=1]`: closes a streaming

@@ -37,13 +37,29 @@ const COUNT_GUM = () => {
 const DENY_GUM = () => {
   navigator.mediaDevices.getUserMedia = async () => { throw new DOMException('Permission denied', 'NotAllowedError'); };
 };
+// Holds every getUserMedia until the test calls releaseGum(), as a prompt nobody has answered yet would.
+const HELD_GUM = () => {
+  const md = navigator.mediaDevices;
+  const ask = md.getUserMedia.bind(md);
+  let release;
+  const held = new Promise((r) => (release = r));
+  window.releaseGum = release;
+  window.gumTracks = [];
+  md.getUserMedia = async (c) => {
+    await held;
+    const s = await ask(c);
+    window.gumTracks.push(...s.getTracks());
+    return s;
+  };
+};
 
-async function open(ctx, name, room, { query = '', viewport } = {}) {
+async function open(ctx, name, room, { query = '', viewport, init } = {}) {
   const p = await ctx.newPage();
   if (viewport) await p.setViewportSize(viewport);
   p.on('pageerror', (e) => errors.push(`${name}: ${e.message}`));
   p.on('dialog', (d) => (errors.push(`${name}: dialog ${d.message()}`), d.dismiss()));
   await p.addInitScript(COUNT_GUM);
+  if (init) await p.addInitScript(init);
   await p.goto(`${base}${query}#${room}`);
   await p.waitForSelector('#lobby:not(.hidden)');
   return p;
@@ -216,6 +232,26 @@ try {
   check(/blocked the camera and microphone.*site settings/.test(await d.$eval('#media-msg', (m) => m.textContent)), 'a refused camera and microphone get a message saying how to allow them');
   await shot(d, 'meet-denied');
   await d.close();
+
+  // A camera asked for and not yet given at Leave: it goes off as it comes, and Rejoin doesn't send it.
+  const h = await open(ctx, 'H', `meet-held-${port}`, { init: HELD_GUM });
+  await joinCall(h, 'Hal', { media: false });
+  await h.click('#cam');
+  await h.click('#leave');
+  await h.evaluate(() => window.releaseGum());
+  await h.waitForFunction(() => window.gumTracks.length > 0 && !document.getElementById('cam').disabled, null, WAIT);
+  const late = await h.evaluate(() => ({
+    sheet: !document.getElementById('left').classList.contains('hidden'),
+    tracks: window.meet.stream.getTracks().length,
+    live: window.gumTracks.filter((t) => t.readyState === 'live').length,
+    preview: document.getElementById('preview').srcObject !== null,
+  }));
+  check(late.sheet && late.tracks === 0 && late.live === 0 && !late.preview, `a camera given after Leave goes straight off, with no preview behind "You left the call" (${JSON.stringify(late)})`);
+  await shot(h, 'meet-left-late-camera');
+  await h.click('#rejoin');
+  await h.waitForFunction(() => window.meet?.call, null, WAIT);
+  check(await h.evaluate(() => window.meet.stream.getTracks().length === 0 && window.gumCalls === 1), 'Rejoin sends no camera, and asks for none: it was off at Leave');
+  await h.close();
 
   // On a phone held upright, two people stack, and the controls fit.
   const room4 = `meet-phone-${port}`;
