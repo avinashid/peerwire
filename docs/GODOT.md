@@ -123,14 +123,18 @@ var copy := doc.snapshot()                  # keep it on the device (it holds wh
   4 Mi characters of JSON). A name or key past its cap, or a value that isn't JSON or is over 64 KiB, also prints an
   error.
 - **The star.** Joiners link to the host alone. So the host passes on what each joiner writes, and a joiner catches
-  up from the host. Frames are messages `0x07` + JSON on the reliable lane, beside Godot's packets. The host
-  disconnects a joiner in two cases. When it joins again, it catches up.
-  - **Its link stalls:** it takes nothing while 16 MiB of doc frames wait for it.
+  up from the host. Frames are messages `0x07` + JSON on the reliable lane, beside Godot's packets.
+- **A slow joiner is caught up again, not cut.** Once 16 MiB of doc frames wait for a joiner, the host drops them
+  and catches it up afresh, as if it had just joined: it asks for what it missed, at its link's pace.
+- **The host disconnects a joiner in two cases.** When it joins again, it catches up.
+  - **Its link stalls:** it takes nothing for 30 s, while 16 MiB of doc frames piled up for it twice.
   - **It writes faster than the host may pass on:** what the host sends on for one joiner is charged to it, once
     for each joiner it goes to, as the host writes it (a number can take longer than the joiner sent it). The
     budget is 8 MiB at once, then 64 KiB/s. With 7 joiners that is about 1.3 MiB of new entries at once, then
     11 KiB/s. A joiner that brings a large copy the host lacks counts too. Coming back doesn't refill the
-    budget; 128 s refill it whole.
+    budget; 128 s refill it whole. But the frame that overdraws the budget still goes on, and each key has its
+    own: a joiner that keeps coming back, or a run of fresh keys, has up to a doc's worth (4 Mi characters)
+    passed on each time. That fills slow joiners' queues, which costs them a catch-up, not their link.
 - **Browsers and Godot don't share a doc live:** a browser doesn't dial a native peer. A copy, or a frame, reads in
   both.
 

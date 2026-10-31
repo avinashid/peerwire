@@ -89,12 +89,16 @@ pub const DEFAULT_KEEP: u64 = 1000;
 pub const MESSAGE_BYTES: usize = 512 * 1024;
 /// Frames a copy may hold (a full doc takes about 30).
 pub const STORED_FRAMES: usize = 64;
-/// What a member's messages may hold waiting to be sent, retried ones included: past it, the member's link is
-/// taken as stalled, and [`Docs`] forgets it as if it left ([`Event::Overflow`]). Four full docs as JSON text.
+/// What a member's messages may hold waiting to be sent, retried ones included. Past it, [`Docs`] drops them, and
+/// each doc catches the member up afresh, as if it had left and joined again: it asks for what it missed, at the
+/// pace catching up goes. What the member's link keeps refusing is then forgotten with it ([`Event::Overflow`]).
+/// Four full docs as JSON text.
 pub const OUTBOX_BYTES: usize = 16 * 1024 * 1024;
 /// What a hub ([`Options::hub`]) may relay of one member's frames at once, as queued for its other members: past
 /// it, [`Docs`] forgets the member as if it left ([`Event::Overflow`]), so the member writing pays rather than
-/// the members it would fill the queues of. Half of [`OUTBOX_BYTES`]: one member alone never fills a queue.
+/// the members it would fill the queues of. Half of [`OUTBOX_BYTES`], but the frame that overdraws it still goes
+/// on, and each key has its own: a member that keeps coming back, or a run of fresh keys, has up to a doc's worth
+/// relayed each time, and can pile [`OUTBOX_BYTES`] up for a slow member, which is caught up afresh, not cut.
 pub const RELAY_BYTES: usize = OUTBOX_BYTES / 2;
 /// How fast [`RELAY_BYTES`] refills, in bytes a second: the rate doc.js lets a member have us send it catch-up.
 pub const RELAY_BYTES_PER_S: usize = 64 * 1024;
@@ -324,9 +328,9 @@ pub struct Item {
 pub enum Event {
     Change(DocId, Change),
     Sync(DocId, Status),
-    /// This member's messages passed [`OUTBOX_BYTES`] waiting for its link, or, at a hub, it had more than
-    /// [`RELAY_BYTES`] of its frames relayed beyond what refilled: [`Docs`] forgot it as if it left, and takes
-    /// nothing more from it until [`Docs::joined`] again. Close its link (it catches up when it comes back; its
-    /// relay budget doesn't refill by coming back).
+    /// This member's link took none of its messages for 30 s, while they passed [`OUTBOX_BYTES`] waiting and were
+    /// dropped twice; or, at a hub, it had more than [`RELAY_BYTES`] of its frames relayed beyond what refilled:
+    /// [`Docs`] forgot it as if it left, and takes nothing more from it until [`Docs::joined`] again. Close its link
+    /// (it catches up when it comes back; its relay budget doesn't refill by coming back).
     Overflow(PeerId),
 }

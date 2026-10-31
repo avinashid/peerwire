@@ -187,8 +187,9 @@ machine.
   value.
 - **Bounds (from the caps, theoretical):** a full doc is 4 Mi characters of JSON, up to 12 MiB as UTF-8. A member
   can make us send it at most two answers at once (CATCHUP_CHARS), then 64 Ki characters/s. In a star, what waits
-  for one member is capped at 16 MiB (OUTBOX_BYTES), and what the host relays for one member's frames, summed over
-  the members it goes to, at 8 MiB at once (RELAY_BYTES), then 64 KiB/s.
+  for one member is capped at 16 MiB (OUTBOX_BYTES; past it, it is dropped and the member caught up afresh), and
+  what the host relays for one member's frames, summed over the members it goes to, at 8 MiB at once
+  (RELAY_BYTES), then 64 KiB/s.
 
 ## 5. Chat (theoretical)
 

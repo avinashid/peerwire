@@ -13,10 +13,27 @@ use rand_core::{RngCore, SeedableRng};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 
-#[derive(Default)]
+/// Times a member's messages are dropped (it is resynced) with its link taking none of them before it is forgotten.
+const RESYNCS: u32 = 2;
+/// How long, in µs, a link must also have taken nothing for: a burst of frames handled before the host sends
+/// again can drop a slow member's messages more than once, but not for this long. A silent link times out in it.
+const STALL_US: u64 = 30_000_000;
+
+/// A member's messages waiting for its link, and when its link last took one.
 struct Outbox {
     messages: VecDeque<Vec<u8>>,
     bytes: usize,
+    /// When its link last took a message (or it joined), in µs, and the times its messages were dropped since.
+    took: u64,
+    resyncs: u32,
+    /// `took` and `resyncs` as they were before the message last taken, for when it comes back with retry.
+    undo: (u64, u32),
+}
+
+impl Outbox {
+    fn new(now_us: u64) -> Outbox {
+        Outbox { messages: VecDeque::new(), bytes: 0, took: now_us, resyncs: 0, undo: (now_us, 0) }
+    }
 }
 
 /// The docs a member has open in one room. See the crate docs for the host loop.
@@ -32,6 +49,7 @@ pub struct Docs {
     /// Joined members, in the order they joined (room.js `peers`).
     members: Vec<PeerId>,
     routes: BTreeMap<PeerId, Route>,
+    /// Each member's, from when it joins until it leaves.
     out: BTreeMap<PeerId, Outbox>,
     /// Members whose link refused a message since poll_transmit last ran dry.
     held: BTreeSet<PeerId>,
@@ -138,27 +156,48 @@ impl Docs {
         }
     }
 
-    /// Queues frames for their members, as doc messages. A member whose queue passes OUTBOX_BYTES is forgotten.
+    /// Queues frames for their members, as doc messages. A member whose queue passes OUTBOX_BYTES is resynced.
     fn queue(&mut self, sent: Vec<(PeerId, String)>) {
         for (p, text) in sent {
-            if !self.members.contains(&p) {
-                continue;
+            if self.push(p, text) {
+                self.cap(p);
             }
-            let mut m = Vec::with_capacity(1 + text.len());
-            m.push(DOC_TAG);
-            m.extend_from_slice(text.as_bytes());
-            let ob = self.out.entry(p).or_default();
-            ob.bytes += m.len();
-            ob.messages.push_back(m);
-            self.cap(p);
         }
     }
 
-    /// A member whose messages passed OUTBOX_BYTES waiting is forgotten, as if it left.
+    /// Puts a frame in member `p`'s queue, as a doc message: false if `p` isn't a member.
+    fn push(&mut self, p: PeerId, text: String) -> bool {
+        let Some(ob) = self.out.get_mut(&p) else { return false };
+        let mut m = Vec::with_capacity(1 + text.len());
+        m.push(DOC_TAG);
+        m.extend_from_slice(text.as_bytes());
+        ob.bytes += m.len();
+        ob.messages.push_back(m);
+        true
+    }
+
+    /// A member whose messages passed OUTBOX_BYTES waiting has them dropped, and each doc catches it up afresh
+    /// (resync): what piles up for a slow member, as a hub's relays do, costs it a catch-up, not its link. What that
+    /// queues isn't capped, so it can't drop it again. One whose link has taken nothing across RESYNCS of those, and
+    /// for STALL_US, is forgotten as if it left.
     fn cap(&mut self, p: PeerId) {
-        if self.out.get(&p).is_some_and(|ob| ob.bytes > OUTBOX_BYTES) {
+        let now = self.now_us;
+        let Some(ob) = self.out.get_mut(&p).filter(|ob| ob.bytes > OUTBOX_BYTES) else { return };
+        if ob.resyncs >= RESYNCS && now.saturating_sub(ob.took) >= STALL_US {
             self.forget(p);
             self.events.push_back(Event::Overflow(p));
+            return;
+        }
+        ob.resyncs += 1;
+        ob.messages.clear();
+        ob.bytes = 0;
+        self.held.remove(&p);
+        let ids: Vec<u32> = self.docs.keys().copied().collect();
+        for id in ids {
+            let (_, sent, _) = self.lend(id, |h, docs| docs.get_mut(&id).map(|d| d.resync(h, p)));
+            for (q, text) in sent {
+                self.push(q, text);
+            }
         }
     }
 
@@ -231,6 +270,7 @@ impl Docs {
             return self.each(|d, h| d.rerouted(h));
         }
         self.members.push(peer);
+        self.out.insert(peer, Outbox::new(self.now_us));
         self.each(|d, h| d.joined(h, peer));
     }
 
@@ -308,26 +348,24 @@ impl Docs {
         let ob = self.out.get_mut(&p)?;
         let m = ob.messages.pop_front()?;
         ob.bytes -= m.len();
-        if ob.messages.is_empty() {
-            self.out.remove(&p);
-        }
+        ob.undo = (ob.took, ob.resyncs);
+        (ob.took, ob.resyncs) = (self.now_us, 0);
         Some((p, m))
     }
 
     /// A message from [`Docs::poll_transmit`] that `peer`'s link refused: it goes first, when the next call to
-    /// poll_transmit after one that returned `None` tries that member again.
+    /// poll_transmit after one that returned `None` tries that member again. It doesn't count as taken.
     pub fn retry(&mut self, peer: PeerId, message: Vec<u8>) {
-        if !self.members.contains(&peer) {
-            return;
-        }
-        self.held.insert(peer);
-        let ob = self.out.entry(peer).or_default();
+        let Some(ob) = self.out.get_mut(&peer) else { return };
+        (ob.took, ob.resyncs) = ob.undo;
         ob.bytes += message.len();
         ob.messages.push_front(message);
+        self.held.insert(peer);
         self.cap(peer);
     }
 
-    /// Bytes of messages waiting for member `peer`, retried ones included (at most [`OUTBOX_BYTES`]).
+    /// Bytes of messages waiting for member `peer`, retried ones included: at most [`OUTBOX_BYTES`] and a message,
+    /// besides what catching it up afresh queues past it (see [`OUTBOX_BYTES`]).
     pub fn queued(&self, peer: &PeerId) -> usize {
         self.out.get(peer).map_or(0, |ob| ob.bytes)
     }
@@ -517,35 +555,217 @@ mod tests {
         assert!(da.poll_transmit().is_some(), "the same frame, plain, is answered (unopened)");
     }
 
-    /// A member whose link takes nothing is forgotten once OUTBOX_BYTES wait for it, retried ones too.
+    /// Hands `from`'s messages for `to` to it: whether there were any. Those for other members are dropped.
+    fn deliver(from: &mut Docs, to: &mut Docs, now: Instant) -> bool {
+        let mut moved = false;
+        while let Some((p, m)) = from.poll_transmit() {
+            if p == to.me {
+                assert!(to.receive(now, from.me, &m));
+                moved = true;
+            }
+        }
+        moved
+    }
+
+    /// Hands each member's messages to the other until neither sends any, then runs their timers, until neither
+    /// has one left: what a link that takes everything does.
+    fn settle(x: &mut Docs, y: &mut Docs, mut now: Instant) -> Instant {
+        for _ in 0..10_000 {
+            while deliver(x, y, now) | deliver(y, x, now) {}
+            let Some(t) = [x.poll_timeout(), y.poll_timeout()].into_iter().flatten().min() else { return now };
+            now = now.max(t);
+            x.handle_timeout(now);
+            y.handle_timeout(now);
+        }
+        panic!("never settled");
+    }
+
+    /// What member `d` holds of doc `id`, as doc.js lists it.
+    fn held(d: &mut Docs, id: DocId) -> String {
+        let d = d.doc(id).unwrap();
+        [(Kind::Map, "big"), (Kind::Set, "s")].map(|(k, c)| d.entries_json(k, c)).join("\n")
+    }
+
+    /// `peer`'s queue, as text.
+    fn waiting(d: &Docs, peer: &PeerId) -> Vec<String> {
+        d.out[peer].messages.iter().map(|m| String::from_utf8(m[1..].to_vec()).unwrap()).collect()
+    }
+
+    /// A member whose messages pass OUTBOX_BYTES waiting has them dropped and is caught up afresh, not forgotten:
+    /// our answer to its latest ask ends, empty; the dots we know are dead go to it; and we ask it, so it asks back
+    /// for what it missed.
     #[test]
-    fn a_member_past_the_outbox_cap_is_forgotten() {
-        let (mut da, _, id, _, b) = pair();
+    fn a_member_past_the_outbox_cap_is_resynced_not_forgotten() {
+        let (mut da, mut db, id, a, b) = pair();
         let now = Instant::from_millis(0);
         da.joined(now, b, Route::Direct);
+        db.joined(now, a, Route::Direct);
+        let (_, ask) = db.poll_transmit().unwrap();
+        let text = String::from_utf8(ask.clone()).unwrap();
+        let q = text.split("\"q\":").nth(1).unwrap().trim_end_matches('}').to_owned();
+        assert!(da.receive(now, b, &ask));
+        settle(&mut da, &mut db, now);
+        // b's link takes nothing while a writes.
         let value = format!("\"{}\"", "x".repeat(60_000));
         let mut written = 0;
-        while da.queued(&b) + 70_000 <= OUTBOX_BYTES {
+        loop {
+            let before = da.queued(&b);
             da.doc(id).unwrap().map_set("big", &format!("k{}", written % 10), &value).unwrap();
             written += 1;
+            if da.queued(&b) < before {
+                break;
+            }
+            assert!(da.queued(&b) <= OUTBOX_BYTES, "{written} written");
         }
-        assert!(da.poll_event().iter().all(|e| !matches!(e, Event::Overflow(_))));
-        // The link refuses one: retried, it goes first, and takes the queue past the cap.
-        let (p, m) = da.poll_transmit().unwrap();
-        assert_eq!(p, b);
-        da.retry(b, m.clone());
-        assert!(da.poll_transmit().is_none(), "held until poll_transmit has run dry");
-        da.doc(id).unwrap().map_set("big", "k0", &value).unwrap();
-        da.doc(id).unwrap().map_set("big", "k1", &value).unwrap();
-        let events: Vec<Event> = std::iter::from_fn(|| da.poll_event()).collect();
-        assert!(events.contains(&Event::Overflow(b)), "{} written", written);
-        assert_eq!(da.queued(&b), 0);
-        assert!(da.poll_transmit().is_none());
-        da.retry(b, m);
-        assert_eq!(da.queued(&b), 0, "nothing is kept for a member that isn't one");
-        // Joined again, it is asked and sent the doc again.
+        assert!(written > 250 && overflows(&mut da).is_empty(), "{written} written");
+        let sent = waiting(&da, &b);
+        assert_eq!(sent.len(), 3, "{sent:?}");
+        assert_eq!(sent[0], format!(r#"{{"d":"board","t":3,"ws":[],"q":{q},"i":0,"n":0,"end":1}}"#));
+        assert!(sent[1].starts_with(r#"{"d":"board","t":3,"ws":[""#) && sent[1].ends_with("]]}"), "{}", sent[1]);
+        assert!(sent[1].contains(r#""x":[[0,1,"#) && !sent[1].contains("\"q\""), "{}", sent[1]);
+        assert!(sent[2].starts_with(r#"{"d":"board","t":2,"ws":[""#), "{}", sent[2]);
+        // It asks back, and catches up.
+        settle(&mut da, &mut db, now);
+        assert_eq!(held(&mut db, id), held(&mut da, id));
+        assert!(db.doc(id).unwrap().get(Kind::Map, "big", "k9").is_some());
+        assert!(overflows(&mut da).is_empty() && overflows(&mut db).is_empty());
+    }
+
+    /// A pair with a doc of 300 set items of 10 KB on `a`, and `b`, which has joined but heard nothing yet.
+    fn loaded() -> (Docs, Docs, DocId) {
+        let (mut da, mut db, id, a, b) = pair();
+        let now = Instant::from_millis(0);
+        for i in 0..300 {
+            da.doc(id).unwrap().set_add("s", &format!("\"{i}{}\"", "x".repeat(10_000))).unwrap();
+        }
         da.joined(now, b, Route::Direct);
-        assert!(da.poll_transmit().is_some_and(|(p, _)| p == b));
+        db.joined(now, a, Route::Direct);
+        (da, db, id)
+    }
+
+    /// Drops what `d` has waiting for `peer`, as a queue past OUTBOX_BYTES has it dropped.
+    fn resync(d: &mut Docs, peer: PeerId) {
+        assert!(d.push(peer, "x".repeat(OUTBOX_BYTES)));
+        d.cap(peer);
+    }
+
+    /// One whose messages are dropped as it catches up from us waits on our answer no more: it ends, so the member
+    /// asks again. Dropped twice before its link takes any, it still is: we keep the number of its ask.
+    #[test]
+    fn a_member_dropped_as_it_catches_up_asks_again() {
+        for drops in [1, 2] {
+            let (mut da, mut db, id) = loaded();
+            let (a, b, now) = (da.me, db.me, Instant::from_millis(0));
+            // b's ask, then our ask and the first pieces of our answer: it acknowledges them.
+            while let Some((_, m)) = db.poll_transmit() {
+                assert!(da.receive(now, b, &m));
+            }
+            for _ in 0..3 {
+                let (_, m) = da.poll_transmit().unwrap();
+                assert!(db.receive(now, a, &m));
+            }
+            while let Some((_, m)) = db.poll_transmit() {
+                assert!(da.receive(now, b, &m));
+            }
+            assert!(db.doc(id).unwrap().sync().json().contains("loading"));
+            for _ in 0..drops {
+                resync(&mut da, b);
+            }
+            let now = settle(&mut da, &mut db, now);
+            assert_eq!(held(&mut db, id), held(&mut da, id), "{drops} drop(s)");
+            assert_eq!(db.doc(id).unwrap().entries(Kind::Set, "s").len(), 300);
+            assert!(now < Instant::from_millis(60_000), "{now:?}");
+        }
+    }
+
+    /// One whose messages are dropped with our deletes in them still holds what we deleted: nothing in our ask shows
+    /// it that, as it has seen those dots. The dead dots sent with the resync do.
+    #[test]
+    fn a_member_dropped_with_deletes_in_its_queue_hears_of_them() {
+        let (mut da, mut db, id) = loaded();
+        let b = db.me;
+        let now = settle(&mut da, &mut db, Instant::from_millis(0));
+        assert_eq!(held(&mut db, id), held(&mut da, id));
+        let items = da.doc(id).unwrap().entries(Kind::Set, "s");
+        for it in items.iter().step_by(3) {
+            assert!(da.doc(id).unwrap().set_delete("s", &it.key).unwrap());
+        }
+        assert_eq!(waiting(&da, &b).len(), 100);
+        resync(&mut da, b);
+        settle(&mut da, &mut db, now);
+        assert_eq!(db.doc(id).unwrap().entries(Kind::Set, "s").len(), 200);
+        assert_eq!(held(&mut db, id), held(&mut da, id));
+    }
+
+    /// `a` with member `b`, which joined at 0 s and whose link took what `a` sent it then.
+    fn lone() -> (Docs, PeerId) {
+        let (mut da, _, _, _, b) = pair();
+        da.joined(Instant::from_millis(0), b, Route::Direct);
+        while da.poll_transmit().is_some() {}
+        (da, b)
+    }
+
+    fn at(d: &mut Docs, s: f64) {
+        d.set_now(Instant::from_micros((s * 1e6) as u64));
+    }
+
+    /// Drops `peer`'s messages at `s` seconds: whether that forgot it (Overflow) rather than resynced it.
+    fn drop_at(d: &mut Docs, peer: PeerId, s: f64) -> bool {
+        at(d, s);
+        resync(d, peer);
+        let cut = overflows(d) == [Event::Overflow(peer)];
+        assert!(cut || d.queued(&peer) < 1000, "resynced");
+        cut
+    }
+
+    /// A member is forgotten (Overflow) only once its link has taken nothing across RESYNCS resyncs and for
+    /// STALL_US. A message its link refused, handed back with retry, isn't taken.
+    #[test]
+    fn a_member_whose_link_takes_nothing_is_forgotten_after_resyncs_and_a_stall() {
+        // A burst of drops in the 30 s after its link last took one: resynced each time.
+        let (mut d, b) = lone();
+        for s in [1.0, 1.0, 1.0, 1.0, 29.999_999] {
+            assert!(!drop_at(&mut d, b, s), "{s} s");
+        }
+        assert!(drop_at(&mut d, b, 30.0));
+        // 30 s on, it is still resynced twice first.
+        let (mut d, b) = lone();
+        assert_eq!([40.0, 40.0, 40.0].map(|s| drop_at(&mut d, b, s)), [false, false, true]);
+        // A message its link took starts both again.
+        let (mut d, b) = lone();
+        assert_eq!([10.0, 10.0].map(|s| drop_at(&mut d, b, s)), [false, false]);
+        at(&mut d, 20.0);
+        assert!(d.poll_transmit().is_some_and(|(p, _)| p == b));
+        assert_eq!([40.0, 40.0, 40.0, 49.9].map(|s| drop_at(&mut d, b, s)), [false; 4]);
+        let (mut d, b) = lone();
+        assert_eq!([10.0, 10.0].map(|s| drop_at(&mut d, b, s)), [false, false]);
+        at(&mut d, 20.0);
+        assert!(d.poll_transmit().is_some());
+        assert_eq!([50.0, 50.0, 50.0].map(|s| drop_at(&mut d, b, s)), [false, false, true]);
+        // One its link refused doesn't.
+        let (mut d, b) = lone();
+        assert_eq!([10.0, 10.0].map(|s| drop_at(&mut d, b, s)), [false, false]);
+        at(&mut d, 20.0);
+        let (p, m) = d.poll_transmit().unwrap();
+        d.retry(p, m.clone());
+        assert!(d.poll_transmit().is_none(), "held until poll_transmit has run dry");
+        assert!(drop_at(&mut d, b, 30.0));
+        assert_eq!(d.queued(&b), 0);
+        d.retry(b, m);
+        assert_eq!(d.queued(&b), 0, "nothing is kept for a member that isn't one");
+        // Joined again, it is asked and sent the doc again.
+        d.joined(Instant::from_micros(30_000_000), b, Route::Direct);
+        assert!(d.poll_transmit().is_some_and(|(p, _)| p == b));
+    }
+
+    /// The cap is OUTBOX_BYTES: a queue of exactly that is kept.
+    #[test]
+    fn a_queue_of_outbox_bytes_is_kept() {
+        let (mut d, b) = lone();
+        d.queue(vec![(b, "x".repeat(OUTBOX_BYTES - 1))]);
+        assert_eq!(d.queued(&b), OUTBOX_BYTES);
+        d.queue(vec![(b, String::new())]);
+        assert!(d.queued(&b) < 1000);
     }
 
     /// A hub with members `a`, `b` and `c`; `a` writes through `leaf`, its own docs, linked to the hub alone.
