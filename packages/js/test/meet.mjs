@@ -155,7 +155,8 @@ try {
   check(true, 'unmute shows on the other tabs');
   // A member whose presence says muted never gets the speaking ring, even while its audio still plays (as in the
   // moment before a muted microphone goes quiet). Here it sends a steady tone: the fake microphone's beeps fade
-  // under the browser's noise suppression, the tone doesn't.
+  // under the browser's noise suppression, the tone doesn't. It is heard (ringed) first, then says it is muted: the
+  // ring goes with the mute mark, not up to a speaking() tick later.
   await b.evaluate(async () => {
     const ctx = new AudioContext();
     const tone = ctx.createOscillator();
@@ -163,16 +164,23 @@ try {
     tone.connect(out);
     tone.start();
     await window.meet.call.setStream(new MediaStream([out.stream.getAudioTracks()[0], ...window.meet.stream.getVideoTracks()]));
-    window.meet.room.setPresence({ ...window.meet.room.getPresence(), mic: false });
   });
+  await a.waitForSelector(`${tileOf(a, NAMES[1])}.speaking`, WAIT);
+  await a.evaluate((name) => {
+    const tile = [...document.querySelectorAll('.tile:not(.self)')].find((t) => t.querySelector('.name').textContent === name);
+    window.mutedRinged = 0;
+    new MutationObserver(() => tile.classList.contains('nomic') && tile.classList.contains('speaking') && window.mutedRinged++)
+      .observe(tile, { attributes: true, attributeFilter: ['class'] });
+  }, NAMES[1]);
+  await b.evaluate(() => window.meet.room.setPresence({ ...window.meet.room.getPresence(), mic: false }));
   await a.waitForSelector(`${tileOf(a, NAMES[1])}.nomic`, WAIT);
   const rang = await a.evaluate(async (name) => {
     const tile = [...document.querySelectorAll('.tile:not(.self)')].find((t) => t.querySelector('.name').textContent === name);
     let n = 0;
     for (let i = 0; i < 25; i++, await new Promise((r) => setTimeout(r, 100))) if (tile.classList.contains('speaking')) n++;
-    return n;
+    return { atMute: window.mutedRinged, samples: n };
   }, NAMES[1]);
-  check(rang === 0, `a member muted in presence isn't shown speaking while its audio plays (${rang} of 25 samples)`);
+  check(rang.atMute === 0 && rang.samples === 0, `a member muted in presence loses its speaking ring with the mute mark, and isn't ringed while its audio plays (ringed and muted together ${rang.atMute} times; ringed in ${rang.samples} of 25 samples after)`);
   await b.evaluate(() => window.meet.call.setStream(window.meet.stream));
   await b.click('#mic');
   await b.click('#mic');
