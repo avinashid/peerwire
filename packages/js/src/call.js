@@ -326,7 +326,7 @@ export class Call {
     const { RTCPeerConnection: Pc, MediaStream: Ms, iceServers = [], privacy = 'direct' } = this.calls.media;
     const pc = new Pc({ iceServers });
     const l = { peer, pc, polite: this.calls.self > peer, remote: new Ms(), tx: null, state: null, shown: false, closed: false,
-      makingOffer: false, ignoreOffer: false, answerPending: false, chain: Promise.resolve(), timer: null, connected: false, restarts: [] };
+      makingOffer: false, chain: Promise.resolve(), timer: null, connected: false, restarts: [] };
     this.links.set(peer, l);
     pc.onicecandidate = ({ candidate }) => {
       if (!candidate?.candidate || l.closed) return;
@@ -367,22 +367,18 @@ export class Call {
   async described(l, d) {
     if (l.closed) return;
     const offer = d.type === 'offer';
-    const ready = !l.makingOffer && (l.pc.signalingState === 'stable' || l.answerPending);
-    l.ignoreOffer = offer && !ready && !l.polite;
-    if (l.ignoreOffer) return;
-    const rollback = offer && (l.makingOffer || l.pc.signalingState === 'have-local-offer');
+    // Descriptions are applied one at a time (signal()), so an offer collides only with one of ours.
+    const collision = offer && (l.makingOffer || l.pc.signalingState !== 'stable');
+    if (collision && !l.polite) return;
     try {
-      l.answerPending = !offer;
       await l.pc.setRemoteDescription(d);
-      l.answerPending = false;
       if (offer && !l.closed) {
         this.attach(l);
         await l.pc.setLocalDescription();
         if (!l.closed) this.describe(l);
-        if (rollback) this.reattach(l);
+        if (collision) this.reattach(l);
       }
     } catch {
-      l.answerPending = false;
       return this.fail(l, 'error');
     }
     this.show(l);

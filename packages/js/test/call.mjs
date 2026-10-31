@@ -324,8 +324,8 @@ async function connected(...ms) {
   check(c({ candidate: 'a=candidate:1 1 udp 1 1.2.3.4 5 typ host' }) === null && c({ candidate: '' }) === null && c({ candidate: 7 }) === null, "ice: one not starting 'candidate:', empty, or not a string: dropped");
   check(c({ sdpMid: 'x'.repeat(32) }) !== null && c({ sdpMid: 'x'.repeat(33) }) === null && c({ sdpMid: 3 }) === null, 'ice: a mid of 32 characters kept, 33 or a number dropped');
   check(c({ sdpMLineIndex: MAX_SECTIONS - 1 }) !== null && c({ sdpMLineIndex: MAX_SECTIONS }) === null && c({ sdpMLineIndex: -1 }) === null && c({ sdpMLineIndex: 0.5 }) === null, `ice: an index from 0 to ${MAX_SECTIONS - 1}`);
-  const big = bytes({ t: 'leave', pad: 'x'.repeat(MAX_FRAME) });
-  check(parseCall(big) === null && parseCall(bytes({ t: 'leave', pad: 'x'.repeat(MAX_FRAME - 26) })) !== null, `a frame over ${MAX_FRAME} bytes is dropped unread`);
+  const frameOf = (n) => bytes({ t: 'leave', pad: 'x'.repeat(n - 22) }); // {"t":"leave","pad":""} is 22 bytes
+  check(frameOf(MAX_FRAME).length === MAX_FRAME && parseCall(frameOf(MAX_FRAME)) !== null && parseCall(frameOf(MAX_FRAME + 1)) === null, `a frame of ${MAX_FRAME} bytes is read, one more dropped unread`);
 }
 
 // ---- Budgets ----
@@ -352,6 +352,15 @@ async function connected(...ms) {
   for (let i = 0; i < BUDGETS.join[0] + 1; i++) a.calls.receive(ID('b'), bytes({ t: 'join', age: 0 }));
   a.calls.receive(ID('b'), bytes({ t: 'nope' }));
   check(a.calls.dropped - before === 2, 'receive(): a join past its budget and a malformed frame are dropped and counted');
+  reset();
+  const r = member(ID('a'));
+  r.calls.receive(ID('b'), bytes({ t: 'join', age: 0 }));
+  const first = r.calls.roster.get(ID('b'));
+  clock.t += 1000;
+  r.calls.receive(ID('b'), bytes({ t: 'join', age: 10 ** 9 }));
+  check(r.calls.roster.get(ID('b')) === first, 'a second join keeps the first claim of when the peer joined');
+  r.calls.gone(ID('b'));
+  check(!r.calls.roster.has(ID('b')), 'a peer gone leaves the roster');
 }
 
 // ---- Privacy ----
@@ -391,6 +400,7 @@ async function connected(...ms) {
   const lb = link(b, a.id);
   check(!la.polite && lb.polite, 'the smaller id is impolite');
   check(sentBy(a.id, 'sdp').map((x) => x.msg.d.type).join() === 'offer' && sentBy(b.id, 'sdp').map((x) => x.msg.d.type).join() === 'answer', 'the smaller id offers, the other answers: one description each');
+  check(sentBy(a.id, 'sdp')[0].msg.d.sdp.match(/a=sendrecv/g)?.length === 2, 'the offer has both transceivers sending both ways');
   check(la.pc.getTransceivers().length === 2 && lb.pc.getTransceivers().length === 2, 'two transceivers each side');
   check(lb.pc.getTransceivers().every((t) => t.direction === 'sendrecv') && lb.tx.audio.sender.track === sb.getTracks()[0] && lb.tx.video.sender.track === sb.getTracks()[1], "the answering side sends its tracks on the offer's transceivers, both ways");
   check(la.tx.audio.sender.track === sa.getTracks()[0] && la.tx.video.sender.track === sa.getTracks()[1], "the offering side's tracks on its own transceivers");
@@ -423,6 +433,7 @@ async function connected(...ms) {
   check(lb.pc.rollbacks === 1 && la.pc.rollbacks === 0, 'glare: the polite side rolled its offer back, the impolite one ignored the other');
   check(lb.tx.video.sender.replaced.join() === ',video' && lb.tx.video.sender.track === sb.getTracks()[1], 'glare: the polite side set its video track again, after null');
   check(evs(a, 'state').length === 2 && a.call.state(b.id) === 'connected', 'glare: no state change');
+  check(evs(a, 'stream').length === 1 && evs(b, 'stream').length === 1, "glare: no second 'stream'");
 
   // An offer with an extra m-section (a newer version's): inactive here, the stream unchanged.
   reset();
@@ -442,6 +453,21 @@ async function connected(...ms) {
   const dirs = ly.pc.getTransceivers().map((t) => t.direction).join();
   check(dirs === 'sendrecv,sendrecv,inactive' && y.call.stream(x.id).getTracks().map((t) => t.kind).join() === 'audio,video', `an offer with three m-sections: the third inactive (${dirs}), the stream one audio and one video`);
   check(sentBy(y.id, 'sdp')[0]?.msg.d.type === 'answer' && sentBy(y.id, 'sdp')[0].msg.d.sdp.includes('a=inactive'), 'and the answer says so');
+
+  // An offer that sends nothing: no track comes, so no 'stream', and call.stream(peer) is null.
+  reset();
+  const [u, v] = [member(ID('1')), member(ID('2'))];
+  meet(u, v);
+  join(v);
+  await settle();
+  const quiet = new FakePc({});
+  quiet.addTransceiver('audio', { direction: 'inactive' });
+  quiet.addTransceiver('video', { direction: 'inactive' });
+  await quiet.setLocalDescription();
+  v.calls.receive(u.id, bytes({ t: 'join', age: 0 }));
+  v.calls.receive(u.id, bytes({ t: 'sdp', d: { type: 'offer', sdp: quiet.localDescription.sdp } }));
+  await settle();
+  check(sentBy(v.id, 'sdp')[0]?.msg.d.type === 'answer' && !evs(v, 'stream').length && v.call.stream(u.id) === null, "an offer that sends nothing: answered, no 'stream', call.stream(peer) null");
 }
 
 // ---- Failures ----
@@ -481,6 +507,7 @@ async function connected(...ms) {
   join(f);
   await connected(e, f);
   const [le, lf] = [link(e, f.id), link(f, e.id)];
+  lf.tx.video.sender.replaced.length = 0;
   for (let i = 1; i <= MAX_RESTARTS; i++) {
     le.pc.setConnection('failed');
     lf.pc.setConnection('failed');
@@ -494,13 +521,34 @@ async function connected(...ms) {
     le.pc.connectionState = 'connecting';
     lf.pc.connectionState = 'connecting';
   }
+  check(!lf.tx.video.sender.replaced.length, 'a restart offer that crosses none of its own: the polite side leaves its tracks as they are');
   le.pc.setConnection('failed');
   await settle();
   check(evs(e, 'state').at(-1).slice(2).join() === 'failed,lost' && le.pc.restarts === MAX_RESTARTS, `ICE lost again after ${MAX_RESTARTS} restarts in ${RESTART_WINDOW_MS} ms: 'lost', no more restarts`);
   await advance(CONNECT_MS);
   check(lf.pc.connectionState === 'connecting' && f.call.state(e.id) === 'connected', 'the polite side holds what its connection says');
 
-  // A restart that doesn't connect in CONNECT_MS is 'lost'; the window lets restarts come back.
+  // Restarts older than RESTART_WINDOW_MS don't count.
+  reset();
+  const [w1, w2] = [member(ID('a')), member(ID('b'))];
+  meet(w1, w2);
+  join(w1);
+  join(w2);
+  await connected(w1, w2);
+  const lw = link(w1, w2.id);
+  for (let i = 1; i <= MAX_RESTARTS; i++) {
+    lw.pc.setConnection('failed');
+    await settle();
+    iceUp();
+    lw.pc.setConnection('connected');
+    await settle();
+  }
+  clock.t += RESTART_WINDOW_MS;
+  lw.pc.setConnection('failed');
+  await settle();
+  check(lw.pc.restarts === MAX_RESTARTS + 1 && w1.call.state(w2.id) === 'connecting', `restarts more than ${RESTART_WINDOW_MS} ms old don't count: ICE lost again is restarted`);
+
+  // A restart that doesn't connect in CONNECT_MS is 'lost'.
   reset();
   const [g, h] = [member(ID('a')), member(ID('b'))];
   meet(g, h);
@@ -616,6 +664,42 @@ async function connected(...ms) {
   k.calls.receive(early, bytes({ t: 'full' }));
   await settle();
   check(k.call.left && evs(k, 'full').length === 1, "not seated: 'full' from an earlier member, and it goes");
+
+  // 'full' from a member that joined within NEAR_MS after us counts too (joins that crossed).
+  reset();
+  const ns2 = 'abcde'.split('').map((c) => member(ID(c)));
+  meet(...ns2);
+  for (const m of ns2) join(m, null);
+  await connected(...ns2);
+  const k2 = member(ID('f'));
+  meet(k2);
+  join(k2, null);
+  await settle();
+  const near = ID('1');
+  k2.room.add(near);
+  clock.t += NEAR_MS;
+  k2.calls.receive(near, bytes({ t: 'join', age: 0 }));
+  k2.calls.receive(near, bytes({ t: 'full' }));
+  await settle();
+  check(k2.call.left, `not seated: 'full' from one that joined ${NEAR_MS} ms after it, and it goes`);
+
+  // Connected to one member that was in before it, the others still connecting: not seated yet.
+  reset();
+  const ss = 'abcde'.split('').map((c) => member(ID(c)));
+  meet(...ss);
+  for (const m of ss) join(m, null);
+  await connected(...ss);
+  const n = member(ID('f'));
+  meet(n);
+  join(n, null);
+  await settle();
+  link(n, ss[0].id).pc.setConnection('connected');
+  link(ss[0], n.id).pc.setConnection('connected');
+  await settle();
+  check(n.call.state(ss[0].id) === 'connected' && !n.call.seated(), 'connected to one member in before it, the others still connecting: not seated');
+  n.calls.receive(ss[1].id, bytes({ t: 'full' }));
+  await settle();
+  check(n.call.left, "so a 'full' from one of those makes it go");
 
   // Seated: neither.
   reset();
@@ -750,6 +834,7 @@ async function connected(...ms) {
   await until("c's join on the reliable lane", () => a.calls.roster.has(c.self));
   await b.leave();
   await until("a and d see b's leave", () => [ca, cd].every((x) => !x.peers.includes(b.self)));
+  check(cb.left && !b.calls.call, "leaving the room leaves its call");
   check(got.get(a.self).some((e) => e[0] === 'ended' && e[1] === b.self && e[2] === 'gone'), "b leaving the room: 'ended' ('gone') on a");
   throws(() => b.call(null), Error, 'room.call() after leaving the room');
   await Promise.all([a, c, d].map((r) => r.leave()));
