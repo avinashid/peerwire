@@ -159,12 +159,15 @@ const site = path.join(tmp, 'check');
 fs.mkdirSync(path.join(site, 'd'), { recursive: true });
 fs.writeFileSync(path.join(site, 'd/a.html'), '<h2 id="x">x</h2><a href="/root.html"></a><a href="//cdn.example/x.js"></a>' +
   '<a href="b.html#y"></a><a href="#x"></a><a href="#z"></a><a href="javascript:x"></a><img src="../up.png">' +
-  '<a href="b.html?q=1#x"></a><a href="https://example.com/"></a><a href="d"></a><a href=""></a>');
+  '<a href="b.html?q=1#x"></a><a href="https://example.com/"></a><a href="d"></a><a href=""></a><a href="/b.html"></a>');
 fs.writeFileSync(path.join(site, 'd/b.html'), '<p id="x"></p>');
 const problems = checkLinks(site, ['d/a.html', 'd/b.html']);
-check(problems.length === 8 && ['"/root.html"', '"//cdn.example/x.js"', 'no id "y"', 'no id "z"', '"javascript:x"',
-  '"../up.png"', 'href="d"', 'href=""'].every((s) => problems.some((p) => p.includes(s))),
-  `checkLinks: root-relative, protocol-relative, other schemes, missing files and ids, empty (${problems.length})`);
+const want = ['"/root.html" isn\'t a relative link', '"//cdn.example/x.js" isn\'t a relative link',
+  '"javascript:x" isn\'t a relative link', 'href="" isn\'t a relative link', '"/b.html" isn\'t a relative link',
+  'no id "y"', 'no id "z"', '"../up.png" names no file', 'href="d" names no file'];
+check(problems.length === want.length && want.every((s) => problems.some((p) => p.includes(s))),
+  `checkLinks: root-relative (even one naming a file), protocol-relative, other schemes, missing files and ids, ` +
+  `empty (${problems.length})`);
 fs.writeFileSync(path.join(tmp, 'keep.txt'), 'x');
 check(throws(() => buildSite({ root: ROOT, out: tmp })) && fs.existsSync(path.join(tmp, 'keep.txt')),
   "the build won't clear a directory that holds something but an earlier site");

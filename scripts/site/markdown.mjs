@@ -14,7 +14,7 @@ const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
 export const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ESC[c]);
 
 // The text of rendered HTML: tags dropped, entities decoded.
-const NAMED = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+const NAMED = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
 export const textOf = (html) => html.replace(/<[^>]*>/g, '').replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (e, n) => {
   if (n[0] !== '#') return NAMED[n] ?? e;
   const code = n[1] === 'x' || n[1] === 'X' ? parseInt(n.slice(2), 16) : +n.slice(1);
@@ -41,7 +41,7 @@ export function slugger() {
 // throws, so a doc can't put one on the site.
 export function safeUrl(dest) {
   const scheme = /^([a-z][a-z\d+.-]*):/i.exec(dest)?.[1].toLowerCase();
-  if (/[\u0000- \u007f]/.test(dest) || (scheme && !['http', 'https', 'mailto'].includes(scheme))) {
+  if (/[\x00-\x20\x7f]/.test(dest) || (scheme && !['http', 'https', 'mailto'].includes(scheme))) {
     throw new Error(`refused link: ${JSON.stringify(dest)}`);
   }
   return dest;
@@ -281,7 +281,7 @@ function emphasis(s) {
 
 function inline(text, ctx) {
   const slots = [];
-  const put = (html) => `${slots.push(html) - 1}`;
+  const put = (html) => `\uE000${slots.push(html) - 1}\uE001`;
   let out = '';
   for (let i = 0; i < text.length; ) {
     const c = text[i];
@@ -334,7 +334,7 @@ function inline(text, ctx) {
       i++;
     }
   }
-  return emphasis(out.trimEnd()).replace(/(\d+)/g, (_, k) => slots[k]);
+  return emphasis(out.trimEnd()).replace(/\uE000(\d+)\uE001/g, (_, k) => slots[k]);
 }
 
 const ALERTS = { NOTE: 'Note', TIP: 'Tip', IMPORTANT: 'Important', WARNING: 'Warning', CAUTION: 'Caution' };
