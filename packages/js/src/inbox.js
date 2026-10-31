@@ -11,21 +11,27 @@
 // messages): a tag it could ask the relays for would be one that anyone who knows its PeerId could compute and watch
 // too (SEC-5).
 //
-// The envelope, big-endian: VERSION (1 byte), kind (1 byte: 0 bytes, 1 text, 2 JSON), id (16 random bytes), at and
-// exp (u32 seconds: when it was sent, and when it expires), len (u32), the body (len bytes), then zeros to a multiple
-// of PAD bytes, so a drop's size says little of its message. Its first byte keeps it apart from signalling's sealed
-// bodies (JSON text), both ways.
+// The envelope, big-endian: VERSION (1 byte), kind (1 byte: 0 bytes, 1 text, 2 JSON), app (the 32 bytes of ns), id
+// (16 random bytes), at and exp (u32 seconds: when it was sent, and when it expires), len (u32), the body (len bytes),
+// then zeros to a multiple of PAD bytes, so a drop's size says little of its message. `app` is sealed with the rest,
+// so a drop copied into another app's namespace isn't read there, by the same identity's inbox in that app. Its
+// first byte keeps it apart from signalling's sealed bodies (JSON text), both ways.
 //
-// Reading (check()): each relay is asked for { kinds: [30078], '#d': [ns], since, limit: MAX_READ }, `since` being
-// SKEW_S before the start of the last read of that relay that reached the end (MAX_TTL_S + SKEW_S ago at first). A
-// relay sends the newest first, so one that sends MAX_READ may hold more: the next check asks it for those up to the
-// oldest it sent (until), and so on down, and the mark moves only once a read reaches the end. So a check opens at
-// most MAX_READ drops a relay, and a flood delays messages rather than costing more each check; a second holding more
-// than MAX_READ drops is read in part. Only events of kind 30078 with our `d`, in the range asked for, count, and
-// content over MAX_CONTENT characters isn't decoded. A drop holds a message if it opens and its envelope checks
-// (VERSION, a kind we know, len within it), sent at most AHEAD_S past our clock, for MAX_TTL_S at most, and not yet
-// expired. A message is delivered once: SHA-256(from || id) is kept until it expires (MAX_KEPT at most, the soonest
-// to expire going first), and with `persist` across sessions, saved before the listeners hear it.
+// Reading (check()): each relay is asked for { kinds: [30078], '#d': [ns], since, until, limit: MAX_READ }, `since`
+// being SKEW_S before the start of the last read of that relay that reached the end (MAX_TTL_S + SKEW_S ago at
+// first), and `until` AHEAD_S past our clock, as no later drop is read: junk dated far ahead can't sit at the top of
+// every read. A relay sends the newest first, so one that sends MAX_READ may hold more: the next check asks it for
+// those up to the oldest it sent (until), and so on down, and the mark moves only once a read reaches the end. So a
+// check opens at most MAX_READ drops a relay, and a flood delays messages rather than costing more each check. But
+// NIP-01 has no cursor within a second (a relay sends a second's events lowest id first), so a full page all in one
+// second goes on below that second: MAX_READ drops or more in a message's second, ordered before it, hide it on that
+// relay. Only events of kind 30078 with our `d`, in the range asked for, count, and content over MAX_CONTENT
+// characters isn't decoded. A read opens each content once, whichever relays serve it: an event's id is the relay's
+// word, so one relay could serve a real drop's id with other content. A drop holds a message if it opens and its
+// envelope checks (VERSION, a kind we know, our app, len within it, JSON nested MAX_VALUE_DEPTH deep at most), sent at
+// most AHEAD_S past our clock, for MAX_TTL_S at most, and not yet expired. A message is delivered once:
+// SHA-256(from || id) is kept until it expires (MAX_KEPT at most, the soonest to expire going first), and with
+// `persist` across sessions, saved before the listeners hear it.
 //
 // The saved state, { v: 1, kept: [[hash, exp]], marks: { url: seconds } } as JSON, is sealed as store.js seals a
 // doc's copy, under keys from our identity's secret rather than a room key: kept under hex(HMAC-SHA256(secret,
@@ -36,12 +42,13 @@ import { toHex, fromHex, isPeerId } from './peerwire.js';
 import { NostrSignaling, DEFAULT_RELAYS, b64, unb64 } from './nostr.js';
 import { storeOf } from './store.js';
 import { peerwireModule } from './room.js';
+import { withinDepth, MAX_VALUE_DEPTH } from './doc.js';
 
 export const KIND = 30078;
 export const VERSION = 1;
 export const MAX_MESSAGE = 16 * 1024; // a message's body, in bytes
 export const PAD = 256;
-const HEAD = 30;
+export const HEAD = 62; // the envelope's fields before the body
 const SEAL_OVERHEAD = 128; // peerwire_core::sealed::SEAL_OVERHEAD
 // The most a drop's content takes: base64 of a MAX_MESSAGE body's envelope, sealed.
 export const MAX_CONTENT = 4 * Math.ceil((SEAL_OVERHEAD + Math.ceil((HEAD + MAX_MESSAGE) / PAD) * PAD) / 3);
@@ -79,27 +86,28 @@ function bodyOf(data) {
   return [2, enc.encode(text)];
 }
 
-// The envelope of a message (see above).
-export function envelope(kind, id, at, exp, body) {
+// The envelope of a message in the app whose ns is `app` (32 bytes; see above).
+export function envelope(app, kind, id, at, exp, body) {
   const out = new Uint8Array(Math.ceil((HEAD + body.length) / PAD) * PAD);
   const v = new DataView(out.buffer);
   out[0] = VERSION;
   out[1] = kind;
-  out.set(id, 2);
-  v.setUint32(18, at);
-  v.setUint32(22, exp);
-  v.setUint32(26, body.length);
+  out.set(app, 2);
+  out.set(id, 34);
+  v.setUint32(50, at);
+  v.setUint32(54, exp);
+  v.setUint32(58, body.length);
   out.set(body, HEAD);
   return out;
 }
 
-// An envelope's fields, or null if `b` isn't one.
-function readEnvelope(b) {
-  if (b.length < HEAD || b[0] !== VERSION || b[1] >= KINDS.length) return null;
+// The fields of an envelope in the app whose ns is `app`, or null if `b` isn't one.
+function readEnvelope(b, app) {
+  if (b.length < HEAD || b[0] !== VERSION || b[1] >= KINDS.length || app.some((x, i) => b[2 + i] !== x)) return null;
   const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
-  const len = v.getUint32(26);
+  const len = v.getUint32(58);
   if (HEAD + len > b.length) return null;
-  return { kind: b[1], id: b.subarray(2, 18), at: v.getUint32(18), exp: v.getUint32(22), body: b.subarray(HEAD, HEAD + len) };
+  return { kind: b[1], id: b.subarray(34, 50), at: v.getUint32(50), exp: v.getUint32(54), body: b.subarray(HEAD, HEAD + len) };
 }
 
 // The inbox of `ep`'s identity in app `appId`: `sig` reads and keeps events on the relays at `urls` (query(), store():
@@ -127,10 +135,11 @@ export class Inbox {
     this.ready = this.load(appId);
   }
 
-  // Our namespace, and with a store, the state's keys and what it saved.
+  // Our namespace (`app` its bytes), and with a store, the state's keys and what it saved.
   async load(appId) {
-    const ns = toHex(await sha256(enc.encode(`peerwire/drop/${appId}`)));
-    if (!this.store) return { ns };
+    const app = await sha256(enc.encode(`peerwire/drop/${appId}`));
+    const ns = toHex(app);
+    if (!this.store) return { ns, app };
     const hk = await crypto.subtle.importKey('raw', this.ep.secret(), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     const mac = async (label) => new Uint8Array(await crypto.subtle.sign('HMAC', hk, enc.encode(label + appId)));
     const id = toHex(await mac('pw-inbox-id'));
@@ -140,7 +149,7 @@ export class Inbox {
     const s = await this.loadState(id, key, ad);
     for (const [k, exp] of s?.kept ?? []) this.kept.set(k, exp);
     for (const [url, t] of Object.entries(s?.marks ?? {})) if (this.urls.includes(url)) this.marks.set(url, t);
-    return { ns, id, key, ad };
+    return { ns, app, id, key, ad };
   }
 
   async loadState(id, key, ad) {
@@ -211,14 +220,14 @@ export class Inbox {
   }
 
   async read() {
-    const { ns } = await this.ready;
+    const { ns, app } = await this.ready;
     const now = Math.floor(this.wall() / 1000);
     const asked = new Map(); // relay url -> { since, until, n, oldest }: its read, and what it sent that counts
     const filter = (url) => {
       const since = Math.max((this.marks.get(url) ?? 0) - SKEW_S, now - MAX_TTL_S - SKEW_S);
-      const until = this.below.get(url)?.until;
-      asked.set(url, { since, until: until ?? Infinity, n: 0, oldest: Infinity });
-      return until === undefined ? { kinds: [KIND], '#d': [ns], since, limit: MAX_READ } : { kinds: [KIND], '#d': [ns], since, until, limit: MAX_READ };
+      const until = this.below.get(url)?.until ?? now + AHEAD_S;
+      asked.set(url, { since, until, n: 0, oldest: Infinity });
+      return { kinds: [KIND], '#d': [ns], since, until, limit: MAX_READ };
     };
     const keep = (ev, url) => {
       const a = asked.get(url);
@@ -232,12 +241,13 @@ export class Inbox {
     // Closed meanwhile, `ep` opens nothing and nobody listens.
     const res = await this.sig.query(filter, { keep });
     const found = [];
+    // By content, not by the id a relay states for it: one serving a real drop's id with junk would hide the drop.
     const opened = new Set();
     for (const [url, r] of res) {
       for (const ev of r.events.values()) {
-        if (opened.has(ev.id)) continue;
-        opened.add(ev.id);
-        const m = this.open(ev, now);
+        if (opened.has(ev.content)) continue;
+        opened.add(ev.content);
+        const m = this.open(ev, now, app);
         if (m) found.push(m);
       }
       if (r.complete && asked.has(url)) this.advance(url, asked.get(url), now);
@@ -269,8 +279,8 @@ export class Inbox {
     }
   }
 
-  // The message drop `ev` holds for us, or null: { from, id, at, exp, kind, data }.
-  open(ev, now) {
+  // The message drop `ev` holds for us in the app whose ns is `app`, or null: { from, id, at, exp, kind, data }.
+  open(ev, now, app) {
     if (typeof ev.content !== 'string' || ev.content.length > MAX_CONTENT) return null;
     let sealed;
     try {
@@ -279,7 +289,7 @@ export class Inbox {
       return null;
     }
     const o = this.ep.open(sealed);
-    const e = o && readEnvelope(o.data);
+    const e = o && readEnvelope(o.data, app);
     if (!e || e.at > now + AHEAD_S || e.exp <= now || e.exp - e.at > MAX_TTL_S) return null;
     let data;
     if (e.kind === 0) data = e.body.slice();
@@ -290,6 +300,8 @@ export class Inbox {
       } catch {
         return null;
       }
+      // Nested deeper, a value from anyone would throw RangeError in the app's JSON.stringify or structuredClone.
+      if (!withinDepth(data)) return null;
     }
     return { from: o.from, id: e.id, at: e.at, exp: e.exp, kind: KINDS[e.kind], data };
   }
@@ -321,13 +333,15 @@ export class Inbox {
   // Leaves `data` (bytes, text or a JSON value, MAX_MESSAGE bytes at most) for `to`, a PeerId, on the relays, for `ttl`
   // seconds (MAX_TTL_S at most): resolves to the number of relays that took it, once each has answered.
   async send(to, data, { ttl = MAX_TTL_S } = {}) {
+    const { app } = await this.ready;
     if (this.closed) throw new Error('inbox.send: the inbox is closed');
     if (!isPeerId(to)) throw new TypeError('inbox.send: `to` must be a peer id (64 lowercase hex characters)');
     if (!Number.isInteger(ttl) || ttl < 1 || ttl > MAX_TTL_S) throw new RangeError(`inbox.send: ttl is whole seconds, 1 to ${MAX_TTL_S}`);
     const [kind, body] = bodyOf(data);
     if (body.length > MAX_MESSAGE) throw new RangeError(`inbox.send: a message takes ${MAX_MESSAGE} bytes at most, not ${body.length}`);
+    if (kind === 2 && !withinDepth(JSON.parse(dec.decode(body)))) throw new RangeError(`inbox.send: a value nests ${MAX_VALUE_DEPTH} deep at most`);
     const at = Math.floor(this.wall() / 1000);
-    return this.post(to, envelope(kind, crypto.getRandomValues(new Uint8Array(16)), at, at + ttl, body), at, at + ttl);
+    return this.post(to, envelope(app, kind, crypto.getRandomValues(new Uint8Array(16)), at, at + ttl, body), at, at + ttl);
   }
 
   // Leaves envelope `env` sealed to `to` on the relays, sent `at`, expiring `exp`.

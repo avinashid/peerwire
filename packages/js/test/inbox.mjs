@@ -7,11 +7,14 @@
 // - nothing in clear on the relays or in a read: no PeerId (hex, or its bytes in a decoded drop), no peer tag (SEC-5),
 //   no `p` tag; one fresh signer per drop; sizes padded;
 // - expiry: NIP-40 set; a drop expired, sent too far ahead or for too long is dropped, whatever the relay serves;
-// - envelopes that don't check (version, kind, length, JSON, a signalling body) and content that isn't ours;
-// - duplicates: the same drop on three relays, its content signed again, a relay serving it with another created_at;
+// - envelopes that don't check (version, kind, another app, length, JSON, a signalling body) and content that isn't
+//   ours; a drop copied into another app's namespace isn't read there; JSON nested deeper than MAX_VALUE_DEPTH;
+// - duplicates: the same drop on three relays, its content signed again, a relay serving it with another created_at,
+//   the same message sealed again; a relay serving a drop's id with junk doesn't hide it on the others;
 // - caps: MAX_MESSAGE to send, MAX_CONTENT to decode, MAX_READ opens a relay per check under a flood (the message
-//   still delivered, reading down), a second with more than MAX_READ drops, relays that ignore `limit` or the filter,
-//   MAX_KEPT (the soonest to expire forgotten first);
+//   still delivered, reading down), a second with more than MAX_READ drops (MAX_READ ordered before a message in its
+//   second hide it), junk dated far ahead, relays that ignore `limit` or the filter, MAX_KEPT (the soonest to expire
+//   forgotten first);
 // - the saved state: sealed, per identity, and one that doesn't open, of another version or failing store handled;
 // - send()'s checks, listeners, the check every CHECK_MS;
 // - end to end over NostrSignaling and fake relay sockets: no live subscription, every socket closed.
@@ -19,9 +22,10 @@
 //   node packages/js/test/inbox.mjs
 
 import { loadPeerwire, toHex, fromHex } from '../src/peerwire.js';
-import { Inbox, envelope, KIND, VERSION, PAD, MAX_MESSAGE, MAX_CONTENT, MAX_TTL_S, AHEAD_S, SKEW_S, MAX_READ, MAX_KEPT, CHECK_MS } from '../src/inbox.js';
+import { Inbox, envelope, KIND, VERSION, PAD, HEAD, MAX_MESSAGE, MAX_CONTENT, MAX_TTL_S, AHEAD_S, SKEW_S, MAX_READ, MAX_KEPT, CHECK_MS } from '../src/inbox.js';
 import { openInbox, memoryStore } from '../src/index.js';
 import { b64, unb64 } from '../src/nostr.js';
+import { MAX_VALUE_DEPTH } from '../src/doc.js';
 
 let failed = 0;
 const fail = (m) => {
@@ -36,7 +40,10 @@ console.warn = (...a) => warnings.push(a.join(' '));
 const WALL0 = Date.UTC(2026, 9, 31, 12);
 const APP = 'peerwire-test';
 const sha256 = async (b) => new Uint8Array(await crypto.subtle.digest('SHA-256', b));
-const NS = toHex(await sha256(enc.encode(`peerwire/drop/${APP}`)));
+const NSB = await sha256(enc.encode(`peerwire/drop/${APP}`));
+const NS = toHex(NSB);
+const OTHER = 'another-app';
+const OTHER_NSB = await sha256(enc.encode(`peerwire/drop/${OTHER}`));
 const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
 const S = (ms) => Math.floor(ms / 1000);
 const has = (hay, needle) => {
@@ -132,9 +139,9 @@ function world(n = 3) {
   w.wall = () => w.now;
   w.relays = Array.from({ length: n }, (_, i) => new Relay(`wss://r${i + 1}.test`, w.wall));
   w.sig = new Sig(w.relays);
-  w.inbox = (secret, { store = null, listen = true } = {}) => {
+  w.inbox = (secret, { store = null, listen = true, appId = APP } = {}) => {
     const ep = pw.endpoint({ secret });
-    const ib = new Inbox(w.sig, pw, ep, { appId: APP, urls: w.relays.map((r) => r.url), store, wall: w.wall });
+    const ib = new Inbox(w.sig, pw, ep, { appId, urls: w.relays.map((r) => r.url), store, wall: w.wall });
     ib.opens = 0;
     const open = ep.open.bind(ep);
     ep.open = (b) => (ib.opens++, open(b));
@@ -172,7 +179,7 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   check(bob.got.length === 1 && m.data === 'hello bob' && m.from === alice.id && m.kind === 'text' && m.at === sentAt * 1000, `bob comes online an hour later: ${JSON.stringify(bob.got)}`);
   check(bob.opens === 1, `the copies on three relays opened once (${bob.opens})`);
   const q = w.relays[0].reqs[0];
-  check(JSON.stringify(q) === JSON.stringify({ kinds: [KIND], '#d': [NS], since: S(w.now) - MAX_TTL_S - SKEW_S, limit: MAX_READ }), `the first read: ${JSON.stringify(q)}`);
+  check(JSON.stringify(q) === JSON.stringify({ kinds: [KIND], '#d': [NS], since: S(w.now) - MAX_TTL_S - SKEW_S, until: S(w.now) + AHEAD_S, limit: MAX_READ }), `the first read: ${JSON.stringify(q)}`);
   check((await bob.check()) === 0 && bob.got.length === 1, 'a second check delivers nothing again');
   bob.close();
   const bob2 = w.inbox(B, { store });
@@ -214,14 +221,14 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const bob = w.inbox(B, { listen: false });
   const at = S(w.now);
   await alice.send(bob.id, 'a', { ttl: 60 });
-  await alice.send(bob.id, 'a'.repeat(PAD - 30));
-  await alice.send(bob.id, 'a'.repeat(PAD - 29));
+  await alice.send(bob.id, 'a'.repeat(PAD - HEAD));
+  await alice.send(bob.id, 'a'.repeat(PAD - HEAD + 1));
   const lens = [...w.relays[0].held.values()].map((ev) => ev.content.length);
   check(lens[0] === lens[1] && lens[2] > lens[1], `sizes padded to ${PAD} bytes: ${lens}`);
   const first = [...w.relays[0].held.values()][0];
   check(first.tags[1][1] === String(at + 60) && first.created_at === at, `NIP-40 expiration at + ttl (${first.tags[1][1]})`);
   w.relays[0].held.clear();
-  const env = (sent, exp, s = 'm') => envelope(1, rand(16), sent, exp, text(s));
+  const env = (sent, exp, s = 'm') => envelope(NSB, 1, rand(16), sent, exp, text(s));
   const put = (sent, exp, s) => w.relays[0].put(craft({ env: env(sent, exp, s), from: alice.ep, to: bob.id, at: S(w.now), exp }));
   const now = S(w.now);
   put(now - 60, now, 'expired');
@@ -250,7 +257,7 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const bob = w.inbox(B, { listen: false });
   const now = S(w.now);
   const id = rand(16);
-  for (const [from, s] of [[alice, 'from alice'], [carol, 'from carol']]) w.relays[0].put(craft({ env: envelope(1, id, now, now + 60, text(s)), from: from.ep, to: bob.id, at: now }));
+  for (const [from, s] of [[alice, 'from alice'], [carol, 'from carol']]) w.relays[0].put(craft({ env: envelope(NSB, 1, id, now, now + 60, text(s)), from: from.ep, to: bob.id, at: now }));
   bob.on('message', (data) => bob.got.push(data));
   await bob.check();
   check(bob.got.length === 2, `one id, two senders: ${bob.got}`);
@@ -279,36 +286,37 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const bob = w.inbox(B, { listen: false });
   const carol = w.inbox(C, { listen: false });
   const now = S(w.now);
-  const good = () => envelope(1, rand(16), now, now + 60, text('fine'));
+  const good = () => envelope(NSB, 1, rand(16), now, now + 60, text('fine'));
   // A body JSON reads, so only the check named drops it.
   const variants = {
     version: (e) => (e[0] = VERSION + 1),
     kind: (e) => (e[1] = 3),
-    length: (e) => new DataView(e.buffer).setUint32(26, e.length - 29),
+    app: (e) => e.set(OTHER_NSB, 2),
+    length: (e) => new DataView(e.buffer).setUint32(HEAD - 4, e.length - HEAD + 1),
   };
   for (const [name, edit] of Object.entries(variants)) {
-    const e = name === 'length' ? good() : envelope(2, rand(16), now, now + 60, text('{"bad":1}'));
+    const e = name === 'length' ? good() : envelope(NSB, 2, rand(16), now, now + 60, text('{"bad":1}'));
     edit(e);
     w.relays[0].put(craft({ env: e, from: alice.ep, to: bob.id, at: now }));
   }
   const lengthOk = good();
-  new DataView(lengthOk.buffer).setUint32(26, lengthOk.length - 30);
+  new DataView(lengthOk.buffer).setUint32(HEAD - 4, lengthOk.length - HEAD);
   w.relays[0].put(craft({ env: lengthOk, from: alice.ep, to: bob.id, at: now }));
   const put = (o) => w.relays[0].put(craft({ from: alice.ep, to: bob.id, at: now, ...o }));
-  put({ env: envelope(2, rand(16), now, now + 60, text('{"no json')) });
+  put({ env: envelope(NSB, 2, rand(16), now, now + 60, text('{"no json')) });
   put({ env: text('{"t":"offer","sdp":"v=0"}') });
-  put({ env: good().subarray(0, 29) });
+  put({ env: good().subarray(0, HEAD - 1) });
   put({ env: good(), to: carol.id });
   put({ content: b64(rand(300)) });
   put({ content: 'not base64!' });
   put({ content: 42 });
-  put({ env: envelope(2, rand(16), now, now + 60, text('{"ok":true}')) });
+  put({ env: envelope(NSB, 2, rand(16), now, now + 60, text('{"ok":true}')) });
   bob.on('message', (data, from, info) => bob.got.push([data, info.kind]));
   await bob.check();
   const t = bob.got.find(([, k]) => k === 'text')?.[0];
-  check(bob.got.length === 2 && t?.length === lengthOk.length - 30 && t.startsWith('fine\0') && bob.got.some(([d, k]) => k === 'json' && d.ok === true),
-    `of 12 drops only the JSON one and one whose length runs to its end are read: ${JSON.stringify(bob.got.map(([d, k]) => [k, typeof d === 'string' ? d.length : d]))}`);
-  check(bob.opens === 10, `content that isn't base64 or a string isn't opened (${bob.opens} of 12 opened)`);
+  check(bob.got.length === 2 && t?.length === lengthOk.length - HEAD && t.startsWith('fine\0') && bob.got.some(([d, k]) => k === 'json' && d.ok === true),
+    `of 13 drops only the JSON one and one whose length runs to its end are read: ${JSON.stringify(bob.got.map(([d, k]) => [k, typeof d === 'string' ? d.length : d]))}`);
+  check(bob.opens === 11, `content that isn't base64 or a string isn't opened (${bob.opens} of 13 opened)`);
   w.done();
 }
 
@@ -328,12 +336,71 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   w.relays[1].put(again);
   w.relays[2].put({ ...ev, created_at: S(w.now) - 5 });
   await bob.check();
-  check(bob.got.length === 1 && bob.opens === 3, `its content signed again, or served as newer, isn't delivered again (${bob.got.length}, ${bob.opens} opens)`);
+  check(bob.got.length === 1 && bob.opens === 2, `its content signed again, or served as newer, is opened once a read and isn't delivered again (${bob.got.length}, ${bob.opens} opens)`);
   bob.close();
   const bob2 = w.inbox(B, { store });
   w.relays[0].put({ ...again, id: toHex(rand(32)) });
   await bob2.check();
   check(bob2.got.length === 0, 'nor in the next session');
+  const now = S(w.now);
+  const env = envelope(NSB, 1, rand(16), now, now + 60, text('sealed twice'));
+  for (const r of w.relays) r.held.clear();
+  for (const r of w.relays.slice(0, 2)) r.put(craft({ env, from: alice.ep, to: bob.id, at: now }));
+  const o = bob2.opens;
+  await bob2.check();
+  check(bob2.got.map((g) => g.data).join() === 'sealed twice' && bob2.opens - o === 2, `the same message sealed twice: both opened, delivered once (${bob2.got.length}, ${bob2.opens - o} opens)`);
+  w.done();
+}
+
+// A relay that serves a drop's id with other content doesn't hide the drop on the others (NB19-1).
+{
+  const w = world();
+  const alice = w.inbox(A, { listen: false });
+  await alice.send(pw.endpoint({ secret: B }).id, 'past a lying relay');
+  const ev = [...w.relays[0].held.values()][0];
+  w.relays[0].held.clear();
+  w.relays[0].put({ ...ev, content: b64(rand(300)) });
+  const bob = w.inbox(B);
+  await bob.check();
+  check(bob.got.map((g) => g.data).join() === 'past a lying relay' && bob.opens === 2,
+    `the first of three relays serves the drop's id with junk: delivered from the others (${bob.got.length}, ${bob.opens} opens)`);
+  w.done();
+}
+
+// A drop copied into another app's namespace isn't read there, by the same identity (NB19-4).
+{
+  const w = world(1);
+  const alice = w.inbox(A, { listen: false });
+  await alice.send(pw.endpoint({ secret: B }).id, 'for this app');
+  const ev = [...w.relays[0].held.values()][0];
+  w.relays[0].put({ ...ev, id: toHex(rand(32)), tags: [['d', toHex(OTHER_NSB)], ev.tags[1]] });
+  const there = w.inbox(B, { appId: OTHER });
+  await there.check();
+  const here = w.inbox(B);
+  await here.check();
+  check(there.got.length === 0 && there.opens === 1 && here.got.length === 1, `opened in the other app and not read there; read in its own (${there.got.length}, ${here.got.length})`);
+  w.done();
+}
+
+// JSON nested MAX_VALUE_DEPTH deep at most (NB19-3): deeper would throw in the app's JSON.stringify or structuredClone.
+{
+  const w = world(1);
+  const alice = w.inbox(A, { listen: false });
+  const bob = w.inbox(B, { listen: false });
+  const now = S(w.now);
+  const nest = (n) => '['.repeat(n) + ']'.repeat(n);
+  for (const n of [MAX_VALUE_DEPTH, MAX_VALUE_DEPTH + 1, 8000]) w.relays[0].put(craft({ env: envelope(NSB, 2, rand(16), now, now + 60, text(nest(n))), from: alice.ep, to: bob.id, at: now }));
+  w.relays[0].put(craft({ env: envelope(NSB, 2, rand(16), now, now + 60, text(`[{"a":${nest(MAX_VALUE_DEPTH - 1)}}]`)), from: alice.ep, to: bob.id, at: now }));
+  bob.on('message', (data) => bob.got.push(JSON.stringify(data)));
+  await bob.check();
+  check(bob.got.join() === nest(MAX_VALUE_DEPTH) && bob.opens === 4, `of depths ${MAX_VALUE_DEPTH}, ${MAX_VALUE_DEPTH + 1}, 8000 and ${MAX_VALUE_DEPTH + 1} through an object, only the first is read (${bob.got.length})`);
+  let threw = null;
+  try {
+    await alice.send(bob.id, JSON.parse(nest(MAX_VALUE_DEPTH + 1)));
+  } catch (e) {
+    threw = e;
+  }
+  check(threw instanceof RangeError && (await alice.send(bob.id, JSON.parse(nest(MAX_VALUE_DEPTH)))) === 1, `send() takes depth ${MAX_VALUE_DEPTH} and throws past it: ${threw?.message}`);
   w.done();
 }
 
@@ -355,7 +422,7 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const big = [...w.relays[0].held.values()][0];
   check(big.content.length === MAX_CONTENT, `the largest message's drop is MAX_CONTENT (${big.content.length}) characters`);
   const now = S(w.now);
-  w.relays[0].put(craft({ env: envelope(1, rand(16), now, now + 60, text('y'.repeat(MAX_MESSAGE + 3 * PAD))), from: alice.ep, to: bob.id, at: now }));
+  w.relays[0].put(craft({ env: envelope(NSB, 1, rand(16), now, now + 60, text('y'.repeat(MAX_MESSAGE + 3 * PAD))), from: alice.ep, to: bob.id, at: now }));
   bob.on('message', (data) => bob.got.push(data));
   await bob.check();
   check(bob.got.length === 1 && bob.got[0].length === MAX_MESSAGE && bob.opens === 1, `a drop over MAX_CONTENT isn't opened (${bob.opens} opened, ${bob.got.length} read)`);
@@ -368,7 +435,7 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const alice = w.inbox(A, { listen: false });
   const bob = w.inbox(B, { listen: false });
   const old = S(w.now) - 7200;
-  w.relays[0].put(craft({ env: envelope(1, rand(16), old, old + 86400, text('under the flood')), from: alice.ep, to: bob.id, at: old }));
+  w.relays[0].put(craft({ env: envelope(NSB, 1, rand(16), old, old + 86400, text('under the flood')), from: alice.ep, to: bob.id, at: old }));
   for (const r of w.relays) for (let i = 1; i <= 250; i++) r.put(craft({ content: b64(rand(200)), at: old + i }));
   bob.on('message', (data) => bob.got.push(data));
   // 20 minutes between checks, and a message left after the first: past the reads down, read from where they began.
@@ -395,7 +462,7 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const alice = w.inbox(A, { listen: false });
   const bob = w.inbox(B, { listen: false });
   const s = S(w.now) - 600;
-  w.relays[0].put(craft({ env: envelope(1, rand(16), s - 10, s + 3600, text('below a full second')), from: alice.ep, to: bob.id, at: s - 10 }));
+  w.relays[0].put(craft({ env: envelope(NSB, 1, rand(16), s - 10, s + 3600, text('below a full second')), from: alice.ep, to: bob.id, at: s - 10 }));
   for (let i = 0; i < 150; i++) w.relays[0].put(craft({ content: b64(rand(200)), at: s }));
   bob.on('message', (data) => bob.got.push(data));
   const opens = [];
@@ -405,6 +472,36 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
     opens.push(bob.opens - o);
   }
   check(bob.got.length === 1 && opens.length === 3 && opens.every((n) => n <= MAX_READ), `150 drops in one second: read past it at check ${opens.length} (${opens})`);
+  w.done();
+}
+// NIP-01 has no cursor within a second: MAX_READ drops in a message's second, ordered before it, hide it (NB19-2).
+for (const n of [MAX_READ - 1, MAX_READ]) {
+  const w = world(1);
+  const alice = w.inbox(A, { listen: false });
+  const bob = w.inbox(B, { listen: false });
+  const s = S(w.now) - 600;
+  w.relays[0].put({ ...craft({ env: envelope(NSB, 1, rand(16), s, s + 3600, text('in a full second')), from: alice.ep, to: bob.id, at: s }), id: 'f'.repeat(64) });
+  for (let i = 0; i < n; i++) w.relays[0].put({ ...craft({ content: b64(rand(200)), at: s }), id: toHex(rand(32)).replace(/^f/, 'e') });
+  bob.on('message', (data) => bob.got.push(data));
+  let checks = 0;
+  do await bob.check();
+  while (bob.below.size && ++checks < 10);
+  check(bob.got.length === Number(n < MAX_READ) && bob.below.size === 0 && bob.marks.size === 1,
+    `${n} drops before a message in its second: ${n < MAX_READ ? 'read' : 'hidden, the read gone past'} (${bob.got.length} after ${checks + 1} checks)`);
+  w.done();
+}
+// Junk dated far ahead isn't read (NB19-5), from a relay that honours `until` or one that ignores the filter.
+{
+  const w = world(2);
+  const alice = w.inbox(A, { listen: false });
+  const bob = w.inbox(B, { listen: false });
+  const now = S(w.now);
+  w.relays[1].ignoresFilter = true;
+  for (const r of w.relays) for (let i = 1; i <= 500; i++) r.put({ ...craft({ content: b64(rand(200)), at: now + 365 * 86400 + i }), tags: [['d', NS]] });
+  await alice.send(bob.id, 'under future junk');
+  bob.on('message', (data) => bob.got.push(data));
+  await bob.check();
+  check(bob.got.join() === 'under future junk' && bob.opens === 1 && bob.below.size === 0, `500 drops a year ahead on each relay: none opened, delivered at the first check (${bob.opens} opens)`);
   w.done();
 }
 {
@@ -432,7 +529,7 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
     r.put({ ...craft({ content: b64(rand(200)), at: now - i }), created_at: String(now - i) });
     r.put({ ...craft({ content: b64(rand(200)), at: now - i }), tags: {} });
   }
-  const real = craft({ env: envelope(1, rand(16), now, now + 60, text('among the junk')), from: alice.ep, to: bob.id, at: now });
+  const real = craft({ env: envelope(NSB, 1, rand(16), now, now + 60, text('among the junk')), from: alice.ep, to: bob.id, at: now });
   r.put(real);
   bob.on('message', (data) => bob.got.push(data));
   await bob.check();
@@ -452,7 +549,7 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const bob = w.inbox(B, { listen: false });
   const now = S(w.now);
   w.relays[0].ignoresFilter = true;
-  w.relays[0].put(craft({ env: envelope(1, rand(16), now - 300, now + 60, text('at the bottom')), from: alice.ep, to: bob.id, at: now - 300 }));
+  w.relays[0].put(craft({ env: envelope(NSB, 1, rand(16), now - 300, now + 60, text('at the bottom')), from: alice.ep, to: bob.id, at: now - 300 }));
   for (let i = 0; i < 250; i++) w.relays[0].put(craft({ content: b64(rand(200)), at: now - 250 + i }));
   bob.on('message', (data) => bob.got.push(data));
   const opens = [];
@@ -476,7 +573,7 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   for (let i = 0; i <= MAX_KEPT; i++) {
     const at = i ? now - 6000 + i : now;
     const exp = now + 3600 + (i ? MAX_KEPT - i : MAX_KEPT + 1);
-    evs.push(craft({ env: envelope(1, rand(16), at, exp, text(String(i))), from: alice.ep, to: bob.id, at, exp }));
+    evs.push(craft({ env: envelope(NSB, 1, rand(16), at, exp, text(String(i))), from: alice.ep, to: bob.id, at, exp }));
   }
   for (const ev of evs.slice(1)) w.relays[0].put(ev);
   bob.on('message', (data) => bob.got.push(data));

@@ -395,14 +395,18 @@ await inbox.send(friendId, { text: 'call me' }); // resolves to the number of re
   store as `room.doc` takes) across sessions too. Without it, a message still on the relays comes again in each new
   session. `persist` needs `secret`: what it stores is sealed under a key from it. An inbox remembers 4096 messages
   until they expire; past that (anyone can send to a PeerId), the one that expires soonest is forgotten, and comes
-  again only if a relay serves it again.
-- **Bounds.** 16 KiB a message (`send` throws RangeError past it). Reading costs one X25519 for each message of the
-  app: a check opens at most 100 a relay, the newest first, and reads on down at the next, so a flood of messages
-  delays yours but doesn't make a check longer. More than 100 in one second on a relay are read in part. A message
-  dated more than 15 minutes ahead of our clock, sent for longer than 7 days, or expired, is dropped; one whose
-  sender's clock runs more than 15 minutes behind may be missed by an inbox that was reading when it was sent.
+  again if it is left on a relay again (anyone can copy one).
+- **Bounds.** 16 KiB a message, and a JSON value nested 64 deep at most (`send` throws RangeError past either; a
+  deeper one is dropped). Reading costs one X25519 for each message of the app: a check opens at most 100 a relay,
+  the newest first, and reads on down at the next, so a flood of messages delays yours but doesn't make a check
+  longer. A relay can't be asked for the rest of a second, though: 100 messages or more left in the same second as
+  yours, and ordered before it on that relay (by event id, which their sender chooses), hide yours there, so a
+  flood that follows the app's messages can keep them from you. A message dated more than 15 minutes ahead of our
+  clock, sent for longer than 7 days, or expired, is dropped; one whose sender's clock runs more than 15 minutes
+  behind may be missed by an inbox that was reading when it was sent.
 - **Trust.** Anyone can leave a message for any PeerId. `from` says who sealed it, and nobody else can read it: check
-  `from`, and every field you render. A relay may keep a message for less than its `ttl`, or not at all.
+  `from`, and every field you render. A message is read only in the app it was left for. A relay may keep a
+  message for less than its `ttl`, or not at all.
 - **Not yet:** messages over 16 KiB, and inboxes in Rust and Godot.
 
 ## Using with React
@@ -738,9 +742,11 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/inbox.mjs`: `openInbox` on fake strfry-like relays and a fake clock. A recipient
   offline when a message was left gets it once (from three relays, and not again in a later session); a
   non-recipient opens it and reads nothing; no PeerId, peer tag or `p` tag on a relay or in a read, a fresh signer
-  for each message, sizes padded. Expired, too-far-ahead and too-long messages, envelopes that don't check and
-  duplicates are dropped. Under a flood a check opens at most 100 messages a relay and the message still comes,
-  reading down; relays that ignore `limit` or the filter; past 4096 delivered, the soonest to expire is forgotten
+  for each message, sizes padded. Expired, too-far-ahead and too-long messages, envelopes that don't check,
+  messages copied in from another app, JSON nested deeper than 64 and duplicates are dropped; a relay serving a
+  message's id with junk doesn't hide it on the others. Under a flood a check opens at most 100 messages a relay
+  and the message still comes, reading down, unless 100 come before it in its own second; junk dated a year ahead
+  isn't read; relays that ignore `limit` or the filter; past 4096 delivered, the soonest to expire is forgotten
   first; the saved state is sealed. End to end over `NostrSignaling` with fake sockets. No relays.
 - `node packages/js/test/rust_hello.mjs`: a Rust or Godot member's room hello, sealed with
   the nonce fixed, is the same base64 that `sealRoom` makes (the vector Rust asserts too),

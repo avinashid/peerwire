@@ -425,17 +425,19 @@ export interface Inbox {
   readonly id: PeerId;
   /** `data` as sent, `from` the sender's PeerId (authenticated: it signed the message, and nobody else can read
    * it). Each message is delivered once (across sessions with `persist`), to every listener, oldest first. The
-   * first listener starts reading: at once, then every minute; nothing is read while nobody listens. A listener
-   * that throws is reported on its own. Returns a function that removes it. */
+   * first listener starts reading: at once, then every minute; nothing is read while nobody listens. A message left
+   * for another app, or a JSON value nested deeper than 64, is dropped. A listener that throws is reported on its
+   * own. Returns a function that removes it. */
   on(event: 'message', fn: (data: any, from: PeerId, info: InboxMessageInfo) => void): () => void;
   off(event: 'message', fn: (data: any, from: PeerId, info: InboxMessageInfo) => void): void;
-  /** Leaves `data` (a string, bytes, or any other value as JSON: 16 KiB at most, else RangeError) for `to` on the
-   * relays, for `ttl` seconds (1 to 7 days, the default; NIP-40 asks relays to drop it after). Resolves to the
-   * number of relays that took it, once each has answered. Anyone can leave a message for any PeerId: check
-   * `from`. */
+  /** Leaves `data` (a string, bytes, or any other value as JSON: 16 KiB at most, and a value nested 64 deep at most,
+   * else RangeError) for `to` on the relays, for `ttl` seconds (1 to 7 days, the default; NIP-40 asks relays to drop
+   * it after). Resolves to the number of relays that took it, once each has answered. Anyone can leave a message for
+   * any PeerId: check `from`. */
   send(to: PeerId, data: any, options?: { ttl?: number }): Promise<number>;
-  /** Reads the relays now (each relay up to 100 messages a check: a flood delays messages, it doesn't cost more);
-   * resolves to the number of messages delivered. */
+  /** Reads the relays now; resolves to the number of messages delivered. Each relay is read up to 100 messages a
+   * check, so a flood delays messages without costing more, except that 100 or more left in a message's second and
+   * ordered before it on a relay (by event id) hide it there: a relay can't be asked for the rest of a second. */
   check(): Promise<number>;
   /** Stops reading and closes the relay connections. */
   close(): void;
