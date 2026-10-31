@@ -4,7 +4,7 @@
 //
 //   node packages/js/test/readme.mjs [screenshot-prefix]
 
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -22,12 +22,10 @@ if (js.length > 10) throw new Error('the README chat must stay within ten lines'
 const importMap = '<script type="importmap">{"imports":{"@peerwire/js":"/src/index.js"}}</script>';
 const page = `<!doctype html><meta charset="utf-8"><title>readme chat</title>${importMap}\n${snippet}`;
 
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 let browser;
 let ok = false;
 try {
-  await new Promise((r) => setTimeout(r, 600));
   browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const ctx = await browser.newContext({ viewport: { width: 480, height: 260 } });
   await ctx.route('**/readme-chat.html', (route) => route.fulfill({ contentType: 'text/html', body: page }));

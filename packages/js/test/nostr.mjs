@@ -5,20 +5,18 @@
 //
 //   node packages/js/test/nostr.mjs
 
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const PW = process.env.PLAYWRIGHT ?? '/home/ubuntu/.local/share/playwright-tools/node_modules/playwright/index.mjs';
 const { chromium } = await import(PW);
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 8500 + Math.floor(Math.random() * 400);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 const room = `t-${Math.random().toString(36).slice(2)}`;
 let browser;
 let code = 1;
 try {
-  await new Promise((r) => setTimeout(r, 600));
   browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const pages = [];
   const t0 = Date.now();

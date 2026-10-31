@@ -8,7 +8,7 @@
 // on signalling with the tabs still linked.
 //
 //   node packages/js/test/netlab_carry.mjs [screenshot-prefix]
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -16,8 +16,7 @@ const PW = process.env.PLAYWRIGHT ?? '/home/ubuntu/.local/share/playwright-tools
 const { chromium } = await import(PW);
 const shot = process.argv[2];
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 let browser;
 let failed = 0;
 const ok = (cond, what) => {
@@ -28,7 +27,6 @@ const pages = [];
 const errors = [];
 const logHas = (page, re, timeout = 15000) => page.waitForFunction((src) => [...document.querySelectorAll('#log div')].some((d) => new RegExp(src).test(d.textContent)), re.source, { timeout });
 try {
-  await new Promise((r) => setTimeout(r, 600));
   // Both tabs' log ticks must run while the other has focus (as arena.mjs): a throttled
   // background tab can miss the gate's timeouts on a loaded host.
   browser = await chromium.launch({

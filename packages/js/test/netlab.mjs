@@ -10,7 +10,7 @@
 // Tab 0 treats every 10.x/172.x/192.168.x host as a phone sharing mobile data
 // (?gwfrom=), so it adds a synthesized 127.0.0.1 hotspot candidate per peer.
 
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -20,8 +20,7 @@ const tabs = Number(process.argv[2] ?? 3);
 const shot = process.argv[3];
 const off = process.env.RTC_OFF;
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 const step = (s) => console.log(`ok: ${s}`);
 // The first octets of this machine's LAN address, as its host candidates show it.
 const { networkInterfaces } = await import('node:os');
@@ -30,7 +29,6 @@ const HOST_FROM = lan.split('.').slice(0, 2).join('.') + '.';
 let browser;
 let ok = false;
 try {
-  await new Promise((r) => setTimeout(r, 600));
   browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   const key = `test${port}abcdefgh`;

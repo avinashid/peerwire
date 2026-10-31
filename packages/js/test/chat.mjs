@@ -4,7 +4,7 @@
 //
 //   node packages/js/test/chat.mjs [screenshot dir]
 
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -12,8 +12,7 @@ const PW = process.env.PLAYWRIGHT ?? '/home/ubuntu/.local/share/playwright-tools
 const { chromium } = await import(PW);
 const shots = process.argv[2];
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 const url = `http://127.0.0.1:${port}/demo/chat.html?signal=local#chat-test-${port}`;
 const WAIT = { timeout: 45000 }; // a loaded host links tabs slowly
 let browser;
@@ -31,7 +30,6 @@ const lastBubble = (p) => p.$$eval('#messages .msg .bubble', (l) => l.at(-1)?.te
 const typingText = (p) => p.$eval('#typing', (t) => t.textContent);
 
 try {
-  await new Promise((r) => setTimeout(r, 600));
   // Tabs of one browser on one machine link over host candidates; headless Chromium can't resolve mDNS ones.
   browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });

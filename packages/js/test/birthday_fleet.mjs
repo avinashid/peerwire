@@ -13,7 +13,7 @@
 // (NB-044); this proves the browser can drive the fleet.
 //
 //   node packages/js/test/birthday_fleet.mjs [fleet=32]
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -21,8 +21,7 @@ const PW = process.env.PLAYWRIGHT ?? '/home/ubuntu/.local/share/playwright-tools
 const { chromium } = await import(PW);
 const fleet = Number(process.argv[2] ?? 32); // fewer than 256 for a fast loopback run; the mechanism is the same
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 let browser;
 let failed = 0;
 const ok = (cond, what) => {
@@ -30,7 +29,6 @@ const ok = (cond, what) => {
   if (!cond) failed++;
 };
 try {
-  await new Promise((r) => setTimeout(r, 600));
   browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const page = await browser.newPage();
   page.on('pageerror', (e) => ok(false, `page error: ${e.message}`));

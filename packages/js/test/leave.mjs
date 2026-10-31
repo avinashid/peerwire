@@ -8,6 +8,7 @@
 // --stress=N runs N busy-loop processes meanwhile, to close tabs on a loaded host.
 
 import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -21,8 +22,7 @@ const crashes = arg('crash', 1);
 const FAST_MS = 5000; // a closed tab's leave must arrive within this
 const IDLE_MS = 45000; // the core's 30 s idle_timeout plus margin, for the crash path
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 const burners = Array.from({ length: stress }, () => spawn(process.execPath, ['-e', 'for(;;);'], { stdio: 'ignore' }));
 let browser;
 let failed = 0;
@@ -54,7 +54,6 @@ async function leaves(pages, id, t0, timeout) {
 }
 
 try {
-  await new Promise((r) => setTimeout(r, 600));
   browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const all = [];
   for (let run = 1; run <= runs; run++) {
