@@ -201,7 +201,7 @@ impl Docs {
     /// (resync): what piles up for a slow member, as a hub's relays do, costs it a catch-up, not its link. Our
     /// replies to its asks for docs we hadn't open go again first. What that queues isn't capped, so it can't drop
     /// it again. One whose link has taken nothing across RESYNCS of those, and for STALL_US, is forgotten as if it
-    /// left.
+    /// left, and so is one whose resync alone queued more than half of OUTBOX_BYTES.
     fn cap(&mut self, p: PeerId) {
         let now = self.now_us;
         let Some(ob) = self.out.get_mut(&p).filter(|ob| ob.bytes > OUTBOX_BYTES) else { return };
@@ -223,6 +223,12 @@ impl Docs {
             for (q, text) in sent {
                 self.push(q, text);
             }
+        }
+        // Frames past half the cap from the resync alone (many docs open near their caps) would have nearly every
+        // frame queued after them resync it again: it is forgotten instead, as before resyncs.
+        if self.out.get(&p).is_some_and(|ob| ob.bytes > OUTBOX_BYTES / 2) {
+            self.forget(p);
+            self.events.push_back(Event::Overflow(p));
         }
     }
 
@@ -922,6 +928,43 @@ mod tests {
                 true => d.retry(b, vec![DOC_TAG]),
             }
             assert!(d.queued(&b) < 1000, "retried: {retried}");
+        }
+    }
+
+    /// A member whose resync alone queues more than half of OUTBOX_BYTES is forgotten, as the cap did before
+    /// resyncs: else nearly every frame queued after it would resync it again. Each doc here holds the dead dots
+    /// of 1000 writers, 7 each, as a member sent them, and the member asked each: 2 docs are resynced, 16 pass half
+    /// the cap but not the cap.
+    #[test]
+    fn a_member_whose_resync_alone_passes_half_the_cap_is_forgotten() {
+        let now = Instant::from_millis(0);
+        let ws: Vec<String> = (0..1000).map(|i| format!("\"{i:064x}00000001\"")).collect();
+        let x: Vec<String> = (0..7000u64)
+            .map(|k| format!("[{},{n},{n}]", k % 1000, n = 1_000_000_000_000_000 + 2 * (k / 1000)))
+            .collect();
+        let frame = |name: &str| format!(r#"{{"d":"{name}","t":3,"ws":[{}],"x":[{}]}}"#, ws.join(","), x.join(","));
+        let mut each = 0;
+        for docs in [2, 16] {
+            let (mut d, b) = lone();
+            for n in 0..docs {
+                let name = format!("d{n}");
+                d.open(now, &name, Options::default()).unwrap();
+                let ask = format!(r#"{{"d":"{name}","t":2,"ws":[],"r":[],"q":1}}"#);
+                for f in [frame(&name), ask] {
+                    assert!(d.receive(now, b, &[&[DOC_TAG][..], f.as_bytes()].concat()));
+                }
+            }
+            while d.poll_transmit().is_some() {}
+            resync(&mut d, b);
+            if docs == 2 {
+                assert_eq!(overflows(&mut d), []);
+                each = d.queued(&b) / docs;
+                assert!(waiting(&d, &b).iter().any(|m| m.starts_with(r#"{"d":"d1","t":3,"ws":[""#)));
+            } else {
+                assert!(OUTBOX_BYTES / 2 < docs * each && docs * each < OUTBOX_BYTES, "{each} B a doc");
+                assert_eq!(overflows(&mut d), [Event::Overflow(b)]);
+                assert_eq!(d.queued(&b), 0);
+            }
         }
     }
 

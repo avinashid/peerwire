@@ -70,8 +70,9 @@ A member whose link has taken nothing across two of those, and for 30 s, is forg
 (`Event::Overflow`), and the host should close its link. It catches up when it joins again.
 
 What a resync queues isn't held to `OUTBOX_BYTES`: up to about 1.5 MB for each doc open at its caps (theoretical:
-its most dead ranges and writers, and an ask of `MESSAGE_BYTES`). With a dozen such docs open one resync passes the
-cap alone, and every frame queued after it resyncs again, so keep the docs a hub has open few.
+its most dead ranges and writers, and an ask of `MESSAGE_BYTES`). A member whose resync alone queues more than half
+of the cap is forgotten too (`Event::Overflow`), as every frame queued after would resync it again. Half a dozen such
+docs open do that, so keep the docs a hub has open few.
 
 A hub charges what it relays for a member's frame to that member: the messages it queued, once for each member they
 go to. Values go on as this crate writes them, which can be longer than the member sent them (`1e20` is 21 digits).

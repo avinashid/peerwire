@@ -95,8 +95,9 @@ pub const STORED_FRAMES: usize = 64;
 /// with it ([`Event::Overflow`]).
 /// Four full docs as JSON text. What a resync queues isn't held to it: for each doc open, up to about 1.5 MB at
 /// the doc's caps (*theoretical*: [`MAX_RANGES`] + [`MAX_ENTRIES`] dead ranges at 48 bytes, [`MAX_WRITERS`] at 80
-/// and an ask of [`MESSAGE_BYTES`]), so with a dozen such docs open, one resync passes it alone and every frame
-/// queued after it resyncs again. Keep the docs a hub has open few.
+/// and an ask of [`MESSAGE_BYTES`]). A member whose resync alone queues more than half of it is forgotten too
+/// ([`Event::Overflow`]), as every frame queued after would resync it again: half a dozen such docs open do that,
+/// so keep the docs a hub has open few.
 pub const OUTBOX_BYTES: usize = 16 * 1024 * 1024;
 /// What a hub ([`Options::hub`]) may relay of one member's frames at once, as queued for its other members: past
 /// it, [`Docs`] forgets the member as if it left ([`Event::Overflow`]), so the member writing pays rather than
@@ -333,7 +334,8 @@ pub enum Event {
     Change(DocId, Change),
     Sync(DocId, Status),
     /// This member's link took none of its messages for 30 s (as the times passed in tell: at least that), while
-    /// they passed [`OUTBOX_BYTES`] waiting and were dropped twice; or, at a hub, it had more than [`RELAY_BYTES`]
+    /// they passed [`OUTBOX_BYTES`] waiting and were dropped twice; or catching it up afresh queued more than half
+    /// of [`OUTBOX_BYTES`] alone (see there); or, at a hub, it had more than [`RELAY_BYTES`]
     /// of its frames relayed beyond what refilled: [`Docs`] forgot it as if it left, and takes nothing more from it
     /// until [`Docs::joined`] again. Close its link (it catches up when it comes back; its relay budget doesn't
     /// refill by coming back).

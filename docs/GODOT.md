@@ -127,9 +127,10 @@ var copy := doc.snapshot()                  # keep it on the device (it holds wh
 - **A slow joiner is caught up again, not cut.** Once 16 MiB of doc frames wait for a joiner, the host drops them
   and catches it up afresh, as if it had just joined: it asks for what it missed, at its link's pace. That
   catch-up starts with up to about 1.5 MB for each doc the host has open (*theoretical*, for a doc at its caps), so
-  keep them few: past a dozen such docs it would fill those 16 MiB alone.
-- **The host disconnects a joiner in two cases.** When it joins again, it catches up.
+  keep them few.
+- **The host disconnects a joiner in three cases.** When it joins again, it catches up.
   - **Its link stalls:** it takes nothing for 30 s, while 16 MiB of doc frames piled up for it twice.
+  - **Catching it up afresh would fill half those 16 MiB alone:** half a dozen docs open at their caps do that.
   - **It writes faster than the host may pass on:** what the host sends on for one joiner is charged to it, once
     for each joiner it goes to, as the host writes it (a number can take longer than the joiner sent it). The
     budget is 8 MiB at once, then 64 KiB/s. With 7 joiners that is about 1.3 MiB of new entries at once, then
