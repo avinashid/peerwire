@@ -191,7 +191,6 @@ impl Docs {
         ob.resyncs += 1;
         ob.messages.clear();
         ob.bytes = 0;
-        self.held.remove(&p);
         let ids: Vec<u32> = self.docs.keys().copied().collect();
         for id in ids {
             let (_, sent, _) = self.lend(id, |h, docs| docs.get_mut(&id).map(|d| d.resync(h, p)));
@@ -709,12 +708,16 @@ mod tests {
         d.set_now(Instant::from_micros((s * 1e6) as u64));
     }
 
-    /// Drops `peer`'s messages at `s` seconds: whether that forgot it (Overflow) rather than resynced it.
+    /// Drops `peer`'s messages at `s` seconds: whether that forgot it (Overflow) rather than resynced it. A member
+    /// that never asked us is sent our ask alone, if it is its turn.
     fn drop_at(d: &mut Docs, peer: PeerId, s: f64) -> bool {
         at(d, s);
         resync(d, peer);
         let cut = overflows(d) == [Event::Overflow(peer)];
-        assert!(cut || d.queued(&peer) < 1000, "resynced");
+        if !cut {
+            let sent = waiting(d, &peer);
+            assert!(sent.len() <= 1 && sent.iter().all(|m| m.starts_with(r#"{"d":"board","t":2,"#)), "{sent:?}");
+        }
         cut
     }
 
@@ -731,6 +734,11 @@ mod tests {
         // 30 s on, it is still resynced twice first.
         let (mut d, b) = lone();
         assert_eq!([40.0, 40.0, 40.0].map(|s| drop_at(&mut d, b, s)), [false, false, true]);
+        // The 30 s count from when it joined.
+        let (mut d, _) = lone();
+        let c = PeerId([0xcc; 32]);
+        d.joined(Instant::from_millis(40_000), c, Route::Direct);
+        assert_eq!([41.0, 41.0, 41.0, 70.0].map(|s| drop_at(&mut d, c, s)), [false, false, false, true]);
         // A message its link took starts both again.
         let (mut d, b) = lone();
         assert_eq!([10.0, 10.0].map(|s| drop_at(&mut d, b, s)), [false, false]);
@@ -758,14 +766,19 @@ mod tests {
         assert!(d.poll_transmit().is_some_and(|(p, _)| p == b));
     }
 
-    /// The cap is OUTBOX_BYTES: a queue of exactly that is kept.
+    /// The cap is OUTBOX_BYTES, retried messages included: a queue of exactly that is kept.
     #[test]
     fn a_queue_of_outbox_bytes_is_kept() {
-        let (mut d, b) = lone();
-        d.queue(vec![(b, "x".repeat(OUTBOX_BYTES - 1))]);
-        assert_eq!(d.queued(&b), OUTBOX_BYTES);
-        d.queue(vec![(b, String::new())]);
-        assert!(d.queued(&b) < 1000);
+        for retried in [false, true] {
+            let (mut d, b) = lone();
+            d.queue(vec![(b, "x".repeat(OUTBOX_BYTES - 1))]);
+            assert_eq!(d.queued(&b), OUTBOX_BYTES);
+            match retried {
+                false => d.queue(vec![(b, String::new())]),
+                true => d.retry(b, vec![DOC_TAG]),
+            }
+            assert!(d.queued(&b) < 1000, "retried: {retried}");
+        }
     }
 
     /// A hub with members `a`, `b` and `c`; `a` writes through `leaf`, its own docs, linked to the hub alone.
