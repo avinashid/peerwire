@@ -118,8 +118,9 @@ NB-016 (`6107674`) in `888e0d6`, NB-010 (`41f4021`) in `869e4cf` and NB-010a
 | NB6H-1 (Low), NB6H-2, I1, I2 (Info) | **Fixed** by `c1b3878`, merged `71f5c6e`, with NB6H-2's first half by `dc156a3` (relay pacing on a monotonic clock, with clamps; the pipe asks `wait()` again each second; a held relay is sent nothing at close; `wait?()` typed). Reviewed 2026-10-29, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
 | NB6I-1 (Low) | **Fixed** by `dc156a3`, merged `6a60ef0` (a relay slowed behind its queue gives up its turn), beside the lead's close fix `cf4a0a9`. Reviewed 2026-10-29; a relay that answers OK and delivers nothing gets 1/n of the pipe (accepted), same section |
 | Half-open relay (Low) | **Fixed** by `659eb28`, merged `5ae3c4e` (NB-006j: a relay that has answered nothing for 5 s since it was sent an event gets no pipe turns while one that answers is left; its next OK gives them back), reviewed 2026-10-29; residuals NB6J-I1, I3, I4 (Info, accepted), same section |
-| NB6J-I2 (Info) | **Fixed** by `0d40053` and `f4a89a4` (NB-006k), merged `b26e869` (a socket that has heard nothing from its relay for 10 s after a non-lossy event is redialled, then after 20 s and 30 s, and no more until it answers in time; the new socket takes no pipe batch until its relay answers), reviewed 2026-10-31; NB6K-I1…I3 (Info) go with NB-058, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
-| Reconnect flap (Low) | Open (NB-058, in progress): a relay that accepts each socket and closes it is redialled every 1.06 s with no end, and each reopen sends a hello to every relay; on main before NB-006k too, same section |
+| NB6J-I2 (Info) | **Fixed** by `0d40053` and `f4a89a4` (NB-006k), merged `b26e869` (a socket that has heard nothing from its relay for 10 s after a non-lossy event is redialled, then after 20 s and 30 s, and no more until it answers in time; the new socket takes no pipe batch until its relay answers), reviewed 2026-10-31; NB6K-I1…I3 (Info) fixed by `d76ed0b` (NB-058), merged `2f68aa8`, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
+| Reconnect flap (Low) | **Fixed** by `df01209` (NB-058), merged `2f68aa8` (a relay socket that closes soon after it opens no longer gives its relay's reconnect wait back: the wait starts over only after a socket stayed open 30 s, so a relay that drops each connection is dialled, and the room says hello, at most twice a minute), reviewed 2026-10-31; residuals accepted, same section |
+| NB58-1 (Low), NB58-I1 (Info) | **Fixed** by `4609955` before NB-058 merged, so never on main (a `navigator.connection` 'change' with the same connection type no longer redials the relays; the docs say "dialled 30 s ago" where that is what counts), reviewed 2026-10-31, same section |
 | NB6L-1 (Low), NB6L-2…NB6L-6 (Info) | **Fixed** by `564e68a` and `8d6d24a`, merged `55b47c5` with the relay copy (NB-006l), before `relays: true` was published (a save whose read no relay completed stays due; a `t: 5` naming a save already made, or from a member now ignored, holds nothing back; a relay can't date `sync.at` ahead; a piece holds at most 16 frames), reviewed 2026-10-30; residuals accepted, [Docs kept on the relays](#docs-kept-on-the-signalling-relays-relays-nb-006l--nb6l-1nb6l-6) |
 | NB6B-1 (Low), NB6B-3 (Info) | **Fixed** by `834ef90` and `4d6f9a2`, merged `6c5af8f` with `peerwire-sync` (NB-006b), before any native or Godot release (a Godot host charges what it passes on to the joiner writing, and cuts that joiner, not its readers; the host's relay is fuzzed), reviewed 2026-10-30; NB6B-2 (Info) accepted, [Shared docs in Rust](#shared-docs-in-rust-peerwire-sync-nb-006b-nb-052--nb6b-1nb6b-4-nb52-1-nb52-2) |
 | NB6B-4 (Low) | **Fixed** by NB-052 (`1113cac`, before any native or Godot release; merged in `143923f`): a joiner's queue past 16 MiB is dropped and the joiner caught up afresh, not cut, so a flood no longer cuts readers. Reviewed 2026-10-31; residuals (1), (2), (3), (5) accepted, same section |
@@ -1860,19 +1861,20 @@ and a fake clock (loopback).
 - **Tests.** `nostr_bounds` 5g, with fake sockets and a fake clock running the timers;
   `doc_catchup` (i) counts the socket that went half-open.
 
-**Info, with NB-058** (written, parked as `cbafbdf`):
+**Info, fixed by NB-058** (`d76ed0b`, merged `2f68aa8`, below):
 - **NB6K-I1.** A relay that answers the first event on each new socket in time, then
   nothing, gets its redial budget back each time: 20 redials in 10 min, with no end
-  (measured on `ce411db` with the probe; before NB-006k there were none). Fix: a timely
-  OK restores the budget only on a socket open ≥ `MAX_RECONNECT_MS` (30 s).
+  (measured on `ce411db` with the probe; before NB-006k there were none). Fixed: a
+  timely OK restores the budget only on a socket dialled `MAX_RECONNECT_MS` (30 s) or
+  more ago. In the probe, 3 redials in 10 min.
 - **NB6K-I2.** A stray "so" in the README; `index.d.ts` says `reconnects` counts closes,
   but a deaf redial counts too.
 - **NB6K-I3.** `nostr_bounds` 5g's fake relays don't echo our hello, as real ones do.
 
-**The reconnect flap (Low), open: NB-058.** Found in the NB-006k review; on main before
-it too. `dial()`'s `onopen` deletes the relay's back-off, so a socket that opens and
-closes is dialled again after `RECONNECT_MS` (1 s) every time: the doubling to
-`MAX_RECONNECT_MS` covers only dials that fail before opening. Each reopen fires
+**The reconnect flap (Low).** Found in the NB-006k review; on main before it too.
+`dial()`'s `onopen` deleted the relay's back-off, so a socket that opened and closed
+was dialled again after `RECONNECT_MS` (1 s) every time: the doubling to
+`MAX_RECONNECT_MS` covered only dials that failed before opening. Each reopen fires
 `onReconnect`, which `room.js` answers with a hello on every open relay.
 - **Repro** (fake sockets and clock, Node 22, measured again on `ce411db`): a relay that
   accepts each socket and closes it 10 ms later is dialled 56 times in 60 s, every
@@ -1882,9 +1884,41 @@ closes is dialled again after `RECONNECT_MS` (1 s) every time: the doubling to
   Relays ban an IP for too many connections; on a shared IP (a hotspot, carrier NAT)
   that hits everyone behind it. Each other relay gets an extra hello a second, a quarter
   of `RELAY_RATE`. Only the relay or the path to it can cause it, not a peer.
-- **Fix (NB-058, in progress):** `onopen` keeps the back-off, and `lostSocket()` starts
-  over at 1 s only after a socket stayed open ≥ `MAX_RECONNECT_MS`. Reopen hellos then
-  follow the back-off: at most 2 a minute at the cap.
+- **Fix:** `onopen` keeps the back-off, and `lostSocket()` starts over at 1 s only
+  after a socket stayed open ≥ `MAX_RECONNECT_MS`. Reopen hellos then follow the
+  back-off: at most 2 a minute at the cap. In the probe, 5 dials in the first minute
+  instead of 56.
+
+**NB58-1 — A connection 'change' gave the flapping relay its 1 s back (Low).** Found in
+the NB-058 review, so never on main. The page took every `navigator.connection`
+'change' as a new network and redialled each relay not open, its wait deleted. Chrome
+fires 'change' when its speed estimate moves too, the type the same, so the wait the
+flap fix keeps was thrown away each time. With a 'change' every 60, 30, 10 or 5 s, the
+probe's flapping relay was dialled, and the room said hello, 6, 10, 24 or 36 times a
+minute (57 to 60 before NB-058). Fix: only going online, a new connection type (the
+rule `room.js` uses) or the page showing again redials; a 'change' with the same type
+does nothing. Then it is 2 a minute at every rate of 'change', and a new type still
+redials at once.
+
+**NB58-I1 (Info).** "Open 30 s" was measured from the dial in `answered()` but from the
+open in `lostSocket()`. The docs now say "dialled 30 s ago" where that is what counts.
+
+**Status: fixed** by `d76ed0b` (NB6K-I1…I3), `df01209` (the flap) and `4609955`
+(NB58-1, NB58-I1), merged in `2f68aa8` (`ui/NB-058-reconnect` at `4609955`), reviewed
+2026-10-31. The tests are `nostr_bounds` 5g and 6, with fake sockets and a fake clock;
+10 of 10 mutants, the author's and two of ours, are caught on `4609955`.
+
+**Residuals (accepted):**
+- **Going online, or the page showing again,** redials at once and starts the wait
+  over, so a relay that drops each connection is dialled once more at each such event.
+- **A deaf socket's redial** leaves the relay's reconnect wait as it was.
+- **A relay that holds each socket 30 s or more** and then closes it starts the wait
+  over each time, so it is dialled about every 31 s, with a hello each time: 2 a
+  minute, as at the cap.
+- **Desktop Chrome has no connection type,** so there a 'change' never redials. A real
+  network change is still caught by 'online', the socket closing, or the deaf check.
+- **Each real change of type** (Wi-Fi to cellular and back) redials at once and starts
+  the wait over at 1 s.
 
 ### Docs kept on the signalling relays, `relays` (NB-006l) — NB6L-1…NB6L-6
 
@@ -2892,7 +2926,8 @@ and what it accepted. Values are from main `7b716a2`.
     second) and is held for 1 s, doubling to 30 s. One that bans us is sent nothing for
     30 s, doubling to 10 min, and that starts over after 10 quiet minutes
     ([Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1)).
-  - Closed sockets are redialled from 1 s, doubling to 30 s.
+  - Closed sockets are redialled from 1 s, doubling to 30 s, starting over only after a
+    socket open 30 s (NB-058).
   - Residual: JS checks neither the event id hash nor the signature, so a relay can
     present one event under many ids. Offers are sealed and hellos proven, and
     replays fall under SEC-6, so the cost is duplicate work. Rust checks the id.
