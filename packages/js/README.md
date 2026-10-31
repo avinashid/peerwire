@@ -618,8 +618,17 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    send us through that relay is lost: a socket that has heard nothing at all for 10 s
    since a signal went through it is closed and dialled again, and the new one takes no
    batch until its relay answers. Relays ban an IP that opens too many connections, so
-   the same relay is redialled so after 20 s, then 30 s, and at most 3 times until it
-   answers within 5 s again; one that answers late, or never, isn't redialled in a loop. The last
+   the same relay is redialled after 20 s, then 30 s, and at most 3 times until it
+   answers within 5 s again on a socket dialled 30 s ago or more; one that answers late,
+   never, or only on each new socket, isn't redialled in a loop. A socket that closes is
+   dialled again after 1 s, doubling to 30 s, and back to 1 s only once a socket has
+   stayed open 30 s: a relay that takes each connection and drops it (overloaded,
+   dropping an IP it bans, wanting auth) is dialled twice a minute at most, not every
+   second. Each time a relay opens again the room says hello through every relay, so
+   that too stays at twice a minute. Going online, a new connection type or the page
+   showing again redials at once and starts over (Chrome's `navigator.connection` also
+   fires 'change' on a new speed estimate, which redials nothing); going online
+   redials every relay. The last
    batches a room sends as it leaves go through every relay, as nothing could send them
    again. A relay that bans us (`blocked:`, `banned`) gets nothing for 30 s, doubling up
    to 10 min; the ban starts over at 30 s once the relay has gone 10 min without one.
@@ -738,9 +747,16 @@ Run these with Node and the Playwright install on this host:
   or `close()`. A socket that has heard nothing at all for 10 s after a signal (pipe batches and
   events to keep don't count) is closed and its relay dialled again, not 1 ms sooner, and the new one takes
   no batch until its relay answers; a relay that never answers is redialled 10, 20 and 30 s after each
-  socket's first unanswered signal, then not again until it answers one within 5 s (5 s is late). Relays
-  answering 0.1, 4 or 9 s late, or sending events but no OK, are never redialled, and one 12 s late once.
-  No relays.
+  socket's first unanswered signal, then not again until it answers one within 5 s (5 s is late) on a
+  socket dialled 30 s ago (29.999 s is too young); one answering each new socket's first signal only is redialled
+  3 times too. Relays answering 0.1, 4 or 9 s late, or sending events but no OK, are never redialled, and
+  one 12 s late once. A relay that drops each connection 10 ms after it opens is dialled again 1, 2, 4,
+  8, 16, 30 and 30 s after each close, and opens again (a room hello each time) twice a minute at most;
+  a socket open 30 s starts the wait over at 1 s, one open 29.999 s doesn't (the 50 ms it took to
+  connect doesn't count). Going online, a new connection type (a fake `navigator.connection`) or the
+  page showing again redials at once and starts over; a 'change' of the same type (a new speed estimate)
+  or a page hidden leaves the wait, and with such a 'change' every 10 s the relay still opens twice a
+  minute at most. No relays.
 - `node packages/js/test/inbox.mjs`: `openInbox` on fake strfry-like relays and a fake clock. A recipient
   offline when a message was left gets it once (from three relays, and not again in a later session); a
   non-recipient opens it and reads nothing; no PeerId, peer tag or `p` tag on a relay or in a read, a fresh signer

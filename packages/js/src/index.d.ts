@@ -745,15 +745,22 @@ export declare class NostrSignaling implements SignalingAdapter {
   readonly id: string;
   readonly ready: Promise<void>;
   /**
-   * `relaysOpen` counts sockets open now; `reconnects` counts relays that opened again after a close; `backoffs`,
-   * relays held for their rate or stopped for a ban; `resent`, events sent to a relay again after it refused them
-   * for its rate; `unsent`, events dropped from a relay's queue (past 64 waiting, or waiting over 10 s); `redials`,
-   * sockets closed and dialled again for hearing nothing at all for 10 s after a signal (20 s, then 30 s, for the
-   * same relay; at most 3 until it answers within 5 s).
+   * `relaysOpen` counts sockets open now; `reconnects` counts relays that opened again after a close or a redial;
+   * `backoffs`, relays held for their rate or stopped for a ban; `resent`, events sent to a relay again after it
+   * refused them for its rate; `unsent`, events dropped from a relay's queue (past 64 waiting, or waiting over 10 s);
+   * `redials`, sockets closed and dialled again for hearing nothing at all for 10 s after a signal (20 s, then 30 s,
+   * for the same relay; at most 3 until it answers within 5 s on a socket dialled 30 s ago or more).
    */
   readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; reconnects: number; backoffs: number; resent: number; unsent: number; redials: number; lastRejection?: string };
   onHello: (peer: PeerId, meta?: unknown) => void;
-  /** A relay opened again after its socket closed or heard nothing (see `stats.redials`); it is redialled on its own, and at once on a network change or the page showing again; going online redials every relay. */
+  /**
+   * A relay opened again after its socket closed or heard nothing (see `stats.redials`). A closed one is redialled on
+   * its own after `RECONNECT_MS` (1 s), doubling to `MAX_RECONNECT_MS` (30 s), and back to 1 s only once a socket has
+   * stayed open 30 s, so a relay that drops each connection as it opens fires this twice a minute at most (a `Room`
+   * says hello through every relay each time); at once, starting over, on going online, a new connection type or the
+   * page showing again (not on a `navigator.connection` 'change' of the same type: a new speed estimate); going online
+   * redials every relay.
+   */
   onReconnect: (url: string) => void;
   hello(meta?: unknown): Promise<void>;
   /** `lossy`: through one relay, the relays taking turns (one that holds us for its rate, has banned us or isn't open
