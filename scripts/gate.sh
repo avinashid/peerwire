@@ -86,6 +86,7 @@ NODE=(
   "node restart budget|node packages/js/test/restart_budget.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
   "node qr|node packages/js/test/qr.mjs"
+  "node site build|node packages/js/test/site_build.mjs"
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
 )
@@ -111,11 +112,12 @@ BROWSER=(
   "netlab mic|node packages/js/test/netlab_mic.mjs"
   "netlab punch close|node packages/js/test/netlab_punch_close.mjs"
   "react example|node packages/react/test/example.mjs"
+  "site|node packages/js/test/site.mjs"
 )
 
 # Paths that cannot change a Rust test, clippy or fmt result. Anything else runs the Rust steps: a new crate,
-# Cargo.lock, scripts/, examples/, a crate README (they run as doctests).
-NOT_RUST='^(packages/js/|packages/react/|docs/|\.github/|docker/|[^/]+\.md$|LICENSE-|Dockerfile$|docker-compose\.yml$|\.dockerignore$)'
+# Cargo.lock, scripts/ (but the site's), examples/, a crate README (they run as doctests).
+NOT_RUST='^(packages/js/|packages/react/|docs/|\.github/|docker/|scripts/site(\.sh$|/)|[^/]+\.md$|LICENSE-|Dockerfile$|docker-compose\.yml$|\.dockerignore$)'
 
 slug() { printf '%s' "${1,,}" | tr -cs 'a-z0-9' '-' | sed 's/-$//'; }
 
