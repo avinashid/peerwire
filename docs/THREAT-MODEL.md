@@ -56,8 +56,8 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `ce411db` (2026-10-31), with NB-052 (`1113cac`) and NB-019
-(`fa25c82`), which merge with this update.** Fixes merged after `@peerwire/js` 0.2.0 and
+**Status as of main `f6b5189` (2026-10-31): NB-052 (`1113cac`) merged in `143923f`,
+NB-019 (`fa25c82`) in `e6c9684`.** Fixes merged after `@peerwire/js` 0.2.0 and
 `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
@@ -120,7 +120,7 @@ that needs a change is tracked as an NB card.
 | Reconnect flap (Low) | Open (NB-058, in progress): a relay that accepts each socket and closes it is redialled every 1.06 s with no end, and each reopen sends a hello to every relay; on main before NB-006k too, same section |
 | NB6L-1 (Low), NB6L-2…NB6L-6 (Info) | **Fixed** by `564e68a` and `8d6d24a`, merged `55b47c5` with the relay copy (NB-006l), before `relays: true` was published (a save whose read no relay completed stays due; a `t: 5` naming a save already made, or from a member now ignored, holds nothing back; a relay can't date `sync.at` ahead; a piece holds at most 16 frames), reviewed 2026-10-30; residuals accepted, [Docs kept on the relays](#docs-kept-on-the-signalling-relays-relays-nb-006l--nb6l-1nb6l-6) |
 | NB6B-1 (Low), NB6B-3 (Info) | **Fixed** by `834ef90` and `4d6f9a2`, merged `6c5af8f` with `peerwire-sync` (NB-006b), before any native or Godot release (a Godot host charges what it passes on to the joiner writing, and cuts that joiner, not its readers; the host's relay is fuzzed), reviewed 2026-10-30; NB6B-2 (Info) accepted, [Shared docs in Rust](#shared-docs-in-rust-peerwire-sync-nb-006b-nb-052--nb6b-1nb6b-4-nb52-1-nb52-2) |
-| NB6B-4 (Low) | **Fixed** by NB-052 (`1113cac`, before any native or Godot release; it merges with this update): a joiner's queue past 16 MiB is dropped and the joiner caught up afresh, not cut, so a flood no longer cuts readers. Reviewed 2026-10-31; residuals (1), (2), (3), (5) accepted, same section |
+| NB6B-4 (Low) | **Fixed** by NB-052 (`1113cac`, before any native or Godot release; merged in `143923f`): a joiner's queue past 16 MiB is dropped and the joiner caught up afresh, not cut, so a flood no longer cuts readers. Reviewed 2026-10-31; residuals (1), (2), (3), (5) accepted, same section |
 | NB52-1, NB52-2 (Low), NB52-I1, NB52-I2 (Info) | **Fixed** by `3749a67`, `ba693d0`, `1113cac` and `da4fe8b` before NB-052 merged, so never on main (a catch-up afresh keeps the joiner's budgets; our replies to its asks for docs not open go again; one that alone queues over 8 MiB cuts the joiner), reviewed 2026-10-31, same section |
 | NB19-1, NB19-3, NB19-4, NB19-5 (Low), NB19-I1, NB19-I2 (Info) | **Fixed** by `5a3fb65` and `c173890` before NB-019 merged, so never on main, before `openInbox` was published (a read opens each content once, whichever relay states its id; JSON nested past 64 is dropped; the envelope names the app; every read asks `until`; listeners get the message's id; `since` is rounded down to 10 min), reviewed 2026-10-31, [Offline messages](#offline-messages-to-a-peerid-openinbox-nb-019--nb19-1nb19-5) |
 | NB19-2 (Low) | Accepted (the lead's call, documented in the README and `index.d.ts`): 100 drops or more in a message's second, ordered before it, hide it on that relay, same section |
@@ -2081,7 +2081,7 @@ Nothing paces rejoins (`PER_SOURCE` caps only half-open handshakes, and only und
 load), and a host keeps up to 32 joiners by default, so holding the invite is enough.
 
 **Status: fixed** by NB-052 (`ops/NB-052-hub-resync` at `1113cac`, before any native or
-Godot release; it merges with this update), reviewed 2026-10-31. A reader's link is no
+Godot release; merged in `143923f`), reviewed 2026-10-31. A reader's link is no
 longer cut over the relay:
 - **Catch-up afresh (resync).** Past `OUTBOX_BYTES`, a member's queue is dropped, and
   each doc catches it up as if it had left and joined again (`Doc::resync`). It sends
@@ -2244,7 +2244,7 @@ read anyway. Then each message took 1 check.
 
 **Status: fixed** by `5a3fb65` (NB19-1, 3, 4, 5 and NB19-2's wording) and `c173890`
 (I1, I2), before NB-019 merged, so never on main (`backend/NB-019-offline-msg` at
-`fa25c82`; it merges with this update). Reviewed 2026-10-31. Each fix has a test in
+`fa25c82`, merged in `e6c9684`). Reviewed 2026-10-31. Each fix has a test in
 `inbox.mjs` and a mutant. The probes for NB19-1, 4, 5 and 3 pass on `fa25c82`, and each
 fails with its fix undone.
 

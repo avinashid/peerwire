@@ -403,9 +403,9 @@ await inbox.send(friendId, { text: 'call me' }); // resolves to the number of re
   longer. A relay can't be asked for the rest of a second, though: 100 messages or more left in the same second as
   yours, and ordered before it on that relay (by event id, which their sender chooses), hide yours there; its
   copies on other relays are still read. So a flood that follows the app's messages on every relay can keep them
-  from you. A message dated more than 15 minutes ahead of our
-  clock, sent for longer than 7 days, or expired, is dropped; one whose sender's clock runs more than 15 minutes
-  behind may be missed by an inbox that was reading when it was sent.
+  from you. A message dated more than 15 minutes ahead of our clock, sent for longer than 7 days, or expired, is
+  dropped; one whose sender's clock runs more than 15 minutes behind may be missed by an inbox that was reading
+  when it was sent.
 - **Trust.** Anyone can leave a message for any PeerId. `from` says who sealed it, and nobody else can read it: check
   `from`, and every field you render. A message is read only in the app it was left for. A relay may keep a
   message for less than its `ttl`, or not at all.
