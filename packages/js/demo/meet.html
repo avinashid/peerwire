@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d13">
+<title>Peerwire Meet</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d13; --panel: #12151e; --raised: #181c27; --sunk: #0e1118; --line: #242a38; --line2: #2f3647;
+    --text: #e7e9ef; --dim: #8a91a3; --faint: #5f6678;
+    --accent: #6e8cff; --accent-bg: #1d2647; --red: #ff6b6f; --red-bg: #3a1618; --green: #5bc46d; --green-bg: #15301c;
+    --amber: #f5b03a; --amber-bg: #3a2a0c; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  button, input, select { font: inherit; color: var(--text); }
+  input, select { background: var(--raised); border: 1px solid var(--line2); border-radius: 8px; padding: 9px 11px; min-height: 42px; min-width: 0; outline: none; }
+  input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+  button { background: var(--raised); border: 1px solid var(--line2); border-radius: 8px; padding: 8px 13px; min-height: 40px; cursor: pointer; white-space: nowrap; }
+  button:hover:not(:disabled) { border-color: var(--dim); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); border-color: var(--accent); }
+  button.ghost { background: transparent; border-color: transparent; color: var(--dim); }
+  button.ghost:hover:not(:disabled) { color: var(--text); border-color: var(--line2); }
+  button.small { min-height: 30px; padding: 3px 10px; font-size: 12.5px; }
+  button.danger { background: #d9393e; border-color: #d9393e; color: #fff; font-weight: 600; }
+  button.danger:hover:not(:disabled) { filter: brightness(1.1); border-color: #d9393e; }
+  svg.i { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+  .hidden { display: none !important; }
+  .dim { color: var(--dim); }
+  .warn { color: var(--amber); } .bad { color: var(--red); }
+
+  /* Header */
+  .top { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 10px 16px;
+    padding-top: max(10px, env(safe-area-inset-top)); background: rgba(18, 21, 30, .92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; }
+  .brand .logo { width: 22px; height: 22px; border-radius: 7px; background: linear-gradient(135deg, var(--accent), #2fc4b2); }
+  .brand small { font-weight: 400; color: var(--dim); }
+  .roombar { display: flex; align-items: center; gap: 6px; background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 3px 4px 3px 10px; min-width: 0; max-width: 100%; }
+  .roombar .label { color: var(--dim); font-size: 12px; }
+  .roombar b { font-family: var(--mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 220px; unicode-bidi: isolate; }
+  .spacer { flex: 1; }
+  .pills { display: flex; gap: 6px; flex-wrap: wrap; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 2px 9px; font-size: 12px; border: 1px solid var(--line2); background: var(--raised); color: var(--dim); white-space: nowrap; }
+  .pill.ok { color: #8fdc9c; border-color: #2b5a35; background: var(--green-bg); }
+  .pill.warn { color: #ffcf7a; border-color: #6a4c14; background: var(--amber-bg); }
+  .pill.bad { color: #ff9a9d; border-color: #6b2326; background: var(--red-bg); }
+  .pill.info { color: #a9baff; border-color: #34437d; background: var(--accent-bg); }
+  @media (max-width: 700px) { .top { padding: 8px 12px; padding-top: max(8px, env(safe-area-inset-top)); } .brand small, #sig-pill, .roombar .label, #copy { display: none; }
+    .roombar { padding: 5px 10px; } .roombar b { max-width: 150px; } }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; min-width: 0; }
+  .card > h2 { font-size: 11px; margin: 0 0 10px; color: var(--faint); font-weight: 700; text-transform: uppercase; letter-spacing: .07em; }
+  label.field { display: block; font-size: 12px; color: var(--dim); margin: 14px 0 5px; font-weight: 600; letter-spacing: .02em; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .row > input { flex: 1 1 180px; }
+  .hint { font-size: 12px; color: var(--faint); margin: 6px 0 0; min-height: 18px; }
+  .hintbox { font-size: 13px; color: var(--dim); background: var(--sunk); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; }
+  .hintbox.warn { color: #ffcf7a; border-color: #6a4c14; background: var(--amber-bg); }
+  .hintbox.bad { color: #ffb3b5; border-color: #6b2326; background: var(--red-bg); }
+  .hintbox b { color: var(--text); }
+  .spinner { width: 12px; height: 12px; border-radius: 50%; border: 2px solid currentColor; border-top-color: transparent; animation: spin .8s linear infinite; flex: none; display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Lobby */
+  #lobby { max-width: 1120px; margin: 0 auto; padding: 22px 16px 32px; display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); align-items: start; }
+  @media (min-width: 900px) { #lobby { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); padding-top: 34px; } }
+  @media (max-width: 700px) { #lobby { padding: 10px 10px 24px; gap: 10px; } }
+  .stage { position: relative; aspect-ratio: 16 / 9; border-radius: 12px; overflow: hidden; background: #07090d; border: 1px solid var(--line); }
+  .stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  .stage .face { position: absolute; inset: 0; display: grid; place-items: center; align-content: center; gap: 10px; color: var(--dim); font-size: 13px; text-align: center; padding: 16px 16px 72px; }
+  .stage .avatar { width: clamp(52px, 22%, 96px); min-width: 0; font-size: clamp(20px, 5vw, 38px); }
+  .stage .floating { position: absolute; left: 0; right: 0; bottom: 12px; display: flex; justify-content: center; gap: 10px; }
+  .level { position: absolute; left: 12px; top: 12px; display: flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 999px; background: #0009; font-size: 12px; color: var(--dim); }
+  .level i { display: block; width: 60px; height: 4px; border-radius: 2px; background: var(--line2); overflow: hidden; }
+  .level i::after { content: ''; display: block; height: 100%; width: calc(var(--lvl, 0) * 100%); background: var(--green); transition: width .1s linear; }
+  #media-msg { margin-top: 12px; }
+  .devices { display: grid; gap: 4px 12px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); margin-top: 6px; }
+  .devices label.field { margin-top: 8px; }
+  .devices select { width: 100%; }
+  @media (max-width: 520px) { .devices { grid-template-columns: minmax(0, 1fr); } .stage { aspect-ratio: 4 / 3; } }
+  .join h1 { font-size: 22px; margin: 2px 0 6px; line-height: 1.25; }
+  .join .lead { color: var(--dim); margin: 0; }
+  .join .go { margin-top: 18px; }
+  .join .go button { flex: 1; min-height: 46px; font-size: 15px; }
+  .facts { list-style: none; padding: 0; margin: 16px 0 0; display: grid; gap: 7px; font-size: 13px; color: var(--dim); }
+  .facts li { display: flex; gap: 8px; align-items: baseline; }
+  .facts li::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; transform: translateY(-1px); }
+
+  /* Round controls */
+  .ctl { width: 48px; height: 48px; min-height: 0; padding: 0; border-radius: 50%; display: inline-grid; place-items: center; background: #262c3b; border-color: #343c50; }
+  .ctl:hover:not(:disabled) { background: #2e3547; }
+  .ctl.off { background: #f1f3f8; border-color: #f1f3f8; color: #b3262b; }
+  .ctl.off:hover:not(:disabled) { background: #fff; }
+  .ctl.leave { width: 64px; border-radius: 24px; background: #d9393e; border-color: #d9393e; color: #fff; }
+  .ctl.leave:hover:not(:disabled) { background: #e5484d; }
+  .ctl[aria-expanded="true"] { background: var(--accent-bg); border-color: #34437d; color: #c4cfff; }
+  .stage .ctl { background: #000a; border-color: #ffffff2a; backdrop-filter: blur(6px); }
+  .stage .ctl.off { background: #f1f3f8; color: #b3262b; }
+
+  /* Call */
+  body.in-call { height: 100vh; height: 100dvh; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+  #call { position: relative; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-height: 0; }
+  /* Each in its own row, so the grid's row is the one that stretches, whether the banner shows or not. */
+  #banner { grid-row: 1; } #grid { grid-row: 2; } #dock { grid-row: 3; }
+  #banner { margin: 10px 16px 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center; text-align: center; }
+  #banner button { min-height: 32px; padding: 4px 12px; }
+  #grid { min-height: 0; padding: 12px 16px; display: flex; flex-wrap: wrap; justify-content: center; align-content: center; gap: 10px; }
+  .tile { position: relative; width: var(--tw, 320px); height: var(--th, 180px); border-radius: 14px; overflow: hidden; background: #151925;
+    border: 1px solid var(--line); box-shadow: 0 8px 24px #0006; transition: box-shadow .15s, border-color .15s; }
+  .tile video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #07090d; }
+  .tile.self video { transform: scaleX(-1); }
+  .tile.speaking { border-color: var(--green); box-shadow: 0 0 0 2px var(--green), 0 8px 24px #0006; }
+  .tile .face { position: absolute; inset: 0; display: none; place-items: center; background: radial-gradient(circle at 50% 40%, hsl(var(--h, 225) 30% 20%), #10131b 70%); }
+  .tile.nocam .face { display: grid; }
+  .tile.nocam video { visibility: hidden; }
+  .avatar { width: 30%; max-width: 96px; min-width: 44px; aspect-ratio: 1; border-radius: 50%; display: grid; place-items: center; font-weight: 700;
+    font-size: clamp(18px, 4vw, 38px); color: #fff; background: hsl(var(--h, 225) 55% 45%); text-transform: uppercase; overflow: hidden; }
+  .tile .label { position: absolute; left: 8px; bottom: 8px; max-width: calc(100% - 16px); display: flex; align-items: center; gap: 6px; padding: 3px 9px 3px 7px;
+    border-radius: 8px; background: #000a; backdrop-filter: blur(6px); font-size: 13px; font-weight: 600; }
+  .tile .label .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; unicode-bidi: isolate; }
+  .tile .label .muted { display: none; color: var(--red); }
+  .tile .label .muted svg { width: 16px; height: 16px; }
+  .tile.nomic .label .muted { display: inline-flex; }
+  .tile .badge { position: absolute; top: 8px; right: 8px; max-width: calc(100% - 16px); display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; background: #000b; backdrop-filter: blur(6px); border: 1px solid #ffffff1f; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile[data-state="connecting"] .badge { color: #ffcf7a; }
+  .tile[data-state="connected"] .badge { color: #8fdc9c; opacity: 0; transition: opacity .6s 2s; }
+  .tile[data-state="failed"] { border-color: #6b2326; }
+  .tile[data-state="failed"] .badge { color: #ffb3b5; border-color: #6b2326; background: #3a1618e6; }
+  .tile[data-state="failed"] .face { display: grid; }
+  .tile[data-state="failed"] video { visibility: hidden; }
+  .tile.self .badge { display: none; }
+  #dock { display: flex; justify-content: center; align-items: center; gap: 12px; padding: 10px 16px 16px; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+  #dock .sep { width: 1px; height: 28px; background: var(--line2); margin: 0 2px; }
+  #devpop { position: absolute; left: 50%; bottom: 84px; transform: translateX(-50%); width: min(560px, calc(100% - 20px)); z-index: 6; box-shadow: 0 18px 50px #000b; }
+  #devpop .devices { margin-top: 0; }
+  #devpop .devices label.field:first-child, #devpop .devices label.field:nth-child(2) { margin-top: 0; }
+  #unmute { position: absolute; left: 50%; top: 56px; transform: translateX(-50%); z-index: 4; box-shadow: 0 8px 30px #000a; }
+  .toast { position: fixed; left: 50%; bottom: 100px; transform: translateX(-50%); z-index: 8; background: var(--raised); border: 1px solid var(--line2); border-radius: 10px;
+    padding: 8px 14px; font-size: 13px; box-shadow: 0 10px 30px #000a; max-width: calc(100% - 24px); text-align: center; }
+  @media (max-width: 700px) {
+    #grid { padding: 8px; gap: 8px; }
+    #dock { gap: 10px; padding: 8px 10px 12px; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+    #dock .sep { display: none; }
+    .ctl { width: 46px; height: 46px; }
+    .ctl.leave { width: 58px; }
+    #devpop { bottom: 72px; }
+  }
+
+  /* Full call, left call */
+  .sheet { position: fixed; inset: 0; z-index: 9; display: grid; place-items: center; background: rgba(8, 9, 13, .82); padding: 16px; }
+  .sheet .card { width: min(440px, 100%); padding: 22px; box-shadow: 0 20px 60px #000a; }
+  .sheet h1 { font-size: 20px; margin: 0 0 6px; }
+  .sheet p { color: var(--dim); margin: 0 0 16px; }
+  .sheet .row button { flex: 1; min-height: 44px; }
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></symbol>
+  <symbol id="i-mic-off" viewBox="0 0 24 24"><path d="M15 9.3V6a3 3 0 0 0-5.7-1.3M9 9v2a3 3 0 0 0 4.6 2.5M18.5 11a6.5 6.5 0 0 1-1 3.4M5.5 11a6.5 6.5 0 0 0 10.4 5.2M12 17.5V21M3 3l18 18"/></symbol>
+  <symbol id="i-cam" viewBox="0 0 24 24"><rect x="2.5" y="6" width="13" height="12" rx="2.5"/><path d="M15.5 10.5l6-3.5v10l-6-3.5z"/></symbol>
+  <symbol id="i-cam-off" viewBox="0 0 24 24"><path d="M15.5 13.5l6 3.5V7l-6 3.5M10 6h3a2.5 2.5 0 0 1 2.5 2.5V11M15.5 15.5A2.5 2.5 0 0 1 13 18H5a2.5 2.5 0 0 1-2.5-2.5v-7A2.5 2.5 0 0 1 4.6 6M3 3l18 18"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13.5a4 4 0 0 0 6 .4l3-3a4 4 0 0 0-5.7-5.7l-1.2 1.2M14 10.5a4 4 0 0 0-6-.4l-3 3a4 4 0 0 0 5.7 5.7l1.2-1.2"/></symbol>
+  <symbol id="i-leave" viewBox="0 0 24 24"><path d="M3.2 13.3c4.9-4.4 12.7-4.4 17.6 0 .6.6.6 1.5 0 2.1l-1.6 1.5c-.5.5-1.3.5-1.8.1l-2-1.6c-.4-.3-.6-.8-.5-1.3l.3-1.6a10 10 0 0 0-6.4 0l.3 1.6c.1.5-.1 1-.5 1.3l-2 1.6c-.5.4-1.3.4-1.8-.1l-1.6-1.5c-.6-.6-.6-1.5 0-2.1z"/></symbol>
+</svg>
+
+<header class="top">
+  <div class="brand"><span class="logo" aria-hidden="true"></span>Meet <small>Peerwire</small></div>
+  <div class="roombar hidden" id="roombar"><span class="label">room</span><b id="room-short"></b><button class="small" id="copy">Copy invite</button></div>
+  <span class="spacer"></span>
+  <div class="pills"><span class="pill" id="sig-pill"></span><span class="pill hidden" id="count-pill"></span></div>
+</header>
+
+<main id="lobby">
+  <section class="card">
+    <h2>Camera and microphone</h2>
+    <div class="stage" id="preview-stage">
+      <video id="preview" playsinline autoplay muted></video>
+      <div class="face" id="preview-off">
+        <span class="avatar" id="preview-avatar">?</span>
+        <span id="preview-text">Your camera is off</span>
+      </div>
+      <div class="level hidden" id="level"><svg class="i" style="width:14px;height:14px"><use href="#i-mic"/></svg><i></i></div>
+      <div class="floating">
+        <button class="ctl" id="pre-mic" aria-label="Turn microphone on" title="Microphone"><svg class="i"><use href="#i-mic"/></svg></button>
+        <button class="ctl" id="pre-cam" aria-label="Turn camera on" title="Camera"><svg class="i"><use href="#i-cam"/></svg></button>
+      </div>
+    </div>
+    <div id="media-msg" class="hintbox">Nothing is recorded or uploaded. Your browser asks for the camera and microphone only when you turn them on.</div>
+    <div class="row" style="margin-top:12px"><button class="primary" id="allow" style="flex:1">Turn on camera and microphone</button></div>
+    <div class="devices" id="devices">
+      <div><label class="field" for="cam-select">Camera</label><select id="cam-select" disabled><option>Turn the camera on to choose</option></select></div>
+      <div><label class="field" for="mic-select">Microphone</label><select id="mic-select" disabled><option>Turn the microphone on to choose</option></select></div>
+    </div>
+  </section>
+  <form class="card join" id="join-form" autocomplete="off">
+    <h1 id="join-title">Start a video call</h1>
+    <p class="lead" id="join-lead">Browser to browser, peer to peer: no account and no server of ours. Up to 6 people.</p>
+    <label class="field" for="room-input">Room</label>
+    <div class="row"><input id="room-input" placeholder="a room name or an invite link" aria-describedby="room-hint"><button type="button" class="ghost" id="random" title="A new private room">New</button></div>
+    <p class="hint" id="room-hint"></p>
+    <label class="field" for="name">Your name</label>
+    <input id="name" maxlength="32" placeholder="e.g. Ada" style="width:100%">
+    <div class="row go"><button class="primary" id="join">Join call</button></div>
+    <p class="hint" id="join-msg"></p>
+    <ul class="facts">
+      <li>Audio and video go straight between the browsers, encrypted.</li>
+      <li>Each browser sends its video to every other one, so calls stop at 6.</li>
+      <li>Anyone with the invite link can join: it is the room’s only key.</li>
+    </ul>
+  </form>
+</main>
+
+<section id="call" class="hidden">
+  <div id="banner" class="hidden"></div>
+  <div id="grid" aria-live="polite"></div>
+  <div id="dock">
+    <button class="ctl" id="mic" aria-label="Mute" title="Microphone"><svg class="i"><use href="#i-mic"/></svg></button>
+    <button class="ctl" id="cam" aria-label="Turn camera off" title="Camera"><svg class="i"><use href="#i-cam"/></svg></button>
+    <button class="ctl" id="settings" aria-label="Devices" title="Devices" aria-expanded="false" aria-controls="devpop"><svg class="i"><use href="#i-sliders"/></svg></button>
+    <button class="ctl" id="invite" aria-label="Copy invite link" title="Copy invite link"><svg class="i"><use href="#i-link"/></svg></button>
+    <span class="sep"></span>
+    <button class="ctl leave" id="leave" aria-label="Leave call" title="Leave call"><svg class="i"><use href="#i-leave"/></svg></button>
+  </div>
+  <div class="card hidden" id="devpop"></div>
+  <button class="primary hidden" id="unmute">Click to hear the call</button>
+</section>
+
+<div class="sheet hidden" id="full">
+  <div class="card">
+    <h1>This call is full</h1>
+    <p id="full-text">Every browser in a call sends its video to every other one, so a call stops at 6 people. Try again when someone leaves, or start a new room.</p>
+    <div class="row"><button id="full-retry">Try again</button><button class="primary" id="full-new">New room</button></div>
+  </div>
+</div>
+<div class="sheet hidden" id="left">
+  <div class="card">
+    <h1>You left the call</h1>
+    <p>Your camera and microphone are off.</p>
+    <div class="row"><button id="rejoin">Rejoin</button><button class="primary" id="home">Back to the start</button></div>
+  </div>
+</div>
+<div class="toast hidden" id="toast" role="status"></div>
+<script type="module" src="meet.js"></script>
+</html>

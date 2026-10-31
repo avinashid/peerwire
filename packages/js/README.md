@@ -594,6 +594,8 @@ send candidates and descriptions through the same filters.
 - Same browser: open `demo/index.html` or the arena pages in several tabs.
 - Chat: open `demo/chat.html`, start a room, and send its invite link to another browser or scan its QR code with a
   phone. Add `?signal=local` to keep it to tabs of one browser.
+- Meet: open `demo/meet.html`, turn the camera on, join, and send the invite link: a video call of up to 6
+  browsers (`room.call`). Add `?signal=local` to keep it to tabs of one browser.
 - Different machines: add `?signal=nostr&room=<something only you know>` to every
   page. Peers meet through `wss://nos.lol`, `wss://relay.primal.net` and `wss://nostr.mom` and use
   Google's public STUN. Peers behind symmetric NATs on both sides still meet: see
@@ -1038,6 +1040,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/chat.mjs [shot dir]`: the chat demo in two tabs: members and routes, nicknames,
   the typing indicator, messages shown as text only, frames that aren't messages dropped, leaving and New room.
 - `node packages/js/test/qr.mjs`: the chat demo's QR encoder against known answers.
+- `node packages/js/test/meet.mjs [tabs] [shot dir]`: the meet demo in 2 to 4 tabs (default 3) with Chromium's fake
+  camera and microphone: no camera before a click, a refused one explained, every tab's video playing on the others,
+  mute and camera-off shown there, leave removing the tile, names as text only, a full call, the grid on a phone.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
   every tab must see every other, and a closed tab must leave.
 - `node packages/js/test/leave.mjs [--runs=10] [--stress=N] [--crash=1]`: closes a streaming
