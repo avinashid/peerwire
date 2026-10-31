@@ -294,7 +294,8 @@ On Linux CI, `scripts/gate.sh --strict` alone covers every job except the macOS 
 
 `.github/workflows/pages.yml` (NB-016) is not CI. It runs only by hand (`workflow_dispatch`): it builds the site
 with `scripts/site.sh`, runs `site_build.mjs`, and deploys `target/site/` to GitHub Pages. The gate runs both site
-tests above.
+tests above. Its build job uses only GitHub's own `actions/*`, with rustup from the runner image and no build cache,
+because what it builds is what Pages serves; `site_build.mjs` checks the `actions/*` rule.
 
 ## Turning acceptance criteria into tests
 

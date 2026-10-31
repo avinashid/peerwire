@@ -5,7 +5,8 @@
 //    scripts, every module they import and the wasm live under assets/<id>/;
 //  - <id> is a hash of the assets: the same for the same inputs, new when the wasm changes;
 //  - doc links point at the rendered page or at GitHub, a broken one fails the build, and so does every broken
-//    href or src of a page.
+//    href or src of a page;
+//  - .github/workflows/pages.yml, which builds what Pages serves, runs no action but GitHub's own actions/* (NB16-1).
 // node packages/js/test/site_build.mjs (needs packages/js/pkg/peerwire_ffi.wasm: packages/js/build.sh)
 
 import { buildSite, checkLinks, DEMO_CSP, PAGE_CSP, REPO_URL } from '../../../scripts/site/build.mjs';
@@ -171,6 +172,12 @@ check(problems.length === want.length && want.every((s) => problems.some((p) => 
 fs.writeFileSync(path.join(tmp, 'keep.txt'), 'x');
 check(throws(() => buildSite({ root: ROOT, out: tmp })) && fs.existsSync(path.join(tmp, 'keep.txt')),
   "the build won't clear a directory that holds something but an earlier site");
+
+// 3. The workflow: a third-party action, or one on a branch, could change what Pages serves without a commit here.
+const uses = [...fs.readFileSync(path.join(ROOT, '.github/workflows/pages.yml'), 'utf8')
+  .matchAll(/^[ \t]*(?:-[ \t]+)?uses:[ \t]*['"]?([^\s'"#]+)/gm)].map((m) => m[1]);
+check(uses.length >= 4 && uses.every((u) => /^actions\/[\w.-]+@(?:v\d+|[\da-f]{40})$/.test(u)),
+  `pages.yml uses GitHub's own actions/* only, each on a major version or a commit (${uses.join(' ')})`);
 
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(failed ? `${failed} check(s) failed` : 'all passed');

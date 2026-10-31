@@ -26,12 +26,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target/web"
+      # What this job builds is what Pages serves, so no third-party action runs in it (NB16-1): rustup comes with
+      # the runner image, and there is no build cache, which other runs would write. site_build.mjs checks that
+      # every action here is one of GitHub's own actions/*.
+      - run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
       - uses: actions/setup-node@v4
         with:
           node-version: 22
