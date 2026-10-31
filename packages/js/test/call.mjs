@@ -508,6 +508,19 @@ async function connected(...ms) {
   const vs = evs(v, 'stream');
   check(sentBy(v.id, 'sdp')[0]?.msg.d.type === 'answer' && vs.length === 1 && vs[0][2] === v.call.stream(u.id) && vs[0][2].getTracks().map((t) => t.kind).join() === 'audio,video', "an offer that sends nothing: answered, and one 'stream' with an audio and a video track");
 
+  // An offer with no media section: no track to show, so no 'stream', and call.stream(peer) is null.
+  reset();
+  const [e1, e2] = [member(ID('1')), member(ID('2'))];
+  meet(e1, e2);
+  join(e2);
+  await settle();
+  const bare = new FakePc({});
+  await bare.setLocalDescription();
+  e2.calls.receive(e1.id, bytes({ t: 'join', age: 0 }));
+  e2.calls.receive(e1.id, bytes({ t: 'sdp', d: { type: 'offer', sdp: bare.localDescription.sdp } }));
+  await settle();
+  check(sentBy(e2.id, 'sdp')[0]?.msg.d.type === 'answer' && !evs(e2, 'stream').length && e2.call.stream(e1.id) === null, "an offer with no media section: answered, no 'stream', call.stream(peer) null");
+
   // An answer that sends nothing (recvonly) to our offer: 'stream' too, on the offering side.
   reset();
   const g = member(ID('1'));
