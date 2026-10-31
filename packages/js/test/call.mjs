@@ -2,7 +2,7 @@
 // implicit offers and answers, rollback, ontrack, trickled candidates) and connects only when the test says ICE
 // did. In one process, with a fake clock:
 // - parseCall: every frame kind, and each cap (frame size, SDP length and m-sections, candidate, mid, index);
-//   a description's candidates past MAX_SDP_CANDIDATES cut; the budgets (join, sdp, ice; leave and full have
+//   a description with more than MAX_SDP_CANDIDATES candidates; the budgets (join, sdp, ice; leave and full have
 //   none); candidateFor and the description sent per privacy.
 // - Two members: the smaller id offers both transceivers and the other answers on them; one 'stream' each with
 //   an audio and a video track, then 'connected'. setStream replaces tracks and sends no description. ICE
@@ -69,6 +69,8 @@ class FakeStream {
 const camera = () => new FakeStream([new FakeTrack('audio'), new FakeTrack('video')]);
 const HOST = 'candidate:1 1 udp 2113937151 192.168.1.5 50000 typ host generation 0';
 const SRFLX = 'candidate:2 1 udp 1677729535 203.0.113.5 40000 typ srflx raddr 192.168.1.5 rport 50000 generation 0';
+// A description with `n` candidates in its one m-section.
+const cands = (n) => `v=0\r\nm=audio 9 x\r\n${`a=candidate:${HOST.slice(10)}\r\n`.repeat(n)}a=end-of-candidates\r\n`;
 const pcs = [];
 
 class FakePc {
@@ -322,10 +324,7 @@ async function connected(...ms) {
   check(['pranswer', 'rollback', undefined].every((type) => ok({ t: 'sdp', d: { type, sdp: sdp(1) } }) === null) && ok({ t: 'sdp', d: { type: 'offer', sdp: 5 } }) === null && ok({ t: 'sdp', d: null }) === null && ok({ t: 'sdp' }) === null, 'sdp: another type, a non-string sdp, no description: dropped');
   const p = ok({ t: 'sdp', d: { type: 'offer', sdp: sdp(1), __proto__: { x: 1 }, extra: 1 } });
   check(p && Object.keys(p.d).join() === 'type,sdp', 'sdp: only type and sdp copied');
-  const cands = (n, end = 'a=end-of-candidates\r\n') => `v=0\r\nm=audio 9 x\r\n${`a=candidate:${HOST.slice(10)}\r\n`.repeat(n)}${end}`;
-  const cut = ok({ t: 'sdp', d: { type: 'offer', sdp: cands(MAX_SDP_CANDIDATES + 5) } })?.d.sdp;
-  check(cut === cands(MAX_SDP_CANDIDATES) && ok({ t: 'sdp', d: { type: 'answer', sdp: cands(MAX_SDP_CANDIDATES) } })?.d.sdp === cands(MAX_SDP_CANDIDATES), `sdp: its first ${MAX_SDP_CANDIDATES} candidates kept, the rest cut, every other line as it was`);
-  check(!ok({ t: 'sdp', d: { type: 'offer', sdp: cands(MAX_SDP_CANDIDATES, 'a=candidate:9 1 udp 1 203.0.113.9 9 typ host') } })?.d.sdp.includes('203.0.113.9'), 'sdp: one more as the last line, with no line end, cut too');
+  check(ok({ t: 'sdp', d: { type: 'offer', sdp: cands(MAX_SDP_CANDIDATES) } })?.d.sdp === cands(MAX_SDP_CANDIDATES) && ok({ t: 'sdp', d: { type: 'answer', sdp: cands(MAX_SDP_CANDIDATES + 1) } }) === null, `sdp: ${MAX_SDP_CANDIDATES} candidates kept, one more dropped`);
   const c = (o) => ok({ t: 'ice', c: { candidate: HOST, sdpMid: '0', sdpMLineIndex: 0, ...o } });
   check(c({})?.c.candidate === HOST && c({ sdpMid: null })?.c.sdpMLineIndex === 0 && c({ sdpMLineIndex: undefined })?.c.sdpMid === '0', 'ice: kept with a mid, an index, or both');
   check(c({ sdpMid: null, sdpMLineIndex: null }) === null, 'ice: neither mid nor index: dropped');
@@ -361,7 +360,8 @@ async function connected(...ms) {
   const before = a.calls.dropped;
   for (let i = 0; i < BUDGETS.join[0] + 1; i++) a.calls.receive(ID('b'), bytes({ t: 'join', age: 0 }));
   a.calls.receive(ID('b'), bytes({ t: 'nope' }));
-  check(a.calls.dropped - before === 2, 'receive(): a join past its budget and a malformed frame are dropped and counted');
+  a.calls.receive(ID('b'), bytes({ t: 'sdp', d: { type: 'offer', sdp: cands(MAX_SDP_CANDIDATES + 1) } }));
+  check(a.calls.dropped - before === 3, `receive(): a join past its budget, a malformed frame and a description with ${MAX_SDP_CANDIDATES + 1} candidates are dropped and counted`);
   reset();
   const r = member(ID('a'));
   r.calls.receive(ID('b'), bytes({ t: 'join', age: 0 }));

@@ -42,14 +42,14 @@ export const CONNECT_MS = 20000;
 export const MAX_RESTARTS = 2;
 export const RESTART_WINDOW_MS = 60000;
 // A call frame is at most MAX_FRAME bytes, a description in it at most MAX_SDP characters with MAX_SECTIONS
-// m-sections (its candidates past the first MAX_SDP_CANDIDATES cut: ours trickle each one as well), and a
-// candidate at most MAX_CANDIDATE. Each peer's joins, descriptions and candidates come out of
-// budgets, BUDGETS[kind] = [burst, ms one takes to refill]: past them a frame is dropped. A join makes a
-// connection (and ICE gathering, which asks the STUN servers), a description has us answer it.
+// m-sections and MAX_SDP_CANDIDATES candidates (ours trickle theirs, but one made again after a rollback holds
+// every one gathered so far), and a candidate at most MAX_CANDIDATE. Each peer's joins, descriptions and
+// candidates come out of budgets, BUDGETS[kind] = [burst, ms one takes to refill]: past them a frame is dropped.
+// A join makes a connection (and ICE gathering, which asks the STUN servers), a description has us answer it.
 export const MAX_FRAME = 64 * 1024;
 export const MAX_SDP = 32 * 1024;
 export const MAX_SECTIONS = 4;
-export const MAX_SDP_CANDIDATES = 16;
+export const MAX_SDP_CANDIDATES = 64;
 export const MAX_CANDIDATE = 512;
 const MAX_MID = 32;
 export const BUDGETS = { join: [6, 5000], sdp: [8, 3000], ice: [64, 250] };
@@ -78,9 +78,8 @@ export function parseCall(bytes) {
     const d = m.d;
     if (typeof d !== 'object' || d === null || (d.type !== 'offer' && d.type !== 'answer') || typeof d.sdp !== 'string') return null;
     if (d.sdp.length > MAX_SDP || (d.sdp.match(/^m=/gm)?.length ?? 0) > MAX_SECTIONS) return null;
-    let n = 0;
-    const sdp = d.sdp.replace(/^a=candidate:[^\n]*\n?/gm, (line) => (++n > MAX_SDP_CANDIDATES ? '' : line));
-    return { t: 'sdp', d: { type: d.type, sdp } };
+    if ((d.sdp.match(/^a=candidate:/gm)?.length ?? 0) > MAX_SDP_CANDIDATES) return null;
+    return { t: 'sdp', d: { type: d.type, sdp: d.sdp } };
   }
   if (m.t === 'ice') {
     const c = m.c;

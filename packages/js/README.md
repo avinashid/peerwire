@@ -410,10 +410,9 @@ call.leave();
   more here, since a page with microphone or camera permission shows its local addresses.
 - **Cost.** Each member uploads its stream once for every other: about 7.5 Mbit/s for six at 720p (1.5 Mbit/s
   each), more than many uplinks. See docs/PERFORMANCE.md §6. `max` goes up to 16, for audio or small video.
-- **Bounds.** A member's call frames are checked (64 KiB, a description of 32 KiB with 4 media sections and only its
-  first 16 candidates kept, a candidate of 512 characters) and rate-limited: 6 joins, 8 descriptions and 64
-  candidates at once, then one join every 5 s, one description every 3 s and four candidates a second. Past that
-  they are dropped.
+- **Bounds.** A member's call frames are checked (64 KiB, a description of 32 KiB with 4 media sections and 64
+  candidates, a candidate of 512 characters) and rate-limited: 6 joins, 8 descriptions and 64 candidates at once,
+  then one join every 5 s, one description every 3 s and four candidates a second. Past that they are dropped.
 - **Not yet:** a member forwarding the others' streams (peer SFU) and broadcast trees for larger calls, simulcast,
   more than one video track (camera and screen at once), and calls in Rust and Godot.
 
@@ -816,10 +815,11 @@ Run these with Node and the Playwright install on this host:
   isn't read; relays that ignore `limit` or the filter; past 4096 delivered, the soonest to expire is forgotten
   first; the saved state is sealed. End to end over `NostrSignaling` with fake sockets. No relays.
 - `node packages/js/test/call.mjs`: calls (`room.call`) with a fake RTCPeerConnection that negotiates like a
-  browser's and connects when the test says ICE did. Every call frame cap and budget, a description's candidates
-  past 16 cut; candidates and descriptions per privacy. The smaller id offers both transceivers, the other answers
-  on them; one 'stream' each, also for an offer or answer that sends nothing; `setStream` sends no description; ICE
-  restarted on both ends at once settles, the polite side setting its tracks again; extra m-sections are inactive.
+  browser's and connects when the test says ICE did. Every call frame cap and budget, a description with more
+  than 64 candidates dropped; candidates and descriptions per privacy. The smaller id offers both transceivers, the
+  other answers on them; one 'stream' each, also for an offer or answer that sends nothing; `setStream` sends no
+  description; ICE restarted on both ends at once settles, the polite side setting its tracks again; extra
+  m-sections are inactive.
   No ICE in 20 s is 'no-path'; ICE lost after connecting is restarted by the smaller id only, twice a minute, then
   'lost'; a description that doesn't apply is 'error'. Seats: 6 in, a 7th gets 'full' at once, an 8th that called
   before learning who is in gets it once it learns, seated members keep their seats against a claimed old `age`
