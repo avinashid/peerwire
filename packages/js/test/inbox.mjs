@@ -171,10 +171,13 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const m = bob.got[0];
   check(bob.got.length === 1 && m.data === 'hello bob' && m.from === alice.id && m.kind === 'text' && m.at === sentAt * 1000, `bob comes online an hour later: ${JSON.stringify(bob.got)}`);
   check(bob.opens === 1, `the copies on three relays opened once (${bob.opens})`);
+  const q = w.relays[0].reqs[0];
+  check(JSON.stringify(q) === JSON.stringify({ kinds: [KIND], '#d': [NS], since: S(w.now) - MAX_TTL_S - SKEW_S, limit: MAX_READ }), `the first read: ${JSON.stringify(q)}`);
   check((await bob.check()) === 0 && bob.got.length === 1, 'a second check delivers nothing again');
   bob.close();
   const bob2 = w.inbox(B, { store });
   check((await bob2.check()) === 0 && bob2.got.length === 0, 'nor does a new session with the same store');
+  check(w.relays[0].reqs.at(-1).since === bob.marks.get(w.relays[0].url) - SKEW_S, 'which reads from where the last left off, less SKEW_S');
   bob2.close();
   const bytes = Uint16Array.of(1, 2, 0xffff);
   await alice.send(bob.id, { n: 1, s: ['x'] });
@@ -187,7 +190,8 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const b = bob3.got.find((g) => g.data.length === 6);
   const ab = bob3.got.find((g) => g.data.length === 8);
   check(bob3.got.length === 3 && j.kind === 'json' && JSON.stringify(j.data) === '{"n":1,"s":["x"]}' && b.kind === 'bytes' && b.data instanceof Uint8Array
-    && toHex(b.data) === toHex(new Uint8Array(bytes.buffer)) && ab.kind === 'bytes' && ab.data.length === 8, `JSON, a typed array and an ArrayBuffer come back as sent (${bob3.got.map((g) => g.kind)})`);
+    && toHex(b.data) === toHex(new Uint8Array(bytes.buffer)) && b.data.buffer.byteLength === 6 && ab.kind === 'bytes' && ab.data.length === 8,
+  `JSON, a typed array and an ArrayBuffer come back as sent, bytes in a buffer of their own (${bob3.got.map((g) => g.kind)})`);
   const carol = w.inbox(C);
   await carol.check();
   check(carol.got.length === 0 && carol.opens === 4, `carol, not the recipient, opens all ${carol.opens} drops and reads none`);
@@ -229,7 +233,42 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   w.relays[0].keepsExpired = true;
   bob.on('message', (data) => bob.got.push(data));
   await bob.check();
-  check(JSON.stringify(bob.got.sort()) === JSON.stringify(['just ahead enough', 'long enough', 'one second left']), `expired, too far ahead, too long dropped: ${bob.got}`);
+  check(bob.got.join() === 'one second left,long enough,just ahead enough', `expired, too far ahead, too long dropped; the rest oldest first: ${bob.got}`);
+  const kept = bob.kept.size;
+  w.relays[0].held.clear();
+  w.now += 1000;
+  await bob.check();
+  check(kept === 3 && bob.kept.size === 2, `one expiring now is forgotten (${kept} kept, then ${bob.kept.size})`);
+  w.done();
+}
+
+// The same id from two senders: two messages.
+{
+  const w = world(1);
+  const alice = w.inbox(A, { listen: false });
+  const carol = w.inbox(C, { listen: false });
+  const bob = w.inbox(B, { listen: false });
+  const now = S(w.now);
+  const id = rand(16);
+  for (const [from, s] of [[alice, 'from alice'], [carol, 'from carol']]) w.relays[0].put(craft({ env: envelope(1, id, now, now + 60, text(s)), from: from.ep, to: bob.id, at: now }));
+  bob.on('message', (data) => bob.got.push(data));
+  await bob.check();
+  check(bob.got.length === 2, `one id, two senders: ${bob.got}`);
+  w.done();
+}
+
+// A read that doesn't reach the relay's end delivers what came, and its mark stays.
+{
+  const w = world(1);
+  const alice = w.inbox(A, { listen: false });
+  await alice.send(pw.endpoint({ secret: B }).id, 'cut short');
+  w.relays[0].noEose = true;
+  const bob = w.inbox(B);
+  await bob.check();
+  const marks = bob.marks.size;
+  w.relays[0].noEose = false;
+  await bob.check();
+  check(bob.got.length === 1 && marks === 0 && bob.marks.size === 1, `delivered; the mark set only by a read that ended (${marks}, then ${bob.marks.size})`);
   w.done();
 }
 
@@ -331,17 +370,21 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   w.relays[0].put(craft({ env: envelope(1, rand(16), old, old + 86400, text('under the flood')), from: alice.ep, to: bob.id, at: old }));
   for (const r of w.relays) for (let i = 1; i <= 250; i++) r.put(craft({ content: b64(rand(200)), at: old + i }));
   bob.on('message', (data) => bob.got.push(data));
+  // 20 minutes between checks, and a message left after the first: past the reads down, read from where they began.
   const opens = [];
-  for (let i = 0; i < 6 && !bob.got.length; i++) {
+  for (let i = 0; i < 8 && bob.got.length < 2; i++) {
     const o = bob.opens;
     await bob.check();
     opens.push(bob.opens - o);
+    w.now += 1200_000;
+    if (!i) await alice.send(bob.id, 'late');
   }
-  check(bob.got[0] === 'under the flood' && opens.length === 3 && opens.every((n) => n <= 3 * MAX_READ), `750 junk drops: delivered at check ${opens.length}, opens per check ${opens}`);
+  check(bob.got.join() === 'under the flood,late' && opens.length === 4 && opens.every((n) => n <= 3 * MAX_READ),
+    `750 junk drops: delivered at check 3, one left meanwhile at check 4; opens per check ${opens}`);
   const o = bob.opens;
-  w.now += 60_000;
+  const mark = bob.marks.get(w.relays[0].url);
   await bob.check();
-  check(bob.opens === o && bob.below.size === 0, `then the marks moved: the next check opens nothing (${bob.opens - o})`);
+  check(bob.opens === o && bob.below.size === 0 && w.relays[0].reqs.at(-1).since === mark - SKEW_S, `then the marks moved: the next check opens nothing (${bob.opens - o})`);
   w.done();
 }
 
@@ -402,6 +445,25 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   w.done();
 }
 
+{
+  const w = world(1);
+  const alice = w.inbox(A, { listen: false });
+  const bob = w.inbox(B, { listen: false });
+  const now = S(w.now);
+  w.relays[0].ignoresFilter = true;
+  w.relays[0].put(craft({ env: envelope(1, rand(16), now - 300, now + 60, text('at the bottom')), from: alice.ep, to: bob.id, at: now - 300 }));
+  for (let i = 0; i < 250; i++) w.relays[0].put(craft({ content: b64(rand(200)), at: now - 250 + i }));
+  bob.on('message', (data) => bob.got.push(data));
+  const opens = [];
+  for (let i = 0; i < 6 && !bob.got.length; i++) {
+    const o = bob.opens;
+    await bob.check();
+    opens.push(bob.opens - o);
+  }
+  check(bob.got.length === 1 && opens.length === 3 && opens.every((n) => n <= MAX_READ), `a relay that ignores until and limit is still read down (${opens})`);
+  w.done();
+}
+
 // MAX_KEPT: the soonest to expire is forgotten first.
 {
   const w = world(1);
@@ -445,9 +507,19 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const bytes = await store.get(keys[0]);
   const plain = new TextDecoder().decode(bytes);
   check(new Set(keys).size === 1 && bytes[0] === VERSION && ![bob.id, alice.id, 'kept', 'marks', w.relays[0].url].some((s) => plain.includes(s)) && !has(bytes, [...fromHex(bob.id)]), `sealed: ${bytes.length} bytes, nothing in clear`);
+  const hk = await crypto.subtle.importKey('raw', B, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const want = toHex(new Uint8Array(await crypto.subtle.sign('HMAC', hk, enc.encode(`pw-inbox-id${APP}`))));
+  check(keys[0] === want, 'kept under hex(HMAC(secret, "pw-inbox-id" || appId))');
   const carol = w.inbox(C, { store: spy });
   await carol.check();
-  check(new Set(keys).size === 2 && toHex(await store.get(keys[0])) === toHex(bytes), "another identity's state is kept apart");
+  const other = new Inbox(w.sig, pw, pw.endpoint({ secret: B }), { appId: 'another-app', urls: [w.relays[0].url], store: spy, wall: w.wall });
+  other.on('message', () => {});
+  await other.check();
+  other.close();
+  check(new Set(keys).size === 3 && toHex(await store.get(keys[0])) === toHex(bytes), "another identity's state, and another app's, are kept apart");
+  const moved = new Inbox(w.sig, pw, pw.endpoint({ secret: B }), { appId: APP, urls: ['wss://elsewhere.test'], store, wall: w.wall });
+  await moved.ready;
+  check(bob.marks.size === 1 && moved.marks.size === 0 && moved.kept.size === 1, 'marks of relays no longer used are dropped on load');
   bob.close();
   const flipped = bytes.slice();
   flipped[flipped.length - 1] ^= 1;

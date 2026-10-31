@@ -136,9 +136,10 @@ export class Inbox {
     const id = toHex(await mac('pw-inbox-id'));
     const key = await crypto.subtle.importKey('raw', await mac('pw-inbox-key'), 'AES-GCM', false, ['encrypt', 'decrypt']);
     const ad = Uint8Array.of(VERSION, ...enc.encode(id));
+    // Ours (it opened under our key), so as we saved it.
     const s = await this.loadState(id, key, ad);
-    for (const [k, exp] of s?.kept ?? []) if (typeof k === 'string' && Number.isSafeInteger(exp)) this.kept.set(k, exp);
-    for (const [url, t] of Object.entries(s?.marks ?? {})) if (this.urls.includes(url) && Number.isSafeInteger(t)) this.marks.set(url, t);
+    for (const [k, exp] of s?.kept ?? []) this.kept.set(k, exp);
+    for (const [url, t] of Object.entries(s?.marks ?? {})) if (this.urls.includes(url)) this.marks.set(url, t);
     return { ns, id, key, ad };
   }
 
@@ -162,10 +163,10 @@ export class Inbox {
     }
     try {
       const text = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.subarray(1, 1 + IV_BYTES), additionalData: ad }, key, bytes.subarray(1 + IV_BYTES));
-      const s = JSON.parse(dec.decode(text));
-      if (Array.isArray(s?.kept) && s.marks !== null && typeof s.marks === 'object') return s;
-    } catch {}
-    return refused("didn't open or isn't ours");
+      return JSON.parse(dec.decode(text));
+    } catch {
+      return refused("didn't open under this identity's key");
+    }
   }
 
   async save() {
@@ -228,8 +229,8 @@ export class Inbox {
       a.oldest = Math.min(a.oldest, ev.created_at);
       return ev.id;
     };
+    // Closed meanwhile, `ep` opens nothing and nobody listens.
     const res = await this.sig.query(filter, { keep });
-    if (this.closed) return 0;
     const found = [];
     const opened = new Set();
     for (const [url, r] of res) {
@@ -340,7 +341,7 @@ export class Inbox {
     const content = b64(sealed);
     const id = await sha256(enc.encode(JSON.stringify([0, pubkey, at, KIND, tags, content])));
     const ev = { id: toHex(id), pubkey, created_at: at, kind: KIND, tags, content, sig: toHex(this.pw.nostrSign(k.secret, id)) };
-    if (this.closed) return 0;
+    // Closed meanwhile, the signalling takes nothing: 0.
     const took = await Promise.all(this.sig.store(ev, this.urls).values());
     return took.filter(Boolean).length;
   }
