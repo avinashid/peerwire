@@ -443,10 +443,15 @@ impl Doc {
     /// afresh, as if it left and joined again, though it saw neither. Our answer to its latest ask ends, empty, or
     /// it would wait on it and never ask us again; the dots we know are dead go to it, as an answer would end with
     /// them, since our ask can't show it a delete of an entry it holds; and our ask shows it any entry it missed,
-    /// so it asks us back and catches up on the paced path. Its ask's number is kept for the next time.
+    /// so it asks us back and catches up on the paced path. Its ask's number is kept for the next time, and so are
+    /// its budgets: a member that leaves them full by dropping its own messages (acknowledging pieces its link
+    /// never took) would have us build answers for it without end, where leaving costs it a rejoin.
     pub(crate) fn resync(&mut self, h: &mut Host, peer: PeerId) {
-        let q = self.members.get(&peer).map_or(0, |st| st.want);
+        let kept = self.members.get(&peer).map(|st| (st.want, st.answers, st.asks, st.chars));
         self.left(h, peer);
+        let st = self.members.entry(peer).or_default();
+        (st.want, st.answers, st.asks, st.chars) = kept.unwrap_or_default();
+        let q = st.want;
         if q > 0 {
             let mut f = String::from("{\"d\":");
             write_str(&self.name, &mut f);
@@ -460,7 +465,6 @@ impl Doc {
             }
         }
         self.joined(h, peer);
-        self.members.entry(peer).or_default().want = q;
     }
 
     /// A doc frame from member `peer`, parsed from JSON. One that is malformed is dropped.

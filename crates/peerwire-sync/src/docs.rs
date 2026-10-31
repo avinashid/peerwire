@@ -792,6 +792,52 @@ mod tests {
         assert!(d.poll_transmit().is_some_and(|(p, _)| p == b));
     }
 
+    /// A member resynced keeps its budgets, as it does if it leaves and comes back at once: else one that drops its
+    /// own messages, asking us and acknowledging pieces its link never took, would have us build answers for it
+    /// without end, and never rejoin. The clock stands still here, so no budget refills.
+    #[test]
+    fn a_member_resynced_keeps_its_budgets() {
+        let doc = |text: String| [&[DOC_TAG][..], text.as_bytes()].concat();
+        let now = Instant::from_millis(0);
+        // Our answers to its asks and our asks of it, each resynced: 8 of each (the burst), our ask as it joined
+        // among them.
+        let (mut d, b) = lone();
+        let (mut answered, mut asked) = (0, 0);
+        for q in 1..=12 {
+            assert!(d.receive(now, b, &doc(format!(r#"{{"d":"board","t":2,"ws":[],"r":[],"q":{q}}}"#))));
+            answered += waiting(&d, &b).iter().filter(|m| m.contains(&format!(r#""q":{q},"#))).count();
+            resync(&mut d, b);
+            asked += waiting(&d, &b).iter().filter(|m| m.contains(r#""t":2,"#)).count();
+        }
+        assert_eq!((answered, asked), (8, 7));
+        // Its chars budget: one acknowledging every piece of 40 answers is built two docs' worth, the doc's 69
+        // values of 60,000 chars of 3 bytes each as UTF-8, and resynced once.
+        let (mut d, _, id, _, b) = pair();
+        let value = format!("\"{}\"", "\u{4e2d}".repeat(60_000));
+        let mut n = 0;
+        while n < 100 && d.doc(id).unwrap().map_set("big", &format!("k{n}"), &value).unwrap() {
+            n += 1;
+        }
+        assert_eq!(n, 69);
+        d.joined(now, b, Route::Direct);
+        while d.poll_transmit().is_some() {}
+        let (mut built, mut resyncs) = (0, 0);
+        for q in 1..=40 {
+            let ask = format!(r#"{{"d":"board","t":2,"ws":[],"r":[],"q":{q}}}"#);
+            let more = (0..64).map(|i| format!(r#"{{"d":"board","t":4,"q":{q},"i":{i}}}"#));
+            for f in [ask].into_iter().chain(more) {
+                let before = d.queued(&b);
+                assert!(d.receive(now, b, &doc(f)));
+                match d.queued(&b).checked_sub(before) {
+                    Some(grew) => built += grew,
+                    None => resyncs += 1,
+                }
+            }
+        }
+        assert!(built <= 6 * crate::MAX_DOC_LENGTH + crate::MESSAGE_BYTES, "{built} B built");
+        assert!(built > OUTBOX_BYTES && resyncs == 1 && overflows(&mut d).is_empty(), "{resyncs} resyncs");
+    }
+
     /// The cap is OUTBOX_BYTES, retried messages included: a queue of exactly that is kept.
     #[test]
     fn a_queue_of_outbox_bytes_is_kept() {

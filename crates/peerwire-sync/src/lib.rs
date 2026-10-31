@@ -91,7 +91,8 @@ pub const MESSAGE_BYTES: usize = 512 * 1024;
 pub const STORED_FRAMES: usize = 64;
 /// What a member's messages may hold waiting to be sent, retried ones included. Past it, [`Docs`] drops them, and
 /// each doc catches the member up afresh, as if it had left and joined again: it asks for what it missed, at the
-/// pace catching up goes. What the member's link keeps refusing is then forgotten with it ([`Event::Overflow`]).
+/// pace catching up goes, its budgets for that as spent. What the member's link keeps refusing is then forgotten
+/// with it ([`Event::Overflow`]).
 /// Four full docs as JSON text.
 pub const OUTBOX_BYTES: usize = 16 * 1024 * 1024;
 /// What a hub ([`Options::hub`]) may relay of one member's frames at once, as queued for its other members: past
