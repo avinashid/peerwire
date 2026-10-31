@@ -2,20 +2,22 @@
 // implicit offers and answers, rollback, ontrack, trickled candidates) and connects only when the test says ICE
 // did. In one process, with a fake clock:
 // - parseCall: every frame kind, and each cap (frame size, SDP length and m-sections, candidate, mid, index);
-//   the budgets (join, sdp, ice; leave and full have none); candidateFor and the description sent per privacy.
+//   a description's candidates past MAX_SDP_CANDIDATES cut; the budgets (join, sdp, ice; leave and full have
+//   none); candidateFor and the description sent per privacy.
 // - Two members: the smaller id offers both transceivers and the other answers on them; one 'stream' each with
 //   an audio and a video track, then 'connected'. setStream replaces tracks and sends no description. ICE
 //   restarted on both ends at once (glare): the larger id rolls its offer back, answers, and sets its tracks
 //   again. An offer with more m-sections: the extra ones inactive, the stream still one audio and one video.
+//   An offer or an answer that sends nothing still gives a 'stream': the first transceivers' tracks.
 // - Failures: no ICE in CONNECT_MS is 'no-path', ICE failed before connecting too; one that connected and failed
 //   is restarted by the smaller id only, MAX_RESTARTS times in RESTART_WINDOW_MS, then 'lost', as is a restart
 //   that doesn't connect in CONNECT_MS; a description that doesn't apply is 'error'. A failed peer stays in the
 //   call until it leaves.
 // - Seats: 6 in, a 7th is 'full' at once and sends nothing; an 8th that called before learning who is in links
 //   5, then goes on the 6th; the 6 never link it. A seated member keeps its seat against a join claiming an old
-//   `age` and a `full`; one not seated gives way to an earlier member, and goes on its `full` but not on a
-//   later one's, nor on one from outside the call. Two joining for the last seat at once: nobody holds more than
-//   max - 1 links.
+//   `age` and a `full`; one not seated gives way to an earlier member, and goes on its `full` (but not on a
+//   later one's, nor on one from outside the call) only when its own roster has no seat for it either. Two
+//   joining for the last seat at once: nobody holds more than max - 1 links.
 // - leave() tells the members and fires nothing more; a member leaving is 'ended' ('left'), leaving the room
 //   'ended' ('gone'); the room leaving tells nobody. The API's argument checks.
 // Then in real rooms (local signalling, the core in wasm, media still fake): calls signalled over room links,
@@ -23,7 +25,7 @@
 // call frame on the unreliable lane is dropped, and a member leaving the room is 'ended' ('gone').
 //
 //   node packages/js/test/call.mjs
-import { parseCall, Calls, BUDGETS, MAX_FRAME, MAX_SDP, MAX_SECTIONS, MAX_CANDIDATE, CONNECT_MS, MAX_RESTARTS, RESTART_WINDOW_MS, NEAR_MS, DEFAULT_MAX, MAX_CALL } from '../src/call.js';
+import { parseCall, Calls, BUDGETS, MAX_FRAME, MAX_SDP, MAX_SECTIONS, MAX_SDP_CANDIDATES, MAX_CANDIDATE, CONNECT_MS, MAX_RESTARTS, RESTART_WINDOW_MS, NEAR_MS, DEFAULT_MAX, MAX_CALL } from '../src/call.js';
 import { candidateFor } from '../src/webrtc.js';
 import { joinRoom, Lane } from '../src/index.js';
 
@@ -320,6 +322,10 @@ async function connected(...ms) {
   check(['pranswer', 'rollback', undefined].every((type) => ok({ t: 'sdp', d: { type, sdp: sdp(1) } }) === null) && ok({ t: 'sdp', d: { type: 'offer', sdp: 5 } }) === null && ok({ t: 'sdp', d: null }) === null && ok({ t: 'sdp' }) === null, 'sdp: another type, a non-string sdp, no description: dropped');
   const p = ok({ t: 'sdp', d: { type: 'offer', sdp: sdp(1), __proto__: { x: 1 }, extra: 1 } });
   check(p && Object.keys(p.d).join() === 'type,sdp', 'sdp: only type and sdp copied');
+  const cands = (n, end = 'a=end-of-candidates\r\n') => `v=0\r\nm=audio 9 x\r\n${`a=candidate:${HOST.slice(10)}\r\n`.repeat(n)}${end}`;
+  const cut = ok({ t: 'sdp', d: { type: 'offer', sdp: cands(MAX_SDP_CANDIDATES + 5) } })?.d.sdp;
+  check(cut === cands(MAX_SDP_CANDIDATES) && ok({ t: 'sdp', d: { type: 'answer', sdp: cands(MAX_SDP_CANDIDATES) } })?.d.sdp === cands(MAX_SDP_CANDIDATES), `sdp: its first ${MAX_SDP_CANDIDATES} candidates kept, the rest cut, every other line as it was`);
+  check(!ok({ t: 'sdp', d: { type: 'offer', sdp: cands(MAX_SDP_CANDIDATES, 'a=candidate:9 1 udp 1 203.0.113.9 9 typ host') } })?.d.sdp.includes('203.0.113.9'), 'sdp: one more as the last line, with no line end, cut too');
   const c = (o) => ok({ t: 'ice', c: { candidate: HOST, sdpMid: '0', sdpMLineIndex: 0, ...o } });
   check(c({})?.c.candidate === HOST && c({ sdpMid: null })?.c.sdpMLineIndex === 0 && c({ sdpMLineIndex: undefined })?.c.sdpMid === '0', 'ice: kept with a mid, an index, or both');
   check(c({ sdpMid: null, sdpMLineIndex: null }) === null, 'ice: neither mid nor index: dropped');
@@ -467,7 +473,8 @@ async function connected(...ms) {
   check(dirs === 'sendrecv,sendrecv,inactive' && y.call.stream(x.id).getTracks().map((t) => t.kind).join() === 'audio,video', `an offer with three m-sections: the third inactive (${dirs}), the stream one audio and one video`);
   check(sentBy(y.id, 'sdp')[0]?.msg.d.type === 'answer' && sentBy(y.id, 'sdp')[0].msg.d.sdp.includes('a=inactive'), 'and the answer says so');
 
-  // The first video section inactive, a later one sending: that one's track is left out like any extra one.
+  // The first video section inactive, a later one sending: the stream has the first one's track (silent), and the
+  // later one's is left out like any extra one.
   reset();
   const [o1, o2] = [member(ID('1')), member(ID('2'))];
   meet(o1, o2);
@@ -481,9 +488,11 @@ async function connected(...ms) {
   o2.calls.receive(o1.id, bytes({ t: 'join', age: 0 }));
   o2.calls.receive(o1.id, bytes({ t: 'sdp', d: { type: 'offer', sdp: odd.localDescription.sdp } }));
   await settle();
-  check(o2.call.stream(o1.id)?.getTracks().map((t) => t.kind).join() === 'audio', 'the first video section inactive and a later one sending: the stream has the audio track only');
+  const ot = link(o2, o1.id).pc.getTransceivers();
+  const got = o2.call.stream(o1.id)?.getTracks() ?? [];
+  check(got.length === 2 && got[0] === ot[0].receiver.track && got[1] === ot[1].receiver.track, 'the first video section inactive and a later one sending: the stream has the first audio and the first video section\'s tracks');
 
-  // An offer that sends nothing: no track comes, so no 'stream', and call.stream(peer) is null.
+  // An offer that sends nothing: 'stream' all the same, with the tracks it could send on (our media reaches it).
   reset();
   const [u, v] = [member(ID('1')), member(ID('2'))];
   meet(u, v);
@@ -496,7 +505,27 @@ async function connected(...ms) {
   v.calls.receive(u.id, bytes({ t: 'join', age: 0 }));
   v.calls.receive(u.id, bytes({ t: 'sdp', d: { type: 'offer', sdp: quiet.localDescription.sdp } }));
   await settle();
-  check(sentBy(v.id, 'sdp')[0]?.msg.d.type === 'answer' && !evs(v, 'stream').length && v.call.stream(u.id) === null, "an offer that sends nothing: answered, no 'stream', call.stream(peer) null");
+  const vs = evs(v, 'stream');
+  check(sentBy(v.id, 'sdp')[0]?.msg.d.type === 'answer' && vs.length === 1 && vs[0][2] === v.call.stream(u.id) && vs[0][2].getTracks().map((t) => t.kind).join() === 'audio,video', "an offer that sends nothing: answered, and one 'stream' with an audio and a video track");
+
+  // An answer that sends nothing (recvonly) to our offer: 'stream' too, on the offering side.
+  reset();
+  const g = member(ID('1'));
+  join(g);
+  await settle();
+  const r = ID('2');
+  g.room.add(r);
+  g.calls.receive(r, bytes({ t: 'join', age: 0 }));
+  await settle();
+  const deaf = new FakePc({});
+  await deaf.setRemoteDescription(sentBy(g.id, 'sdp')[0].msg.d);
+  for (const t of deaf.getTransceivers()) t.direction = 'recvonly';
+  await deaf.setLocalDescription();
+  g.calls.receive(r, bytes({ t: 'sdp', d: deaf.localDescription }));
+  await settle();
+  const gs = evs(g, 'stream');
+  const gt = link(g, r).pc.getTransceivers();
+  check(deaf.localDescription.sdp.match(/a=recvonly/g)?.length === 2 && gs.length === 1 && gs[0][1] === r && g.call.stream(r)?.getTracks().length === 2 && g.call.stream(r).getTracks().every((t, i) => t === gt[i].receiver.track), "an answer that sends nothing: one 'stream' on the offering side, with its transceivers' tracks");
 }
 
 // ---- Failures ----
@@ -731,7 +760,14 @@ async function connected(...ms) {
   check(n.call.state(ss[0].id) === 'connected' && !n.call.seated(), 'connected to one member in before it, the others still connecting: not seated');
   n.calls.receive(ss[1].id, bytes({ t: 'full' }));
   await settle();
-  check(n.call.left, "so a 'full' from one of those makes it go");
+  check(!n.call.left, `but with ${DEFAULT_MAX - 1} in, its own roster has a seat for it: a 'full' from one of those is ignored`);
+  // A rival for the last seat, later than it, hears 'full'; with no seat in its own roster now, the 'full' counts.
+  const rival = ID('9');
+  n.room.add(rival);
+  n.calls.receive(rival, bytes({ t: 'join', age: 0 }));
+  n.calls.receive(ss[1].id, bytes({ t: 'full' }));
+  await settle();
+  check(n.call.left && sentBy(n.id, 'full').some((y) => y.to === rival), `with ${DEFAULT_MAX} others in its roster, the same 'full' makes it go`);
 
   // Seated: neither.
   reset();

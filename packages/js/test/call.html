@@ -5,10 +5,19 @@
 <script type="module">
   // A room member for test/call_browser.mjs: joins room ?room= over local signalling (with ?privacy=), and its
   // call when asked, with the fake camera and microphone or with nothing (to only receive); ?call=1 joins the
-  // call as soon as the room is joined. It records the call's events.
+  // call as soon as the room is joined; ?recvonly=1 plays a modified client whose transceivers only receive,
+  // however they are made or set. It records the call's events.
   import { joinRoom } from '../src/index.js';
 
   const params = new URLSearchParams(location.search);
+  if (params.get('recvonly')) {
+    const add = RTCPeerConnection.prototype.addTransceiver;
+    RTCPeerConnection.prototype.addTransceiver = function (x, init = {}) {
+      return add.call(this, x, { ...init, direction: 'recvonly' });
+    };
+    const dir = Object.getOwnPropertyDescriptor(RTCRtpTransceiver.prototype, 'direction');
+    Object.defineProperty(RTCRtpTransceiver.prototype, 'direction', { ...dir, set(v) { dir.set.call(this, v === 'sendrecv' ? 'recvonly' : v); } });
+  }
   const room = await joinRoom({ appId: 'peerwire-test', roomId: `call/${params.get('room')}`, privacy: params.get('privacy') ?? 'direct' });
   const events = [];
   let call = null;
@@ -60,6 +69,7 @@
       for (const l of call.links.values()) l.pc.restartIce();
     },
     signaling: () => [...call.links.values()].map((l) => l.pc.signalingState),
+    directions: () => [...call.links.values()].flatMap((l) => l.pc.getTransceivers().map((x) => x.currentDirection)),
     ufrag: () => /a=ice-ufrag:(\S+)/.exec([...call.links.values()][0]?.pc.localDescription?.sdp ?? '')?.[1] ?? null,
     route: (peer) => room.route(peer)?.kind ?? null,
     sent: () => room.stats(),

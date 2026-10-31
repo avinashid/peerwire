@@ -3,14 +3,16 @@
 //
 //   const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
 //   const call = room.call(stream);
-//   call.on('stream', (peer, s) => (videos[peer].srcObject = s));
-//   call.on('ended', (peer) => videos[peer].remove());
+//   call.on('state', (peer, state) => (tile(peer).dataset.state = state)); // tile(peer) makes it on first use
+//   call.on('stream', (peer, s) => (tile(peer).srcObject = s));
+//   call.on('ended', (peer) => tile(peer).remove());
 //
 // Each peer in the call gets an RTCPeerConnection for media alone, apart from the room's link to it
 // (webrtc.js), whatever route that link takes, and is signalled over that link: frames of the room's tag
-// Call, JSON on the reliable lane, sealed and authenticated like any room message. Nothing goes through the
-// signalling relays. The smaller PeerId offers, with one audio and one video transceiver, and the other
-// answers on them, so a stream set later (a camera turned on, a screen shared) only replaces tracks and
+// Call, JSON on the reliable lane, sealed and authenticated like any room message. No call frame is a relay
+// event of its own: on a link over the signalling relays (a pipe) they go inside it, sealed, so a relay sees
+// only their sizes and timing. The smaller PeerId offers, with one audio and one video transceiver, and the
+// other answers on them, so a stream set later (a camera turned on, a screen shared) only replaces tracks and
 // never renegotiates. Descriptions follow perfect negotiation (the larger PeerId is polite); only the smaller
 // restarts ICE, so our own offers never cross, but a polite side whose offer is rolled back recovers.
 //
@@ -21,9 +23,11 @@
 // seated once one of its links has connected and none to a member that was in the call before it (its
 // seniors) is still connecting. One not seated gives way: with no seat for a member that joined before it,
 // it leaves the call ('full'), and it leaves on a `full` from one that joined before it or within NEAR_MS
-// of it. A seated member never does. So the joiner goes, also one that called as soon as it joined the room
-// and learns who is in only then; `age` counts only between members not seated, so one claiming it joined
-// long ago can't take a seat; and two joining at the same moment for the last seat may both go.
+// of it if its own roster has no seat for it either (`max` others in), so no member can turn a joiner away
+// while there is room. A seated member never does. So the joiner goes, also one that called as soon as it
+// joined the room and learns who is in only then; `age` counts only at capacity and between members not
+// seated, so one claiming it joined long ago can't take a seat; and two joining at the same moment for the
+// last seat may both go, or one stay with a member that turned it away (that pair fails, 'no-path').
 //
 // A peer whose media isn't connected CONNECT_MS after its link was made (no direct path, and no TURN server
 // in iceServers) fails ('no-path') and stays failed until it or we join the call again. One that connected
@@ -38,12 +42,14 @@ export const CONNECT_MS = 20000;
 export const MAX_RESTARTS = 2;
 export const RESTART_WINDOW_MS = 60000;
 // A call frame is at most MAX_FRAME bytes, a description in it at most MAX_SDP characters with MAX_SECTIONS
-// m-sections, and a candidate at most MAX_CANDIDATE. Each peer's joins, descriptions and candidates come out of
+// m-sections (its candidates past the first MAX_SDP_CANDIDATES cut: ours trickle each one as well), and a
+// candidate at most MAX_CANDIDATE. Each peer's joins, descriptions and candidates come out of
 // budgets, BUDGETS[kind] = [burst, ms one takes to refill]: past them a frame is dropped. A join makes a
 // connection (and ICE gathering, which asks the STUN servers), a description has us answer it.
 export const MAX_FRAME = 64 * 1024;
 export const MAX_SDP = 32 * 1024;
 export const MAX_SECTIONS = 4;
+export const MAX_SDP_CANDIDATES = 16;
 export const MAX_CANDIDATE = 512;
 const MAX_MID = 32;
 export const BUDGETS = { join: [6, 5000], sdp: [8, 3000], ice: [64, 250] };
@@ -72,7 +78,9 @@ export function parseCall(bytes) {
     const d = m.d;
     if (typeof d !== 'object' || d === null || (d.type !== 'offer' && d.type !== 'answer') || typeof d.sdp !== 'string') return null;
     if (d.sdp.length > MAX_SDP || (d.sdp.match(/^m=/gm)?.length ?? 0) > MAX_SECTIONS) return null;
-    return { t: 'sdp', d: { type: d.type, sdp: d.sdp } };
+    let n = 0;
+    const sdp = d.sdp.replace(/^a=candidate:[^\n]*\n?/gm, (line) => (++n > MAX_SDP_CANDIDATES ? '' : line));
+    return { t: 'sdp', d: { type: d.type, sdp } };
   }
   if (m.t === 'ice') {
     const c = m.c;
@@ -290,10 +298,11 @@ export class Call {
   // A description, candidate or `full` from `peer`.
   signal(peer, m) {
     if (this.left) return;
-    // `full` from a member in the call: a member not seated goes if that one joined before it (or about then).
+    // `full` from a member in the call: a member not seated goes if that one joined before it (or about then) and
+    // its own roster has no seat for it either, so no member turns a joiner away while there is room.
     if (m.t === 'full') {
       const at = this.calls.roster.get(peer);
-      if (at !== undefined && at <= this.started + NEAR_MS && !this.seated()) this.end('full', true);
+      if (at !== undefined && at <= this.started + NEAR_MS && !this.seated() && this.calls.roster.size >= this.max) this.end('full', true);
       return;
     }
     const l = this.links.get(peer);
@@ -333,7 +342,6 @@ export class Call {
       const c = candidateFor(privacy, candidate.toJSON());
       if (c) this.calls.send(peer, { t: 'ice', c: { candidate: c.candidate, sdpMid: c.sdpMid ?? null, sdpMLineIndex: c.sdpMLineIndex ?? null } });
     };
-    pc.ontrack = (e) => this.ontrack(l, e);
     pc.onnegotiationneeded = () => this.offer(l);
     pc.onconnectionstatechange = () => this.connection(l);
     // The impolite side offers both transceivers; the polite one answers on them (attach).
@@ -418,17 +426,17 @@ export class Call {
     }
   }
 
-  // A remote track: the first audio and the first video transceiver's go in the peer's stream, once each.
-  ontrack(l, e) {
-    const kind = e.track.kind;
-    const first = l.pc.getTransceivers().find((t) => t.receiver.track.kind === kind);
-    if (l.closed || (e.transceiver && e.transceiver !== first) || l.remote.getTracks().some((t) => t.kind === kind)) return;
-    l.remote.addTrack(e.track);
-  }
-
-  // 'stream', once the peer's stream has its tracks.
+  // 'stream', once the peer's description is applied: its stream has the first audio and the first video
+  // transceiver's tracks, whatever the peer sends on them. Not from 'track' events, which come only for what it
+  // sends: one sending nothing still gets ours, and shows.
   show(l) {
-    if (l.shown || l.closed || !l.remote.getTracks().length) return;
+    if (l.shown || l.closed) return;
+    const ts = l.pc.getTransceivers();
+    for (const k of KINDS) {
+      const t = ts.find((x) => x.receiver.track.kind === k);
+      if (t) l.remote.addTrack(t.receiver.track);
+    }
+    if (!l.remote.getTracks().length) return;
     l.shown = true;
     this.emit('stream', l.peer, l.remote);
   }

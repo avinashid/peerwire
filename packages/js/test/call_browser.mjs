@@ -9,8 +9,10 @@
 //    of them leaves, and the 7th then gets in.
 // 3. privacy 'public-only' with no STUN server: no candidates at all, so the room links over signalling (its
 //    pipe), the call is signalled over that, and its media fails ('no-path') CONNECT_MS after the link was made.
+// 4. A member that sends nothing, its transceivers receive-only (a modified client), with 2 that send: it decodes
+//    their video, and each of them still gets one 'stream' for it, audio and video (silent), once it connects.
 //
-//   node packages/js/test/call_browser.mjs [--part=1,2,3]
+//   node packages/js/test/call_browser.mjs [--part=1,2,3,4]
 
 import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
@@ -19,7 +21,7 @@ import { CONNECT_MS } from '../src/call.js';
 
 const PW = process.env.PLAYWRIGHT ?? '/home/ubuntu/.local/share/playwright-tools/node_modules/playwright/index.mjs';
 const { chromium } = await import(PW);
-const parts = (process.argv.find((a) => a.startsWith('--part='))?.split('=')[1] ?? '1,2,3').split(',').map(Number);
+const parts = (process.argv.find((a) => a.startsWith('--part='))?.split('=')[1] ?? '1,2,3,4').split(',').map(Number);
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { port, server } = await serve(root);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -191,6 +193,29 @@ try {
     check(fails && ms >= CONNECT_MS - 1000, `privacy 'public-only', no STUN: the call's media fails 'no-path' on both after CONNECT_MS (${ms} ms)`);
     const st = await Promise.all(pages.map((p) => p.evaluate(() => window.t.states())));
     check(st.every((s, i) => s[ids[1 - i]] === 'failed'), 'a failed peer stays in the call, failed');
+    await ctx.close();
+  }
+
+  if (parts.includes(4)) {
+    const ctx = await browser.newContext();
+    const name = `r${port}`;
+    const pages = [...(await tabs(ctx, name, 2)), await tab(ctx, name, '&recvonly=1')];
+    check(await linked(pages, 2), '3 tabs, one receive-only: the room links');
+    const ids = await Promise.all(pages.map((p) => p.evaluate(() => window.t.id)));
+    const [deaf, id] = [pages[2], ids[2]];
+    await Promise.all(pages.map((p, i) => p.evaluate((send) => window.t.join({ send }), i < 2)));
+    const watches = await until(async () => {
+      const d = Object.values(await deaf.evaluate(() => window.t.decoded()));
+      return d.length === 2 && d.every((x) => x.frames > 0);
+    }, 30000);
+    const dirs = await deaf.evaluate(() => window.t.directions());
+    check(watches && dirs.length === 4 && dirs.every((d) => d === 'recvonly'), `the receive-only member decodes both others' video, its transceivers all recvonly (${dirs})`);
+    const order = ids.slice(0, 2).map((x) => (id < x ? 'it offers' : 'it answers')).join(', ');
+    for (const [i, p] of pages.slice(0, 2).entries()) {
+      const shown = await until(async () => (await p.evaluate((id) => window.t.states()[id], id)) === 'connected' && p.evaluate((id) => window.t.hasStream(id), id), 10000);
+      const s = (await events(p, 'stream')).filter(([peer]) => peer === id);
+      check(shown && s.length === 1 && s[0][1] === 'tracks:audio,video' && (await frames(p, id)) === 0, `tab ${i}: the member sending nothing is 'connected', with one 'stream' for it (audio and video, no frames) (${order})`);
+    }
     await ctx.close();
   }
 } finally {

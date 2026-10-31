@@ -222,7 +222,7 @@ export declare class Room {
 export interface CallOptions {
   /** The most in the call, us included: 2 to 16, default 6. Each member sends its stream to every other, so its
    * upload grows with each one (see docs/PERFORMANCE.md §6). A member with no seat for a joiner tells it the call
-   * is full. */
+   * is full; the joiner goes only if its own count of who is in agrees. */
   max?: number;
 }
 
@@ -235,9 +235,10 @@ export interface CallEvents {
   /** A peer's media connection: 'connecting' once its link is made (and again while an ICE restart runs),
    * 'connected', or 'failed' with why. A failed peer is not tried again until it or we join again. */
   state: (peer: PeerId, state: 'connecting' | 'connected' | 'failed', reason?: CallFailure) => void;
-  /** A peer's stream, once per peer: one audio and one video track, whatever it sends. Its tracks stay the same
-   * when the peer changes what it sends (`setStream`); they are silent or black while it sends nothing, so say
-   * "muted" or "camera off" in presence rather than guessing from frames. */
+  /** A peer's stream, once per peer, when its description is applied: one audio and one video track, whatever it
+   * sends. Its tracks stay the same when the peer changes what it sends (`setStream`); they are silent or black
+   * while it sends nothing, so say "muted" or "camera off" in presence rather than guessing from frames. A peer
+   * gets our media from 'connected' on, so draw its tile from its first 'state'. */
   stream: (peer: PeerId, stream: MediaStream) => void;
   /** A peer in `call.peers` is out of the call: it left the call ('left') or the room ('gone'). */
   ended: (peer: PeerId, reason: 'left' | 'gone') => void;
