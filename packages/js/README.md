@@ -372,6 +372,44 @@ doc.on('sync', ({ source, at }) => {
 - **Not yet:** collaborative text (character sequences), docs in Rust and Godot, and moving a relay copy to new
   keys (to cut off old links without a new roomId).
 
+## Calls
+
+`room.call(stream)` joins the room's voice and video call: every member in it sends its stream to every other
+(a mesh), up to 6 by default. The app gets the stream; the library never asks for the camera or microphone.
+
+```js
+const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }); // on a click
+const call = room.call(stream);                     // null: only receive
+call.on('stream', (peer, s) => (tile(peer).srcObject = s));
+call.on('state', (peer, state, reason) => badge(peer, state, reason)); // 'connecting' | 'connected' | 'failed'
+call.on('ended', (peer, reason) => tile(peer).remove());               // 'left' the call, or 'gone' from the room
+call.on('full', (max) => say(`the call is full (${max})`));
+await call.setStream(screen);                       // a screen share, the camera off (null): no renegotiation
+call.leave();
+```
+
+- **How.** Each member in the call gets an RTCPeerConnection for media alone, apart from the room's link to it, and
+  is signalled over that link (sealed, whatever route it takes); nothing about the call goes through the signalling
+  relays. Each connection carries one audio and one video track each way: `setStream` swaps tracks (the first audio
+  and first video track of its stream) and never renegotiates. A peer's stream keeps its tracks when it changes what
+  it sends: put "muted" or "camera off" in presence rather than guessing from black frames.
+- **Seats.** Members in the call tell every room member so, so a member joining when `max` are in gets 'full' at
+  once; one that calls before it knows who is in (as soon as it joins the room) gets it when it learns. A member
+  already linked keeps its seat, whatever a newcomer claims. Two joining at the same moment for the last seat may both
+  get 'full'; `room.call()` may try again.
+- **Paths.** Media takes a direct path only: there is no TURN server unless you put one in `iceServers`. A peer whose
+  media doesn't connect within 20 s fails ('no-path'), shows as failed in `call.peers` until it leaves, and isn't
+  tried again until it or we join again. One that connected and lost ICE gets 2 restarts in a minute, then fails
+  ('lost'). `privacy` and `iceServers` apply to calls as to the room's links: see [Privacy](#privacy), which matters
+  more here, since a page with microphone or camera permission shows its local addresses.
+- **Cost.** Each member uploads its stream once for every other: about 7.5 Mbit/s for six at 720p (1.5 Mbit/s
+  each), more than many uplinks. See docs/PERFORMANCE.md §6. `max` goes up to 16, for audio or small video.
+- **Bounds.** A member's call frames are checked (64 KiB, a description of 32 KiB with 4 media sections, a candidate
+  of 512 characters) and rate-limited: 6 joins, 8 descriptions and 64 candidates at once, then one join every 5 s,
+  one description every 3 s and four candidates a second. Past that they are dropped.
+- **Not yet:** a member forwarding the others' streams (peer SFU) and broadcast trees for larger calls, simulcast,
+  more than one video track (camera and screen at once), and calls in Rust and Godot.
+
 ## Offline messages
 
 An inbox leaves a message for one peer, by its PeerId, while that peer is offline: it gets the message the next time
@@ -490,6 +528,7 @@ function Chat() {
 | `src/room.js` | `joinRoom` and `Room`: mesh, presence, message framing, backpressure. |
 | `src/doc.js` | `room.doc()`: shared documents (maps, sets, logs), a delta-state CRDT, catch-up, limits on member data. |
 | `src/inbox.js` | `openInbox`: offline messages to one PeerId, sealed and left on the Nostr relays. |
+| `src/call.js` | `room.call()`: a room's voice and video call, a mesh of WebRTC media connections signalled over the room's links. |
 | `src/proof.js` | Room key and HMAC proofs (hello, offer, link), compatible with Rust's; `randomRoomId()`. |
 | `src/peerwire.js` | Loads the module; `Endpoint` (connect, send, events, stats, seal/open) and Nostr key helpers. Browser and Node. |
 | `src/webrtc.js` | `WebRtcTransport`: one negotiated, unordered, no-retransmit DataChannel per peer. `BroadcastSignaling` for tabs of one browser. |
@@ -539,6 +578,9 @@ later visits and to pages of that origin that never ask:
 - `'public-only'`: none of those, and so not that direct path either. Each interface's
   public address as STUN sees it still goes (the Wi-Fi's and the mobile network's, or
   the real network's under a VPN).
+
+`joinRoom`'s `privacy` (`'direct'` or `'public-only'`) applies to the room's calls too: their media connections
+send candidates and descriptions through the same filters.
 
 ## Trying it
 
@@ -766,6 +808,17 @@ Run these with Node and the Playwright install on this host:
   and the message still comes, reading down, unless 100 come before it in its own second; junk dated a year ahead
   isn't read; relays that ignore `limit` or the filter; past 4096 delivered, the soonest to expire is forgotten
   first; the saved state is sealed. End to end over `NostrSignaling` with fake sockets. No relays.
+- `node packages/js/test/call.mjs`: calls (`room.call`) with a fake RTCPeerConnection that negotiates like a
+  browser's and connects when the test says ICE did. Every call frame cap and budget; candidates and descriptions
+  per privacy. The smaller id offers both transceivers, the other answers on them; one 'stream' each; `setStream`
+  sends no description; ICE restarted on both ends at once settles, the polite side setting its tracks again; extra
+  m-sections are inactive. No ICE in 20 s is 'no-path'; ICE lost after connecting is restarted by the smaller id
+  only, twice a minute, then 'lost'; a description that doesn't apply is 'error'. Seats: 6 in, a 7th gets 'full' at
+  once, an 8th that called before learning who is in gets it once it learns, seated members keep their seats
+  against a claimed old `age` and its 'full', one not yet seated gives way to an earlier one, two at once for the
+  last seat hold at most 5 links each. Then in real Node rooms (the core in wasm): signalled over room links, the
+  roster on a member not in the call and on a late joiner, a call frame on the unreliable lane dropped, a member
+  leaving the room 'ended' ('gone'). No relays.
 - `node packages/js/test/rust_hello.mjs`: a Rust or Godot member's room hello, sealed with
   the nonce fixed, is the same base64 that `sealRoom` makes (the vector Rust asserts too),
   and opens to Rust's exact JSON. A `Room` that hears it through `NostrSignaling` doesn't
@@ -966,6 +1019,13 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/wasm_url.mjs [shot-prefix]`: two tabs join with a root-relative `wasm`
   (`'/pkg/peerwire_ffi.wasm'`, the kind of URL a bundler's `?url` import gives) and chat; relative and
   absolute URLs load, and a 404 rejects with its status.
+- `node packages/js/test/call_browser.mjs [--part=1,2,3]`: calls in headless Chromium with its fake camera and
+  microphone, tabs of one room over local signalling (`test/call.html`). 2, 3 and 4 tabs each decode every other's
+  video (`framesDecoded`) and get its audio; `setStream` changes no description and the video goes on; with 2, ICE
+  restarted on both ends at once settles and the video goes on; leaving the call or the room is 'ended' on the
+  others. 6 in the call: a 7th gets 'full' at once, an 8th that calls as it joins the room gets it once it learns,
+  the 6 keep their 5 peers, and once one leaves the 7th gets in. `privacy: 'public-only'` with no STUN: the room
+  links over signalling and the call's media fails 'no-path' after 20 s.
 - `node packages/js/test/chat.mjs [shot dir]`: the chat demo in two tabs: members and routes, nicknames,
   the typing indicator, messages shown as text only, frames that aren't messages dropped, leaving and New room.
 - `node packages/js/test/qr.mjs`: the chat demo's QR encoder against known answers.
