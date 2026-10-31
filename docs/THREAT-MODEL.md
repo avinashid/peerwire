@@ -56,8 +56,9 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `e43391c` (2026-10-30).** Fixes merged after `@peerwire/js` 0.2.0
-and `@peerwire/react` 0.1.1 reach apps with the next release of each.
+**Status as of main `ce411db` (2026-10-31), with NB-052 (`1113cac`) and NB-019
+(`fa25c82`), which merge with this update.** Fixes merged after `@peerwire/js` 0.2.0 and
+`@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
 |---|---|
@@ -114,10 +115,15 @@ and `@peerwire/react` 0.1.1 reach apps with the next release of each.
 | I3a (Info), I4 (accepted) | **Fixed** by `1b0fc35` (the `VERSION` comment covers a copy read only in part; `close()` and `leave()` say they wait for the store), same section |
 | NB6H-1 (Low), NB6H-2, I1, I2 (Info) | **Fixed** by `c1b3878`, merged `71f5c6e`, with NB6H-2's first half by `dc156a3` (relay pacing on a monotonic clock, with clamps; the pipe asks `wait()` again each second; a held relay is sent nothing at close; `wait?()` typed). Reviewed 2026-10-29, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
 | NB6I-1 (Low) | **Fixed** by `dc156a3`, merged `6a60ef0` (a relay slowed behind its queue gives up its turn), beside the lead's close fix `cf4a0a9`. Reviewed 2026-10-29; a relay that answers OK and delivers nothing gets 1/n of the pipe (accepted), same section |
-| Half-open relay (Low) | **Fixed** by `659eb28`, merged `5ae3c4e` (NB-006j: a relay that has answered nothing for 5 s since it was sent an event gets no pipe turns while one that answers is left; its next OK gives them back), reviewed 2026-10-29; residuals NB6J-I1…I4 (Info, accepted), same section |
+| Half-open relay (Low) | **Fixed** by `659eb28`, merged `5ae3c4e` (NB-006j: a relay that has answered nothing for 5 s since it was sent an event gets no pipe turns while one that answers is left; its next OK gives them back), reviewed 2026-10-29; residuals NB6J-I1, I3, I4 (Info, accepted), same section |
+| NB6J-I2 (Info) | **Fixed** by `0d40053` and `f4a89a4` (NB-006k), merged `b26e869` (a socket that has heard nothing from its relay for 10 s after a non-lossy event is redialled, then after 20 s and 30 s, and no more until it answers in time; the new socket takes no pipe batch until its relay answers), reviewed 2026-10-31; NB6K-I1…I3 (Info) go with NB-058, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
+| Reconnect flap (Low) | Open (NB-058, in progress): a relay that accepts each socket and closes it is redialled every 1.06 s with no end, and each reopen sends a hello to every relay; on main before NB-006k too, same section |
 | NB6L-1 (Low), NB6L-2…NB6L-6 (Info) | **Fixed** by `564e68a` and `8d6d24a`, merged `55b47c5` with the relay copy (NB-006l), before `relays: true` was published (a save whose read no relay completed stays due; a `t: 5` naming a save already made, or from a member now ignored, holds nothing back; a relay can't date `sync.at` ahead; a piece holds at most 16 frames), reviewed 2026-10-30; residuals accepted, [Docs kept on the relays](#docs-kept-on-the-signalling-relays-relays-nb-006l--nb6l-1nb6l-6) |
-| NB6B-1 (Low), NB6B-3 (Info) | **Fixed** by `834ef90` and `4d6f9a2`, merged `6c5af8f` with `peerwire-sync` (NB-006b), before any native or Godot release (a Godot host charges what it passes on to the joiner writing, and cuts that joiner, not its readers; the host's relay is fuzzed), reviewed 2026-10-30; NB6B-2 (Info) accepted, [Shared docs in Rust](#shared-docs-in-rust-peerwire-sync-nb-006b--nb6b-1nb6b-4) |
-| NB6B-4 (Low) | Open (NB-052): to be fixed or accepted before the first native or Godot release, same section |
+| NB6B-1 (Low), NB6B-3 (Info) | **Fixed** by `834ef90` and `4d6f9a2`, merged `6c5af8f` with `peerwire-sync` (NB-006b), before any native or Godot release (a Godot host charges what it passes on to the joiner writing, and cuts that joiner, not its readers; the host's relay is fuzzed), reviewed 2026-10-30; NB6B-2 (Info) accepted, [Shared docs in Rust](#shared-docs-in-rust-peerwire-sync-nb-006b-nb-052--nb6b-1nb6b-4-nb52-1-nb52-2) |
+| NB6B-4 (Low) | **Fixed** by NB-052 (`1113cac`, before any native or Godot release; it merges with this update): a joiner's queue past 16 MiB is dropped and the joiner caught up afresh, not cut, so a flood no longer cuts readers. Reviewed 2026-10-31; residuals (1), (2), (3), (5) accepted, same section |
+| NB52-1, NB52-2 (Low), NB52-I1, NB52-I2 (Info) | **Fixed** by `3749a67`, `ba693d0`, `1113cac` and `da4fe8b` before NB-052 merged, so never on main (a catch-up afresh keeps the joiner's budgets; our replies to its asks for docs not open go again; one that alone queues over 8 MiB cuts the joiner), reviewed 2026-10-31, same section |
+| NB19-1, NB19-3, NB19-4, NB19-5 (Low), NB19-I1, NB19-I2 (Info) | **Fixed** by `5a3fb65` and `c173890` before NB-019 merged, so never on main, before `openInbox` was published (a read opens each content once, whichever relay states its id; JSON nested past 64 is dropped; the envelope names the app; every read asks `until`; listeners get the message's id; `since` is rounded down to 10 min), reviewed 2026-10-31, [Offline messages](#offline-messages-to-a-peerid-openinbox-nb-019--nb19-1nb19-5) |
+| NB19-2 (Low) | Accepted (the lead's call, documented in the README and `index.d.ts`): 100 drops or more in a message's second, ordered before it, hide it on that relay, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -1794,7 +1800,8 @@ and what it took was lost. Before NB-006i the other relays carried a copy of eac
 - **Silent.** A relay is silent once an event sent to it `SILENT_MS` (5 s) ago has had
   no OK since, taken or refused. The mark (`ws.asked`) is the time of the first EVENT
   sent since its last OK, on `performance.now()`. Any OK clears it, the REQ doesn't
-  set it, and a new socket starts without one.
+  set it, and a new socket starts without one, except one that replaces a deaf socket
+  (NB-006k, below): it starts silent, so it takes no pipe batch until its relay answers.
 - **Turns.** While a relay that answers is left, `next()` and `wait()` pass over a
   silent one. Its next OK gives its turns back. With only silent relays left (a frozen
   tab waking with its OKs unread), they take turns as before, so nothing stalls.
@@ -1822,18 +1829,57 @@ and what it took was lost. Before NB-006i the other relays carried a copy of eac
   instead of writing into the silent relay. A relay holds us only by its own refusals:
   1 s (`HOLD_MS`) after an OK that took an event, and up to 30 s (`MAX_HOLD_MS`) only
   after refusals in a row. The core resends what is late.
-- **NB6J-I2, the receive side.** If our own socket is half-open, its subscription
-  delivers nothing, and senders can't tell. Their batches through that relay are lost
-  to us (1/n, as in `doc_catchup` (h)) until the socket closes. Our socket does show as
-  silent. Follow-up NB-006k: redial a silent relay, but only after its non-lossy events
-  also went unanswered, at most once per relay with back-off, and never in a loop
-  (relays ban an IP for too many connections).
+- **NB6J-I2, the receive side (fixed by NB-006k, below).** If our own socket is
+  half-open, its subscription delivers nothing, and senders can't tell. Their batches
+  through that relay were lost to us (1/n, as in `doc_catchup` (h)) until the socket
+  closed. Our socket did show as silent.
 - **NB6J-I3.** A relay that never sends OK loses its pipe turns for good, though it
   keeps every other event. One that dropped a single OK gets them back with the OK for
   our next hello (`HELLO_EVERY_MS`, 15 s).
 - **NB6J-I4.** Any OK clears the mark, even one for an id we don't know. Taking only
   OKs for ids still in flight would add nothing against a hostile relay, which knows
   the ids it took: it is the accepted "answers OK, delivers nothing" relay above.
+
+**Deaf sockets, NB6J-I2.** **Status: fixed** by `0d40053` and `f4a89a4` (NB-006k),
+merged `b26e869`, reviewed 2026-10-31 by reading the diff, with a probe on fake sockets
+and a fake clock (loopback).
+- **Deaf.** A socket is deaf once it has heard nothing from its relay, no OK and no
+  event, for 10 s after a non-lossy event we sent through it (`ws.unheard`). Lossy pipe
+  batches and stored events (a doc's relay copy, the inbox below) don't arm it, and any
+  frame clears it.
+- **Redial.** A deaf socket is closed and its relay dialled again. The new socket starts
+  silent, so it takes no pipe batch until its relay answers.
+- **Never in a loop.** The same relay's next redials wait 20 s, then 30 s. After 3 there
+  are none until it answers an event within 5 s (`stats.redials`). Real relays echo our
+  hello, which our REQ asks for, so an answering relay clears the mark without an OK.
+- **Tests.** `nostr_bounds` 5g, with fake sockets and a fake clock running the timers;
+  `doc_catchup` (i) counts the socket that went half-open.
+
+**Info, with NB-058** (written, parked as `cbafbdf`):
+- **NB6K-I1.** A relay that answers the first event on each new socket in time, then
+  nothing, gets its redial budget back each time: 20 redials in 10 min, with no end
+  (measured on `ce411db` with the probe; before NB-006k there were none). Fix: a timely
+  OK restores the budget only on a socket open ≥ `MAX_RECONNECT_MS` (30 s).
+- **NB6K-I2.** A stray "so" in the README; `index.d.ts` says `reconnects` counts closes,
+  but a deaf redial counts too.
+- **NB6K-I3.** `nostr_bounds` 5g's fake relays don't echo our hello, as real ones do.
+
+**The reconnect flap (Low), open: NB-058.** Found in the NB-006k review; on main before
+it too. `dial()`'s `onopen` deletes the relay's back-off, so a socket that opens and
+closes is dialled again after `RECONNECT_MS` (1 s) every time: the doubling to
+`MAX_RECONNECT_MS` covers only dials that fail before opening. Each reopen fires
+`onReconnect`, which `room.js` answers with a hello on every open relay.
+- **Repro** (fake sockets and clock, Node 22, measured again on `ce411db`): a relay that
+  accepts each socket and closes it 10 ms later is dialled 56 times in 60 s, every
+  1.06 s, with no end, and 56 hellos go out on a healthy relay, against about 4 a minute
+  from the 15 s hello timer.
+- **Impact.** About 56 connections a minute from one client for as long as it lasts.
+  Relays ban an IP for too many connections; on a shared IP (a hotspot, carrier NAT)
+  that hits everyone behind it. Each other relay gets an extra hello a second, a quarter
+  of `RELAY_RATE`. Only the relay or the path to it can cause it, not a peer.
+- **Fix (NB-058, in progress):** `onopen` keeps the back-off, and `lostSocket()` starts
+  over at 1 s only after a socket stayed open ≥ `MAX_RECONNECT_MS`. Reopen hellos then
+  follow the back-off: at most 2 a minute at the cap.
 
 ### Docs kept on the signalling relays, `relays` (NB-006l) — NB6L-1…NB6L-6
 
@@ -1940,7 +1986,7 @@ when none is left.
   added to the ignored set after it left: one stale entry per such member until it
   rejoins.
 
-### Shared docs in Rust, `peerwire-sync` (NB-006b) — NB6B-1…NB6B-4
+### Shared docs in Rust, `peerwire-sync` (NB-006b, NB-052) — NB6B-1…NB6B-4, NB52-1, NB52-2
 
 `crates/peerwire-sync` is `room.doc()` in Rust, for Godot (`open_doc`) and native apps
 (the C ABI's `pw_doc_*` and `pw_docs_*`, behind the `sync` feature, off by default). It
@@ -1953,13 +1999,15 @@ written there. What differs:
 - **No deflate and no store.** Tag 8 is dropped unread, and `t: 5` drops its frame
   (NB-006l's relay copy is JS only). The snapshot is plain JSON, and the docs say to
   keep it private.
-- **A queue per member.** Frames wait in `Docs` until the host sends them. A member
-  whose queue passes `OUTBOX_BYTES` (16 MiB) is forgotten and reported as `Overflow`,
-  which the Godot binding answers with a disconnect.
+- **A queue per member.** Frames wait in `Docs` until the host sends them. Since NB-052,
+  a member whose queue passes `OUTBOX_BYTES` (16 MiB) is caught up afresh (NB6B-4,
+  below). One whose link takes nothing across two of those, and for 30 s, is forgotten
+  and reported as `Overflow`, which the Godot binding answers with a disconnect.
 
 Reviewed 2026-10-30, by reading the code, with in-process release probes on archives of
 the branch: `eb85263..24a01a7` and `6be6ad6`, then the fixes `14e67e8..4d6f9a2` (merged
-`6c5af8f`).
+`6c5af8f`). NB-052 was reviewed 2026-10-31 the same way: `73b3de7..96102e3`, then the
+fixes `96102e3..1113cac`.
 
 **Checked and holding:**
 - **Parsing.** The JSON reader parses, writes and drops with loops over a flat node
@@ -2009,7 +2057,7 @@ removals are O(n²): 10,000 values on one key (one 249 KB delta), then one kill 
 cost 93 ms, where parsing any 1 MiB frame costs 26–76 ms. Left as is on purpose:
 `doc.js` holds them the same way, and their order goes into deltas byte for byte as
 `doc.js` writes them. An ordered set that keeps it would cost about 13 MB more at 10,000
-keys. Optional, with NB-052.
+keys. NB-052 left it as is: a fix that keeps the order isn't cheap.
 
 **NB6B-3 (Info, test gaps), fixed by `4d6f9a2`:** the frame fuzzer now reaches the hub's
 doc, so the relay is fuzzed (655 relays in 20,000 cases, with rejoins after a cut);
@@ -2032,21 +2080,59 @@ every reader. With 7 readers whose links take nothing:
 Nothing paces rejoins (`PER_SOURCE` caps only half-open handshakes, and only under
 load), and a host keeps up to 32 joiners by default, so holding the invite is enough.
 
-**Status: open**, NB-052, to be fixed or accepted before the first native or Godot
-release (`sync` is off by default and unreleased). The recommended fix: don't drop a
-reader's link over the relay.
-- When a member's queue passes a threshold, drop the queue and re-ask that member at
-  the doc layer (`left`, then `joined`, with no `Overflow`). Its `on_ask` finds the hub
-  holds dots it lacks and asks back, so it catches up on the paced path at its link's
-  speed.
-- Keep `Overflow` for a link that takes nothing across several resyncs.
-- The test: the 7-rejoin and 5-key floods above leave every reader linked, and they
-  converge.
+**Status: fixed** by NB-052 (`ops/NB-052-hub-resync` at `1113cac`, before any native or
+Godot release; it merges with this update), reviewed 2026-10-31. A reader's link is no
+longer cut over the relay:
+- **Catch-up afresh (resync).** Past `OUTBOX_BYTES`, a member's queue is dropped, and
+  each doc catches it up as if it had left and joined again (`Doc::resync`). It sends
+  an empty end for the member's latest ask, or the member would wait on that ask and
+  never ask again; the dots it knows are dead, since its ask can't show the member a
+  dropped delete of an entry it holds; then its ask, so the member asks back and
+  catches up on the paced path. Each is a frame `doc.js` already sends, so readers are
+  unchanged.
+- **The cut** (`Overflow`) stays for a link that took nothing across 2 resyncs and for
+  30 s. `poll_transmit` isn't told the time, so a take is timed by the next call that
+  is: a clock that stood still can only make the 30 s longer.
+- **The flooder** is still charged before anything is queued, and cut on every join.
+- **Test.** `tests/flood.rs` ports the probe: 7 real readers at 2 MB/s and at 0 B/s, 8
+  fresh keys, and one key back 19×. Every reader stays linked and holds the hub's
+  ~4 MB doc within a minute; with the code from before NB-052, all are cut.
 
-A narrower fix covers one key only: drop a frame from a member still overdrawn before
-applying it, and cut it again.
+**NB52-1 — A member could resync itself and refill its catch-up budgets (Low).** Found
+in the re-check of `96102e3`, fixed by `3749a67` before the merge, so never on main.
+`Doc::resync` ran `left`, which drops the member's `answers`, `asks` and `chars`
+budgets. A member that asked, then acknowledged every piece (`MORE` needs a piece
+queued, not received) while its link took nothing, overflowed its own queue, got fresh
+budgets, and asked again, with no reconnect.
+- In the probe (release, the clock frozen so nothing refills), 87.7 KB sent had the hub
+  build 319.5 MiB of answers, with 20 resyncs, in 79 ms, against a budget of 8 Mi
+  characters (at most 24 MiB as UTF-8).
+- Fix: a resync keeps `want`, `answers`, `asks` and `chars`. The same probe stops at the
+  burst, 23.9 MiB, with 1 resync. `a_member_resynced_keeps_its_budgets` and 5 mutants
+  hold it.
 
-**Info, with NB-052:**
+**NB52-2 — A dropped reply to an ask for a doc not open left that ask open for good
+(Low).** Fixed by `ba693d0` before the merge. Our empty end for an ask about a doc we
+hadn't open went straight into the queue, and no doc recorded it. Once a resync dropped
+it, a reader asking us alone marked us stalled; when we later opened the doc and asked
+it, it never asked back, so it never got what the doc held, and stayed `Loading`.
+- Fix: each member's queue keeps our latest such reply per doc name, for the last 16
+  names (a name is at most 128 UTF-16 units), and a resync sends them first. A stale
+  one is ignored, since a reader takes an end only for the ask it names.
+- Test: `a_reply_for_a_doc_not_open_goes_again_when_dropped`, the probe's case.
+
+**Info, fixed before the merge:**
+- **NB52-I1** (`1113cac`). What a resync queues isn't capped, so it can't recurse: up to
+  about 1.5 MB for each doc open at its caps (*theoretical*: (`MAX_RANGES` +
+  `MAX_ENTRIES`) dead ranges at 48 bytes, `MAX_WRITERS` at 80, and an ask of
+  `MESSAGE_BYTES`). With a dozen such docs a resync alone passed `OUTBOX_BYTES`, and
+  every frame after it resynced again. Now a member whose resync alone queues more than
+  half of `OUTBOX_BYTES` is forgotten (`Overflow`).
+- **NB52-I2** (`da4fe8b`). `queued()` says a resync can queue an ask per doc for the
+  other members too.
+
+**Info, with NB-052** (done: `a4fdadc` corrected both texts, and `ee85cb0` makes
+`gate.sh`'s `rust_build` fail if any build failed):
 - An honest joiner that answers a host lacking a big copy pays for that relay: with 7
   joiners it is cut after about 1.3 MiB, and each rejoin while in debt delivers one more
   piece (GODOT.md says so). The recommended fix helps here too.
@@ -2056,9 +2142,131 @@ applying it, and cut it again.
 
 **Residuals (accepted):**
 - Parsing a 1 MiB frame briefly holds 16–50× its size in memory.
-- A host can hold 16 MiB of doc queue for each joiner before it cuts it.
+- A host can hold 16 MiB of doc queue for each joiner before it catches it up afresh,
+  plus up to 8 MiB that the catch-up queues (NB52-I1).
 - The snapshot is plain JSON, as designed: whoever can read where an app keeps it reads
   the doc.
+- **(1) A slow link can still be cut.** One that takes less than one message (at most
+  512 KiB) per 30 s, about 17 KB/s, is cut by a flood that lasts 30 s and 2 resyncs
+  (about 32 MiB to it).
+- **(2) A flood restarts a slow reader's catch-up** at each resync. It converges once
+  the flood stops.
+- **(3) `synced` early.** A reader whose ask was open shows `synced` after the empty end
+  (`doc.js`'s "every member answered") while its data still catches up.
+- **(5) Many docs bring the cut back.** A resync's frames grow with doc state any member
+  can write: one frame can name the dead dots of 1000 made-up writers, 709 KB a doc in
+  the guard's test. On a hub with about half a dozen docs open at their caps
+  (*theoretical*: 8 MiB / ~1.5 MB a doc), a member that fills them and then floods gets
+  each reader cut at its first resync, NB6B-4's outcome, for such hubs only. GODOT.md
+  says to keep a host's docs few. Before NB-052 any such flood cut readers.
+- Residual (4), a resync resetting the budgets, was withdrawn: it was NB52-1.
+
+### Offline messages to a PeerId, `openInbox` (NB-019) — NB19-1…NB19-5
+
+`openInbox()` in `@peerwire/js` (`src/inbox.js`) leaves a message for one PeerId on the
+Nostr relays while it is offline, as Protocol Zero's dead drop did. Rust and Godot
+parity is NB-019b. The design:
+- **No recipient tag.** A tag the recipient could ask the relays for is one anyone who
+  knows its PeerId could compute and watch (SEC-5). So a drop carries only its app's
+  namespace, `d` = hex(SHA-256(`peerwire/drop/` ‖ appId)), and a NIP-40 `expiration`.
+  An inbox reads all of its app's drops and trial-opens each: one X25519 a drop.
+- **Sealed and padded.** The envelope (version, kind, the app's namespace, a random
+  16-byte id, when it was sent and expires, its length, the body) is sealed to the
+  recipient with Noise X (`ep.seal`, as signalling seals), which carries the sender's
+  PeerId encrypted and authenticated, and padded to 256 bytes. Each drop is kind 30078,
+  signed by a fresh Nostr key.
+- **Reading.** Each relay is asked for the app's drops from `since` (the start of the
+  last complete read, less 15 min, rounded down to 10 min) to `until` (15 min ahead, or
+  the cursor reading down), at most `MAX_READ` (100) a check, newest first. A full page
+  goes on down at the next check.
+- **Once.** SHA-256(from ‖ id) is kept until the message expires (4096 at most, the
+  soonest to expire forgotten first). With `persist` it is saved sealed, as `store.js`
+  seals a doc's copy, before listeners hear the message. Its first 16 bytes in hex are
+  the message's `id` for the app.
+- **Caps.** 16 KiB a message. Content over 22,360 characters isn't decoded. A message
+  dated more than 15 min ahead, sent for over 7 days, expired, or JSON nested past 64 is
+  dropped.
+
+Reviewed 2026-10-31 by reading `b26e869..797afbc`, then the fixes `797afbc..fa25c82`,
+with probes on `inbox.mjs`'s own fake relays (loopback, Node 22).
+
+**Checked and holding:**
+- Noise X authenticates the sender, and nobody else can open a drop. A recipient whose
+  key leaks can be impersonated to itself (key-compromise impersonation, X's known
+  limit).
+- The envelope parser holds its bounds, and `MAX_CONTENT` is checked before base64 is
+  decoded.
+- The time checks agree with the dedupe: a message is dropped at `exp ≤ now`, when its
+  kept entry goes, so a replay can't slip in between.
+- Signalling and the inbox reject each other's sealed bodies by their first byte.
+- The saved state is AES-GCM under keys from HMAC(secret, label ‖ appId), so it can't be
+  read or mixed up across apps.
+- The inbox's signalling sends no `#p` REQ (`listen: false`), so no peer tag reaches a
+  relay. Nothing is in clear on a drop or in a read.
+
+**NB19-1 — One relay could hide every drop the others deliver (Low).** `read()` skipped
+an event whose `id` was already opened from an earlier relay. That id is the relay's
+word (only its shape is checked), so a relay first in socket order that served each real
+id with junk content had the honest copies skipped; once the marks moved past the drop,
+nobody read it again. In the probe, with that relay first of three, nothing was
+delivered in 40 checks. Fix: a read opens each content once, whichever relay serves it.
+
+**NB19-2 — A flood in a message's second hides it (Low, accepted).** NIP-01 has no
+cursor within a second: a relay sends a second's events lowest id first, and a full page
+inside one second goes on below it. So 100 drops or more left in a message's second
+with lower ids (their sender chooses them) hide it on that relay for good.
+- In the probe, 99 junk drops a relay: delivered at once; 100: not in 60 checks.
+- Doing it on every relay costs 100 × relays events a message (*theoretical*), so a
+  flood that follows an app's messages live can keep them from their recipients.
+- Paging the stuck second would make that about 10× dearer and cost an honest reader of
+  a flooded relay up to about 22 MB a check (*theoretical*: 1000 drops × 22,360
+  characters). The lead accepted it instead, and the README and `index.d.ts` say so.
+
+**NB19-3 — A stranger's JSON nested deep enough to throw in the app (Low).** A JSON
+message was delivered at any depth. A 16 KiB body nests 8150 deep, and on Node 22
+`JSON.stringify` and `structuredClone` of it throw `RangeError`, so an app that logs,
+stores or renders a message threw in its listener (an uncaught exception in Node).
+Anyone can send to any PeerId. Same class as DOC-7. Fix: a value nested past 64 is
+dropped, by `doc.js`'s iterative walk, now shared as `withinDepth`; `send()` throws.
+
+**NB19-4 — A drop copied into another app's namespace was read there (Low).** The
+envelope didn't name the app, and the README tells apps to reuse a room's identity. So
+anyone could copy a drop's content from app A's namespace into app B's, and B delivered
+A's message, authenticated, to code not written for it. Fix, while `VERSION` 1 is
+unreleased: the envelope carries the app's 32-byte namespace inside the seal (its header
+grows from 30 to 62 bytes, still one 256-byte block), and a mismatch is dropped.
+
+**NB19-5 — Junk dated far ahead topped every read (Low).** The first page had no
+`until`. strfry refuses events more than 15 min ahead, but a relay that takes them
+would serve them first forever: in the probe, 500 such drops made each message wait 5
+or 6 checks. Fix: every read asks `until` at most 15 min ahead, past which nothing is
+read anyway. Then each message took 1 check.
+
+**Status: fixed** by `5a3fb65` (NB19-1, 3, 4, 5 and NB19-2's wording) and `c173890`
+(I1, I2), before NB-019 merged, so never on main (`backend/NB-019-offline-msg` at
+`fa25c82`; it merges with this update). Reviewed 2026-10-31. Each fix has a test in
+`inbox.mjs` and a mutant. The probes for NB19-1, 4, 5 and 3 pass on `fa25c82`, and each
+fails with its fix undone.
+
+**Info, folded in:**
+- **NB19-I1.** Past 4096 kept, a delivered message comes again if anyone posts it
+  again, and anyone can force that: 4096 throwaway messages, then the old content
+  posted again. Listeners now get the message's `id`, the same each time, so an app
+  can drop it.
+- **NB19-I2.** The `since` sent was exact to the second of the reader's last read, so a
+  relay could link a reader's sessions across IPs by it. It is now rounded down to
+  10 min.
+
+**Residuals (accepted):**
+- **The flood (NB19-2),** above. Otherwise a flood delays delivery but can't lengthen a
+  check: at most 100 drops opened a relay.
+- **Coming again (NB19-I1),** which the app can drop by `id`. Without `persist`, a
+  message still on the relays comes again in each new session.
+- **Clock skew.** A sender whose clock runs more than 15 min behind may be missed by an
+  inbox that had already read past that time.
+- **What a relay sees:** the IP and rhythm of senders and readers, and the app's volume.
+  Rounding `since` narrows linking by timing; it doesn't remove it. Outer event
+  signatures and ids aren't checked, and nothing trusts them: Noise X authenticates.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
@@ -2752,6 +2960,10 @@ mappings that carry over and are already handled in Peerwire:
 - **A11 metadata / A12 forward secrecy → OPEN here too: SEC-3/5 and SEC-7.** The
   same open problems (relay-visible timing/IP, static-key exposure) apply; Peerwire's
   per-session Nostr key and rotating-tag ideas mirror P0's mitigations.
+- **The dead drop → NB-019.** `openInbox` leaves sealed messages on the relays as
+  P0's dead drop does, with no recipient tag, a fresh signer for each drop and the app
+  named inside the seal: see
+  [Offline messages](#offline-messages-to-a-peerid-openinbox-nb-019--nb19-1nb19-5).
 - **A5 spam / A13 Sybil → relevant to the signaling layer**; the half-open cap
   with its handshake cookies (SEC-4) and relay rate limiting are the Peerwire
   analogues. A PoW-gated first contact (as in P0 A5) is a candidate hardening if
