@@ -2,7 +2,8 @@
 // process: relays that keep events as strfry does (an addressable event replaced only by a newer one, none over 64 KiB
 // or more than 15 min ahead, NIP-40 expiry, the newest first up to `limit`), a fake clock, and the real wasm. Checks:
 // - a recipient offline when a message was left comes online and gets it once, from three relays, and not again in a
-//   check or a session after; bytes, text and JSON come back as sent;
+//   check or a session after; bytes, text and JSON come back as sent; info.id, the same when a message comes again;
+//   every `since` sent rounded down to SINCE_STEP_S;
 // - a non-recipient opens every drop and reads none;
 // - nothing in clear on the relays or in a read: no PeerId (hex, or its bytes in a decoded drop), no peer tag (SEC-5),
 //   no `p` tag; one fresh signer per drop; sizes padded;
@@ -22,7 +23,7 @@
 //   node packages/js/test/inbox.mjs
 
 import { loadPeerwire, toHex, fromHex } from '../src/peerwire.js';
-import { Inbox, envelope, KIND, VERSION, PAD, HEAD, MAX_MESSAGE, MAX_CONTENT, MAX_TTL_S, AHEAD_S, SKEW_S, MAX_READ, MAX_KEPT, CHECK_MS } from '../src/inbox.js';
+import { Inbox, envelope, KIND, VERSION, PAD, HEAD, MAX_MESSAGE, MAX_CONTENT, MAX_TTL_S, AHEAD_S, SKEW_S, SINCE_STEP_S, MAX_READ, MAX_KEPT, CHECK_MS } from '../src/inbox.js';
 import { openInbox, memoryStore } from '../src/index.js';
 import { b64, unb64 } from '../src/nostr.js';
 import { MAX_VALUE_DEPTH } from '../src/doc.js';
@@ -46,6 +47,7 @@ const OTHER = 'another-app';
 const OTHER_NSB = await sha256(enc.encode(`peerwire/drop/${OTHER}`));
 const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
 const S = (ms) => Math.floor(ms / 1000);
+const step = (s) => Math.floor(s / SINCE_STEP_S) * SINCE_STEP_S; // a since as sent
 const has = (hay, needle) => {
   for (let i = 0; i + needle.length <= hay.length; i++) if (needle.every((x, j) => hay[i + j] === x)) return true;
   return false;
@@ -171,20 +173,28 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const sentAt = S(w.now);
   const took = await alice.send(pw.endpoint({ secret: B }).id, 'hello bob');
   check(took === 3 && w.relays.every((r) => r.held.size === 1), `left on ${took} relays while bob is offline`);
-  w.now += 3600_000;
+  // Off the SINCE_STEP_S grid, so rounding shows.
+  w.now += 3607_000;
   const store = memoryStore();
   const bob = w.inbox(B, { store });
   await bob.check();
   const m = bob.got[0];
   check(bob.got.length === 1 && m.data === 'hello bob' && m.from === alice.id && m.kind === 'text' && m.at === sentAt * 1000, `bob comes online an hour later: ${JSON.stringify(bob.got)}`);
   check(bob.opens === 1, `the copies on three relays opened once (${bob.opens})`);
+  const inside = pw.endpoint({ secret: B }).open(unb64(all(w)[0].content)).data;
+  const key = toHex((await sha256(new Uint8Array([...fromHex(alice.id), ...inside.subarray(34, 50)]))).subarray(0, 16));
+  check(m.id === key, `info.id is hex(SHA-256(from || id))[:16] (${m.id})`);
   const q = w.relays[0].reqs[0];
-  check(JSON.stringify(q) === JSON.stringify({ kinds: [KIND], '#d': [NS], since: S(w.now) - MAX_TTL_S - SKEW_S, until: S(w.now) + AHEAD_S, limit: MAX_READ }), `the first read: ${JSON.stringify(q)}`);
+  check(JSON.stringify(q) === JSON.stringify({ kinds: [KIND], '#d': [NS], since: step(S(w.now) - MAX_TTL_S - SKEW_S), until: S(w.now) + AHEAD_S, limit: MAX_READ }), `the first read: ${JSON.stringify(q)}`);
   check((await bob.check()) === 0 && bob.got.length === 1, 'a second check delivers nothing again');
   bob.close();
   const bob2 = w.inbox(B, { store });
   check((await bob2.check()) === 0 && bob2.got.length === 0, 'nor does a new session with the same store');
-  check(w.relays[0].reqs.at(-1).since === bob.marks.get(w.relays[0].url) - SKEW_S, 'which reads from where the last left off, less SKEW_S');
+  const mark = bob.marks.get(w.relays[0].url);
+  const since = w.relays[0].reqs.at(-1).since;
+  check(mark % SINCE_STEP_S && since === step(mark - SKEW_S) && since > mark - SKEW_S - SINCE_STEP_S,
+    `which reads from where the last left off, less SKEW_S, rounded down to SINCE_STEP_S (${mark - SKEW_S} -> ${since})`);
+  check(w.relays.every((r) => r.reqs.every((f) => f.since % SINCE_STEP_S === 0)), `every since sent is a multiple of ${SINCE_STEP_S}`);
   bob2.close();
   const bytes = Uint16Array.of(1, 2, 0xffff);
   await alice.send(bob.id, { n: 1, s: ['x'] });
@@ -336,6 +346,8 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   w.relays[1].put(again);
   w.relays[2].put({ ...ev, created_at: S(w.now) - 5 });
   await bob.check();
+  // 2 opens, not 3: both copies of the third check hold the content opened once that read (NB19-1), and `kept`
+  // drops the message they hold, delivered at the second.
   check(bob.got.length === 1 && bob.opens === 2, `its content signed again, or served as newer, is opened once a read and isn't delivered again (${bob.got.length}, ${bob.opens} opens)`);
   bob.close();
   const bob2 = w.inbox(B, { store });
@@ -452,7 +464,7 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const o = bob.opens;
   const mark = bob.marks.get(w.relays[0].url);
   await bob.check();
-  check(bob.opens === o && bob.below.size === 0 && w.relays[0].reqs.at(-1).since === mark - SKEW_S, `then the marks moved: the next check opens nothing (${bob.opens - o})`);
+  check(bob.opens === o && bob.below.size === 0 && w.relays[0].reqs.at(-1).since === step(mark - SKEW_S), `then the marks moved: the next check opens nothing (${bob.opens - o})`);
   w.done();
 }
 
@@ -538,7 +550,7 @@ for (const n of [MAX_READ - 1, MAX_READ]) {
   await bob.check();
   check(bob.got[0] === 'among the junk' && bob.opens === 1 && bob.below.size === 0, `a relay that ignores the filter: 305 events not ours, 1 opened, the read complete (${bob.opens})`);
   r.held.delete(real.id);
-  for (let i = 0; i < 150; i++) r.put(craft({ content: b64(rand(200)), at: now - SKEW_S - 100 - i }));
+  for (let i = 0; i < 150; i++) r.put(craft({ content: b64(rand(200)), at: step(now - SKEW_S) - 1 - i }));
   w.now += 60_000;
   const o = bob.opens;
   await bob.check();
@@ -579,7 +591,8 @@ for (const n of [MAX_READ - 1, MAX_READ]) {
     evs.push(craft({ env: envelope(NSB, 1, rand(16), at, exp, text(String(i))), from: alice.ep, to: bob.id, at, exp }));
   }
   for (const ev of evs.slice(1)) w.relays[0].put(ev);
-  bob.on('message', (data) => bob.got.push(data));
+  const ids = [];
+  bob.on('message', (data, from, info) => (bob.got.push(data), ids.push(info.id)));
   let checks = 0;
   do await bob.check();
   while (bob.below.size && ++checks < 100);
@@ -592,6 +605,8 @@ for (const n of [MAX_READ - 1, MAX_READ]) {
   const seen = bob.got.length;
   await bob.check();
   check(JSON.stringify(bob.got.slice(seen)) === `["${MAX_KEPT}"]`, `only the one that expires soonest was forgotten, and comes again: ${JSON.stringify(bob.got.slice(seen))}`);
+  const first = ids[bob.got.indexOf(String(MAX_KEPT))];
+  check(new Set(ids.slice(0, seen)).size === seen && ids.at(-1) === first && /^[0-9a-f]{32}$/.test(first), `with the same info.id as the first time, and the ${seen} before all different (${first})`);
   w.done();
 }
 

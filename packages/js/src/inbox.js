@@ -19,19 +19,21 @@
 //
 // Reading (check()): each relay is asked for { kinds: [30078], '#d': [ns], since, until, limit: MAX_READ }, `since`
 // being SKEW_S before the start of the last read of that relay that reached the end (MAX_TTL_S + SKEW_S ago at
-// first), and `until` AHEAD_S past our clock, as no later drop is read: junk dated far ahead can't sit at the top of
-// every read. A relay sends the newest first, so one that sends MAX_READ may hold more: the next check asks it for
-// those up to the oldest it sent (until), and so on down, and the mark moves only once a read reaches the end. So a
-// check opens at most MAX_READ drops a relay, and a flood delays messages rather than costing more each check. But
-// NIP-01 has no cursor within a second (a relay sends a second's events lowest id first), so a full page all in one
-// second goes on below that second: MAX_READ drops or more in a message's second, ordered before it, hide it on that
-// relay. Only events of kind 30078 with our `d`, in the range asked for, count, and content over MAX_CONTENT
-// characters isn't decoded. A read opens each content once, whichever relays serve it: an event's id is the relay's
-// word, so one relay could serve a real drop's id with other content. A drop holds a message if it opens and its
-// envelope checks (VERSION, a kind we know, our app, len within it, JSON nested MAX_VALUE_DEPTH deep at most), sent at
-// most AHEAD_S past our clock, for MAX_TTL_S at most, and not yet expired. A message is delivered once:
-// SHA-256(from || id) is kept until it expires (MAX_KEPT at most, the soonest to expire going first), and with
-// `persist` across sessions, saved before the listeners hear it.
+// first), rounded down to SINCE_STEP_S, so it doesn't carry the second of our last read into the next session for a
+// relay to link the two by; and `until` AHEAD_S past our clock, as no later drop is read: junk dated far ahead can't
+// sit at the top of every read. A relay sends the newest first, so one that sends MAX_READ may hold more: the next
+// check asks it for those up to the oldest it sent (until), and so on down, and the mark moves only once a read
+// reaches the end. So a check opens at most MAX_READ drops a relay, and a flood delays messages rather than costing
+// more each check. But NIP-01 has no cursor within a second (a relay sends a second's events lowest id first), so a
+// full page all in one second goes on below that second: MAX_READ drops or more in a message's second, ordered before
+// it, hide it on that relay (its copies on others are still read). Only events of kind 30078 with our `d`, in the
+// range asked for, count, and content over MAX_CONTENT characters isn't decoded. A read opens each content once,
+// whichever relays serve it: an event's id is the relay's word, so one relay could serve a real drop's id with other
+// content. A drop holds a message if it opens and its envelope checks (VERSION, a kind we know, our app, len within
+// it, JSON nested MAX_VALUE_DEPTH deep at most), sent at most AHEAD_S past our clock, for MAX_TTL_S at most, and not
+// yet expired. A message is delivered once: SHA-256(from || id) is kept until it expires (MAX_KEPT at most, the
+// soonest to expire going first), and with `persist` across sessions, saved before the listeners hear it; its first
+// 16 bytes in hex are the message's id for the listeners.
 //
 // The saved state, { v: 1, kept: [[hash, exp]], marks: { url: seconds } } as JSON, is sealed as store.js seals a
 // doc's copy, under keys from our identity's secret rather than a room key: kept under hex(HMAC-SHA256(secret,
@@ -55,6 +57,7 @@ export const MAX_CONTENT = 4 * Math.ceil((SEAL_OVERHEAD + Math.ceil((HEAD + MAX_
 export const MAX_TTL_S = 7 * 86400;
 export const AHEAD_S = 15 * 60;
 export const SKEW_S = 15 * 60;
+export const SINCE_STEP_S = 10 * 60;
 export const MAX_READ = 100;
 export const MAX_KEPT = 4096;
 export const CHECK_MS = 60000;
@@ -192,9 +195,11 @@ export class Inbox {
     }
   }
 
-  // `fn(data, from, { kind, at })` for each message: `data` as sent (bytes, text or a JSON value), `from` the sender's
-  // PeerId (authenticated), `kind` 'bytes', 'text' or 'json', `at` when it was sent (ms, by the sender's clock). The
-  // first listener starts the reading: now, then every CHECK_MS. Returns a function that removes it.
+  // `fn(data, from, { kind, at, id })` for each message: `data` as sent (bytes, text or a JSON value), `from` the
+  // sender's PeerId (authenticated), `kind` 'bytes', 'text' or 'json', `at` when it was sent (ms, by the sender's
+  // clock), `id` the hex of what it is kept as delivered under: the same if it comes again (past MAX_KEPT, or in a
+  // session without `persist`), for the app to drop. The first listener starts the reading: now, then every
+  // CHECK_MS. Returns a function that removes it.
   on(event, fn) {
     if (event !== 'message') throw new TypeError(`inbox.on: the one event is 'message', not ${event}`);
     if (typeof fn !== 'function') throw new TypeError('inbox.on: a listener is a function');
@@ -224,7 +229,7 @@ export class Inbox {
     const now = Math.floor(this.wall() / 1000);
     const asked = new Map(); // relay url -> { since, until, n, oldest }: its read, and what it sent that counts
     const filter = (url) => {
-      const since = Math.max((this.marks.get(url) ?? 0) - SKEW_S, now - MAX_TTL_S - SKEW_S);
+      const since = Math.floor(Math.max((this.marks.get(url) ?? 0) - SKEW_S, now - MAX_TTL_S - SKEW_S) / SINCE_STEP_S) * SINCE_STEP_S;
       const until = this.below.get(url)?.until ?? now + AHEAD_S;
       asked.set(url, { since, until, n: 0, oldest: Infinity });
       return { kinds: [KIND], '#d': [ns], since, until, limit: MAX_READ };
@@ -258,7 +263,7 @@ export class Inbox {
       const k = toHex((await sha256(concat(fromHex(m.from), m.id))).subarray(0, 16));
       if (this.kept.has(k)) continue;
       this.keep(k, m.exp);
-      out.push(m);
+      out.push({ ...m, key: k });
     }
     if (this.dirty) await this.save();
     for (const m of out) this.emit(m);
@@ -320,7 +325,7 @@ export class Inbox {
   emit(m) {
     for (const fn of this.handlers) {
       try {
-        fn(m.data, m.from, { kind: m.kind, at: m.at * 1000 });
+        fn(m.data, m.from, { kind: m.kind, at: m.at * 1000, id: m.key });
       } catch (e) {
         // A throwing listener must not keep the message from the others: report it on its own.
         setTimeout(() => {

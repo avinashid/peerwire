@@ -414,6 +414,9 @@ export interface InboxMessageInfo {
   kind: 'text' | 'bytes' | 'json';
   /** When it was sent, in ms, by the sender's clock. */
   at: number;
+  /** The message's id, 32 hex characters, from its sender and the id the sender gave it: the same if the message
+   * comes again (an inbox remembers 4096 messages, and without `persist` one session's), so the app can drop it. */
+  id: string;
 }
 
 /** Messages to one peer by its PeerId while it is offline, from `openInbox()`: sealed to the recipient and left on
@@ -437,7 +440,8 @@ export interface Inbox {
   send(to: PeerId, data: any, options?: { ttl?: number }): Promise<number>;
   /** Reads the relays now; resolves to the number of messages delivered. Each relay is read up to 100 messages a
    * check, so a flood delays messages without costing more, except that 100 or more left in a message's second and
-   * ordered before it on a relay (by event id) hide it there: a relay can't be asked for the rest of a second. */
+   * ordered before it on a relay (by event id) hide it there: a relay can't be asked for the rest of a second. Its
+   * copies on other relays are still read. */
   check(): Promise<number>;
   /** Stops reading and closes the relay connections. */
   close(): void;
