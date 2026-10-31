@@ -69,6 +69,10 @@ messages. Our replies to its asks for docs we haven't open (the last 16) go agai
 A member whose link has taken nothing across two of those, and for 30 s, is forgotten as if it left
 (`Event::Overflow`), and the host should close its link. It catches up when it joins again.
 
+What a resync queues isn't held to `OUTBOX_BYTES`: up to about 1.5 MB for each doc open at its caps (theoretical:
+its most dead ranges and writers, and an ask of `MESSAGE_BYTES`). With a dozen such docs open one resync passes the
+cap alone, and every frame queued after it resyncs again, so keep the docs a hub has open few.
+
 A hub charges what it relays for a member's frame to that member: the messages it queued, once for each member they
 go to. Values go on as this crate writes them, which can be longer than the member sent them (`1e20` is 21 digits).
 Past `RELAY_BYTES` (8 MiB) beyond what refilled at `RELAY_BYTES_PER_S` (64 KiB/s), the member writing is forgotten

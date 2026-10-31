@@ -200,8 +200,8 @@ impl Docs {
     /// A member whose messages passed OUTBOX_BYTES waiting has them dropped, and each doc catches it up afresh
     /// (resync): what piles up for a slow member, as a hub's relays do, costs it a catch-up, not its link. Our
     /// replies to its asks for docs we hadn't open go again first. What that queues isn't capped, so it can't drop
-    /// it again. One whose link has taken nothing across RESYNCS of those, and
-    /// for STALL_US, is forgotten as if it left.
+    /// it again. One whose link has taken nothing across RESYNCS of those, and for STALL_US, is forgotten as if it
+    /// left.
     fn cap(&mut self, p: PeerId) {
         let now = self.now_us;
         let Some(ob) = self.out.get_mut(&p).filter(|ob| ob.bytes > OUTBOX_BYTES) else { return };
@@ -398,7 +398,8 @@ impl Docs {
     }
 
     /// Bytes of messages waiting for member `peer`, retried ones included: at most [`OUTBOX_BYTES`] and a message,
-    /// besides what catching it up afresh queues past it (see [`OUTBOX_BYTES`]).
+    /// besides what catching a member up afresh queues past it: for that member, and for each other one an ask per
+    /// doc (see [`OUTBOX_BYTES`]).
     pub fn queued(&self, peer: &PeerId) -> usize {
         self.out.get(peer).map_or(0, |ob| ob.bytes)
     }

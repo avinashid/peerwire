@@ -93,7 +93,10 @@ pub const STORED_FRAMES: usize = 64;
 /// each doc catches the member up afresh, as if it had left and joined again: it asks for what it missed, at the
 /// pace catching up goes, its budgets for that as spent. What the member's link keeps refusing is then forgotten
 /// with it ([`Event::Overflow`]).
-/// Four full docs as JSON text.
+/// Four full docs as JSON text. What a resync queues isn't held to it: for each doc open, up to about 1.5 MB at
+/// the doc's caps (*theoretical*: [`MAX_RANGES`] + [`MAX_ENTRIES`] dead ranges at 48 bytes, [`MAX_WRITERS`] at 80
+/// and an ask of [`MESSAGE_BYTES`]), so with a dozen such docs open, one resync passes it alone and every frame
+/// queued after it resyncs again. Keep the docs a hub has open few.
 pub const OUTBOX_BYTES: usize = 16 * 1024 * 1024;
 /// What a hub ([`Options::hub`]) may relay of one member's frames at once, as queued for its other members: past
 /// it, [`Docs`] forgets the member as if it left ([`Event::Overflow`]), so the member writing pays rather than

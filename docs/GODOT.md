@@ -125,7 +125,9 @@ var copy := doc.snapshot()                  # keep it on the device (it holds wh
 - **The star.** Joiners link to the host alone. So the host passes on what each joiner writes, and a joiner catches
   up from the host. Frames are messages `0x07` + JSON on the reliable lane, beside Godot's packets.
 - **A slow joiner is caught up again, not cut.** Once 16 MiB of doc frames wait for a joiner, the host drops them
-  and catches it up afresh, as if it had just joined: it asks for what it missed, at its link's pace.
+  and catches it up afresh, as if it had just joined: it asks for what it missed, at its link's pace. That
+  catch-up starts with up to about 1.5 MB for each doc the host has open (*theoretical*, for a doc at its caps), so
+  keep them few: past a dozen such docs it would fill those 16 MiB alone.
 - **The host disconnects a joiner in two cases.** When it joins again, it catches up.
   - **Its link stalls:** it takes nothing for 30 s, while 16 MiB of doc frames piled up for it twice.
   - **It writes faster than the host may pass on:** what the host sends on for one joiner is charged to it, once
