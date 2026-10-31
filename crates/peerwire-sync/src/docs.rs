@@ -23,16 +23,20 @@ const STALL_US: u64 = 30_000_000;
 struct Outbox {
     messages: VecDeque<Vec<u8>>,
     bytes: usize,
-    /// When its link last took a message (or it joined), in µs, and the times its messages were dropped since.
+    /// When its link last took a message (or it joined), in µs. poll_transmit isn't told the time, so a message
+    /// taken is `taken` until the next call that is, which gives `took` its time: a clock not moved on since can
+    /// only make the link seem to have taken it later.
     took: u64,
+    taken: bool,
+    /// The times its messages were dropped since its link last took one.
     resyncs: u32,
-    /// `took` and `resyncs` as they were before the message last taken, for when it comes back with retry.
-    undo: (u64, u32),
+    /// `taken` and `resyncs` as they were before the message last taken, for when it comes back with retry.
+    undo: (bool, u32),
 }
 
 impl Outbox {
     fn new(now_us: u64) -> Outbox {
-        Outbox { messages: VecDeque::new(), bytes: 0, took: now_us, resyncs: 0, undo: (now_us, 0) }
+        Outbox { messages: VecDeque::new(), bytes: 0, took: now_us, taken: false, resyncs: 0, undo: (false, 0) }
     }
 }
 
@@ -110,6 +114,9 @@ impl Docs {
 
     fn set_now(&mut self, now: Instant) {
         self.now_us = self.now_us.max(now.as_micros());
+        for ob in self.out.values_mut().filter(|ob| ob.taken) {
+            (ob.took, ob.taken) = (self.now_us, false);
+        }
     }
 
     /// Runs `f` with the host lent to the docs, then queues what they sent.
@@ -183,7 +190,7 @@ impl Docs {
     fn cap(&mut self, p: PeerId) {
         let now = self.now_us;
         let Some(ob) = self.out.get_mut(&p).filter(|ob| ob.bytes > OUTBOX_BYTES) else { return };
-        if ob.resyncs >= RESYNCS && now.saturating_sub(ob.took) >= STALL_US {
+        if ob.resyncs >= RESYNCS && !ob.taken && now.saturating_sub(ob.took) >= STALL_US {
             self.forget(p);
             self.events.push_back(Event::Overflow(p));
             return;
@@ -347,8 +354,8 @@ impl Docs {
         let ob = self.out.get_mut(&p)?;
         let m = ob.messages.pop_front()?;
         ob.bytes -= m.len();
-        ob.undo = (ob.took, ob.resyncs);
-        (ob.took, ob.resyncs) = (self.now_us, 0);
+        ob.undo = (ob.taken, ob.resyncs);
+        (ob.taken, ob.resyncs) = (true, 0);
         Some((p, m))
     }
 
@@ -356,7 +363,7 @@ impl Docs {
     /// poll_transmit after one that returned `None` tries that member again. It doesn't count as taken.
     pub fn retry(&mut self, peer: PeerId, message: Vec<u8>) {
         let Some(ob) = self.out.get_mut(&peer) else { return };
-        (ob.took, ob.resyncs) = ob.undo;
+        (ob.taken, ob.resyncs) = ob.undo;
         ob.bytes += message.len();
         ob.messages.push_front(message);
         self.held.insert(peer);
@@ -705,6 +712,7 @@ mod tests {
         let (mut da, _, _, _, b) = pair();
         da.joined(Instant::from_millis(0), b, Route::Direct);
         while da.poll_transmit().is_some() {}
+        da.set_now(Instant::from_millis(0));
         (da, b)
     }
 
@@ -726,7 +734,8 @@ mod tests {
     }
 
     /// A member is forgotten (Overflow) only once its link has taken nothing across RESYNCS resyncs and for
-    /// STALL_US. A message its link refused, handed back with retry, isn't taken.
+    /// STALL_US. A message its link refused, handed back with retry, isn't taken; one taken is timed by the next
+    /// call that brings the time in.
     #[test]
     fn a_member_whose_link_takes_nothing_is_forgotten_after_resyncs_and_a_stall() {
         // A burst of drops in the 30 s after its link last took one: resynced each time.
@@ -748,12 +757,25 @@ mod tests {
         assert_eq!([10.0, 10.0].map(|s| drop_at(&mut d, b, s)), [false, false]);
         at(&mut d, 20.0);
         assert!(d.poll_transmit().is_some_and(|(p, _)| p == b));
+        at(&mut d, 20.0);
         assert_eq!([40.0, 40.0, 40.0, 49.9].map(|s| drop_at(&mut d, b, s)), [false; 4]);
         let (mut d, b) = lone();
         assert_eq!([10.0, 10.0].map(|s| drop_at(&mut d, b, s)), [false, false]);
         at(&mut d, 20.0);
         assert!(d.poll_transmit().is_some());
+        at(&mut d, 20.0);
         assert_eq!([50.0, 50.0, 50.0].map(|s| drop_at(&mut d, b, s)), [false, false, true]);
+        // Taken while the clock stood at 40 s (writes and poll_transmit bring no time in): never cut on that
+        // clock's say, however often dropped, but timed by the next call that brings the time in.
+        let (mut d, b) = lone();
+        assert_eq!([40.0, 40.0].map(|s| drop_at(&mut d, b, s)), [false, false]);
+        assert!(d.poll_transmit().is_some());
+        for _ in 0..3 {
+            resync(&mut d, b);
+            assert_eq!(overflows(&mut d), []);
+        }
+        at(&mut d, 60.0);
+        assert_eq!([89.9, 90.0].map(|s| drop_at(&mut d, b, s)), [false, true]);
         // One its link refused doesn't.
         let (mut d, b) = lone();
         assert_eq!([10.0, 10.0].map(|s| drop_at(&mut d, b, s)), [false, false]);
