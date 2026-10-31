@@ -427,8 +427,8 @@ export class Call {
   }
 
   // 'stream', once the peer's description is applied: its stream has the first audio and the first video
-  // transceiver's tracks, whatever the peer sends on them. Not from 'track' events, which come only for what it
-  // sends: one sending nothing still gets ours, and shows.
+  // transceiver's tracks, whatever the peer sends on them. 'track' events don't do: they come only for what it
+  // sends, and one sending nothing still gets ours, so it shows.
   show(l) {
     if (l.shown || l.closed) return;
     const ts = l.pc.getTransceivers();
