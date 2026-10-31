@@ -499,9 +499,12 @@ for (const n of [MAX_READ - 1, MAX_READ]) {
   w.relays[1].ignoresFilter = true;
   for (const r of w.relays) for (let i = 1; i <= 500; i++) r.put({ ...craft({ content: b64(rand(200)), at: now + 365 * 86400 + i }), tags: [['d', NS]] });
   await alice.send(bob.id, 'under future junk');
+  // A sender whose clock runs 10 minutes ahead: within AHEAD_S, read at once.
+  w.relays[0].put(craft({ env: envelope(NSB, 1, rand(16), now + 600, now + 3600, text('ten minutes ahead')), from: alice.ep, to: bob.id, at: now + 600 }));
   bob.on('message', (data) => bob.got.push(data));
   await bob.check();
-  check(bob.got.join() === 'under future junk' && bob.opens === 1 && bob.below.size === 0, `500 drops a year ahead on each relay: none opened, delivered at the first check (${bob.opens} opens)`);
+  check(bob.got.join() === 'under future junk,ten minutes ahead' && bob.opens === 2 && bob.below.size === 0,
+    `500 drops a year ahead on each relay: none opened, delivered at the first check with one 10 min ahead (${bob.got}, ${bob.opens} opens)`);
   w.done();
 }
 {
