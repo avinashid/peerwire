@@ -215,6 +215,15 @@ function unaddressed(l) {
     .replace(/^(m=\S+ )[1-9]\d*/, (_, m) => `${m}9`).replace(/^a=rtcp:\d+ IN IP[46] [^\s]+/i, 'a=rtcp:9 IN IP4 0.0.0.0');
 }
 
+// A candidate (as RTCIceCandidate.toJSON() gives it) to send under `privacy`, as WebRtcTransport sends
+// its own: unless 'direct', null for a host one, and any other with its related address cleared.
+// Calls (call.js) send their media candidates through it.
+export function candidateFor(privacy, j) {
+  if (privacy === 'direct') return j;
+  if (HOST.test(j.candidate ?? '')) return null;
+  return { ...j, candidate: unaddressed(j.candidate ?? '') };
+}
+
 // Whether `pc`'s ICE is connected now.
 function iceUp(pc) {
   return pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';

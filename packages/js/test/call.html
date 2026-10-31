@@ -1,0 +1,80 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>peerwire call test</title>
+<p id="state">joining</p>
+<script type="module">
+  // A room member for test/call_browser.mjs: joins room ?room= over local signalling (with ?privacy=), and its
+  // call when asked, with the fake camera and microphone or with nothing (to only receive); ?call=1 joins the
+  // call as soon as the room is joined; ?recvonly=1 plays a modified client whose transceivers only receive,
+  // however they are made or set. It records the call's events.
+  import { joinRoom } from '../src/index.js';
+
+  const params = new URLSearchParams(location.search);
+  if (params.get('recvonly')) {
+    const add = RTCPeerConnection.prototype.addTransceiver;
+    RTCPeerConnection.prototype.addTransceiver = function (x, init = {}) {
+      return add.call(this, x, { ...init, direction: 'recvonly' });
+    };
+    const dir = Object.getOwnPropertyDescriptor(RTCRtpTransceiver.prototype, 'direction');
+    Object.defineProperty(RTCRtpTransceiver.prototype, 'direction', { ...dir, set(v) { dir.set.call(this, v === 'sendrecv' ? 'recvonly' : v); } });
+  }
+  const room = await joinRoom({ appId: 'peerwire-test', roomId: `call/${params.get('room')}`, privacy: params.get('privacy') ?? 'direct' });
+  const events = [];
+  let call = null;
+  let media = null;
+  const join = async ({ send = true, max } = {}) => {
+    if (send && !media) media = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 320, height: 240, frameRate: 15 } });
+    call = room.call(send ? media : null, max ? { max } : {});
+    for (const e of ['state', 'stream', 'ended', 'full']) {
+      call.on(e, (...a) => events.push({ e, a: a.map((x) => (x && typeof x === 'object' ? `tracks:${x.getTracks().map((t) => t.kind).join(',')}` : x)), at: Date.now() }));
+    }
+  };
+  if (params.get('call')) join({ send: false });
+  window.t = {
+    id: room.self,
+    peers: () => room.peers.length,
+    events: () => events,
+    join,
+    left: () => call?.left ?? null,
+    callPeers: () => call?.peers ?? [],
+    states: () => Object.fromEntries((call?.peers ?? []).map((p) => [p, call.state(p)])),
+    hasStream: (p) => !!call?.stream(p),
+    // Per call peer: video frames decoded and audio packets received so far (a page that plays no audio counts no
+    // samples).
+    async decoded() {
+      const out = {};
+      for (const p of call?.peers ?? []) {
+        const s = await call.getStats(p);
+        const d = { frames: 0, audio: 0 };
+        s?.forEach((r) => {
+          if (r.type === 'inbound-rtp' && r.kind === 'video') d.frames += r.framesDecoded ?? 0;
+          if (r.type === 'inbound-rtp' && r.kind === 'audio') d.audio += r.packetsReceived ?? 0;
+        });
+        out[p] = d;
+      }
+      return out;
+    },
+    // Sends nothing, then the camera again: true if every link kept its descriptions (replaceTrack only).
+    async swap() {
+      const sdp = () => [...call.links.values()].map((l) => `${l.pc.signalingState} ${l.pc.localDescription?.sdp} ${l.pc.remoteDescription?.sdp}`);
+      const before = sdp();
+      await call.setStream(null);
+      await new Promise((r) => setTimeout(r, 500));
+      await call.setStream(media);
+      await new Promise((r) => setTimeout(r, 1000));
+      return sdp().every((s, i) => s === before[i]) && before.every((s) => s.startsWith('stable '));
+    },
+    // ICE restarts on both ends at once (perfect negotiation's glare).
+    restart: () => {
+      for (const l of call.links.values()) l.pc.restartIce();
+    },
+    signaling: () => [...call.links.values()].map((l) => l.pc.signalingState),
+    directions: () => [...call.links.values()].flatMap((l) => l.pc.getTransceivers().map((x) => x.currentDirection)),
+    ufrag: () => /a=ice-ufrag:(\S+)/.exec([...call.links.values()][0]?.pc.localDescription?.sdp ?? '')?.[1] ?? null,
+    route: (peer) => room.route(peer)?.kind ?? null,
+    sent: () => room.stats(),
+    leave: () => call.leave(),
+    leaveRoom: () => room.leave(),
+  };
+  document.getElementById('state').textContent = 'joined';
+</script>

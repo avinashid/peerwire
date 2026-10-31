@@ -203,14 +203,69 @@ export declare class Room {
    * signalling, and RangeError for a name with `persist` or `relays` that isn't well-formed (a lone surrogate) or for
    * `relays: true` with a roomId that hasn't `randomRoomId()`'s shape. See {@link Doc}. */
   doc(name: string, options?: DocOptions): Doc;
+  /** Joins the room's voice and video call with `stream` (null only receives): every member in it sends us its
+   * stream and gets ours, each over a WebRTC connection of its own, signalled over the room's links. The app gets the
+   * stream (getUserMedia); the library never asks for the camera or microphone. One call per room: throws while
+   * ours is open (see `Call.setStream`, `Call.leave`) and after `leave()`; TypeError where WebRTC has no media
+   * (Node), or for a stream that isn't a MediaStream; RangeError for a `max` that isn't 2 to 16. See {@link Call}. */
+  call(stream: MediaStream | null, options?: CallOptions): Call;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
   /** Tells every peer we're going, then closes the links, all before it returns (so it works from `pagehide`,
    * where it also runs); the promise resolves once docs kept on this device (`persist`) have saved, however long
    * the store takes (one that never settles holds it; the links are closed by then). Reliable messages not yet
-   * acknowledged may not arrive: the goodbye can overtake them. */
+   * acknowledged may not arrive: the goodbye can overtake them. Leaves the call too. */
   leave(): Promise<void>;
+}
+
+export interface CallOptions {
+  /** The most in the call, us included: 2 to 16, default 6. Each member sends its stream to every other, so its
+   * upload grows with each one (see docs/PERFORMANCE.md §6). A member with no seat for a joiner tells it the call
+   * is full; the joiner goes only if its own count of who is in agrees. */
+  max?: number;
+}
+
+/** Why a peer's media failed: 'no-path', it never connected within 20 s (no direct path between the two, and no
+ * TURN server in `iceServers`); 'lost', it connected, then ICE failed and 2 restarts in a minute didn't bring it
+ * back; 'error', its description couldn't be applied. */
+export type CallFailure = 'no-path' | 'lost' | 'error';
+
+export interface CallEvents {
+  /** A peer's media connection: 'connecting' once its link is made (and again while an ICE restart runs),
+   * 'connected', or 'failed' with why. A failed peer is not tried again until it or we join again. */
+  state: (peer: PeerId, state: 'connecting' | 'connected' | 'failed', reason?: CallFailure) => void;
+  /** A peer's stream, once per peer, when its description is applied: one audio and one video track, whatever it
+   * sends. Its tracks stay the same when the peer changes what it sends (`setStream`); they are silent or black
+   * while it sends nothing, so say "muted" or "camera off" in presence rather than guessing from frames. A peer
+   * gets our media from 'connected' on, so draw its tile from its first 'state'. */
+  stream: (peer: PeerId, stream: MediaStream) => void;
+  /** A peer in `call.peers` is out of the call: it left the call ('left') or the room ('gone'). */
+  ended: (peer: PeerId, reason: 'left' | 'gone') => void;
+  /** The call had no seat for us: we are out of it (`call.left`), and `room.call()` may try again. `max` is ours. */
+  full: (max: number) => void;
+}
+
+/** The room's voice and video call, as `room.call()` joined it: a mesh, each member linked to every other. */
+export interface Call {
+  /** The peers in the call with us, failed ones too (see `state`), until 'ended'. */
+  readonly peers: PeerId[];
+  /** True after `leave()`, 'full', or the room's `leave()`. Nothing fires after it but 'full'. */
+  readonly left: boolean;
+  /** Subscribes; returns a function that unsubscribes. */
+  on<E extends keyof CallEvents>(event: E, fn: CallEvents[E]): () => void;
+  off<E extends keyof CallEvents>(event: E, fn: CallEvents[E]): void;
+  /** The peer's media state, or null for a peer not in the call with us. */
+  state(peer: PeerId): 'connecting' | 'connected' | 'failed' | null;
+  /** The peer's stream once 'stream' has fired, else null. */
+  stream(peer: PeerId): MediaStream | null;
+  /** The peer's connection stats (inbound-rtp's framesDecoded, say), or null for a peer not linked or failed. */
+  getStats(peer: PeerId): Promise<RTCStatsReport | null>;
+  /** Sends `stream`'s first audio and first video track from now on, or nothing for a kind it lacks (null: nothing
+   * at all): a camera turned on, a screen shared. It replaces tracks and never renegotiates. Throws after leaving. */
+  setStream(stream: MediaStream | null): Promise<void>;
+  /** Leaves the call and tells the members; the room stays. */
+  leave(): void;
 }
 
 /** A map key, set item or log entry as `entries()` lists it. Values come back frozen. A value is member data: check

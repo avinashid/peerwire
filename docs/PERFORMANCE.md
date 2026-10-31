@@ -216,6 +216,16 @@ Media runs over WebRTC media tracks in browsers. Peerwire does the signaling, id
 - **Mesh**, where each peer sends its stream to every other: per-peer uplink = `(N − 1) × bitrate`.
   - 720p on 10 Mbit/s: **~6 participants**.
   - 360p: ~20 by bandwidth, but CPU (encrypting N−1 copies) limits it to about **8–12**.
+- **`room.call()` is this mesh (NB-010), capped at `max` = 6 by default.** Each member runs `N − 1` media
+  connections, each with an encoder of its own: it encodes and uploads its stream `N − 1` times and decodes `N − 1`.
+  - Uplink per member at the cap: `5 × 1.5` = **7.5 Mbit/s** at 720p, `5 × 0.5` = 2.5 Mbit/s at 360p, `5 × 32` =
+    160 kbit/s for audio alone. The browser's congestion control lowers the video bitrate on a smaller uplink.
+  - Connections in a call of `N`: `N(N − 1)/2`, 15 for 6. Signalling, over the room's links: one `join` to each
+    room member, then a description each way per connection and its trickled candidates.
+  - `max` goes up to 16: audio fits (`15 × 32` = 480 kbit/s up), video doesn't on most uplinks.
+  - Larger calls need the peer SFU or the broadcast tree below (NB-010b).
+  - Measured, not a load test: `packages/js/test/call_browser.mjs` prints how long 2, 3 and 4 tabs (headless
+    Chromium, fake 320×240 camera at 15 fps, loopback) take from joining until each decodes every other's video.
 - **Peer SFU**, where the participant with the best uplink forwards the streams:
   - It receives N streams and sends N × (N − 1).
   - With simulcast at 360p and 50 Mbit/s up, that is about **10 active video participants**, with audio for many more.
