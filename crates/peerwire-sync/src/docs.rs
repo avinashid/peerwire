@@ -18,11 +18,17 @@ const RESYNCS: u32 = 2;
 /// How long, in µs, a link must also have taken nothing for: a burst of frames handled before the host sends
 /// again can drop a slow member's messages more than once, but not for this long. A silent link times out in it.
 const STALL_US: u64 = 30_000_000;
+/// Docs we haven't open whose replies to a member's asks a resync sends again, the latest of each: a member asks
+/// only for the docs it has open.
+const UNOPENED: usize = 16;
 
 /// A member's messages waiting for its link, and when its link last took one.
 struct Outbox {
     messages: VecDeque<Vec<u8>>,
     bytes: usize,
+    /// Our latest reply to its ask for each doc we hadn't open, for the last UNOPENED of them: no doc would end
+    /// that ask again if a resync dropped it, and the member would wait on it for good.
+    unopened: VecDeque<(Utf16, String)>,
     /// When its link last took a message (or it joined), in µs. poll_transmit isn't told the time, so a message
     /// taken is `taken` until the next call that is, which gives `took` its time: a clock not moved on since can
     /// only make the link seem to have taken it later.
@@ -36,7 +42,15 @@ struct Outbox {
 
 impl Outbox {
     fn new(now_us: u64) -> Outbox {
-        Outbox { messages: VecDeque::new(), bytes: 0, took: now_us, taken: false, resyncs: 0, undo: (false, 0) }
+        Outbox {
+            messages: VecDeque::new(),
+            bytes: 0,
+            unopened: VecDeque::new(),
+            took: now_us,
+            taken: false,
+            resyncs: 0,
+            undo: (false, 0),
+        }
     }
 }
 
@@ -184,8 +198,9 @@ impl Docs {
     }
 
     /// A member whose messages passed OUTBOX_BYTES waiting has them dropped, and each doc catches it up afresh
-    /// (resync): what piles up for a slow member, as a hub's relays do, costs it a catch-up, not its link. What that
-    /// queues isn't capped, so it can't drop it again. One whose link has taken nothing across RESYNCS of those, and
+    /// (resync): what piles up for a slow member, as a hub's relays do, costs it a catch-up, not its link. Our
+    /// replies to its asks for docs we hadn't open go again first. What that queues isn't capped, so it can't drop
+    /// it again. One whose link has taken nothing across RESYNCS of those, and
     /// for STALL_US, is forgotten as if it left.
     fn cap(&mut self, p: PeerId) {
         let now = self.now_us;
@@ -198,6 +213,10 @@ impl Docs {
         ob.resyncs += 1;
         ob.messages.clear();
         ob.bytes = 0;
+        let again: Vec<String> = ob.unopened.iter().map(|(_, reply)| reply.clone()).collect();
+        for reply in again {
+            self.push(p, reply);
+        }
         let ids: Vec<u32> = self.docs.keys().copied().collect();
         for id in ids {
             let (_, sent, _) = self.lend(id, |h, docs| docs.get_mut(&id).map(|d| d.resync(h, p)));
@@ -320,7 +339,8 @@ impl Docs {
         }
         let Some(t) = Tree::parse(&message[1..]) else { return true };
         let root = t.root();
-        let open = t.field(root, "d").and_then(|d| t.str(d)).and_then(|d| self.names.get(d)).copied();
+        let name = t.field(root, "d").and_then(|d| t.str(d));
+        let open = name.and_then(|d| self.names.get(d)).copied();
         match open {
             Some(id) => {
                 let ((), sent, relayed) = self.lend(id, |h, docs| {
@@ -335,6 +355,13 @@ impl Docs {
             }
             None => {
                 if let Some(reply) = unopened(&t, root) {
+                    if let (Some(ob), Some(name)) = (self.out.get_mut(&peer), name) {
+                        ob.unopened.retain(|(d, _)| d[..] != *name);
+                        if ob.unopened.len() == UNOPENED {
+                            ob.unopened.pop_front();
+                        }
+                        ob.unopened.push_back((name.to_vec(), reply.clone()));
+                    }
                     self.queue(vec![(peer, reply)]);
                 }
             }
@@ -705,6 +732,50 @@ mod tests {
         settle(&mut da, &mut db, now);
         assert_eq!(db.doc(id).unwrap().entries(Kind::Set, "s").len(), 200);
         assert_eq!(held(&mut db, id), held(&mut da, id));
+    }
+
+    /// Our reply to its ask for a doc we haven't open, dropped with the rest, goes again: else the member, which
+    /// asks us alone, waits on that ask for good, and doesn't ask us back once we open the doc and ask it.
+    #[test]
+    fn a_reply_for_a_doc_not_open_goes_again_when_dropped() {
+        let (mut da, mut db, _, a, b) = pair();
+        let now = Instant::from_millis(0);
+        // A copy of "other" holding one entry, as a third member wrote it.
+        let mut dc = Docs::new(PeerId([0xcc; 32]), [3; 32]);
+        let cid = dc.open(now, "other", Options::default()).unwrap();
+        dc.doc(cid).unwrap().map_set("m", "k", "\"v\"").unwrap();
+        let copy = dc.doc(cid).unwrap().snapshot();
+        let bid = db.open(now, "other", Options::default()).unwrap();
+        da.joined(now, b, Route::Direct);
+        db.joined(now, a, Route::Direct);
+        while let Some((_, m)) = db.poll_transmit() {
+            assert!(da.receive(now, b, &m));
+        }
+        let reply = waiting(&da, &b).into_iter().find(|m| m.starts_with(r#"{"d":"other","t":3,"ws":[],"q":"#)).unwrap();
+        assert!(reply.ends_with(r#","i":0,"n":0,"end":1}"#), "{reply}");
+        resync(&mut da, b);
+        assert_eq!(waiting(&da, &b)[0], reply);
+        let now = settle(&mut da, &mut db, now);
+        da.open(now, "other", Options { copy: Some(&copy), ..Options::default() }).unwrap();
+        settle(&mut da, &mut db, now);
+        assert_eq!(db.doc(bid).unwrap().get(Kind::Map, "m", "k"), Some("\"v\""));
+        assert_eq!(db.doc(bid).unwrap().sync().state, crate::State::Synced);
+        // The latest reply for each doc, for the last UNOPENED docs asked for.
+        let (mut d, b) = lone();
+        let ask = |d: &mut Docs, name: &str, q: u64| {
+            let f = format!(r#"{{"d":"{name}","t":2,"ws":[],"r":[],"q":{q}}}"#);
+            assert!(d.receive(now, b, &[&[DOC_TAG][..], f.as_bytes()].concat()));
+        };
+        for n in 0..=UNOPENED {
+            ask(&mut d, &format!("n{n}"), 1);
+        }
+        ask(&mut d, "n1", 2);
+        resync(&mut d, b);
+        let end = |n: usize, q: u64| format!(r#"{{"d":"n{n}","t":3,"ws":[],"q":{q},"i":0,"n":0,"end":1}}"#);
+        let mut want: Vec<String> = (2..=UNOPENED).map(|n| end(n, 1)).collect();
+        want.push(end(1, 2));
+        assert_eq!(waiting(&d, &b)[..UNOPENED], want[..]);
+        assert!(waiting(&d, &b)[UNOPENED..].iter().all(|m| m.starts_with(r#"{"d":"board","#)));
     }
 
     /// `a` with member `b`, which joined at 0 s and whose link took what `a` sent it then.
