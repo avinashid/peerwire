@@ -574,7 +574,12 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    with an OK within a round trip) is silent: a half-open socket, still open but dead,
    would otherwise take its turns and lose them until it closes. It is skipped too, while
    any relay that answers is left, and still sent every other signal; its next answer
-   gives it its turns back. The last
+   gives it its turns back. Our own half-open socket hears nothing either, so what peers
+   send us through that relay is lost: a socket that has heard nothing at all for 10 s
+   since a signal went through it is closed and dialled again, and the new one takes no
+   batch until its relay answers. Relays ban an IP that opens too many connections, so
+   the same relay is redialled so after 20 s, then 30 s, and at most 3 times until it
+   answers within 5 s again; one that answers late, or never, isn't redialled in a loop. The last
    batches a room sends as it leaves go through every relay, as nothing could send them
    again. A relay that bans us (`blocked:`, `banned`) gets nothing for 30 s, doubling up
    to 10 min; the ban starts over at 30 s once the relay has gone 10 min without one.

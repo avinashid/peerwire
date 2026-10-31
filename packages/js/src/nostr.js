@@ -68,6 +68,14 @@ export const BACKOFF_MS = 30000;
 export const MAX_BACKOFF_MS = 600000;
 // NIP-01 relays answer each event with an OK within a round trip.
 export const SILENT_MS = 5000;
+// Our own socket may be half-open too, its subscription hearing nothing, so what peers send us through that relay
+// is lost. A socket that has heard nothing at all (no OK, no event) since an event sent through every relay (not a
+// pipe batch, nor one to keep) REDIAL_SILENT_MS ago is deaf: it is closed and its relay dialled again, and the new
+// socket is silent (see silent()) until its relay answers. Each next redial of that relay waits twice as long, to
+// MAX_RECONNECT_MS, and after REDIAL_TRIES there are none until it answers an event within SILENT_MS: one that never
+// answers, or answers late, isn't dialled again and again (relays ban an IP for too many connections, see start()).
+export const REDIAL_SILENT_MS = 2 * SILENT_MS;
+export const REDIAL_TRIES = 3;
 // Events to keep (store(): a doc's copy on the relays) go to each relay one every STORE_EVERY_MS
 // at most, and only while no other event waits there, so they never hold up a join or a pipe.
 // One waits STORE_QUEUE_MS at most to be sent, and STORE_OK_MS for its relay's OK, then counts as
@@ -119,11 +127,12 @@ export class NostrSignaling {
     this.rates = new Map(); // relay url -> { tokens, at, rate, low, lowAt }: its token bucket
     this.seq = 0; // events published, numbering them so a refused one goes back in its place
     this.turn = 0; // the socket whose turn it is to take a lossy event (see next())
-    this.stats = { published: 0, received: 0, rejected: 0, relaysOpen: 0, reconnects: 0, backoffs: 0, resent: 0, unsent: 0 };
+    this.stats = { published: 0, received: 0, rejected: 0, relaysOpen: 0, reconnects: 0, backoffs: 0, resent: 0, unsent: 0, redials: 0 };
     this.closed = false;
     this.sending = 0; // send()s not yet published: close() leaves the sockets open for them
     this.retry = new Map(); // relay url -> { ms, timer }: redial after a close
-    this.onReconnect = () => {}; // (url): a relay opened again after a close
+    this.redialled = new Map(); // relay url -> its deaf sockets redialled since it last answered in time (see deaf())
+    this.onReconnect = () => {}; // (url): a relay opened again after a close, or after its socket went deaf (see deaf())
     this.ready = this.start(relays);
   }
 
@@ -153,8 +162,9 @@ export class NostrSignaling {
     })));
   }
 
-  // Opens (or reopens) the socket to `url`; `opened` runs once it opens or fails.
-  dial(url, opened = () => {}) {
+  // Opens (or reopens) the socket to `url`; `opened` runs once it opens or fails. One dialled for a `deaf` one (see
+  // deaf()) is silent from the start: it takes no pipe batch until its relay answers.
+  dial(url, opened = () => {}, deaf = false) {
     if (this.closed) return;
     const again = this.sockets.some((s) => s.relayUrl === url);
     for (const s of this.sockets) if (s.relayUrl === url) this.forget(s);
@@ -178,6 +188,7 @@ export class NostrSignaling {
     ws.onclose = () => this.lostSocket(ws);
     ws.onmessage = (m) => void this.onRelay(url, m.data, ws).catch(() => {});
     ws.dialled = clock();
+    if (deaf) ws.asked = -Infinity;
     this.sockets.push(ws);
   }
 
@@ -185,6 +196,7 @@ export class NostrSignaling {
   // count as refused, and its reads as cut short.
   forget(ws) {
     clearTimeout(ws.pumpTimer);
+    clearTimeout(ws.deafTimer);
     ws.q = [];
     for (const e of ws.low ?? []) e.done(false);
     ws.low = [];
@@ -219,15 +231,20 @@ export class NostrSignaling {
       if ((open && !all) || stuck) continue;
       clearTimeout(this.retry.get(ws.relayUrl)?.timer);
       this.retry.delete(ws.relayUrl);
-      if (ws.counted) this.stats.relaysOpen--;
-      ws.counted = false;
-      ws.onclose = null;
-      ws.onmessage = null;
-      try {
-        ws.close();
-      } catch {}
-      this.dial(ws.relayUrl);
+      this.swap(ws);
     }
+  }
+
+  // Closes `ws`, which isn't lost (its onclose doesn't run), and dials its relay again (see dial()).
+  swap(ws, deaf = false) {
+    if (ws.counted) this.stats.relaysOpen--;
+    ws.counted = false;
+    ws.onclose = null;
+    ws.onmessage = null;
+    try {
+      ws.close();
+    } catch {}
+    this.dial(ws.relayUrl, undefined, deaf);
   }
 
   // `lossy`: through one relay, the relays taking turns (stripe), not each.
@@ -277,6 +294,31 @@ export class NostrSignaling {
   // so one pushed out of `inflight` unanswered (past RELAY_QUEUE) doesn't end it.
   silent(ws, now) {
     return now - (ws.asked ?? now) >= SILENT_MS;
+  }
+
+  // Whether `ws` has heard nothing at all from its relay since an event sent through every relay deafAfter() or more
+  // ago: our socket may be half-open (see REDIAL_SILENT_MS). The mark is the time of the first such event sent since
+  // anything came on it; whatever comes clears it.
+  deaf(ws, now) {
+    return now - (ws.unheard ?? now) >= this.deafAfter(ws.relayUrl);
+  }
+
+  // How long a socket to `url` may hear nothing before it is deaf: REDIAL_SILENT_MS, doubling with each of the relay's
+  // redials since it last answered in time, to MAX_RECONNECT_MS; Infinity after REDIAL_TRIES of them.
+  deafAfter(url) {
+    const n = this.redialled.get(url) ?? 0;
+    return n < REDIAL_TRIES ? Math.min(REDIAL_SILENT_MS * 2 ** n, MAX_RECONNECT_MS) : Infinity;
+  }
+
+  // Redials `ws`'s relay once `ws` is deaf, and until then looks again when it may be. Its timer goes when anything
+  // comes on it, and when it is replaced or lost (see forget()); nothing is dialled once closed (see dial()).
+  revive(ws) {
+    const now = clock();
+    const ms = this.deafAfter(ws.relayUrl);
+    if (!this.deaf(ws, now)) return void (ms < Infinity && (ws.deafTimer = setTimeout(() => this.revive(ws), Math.ceil(ws.unheard + ms - now))));
+    this.redialled.set(ws.relayUrl, (this.redialled.get(ws.relayUrl) ?? 0) + 1);
+    this.stats.redials++;
+    this.swap(ws, true);
   }
 
   // Queues `e` on the relay whose turn it is (see next()), and sends it if its rate allows.
@@ -335,6 +377,11 @@ export class NostrSignaling {
         old.done?.(false);
       }
       ws.asked ??= now;
+      // One sent through every relay starts the wait for the socket to hear something (see deaf()).
+      if (!e.lossy && !e.stored && ws.unheard == null) {
+        ws.unheard = now;
+        this.revive(ws);
+      }
       ws.send(e.msg);
     };
     while (q.length && (r.tokens >= 1 || this.closed)) send(q.shift());
@@ -405,6 +452,11 @@ export class NostrSignaling {
 
   // A message from relay `url`, on socket `ws` (that relay's, if not given).
   async onRelay(url, raw, ws = this.sockets.find((s) => s.relayUrl === url)) {
+    // Anything at all: the socket hears (see deaf()).
+    if (ws) {
+      ws.unheard = null;
+      clearTimeout(ws.deafTimer);
+    }
     let m;
     try {
       m = JSON.parse(raw);
@@ -456,6 +508,8 @@ export class NostrSignaling {
     ws?.inflight?.delete(id);
     if (ws) ws.asked = null; // it answers (see silent())
     const now = clock();
+    // In time: its redials start over (see deafAfter()).
+    if (e && now - e.sent < SILENT_MS) this.redialled.delete(url);
     const p = this.paused.get(url);
     if (ok === true) {
       // It took one sent since its last hold began: a refusal from now on starts over.
