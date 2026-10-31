@@ -932,8 +932,8 @@ fn local_addresses(local: SocketAddr) -> Vec<SocketAddr> {
     if local.is_ipv6() {
         out.push(at(IpAddr::V6(Ipv6Addr::LOCALHOST)));
     }
-    let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
-    let private = private_v4(ifaces.iter().map(|i| (i.name.as_str(), i.ip())));
+    let ifaces = interface_addrs();
+    let private = private_v4(ifaces.iter().map(|(name, ip)| (name.as_str(), *ip)));
     for ip in private.into_iter().map(at) {
         if !out.contains(&ip) && out.len() < families.len() + 2 + MAX_PRIVATE {
             out.push(ip);
@@ -944,6 +944,26 @@ fn local_addresses(local: SocketAddr) -> Vec<SocketAddr> {
 
 /// How many extra private interface addresses a socket offers (the offer holds 8).
 const MAX_PRIVATE: usize = 3;
+
+/// Each interface's name and address.
+#[cfg(not(target_os = "espidf"))]
+fn interface_addrs() -> Vec<(String, IpAddr)> {
+    let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
+    ifaces
+        .into_iter()
+        .map(|i| {
+            let ip = i.ip();
+            (i.name, ip)
+        })
+        .collect()
+}
+
+/// ESP-IDF has no getifaddrs: a socket bound to any interface offers its default
+/// route's address and loopback only.
+#[cfg(target_os = "espidf")]
+fn interface_addrs() -> Vec<(String, IpAddr)> {
+    Vec::new()
+}
 
 /// The private IPv4 addresses (RFC 1918) of `(interface, address)` pairs, without
 /// container and VM bridges, which no other device can reach.
