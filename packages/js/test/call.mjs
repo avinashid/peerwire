@@ -459,8 +459,10 @@ async function connected(...ms) {
   await pc.setLocalDescription();
   y.calls.receive(x.id, bytes({ t: 'join', age: 0 }));
   y.calls.receive(x.id, bytes({ t: 'sdp', d: { type: 'offer', sdp: pc.localDescription.sdp } }));
+  y.calls.receive(x.id, bytes({ t: 'ice', c: { candidate: SRFLX, sdpMid: '0', sdpMLineIndex: 0 } }));
   await settle();
   const ly = link(y, x.id);
+  check(ly.pc.remoteCandidates.length === 1, 'a candidate right behind its description is applied after it, not lost');
   const dirs = ly.pc.getTransceivers().map((t) => t.direction).join();
   check(dirs === 'sendrecv,sendrecv,inactive' && y.call.stream(x.id).getTracks().map((t) => t.kind).join() === 'audio,video', `an offer with three m-sections: the third inactive (${dirs}), the stream one audio and one video`);
   check(sentBy(y.id, 'sdp')[0]?.msg.d.type === 'answer' && sentBy(y.id, 'sdp')[0].msg.d.sdp.includes('a=inactive'), 'and the answer says so');
