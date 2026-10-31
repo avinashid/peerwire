@@ -157,6 +157,10 @@ try {
   check(await y.$eval('.tile:not(.self) .name', (n) => n.textContent) === '<img src=x onerror=pwned=1>', 'a name with markup shows as its text, without its bidi override');
   check(await y.$$eval('.tile .name *, .tile img', (l) => l.length) === 0 && await y.evaluate(() => window.pwned) === undefined, 'no element came from a name, and nothing in it ran');
   check(await y.$eval('.tile:not(.self)', (t) => t.classList.contains('nocam')), 'a member with no camera shows its initial');
+  // A member that leaves the call but stays in the room (another app on the same appId, say): its tile goes too.
+  await x.evaluate(() => window.meet.call.leave());
+  await y.waitForFunction(() => document.querySelectorAll('.tile:not(.self)').length === 0, null, WAIT);
+  check(await y.evaluate(() => window.meet.room.peers.length) === 1, 'a member that leaves only the call loses its tile, and stays in the room');
   for (const p of [x, y]) await p.close();
 
   // A full call: two tabs in a call of at most 2, then a third.

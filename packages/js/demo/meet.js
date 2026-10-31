@@ -322,8 +322,6 @@ async function enter(id) {
   if (typeof r.call !== 'function') return banner('bad', 'This build of @peerwire/js has no calls (room.call).');
   call = r.call(stream, { max });
   wireCall(r, call);
-  // A call that already had `max` people may say so before we listen: then it is over (left) from the start.
-  if (call.left) return callFull();
   sharePresence();
   renderAll();
 }
@@ -334,7 +332,8 @@ function join(id) {
   done.catch((e) => my === session && banner('bad', `Something went wrong: ${e.message}`, { label: 'Retry', run: () => join(id) }));
 }
 
-// The call's events, onto the tiles. A member's tile comes with its first event and goes when it ends or leaves.
+// The call's events, onto the tiles. A member's tile comes with its first event and goes with 'ended', which the
+// call gives for a member that leaves the call or the room.
 function wireCall(r, c) {
   const live = () => r === room && c === call;
   c.on('state', (peer, state, reason) => {
@@ -358,7 +357,6 @@ function wireCall(r, c) {
   c.on('ended', (peer) => live() && dropTile(peer));
   c.on('full', (seats) => live() && callFull(seats));
   r.on('presence', (peer) => live() && renderTile(peer));
-  r.on('peer-leave', (peer) => live() && dropTile(peer));
 }
 // No seat for us: back to the lobby, camera still on, with the choice to try again or start another room.
 function callFull(seats) {
