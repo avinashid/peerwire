@@ -280,13 +280,14 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   const carol = w.inbox(C, { listen: false });
   const now = S(w.now);
   const good = () => envelope(1, rand(16), now, now + 60, text('fine'));
+  // A body JSON reads, so only the check named drops it.
   const variants = {
     version: (e) => (e[0] = VERSION + 1),
     kind: (e) => (e[1] = 3),
     length: (e) => new DataView(e.buffer).setUint32(26, e.length - 29),
   };
   for (const [name, edit] of Object.entries(variants)) {
-    const e = good();
+    const e = name === 'length' ? good() : envelope(2, rand(16), now, now + 60, text('{"bad":1}'));
     edit(e);
     w.relays[0].put(craft({ env: e, from: alice.ep, to: bob.id, at: now }));
   }
@@ -376,8 +377,8 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
     const o = bob.opens;
     await bob.check();
     opens.push(bob.opens - o);
-    w.now += 1200_000;
     if (!i) await alice.send(bob.id, 'late');
+    w.now += 1200_000;
   }
   check(bob.got.join() === 'under the flood,late' && opens.length === 4 && opens.every((n) => n <= 3 * MAX_READ),
     `750 junk drops: delivered at check 3, one left meanwhile at check 4; opens per check ${opens}`);
@@ -633,9 +634,10 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   bob.off('message', bob.handlers.values().next().value);
   const r = w.relays[0].reqs.length;
   check((await bob.check()) === 0 && w.relays[0].reqs.length === r, 'with every listener gone, nothing more is read');
+  await alice.send(bob.id, 'after close');
   bob.close();
   bob.on('message', () => {});
-  check((await bob.check()) === 0, 'nor once closed');
+  check((await bob.check()) === 0 && w.relays[0].reqs.length === r, 'nor once closed');
   let closed = null;
   try {
     await bob.send(alice.id, 'x');

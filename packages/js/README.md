@@ -393,7 +393,9 @@ await inbox.send(friendId, { text: 'call me' }); // resolves to the number of re
   leaves or reads messages, when, and how many the app holds.
 - **Once.** A message is delivered once, oldest first, to every listener; with `persist` (`true` for IndexedDB, or a
   store as `room.doc` takes) across sessions too. Without it, a message still on the relays comes again in each new
-  session. `persist` needs `secret`: what it stores is sealed under a key from it.
+  session. `persist` needs `secret`: what it stores is sealed under a key from it. An inbox remembers 4096 messages
+  until they expire; past that (anyone can send to a PeerId), the one that expires soonest is forgotten, and comes
+  again only if a relay serves it again.
 - **Bounds.** 16 KiB a message (`send` throws RangeError past it). Reading costs one X25519 for each message of the
   app: a check opens at most 100 a relay, the newest first, and reads on down at the next, so a flood of messages
   delays yours but doesn't make a check longer. More than 100 in one second on a relay are read in part. A message
