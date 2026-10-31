@@ -91,7 +91,10 @@ const refusal = (why) => (/^rate-limited/i.test(why) ? 'rate' : /^blocked|banned
 // A relay socket that closes (the phone switched networks or turned on its hotspot,
 // Android froze the tab, the relay dropped us) is dialled again after this long,
 // doubling to the cap; a network change or the page showing again redials it at
-// once, and going online redials every relay.
+// once, and going online redials every relay. The wait starts over only once a socket
+// has stayed open the cap: one that takes each connection and drops it (overloaded,
+// dropping an IP it bans, wanting auth) would otherwise be dialled every second, and
+// each reopen says hello again (see onReconnect).
 export const RECONNECT_MS = 1000;
 export const MAX_RECONNECT_MS = 30000;
 // A socket still connecting this long when the network changes is given up and redialled.
@@ -177,7 +180,9 @@ export class NostrSignaling {
     ws.onopen = () => {
       this.stats.relaysOpen++;
       ws.counted = true;
-      this.retry.delete(url);
+      // Its relay's wait (`retry`) stays until this socket has stayed open a while (see lostSocket()); the timer
+      // that dialled it has run.
+      ws.opened = clock();
       // Since a little before now: what was published while we were away has gone.
       const filter = { kinds: [KIND], '#p': [this.myTag, this.roomTag], since: Math.floor(Date.now() / 1000) - 30 };
       if (this.listen) ws.send(JSON.stringify(['REQ', this.sub, filter]));
@@ -215,7 +220,9 @@ export class NostrSignaling {
     if (this.closed || !this.sockets.includes(ws)) return;
     this.release(); // it may have been the one relay free
     if (this.retry.get(ws.relayUrl)?.timer) return;
-    const ms = this.retry.get(ws.relayUrl)?.ms ?? RECONNECT_MS;
+    // Back to RECONNECT_MS after a socket open MAX_RECONNECT_MS or more; after one that closed sooner, or never
+    // opened (no `opened`), the wait goes on doubling.
+    const ms = clock() - ws.opened >= MAX_RECONNECT_MS ? RECONNECT_MS : this.retry.get(ws.relayUrl)?.ms ?? RECONNECT_MS;
     const timer = setTimeout(() => {
       this.retry.set(ws.relayUrl, { ms: Math.min(ms * 2, MAX_RECONNECT_MS), timer: null });
       this.dial(ws.relayUrl);
@@ -224,8 +231,9 @@ export class NostrSignaling {
   }
 
   // The network came back or changed, or the page is showing again: every relay that
-  // isn't open is redialled now. On going online (`all`), open sockets are too,
-  // since their TCP connection may be on the old network and take minutes to time out.
+  // isn't open is redialled now, its wait starting over. On going online (`all`), open
+  // sockets are too, since their TCP connection may be on the old network and take
+  // minutes to time out.
   redial(all) {
     if (this.closed) return;
     for (const ws of [...this.sockets]) {

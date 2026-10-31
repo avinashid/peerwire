@@ -975,6 +975,83 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
   s6.close();
   await tick(RECONNECT_MS * 2 + 100);
   check(made.length === 6 && s6.retry.size === 0, 'close() stops the redialling');
+
+  // NB-058: a relay that takes each connection and drops it 10 ms after it opens (overloaded, dropping an IP it bans,
+  // wanting auth) is redialled 1, 2, 4, 8, 16, 30 and 30 s after each close, as one that never opens; each reopen
+  // says hello (room.js), so at most twice a minute at 30 s, not every second. One that stayed open 30 s starts over
+  // at 1 s, one open 29.999 s doesn't, and the time it took to connect doesn't count. A network change redials at once
+  // and starts over. A fake clock runs the timers.
+  {
+    let now = 2e6;
+    performance.now = () => now;
+    const [realTimeout, realClear] = [globalThis.setTimeout, globalThis.clearTimeout];
+    const timers = new Map(); // id -> { at, fn }
+    let ids = 0;
+    globalThis.setTimeout = (fn, ms = 0) => (timers.set(++ids, { at: now + Math.max(0, ms), fn }), ids);
+    globalThis.clearTimeout = (id) => void timers.delete(id);
+    // Runs the clock to `to` (never back), each timer at its time, the earliest first; it stops after one that makes
+    // `until` true.
+    const run = (to, until = () => false) => {
+      for (;;) {
+        let next = null;
+        for (const [id, t] of timers) if (t.at <= to && (!next || t.at < next[1].at)) next = [id, t];
+        if (!next) break;
+        timers.delete(next[0]);
+        now = Math.max(now, next[1].at);
+        next[1].fn();
+        if (until()) return;
+      }
+      now = Math.max(now, to);
+    };
+    const [F, G] = ['wss://f6', 'wss://g6'];
+    const of = (url) => made.filter((w) => w.url === url);
+    const s = new NostrSignaling(pw, pw.endpoint(), { room: 'flap/reconnect', relays: [F, G] });
+    for (let i = 0; i < 1000 && !(of(F).length && of(G).length); i++) await new Promise((r) => realTimeout(r, 5));
+    of(F)[0].open();
+    of(G)[0].open();
+    await s.ready;
+    const hellos = []; // when f opened again
+    s.onReconnect = (url) => url === F && hellos.push(now);
+    // f's newest socket, open, closes `open` ms later (`wake`: then the network changes): how long until f is dialled
+    // again, Infinity if not within 60 s.
+    const drop = (open = 10, wake = false) => {
+      run(now + open);
+      of(F).at(-1).close();
+      const [t, n] = [now, made.length];
+      if (wake) s.wake({ type: 'change' });
+      run(t + 60000, () => made.length > n);
+      return made.length > n ? of(F).at(-1).dialled - t : Infinity;
+    };
+    // f's newest socket opens 50 ms after it was dialled, then closes as above.
+    const flap = (open, wake) => {
+      run(of(F).at(-1).dialled + 50);
+      of(F).at(-1).open();
+      return drop(open, wake);
+    };
+    const gaps = [drop(), ...Array.from({ length: 6 }, () => flap())];
+    check(gaps.join() === '1000,2000,4000,8000,16000,30000,30000',
+      `a relay that drops each connection 10 ms after it opens is redialled ${gaps.map((g) => g / 1000).join(', ')} s after each close`);
+    const T = now;
+    while (now < T + 300000) flap();
+    const late = hellos.filter((h) => h > T);
+    const peak = Math.max(...late.map((h) => late.filter((x) => x >= h && x < h + 60000).length));
+    check(late.length === 10 && peak === 2 && s.stats.reconnects === hellos.length,
+      `at 30 s it reopens, and the room says hello, ${late.length} times in 5 min, ${peak} in a minute at most`);
+    const young = flap(29999);
+    const old = flap(30000);
+    const again = flap();
+    check(young === 30000 && old === 1000 && again === 2000,
+      `a socket open 29.999 s (connected in 50 ms): the next wait is still ${young / 1000} s; open 30 s, ${old / 1000} s, then ${again / 1000} s`);
+    flap();
+    const woke = flap(10, true);
+    const after = flap();
+    check(woke === 0 && after === 1000, `a network change after a close redials at once (${woke} ms), and the next wait is ${after / 1000} s`);
+    s.close();
+    check(of(G).length === 1 && timers.size === 0 && s.retry.size === 0, 'g is never redialled, and close() leaves no timer');
+    globalThis.setTimeout = realTimeout;
+    globalThis.clearTimeout = realClear;
+    delete performance.now;
+  }
   globalThis.WebSocket = Real;
 }
 
