@@ -3,9 +3,10 @@
 Scope of this document: `peerwire-core` (handshake, wire format, lanes, relay, NAT
 traversal, STUN, invites, sealed messages), the C ABI (`peerwire-ffi`), shared docs
 in Rust (`peerwire-sync`), the JavaScript glue and transport (`packages/js`), the
-React hooks (`packages/react`), and the Nostr / BroadcastChannel signaling adapters.
-It records what Peerwire defends against, what it does not, and the findings of the
-first security review (M5, NB-013) and of every review since.
+React hooks (`packages/react`), the Nostr / BroadcastChannel signaling adapters, and
+the docs and demos site built for GitHub Pages. It records what Peerwire defends
+against, what it does not, and the findings of the first security review (M5, NB-013)
+and of every review since.
 
 Status: pre-1.0, no external audit. See [SECURITY.md](../SECURITY.md).
 
@@ -127,6 +128,7 @@ NB-016 (`6107674`) in `888e0d6`, NB-010 (`41f4021`) in `869e4cf` and NB-010a
 | NB19-2 (Low) | Accepted (the lead's call, documented in the README and `index.d.ts`): 100 drops or more in a message's second, ordered before it, hide it on that relay, same section |
 | NB10-1, NB10-2 (Low), NB10-I1, NB10-I2 (Info) | **Fixed** by `c578263` and `41f4021` before NB-010 merged, so never on main (merged `869e4cf`), before `room.call()` was published (a member's `full` turns a joiner away only when the joiner's own roster has no seat for it either; 'stream' comes for every peer once its description applies, whatever it sends; a description with more than 64 candidates is dropped; the docs say call frames on a pipe go inside it), reviewed 2026-10-31; NB10-I1a, NB10-I3 (Info) and the residuals accepted, [Calls](#calls-roomcall-nb-010-nb-010a--nb10-1-nb10-2-nb10a-1) |
 | NB10a-1 (Low) | **Fixed** by `f979384` before NB-010a merged, so never on main (merged `4f681b4`): in the meet page, a camera or microphone request still pending at Leave is turned off when it lands, reviewed 2026-10-31, same section |
+| NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; the shared origin (Low, NB10a-I1) is the repo owner's call before the first deploy, and a frame check is a condition before the meet page goes on the site; NB16-I1…I3 (Info), [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -2395,6 +2397,126 @@ the three probes reproduces on the fixed heads.
   [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043)).
 - **What the room learns.** Every room member, in the call or not, learns who is in it.
   A relay carrying a pipe sees the sizes and timing of the call frames inside it.
+- **The meet page on the public site.** It isn't there yet. Before it goes, see the
+  frame check and NB10a-I1 under
+  [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1).
+
+### The docs and demos site (NB-016) — NB16-1
+
+`scripts/site.sh` builds a static site into `target/site/`: a landing page, the README,
+the package READMEs and `docs/*.md` rendered to HTML by our own renderer
+(`scripts/site/markdown.mjs`), and the demos that need no server of ours (index, chat,
+poll, arena, Net Lab). `.github/workflows/pages.yml` deploys it to GitHub Pages at
+`avinashid.github.io/peerwire/`, run by hand only. It hasn't been deployed. The design:
+- **No third-party code at runtime.** No CDN, font, analytics or remote image; the
+  README's badges become text.
+- **The policy is a `<meta>` CSP.** Pages sends no headers we choose, so each page
+  carries its own: the demos get `docker/examples-nginx.conf`'s, less
+  `frame-ancestors` (a `<meta>` policy can't set it), and the other pages allow no
+  script. No page sends a referrer.
+- **Versioned assets.** Every module, the wasm and the stylesheet live under
+  `assets/<id>/`, `<id>` being 12 hex digits of a SHA-256 of their contents. A demo
+  page's `<script src>` is the only rewrite.
+- **Links.** The build fails on any link that isn't relative, http(s), mailto, or a `#`
+  anchor that exists. A link to a repo file that isn't rendered goes to GitHub.
+- **Workflow.** `workflow_dispatch` only, with no inputs. `permissions: {}`, then
+  `contents: read` for the build job (with `persist-credentials: false`) and only
+  `pages: write` and `id-token: write` for the deploy job, in the `github-pages`
+  environment.
+
+Reviewed 2026-10-31 by reading `2f68aa8..47ce300`, then the fix `6107674`, with one
+probe of the renderer (Node 22). Nothing was sent to Pages or GitHub.
+
+**Checked and holding:**
+- The renderer escapes text, code, fence languages, heading ids, table cells, alerts and
+  link text (`& < > "`), and attributes always use `"`. Its slots are whole elements,
+  replaced in one pass, so nothing reaches an attribute. `safeUrl` runs after
+  backslash-unescaping, and entities pass only as text, so `javascript&#58;…` becomes a
+  relative path. A `<br` followed by anything but `\s*/?>` stays text.
+- `link()` turns every link that isn't http(s), mailto or `#` into a repo file, or
+  throws, so `//host`, and `\\host` (which browsers read as `//host`), can't leave the
+  site.
+- The demo policy sits right after `<meta charset>`, before every `<style>` and the one
+  module script, and the build throws on any other script.
+- Invite secrets ride in the fragment (`#key=`, `#room=`, chat's `#id`), so neither
+  Pages nor its CDN sees them in a request.
+- `site.sh --serve` binds 127.0.0.1.
+
+**NB16-1 — Third-party actions built what Pages would serve (Low).** The build job ran
+`dtolnay/rust-toolchain@stable` (a branch) and `Swatinem/rust-cache@v2` (a movable
+tag), and its output was deployed as is. Whoever moved either ref could choose the JS
+and wasm served to every visitor, with no commit in this repo, as happened to
+`tj-actions/changed-files`' tags in March 2025. rust-cache also restored compiled
+dependencies that other runs wrote. Fix: the toolchain comes from the runner image's
+rustup (`rustup toolchain install stable --profile minimal --target
+wasm32-unknown-unknown`), with no build cache, so only GitHub's own `actions/*` are
+left. `site_build.mjs` fails on any other `uses:`, or one not on a major version or a
+full commit.
+
+**Status: fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed.
+Reviewed 2026-10-31 by reading the workflow. The guard's 7 mutants are all caught.
+
+**The shared origin (Low, the repo owner's call before the first deploy).**
+`avinashid.github.io` is one origin for every Pages site of the account. `github.io` is
+on the Public Suffix List, so other accounts' sites are kept apart, but any script on
+any of this account's sites can:
+- read the demos' storage: Net Lab's last 6 named rooms (a room's name is its secret)
+  and the nickname;
+- `window.open` a demo, which is same-origin, and script it: read the key from
+  `location.hash`, or speak in the room as the visitor;
+- if the account ever has a user site (a repo named `avinashid.github.io`; there is
+  none today), register a service worker at scope `/` that serves its own JS for every
+  `/peerwire/` URL and outlives any fix.
+
+**NB10a-I1 (Info), the camera.** Browsers keep a camera or microphone grant per origin.
+Once the meet page is on the site, a visitor's "allow" there is a grant to
+`avinashid.github.io`, so every Pages site of the account could then use that visitor's
+camera or microphone without asking again, for as long as the browser keeps the grant.
+
+**Fix, before the first deploy: an origin of the site's own.** A custom subdomain on a
+domain the owner holds is the one choice no other site shares: an organisation's
+`<org>.github.io` is still shared by that organisation's other Pages sites. It keeps the
+demos' storage, scripting, service workers and media grants apart from everything else
+the account publishes, and the site needs no change, since its URLs are all relative.
+With a custom domain, verify it in the account's Pages settings and enforce HTTPS, and
+remove its DNS record if the site is ever taken down, so no other Pages site can claim
+it. Recording the shared origin as accepted instead holds only while nothing else on
+the account runs third-party scripts or user content, and it doesn't cover the camera.
+
+**Framing (Info; a condition for the meet page).** A `<meta>` policy can't set
+`frame-ancestors`, so any site can frame the demos. For today's pages that is accepted:
+- browsers partition a framed page's storage by the top site, so a framer sees none of
+  the visitor's nickname or rooms;
+- a microphone prompt in a frame needs the framer's `allow=`, and the grant goes to the
+  framer;
+- Net Lab's one-click actions reveal nothing a page couldn't learn by running the same
+  open code.
+
+A camera page is different: a framer that delegates `allow="camera; microphone"` can
+show it under a decoy and have the visitor's own grant put them in a call they can't
+see. **Before the meet page joins the site's demos,** it must check
+`window.top !== window` and, framed, show a message, ask for no media and join no room.
+
+**Accepted:**
+- **Old pages after a deploy.** A page cached from before a deploy (Pages caches for
+  about 10 min) asks for its old `assets/<id>/`, which the deploy removed. It fails
+  closed until reloaded, and never runs a mix of old and new JS and wasm.
+- **Public Nostr and STUN by default.** Chat and Net Lab use them, as designed, and
+  their cards on the landing page say so. Net Lab takes `?relays=` from its link, so a
+  link to our site can send a visitor to a relay of the link-maker's choosing, which
+  learns their IP and room tag. Anyone in the room learns the IP over ICE anyway.
+
+**Info:**
+- **NB16-I1.** `buildSite` clears a non-empty `--out` that holds an `assets` entry, and
+  many web project directories have one. No repo directory does, and `site.sh` always
+  passes `target/site`. A stamp file the build writes would be tighter (written, not
+  merged).
+- **NB16-I2.** U+E000 and U+E001 in a doc's prose are read as the renderer's slot
+  markers, so they repeat an earlier code span or link, or print `undefined`. Not
+  exploitable: slots are whole, escaped elements in text positions (fix written, not
+  merged).
+- **NB16-I3.** For the first deploy, the `github-pages` environment should take `main`
+  only, with a required reviewer, so a dispatch from another branch can't deploy.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
