@@ -268,18 +268,18 @@ fuzz_tests() {
   return $r
 }
 
-# Build every test binary, so the run phase doesn't wait on cargo's lock. A build error shows up again, and is
-# reported, in the step that runs the tests.
+# Build every test binary, so the run phase doesn't wait on cargo's lock: 1 if any build failed. A build error
+# shows up again, and is reported, in the step that runs the tests.
 rust_build() {
-  if [ $nextest = 1 ]; then
-    cargo nextest run --workspace --release --no-run
-    cargo nextest run "${FFI_SYNC[@]}" --no-run
-    [ $strict = 0 ] || { cargo nextest run "${FUZZ[@]}" --no-run; cargo nextest run "${FFI_SYNC_DEBUG[@]}" --no-run; }
-  else
-    cargo test --workspace --release --no-run
-    cargo test "${FFI_SYNC[@]}" --no-run
-    [ $strict = 0 ] || { cargo test "${FUZZ[@]}" --no-run; cargo test "${FFI_SYNC_DEBUG[@]}" --no-run; }
+  local r=0 run=(cargo test)
+  [ $nextest = 0 ] || run=(cargo nextest run)
+  "${run[@]}" --workspace --release --no-run || r=1
+  "${run[@]}" "${FFI_SYNC[@]}" --no-run || r=1
+  if [ $strict = 1 ]; then
+    "${run[@]}" "${FUZZ[@]}" --no-run || r=1
+    "${run[@]}" "${FFI_SYNC_DEBUG[@]}" --no-run || r=1
   fi
+  return $r
 }
 
 clippy() {
@@ -366,7 +366,7 @@ else
     skip "cargo fmt" "rustfmt not installed"
   fi
   echo "==> build the Rust tests (log: $LOGS/rust-build.log)"
-  rust_build >"$LOGS/rust-build.log" 2>&1 </dev/null
+  rust_build >"$LOGS/rust-build.log" 2>&1 </dev/null || echo "==> a Rust test build failed: see $LOGS/rust-build.log"
 fi
 
 # 2. The Rust tests and the Node tests side by side, then the browser tests one at a time.
