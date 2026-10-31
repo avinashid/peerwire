@@ -65,8 +65,9 @@ answer with no number. It never sends a frame back to its source.
 Each member's messages wait, in order, until its link takes them. Past `OUTBOX_BYTES` (16 MiB) they are dropped,
 and each doc catches the member up afresh, as if it had left and joined again: it asks for what it missed, at the
 pace catching up goes. Its budgets for catching up stay as spent, so a member can't refill them by dropping its own
-messages. A member whose link has taken nothing across two of those, and for 30 s, is forgotten as if
-it left (`Event::Overflow`), and the host should close its link. It catches up when it joins again.
+messages. Our replies to its asks for docs we haven't open (the last 16) go again, since no doc would end those asks.
+A member whose link has taken nothing across two of those, and for 30 s, is forgotten as if it left
+(`Event::Overflow`), and the host should close its link. It catches up when it joins again.
 
 A hub charges what it relays for a member's frame to that member: the messages it queued, once for each member they
 go to. Values go on as this crate writes them, which can be longer than the member sent them (`1e20` is 21 digits).
