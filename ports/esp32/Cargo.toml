@@ -1,0 +1,30 @@
+[package]
+name = "peerwire-esp32"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version = "1.82"
+
+# Not a member of the repo's workspace: it builds for ESP32-C3 only, with its own toolchain (see README.md).
+[workspace]
+
+[[bin]]
+name = "peerwire-esp32"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+peerwire = { path = "../../crates/peerwire" }
+esp-idf-svc = "0.53"
+log = "0.4"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.33.5"

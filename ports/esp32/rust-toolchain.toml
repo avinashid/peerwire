@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned before two nightly regressions: from 2026-10-10 an ICE on esp-idf-svc's async traits
+# (rust-lang/rust#164093, fixed 2026-10-20), and from 2026-10-16 std no longer builds for
+# ESP-IDF against libc 0.2.191 (rust-lang/rust#164555, open).
+channel = "nightly-2026-10-05"
+components = ["rust-src"]
