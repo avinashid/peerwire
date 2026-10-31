@@ -3,9 +3,10 @@
 Scope of this document: `peerwire-core` (handshake, wire format, lanes, relay, NAT
 traversal, STUN, invites, sealed messages), the C ABI (`peerwire-ffi`), shared docs
 in Rust (`peerwire-sync`), the JavaScript glue and transport (`packages/js`), the
-React hooks (`packages/react`), and the Nostr / BroadcastChannel signaling adapters.
-It records what Peerwire defends against, what it does not, and the findings of the
-first security review (M5, NB-013) and of every review since.
+React hooks (`packages/react`), the Nostr / BroadcastChannel signaling adapters, and
+the docs and demos site built for GitHub Pages. It records what Peerwire defends
+against, what it does not, and the findings of the first security review (M5, NB-013)
+and of every review since.
 
 Status: pre-1.0, no external audit. See [SECURITY.md](../SECURITY.md).
 
@@ -56,8 +57,9 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `f6b5189` (2026-10-31): NB-052 (`1113cac`) merged in `143923f`,
-NB-019 (`fa25c82`) in `e6c9684`.** Fixes merged after `@peerwire/js` 0.2.0 and
+**Status as of main `4f681b4` (2026-10-31): NB-058 (`4609955`) merged in `2f68aa8`,
+NB-016 (`6107674`) in `888e0d6`, NB-010 (`41f4021`) in `869e4cf` and NB-010a
+(`0ac7547`) in `4f681b4`.** Fixes merged after `@peerwire/js` 0.2.0 and
 `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
@@ -116,14 +118,18 @@ NB-019 (`fa25c82`) in `e6c9684`.** Fixes merged after `@peerwire/js` 0.2.0 and
 | NB6H-1 (Low), NB6H-2, I1, I2 (Info) | **Fixed** by `c1b3878`, merged `71f5c6e`, with NB6H-2's first half by `dc156a3` (relay pacing on a monotonic clock, with clamps; the pipe asks `wait()` again each second; a held relay is sent nothing at close; `wait?()` typed). Reviewed 2026-10-29, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
 | NB6I-1 (Low) | **Fixed** by `dc156a3`, merged `6a60ef0` (a relay slowed behind its queue gives up its turn), beside the lead's close fix `cf4a0a9`. Reviewed 2026-10-29; a relay that answers OK and delivers nothing gets 1/n of the pipe (accepted), same section |
 | Half-open relay (Low) | **Fixed** by `659eb28`, merged `5ae3c4e` (NB-006j: a relay that has answered nothing for 5 s since it was sent an event gets no pipe turns while one that answers is left; its next OK gives them back), reviewed 2026-10-29; residuals NB6J-I1, I3, I4 (Info, accepted), same section |
-| NB6J-I2 (Info) | **Fixed** by `0d40053` and `f4a89a4` (NB-006k), merged `b26e869` (a socket that has heard nothing from its relay for 10 s after a non-lossy event is redialled, then after 20 s and 30 s, and no more until it answers in time; the new socket takes no pipe batch until its relay answers), reviewed 2026-10-31; NB6K-I1…I3 (Info) go with NB-058, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
-| Reconnect flap (Low) | Open (NB-058, in progress): a relay that accepts each socket and closes it is redialled every 1.06 s with no end, and each reopen sends a hello to every relay; on main before NB-006k too, same section |
+| NB6J-I2 (Info) | **Fixed** by `0d40053` and `f4a89a4` (NB-006k), merged `b26e869` (a socket that has heard nothing from its relay for 10 s after a non-lossy event is redialled, then after 20 s and 30 s, and no more until it answers in time; the new socket takes no pipe batch until its relay answers), reviewed 2026-10-31; NB6K-I1…I3 (Info) fixed by `d76ed0b` (NB-058), merged `2f68aa8`, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
+| Reconnect flap (Low) | **Fixed** by `df01209` (NB-058), merged `2f68aa8` (a relay socket that closes soon after it opens no longer gives its relay's reconnect wait back: the wait starts over only after a socket stayed open 30 s, so a relay that drops each connection is dialled, and the room says hello, at most twice a minute), reviewed 2026-10-31; residuals accepted, same section |
+| NB58-1 (Low), NB58-I1 (Info) | **Fixed** by `4609955` before NB-058 merged, so never on main (a `navigator.connection` 'change' with the same connection type no longer redials the relays; the docs say "dialled 30 s ago" where that is what counts), reviewed 2026-10-31, same section |
 | NB6L-1 (Low), NB6L-2…NB6L-6 (Info) | **Fixed** by `564e68a` and `8d6d24a`, merged `55b47c5` with the relay copy (NB-006l), before `relays: true` was published (a save whose read no relay completed stays due; a `t: 5` naming a save already made, or from a member now ignored, holds nothing back; a relay can't date `sync.at` ahead; a piece holds at most 16 frames), reviewed 2026-10-30; residuals accepted, [Docs kept on the relays](#docs-kept-on-the-signalling-relays-relays-nb-006l--nb6l-1nb6l-6) |
 | NB6B-1 (Low), NB6B-3 (Info) | **Fixed** by `834ef90` and `4d6f9a2`, merged `6c5af8f` with `peerwire-sync` (NB-006b), before any native or Godot release (a Godot host charges what it passes on to the joiner writing, and cuts that joiner, not its readers; the host's relay is fuzzed), reviewed 2026-10-30; NB6B-2 (Info) accepted, [Shared docs in Rust](#shared-docs-in-rust-peerwire-sync-nb-006b-nb-052--nb6b-1nb6b-4-nb52-1-nb52-2) |
 | NB6B-4 (Low) | **Fixed** by NB-052 (`1113cac`, before any native or Godot release; merged in `143923f`): a joiner's queue past 16 MiB is dropped and the joiner caught up afresh, not cut, so a flood no longer cuts readers. Reviewed 2026-10-31; residuals (1), (2), (3), (5) accepted, same section |
 | NB52-1, NB52-2 (Low), NB52-I1, NB52-I2 (Info) | **Fixed** by `3749a67`, `ba693d0`, `1113cac` and `da4fe8b` before NB-052 merged, so never on main (a catch-up afresh keeps the joiner's budgets; our replies to its asks for docs not open go again; one that alone queues over 8 MiB cuts the joiner), reviewed 2026-10-31, same section |
 | NB19-1, NB19-3, NB19-4, NB19-5 (Low), NB19-I1, NB19-I2 (Info) | **Fixed** by `5a3fb65` and `c173890` before NB-019 merged, so never on main, before `openInbox` was published (a read opens each content once, whichever relay states its id; JSON nested past 64 is dropped; the envelope names the app; every read asks `until`; listeners get the message's id; `since` is rounded down to 10 min), reviewed 2026-10-31, [Offline messages](#offline-messages-to-a-peerid-openinbox-nb-019--nb19-1nb19-5) |
 | NB19-2 (Low) | Accepted (the lead's call, documented in the README and `index.d.ts`): 100 drops or more in a message's second, ordered before it, hide it on that relay, same section |
+| NB10-1, NB10-2 (Low), NB10-I1, NB10-I2 (Info) | **Fixed** by `c578263` and `41f4021` before NB-010 merged, so never on main (merged `869e4cf`), before `room.call()` was published (a member's `full` turns a joiner away only when the joiner's own roster has no seat for it either; 'stream' comes for every peer once its description applies, whatever it sends; a description with more than 64 candidates is dropped; the docs say call frames on a pipe go inside it), reviewed 2026-10-31; NB10-I1a, NB10-I3 (Info) and the residuals accepted, [Calls](#calls-roomcall-nb-010-nb-010a--nb10-1-nb10-2-nb10a-1) |
+| NB10a-1 (Low) | **Fixed** by `f979384` before NB-010a merged, so never on main (merged `4f681b4`): in the meet page, a camera or microphone request still pending at Leave is turned off when it lands, reviewed 2026-10-31, same section |
+| NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; the shared origin (Low, NB10a-I1) is the repo owner's call before the first deploy, and a frame check is a condition before the meet page goes on the site; NB16-I1…I3 (Info), [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -1855,19 +1861,20 @@ and a fake clock (loopback).
 - **Tests.** `nostr_bounds` 5g, with fake sockets and a fake clock running the timers;
   `doc_catchup` (i) counts the socket that went half-open.
 
-**Info, with NB-058** (written, parked as `cbafbdf`):
+**Info, fixed by NB-058** (`d76ed0b`, merged `2f68aa8`, below):
 - **NB6K-I1.** A relay that answers the first event on each new socket in time, then
   nothing, gets its redial budget back each time: 20 redials in 10 min, with no end
-  (measured on `ce411db` with the probe; before NB-006k there were none). Fix: a timely
-  OK restores the budget only on a socket open ≥ `MAX_RECONNECT_MS` (30 s).
+  (measured on `ce411db` with the probe; before NB-006k there were none). Fixed: a
+  timely OK restores the budget only on a socket dialled `MAX_RECONNECT_MS` (30 s) or
+  more ago. In the probe, 3 redials in 10 min.
 - **NB6K-I2.** A stray "so" in the README; `index.d.ts` says `reconnects` counts closes,
   but a deaf redial counts too.
 - **NB6K-I3.** `nostr_bounds` 5g's fake relays don't echo our hello, as real ones do.
 
-**The reconnect flap (Low), open: NB-058.** Found in the NB-006k review; on main before
-it too. `dial()`'s `onopen` deletes the relay's back-off, so a socket that opens and
-closes is dialled again after `RECONNECT_MS` (1 s) every time: the doubling to
-`MAX_RECONNECT_MS` covers only dials that fail before opening. Each reopen fires
+**The reconnect flap (Low).** Found in the NB-006k review; on main before it too.
+`dial()`'s `onopen` deleted the relay's back-off, so a socket that opened and closed
+was dialled again after `RECONNECT_MS` (1 s) every time: the doubling to
+`MAX_RECONNECT_MS` covered only dials that failed before opening. Each reopen fires
 `onReconnect`, which `room.js` answers with a hello on every open relay.
 - **Repro** (fake sockets and clock, Node 22, measured again on `ce411db`): a relay that
   accepts each socket and closes it 10 ms later is dialled 56 times in 60 s, every
@@ -1877,9 +1884,41 @@ closes is dialled again after `RECONNECT_MS` (1 s) every time: the doubling to
   Relays ban an IP for too many connections; on a shared IP (a hotspot, carrier NAT)
   that hits everyone behind it. Each other relay gets an extra hello a second, a quarter
   of `RELAY_RATE`. Only the relay or the path to it can cause it, not a peer.
-- **Fix (NB-058, in progress):** `onopen` keeps the back-off, and `lostSocket()` starts
-  over at 1 s only after a socket stayed open ≥ `MAX_RECONNECT_MS`. Reopen hellos then
-  follow the back-off: at most 2 a minute at the cap.
+- **Fix:** `onopen` keeps the back-off, and `lostSocket()` starts over at 1 s only
+  after a socket stayed open ≥ `MAX_RECONNECT_MS`. Reopen hellos then follow the
+  back-off: at most 2 a minute at the cap. In the probe, 5 dials in the first minute
+  instead of 56.
+
+**NB58-1 — A connection 'change' gave the flapping relay its 1 s back (Low).** Found in
+the NB-058 review, so never on main. The page took every `navigator.connection`
+'change' as a new network and redialled each relay not open, its wait deleted. Chrome
+fires 'change' when its speed estimate moves too, the type the same, so the wait the
+flap fix keeps was thrown away each time. With a 'change' every 60, 30, 10 or 5 s, the
+probe's flapping relay was dialled, and the room said hello, 6, 10, 24 or 36 times a
+minute (57 to 60 before NB-058). Fix: only going online, a new connection type (the
+rule `room.js` uses) or the page showing again redials; a 'change' with the same type
+does nothing. Then it is 2 a minute at every rate of 'change', and a new type still
+redials at once.
+
+**NB58-I1 (Info).** "Open 30 s" was measured from the dial in `answered()` but from the
+open in `lostSocket()`. The docs now say "dialled 30 s ago" where that is what counts.
+
+**Status: fixed** by `d76ed0b` (NB6K-I1…I3), `df01209` (the flap) and `4609955`
+(NB58-1, NB58-I1), merged in `2f68aa8` (`ui/NB-058-reconnect` at `4609955`), reviewed
+2026-10-31. The tests are `nostr_bounds` 5g and 6, with fake sockets and a fake clock;
+10 of 10 mutants, the author's and two of ours, are caught on `4609955`.
+
+**Residuals (accepted):**
+- **Going online, or the page showing again,** redials at once and starts the wait
+  over, so a relay that drops each connection is dialled once more at each such event.
+- **A deaf socket's redial** leaves the relay's reconnect wait as it was.
+- **A relay that holds each socket 30 s or more** and then closes it starts the wait
+  over each time, so it is dialled about every 31 s, with a hello each time: 2 a
+  minute, as at the cap.
+- **Desktop Chrome has no connection type,** so there a 'change' never redials. A real
+  network change is still caught by 'online', the socket closing, or the deaf check.
+- **Each real change of type** (Wi-Fi to cellular and back) redials at once and starts
+  the wait over at 1 s.
 
 ### Docs kept on the signalling relays, `relays` (NB-006l) — NB6L-1…NB6L-6
 
@@ -2268,6 +2307,251 @@ fails with its fix undone.
   Rounding `since` narrows linking by timing; it doesn't remove it. Outer event
   signatures and ids aren't checked, and nothing trusts them: Noise X authenticates.
 
+### Calls, `room.call()` (NB-010, NB-010a) — NB10-1, NB10-2, NB10a-1
+
+`room.call(stream, { max })` in `@peerwire/js` (`src/call.js`) is a voice and video
+call among a room's members, each linked to every other (a mesh): `max` is 6 by default
+and 16 at most. The meet demo (`demo/meet.html`, NB-010a) is built on it. The design:
+- **Signalled over the room's link.** Each peer in the call gets an `RTCPeerConnection`
+  for media alone. Its descriptions and candidates are room frames of tag 9, JSON on
+  the reliable lane, sealed and authenticated like any room message. They act only from
+  a proven member, and `sdp` and `ice` only from one we linked. No call frame is a
+  relay event of its own: on a pipe they go inside it, sealed. Old JS peers drop tag 9.
+- **Media bound to the PeerId.** Each DTLS fingerprint travels in a description sealed
+  by that peer's session, so neither a signalling relay nor another member can sit in
+  the middle of a call.
+- **Fixed transceivers.** The smaller PeerId offers one audio and one video transceiver,
+  and descriptions follow perfect negotiation. Extra m-sections in a remote description
+  are set inactive before we answer, and only the first audio and first video
+  transceiver reach the app. A stream set later replaces tracks and never renegotiates.
+- **Caps** (`parseCall`). A frame of 64 KiB; a description of 32 KiB with at most 4
+  m-sections and 64 `a=candidate:` lines; a candidate of 512 characters starting
+  `candidate:`; a mid of 32 characters; an index from 0 to 3. Only known fields are
+  copied. A malformed frame is dropped and counted, and spends no budget.
+- **Budgets per peer** (`BUDGETS`, on `performance.now()`). `join` 6, then 1 per 5 s
+  (each makes a connection, whose ICE asks STUN); `sdp` 8, then 1 per 3 s; `ice` 64,
+  then 4 a second. Past them a frame is dropped and counted.
+- **Privacy.** `joinRoom` refuses `'relay-only'`, so a call runs under `'direct'` or
+  `'public-only'`. Under `'public-only'`, descriptions go through
+  `withoutHostCandidates` and trickled candidates through `candidateFor`, the data
+  links' MIC-1 and MIC-5 filters.
+- **No retry loop.** A peer whose media hasn't connected 20 s (`CONNECT_MS`) after its
+  link was made fails (`'no-path'`) and stays failed until one side joins again. One
+  that lost ICE gets 2 restarts in 60 s, then fails.
+- **Seats.** A member in the call tells every room member (`join`, with how long it has
+  been in, `age`), so each knows who is in (the roster). Joining with `max` in already
+  is `'full'` at once. A member is seated once a link has connected and none to a
+  member that was in before it is still connecting. One not seated gives way at
+  capacity to a member that joined before it; a seated one never does.
+
+Reviewed 2026-10-31 by reading `888e0d6..78a464b`, then the fixes `78a464b..41f4021`,
+and the meet page `c578263..97bdf7d`, then its fix `97bdf7d..f979384`. Probes ran in
+headless Chromium with fake devices, on loopback with local signalling (Node 22).
+
+**Checked and holding:**
+- `parseCall` parses JSON in a `try`, checks every cap before use and copies only known
+  fields, so no prototype key reaches a connection; `age` must be a safe integer. Its
+  m-line count is at least the number of sections Chromium splits.
+- Budgets go when a peer leaves the room, a link's timers clear when it closes, and
+  nothing is sent after we leave the call.
+- The meet page writes names and reasons as text. It asks for media only from a click;
+  mute disables a track, and turning the camera off stops it. A member's presence
+  (`{name, mic, cam}`) speaks only for its own media, and tiles are bounded by the
+  call's seats.
+
+**NB10-1 — One room member could keep every newcomer out of the call (Low).** A joiner
+not yet seated left on a `full` from any roster member claiming an earlier start, and it
+is never seated when that `full` lands: `full` answers its `join` in one hop, while a
+seat needs an answer, ICE and DTLS (up to 20 s against a member that never answers). So
+any member, which is anyone with the invite, could answer each joiner `full` and lock
+the call to whoever was in it. The joiner saw `'full'` and couldn't tell who sent it.
+In the probe, a joiner got `'full'` 19 ms after calling, both links still connecting.
+Fix: a `full` counts only when the joiner's own roster has no seat for it either
+(`roster.size >= max`, the test `start()` makes). The joiner then stays and connects (in
+45 ms in the probe), and a claimed `age` matters only at capacity.
+
+**NB10-2 — A member that sent nothing got our media unseen (Low).** `'stream'` came
+only from `ontrack`, which a browser fires only for m-sections the remote sends on. A
+modified client with recvonly transceivers got every member's audio and video, yet no
+member got `'stream'` for it, and `call.stream(peer)` stayed null: an app drawing tiles
+on `'stream'`, as the README did, showed nobody there. In the probe it decoded 88 or 89
+of a member's video frames and about 300 audio packets in 6 s, unseen. Fix: `show()`
+builds the stream from the first audio and first video transceiver's `receiver.track`
+once the peer's description applies, whatever it sends, and the README draws a tile on
+the first `'state'`.
+
+**NB10a-1 — A camera asked for before Leave came on after it (Low).** The meet page's
+`acquire()` awaited `getUserMedia`, then added what it got to whatever stream was
+current. Leave wasn't disabled meanwhile, and `stopMedia()` put in a new stream, so a
+grant that landed after Leave turned the camera on behind "Your camera and microphone
+are off", and Rejoin sent it to the call. In the probe (`getUserMedia` held until after
+Leave), the camera was live 2.5 s after Leave and went out on Rejoin. Fix: `stopMedia()`
+bumps `mediaEpoch`, and `acquire()` stops what it got if the epoch moved.
+
+**Status: fixed** by `c578263` (NB10-1, NB10-2, NB10-I2) and `41f4021` (NB10-I1) before
+NB-010 merged, so never on main (`backend/NB-010-calls` at `41f4021`, merged in
+`869e4cf`), and by `f979384` (NB10a-1) before NB-010a merged (`ui/NB-010a-meet` at
+`0ac7547`, merged in `4f681b4`). Reviewed 2026-10-31. Each fix has a test: `call.mjs`,
+`call_browser.mjs` part 4, and `meet.mjs` with `getUserMedia` held past Leave. None of
+the three probes reproduces on the fixed heads.
+
+**Info:**
+- **NB10-I1 (fixed).** The `ice` budget didn't count candidates inside a description,
+  and 32 KiB holds about 760 minimal `a=candidate` lines (*theoretical*: 32,768 / 43
+  bytes). A description with more than 64 is now dropped and counted. 64 leaves room
+  for one made again after a rollback on a host with many interfaces.
+- **NB10-I1a (accepted).** With that cap, a member can add remote candidates to our
+  connection at most 64 (the `ice` burst) + 8 × 64 (the `sdp` burst) = 576 at once,
+  then 4/s + 64 / 3 s ≈ 25 a second (*theoretical*, from `BUDGETS` and the cap). Before
+  the cap it was about 8 × 760 at once. The browser paces its connectivity checks, so
+  the STUN it sends doesn't grow with that count: no amplification.
+- **NB10-I2 (fixed).** The docs said nothing went through the signalling relays. That
+  holds on a direct or member-relayed link, not on a pipe, where call frames go inside
+  it, sealed, and a relay sees their sizes and timing (a burst of descriptions when
+  someone joins). The header and README now say so.
+- **NB10-I3 (accepted).** A member with several PeerIds in the room (the room key is
+  all it takes) can send `join` from each and fill the roster, so every newcomer gets
+  `'full'` at once. Members are trusted alike under the room key.
+
+**Residuals (accepted):**
+- **Trust between members.** Any member can refuse to link a newcomer (that pair fails
+  `'no-path'`) or fill the call with its own PeerIds (NB10-I3), but can't take a linked
+  member's seat. A claimed `age` counts only at capacity and between members not
+  seated.
+- **The last seat.** Two joining for the last seat at the same moment may both go, or
+  one stay unlinked from a member that turned it away (that pair fails `'no-path'`).
+- **Calls that meet.** After a room splits and joins again, its two calls stay partial
+  meshes, each member linking at most `max − 1`.
+- **No TURN.** A pair with no direct path fails `'no-path'` after 20 s and isn't retried
+  until one of them joins again. An app can pass a TURN server in `iceServers`.
+- **Addresses.** Under `'direct'` with a microphone or camera grant, call members get
+  every local address, as data links do. Under `'public-only'`, a member on the same
+  network can still see a local address as a peer-reflexive candidate from our ICE
+  checks, as for data links ("Not covered" in
+  [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043)).
+- **What the room learns.** Every room member, in the call or not, learns who is in it.
+  A relay carrying a pipe sees the sizes and timing of the call frames inside it.
+- **The meet page on the public site.** It isn't there yet. Before it goes, see the
+  frame check and NB10a-I1 under
+  [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1).
+
+### The docs and demos site (NB-016) — NB16-1
+
+`scripts/site.sh` builds a static site into `target/site/`: a landing page, the README,
+the package READMEs and `docs/*.md` rendered to HTML by our own renderer
+(`scripts/site/markdown.mjs`), and the demos that need no server of ours (index, chat,
+poll, arena, Net Lab). `.github/workflows/pages.yml` deploys it to GitHub Pages at
+`avinashid.github.io/peerwire/`, run by hand only. It hasn't been deployed. The design:
+- **No third-party code at runtime.** No CDN, font, analytics or remote image; the
+  README's badges become text.
+- **The policy is a `<meta>` CSP.** Pages sends no headers we choose, so each page
+  carries its own: the demos get `docker/examples-nginx.conf`'s, less
+  `frame-ancestors` (a `<meta>` policy can't set it), and the other pages allow no
+  script. No page sends a referrer.
+- **Versioned assets.** Every module, the wasm and the stylesheet live under
+  `assets/<id>/`, `<id>` being 12 hex digits of a SHA-256 of their contents. A demo
+  page's `<script src>` is the only rewrite.
+- **Links.** The build fails on any link that isn't relative, http(s), mailto, or a `#`
+  anchor that exists. A link to a repo file that isn't rendered goes to GitHub.
+- **Workflow.** `workflow_dispatch` only, with no inputs. `permissions: {}`, then
+  `contents: read` for the build job (with `persist-credentials: false`) and only
+  `pages: write` and `id-token: write` for the deploy job, in the `github-pages`
+  environment.
+
+Reviewed 2026-10-31 by reading `2f68aa8..47ce300`, then the fix `6107674`, with one
+probe of the renderer (Node 22). Nothing was sent to Pages or GitHub.
+
+**Checked and holding:**
+- The renderer escapes text, code, fence languages, heading ids, table cells, alerts and
+  link text (`& < > "`), and attributes always use `"`. Its slots are whole elements,
+  replaced in one pass, so nothing reaches an attribute. `safeUrl` runs after
+  backslash-unescaping, and entities pass only as text, so `javascript&#58;…` becomes a
+  relative path. A `<br` followed by anything but `\s*/?>` stays text.
+- `link()` turns every link that isn't http(s), mailto or `#` into a repo file, or
+  throws, so `//host`, and `\\host` (which browsers read as `//host`), can't leave the
+  site.
+- The demo policy sits right after `<meta charset>`, before every `<style>` and the one
+  module script, and the build throws on any other script.
+- Invite secrets ride in the fragment (`#key=`, `#room=`, chat's `#id`), so neither
+  Pages nor its CDN sees them in a request.
+- `site.sh --serve` binds 127.0.0.1.
+
+**NB16-1 — Third-party actions built what Pages would serve (Low).** The build job ran
+`dtolnay/rust-toolchain@stable` (a branch) and `Swatinem/rust-cache@v2` (a movable
+tag), and its output was deployed as is. Whoever moved either ref could choose the JS
+and wasm served to every visitor, with no commit in this repo, as happened to
+`tj-actions/changed-files`' tags in March 2025. rust-cache also restored compiled
+dependencies that other runs wrote. Fix: the toolchain comes from the runner image's
+rustup (`rustup toolchain install stable --profile minimal --target
+wasm32-unknown-unknown`), with no build cache, so only GitHub's own `actions/*` are
+left. `site_build.mjs` fails on any other `uses:`, or one not on a major version or a
+full commit.
+
+**Status: fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed.
+Reviewed 2026-10-31 by reading the workflow. The guard's 7 mutants are all caught.
+
+**The shared origin (Low, the repo owner's call before the first deploy).**
+`avinashid.github.io` is one origin for every Pages site of the account. `github.io` is
+on the Public Suffix List, so other accounts' sites are kept apart, but any script on
+any of this account's sites can:
+- read the demos' storage: Net Lab's last 6 named rooms (a room's name is its secret)
+  and the nickname;
+- `window.open` a demo, which is same-origin, and script it: read the key from
+  `location.hash`, or speak in the room as the visitor;
+- if the account ever has a user site (a repo named `avinashid.github.io`; there is
+  none today), register a service worker at scope `/` that serves its own JS for every
+  `/peerwire/` URL and outlives any fix.
+
+**NB10a-I1 (Info), the camera.** Browsers keep a camera or microphone grant per origin.
+Once the meet page is on the site, a visitor's "allow" there is a grant to
+`avinashid.github.io`, so every Pages site of the account could then use that visitor's
+camera or microphone without asking again, for as long as the browser keeps the grant.
+
+**Fix, before the first deploy: an origin of the site's own.** A custom subdomain on a
+domain the owner holds is the one choice no other site shares: an organisation's
+`<org>.github.io` is still shared by that organisation's other Pages sites. It keeps the
+demos' storage, scripting, service workers and media grants apart from everything else
+the account publishes, and the site needs no change, since its URLs are all relative.
+With a custom domain, verify it in the account's Pages settings and enforce HTTPS, and
+remove its DNS record if the site is ever taken down, so no other Pages site can claim
+it. Recording the shared origin as accepted instead holds only while nothing else on
+the account runs third-party scripts or user content, and it doesn't cover the camera.
+
+**Framing (Info; a condition for the meet page).** A `<meta>` policy can't set
+`frame-ancestors`, so any site can frame the demos. For today's pages that is accepted:
+- browsers partition a framed page's storage by the top site, so a framer sees none of
+  the visitor's nickname or rooms;
+- a microphone prompt in a frame needs the framer's `allow=`, and the grant goes to the
+  framer;
+- Net Lab's one-click actions reveal nothing a page couldn't learn by running the same
+  open code.
+
+A camera page is different: a framer that delegates `allow="camera; microphone"` can
+show it under a decoy and have the visitor's own grant put them in a call they can't
+see. **Before the meet page joins the site's demos,** it must check
+`window.top !== window` and, framed, show a message, ask for no media and join no room.
+
+**Accepted:**
+- **Old pages after a deploy.** A page cached from before a deploy (Pages caches for
+  about 10 min) asks for its old `assets/<id>/`, which the deploy removed. It fails
+  closed until reloaded, and never runs a mix of old and new JS and wasm.
+- **Public Nostr and STUN by default.** Chat and Net Lab use them, as designed, and
+  their cards on the landing page say so. Net Lab takes `?relays=` from its link, so a
+  link to our site can send a visitor to a relay of the link-maker's choosing, which
+  learns their IP and room tag. Anyone in the room learns the IP over ICE anyway.
+
+**Info:**
+- **NB16-I1.** `buildSite` clears a non-empty `--out` that holds an `assets` entry, and
+  many web project directories have one. No repo directory does, and `site.sh` always
+  passes `target/site`. A stamp file the build writes would be tighter (written, not
+  merged).
+- **NB16-I2.** U+E000 and U+E001 in a doc's prose are read as the renderer's slot
+  markers, so they repeat an earlier code span or link, or print `undefined`. Not
+  exploitable: slots are whole, escaped elements in text positions (fix written, not
+  merged).
+- **NB16-I3.** For the first deploy, the `github-pages` environment should take `main`
+  only, with a required reviewer, so a dispatch from another branch can't deploy.
+
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
 `@peerwire/react` (`packages/react`, 0.1.0 published from `dec1554`) wraps a room in
@@ -2642,7 +2926,8 @@ and what it accepted. Values are from main `7b716a2`.
     second) and is held for 1 s, doubling to 30 s. One that bans us is sent nothing for
     30 s, doubling to 10 min, and that starts over after 10 quiet minutes
     ([Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1)).
-  - Closed sockets are redialled from 1 s, doubling to 30 s.
+  - Closed sockets are redialled from 1 s, doubling to 30 s, starting over only after a
+    socket open 30 s (NB-058).
   - Residual: JS checks neither the event id hash nor the signature, so a relay can
     present one event under many ids. Offers are sealed and hellos proven, and
     replays fall under SEC-6, so the cost is duplicate work. Rust checks the id.
