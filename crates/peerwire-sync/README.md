@@ -62,14 +62,25 @@ answer with no number. It never sends a frame back to its source.
 
 ## Memory
 
-Each member's messages wait, in order, until its link takes them. Past `OUTBOX_BYTES` (16 MiB) the member is
-forgotten as if it left (`Event::Overflow`), and the host should close its link. It catches up when it joins again.
+Each member's messages wait, in order, until its link takes them. Past `OUTBOX_BYTES` (16 MiB) they are dropped,
+and each doc catches the member up afresh, as if it had left and joined again: it asks for what it missed, at the
+pace catching up goes. Its budgets for catching up stay as spent, so a member can't refill them by dropping its own
+messages. Our replies to its asks for docs we haven't open (the last 16) go again, since no doc would end those asks.
+A member whose link has taken nothing across two of those, and for 30 s, is forgotten as if it left
+(`Event::Overflow`), and the host should close its link. It catches up when it joins again.
+
+What a resync queues isn't held to `OUTBOX_BYTES`: up to about 1.5 MB for each doc open at its caps (theoretical:
+its most dead ranges and writers, and an ask of `MESSAGE_BYTES`). A member whose resync alone queues more than half
+of the cap is forgotten too (`Event::Overflow`), as every frame queued after would resync it again. Half a dozen such
+docs open do that, so keep the docs a hub has open few.
 
 A hub charges what it relays for a member's frame to that member: the messages it queued, once for each member they
 go to. Values go on as this crate writes them, which can be longer than the member sent them (`1e20` is 21 digits).
 Past `RELAY_BYTES` (8 MiB) beyond what refilled at `RELAY_BYTES_PER_S` (64 KiB/s), the member writing is forgotten
 the same way, not the members it would fill the queues of. Its budget is kept when it leaves, so coming back doesn't
-refill it.
+refill it. The frame that overdraws a budget still goes on, though, and each key has its own: a member that keeps
+coming back, or a run of fresh keys, has up to a doc's worth relayed each time. That can fill a slow member's queue,
+which costs it a catch-up, not its link.
 
 ## The copy
 
@@ -87,8 +98,10 @@ it, and `Options::copy` starts from it when the doc opens again. Sealing it at r
   - doc.js applies the frames of a Rust session (`rust.json`).
 - The frame and JSON corpora check that every frame and text is kept or dropped as doc.js and V8 keep or drop it.
 - The fuzzers in `src/fuzz.rs` feed mutated frames, JSON and copies.
+- [`tests/flood.rs`](tests/flood.rs): a member floods a hub's seven readers with fresh keys, or by coming back,
+  while their links are slow or take nothing. No reader is cut, and each then holds what the hub holds.
 - `peerwire-sim/tests/sync.rs` checks convergence on simulated links:
   - loss, duplicates and jitter;
   - partitions and a late joiner;
   - frames in any order, any number of times;
-  - a star with a hub and a stalled member.
+  - a star with a hub, and a member whose link takes nothing.

@@ -22,8 +22,9 @@
 //!
 //! Shared docs ([`Session::open_doc`]) are peerwire-sync's, the frames of `@peerwire/js` `room.doc()`. Joiners
 //! link to the host alone, so the host runs each doc as the hub of the star: what a joiner's frame adds goes on
-//! to the others. One whose link stalls with OUTBOX_BYTES waiting for it is disconnected, and so is one that has
-//! the host relay more of its frames than RELAY_BYTES, then RELAY_BYTES_PER_S.
+//! to the others. One with OUTBOX_BYTES waiting for it has them dropped and is caught up afresh; one whose link
+//! took nothing for 30 s across two of those is disconnected, and so is one that has the host relay more of its
+//! frames than RELAY_BYTES, then RELAY_BYTES_PER_S.
 
 use peerwire::{
     Event, Failure, Invite, Lane, MapProtocol, NatType, Node, NostrSignaling, PeerId, PeerStats, PortMapping, Privacy,
@@ -787,8 +788,9 @@ impl Session {
         self.doc_events.pop_front()
     }
 
-    /// Runs the docs' timers and sends their frames; a member the docs forgot (its frames passed OUTBOX_BYTES
-    /// waiting, or it had the host relay past RELAY_BYTES) is disconnected. It catches up when it joins again.
+    /// Runs the docs' timers and sends their frames; a member the docs forgot (its link took nothing for 30 s while
+    /// OUTBOX_BYTES piled up, or it had the host relay past RELAY_BYTES) is disconnected. It catches up when it joins
+    /// again.
     fn pump_docs(&mut self) {
         let now = self.doc_time();
         let Session { docs, node, doc_events, .. } = self;

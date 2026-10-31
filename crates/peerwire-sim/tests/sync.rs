@@ -2,17 +2,16 @@
 //! deletes, set adds and deletes, log appends) on real endpoints over simulated links that lose, duplicate and
 //! delay packets (the reliable lane hides that); links are cut and made again (a partition healed) and a member
 //! joins late. Without the lane, doc frames delivered in any order and any number of times converge too. A star,
-//! every member linked to the host alone as in a Godot room, converges through a hub, and a member whose link
-//! stalls is cut before what waits for it fills the host's memory.
+//! every member linked to the host alone as in a Godot room, converges through a hub; what waits for a member
+//! whose link takes nothing never fills the host's memory, and the member is cut only once it has taken nothing
+//! for 30 s.
 
 use peerwire_core::{Config, Event as Net, Instant, Lane, PeerId, SendError};
 use peerwire_sim::{NetConfig, Sim};
 use peerwire_sync::{DocId, Docs, Event, Kind, Options, Route, MESSAGE_BYTES, OUTBOX_BYTES, RELAY_BYTES};
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
-use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
 use std::time::Duration;
 
 const KEYS: [&str; 6] = ["k0", "k1", "k2", "ключ", "😀", ""];
@@ -359,10 +358,13 @@ fn frames_in_any_order_and_any_number_of_times_converge() {
 }
 
 /// A Godot room: every member linked to the host alone, which runs the doc as a hub. Members' writes reach each
-/// other through it. Then one member's link stalls (none of its packets get through) while the host writes a
-/// lot: the host never holds more than OUTBOX_BYTES for it, cuts it, and once it links again it catches up.
+/// other through it. Then the host's link to one member takes none of its doc messages while the host writes a
+/// lot: the host never holds more than OUTBOX_BYTES for it. It drops what waits and catches the member up afresh
+/// (a resync) rather than cutting it, and cuts it only once its link has taken nothing for 30 s and two resyncs.
+/// The host's docs hear the time only from members' frames and due timers, so the 30 s can run later. Once it
+/// links again it catches up.
 #[test]
-fn a_star_converges_through_its_hub_and_a_stalled_member_is_cut() {
+fn a_star_converges_through_its_hub_and_a_member_taking_nothing_is_cut() {
     let mut r = Room::new(5, NetConfig::default(), 11, Some(0));
     for i in 1..5 {
         r.link(i, 0);
@@ -376,25 +378,29 @@ fn a_star_converges_through_its_hub_and_a_stalled_member_is_cut() {
     r.pump(ms(5000));
     assert!(r.converged(&[0, 1, 2, 3, 4]));
     assert!(!r.held(0).contains("[]\n[]"), "they wrote");
-    // Member 4 stalls: its packets are dropped, so the host's link to it takes nothing more.
-    let stalled = Rc::new(Cell::new(true));
-    let (addr, s) = (r.sim.addr(4), stalled.clone());
-    r.sim.hook = Some(Box::new(move |from, _, _| !(s.get() && from == addr)));
-    // 30 MB, more than the host's link (4 MiB) and its outbox (16 MiB) can hold for it, well within the 30 s a
-    // silent link takes to time out. The host's own writes: a member's would be cut first (RELAY_BYTES).
-    for _ in 0..60 {
+    // The host's link to member 4 takes nothing more, though the link is up (a silent one would time out in
+    // 30 s). The host writes 2 MB/s, its own writes: a member's would be cut first (RELAY_BYTES).
+    let stuck = r.sim.peer_id(4);
+    let start = r.sim.now;
+    r.pace = Some(Pace { from: 0, to: stuck, bytes_per_s: 0, since: start, sent: 0 });
+    let mut dropped = 0;
+    while r.overflows.is_empty() && r.sim.now < start + ms(90_000) {
+        let before = r.docs[0].queued(&stuck);
         for _ in 0..10 {
             r.write(0, true);
         }
         r.pump(ms(250));
+        dropped += usize::from(r.docs[0].queued(&stuck) < before);
     }
-    assert_eq!(r.overflows, [(0, r.sim.peer_id(4))]);
+    let cut = r.sim.now - start;
+    assert_eq!(r.overflows, [(0, stuck)]);
+    assert!(cut >= ms(30_000) && cut < ms(60_000) && dropped >= 2, "cut after {cut:?}, {dropped} resyncs");
     assert!(r.most_queued <= OUTBOX_BYTES + MESSAGE_BYTES, "{} bytes waited", r.most_queued);
-    assert_eq!(r.docs[0].queued(&r.sim.peer_id(4)), 0);
+    assert_eq!(r.docs[0].queued(&stuck), 0);
     r.pump(ms(2000));
     assert!(r.converged(&[0, 1, 2, 3]));
     // It comes back.
-    stalled.set(false);
+    r.pace = None;
     r.pump(ms(1000));
     r.link(4, 0);
     r.pump(ms(20_000));
