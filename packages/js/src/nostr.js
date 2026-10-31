@@ -16,8 +16,9 @@
 //   room members without changing who can join.
 //
 // Same interface as BroadcastSignaling: id, hello(meta), onHello, send(to, body, { lossy }),
-// onMessage(fn), close(). A doc's copy on the relays (relays.js) also reads stored events with
-// query(filter) and writes them with store(ev, urls), behind signalling.
+// onMessage(fn), close(). A doc's copy on the relays (relays.js) and an inbox (inbox.js) also
+// read stored events with query(filter) and write them with store(ev, urls), behind signalling.
+// An inbox's own signalling (`listen: false`) subscribes to nothing, so no relay sees our peer tag.
 
 import { isPeerId } from './peerwire.js';
 
@@ -103,11 +104,12 @@ export const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const sha256 = async (bytes) => new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
 
 export class NostrSignaling {
-  constructor(pw, endpoint, { room, relays = DEFAULT_RELAYS } = {}) {
+  constructor(pw, endpoint, { room, relays = DEFAULT_RELAYS, listen = true } = {}) {
     this.pw = pw;
     this.ep = endpoint;
     this.id = endpoint.id;
     this.room = room;
+    this.listen = listen;
     this.key = pw.nostrKeypair();
     this.pubkey = hex(this.key.pubkey);
     this.handlers = [];
@@ -167,7 +169,7 @@ export class NostrSignaling {
       this.retry.delete(url);
       // Since a little before now: what was published while we were away has gone.
       const filter = { kinds: [KIND], '#p': [this.myTag, this.roomTag], since: Math.floor(Date.now() / 1000) - 30 };
-      ws.send(JSON.stringify(['REQ', this.sub, filter]));
+      if (this.listen) ws.send(JSON.stringify(['REQ', this.sub, filter]));
       opened();
       if (again) {
         this.stats.reconnects++;
@@ -503,9 +505,10 @@ export class NostrSignaling {
     if (ws) this.pump(ws);
   }
 
-  // Reads stored events: `filter` (NIP-01) to every open relay that hasn't banned us, under a
-  // subscription of its own, closed at the relay's EOSE or after `ms`. `keep(ev)` names the slot an
-  // event goes in, or null to drop it (it gets the event as the relay sent it: any JSON value), and
+  // Reads stored events: `filter` (NIP-01; or a function of the relay's url giving that relay's) to
+  // every open relay that hasn't banned us, under a subscription of its own, closed at the relay's EOSE
+  // or after `ms`. `keep(ev, url)` names the slot an event from the relay at `url` goes in, or null to
+  // drop it (it gets the event as the relay sent it: any JSON value), and
   // each relay keeps the newest event of each slot, by created_at and then the lower id, as relays
   // replace them: so a relay that sends more than asked costs a check each, not memory. Resolves to
   // a Map: relay url -> { complete, events: Map(slot -> event) }, `complete` once that relay sent
@@ -524,7 +527,7 @@ export class NostrSignaling {
         const timer = setTimeout(() => read.end(false), ms);
         const read = {
           take: (ev) => {
-            const slot = keep(ev);
+            const slot = keep(ev, ws.relayUrl);
             if (slot === null || slot === undefined) return;
             const old = r.events.get(slot);
             if (!old || ev.created_at > old.created_at || (ev.created_at === old.created_at && ev.id < old.id)) r.events.set(slot, ev);
@@ -541,7 +544,7 @@ export class NostrSignaling {
           },
         };
         (ws.queries ??= new Map()).set(sub, read);
-        ws.send(JSON.stringify(['REQ', sub, filter]));
+        ws.send(JSON.stringify(['REQ', sub, typeof filter === 'function' ? filter(ws.relayUrl) : filter]));
       }));
     }
     await Promise.all(reads);

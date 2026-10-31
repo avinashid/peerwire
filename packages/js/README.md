@@ -372,6 +372,37 @@ doc.on('sync', ({ source, at }) => {
 - **Not yet:** collaborative text (character sequences), docs in Rust and Godot, and moving a relay copy to new
   keys (to cut off old links without a new roomId).
 
+## Offline messages
+
+An inbox leaves a message for one peer, by its PeerId, while that peer is offline: it gets the message the next time
+it opens its inbox. No room is needed, nor anyone online: the message is sealed to the recipient and left on the
+Nostr relays (kind 30078, expiring after its `ttl`, 7 days at most).
+
+```js
+import { openInbox } from '@peerwire/js';
+
+const inbox = await openInbox({ appId: 'my-app', secret, persist: true }); // secret: room.endpoint.secret(), kept
+inbox.on('message', (data, from, { kind, at }) => show(from, data)); // reads now, then every minute
+await inbox.send(friendId, { text: 'call me' }); // resolves to the number of relays that took it
+```
+
+- **What a relay sees.** Neither recipient nor sender. Each message is sealed to the recipient's PeerId (Noise X: a
+  fresh ephemeral key, the sender's PeerId inside and authenticated), signed by a fresh Nostr key, tagged only with
+  the app (a hash of the `appId`) and padded to 256 bytes. Every inbox of the app reads every message of the app and
+  opens only its own, so a relay can't tell whose a message is, or which go together. It does see the IP of whoever
+  leaves or reads messages, when, and how many the app holds.
+- **Once.** A message is delivered once, oldest first, to every listener; with `persist` (`true` for IndexedDB, or a
+  store as `room.doc` takes) across sessions too. Without it, a message still on the relays comes again in each new
+  session. `persist` needs `secret`: what it stores is sealed under a key from it.
+- **Bounds.** 16 KiB a message (`send` throws RangeError past it). Reading costs one X25519 for each message of the
+  app: a check opens at most 100 a relay, the newest first, and reads on down at the next, so a flood of messages
+  delays yours but doesn't make a check longer. More than 100 in one second on a relay are read in part. A message
+  dated more than 15 minutes ahead of our clock, sent for longer than 7 days, or expired, is dropped; one whose
+  sender's clock runs more than 15 minutes behind may be missed by an inbox that was reading when it was sent.
+- **Trust.** Anyone can leave a message for any PeerId. `from` says who sealed it, and nobody else can read it: check
+  `from`, and every field you render. A relay may keep a message for less than its `ttl`, or not at all.
+- **Not yet:** messages over 16 KiB, and inboxes in Rust and Godot.
+
 ## Using with React
 
 [`@peerwire/react`](../react/README.md) does all of this for you, with TypeScript types: `<RoomProvider>`, and
@@ -450,6 +481,7 @@ function Chat() {
 | `src/index.js` | The package entry: `joinRoom` and everything below. |
 | `src/room.js` | `joinRoom` and `Room`: mesh, presence, message framing, backpressure. |
 | `src/doc.js` | `room.doc()`: shared documents (maps, sets, logs), a delta-state CRDT, catch-up, limits on member data. |
+| `src/inbox.js` | `openInbox`: offline messages to one PeerId, sealed and left on the Nostr relays. |
 | `src/proof.js` | Room key and HMAC proofs (hello, offer, link), compatible with Rust's; `randomRoomId()`. |
 | `src/peerwire.js` | Loads the module; `Endpoint` (connect, send, events, stats, seal/open) and Nostr key helpers. Browser and Node. |
 | `src/webrtc.js` | `WebRtcTransport`: one negotiated, unordered, no-retransmit DataChannel per peer. `BroadcastSignaling` for tabs of one browser. |
@@ -691,6 +723,13 @@ Run these with Node and the Playwright install on this host:
   behind signalling, goes one a second per relay, and resolves on the OK, a refusal (after
   sending one refused for its rate again), a ban, 30 s without an answer, 120 s waiting,
   or `close()`. No relays.
+- `node packages/js/test/inbox.mjs`: `openInbox` on fake strfry-like relays and a fake clock. A recipient
+  offline when a message was left gets it once (from three relays, and not again in a later session); a
+  non-recipient opens it and reads nothing; no PeerId, peer tag or `p` tag on a relay or in a read, a fresh signer
+  for each message, sizes padded. Expired, too-far-ahead and too-long messages, envelopes that don't check and
+  duplicates are dropped. Under a flood a check opens at most 100 messages a relay and the message still comes,
+  reading down; relays that ignore `limit` or the filter; past 4096 delivered, the soonest to expire is forgotten
+  first; the saved state is sealed. End to end over `NostrSignaling` with fake sockets. No relays.
 - `node packages/js/test/rust_hello.mjs`: a Rust or Godot member's room hello, sealed with
   the nonce fixed, is the same base64 that `sealRoom` makes (the vector Rust asserts too),
   and opens to Rust's exact JSON. A `Room` that hears it through `NostrSignaling` doesn't

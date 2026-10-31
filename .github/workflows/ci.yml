@@ -67,6 +67,7 @@ jobs:
       - run: node packages/js/test/room_node.mjs
       - run: node packages/js/test/peer_id.mjs
       - run: node packages/js/test/nostr_bounds.mjs
+      - run: node packages/js/test/inbox.mjs
       - run: node packages/js/test/rust_hello.mjs
       - run: node packages/js/test/rust_doc.mjs
       - run: node packages/js/test/room_proof.mjs

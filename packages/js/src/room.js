@@ -90,7 +90,15 @@ const tooLarge = (f) => new RangeError(`message of ${f.length - 1} bytes is too 
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-const modules = new Map(); // wasm source -> Promise<Peerwire>, shared by rooms
+const modules = new Map(); // wasm source -> Promise<Peerwire>, shared by rooms and inboxes
+
+// The Peerwire module from `wasm` (a URL, path or bytes; the package's own by default), loaded once.
+export async function peerwireModule(wasm) {
+  const src = wasm ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url);
+  const key = String(src);
+  if (!modules.has(key)) modules.set(key, loadPeerwire(src).catch((e) => (modules.delete(key), Promise.reject(e))));
+  return modules.get(key);
+}
 
 function frame(tag, body) {
   const b = new Uint8Array(body.length + 1);
@@ -160,10 +168,7 @@ export async function joinRoom({
   if (privacy !== 'direct' && privacy !== 'public-only') throw new TypeError(`joinRoom privacy must be 'direct' or 'public-only', not ${privacy}`);
   if (!['auto', 'peers', 'off'].includes(fallback)) throw new TypeError(`joinRoom fallback must be 'auto', 'peers' or 'off', not ${fallback}`);
   presenceFrame(presence);
-  const src = wasm ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url);
-  const key = String(src);
-  if (!modules.has(key)) modules.set(key, loadPeerwire(src).catch((e) => (modules.delete(key), Promise.reject(e))));
-  const pw = await modules.get(key);
+  const pw = await peerwireModule(wasm);
   const endpoint = pw.endpoint({ secret });
   const name = `${appId}/${roomId}`;
   const proof = await RoomProof.create(name);
