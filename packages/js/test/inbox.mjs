@@ -450,14 +450,15 @@ const all = (w) => w.relays.flatMap((r) => [...r.held.values()]);
   w.relays[0].put(craft({ env: envelope(NSB, 1, rand(16), old, old + 86400, text('under the flood')), from: alice.ep, to: bob.id, at: old }));
   for (const r of w.relays) for (let i = 1; i <= 250; i++) r.put(craft({ content: b64(rand(200)), at: old + i }));
   bob.on('message', (data) => bob.got.push(data));
-  // 20 minutes between checks, and a message left after the first: past the reads down, read from where they began.
+  // 30 minutes between checks, and a message left after the first: past the reads down, read from where they began.
+  // (A mark at the second check, less SKEW_S and rounded down to SINCE_STEP_S, would be over 5 minutes past it.)
   const opens = [];
   for (let i = 0; i < 8 && bob.got.length < 2; i++) {
     const o = bob.opens;
     await bob.check();
     opens.push(bob.opens - o);
     if (!i) await alice.send(bob.id, 'late');
-    w.now += 1200_000;
+    w.now += 1800_000;
   }
   check(bob.got.join() === 'under the flood,late' && opens.length === 4 && opens.every((n) => n <= 3 * MAX_READ),
     `750 junk drops: delivered at check 3, one left meanwhile at check 4; opens per check ${opens}`);
