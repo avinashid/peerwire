@@ -670,6 +670,10 @@ mod tests {
             for _ in 0..drops {
                 resync(&mut da, b);
             }
+            // No dot is dead: our answer's end and our ask alone.
+            let sent = waiting(&da, &b);
+            assert!(sent.len() == 2 && sent[0].ends_with(r#""i":0,"n":0,"end":1}"#), "{sent:?}");
+            assert!(sent[1].starts_with(r#"{"d":"board","t":2,"#), "{sent:?}");
             let now = settle(&mut da, &mut db, now);
             assert_eq!(held(&mut db, id), held(&mut da, id), "{drops} drop(s)");
             assert_eq!(db.doc(id).unwrap().entries(Kind::Set, "s").len(), 300);
