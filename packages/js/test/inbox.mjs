@@ -745,6 +745,11 @@ for (const n of [MAX_READ - 1, MAX_READ]) {
     closed = e;
   }
   check(closed instanceof Error && /closed/.test(closed.message), `send() once closed throws: ${closed?.message}`);
+  const held = w.relays[0].held.size;
+  const sending = alice.send(bob.id, 'closed while sending');
+  alice.close();
+  closed = await sending.then(() => null, (e) => e);
+  check(/closed/.test(closed?.message) && w.relays[0].held.size === held, `nor if closed while send() starts: ${closed?.message}`);
   w.done();
 }
 
