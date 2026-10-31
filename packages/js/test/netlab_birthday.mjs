@@ -11,7 +11,7 @@
 // no punch: a click or the console logs it as skipped, and its invite gets an abort.
 //
 //   node packages/js/test/netlab_birthday.mjs [screenshot-prefix]
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -19,8 +19,7 @@ const PW = process.env.PLAYWRIGHT ?? '/home/ubuntu/.local/share/playwright-tools
 const { chromium } = await import(PW);
 const shot = process.argv[2];
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 let browser;
 let failed = 0;
 const ok = (cond, what) => {
@@ -28,7 +27,6 @@ const ok = (cond, what) => {
   if (!cond) failed++;
 };
 try {
-  await new Promise((r) => setTimeout(r, 600));
   // The route line is logged from a 1 s render timer in each tab: keep background tabs'
   // timers running (as arena.mjs), or a loaded host can starve them past the waits.
   browser = await chromium.launch({

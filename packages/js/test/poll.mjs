@@ -4,7 +4,7 @@
 //
 //   node packages/js/test/poll.mjs [tabs=3] [screenshot.png]
 
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -14,12 +14,10 @@ const tabs = Number(process.argv[2] ?? 3);
 const shot = process.argv[3];
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LEAVE_MS = 45000; // the core's 30 s idle_timeout plus margin for a loaded host
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 let browser;
 let ok = false;
 try {
-  await new Promise((r) => setTimeout(r, 600));
   browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const ctx = await browser.newContext({ viewport: { width: 800, height: 620 } });
   const pages = [];

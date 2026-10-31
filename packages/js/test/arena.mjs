@@ -4,7 +4,7 @@
 //
 //   node packages/js/test/arena.mjs [players=8] [seconds=10] [screenshot.png]
 
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -15,13 +15,11 @@ const secs = Number(process.argv[3] ?? 10);
 const shot = process.argv[4] && process.argv[4] !== '-' ? process.argv[4] : null;
 const loss = Number(process.env.LOSS ?? 0);
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 9800 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 
 let browser;
 let failed = false;
 try {
-  await new Promise((r) => setTimeout(r, 600));
   browser = await chromium.launch({
     args: [
       '--disable-features=WebRtcHideLocalIpsWithMdns',

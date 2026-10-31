@@ -8,7 +8,7 @@
 //
 //   node packages/js/test/netlab_rooms.mjs [screenshot-prefix]
 
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -16,8 +16,7 @@ const PW = process.env.PLAYWRIGHT ?? '/home/ubuntu/.local/share/playwright-tools
 const { chromium } = await import(PW);
 const shot = process.argv[2];
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 let browser;
 let failed = 0;
 const ok = (cond, what) => {
@@ -27,7 +26,6 @@ const ok = (cond, what) => {
 const page = `http://127.0.0.1:${port}/demo/netlab.html?signal=local`;
 
 try {
-  await new Promise((r) => setTimeout(r, 600));
   browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const ctx = await browser.newContext({ viewport: { width: 1360, height: 900 } });
   const open = async (url) => {

@@ -10,7 +10,7 @@
 // own symmetric NAT, so the game runs over the signalling fallback; RTC_OFF=<i>
 // fails tab i's links only, so it plays relayed by the others.
 
-import { spawn } from 'node:child_process';
+import { serve } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -21,13 +21,11 @@ const rtcOff = process.env.RTC_OFF;
 const offAt = (i) => rtcOff === 'all' || rtcOff === String(i);
 const shot = process.argv[3];
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const { port, server } = await serve(root);
 const step = (s) => console.log(`ok: ${s}`);
 let browser;
 let ok = false;
 try {
-  await new Promise((r) => setTimeout(r, 600));
   browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const ctx = await browser.newContext({ viewport: { width: 1300, height: 700 } });
   const pages = [];
