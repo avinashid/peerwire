@@ -73,9 +73,9 @@ export const SILENT_MS = 5000;
 // is lost. A socket that has heard nothing at all (no OK, no event) since an event sent through every relay (not a
 // pipe batch, nor one to keep) REDIAL_SILENT_MS ago is deaf: it is closed and its relay dialled again, and the new
 // socket is silent (see silent()) until its relay answers. Each next redial of that relay waits twice as long, to
-// MAX_RECONNECT_MS, and after REDIAL_TRIES there are none until it answers an event within SILENT_MS on a socket open
-// MAX_RECONNECT_MS or more: one that never answers, answers late, or answers each new socket only to go deaf again,
-// isn't dialled again and again (relays ban an IP for too many connections, see start()).
+// MAX_RECONNECT_MS, and after REDIAL_TRIES there are none until it answers an event within SILENT_MS on a socket
+// dialled MAX_RECONNECT_MS or more ago: one that never answers, answers late, or answers each new socket only to go
+// deaf again, isn't dialled again and again (relays ban an IP for too many connections, see start()).
 export const REDIAL_SILENT_MS = 2 * SILENT_MS;
 export const REDIAL_TRIES = 3;
 // Events to keep (store(): a doc's copy on the relays) go to each relay one every STORE_EVERY_MS
@@ -90,11 +90,11 @@ export const QUERY_MS = 10000;
 const refusal = (why) => (/^rate-limited/i.test(why) ? 'rate' : /^blocked|banned/i.test(why) ? 'ban' : /rate.?limit/i.test(why) ? 'rate' : null);
 // A relay socket that closes (the phone switched networks or turned on its hotspot,
 // Android froze the tab, the relay dropped us) is dialled again after this long,
-// doubling to the cap; a network change or the page showing again redials it at
-// once, and going online redials every relay. The wait starts over only once a socket
-// has stayed open the cap: one that takes each connection and drops it (overloaded,
-// dropping an IP it bans, wanting auth) would otherwise be dialled every second, and
-// each reopen says hello again (see onReconnect).
+// doubling to the cap; going online, a new connection type or the page showing again
+// redials it at once (see start()), and going online redials every relay. The wait
+// starts over only once a socket has stayed open the cap: one that takes each
+// connection and drops it (overloaded, dropping an IP it bans, wanting auth) would
+// otherwise be dialled every second, and each reopen says hello again (see onReconnect).
 export const RECONNECT_MS = 1000;
 export const MAX_RECONNECT_MS = 30000;
 // A socket still connecting this long when the network changes is given up and redialled.
@@ -152,12 +152,18 @@ export class NostrSignaling {
       'raw', await sha256(enc.encode(`peerwire/room-enc/${this.room}`)),
       { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
     this.sub = hex(crypto.getRandomValues(new Uint8Array(8)));
-    // Only going online recycles open sockets: navigator.connection's 'change' also
-    // fires when Chrome's speed estimate moves (rtt 450 -> 300 ms), and redialling every
-    // relay on each of those got an IP banned for too many connections.
+    // Going online, a new connection type (a new network, as in room.js) or the page showing again redials the relays
+    // that aren't open, their waits starting over; only going online recycles open sockets too. navigator.connection's
+    // 'change' also fires when Chrome's speed estimate moves (rtt 450 -> 300 ms), the type the same: redialling every
+    // relay on each of those got an IP banned for too many connections, and would put a relay that drops each
+    // connection back on a 1 s wait each time. Desktop Chrome has no type, so there a 'change' redials nothing.
+    this.netType = globalThis.navigator?.connection?.type;
     this.wake = (e) => {
       if (e?.type === 'visibilitychange' && globalThis.document?.visibilityState !== 'visible') return;
-      this.redial(e?.type === 'online');
+      const type = globalThis.navigator?.connection?.type;
+      const same = e?.type === 'change' && type === this.netType;
+      this.netType = type;
+      if (!same) this.redial(e?.type === 'online');
     };
     globalThis.addEventListener?.('online', this.wake);
     globalThis.document?.addEventListener?.('visibilitychange', this.wake);
@@ -230,10 +236,9 @@ export class NostrSignaling {
     this.retry.set(ws.relayUrl, { ms, timer });
   }
 
-  // The network came back or changed, or the page is showing again: every relay that
-  // isn't open is redialled now, its wait starting over. On going online (`all`), open
-  // sockets are too, since their TCP connection may be on the old network and take
-  // minutes to time out.
+  // We went online or onto a new connection type, or the page is showing again (see start()): every relay that isn't
+  // open is redialled now, its wait starting over. On going online (`all`), open sockets are too, since their TCP
+  // connection may be on the old network and take minutes to time out.
   redial(all) {
     if (this.closed) return;
     for (const ws of [...this.sockets]) {
@@ -519,8 +524,8 @@ export class NostrSignaling {
     ws?.inflight?.delete(id);
     if (ws) ws.asked = null; // it answers (see silent())
     const now = clock();
-    // In time, on a socket open MAX_RECONNECT_MS or more: its redials start over (see deafAfter()). A relay that answers
-    // each new socket at first, then goes deaf again, only ever answers on young ones.
+    // In time, on a socket dialled MAX_RECONNECT_MS or more ago: its redials start over (see deafAfter()). A relay that
+    // answers each new socket at first, then goes deaf again, only ever answers on young ones.
     if (e && now - e.sent < SILENT_MS && now - ws.dialled >= MAX_RECONNECT_MS) this.redialled.delete(url);
     const p = this.paused.get(url);
     if (ok === true) {

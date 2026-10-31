@@ -685,7 +685,7 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
 //     relay is lost. A socket that has heard nothing at all since an event sent through every relay (not a pipe batch,
 //     nor one to keep) 10 s ago is deaf: it is closed and its relay dialled again, and the new socket takes no pipe
 //     batch until its relay answers. Each next redial of that relay waits twice as long, to 30 s, and after 3 there are
-//     none until it answers an event within 5 s on a socket open 30 s; a late answer, or one on a younger socket,
+//     none until it answers an event within 5 s on a socket dialled 30 s ago; a late answer, or one on a younger socket,
 //     doesn't count. A relay that answers, even 9 s late, or sends no OK but events, is never redialled; one that
 //     answers 12 s late, once. A deaf socket that closes is redialled as any closed one. The numbers are written out,
 //     so that the constants themselves are checked. Fake sockets, and a fake clock that runs the timers. The fakes
@@ -848,8 +848,8 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
   }
 
   // A relay that answers the first signal on each new socket, then nothing: those answers come on young sockets, so
-  // it is redialled 3 times, then not again. An answer in time on a socket open 29.999 s doesn't give the relay's
-  // redials back; one on a socket open 30 s does.
+  // it is redialled 3 times, then not again. An answer in time on a socket dialled 29.999 s ago doesn't give the
+  // relay's redials back; one on a socket dialled 30 s ago does.
   {
     const [A, F] = ['wss://a4', 'wss://f4'];
     lag[A] = lag[F] = 100;
@@ -873,7 +873,7 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
       run(T + 30000);
       return of(H).at(-1).at - T;
     };
-    // One signal on `w`, answered (in 0.1 s) when `w` has been open `age`.
+    // One signal on `w`, answered (in 0.1 s) when `w` was dialled `age` ago.
     const answer = async (w, age) => {
       run(w.at + age - 100);
       await s.publish(s.roomTag, 'sig');
@@ -886,7 +886,7 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
     const old = await answer(of(H)[2], 30000);
     const back = await deafen(of(H)[2]);
     check(first === 10000 && young && kept === 20000 && old && back === 10000 && s.stats.redials === 3,
-      `a timely answer on a socket open 29.999 s: the next redial still waits ${kept / 1000} s; on one open 30 s, ${back / 1000} s again`);
+      `a timely answer on a socket dialled 29.999 s ago: the next redial still waits ${kept / 1000} s; on one dialled 30 s ago, ${back / 1000} s again`);
     s.close();
   }
 
@@ -912,7 +912,7 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
 }
 
 // 6. A relay socket that closes (phone hotspot on, network switch, tab frozen) is redialled,
-//    subscribes again and says so; a network change recycles open sockets; close() stops it.
+//    subscribes again and says so; going online recycles open sockets; close() stops it.
 {
   const Real = globalThis.WebSocket;
   const made = [];
@@ -979,8 +979,9 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
   // NB-058: a relay that takes each connection and drops it 10 ms after it opens (overloaded, dropping an IP it bans,
   // wanting auth) is redialled 1, 2, 4, 8, 16, 30 and 30 s after each close, as one that never opens; each reopen
   // says hello (room.js), so at most twice a minute at 30 s, not every second. One that stayed open 30 s starts over
-  // at 1 s, one open 29.999 s doesn't, and the time it took to connect doesn't count. A network change redials at once
-  // and starts over. A fake clock runs the timers.
+  // at 1 s, one open 29.999 s doesn't, and the time it took to connect doesn't count. A new connection type or the page
+  // showing again redials at once and starts over; a 'change' of the same type (Chrome's new speed estimate) or the
+  // page hidden doesn't. A fake clock runs the timers, a fake navigator.connection says the type.
   {
     let now = 2e6;
     performance.now = () => now;
@@ -1005,6 +1006,7 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
     };
     const [F, G] = ['wss://f6', 'wss://g6'];
     const of = (url) => made.filter((w) => w.url === url);
+    Object.defineProperty(globalThis.navigator, 'connection', { value: { type: 'wifi' }, configurable: true });
     const s = new NostrSignaling(pw, pw.endpoint(), { room: 'flap/reconnect', relays: [F, G] });
     for (let i = 0; i < 1000 && !(of(F).length && of(G).length); i++) await new Promise((r) => realTimeout(r, 5));
     of(F)[0].open();
@@ -1012,13 +1014,13 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
     await s.ready;
     const hellos = []; // when f opened again
     s.onReconnect = (url) => url === F && hellos.push(now);
-    // f's newest socket, open, closes `open` ms later (`wake`: then the network changes): how long until f is dialled
-    // again, Infinity if not within 60 s.
-    const drop = (open = 10, wake = false) => {
+    // f's newest socket, open, closes `open` ms later (then an event of type `wake`, if given, comes): how long until f
+    // is dialled again, Infinity if not within 60 s.
+    const drop = (open = 10, wake) => {
       run(now + open);
       of(F).at(-1).close();
       const [t, n] = [now, made.length];
-      if (wake) s.wake({ type: 'change' });
+      if (wake) s.wake({ type: wake });
       run(t + 60000, () => made.length > n);
       return made.length > n ? of(F).at(-1).dialled - t : Infinity;
     };
@@ -1042,11 +1044,38 @@ check(STORE_EVERY_MS === 1000 && STORE_QUEUE_MS === 120000 && STORE_OK_MS === 30
     const again = flap();
     check(young === 30000 && old === 1000 && again === 2000,
       `a socket open 29.999 s (connected in 50 ms): the next wait is still ${young / 1000} s; open 30 s, ${old / 1000} s, then ${again / 1000} s`);
-    flap();
-    const woke = flap(10, true);
+    // Chrome fires 'change' on each new speed estimate too, the type the same: no new network, so f's wait goes on (4 s
+    // here, not at once), and with one every 10 s f still opens twice a minute at most once at 30 s.
+    const est = flap(10, 'change');
+    let ticks = 0;
+    let ticker = setTimeout(function change() {
+      ticks++;
+      s.wake({ type: 'change' });
+      ticker = setTimeout(change, 10000);
+    }, 10000);
+    const T2 = now;
+    while (now < T2 + 360000) flap();
+    clearTimeout(ticker);
+    const late2 = hellos.filter((h) => h > T2 + 60000 && h < T2 + 360000);
+    const peak2 = Math.max(...late2.map((h) => late2.filter((x) => x >= h && x < h + 60000).length));
+    check(est === 4000 && ticks >= 36 && late2.length === 10 && peak2 === 2,
+      `a 'change' of the same connection type (a new speed estimate) after a close leaves the wait (${est / 1000} s); with ${ticks} of them, one every 10 s, at 30 s f opens ${late2.length} times in 5 min, ${peak2} in a minute at most`);
+    // A new type is a new network: f is redialled at once and its wait starts over; a 'change' of that type again is a
+    // speed estimate once more. The page showing again redials at once too, whatever the type; hidden, it doesn't.
+    globalThis.navigator.connection.type = 'cellular';
+    const moved = flap(10, 'change');
     const after = flap();
-    check(woke === 0 && after === 1000, `a network change after a close redials at once (${woke} ms), and the next wait is ${after / 1000} s`);
+    const est2 = flap(10, 'change');
+    globalThis.document = { visibilityState: 'hidden' };
+    const hidden = flap(10, 'visibilitychange');
+    globalThis.document.visibilityState = 'visible';
+    const shown = flap(10, 'visibilitychange');
+    delete globalThis.document;
+    const next = flap();
+    check(moved === 0 && after === 1000 && est2 === 2000 && hidden === 4000 && shown === 0 && next === 1000,
+      `a new connection type after a close redials at once (${moved} ms), then waits ${after / 1000} s, and a 'change' of that type again leaves the wait (${est2 / 1000} s); the page hidden leaves it (${hidden / 1000} s), shown again redials at once (${shown} ms), then waits ${next / 1000} s`);
     s.close();
+    delete globalThis.navigator.connection;
     check(of(G).length === 1 && timers.size === 0 && s.retry.size === 0, 'g is never redialled, and close() leaves no timer');
     globalThis.setTimeout = realTimeout;
     globalThis.clearTimeout = realClear;
