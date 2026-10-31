@@ -101,6 +101,7 @@ BROWSER=(
   "poll|node packages/js/test/poll.mjs 3"
   "chat|node packages/js/test/chat.mjs"
   "call|node packages/js/test/call_browser.mjs"
+  "meet|node packages/js/test/meet.mjs 3"
   "webrtc signals|node packages/js/test/webrtc_signals.mjs"
   "ice restart|node packages/js/test/ice_restart.mjs"
   "retry direct|node packages/js/test/retry_direct.mjs"
