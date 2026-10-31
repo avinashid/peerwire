@@ -14,3 +14,5 @@
 4. Keep `peerwire-core` sans-IO and deterministic, and keep the wasm build free of imports.
 5. Every performance number in the docs must be reproducible from the repo, or labelled theoretical with its
    formula.
+6. The README, the package READMEs and `docs/` are also built into a static site with the browser demos.
+   `scripts/site.sh --serve` previews it on loopback. A link to a missing file or `#anchor` fails the build.
