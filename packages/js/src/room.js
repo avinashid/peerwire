@@ -40,6 +40,10 @@
 // room.doc(name) opens a shared document (doc.js) that every member holds and that
 // catches up members who join later. Its frames have their own tags, plain or deflated,
 // so they never show as messages; an older peer drops a tag it doesn't know.
+//
+// room.call(stream) joins the room's voice and video call (call.js): a mesh of WebRTC media
+// connections, one per member in the call, apart from the room's links and signalled over them
+// with a tag of their own.
 
 import { loadPeerwire, Lane, toHex, fromHex, isPeerId } from './peerwire.js';
 import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
@@ -51,13 +55,14 @@ import { Doc, unopened } from './doc.js';
 import { docCopy, storeOf } from './store.js';
 import { deflate, inflate, deflates } from './zip.js';
 import { RelayCopy } from './relays.js';
+import { Calls } from './call.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
 // Nudge carries nothing (peers ignore tags they don't know): see the 'open' handler. Doc
 // carries a shared document's frame as JSON (doc.js), on the reliable lane; DocZ the same,
-// deflated (raw deflate).
-const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6, Doc: 7, DocZ: 8 };
+// deflated (raw deflate). Call carries a call frame as JSON (call.js), on the reliable lane.
+const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6, Doc: 7, DocZ: 8, Call: 9 };
 // Doc frames of DEFLATE_MIN bytes or more go deflated to members whose doc reads them, where
 // this platform has 'deflate-raw' streams. One goes plain if it deflates to under 1/DEFLATE_RATIO
 // of its size, and one is inflated only to the lane's limit and DEFLATE_RATIO times its own size,
@@ -178,9 +183,9 @@ export async function joinRoom({
   else if (typeof signaling === 'function') sig = signaling({ endpoint, peerwire: pw, room: name });
   else throw new TypeError(`unknown signaling ${signaling}: use 'local', 'nostr' or a factory`);
   let transport;
+  // Remote peers need STUN to find a path; tabs of one browser don't.
+  const ice = iceServers ?? (signaling === 'local' ? [] : DEFAULT_ICE_SERVERS);
   if (RTCPeerConnection) {
-    // Remote peers need STUN to find a path; tabs of one browser don't.
-    const ice = iceServers ?? (signaling === 'local' ? [] : DEFAULT_ICE_SERVERS);
     // Relays charge per event: one offer and one answer, each with every candidate.
     const offerProof = {
       sign: (to) => proof.pair('pw-rtc-offer', endpoint.id, to),
@@ -195,8 +200,10 @@ export async function joinRoom({
     sig.close();
     throw new Error('no WebRTC in this runtime: pass RTCPeerConnection (e.g. from node-datachannel) or use signaling: \'local\'');
   }
-  // A grant shows local addresses only to new connections, and only 'direct' offers them.
-  const room = new Room(endpoint, sig, transport, presence, proof, { fallback, grants: privacy === 'direct' && retryOnGrant, roomId, pw });
+  // A grant shows local addresses only to new connections, and only 'direct' offers them. Calls use the room's
+  // iceServers and privacy for their media connections too.
+  const media = RTCPeerConnection ? { RTCPeerConnection, MediaStream: globalThis.MediaStream, iceServers: ice, privacy } : null;
+  const room = new Room(endpoint, sig, transport, presence, proof, { fallback, grants: privacy === 'direct' && retryOnGrant, roomId, pw, media });
   if (queue) room.queue = [];
   await sig.ready;
   await room.hello();
@@ -206,7 +213,7 @@ export async function joinRoom({
 export class Room {
   static proofMs = PROOF_MS; // tests shorten it
   static peerFirstMs = PEER_FIRST_MS;
-  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off', grants = false, roomId = null, pw = null } = {}) {
+  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off', grants = false, roomId = null, pw = null, media = null } = {}) {
     this.endpoint = endpoint;
     this.signaling = signaling;
     this.roomId = roomId; // for room.doc(name, { relays })
@@ -233,6 +240,8 @@ export class Room {
     this.docOut = new Map(); // peer -> the doc frames to it, in order, while one waits to be deflated
     this.docIn = new Map(); // peer -> the doc frames from it, in order, while one waits to be inflated
     this.deflated = new WeakMap(); // doc frame -> its deflated bytes, made once for all the members it goes to
+    // The room's call: who is in it, and ours while we are (see call()).
+    this.calls = new Calls({ self: this.self, send: (peer, m) => this.writeCall(peer, m), members: () => this.peers, media });
     this.transport = makeTransport((peer, state, handle) => {
       if (state === 'closed') this.rtcClosed(peer, handle);
       else if (state === 'failed') this.rtcFailed(peer);
@@ -454,6 +463,25 @@ export class Room {
     return d;
   }
 
+  // Joins the room's voice and video call with `stream` (a MediaStream; null to only receive), and returns
+  // the call (see call.js): every member in it, up to `max` with us, sends us its stream and gets ours, each
+  // over a WebRTC connection of its own. The library never asks for the camera or microphone: the app does.
+  // One call per room: call.leave() leaves it, and room.call() may join it again.
+  call(stream = null, { max } = {}) {
+    if (this.left) throw new Error('left the room');
+    return this.calls.open(stream, max === undefined ? {} : { max });
+  }
+
+  // A call frame to a member: none to a peer gone meanwhile.
+  writeCall(peer, m) {
+    if (this.left || !this.members.has(peer)) return;
+    try {
+      this.write(peer, frame(T.Call, enc.encode(JSON.stringify(m))), Lane.Reliable);
+    } catch {
+      // A call frame stays far under the lane's limit.
+    }
+  }
+
   // Doc frames go to a peer in order. One of DEFLATE_MIN bytes or more, to a member whose doc
   // reads deflated frames (`z`), goes deflated where we can, which takes a moment: the frames
   // after it wait for it.
@@ -539,6 +567,7 @@ export class Room {
     globalThis.document?.removeEventListener?.('visibilitychange', this.onHidden);
     this.retries.close();
     for (const off of this.unwatch) off();
+    this.calls.close();
     const saved = [...this.docs.values()].map((d) => d.close());
     this.docOut.clear();
     this.docIn.clear();
@@ -630,13 +659,17 @@ export class Room {
       const joined = this.members.has(peer);
       this.members.set(peer, p);
       this.emit(joined ? 'presence' : 'peer-join', peer, p);
-      if (!joined) for (const d of this.docs.values()) d.joined(peer);
+      if (!joined) {
+        for (const d of this.docs.values()) d.joined(peer);
+        this.calls.joinedRoom(peer);
+      }
       return;
     }
     if (tag === T.Bye) return this.lost(peer, 'left');
     // Before its presence, a peer hasn't joined: only unreliable data can race it.
     if (!this.members.has(peer)) return;
     if (tag === T.Doc || tag === T.DocZ) return this.onDoc(peer, tag, body);
+    if (tag === T.Call) return void (lane === Lane.Reliable && this.calls.receive(peer, body));
     let value;
     if (tag === T.Bytes) value = body;
     else if (tag === T.Text) value = dec.decode(body);
@@ -787,6 +820,7 @@ export class Room {
     if (reason === 'left') this.endpoint.disconnect(peer);
     if (member) {
       for (const d of this.docs.values()) d.left(peer);
+      this.calls.gone(peer);
       this.emit('peer-leave', peer, reason);
     }
   }
