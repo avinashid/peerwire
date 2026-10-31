@@ -492,7 +492,8 @@ function speaking() {
     const m = peer === SELF ? (micOn ? selfMeter : null) : t.meter;
     const level = m?.level() ?? 0;
     if (level > SPEAKING) t.loudUntil = now + SPEAKING_HOLD_MS;
-    t.box.classList.toggle('speaking', t.loudUntil > now && t.state !== 'failed');
+    // A member muted (or failed) isn't speaking, whatever audio is still on its way.
+    t.box.classList.toggle('speaking', t.loudUntil > now && t.state !== 'failed' && !t.box.classList.contains('nomic'));
   }
   if (!$('lobby').classList.contains('hidden')) $('level').style.setProperty('--lvl', Math.min(1, (selfMeter?.level() ?? 0) * 8).toFixed(3));
 }

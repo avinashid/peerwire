@@ -137,6 +137,30 @@ try {
   await b.click('#mic');
   await a.waitForSelector(`${tileOf(a, NAMES[1])}:not(.nomic)`, WAIT);
   check(true, 'unmute shows on the other tabs');
+  // A member whose presence says muted never gets the speaking ring, even while its audio still plays (as in the
+  // moment before a muted microphone goes quiet). Here it sends a steady tone: the fake microphone's beeps fade
+  // under the browser's noise suppression, the tone doesn't.
+  await b.evaluate(async () => {
+    const ctx = new AudioContext();
+    const tone = ctx.createOscillator();
+    const out = ctx.createMediaStreamDestination();
+    tone.connect(out);
+    tone.start();
+    await window.meet.call.setStream(new MediaStream([out.stream.getAudioTracks()[0], ...window.meet.stream.getVideoTracks()]));
+    window.meet.room.setPresence({ ...window.meet.room.getPresence(), mic: false });
+  });
+  await a.waitForSelector(`${tileOf(a, NAMES[1])}.nomic`, WAIT);
+  const rang = await a.evaluate(async (name) => {
+    const tile = [...document.querySelectorAll('.tile:not(.self)')].find((t) => t.querySelector('.name').textContent === name);
+    let n = 0;
+    for (let i = 0; i < 25; i++, await new Promise((r) => setTimeout(r, 100))) if (tile.classList.contains('speaking')) n++;
+    return n;
+  }, NAMES[1]);
+  check(rang === 0, `a member muted in presence isn't shown speaking while its audio plays (${rang} of 25 samples)`);
+  await b.evaluate(() => window.meet.call.setStream(window.meet.stream));
+  await b.click('#mic');
+  await b.click('#mic');
+  await a.waitForSelector(`${tileOf(a, NAMES[1])}:not(.nomic)`, WAIT);
 
   // Leave: the tile goes everywhere else, and the leaver's camera and microphone go off.
   await last.click('#leave');
