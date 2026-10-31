@@ -328,9 +328,10 @@ pub struct Item {
 pub enum Event {
     Change(DocId, Change),
     Sync(DocId, Status),
-    /// This member's link took none of its messages for 30 s, while they passed [`OUTBOX_BYTES`] waiting and were
-    /// dropped twice; or, at a hub, it had more than [`RELAY_BYTES`] of its frames relayed beyond what refilled:
-    /// [`Docs`] forgot it as if it left, and takes nothing more from it until [`Docs::joined`] again. Close its link
-    /// (it catches up when it comes back; its relay budget doesn't refill by coming back).
+    /// This member's link took none of its messages for 30 s (as the times passed in tell: at least that), while
+    /// they passed [`OUTBOX_BYTES`] waiting and were dropped twice; or, at a hub, it had more than [`RELAY_BYTES`]
+    /// of its frames relayed beyond what refilled: [`Docs`] forgot it as if it left, and takes nothing more from it
+    /// until [`Docs::joined`] again. Close its link (it catches up when it comes back; its relay budget doesn't
+    /// refill by coming back).
     Overflow(PeerId),
 }

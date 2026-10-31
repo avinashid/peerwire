@@ -361,7 +361,8 @@ fn frames_in_any_order_and_any_number_of_times_converge() {
 /// other through it. Then the host's link to one member takes none of its doc messages while the host writes a
 /// lot: the host never holds more than OUTBOX_BYTES for it. It drops what waits and catches the member up afresh
 /// (a resync) rather than cutting it, and cuts it only once its link has taken nothing for 30 s and two resyncs.
-/// Once it links again it catches up.
+/// The host's docs hear the time only from members' frames and due timers, so the 30 s can run later. Once it
+/// links again it catches up.
 #[test]
 fn a_star_converges_through_its_hub_and_a_member_taking_nothing_is_cut() {
     let mut r = Room::new(5, NetConfig::default(), 11, Some(0));
@@ -383,7 +384,7 @@ fn a_star_converges_through_its_hub_and_a_member_taking_nothing_is_cut() {
     let start = r.sim.now;
     r.pace = Some(Pace { from: 0, to: stuck, bytes_per_s: 0, since: start, sent: 0 });
     let mut dropped = 0;
-    while r.overflows.is_empty() && r.sim.now < start + ms(60_000) {
+    while r.overflows.is_empty() && r.sim.now < start + ms(90_000) {
         let before = r.docs[0].queued(&stuck);
         for _ in 0..10 {
             r.write(0, true);
@@ -393,7 +394,7 @@ fn a_star_converges_through_its_hub_and_a_member_taking_nothing_is_cut() {
     }
     let cut = r.sim.now - start;
     assert_eq!(r.overflows, [(0, stuck)]);
-    assert!(cut >= ms(30_000) && cut < ms(40_000) && dropped >= 2, "cut after {cut:?}, {dropped} resyncs");
+    assert!(cut >= ms(30_000) && cut < ms(60_000) && dropped >= 2, "cut after {cut:?}, {dropped} resyncs");
     assert!(r.most_queued <= OUTBOX_BYTES + MESSAGE_BYTES, "{} bytes waited", r.most_queued);
     assert_eq!(r.docs[0].queued(&stuck), 0);
     r.pump(ms(2000));
