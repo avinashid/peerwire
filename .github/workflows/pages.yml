@@ -1,0 +1,57 @@
+name: Pages
+
+# Builds the site (scripts/site.sh: the landing page, README and docs as HTML, the browser demos and their wasm)
+# and deploys it to GitHub Pages, at https://avinashid.github.io/peerwire/. Run by hand only (Actions → Pages →
+# Run workflow): nothing deploys on a push. The deploy needs Pages enabled with "GitHub Actions" as its source, and
+# waits on the github-pages environment's protection rules. See scripts/site/build.mjs for what the site holds and
+# how its modules and wasm are versioned per build.
+on:
+  workflow_dispatch:
+
+# One deploy at a time; a run started meanwhile waits rather than cancelling one under way.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: build the site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/web"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: scripts/site.sh
+      - run: node packages/js/test/site_build.mjs
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/site
+
+  deploy:
+    name: deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
