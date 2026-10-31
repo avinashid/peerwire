@@ -178,16 +178,17 @@ function collection(name) {
 // A string's length as JSON text: control characters take up to 6.
 const jsonLength = (s) => JSON.stringify(s).length;
 
-// Freezes a value parsed from JSON, unless it nests deeper than MAX_VALUE_DEPTH: then false. A loop, not
-// recursion, so no value can overflow the stack. Arrays by index and objects by their own keys, as JSON.stringify
-// takes them: for…in makes a string of every index, and walks keys a page put on Object.prototype.
-function freezeJson(v) {
+// Whether a value parsed from JSON nests MAX_VALUE_DEPTH deep at most, calling `visit` on each of its arrays and
+// objects on the way (inbox.js checks messages with it). A loop, not recursion, so no value can overflow the stack.
+// Arrays by index and objects by their own keys, as JSON.stringify takes them: for…in makes a string of every
+// index, and walks keys a page put on Object.prototype.
+export function withinDepth(v, visit) {
   if (v === null || typeof v !== 'object') return true;
   const stack = [[v, 1]];
   while (stack.length) {
     const [o, depth] = stack.pop();
     if (depth > MAX_VALUE_DEPTH) return false;
-    Object.freeze(o);
+    visit?.(o);
     if (Array.isArray(o)) {
       for (let i = 0; i < o.length; i++) {
         const x = o[i];
@@ -202,6 +203,9 @@ function freezeJson(v) {
   }
   return true;
 }
+
+// Freezes a value parsed from JSON, unless it nests deeper than MAX_VALUE_DEPTH: then false.
+const freezeJson = (v) => withinDepth(v, Object.freeze);
 
 // Our own value as members will see it (JSON gives back a copy), frozen, and its length as JSON text.
 // Throws for a value that isn't JSON or is past the limits: those are the app's own mistakes.

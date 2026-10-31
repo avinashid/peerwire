@@ -204,6 +204,10 @@ route 1 a member coming back gets the messages sent while it was away, from the
 relays or any member. What is left for NB-019 is a message to one peer outside a
 room, to its PeerId: sealed to the recipient and left on relays (Protocol Zero's dead
 drop, proven live), with erasure only for payloads over one piece.
+Built in JS as `openInbox()` (`packages/js/src/inbox.js`, whose header gives the format):
+one event of at most 16 KiB a message, so no erasure. Unlike the dead drop's tag, which
+anyone who knows the recipient's key can compute, a drop carries no recipient tag at
+all: each inbox opens every drop of its app (SEC-5).
 
 ## Threats
 

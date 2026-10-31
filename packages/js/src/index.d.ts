@@ -394,6 +394,66 @@ export declare function randomRoomId(): string;
 /** A {@link DocStore} in this process's memory, for Node and tests: its copies go with the process. */
 export declare function memoryStore(): DocStore;
 
+export interface InboxOptions {
+  appId: string;
+  /** 32 bytes restoring the identity whose inbox it is (`room.endpoint.secret()`); a fresh one by default, which can
+   * only send, as nobody knows its PeerId. */
+  secret?: Uint8Array;
+  /** Nostr relays to leave and read messages on. Default {@link DEFAULT_RELAYS}. */
+  relays?: string[];
+  /** Remembers which messages were delivered, across sessions: `true` for IndexedDB (browsers), or a
+   * {@link DocStore}. Without it, a message still on the relays is delivered again in each new session. Needs
+   * `secret`; sealed under a key from it, so the storage shows nothing of what was delivered. */
+  persist?: boolean | DocStore;
+  /** Where to load `peerwire_ffi.wasm` from, as for `joinRoom`. */
+  wasm?: string | URL | BufferSource;
+}
+
+export interface InboxMessageInfo {
+  /** How it was sent: a string, bytes, or any other value as JSON. */
+  kind: 'text' | 'bytes' | 'json';
+  /** When it was sent, in ms, by the sender's clock. */
+  at: number;
+  /** The message's id, 32 hex characters, from its sender and the id the sender gave it: the same if the message
+   * comes again (an inbox remembers 4096 messages, and without `persist` one session's), so the app can drop it. */
+  id: string;
+}
+
+/** Messages to one peer by its PeerId while it is offline, from `openInbox()`: sealed to the recipient and left on
+ * Nostr relays, read the next time it opens its inbox. A relay sees neither recipient nor sender, nor which messages
+ * go together: each is signed by a fresh key and padded, and every inbox of the app reads every message of the app,
+ * opening only its own. The relay does see the IP of whoever leaves or reads messages, and when. */
+export interface Inbox {
+  /** Our PeerId: give it to those who may write to us. */
+  readonly id: PeerId;
+  /** `data` as sent, `from` the sender's PeerId (authenticated: it signed the message, and nobody else can read
+   * it). Each message is delivered once (across sessions with `persist`), to every listener, oldest first. The
+   * first listener starts reading: at once, then every minute; nothing is read while nobody listens. A message left
+   * for another app, or a JSON value nested deeper than 64, is dropped. A listener that throws is reported on its
+   * own. Returns a function that removes it. */
+  on(event: 'message', fn: (data: any, from: PeerId, info: InboxMessageInfo) => void): () => void;
+  off(event: 'message', fn: (data: any, from: PeerId, info: InboxMessageInfo) => void): void;
+  /** Leaves `data` (a string, bytes, or any other value as JSON: 16 KiB at most, and a value nested 64 deep at most,
+   * else RangeError) for `to` on the relays, for `ttl` seconds (1 to 7 days, the default; NIP-40 asks relays to drop
+   * it after). Resolves to the number of relays that took it, once each has answered. Anyone can leave a message for
+   * any PeerId: check `from`. */
+  send(to: PeerId, data: any, options?: { ttl?: number }): Promise<number>;
+  /** Reads the relays now; resolves to the number of messages delivered. Each relay is read up to 100 messages a
+   * check, so a flood delays messages without costing more, except that 100 or more left in a message's second and
+   * ordered before it on a relay (by event id) hide it there: a relay can't be asked for the rest of a second. Its
+   * copies on other relays are still read. */
+  check(): Promise<number>;
+  /** Stops reading and closes the relay connections. */
+  close(): void;
+}
+
+/** Opens an inbox: `const inbox = await openInbox({ appId: 'my-app', secret, persist: true })`. */
+export declare function openInbox(options: InboxOptions): Promise<Inbox>;
+/** The largest message `inbox.send` takes, in bytes (16 KiB). */
+export declare const MAX_MESSAGE: number;
+/** The longest a message stays on the relays, in seconds (7 days). */
+export declare const MAX_TTL_S: number;
+
 export declare const DEFAULT_ICE_SERVERS: RTCIceServer[];
 export declare const DEFAULT_RELAYS: string[];
 export declare const RECONNECT_MS: number;

@@ -20,7 +20,8 @@
   ├─ peerwire-sync   CRDT documents: maps, lists, text, presence (planned; JS has room.doc(): maps, sets, logs)
   ├─ peerwire-game   fixed-point maths, Hilbert islands, desync detection, lockstep/rollback helpers
   ├─ peerwire-media  WebRTC media signaling, mesh / peer-SFU / broadcast tree topologies (planned)
-  └─ peerwire-store  offline store-and-forward with erasure coding and quotas (planned)
+  └─ peerwire-store  offline store-and-forward (planned; JS has room.doc's relay copy, and openInbox(): sealed
+                     messages to one PeerId left on Nostr relays)
  peerwire-core ───────────────────────────────────────────────────────────────
   Endpoint: sessions, Noise IK, lanes (unreliable / reliable / urgent), ACK + congestion control,
             tail-loss probe, keepalive, roaming, peer relay (FWD/RELAYED), hole punching, STUN codec, invites

@@ -54,6 +54,7 @@ Peerwire is **v0.1 and in early development**. The APIs will change, and nothing
 | WebAssembly module and JS package (WebRTC transport, Nostr signaling) | ✅ Working, tested in headless browsers |
 | Shared documents in the JS package: `room.doc()` with maps, sets and logs (CRDT, catch-up for late joiners) | ✅ Working, tested |
 | Shared documents in Rust, Godot (`open_doc`) and the C ABI: `peerwire-sync`, frame for frame with `room.doc()` | ✅ Working, tested against doc.js's frames |
+| Offline messages to one PeerId in the JS package: `openInbox()`, sealed and left on Nostr relays | ✅ Working, tested on local fake relays |
 | Deterministic network simulator and multiplayer arena benchmark | ✅ Working |
 | Game layer: fixed-point maths, Hilbert islands, desync detection, lockstep | ✅ Working |
 | Mesh size limit and super-peers in the `Node` facade | 🚧 Planned |
