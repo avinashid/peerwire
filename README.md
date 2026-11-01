@@ -130,7 +130,7 @@ The [quick start](docs/getting-started/quick-start.md) walks through each of the
 | [`peerwire-sync`](crates/peerwire-sync) | Shared documents in Rust, frame for frame with `room.doc()`. |
 | [`peerwire-godot`](bindings/godot) | Godot 4 GDExtension: `PeerwireMultiplayerPeer`. |
 | [`peerwire-ffi`](crates/peerwire-ffi) | The C ABI behind the WebAssembly module and native bindings. |
-| [`peerwire-peer`](crates/peerwire-peer) | An optional always-on peer that relays for the peers linked to it. Runs in Docker. |
+| [`peerwire-peer`](crates/peerwire-peer) | An optional always-on peer that relays for the peers linked to it. Runs natively or in Docker. |
 | [`peerwire-game`](crates/peerwire-game), [`peerwire-sim`](crates/peerwire-sim) | Game building blocks (fixed-point maths, islands, desync detection) and a deterministic network simulator. |
 
 `@peerwire/js` 0.1.1 and `@peerwire/react` 0.1.0 are on npm. Shared documents, calls and offline messages are newer

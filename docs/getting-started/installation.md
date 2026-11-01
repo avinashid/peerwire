@@ -85,7 +85,8 @@ and their conventions.
 
 ## Docker
 
-The optional always-on peer, and the browser demos, run with Docker. See
+The optional always-on peer, and the browser demos, run with Docker, from the repo root:
+`docker compose -f docker/compose.yml up -d --build`. The peer also runs without Docker. See
 [always-on peer](../guides/always-on-peer.md).
 
 ## Building from source

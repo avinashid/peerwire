@@ -368,12 +368,14 @@ player moves a square with the arrow keys, synced by `MultiplayerSynchronizer` a
 ```sh
 cargo build --release -p peerwire-godot
 godot --path examples/godot              # twice: Host in one window, paste the invite + Join in the other
-GODOT=godot ./examples/godot/test.sh     # headless check on loopback: invite run + room run, exits 0 on success
+GODOT=godot ./examples/godot/test.sh     # headless check on loopback: invite, room, relay-peer runs; 0 on success
 ```
 
-`test.sh` runs a host and a joiner headless, twice: by invite, then by room through a local Nostr relay
-(`examples/rust/nostr_relay.rs`). The joiner is `--privacy=public-only` in the first run and `relay-only` in the
-second. Each host prints its port-mapping state line (`port mapping: off`; `--port-mapping` turns it on), and
+`test.sh` runs a host and a joiner headless, three times: by invite, then by room through a local Nostr relay
+(`examples/rust/nostr_relay.rs`), then by room again with both linked to a local always-on peer
+(`peerwire-peer`) as their relay peer. The joiner is `--privacy=public-only` in the first run and `relay-only` in
+the second. The third run also fails unless both linked the relay peer and still link each other directly. Each
+host prints its port-mapping state line (`port mapping: off`; `--port-mapping` turns it on), and
 the run fails without it. Every instance logs each link's route as it changes: `route to peer N: direct to
 ADDRESS` or `through a relay`. A link a birthday punch made is marked `(birthday punch worked: …)` on the
 symmetric side and `(this side probed for a birthday punch)` on the cone side. Each run fails unless the

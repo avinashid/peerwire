@@ -26,7 +26,7 @@ WebAssembly module with a small JS package, and a C ABI. Status: early developme
 | `examples/` | Runnable examples: `rust/` (examples of the `peerwire` crate) and the Godot demo `godot/`; `examples/README.md` indexes every example in the repo |
 | `ports/esp32` | ESP32-C3 prototype under ESP-IDF, with its own `[workspace]` and pinned nightly: not built by the workspace, CI or the gate |
 | `docker/` | `Dockerfile` (the always-on peer and the examples server), `compose.yml`, the nginx config; the build context is the repo root |
-| `docs/` | `README.md` (the index), `getting-started/`, `guides/`, `concepts/` (architecture, NAT traversal, protocol), `reference/`, `project/` (status, performance, testing, threat model) |
+| `docs/` | `README.md` (the index), `getting-started/`, `guides/`, `concepts/` (architecture, NAT traversal, protocol, security model, scaling), `reference/`, `project/` (status, performance, testing, comparison, threat model, offline-store design) |
 | `scripts/` | `gate.sh` (the gate), `site.sh` and `site/` (the docs and demos site), benchmarks |
 
 ## Setup
