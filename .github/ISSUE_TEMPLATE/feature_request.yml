@@ -1,0 +1,36 @@
+name: Feature request
+description: Something Peerwire could do, or do better.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you're trying to do
+      description: The app or the situation, and where Peerwire gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: The API, setting or behaviour you have in mind, if you have one.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Workarounds you use now, or how other libraries do it.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Part
+      options:
+        - "@peerwire/js (browser or Node)"
+        - "@peerwire/react"
+        - Rust crates (peerwire, peerwire-core, peerwire-sync, ...)
+        - Godot binding
+        - C ABI (peerwire-ffi)
+        - Always-on peer or Docker
+        - ESP32 port
+        - Demos
+        - Docs or the site
+        - Other

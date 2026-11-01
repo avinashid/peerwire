@@ -1,0 +1,19 @@
+# Editor settings (https://editorconfig.org): 120 columns as in rustfmt.toml, LF, UTF-8, a final newline.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+max_line_length = 120
+
+# JavaScript and TypeScript, the demos' HTML and CSS, JSON, YAML, shell scripts and Markdown lists.
+[*.{js,mjs,ts,tsx,html,css,json,yml,yaml,sh,md}]
+indent_size = 2
+
+# GDScript: Godot's own style.
+[*.gd]
+indent_style = tab
