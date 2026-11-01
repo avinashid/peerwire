@@ -16,7 +16,8 @@ import { joinRoom, openInbox, toHex, fromHex } from '@peerwire/js';
 const saved = localStorage.getItem('peerwire-secret');
 const room = await joinRoom({ appId: 'my-app', roomId, secret: saved ? fromHex(saved) : undefined });
 const secret = room.endpoint.secret();
-localStorage.setItem('peerwire-secret', toHex(secret)); // anyone who reads it can read your messages
+// Anyone who reads it can read your messages and act as you, and so can any script on this origin.
+localStorage.setItem('peerwire-secret', toHex(secret));
 ```
 
 `room.self` is that PeerId: share it with whoever may write to you, in presence or a link. An inbox opened without

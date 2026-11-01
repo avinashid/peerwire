@@ -63,8 +63,8 @@ a multicast address). Junk sent to a member costs it a bounded amount of work: o
 budget, spent before the costly decryption.
 
 One open issue: a neighbour who floods two members' inbox topics (where their offers arrive) with junk can keep them
-from linking for as long as it keeps going (NB-065, low severity). It needs both members' PeerIds in advance. The [threat model](../project/threat-model.md)
-lists the findings for LAN discovery and their status.
+from linking for as long as it keeps going (NB-065, low severity). It needs both members' PeerIds in advance. The
+[threat model](../project/threat-model.md) lists the findings for LAN discovery and their status.
 
 ## On ESP32
 

@@ -24,7 +24,7 @@
 | Party | Can see | Can't |
 |---|---|---|
 | A signaling relay, or anyone watching it | room and inbox topics (hashes), sealed hellos and offers (their length and timing), and the IP address each client connects to it from | read hellos, offers or addresses; join a room or pose as its host without the name; forge a link |
-| Someone who knows a PeerId, but not its invite | the PeerId | make the node dial back, or learn its addresses |
+| Someone who knows a PeerId, but not its invite | the PeerId | make the node dial back, or learn its addresses (except from a bare `WebRtcTransport` built without `offerProof`, which answers any sealed offer with its candidates: [SEC-3](../project/threat-model.md#sec-3--sealed-offer-probe-reveals-ip-candidates-to-anyone-who-knows-your-peerid-medium--nb-023)) |
 | A peer relaying a link | that A and B talk, both their IP addresses, packet sizes and timing | read, change or inject the link's traffic |
 | An on-path attacker | ciphertext, sizes and timing | impersonate a PeerId; replay data packets |
 | A room member, or someone holding an invite | candidate addresses, as the [privacy mode](../guides/privacy.md) allows, and the source address of a direct link | pose as another PeerId |
@@ -53,6 +53,8 @@ traffic analysis by a global passive adversary, and malicious code in the app it
 - **Connection-setup floods from many real addresses.** Handshake cookies stop floods from spoofed addresses, and each
   IPv4 address or IPv6 /64 can hold at most 4 half-open handshakes, but an attacker with 256 such addresses can still
   fill the part of the half-open table above the cookie mark.
+- **Inbox floods on a LAN.** With [LAN discovery](../guides/lan-discovery.md), a neighbour who knows two members'
+  PeerIds can keep them from linking by flooding their inbox topics with junk, for as long as it keeps going (NB-065).
 - **Key rotation within a session.** Session keys are only replaced by a new handshake, on reconnect.
 
 ## Using it safely
