@@ -110,7 +110,7 @@ What `joinRoom` resolves to. One per join; `leave()` ends it.
 
 ### Events
 
-```ts
+```ts ignore
 room.on(event, fn): () => void   // returns a function that unsubscribes
 room.off(event, fn): void
 ```
@@ -129,7 +129,7 @@ presence, and an `urgent` message can overtake it.
 
 ### send
 
-```ts
+```ts ignore
 room.send(data: RoomData, options?: { to?: PeerId | PeerId[]; lane?: LaneName | number }): number
 ```
 
@@ -151,7 +151,7 @@ See [Sending messages](../guides/messaging.md) for choosing a lane.
 
 ### sendTo
 
-```ts
+```ts ignore
 room.sendTo(peer: PeerId | '' | null, data: RoomData, lane?: LaneName | number): number
 ```
 
@@ -159,7 +159,7 @@ room.sendTo(peer: PeerId | '' | null, data: RoomData, lane?: LaneName | number):
 
 ### poll and receive
 
-```ts
+```ts ignore
 room.poll(): RoomEvent[]          // every queued event, oldest first, and clears the queue
 room.receive(): RoomEvent | null  // the next queued event, or null
 ```
@@ -184,7 +184,7 @@ room.sendTo('', 'x,y', 'unreliable');
 
 ### Presence
 
-```ts
+```ts ignore
 room.getPresence(peer?: PeerId): Presence | undefined   // ours with no argument
 room.setPresence(presence: Presence): void
 ```
@@ -195,7 +195,7 @@ old one.
 
 ### route
 
-```ts
+```ts ignore
 room.route(peer: PeerId):
   | (({ kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' })
       & { rttMs: number | null })
@@ -213,7 +213,7 @@ and 15 ms, in 3 of 5 probe rounds 2 s apart). See [Through any NAT](#through-any
 
 ### retryDirect
 
-```ts
+```ts ignore
 room.retryDirect(peer?: PeerId): number
 ```
 
@@ -224,7 +224,7 @@ retried. The room also retries on its own: see [WebRTC is tried again](#webrtc-i
 
 ### adoptChannel
 
-```ts
+```ts ignore
 room.adoptChannel(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel): Promise<boolean>
 ```
 
@@ -236,14 +236,14 @@ peer didn't adopt within 5 s. When the channel closes, the link goes back to its
 
 ### rtt and stats
 
-```ts
+```ts ignore
 room.rtt(peer: PeerId): number | null   // smoothed round trip in ms; null before the first sample
 room.stats(): EndpointStats             // the endpoint's counters: see Endpoint
 ```
 
 ### doc
 
-```ts
+```ts ignore
 room.doc(name: string, options?: DocOptions): Doc
 ```
 
@@ -251,7 +251,7 @@ The shared document `name`: see [Doc](#doc-1).
 
 ### call
 
-```ts
+```ts ignore
 room.call(stream: MediaStream | null, options?: { max?: number }): Call
 ```
 
@@ -259,7 +259,7 @@ Joins the room's voice and video call: see [Call](#call-1).
 
 ### leave
 
-```ts
+```ts ignore
 room.leave(): Promise<void>
 ```
 
@@ -270,7 +270,7 @@ this device (`persist`) have saved, however long the store takes.
 
 ## Doc
 
-```ts
+```ts ignore
 room.doc(name: string, options?: DocOptions): Doc
 ```
 
@@ -404,7 +404,7 @@ that doesn't fit. Deleting frees room.
 
 ## Call
 
-```ts
+```ts ignore
 room.call(stream: MediaStream | null, options?: { max?: number }): Call
 ```
 
@@ -742,7 +742,7 @@ Counters, as `endpoint.stats()` and `room.stats()` return them: `txPackets`, `rx
 
 ## WebRtcTransport
 
-```ts
+```ts ignore
 new WebRtcTransport(endpoint: Endpoint, signaling: SignalingAdapter, options?)
 ```
 
@@ -787,7 +787,7 @@ build your own for relay-only privacy or a custom room.
 
 ## LocalTransport
 
-```ts
+```ts ignore
 new LocalTransport(endpoint: Endpoint, signaling: BroadcastSignaling)
 ```
 
@@ -797,7 +797,7 @@ browser. `joinRoom` uses it for `'local'` rooms when the runtime has no WebRTC. 
 
 ## BroadcastSignaling
 
-```ts
+```ts ignore
 new BroadcastSignaling(id: string, room?: string)
 ```
 
@@ -806,7 +806,7 @@ A [`SignalingAdapter`](#signalingadapter) over a BroadcastChannel, for tabs of o
 
 ## NostrSignaling
 
-```ts
+```ts ignore
 new NostrSignaling(pw: Peerwire, endpoint: Endpoint, options: { room: string; relays?: string[] })
 ```
 

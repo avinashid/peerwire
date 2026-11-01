@@ -98,6 +98,8 @@ struct ReadmeDoctests;
 // ```rust block that isn't listed here.
 #[cfg(all(doctest, docs_samples))]
 mod doc_samples {
+    #[doc = include_str!("../../../README.md")]
+    struct Readme;
     #[doc = include_str!("../../../docs/getting-started/quick-start.md")]
     struct GettingStartedQuickStart;
     #[doc = include_str!("../../../docs/guides/lan-discovery.md")]

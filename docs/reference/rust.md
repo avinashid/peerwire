@@ -277,6 +277,7 @@ use peerwire::{LanSignaling, Node};
 
 let mut node = Node::builder().signaling(LanSignaling::new()?).bind("0.0.0.0:0")?;
 node.join_room("my-app", "kitchen"); // links with every node in "kitchen" on this LAN
+# Ok::<(), std::io::Error>(())
 ```
 
 #### Config
@@ -433,6 +434,7 @@ itself. Carriers are untrusted: they see topics, timing and the sender's IP, nev
 peer messages.
 
 ```rust
+# use peerwire::Topic;
 pub trait Signaling: Send {
     fn subscribe(&mut self, topic: Topic);
     fn unsubscribe(&mut self, topic: Topic);
@@ -497,6 +499,7 @@ let mut node = Node::builder()
     .signaling(NostrSignaling::new(["wss://nos.lol", "wss://nostr.mom"]))
     .bind("[::]:0")?;
 node.join_room("my-app", "lobby"); // finds and connects the room's peers
+# Ok::<(), std::io::Error>(())
 ```
 
 For tests on a LAN, [`examples/rust/nostr_relay.rs`](../../examples/rust/nostr_relay.rs) is a small relay:

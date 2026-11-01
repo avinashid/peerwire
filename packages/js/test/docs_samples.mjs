@@ -30,8 +30,6 @@ const check = (ok, what) => {
 // Pages exempt as they were on 6ba7cd9, each pinned to a hash of its code blocks: an edit to one of them ends the
 // exemption, and this fails until its line is deleted. NB-070 lists what each fails.
 const BASELINE = {
-  // The old README, which NB-066 rewrites: 3 of its 4 blocks don't compile as doc tests.
-  'README.md': '7f85bd15672f',
   // A fragment: peerwire-sync's lib.rs doesn't include its README.
   'crates/peerwire-sync/README.md': '8673a29fdd77',
 };

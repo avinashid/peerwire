@@ -257,6 +257,13 @@ The full analysis is the DOC section of the [threat model](../project/threat-mod
 passes time and messages in, and drains messages, events and the next timer. Beside a `peerwire::Node`:
 
 ```rust
+# use peerwire::{Lane, Node, SendError};
+# use peerwire_sync::{Instant, PeerId, State};
+# fn render(_: String, _: String, _: Option<&str>) {}
+# fn status(_: State) {}
+# let mut node = Node::builder().bind("127.0.0.1:0")?;
+# let (me, peer, seed, now) = (PeerId([1; 32]), PeerId([2; 32]), [7; 32], Instant::from_millis(0));
+# let message = b"\x01app bytes".to_vec();
 use peerwire_sync::{Docs, Event, Options, Route, DOC_TAG};
 
 let mut docs = Docs::new(me, seed);                        // seed: 32 bytes from the OS
@@ -279,6 +286,7 @@ while let Some(e) = docs.poll_event() {
     }
 }
 // and docs.handle_timeout(now) once docs.poll_timeout() has passed.
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 - A doc message is `DOC_TAG` (7) followed by the frame's JSON, on the reliable lane. `Node::send` carries raw app
