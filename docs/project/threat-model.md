@@ -136,7 +136,8 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; NB16-I1, I2 (Info) open, NB16-I3 done when Pages was enabled, [The docs and demos site](#the-docs-and-demos-site-nb-016-nb-067--nb16-1-nb16-2-nb67-1) |
 | The shared origin (Low) | Accepted by the repo owner on 2026-11-01: the site is served from `avinashid.github.io` with no origin of its own. The meet page stays off the site, so NB10a-I1 doesn't arise; it joins only with the owner's approval and a frame check, same section |
 | NB16-2 (Low) | Accepted by the repo owner on 2026-11-01 (NB-071): Net Lab keeps its microphone button on the site, and on a `*.github.io` host its note says, before and after the grant, that the permission covers the whole origin, so the account's other Pages sites could use the microphone, and see the device's local addresses, without asking (`1d434cb`, and `8f4a635` for the addresses, NB71-I1), reviewed 2026-11-01, same section |
-| NB67-1 (Low), NB67-I3, NB67-I4 (Info) | **Fixed** by `41c91ef`, `a7da8c2` and `4386eec` before NB-066 merged, so never on main (an SVG under `docs/assets/` may hold only 20 drawing elements, SVG's and xlink's namespaces and printable ASCII, with no prefix, `&#`, processing instruction, backslash, or `//` but in the `xmlns`), reviewed 2026-11-01; NB67-I1, I2 (Info) open, same section |
+| NB67-1 (Low), NB67-I3, NB67-I4 (Info) | **Fixed** by `41c91ef`, `a7da8c2` and `4386eec` before NB-066 merged, so never on main (an SVG under `docs/assets/` may hold only 20 drawing elements, SVG's and xlink's namespaces and printable ASCII, with no prefix, `&#`, processing instruction, backslash, or `//` but in the `xmlns`), reviewed 2026-11-01; NB67-I1, I2 (Info) fixed by NB-073, next row, same section |
+| NB67-I1, NB67-I2 (Info) | **Fixed** by `1f2a492` and `9d3396d` (NB-073): the edit link takes the doc's path through `encodeURI`, then escaped, and every link to a page is escaped; a symlink under `docs/assets/`, or `docs/assets` one or under one, fails the build. Reviewed 2026-11-01; NB73-I1, NB73-I2 (Info) open (the build still follows symlinks to docs and demo modules; a `%` in a doc's name breaks its links), same section |
 | NB64-1, NB64-2 (Low), NB64-3, NB64-4, NB64-5 (Info) | **Fixed** by `a0fe2b1` and `4c86af7` before NB-064 merged, so never on main (merged `34a35a8`): `LanSignaling` takes only datagrams sent to its group, except on Windows; an inbox message spends a token before it is opened; `lan_chat` escapes member text; the docs say the ESP32 seed fixes the identity only, and what a replayed hello does. Reviewed 2026-11-01; residuals accepted, [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6) |
 | NB64-6 (Low) | Open (NB-065): a neighbour who knows two members' PeerIds can keep them from linking by flooding their inbox topics, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
@@ -2477,8 +2478,10 @@ design:
   `assets/<id>/`, `<id>` being 12 hex digits of a SHA-256 of their contents. A demo
   page's `<script src>` is the only rewrite.
 - **Images.** A doc may show only a file under `docs/assets/`, named `[\w-]` with an
-  image extension. An SVG there is served from the site's origin with no policy of
-  ours, so the build (`checkSvg`; NB67-1) refuses one that holds:
+  image extension. The build refuses a symlink there, to a file or a directory, and
+  `docs/assets` itself as one or under one (NB67-I2), so it copies only files the repo
+  holds. An SVG there is served from the site's origin with no policy of ours, so the
+  build (`checkSvg`; NB67-1) refuses one that holds:
   - an element outside a list of 20 shapes, groups and paint servers (`svg`, `g`,
     `path`, `rect`, `use`, `linearGradient`, `stop`, `mask`, …), so no `script`,
     `foreignObject`, `iframe`, `a`, `image`, `style` or animation;
@@ -2507,7 +2510,10 @@ Reviewed 2026-10-31 by reading `2f68aa8..47ce300`, then the fix `6107674`, with 
 probe of the renderer (Node 22). The docs layout (NB-067, `6ba7cd9..a2d4029`, merged in
 `2735268`) was reviewed on 2026-11-01 by reading the diff, with a loopback probe of
 `checkSvg` in headless Chromium for NB67-1, and its fixes were re-read the same day,
-with the probes re-run on each. Nothing was sent to Pages or GitHub.
+with the probes re-run on each. NB-073's fixes for NB67-I1 and NB67-I2
+(`cecbb72..9d3396d`) were reviewed the same day by reading the diff, with a probe of
+`buildSite` on a copy of the tree (Node 22), on this machine only. Nothing was sent to
+Pages or GitHub.
 
 **Checked and holding:**
 - The renderer escapes text, code, fence languages, heading ids, table cells, alerts and
@@ -2524,9 +2530,12 @@ with the probes re-run on each. Nothing was sent to Pages or GitHub.
   Pages nor its CDN sees them in a request.
 - `site.sh --serve` binds 127.0.0.1.
 - The layouts escape every string they put in a page: titles, groups, headings and
-  their ids, descriptions, and a redirect's target. `docs/README.md` may list only
-  `.md` files inside the repo, and a doc missing from it or listed twice fails the
-  build.
+  their ids, descriptions, a redirect's target, and since NB-073 every link to a page
+  (sidebar, prev/next, the overview's cards) and the edit link, whose path goes through
+  `encodeURI` first. `docs/README.md` may list only `.md` files inside the repo, and a
+  doc missing from it or listed twice fails the build. A doc whose name holds `#` or
+  `?` fails it too: the link check finds no file at the sidebar's link to it, so its
+  edit link can't name another file on GitHub.
 - `logo.svg` and `favicon.svg` hold paths, shapes and a gradient, and refer to nothing
   but their own `#pw-g`.
 
@@ -2692,11 +2701,20 @@ see. **Before the meet page joins the site's demos,** it must check
 - **NB67-I1.** The "Edit this page on GitHub" link puts the doc's path in its `href`
   as it is, neither escaped nor URL-encoded. A path holding `"` could leave the
   attribute, which `PAGE_CSP` keeps inert, and only a file the repo holds can be a doc.
-  `encodeURI` would do (not written).
+  `encodeURI` would do. Fixed by `1f2a492` (NB-073), reviewed 2026-11-01: the path goes
+  through `encodeURI`, then is escaped, and the sidebar, prev/next and the overview's
+  cards escape their links to a page as well; `site_build.mjs` builds a doc named
+  `q" &amp;.md`. `encodeURI` leaves `#` and `?`, but a doc named with either fails the
+  build (above).
 - **NB67-I2.** The build follows symlinks under `docs/assets/`, so a committed symlink
   named like an image would publish whatever it points at on the build machine. A
   reviewer sees it in the diff as a one-line file. Refusing symlinks there (`lstat`)
-  would be tighter (not written).
+  would be tighter. Fixed by `9d3396d` (NB-073), reviewed 2026-11-01: `walk` reads
+  `docs/assets/` with `lstat` and throws on a symlink, to a file or a directory, and
+  the build throws unless `docs/assets` resolves to itself under the repo, so neither
+  it nor `docs` can be one. A probe of a link inside a real subdirectory, and of `docs`
+  as a link, was refused. Git stores no hard links, devices or FIFOs, so a commit can
+  put nothing else there that names a file outside the repo. Residual: NB73-I1.
 - **NB67-I3.** `<a><set attributeName="href" to="java…script:…"/>`, with a tab inside
   `javascript:`, passed the check until the allow-list: the URL parser drops the tab,
   but the regex saw no `javascript:`. It didn't run on a click in headless Chromium.
@@ -2708,6 +2726,24 @@ see. **Before the meet page joins the site's demos,** it must check
   in a `style` or a `fill`. Each fetched from a second loopback port in headless
   Chromium; that host learns the visitor's IP address. Fixed by `4386eec`: no
   backslash, and no `//` but in the `xmlns`.
+- **NB73-I1.** Outside `docs/assets/` the build still follows symlinks: to each `.md`
+  that `docs/README.md` lists (anywhere in the repo), to the demos' pages and every
+  module they load, and to `site.css`. A commit that adds such a link, with a sidebar
+  line or a demo `<script>`, would publish what it names on the build machine. Repro,
+  on a copy of `9d3396d`: a listed `docs/leak.md -> /etc/hostname` put the host's name
+  on `docs/leak.html`, one to `/proc/self/environ` put the build's environment there,
+  and `packages/js/demo/leak.js -> /etc/hostname`, loaded by a demo, was copied to
+  `assets/<id>/demo/`. Info, as NB67-I2: it takes a merged commit, where the link shows
+  as a one-line file; the Pages build job holds only `contents: read`, no secret and no
+  persisted credentials, and the site goes live after that job, and its tokens, have
+  ended. The repo tracks no symlinks, so refusing them changes nothing it builds: the
+  same `realpath` check as `docs/assets` for every file the build reads and publishes
+  (not written).
+- **NB73-I2.** A page's links are escaped but not URL-encoded, so a doc named
+  `a%41.md` builds with links to `a%41.html`, which a browser reads as `aA.html`; the
+  link check reads the raw path and passes it. Only the site's own links break.
+  Accepting only `[\w-]` doc names, as for images, would settle it and `#` and `?` by
+  rule rather than by the link check (not written).
 
 ### LAN signalling, `LanSignaling` (NB-064) — NB64-1…NB64-6
 
