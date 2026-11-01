@@ -1,4 +1,4 @@
-//! Shared docs (peerwire-sync) at size: the numbers in docs/PERFORMANCE.md §4.
+//! Shared docs (peerwire-sync) at size: the numbers in docs/project/performance.md §4.
 //!
 //! ```text
 //! cargo run --release -p peerwire-sim --example docs

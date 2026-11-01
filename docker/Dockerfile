@@ -1,10 +1,12 @@
-# Peerwire images (see docs/DOCKER.md):
+# Peerwire images (see docs/guides/always-on-peer.md). Build from the repo root, which is the context:
 #
-#   docker build -t peerwire-peer .                         # the always-on peer (default target)
-#   docker build -t peerwire-examples --target examples .   # the browser demos, served by nginx
+#   docker build -f docker/Dockerfile -t peerwire-peer .                         # the always-on peer (default target)
+#   docker build -f docker/Dockerfile -t peerwire-examples --target examples .   # the browser demos, served by nginx
 #
-# Both run as a non-root user. Neither publishes a port by itself: docker-compose.yml binds them to
-# localhost only.
+# What stays out of the context is in Dockerfile.dockerignore, next to this file: BuildKit reads it in place of a
+# .dockerignore at the root (the RUN --mount steps below need BuildKit anyway).
+#
+# Both run as a non-root user. Neither publishes a port by itself: docker/compose.yml binds them to localhost only.
 
 # ---- build: the peer binary, and the wasm module for the demos ----
 FROM rust:1-slim-bookworm AS build

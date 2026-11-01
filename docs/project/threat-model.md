@@ -9,7 +9,7 @@ docs and demos site built for GitHub Pages. It records what Peerwire defends
 against, what it does not, and the findings of the first security review (M5, NB-013)
 and of every review since.
 
-Status: pre-1.0, no external audit. See [SECURITY.md](../SECURITY.md).
+Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 
 ## What Peerwire protects
 
@@ -75,12 +75,12 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | SEC-4 (Medium) | **Fixed** by NB-024 (`85b8460`), merged `208659b` (under load a handshake from a UDP address takes no state until it echoes a cookie, and each source holds at most 4 half-open handshakes), reviewed 2026-10-29; residuals R1–R5, [SEC-4](#sec-4--half-open-handshake-table-exhaustion-medium--nb-024) |
 | NB24-1 (Medium) | **Fixed** by `3e1cab3` (its type named in `ae34744`) before the merge `208659b`, so never on main (a handshake a UDP address took below the mark, which may be spoofed, isn't counted against that address), reviewed 2026-10-29; Info NB24-I1…I6 (accepted or optional; I3 fixed by NB-050), same section |
 | SEC-5…SEC-8 | Open (NB-025…NB-028) |
-| SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 audit and N29-1 fix |
+| SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/guides/godot.md` (Security); NB-029 audit and N29-1 fix |
 | SEC-12 (Info) | Accepted, no card |
 | SEC-13 (Low) | **Fixed** by NB-050 (`2f0c823`), merged `fe6854d` (an HS1's Noise part must be exactly 128 bytes, so a short copy of a half-open handshake's HS1 no longer draws its 57-byte HS2), reviewed 2026-10-30; residual NB50-I1 (Info, accepted), [SEC-13](#sec-13--a-short-copy-of-a-half-open-handshakes-hs1-reflects-its-hs2-low) |
 | N38-1…N38-3 (port mapping) | **Fixed** in NB-038 (`71d83b2`) and NB-041 (`0dfdbc9`) |
 | NPM-1 (Low) | **Fixed** by `4cffbf9` (merged `14f463a`): no port mapping under `RelayOnly` |
-| NPM-2 (Low) | **Fixed** in `docs/GODOT.md` (`9be92d5`); the flood risk itself is SEC-4 |
+| NPM-2 (Low) | **Fixed** in `docs/guides/godot.md` (`9be92d5`); the flood risk itself is SEC-4 |
 | NPM-3 (Low) | **Fixed** by `6f947f3`: a map request in flight at stop gets one delete |
 | NB44-1 (Medium) | **Fixed** by `40e42db` (per-IP punch cap), re-checked 2026-10-23 ([below](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2)) |
 | NB48-1 (Medium) | **Fixed** by `d1b2d25` (fleet checks one public address; Net Lab consent and cooldown), re-checked 2026-10-23 |
@@ -133,9 +133,10 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB19-2 (Low) | Accepted (the lead's call, documented in the README and `index.d.ts`): 100 drops or more in a message's second, ordered before it, hide it on that relay, same section |
 | NB10-1, NB10-2 (Low), NB10-I1, NB10-I2 (Info) | **Fixed** by `c578263` and `41f4021` before NB-010 merged, so never on main (merged `869e4cf`), before `room.call()` was published (a member's `full` turns a joiner away only when the joiner's own roster has no seat for it either; 'stream' comes for every peer once its description applies, whatever it sends; a description with more than 64 candidates is dropped; the docs say call frames on a pipe go inside it), reviewed 2026-10-31; NB10-I1a, NB10-I3 (Info) and the residuals accepted, [Calls](#calls-roomcall-nb-010-nb-010a--nb10-1-nb10-2-nb10a-1) |
 | NB10a-1 (Low) | **Fixed** by `f979384` before NB-010a merged, so never on main (merged `4f681b4`): in the meet page, a camera or microphone request still pending at Leave is turned off when it lands, reviewed 2026-10-31, same section |
-| NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; NB16-I1, I2 (Info) open, NB16-I3 done when Pages was enabled, [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1-nb16-2) |
+| NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; NB16-I1, I2 (Info) open, NB16-I3 done when Pages was enabled, [The docs and demos site](#the-docs-and-demos-site-nb-016-nb-067--nb16-1-nb16-2-nb67-1) |
 | The shared origin (Low) | Accepted by the repo owner on 2026-11-01: the site is served from `avinashid.github.io` with no origin of its own. The meet page stays off the site, so NB10a-I1 doesn't arise; it joins only with the owner's approval and a frame check, same section |
-| NB16-2 (Low) | Open: Net Lab, which is on the site, asks for the microphone, and a grant the browser keeps belongs to the shared origin, same section |
+| NB16-2 (Low) | Accepted by the repo owner on 2026-11-01 (NB-071): Net Lab keeps its microphone button on the site, and on a `*.github.io` host its note says, before and after the grant, that the permission covers the whole origin, so the account's other Pages sites could use the microphone, and see the device's local addresses, without asking (`1d434cb`, and `8f4a635` for the addresses, NB71-I1), reviewed 2026-11-01, same section |
+| NB67-1 (Low), NB67-I3, NB67-I4 (Info) | **Fixed** by `41c91ef`, `a7da8c2` and `4386eec` before NB-066 merged, so never on main (an SVG under `docs/assets/` may hold only 20 drawing elements, SVG's and xlink's namespaces and printable ASCII, with no prefix, `&#`, processing instruction, backslash, or `//` but in the `xmlns`), reviewed 2026-11-01; NB67-I1, I2 (Info) open, same section |
 | NB64-1, NB64-2 (Low), NB64-3, NB64-4, NB64-5 (Info) | **Fixed** by `a0fe2b1` and `4c86af7` before NB-064 merged, so never on main (merged `34a35a8`): `LanSignaling` takes only datagrams sent to its group, except on Windows; an inbox message spends a token before it is opened; `lan_chat` escapes member text; the docs say the ESP32 seed fixes the identity only, and what a replayed hello does. Reviewed 2026-11-01; residuals accepted, [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6) |
 | NB64-6 (Low) | Open (NB-065): a neighbour who knows two members' PeerIds can keep them from linking by flooding their inbox topics, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
@@ -514,7 +515,7 @@ surface in three ways:
   Under a handshake flood that endpoint takes no state for spoofed handshakes
   (SEC-4, fixed by NB-024), but an attacker with many real addresses can still
   keep others from connecting (SEC-4 R1). It also shows up in port scans.
-  `docs/GODOT.md` says this and advises asking the player first (NPM-2).
+  `docs/guides/godot.md` says this and advises asking the player first (NPM-2).
 - **The gateway and the LAN are trusted for the address only.** Any device on the
   LAN can answer the requests. A rogue responder can report a false address,
   which peers would then dial. It can't get into a session: no one finishes a
@@ -538,7 +539,7 @@ Findings:
   deletes the mapping without blocking, and switching out maps again after the
   old delete has gone out. A Godot relay-only host still maps, because it gives
   out its public addresses as under `PublicOnly`.
-- **NPM-2 (Low, fixed in `docs/GODOT.md`, `9be92d5`).** The doc said the port
+- **NPM-2 (Low, fixed in `docs/guides/godot.md`, `9be92d5`).** The doc said the port
   "reaches only the Noise endpoint" without the SEC-4 flood caveat.
 - **NPM-3 (Low, fixed by `6f947f3`).** `Mapper::stop()` deleted only a lease it
   held. A PCP or NAT-PMP map request still unanswered when the worker stopped
@@ -554,7 +555,7 @@ Reviewed on 2026-10-23: native `backend/NB-045-lockstep-prediction` (`3a6c8b8`,
 NB-044 birthday punch and NB-045 lockstep) and browser
 `ui/NB-048-browser-birthday` (`5ee351e`, NB-046 ICE restart and port prediction,
 NB-047 Net Lab rooms, NB-048 browser birthday punch). Mechanisms and costs are in
-`docs/NAT-TRAVERSAL.md` (Birthday punching, Lockstep prediction, Reflection).
+`docs/concepts/nat-traversal.md` (Birthday punching, Lockstep prediction, Reflection).
 
 These features make a node send many packets to an address a remote party names.
 The security question is who can name that address and how much traffic follows.
@@ -1940,7 +1941,7 @@ open in `lostSocket()`. The docs now say "dialled 30 s ago" where that is what c
 `room.doc(name, { relays: true })` (`packages/js/src/relays.js`; `nostr.js` `query()`
 and `store()`) keeps a sealed copy of the doc on the room's Nostr signalling relays, so
 a member who opens it while no other member is online still gets it. The design is
-route 1 of [STORE-DESIGN.md](STORE-DESIGN.md), with security's design review (NB-006g-1
+route 1 of [STORE-DESIGN.md](offline-store-design.md), with security's design review (NB-006g-1
 to -10) written into it. Its "Threats" are the copy's threat model, and the README and
 `index.d.ts` state them for apps.
 
@@ -2448,26 +2449,53 @@ the three probes reproduces on the fixed heads.
   A relay carrying a pipe sees the sizes and timing of the call frames inside it.
 - **The meet page on the public site.** It stays off it: the owner accepted the shared
   origin on 2026-11-01 with the meet page kept out. Before it ever goes, see the frame
-  check and NB10a-I1 under
-  [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1-nb16-2).
+  check and NB10a-I1 under the
+  [site's section](#the-docs-and-demos-site-nb-016-nb-067--nb16-1-nb16-2-nb67-1).
 
-### The docs and demos site (NB-016) — NB16-1, NB16-2
+### The docs and demos site (NB-016, NB-067) — NB16-1, NB16-2, NB67-1
 
-`scripts/site.sh` builds a static site into `target/site/`: a landing page, the README,
-the package READMEs and `docs/*.md` rendered to HTML by our own renderer
-(`scripts/site/markdown.mjs`), and the demos that need no server of ours (index, chat,
-poll, arena, Net Lab). `.github/workflows/pages.yml` deploys it to GitHub Pages at
-`avinashid.github.io/peerwire/`, run by hand only. It was first deployed on 2026-11-01,
-from `be989d4`, without the meet page. The design:
-- **No third-party code at runtime.** No CDN, font, analytics or remote image; the
-  README's badges become text.
+`scripts/site.sh` builds a static site into `target/site/`: a landing page; the docs
+listed in `docs/README.md`, which is their index and sidebar, and `CHANGELOG.md`,
+`CONTRIBUTING.md` and `SECURITY.md` from the repo's root, rendered to HTML by our own
+renderer (`scripts/site/markdown.mjs`); the demos that need no server of ours (index,
+chat, poll, arena, Net Lab); and 12 pages at the first site's URLs (`README.html`,
+`docs/THREAT-MODEL.html`, …) that refresh to where each page is now. The README and the
+package READMEs are no longer rendered. `.github/workflows/pages.yml` deploys it to
+GitHub Pages at `avinashid.github.io/peerwire/`, run by hand only. It was first deployed
+on 2026-11-01, from `be989d4`, without the meet page; the docs layout (NB-067: sidebar,
+"On this page", prev/next, build-time highlighting, the logo) came with NB-066. The
+design:
+- **No third-party code at runtime.** No CDN, font, analytics or remote image; a remote
+  image in a doc (a badge) becomes its alt text.
 - **The policy is a `<meta>` CSP.** Pages sends no headers we choose, so each page
   carries its own: the demos get `docker/examples-nginx.conf`'s, less
   `frame-ancestors` (a `<meta>` policy can't set it), and the other pages allow no
-  script. No page sends a referrer.
-- **Versioned assets.** Every module, the wasm and the stylesheet live under
+  script: `default-src 'none'`, with styles from the site and images from it or
+  `data:`, so no script, inline style or handler. Their menus are `<details>`, and the
+  landing page's code tabs are CSS radio buttons. No page sends a referrer.
+- **Versioned assets.** Every module, the wasm, the stylesheet and the images live under
   `assets/<id>/`, `<id>` being 12 hex digits of a SHA-256 of their contents. A demo
   page's `<script src>` is the only rewrite.
+- **Images.** A doc may show only a file under `docs/assets/`, named `[\w-]` with an
+  image extension. An SVG there is served from the site's origin with no policy of
+  ours, so the build (`checkSvg`; NB67-1) refuses one that holds:
+  - an element outside a list of 20 shapes, groups and paint servers (`svg`, `g`,
+    `path`, `rect`, `use`, `linearGradient`, `stop`, `mask`, …), so no `script`,
+    `foreignObject`, `iframe`, `a`, `image`, `style` or animation;
+  - a namespace but SVG's (and xlink's, as `xmlns:xlink`), or an element with a
+    prefix;
+  - an `on*` handler, a DTD, a character reference (`&#`), a processing instruction
+    other than the XML declaration, a backslash, or a character outside printable
+    ASCII, tab, LF and CR;
+  - a reference to anything outside it: `href` and `url()` name only `#ids`, and no
+    URL scheme, `javascript:`, `data:` or `//` appears but in the `xmlns`.
+- **Highlighting.** Code is highlighted at build time: `highlight.mjs` wraps escaped
+  text in `<span class>` from a fixed set, and the test checks that the output's text
+  is the code, for every fence in the docs and for 400 random inputs × 10 languages.
+- **Redirects.** Each of the first site's URLs is a page with a
+  `<meta http-equiv="refresh">` to a page of the build, a link to it, and `noindex`.
+  The targets are a fixed list, not taken from the URL, and the link check covers
+  refresh URLs.
 - **Links.** The build fails on any link that isn't relative, http(s), mailto, or a `#`
   anchor that exists. A link to a repo file that isn't rendered goes to GitHub.
 - **Workflow.** `workflow_dispatch` only, with no inputs. `permissions: {}`, then
@@ -2476,7 +2504,10 @@ from `be989d4`, without the meet page. The design:
   environment.
 
 Reviewed 2026-10-31 by reading `2f68aa8..47ce300`, then the fix `6107674`, with one
-probe of the renderer (Node 22). Nothing was sent to Pages or GitHub.
+probe of the renderer (Node 22). The docs layout (NB-067, `6ba7cd9..a2d4029`, merged in
+`2735268`) was reviewed on 2026-11-01 by reading the diff, with a loopback probe of
+`checkSvg` in headless Chromium for NB67-1, and its fixes were re-read the same day,
+with the probes re-run on each. Nothing was sent to Pages or GitHub.
 
 **Checked and holding:**
 - The renderer escapes text, code, fence languages, heading ids, table cells, alerts and
@@ -2492,6 +2523,12 @@ probe of the renderer (Node 22). Nothing was sent to Pages or GitHub.
 - Invite secrets ride in the fragment (`#key=`, `#room=`, chat's `#id`), so neither
   Pages nor its CDN sees them in a request.
 - `site.sh --serve` binds 127.0.0.1.
+- The layouts escape every string they put in a page: titles, groups, headings and
+  their ids, descriptions, and a redirect's target. `docs/README.md` may list only
+  `.md` files inside the repo, and a doc missing from it or listed twice fails the
+  build.
+- `logo.svg` and `favicon.svg` hold paths, shapes and a gradient, and refer to nothing
+  but their own `#pw-g`.
 
 **NB16-1 — Third-party actions built what Pages would serve (Low).** The build job ran
 `dtolnay/rust-toolchain@stable` (a branch) and `Swatinem/rust-cache@v2` (a movable
@@ -2506,6 +2543,46 @@ full commit.
 
 **Status: fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed.
 Reviewed 2026-10-31 by reading the workflow. The guard's 7 mutants are all caught.
+
+**NB67-1 — `checkSvg` misses a script with a namespace prefix (Low).** An SVG opened
+on its own is an XML document, where an element's namespace, not its spelling, makes it
+a script: `<s:script>`, with `xmlns:s` bound to the SVG namespace, runs, and so does
+`<h:script>` (XHTML) inside `<s:foreignObject>`. `checkSvg` looks for the text
+`<script` and `<foreignObject`, so both pass it. The build copies an SVG under
+`docs/assets/` to `assets/<id>/img/`, served from `avinashid.github.io` with no policy,
+so a link straight to the file would run its script on the shared origin, with the
+demos' storage (above). It takes such a file merged into `docs/assets/`, which is the
+case the check is there for. Repro, on loopback: both forms pass `checkSvg` (at
+`46b8ad0`), and their script runs when headless Chromium opens the file from a
+127.0.0.1 server as `image/svg+xml`; the plain `<script>` control is refused. An
+embedded XSLT stylesheet (`<?xml-stylesheet href="#x"?>`) didn't run in that Chromium,
+and is refused already. Fix: refuse any element name with a prefix
+(`/<\/?[A-Za-z_][\w.-]*:/`), which the logo and favicon pass; refusing character
+references (`&#`) and processing instructions other than the XML declaration also
+closes the spellings a regex can't see through. Found on 2026-11-01 in the review of
+NB-066 before its push.
+
+The re-reads found two more forms, reproduced the same way. At `41c91ef`, which refused
+the prefix, `&#` and processing instructions: an XHTML element needs no prefix in the
+default namespace, so `<g xmlns="http://www.w3.org/1999/xhtml">` around
+`<iframe srcdoc="&lt;script&gt;…">` passed, since nothing in it spells `<script`, `&#`
+or a URL, and a srcdoc frame runs with its parent's origin; so did the same under an
+`<html>` root. At `a7da8c2`, which allowed only listed elements and SVG's namespace:
+U+1680 and U+FEFF are XML name characters that JS's `\s` matches, so a prefix of `g`
+and U+1680 read to every rule as an allowed `<g`, and hid a `<g…:script>` in the SVG
+namespace. The fix is all three steps: no prefix, `&#` or processing instruction but
+the XML declaration (`41c91ef`); only 20 drawing elements, and no namespace but SVG's
+and xlink's (`a7da8c2`); and only printable ASCII, tab, LF and CR, so that `\s` and
+`\w` agree with XML's names (`4386eec`). With no DTD, `&#`, processing instruction or
+other character, every element of the parsed file is a literal `<name` in the source,
+where the list sees it. `site_build.mjs` holds each form, and taking out the
+allow-list, the namespace rule or any of `4386eec`'s three rules makes it fail.
+
+**Status: fixed** by `41c91ef`, `a7da8c2` and `4386eec` before NB-066 merged, so never
+on main or on the site. Reviewed 2026-11-01 by reading the diffs and re-running the
+loopback probes on each: every form above is refused, and the logo and favicon pass.
+Residual: the check reads the source with regexes, not an XML parser; it holds because
+what it allows has one reading, as above.
 
 **The shared origin (Low): accepted by the repo owner on 2026-11-01.**
 `avinashid.github.io` is one origin for every Pages site of the account. `github.io` is
@@ -2529,7 +2606,7 @@ Once the meet page is on the site, a visitor's "allow" there is a grant to
 `avinashid.github.io`, so every Pages site of the account could then use that visitor's
 camera or microphone without asking again, for as long as the browser keeps the grant.
 With the meet page off the site this doesn't arise for the camera; NB16-2 is the same
-case for the microphone, which a page on the site already asks for.
+case for the microphone, which a page on the site already asks for (accepted, below).
 
 **NB16-2 — Net Lab's microphone grant goes to the shared origin (Low).** Net Lab is on
 the site, and its "Use microphone" button calls `getUserMedia({ audio: true })` and
@@ -2547,9 +2624,22 @@ lists `netlab.html`. Nothing was run against the live site. Fix, while the site 
 on the shared origin: the site build leaves Net Lab's microphone button out and the
 page skips what needs it (Net Lab works without the grant), with a `site_build.mjs`
 check that no page on the site calls `getUserMedia`; the Docker and local copies keep
-the button. An origin of the site's own fixes it with the rest. **Status: open**, found
-on 2026-11-01 while recording the owner's decision; the site review on 2026-10-31
-named the camera only.
+the button. An origin of the site's own fixes it with the rest. Found on 2026-11-01
+while recording the owner's decision; the site review on 2026-10-31 named the camera
+only.
+
+**Status: accepted** by the repo owner on 2026-11-01 (NB-071), who kept the button on
+the site, so neither fix was taken. The mitigation is the button's note (`1d434cb`): on
+a `*.github.io` host it adds, before the grant and after it, that the permission is for
+all of that host (`avinashid.github.io` here), so the other GitHub Pages sites on it
+could use the microphone, and see this device's local addresses, without asking. On
+other hosts (local, Docker) the note is unchanged. Reviewed 2026-11-01 by reading the
+diff. NB71-I1 (Info), that the note named the microphone only, though those sites'
+WebRTC connections would carry the local addresses too with no indicator, is fixed by
+the words on the addresses (`8f4a635`); `test/netlab_mic.mjs` checks the note on a
+faked `avinashid.github.io` origin (NB71-I2). Residual: like the shared origin, it
+holds only while none of the account's other Pages sites runs third-party scripts or
+user content.
 
 **Fix not taken for now: an origin of the site's own.** A custom subdomain on a
 domain the owner holds is the one choice no other site shares: an organisation's
@@ -2559,8 +2649,9 @@ the account publishes, and the site needs no change, since its URLs are all rela
 With a custom domain, verify it in the account's Pages settings and enforce HTTPS, and
 remove its DNS record if the site is ever taken down, so no other Pages site can claim
 it. Accepting the shared origin, as the owner has, holds only while nothing else on the
-account runs third-party scripts or user content, and it doesn't cover the camera or
-the microphone (NB10a-I1, NB16-2).
+account runs third-party scripts or user content, and it doesn't cover the camera
+(NB10a-I1). The owner accepted Net Lab's microphone grant on its own, with a note on the
+button (NB16-2).
 
 **Framing (Info; a condition for the meet page).** A `<meta>` policy can't set
 `frame-ancestors`, so any site can frame the demos. For today's pages that is accepted:
@@ -2598,6 +2689,25 @@ see. **Before the meet page joins the site's demos,** it must check
   only, with a required reviewer, so a dispatch from another branch can't deploy. Done
   in the repository's settings when Pages was enabled on 2026-11-01: `main` only, the
   owner as required reviewer.
+- **NB67-I1.** The "Edit this page on GitHub" link puts the doc's path in its `href`
+  as it is, neither escaped nor URL-encoded. A path holding `"` could leave the
+  attribute, which `PAGE_CSP` keeps inert, and only a file the repo holds can be a doc.
+  `encodeURI` would do (not written).
+- **NB67-I2.** The build follows symlinks under `docs/assets/`, so a committed symlink
+  named like an image would publish whatever it points at on the build machine. A
+  reviewer sees it in the diff as a one-line file. Refusing symlinks there (`lstat`)
+  would be tighter (not written).
+- **NB67-I3.** `<a><set attributeName="href" to="java…script:…"/>`, with a tab inside
+  `javascript:`, passed the check until the allow-list: the URL parser drops the tab,
+  but the regex saw no `javascript:`. It didn't run on a click in headless Chromium.
+  The allow-list refuses `a` and `set` (`a7da8c2`), and `site_build.mjs` holds the
+  case.
+- **NB67-I4.** Until `4386eec`, an SVG opened on its own could still fetch from another
+  host, with no script: CSS takes a string URL in `image-set('//host/…' 1x)`, with no
+  `url(` or scheme, and a CSS escape spells `url(` as `u\72l(` and `//` as `\2f \2f`,
+  in a `style` or a `fill`. Each fetched from a second loopback port in headless
+  Chromium; that host learns the visitor's IP address. Fixed by `4386eec`: no
+  backslash, and no `//` but in the `xmlns`.
 
 ### LAN signalling, `LanSignaling` (NB-064) — NB64-1…NB64-6
 
@@ -3022,7 +3132,7 @@ and what it accepted. Values are from main `7b716a2`.
   - Fragments longer than `FRAGMENT`, and reassembly past `max_message` (1 MiB by
     default), are refused.
   - The bound tested in `fuzz.rs` is about 2.31 MB per link (2.17 MB reliable, 0.13
-    MB urgent). `docs/DOCKER.md` sizes `PEERWIRE_MAX_PEERS` from it: 256 peers can pin
+    MB urgent). `docs/guides/always-on-peer.md` sizes `PEERWIRE_MAX_PEERS` from it: 256 peers can pin
     about 0.6 GB.
 - **Retransmission.**
   - RTO is 20 ms to 5 s; backoff `rto·2^min(tries-1, 8)`, at most 10 s.
@@ -3227,8 +3337,9 @@ and what it accepted. Values are from main `7b716a2`.
 - Net Lab caps its event log at 500, the DOM log at 300 and chat at 200. The
   per-peer route history has no cap.
 - **README examples (`9e4640b`, reviewed 2026-10-24).** "Using with React" in
-  `packages/js/README.md` joins in an effect and leaves in its cleanup. A room `message`
-  is whatever the member chose to send: text, bytes or any JSON.
+  `packages/js/README.md` (since NB-066 [Your own hook](../guides/react.md#your-own-hook))
+  joins in an effect and leaves in its cleanup. A room `message` is whatever the member
+  chose to send: text, bytes or any JSON.
   - **RX-1 (Low):** the example's hook stored every message and rendered `{m.data}`. A
     member who sent an object made React throw while rendering, which unmounted the
     app, and the cleanup then left the room. So one broadcast object took every other
@@ -3404,7 +3515,7 @@ nodes and set properties on others' scene trees. A malicious peer that the app
 treats as an authority corrupts every client.
 
 **Requirements.**
-- `docs/GODOT.md` must state that Godot's authority model is only as trustworthy
+- `docs/guides/godot.md` must state that Godot's authority model is only as trustworthy
   as the app's topology; in an open mesh, `@rpc("authority")` is not a security
   control.
 - Recommend a pattern: designate the host as the only synchronizer/spawner
@@ -3416,7 +3527,7 @@ treats as an authority corrupts every client.
   don't bypass it).
 
 **Status of SEC-9…SEC-11 as of `ccc3b79`.** The binding shipped (NB-020) and was
-hardened (NB-030). `docs/GODOT.md` (Security) now states each requirement: keep
+hardened (NB-030). `docs/guides/godot.md` (Security) now states each requirement: keep
 `allow_object_decoding` off (the demo asserts it), treat `@rpc("any_peer")`
 arguments as attacker-controlled, ids are labels (the host renumbers collisions,
 only the dialled host is 1, authorize by `get_peer_key`), and Godot's authority
@@ -3424,7 +3535,7 @@ is only as trustworthy as the peer made authority (use the host, or lockstep on
 `peerwire-game`). SEC-11 is a design property: it stays a documented residual, not
 a bug. NB-037's room-key proof does not change it. It only limits who can join a
 room to holders of the room key, and any of them can still be malicious. Godot's
-`server_relay` is on by default; `docs/GODOT.md` names its cost, how to turn it
+`server_relay` is on by default; `docs/guides/godot.md` names its cost, how to turn it
 off, and that a relayed packet's sender id is the host's word (the host can forge
 it).
 
@@ -3489,6 +3600,9 @@ mappings that carry over and are already handled in Peerwire:
 - Metadata at the signaling layer (who talks to whom, when) is minimized but not
   hidden from a relay that correlates tags and timing. Over `LanSignaling` every
   device on the LAN sees what a relay sees, and the sender's IP and MAC addresses.
+- On the docs and demos site, what the account's other Pages sites can do on the shared
+  origin `avinashid.github.io`, a microphone grant given to Net Lab included (accepted
+  by the owner; NB16-2).
 - The security of the underlying crypto crates is assumed.
 
 ## Review method

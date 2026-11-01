@@ -1,0 +1,68 @@
+name: Bug report
+description: Something in Peerwire doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **A security problem?** Don't file it here: report it privately, as [SECURITY.md](https://github.com/avinashid/peerwire/blob/main/SECURITY.md) says.
+
+        Logs can hold IP addresses, peer ids and invites (`pw:…`). Remove the ones you don't want public before you paste them.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Part
+      options:
+        - "@peerwire/js (browser or Node)"
+        - "@peerwire/react"
+        - Rust crates (peerwire, peerwire-core, peerwire-sync, ...)
+        - Godot binding
+        - C ABI (peerwire-ffi)
+        - Always-on peer or Docker
+        - ESP32 port
+        - Demos
+        - Docs or the site
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The package or crate version, or the commit you built from.
+      placeholder: "@peerwire/js 0.1.1, or main at 1a2b3c4"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: And what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce it
+      description: The smallest code or the commands that show it, from a fresh start.
+      placeholder: |
+        1. Open demo/chat.html in two tabs
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        OS; browser and version, Node (`node --version`), Rust (`rustc --version`) or Godot, whichever you used. For a
+        connection problem, where the peers were: one machine, one LAN, or different networks (home router, phone
+        hotspot, VPN).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Console output or error messages, if any.
+      render: text

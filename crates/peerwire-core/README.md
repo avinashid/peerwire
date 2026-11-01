@@ -1,7 +1,7 @@
 # peerwire-core
 
 Sans-IO peer-to-peer session core for Peerwire.
-Design: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).
+Design: [docs/concepts/architecture.md](../../docs/concepts/architecture.md).
 
 An `Endpoint` holds one identity and any number of encrypted links. It never
 opens sockets, spawns threads or reads a clock: the host passes in datagrams

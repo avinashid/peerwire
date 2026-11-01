@@ -19,29 +19,32 @@ Give its invite to the peers of an app, and they keep a link to it (`Node::set_r
 `set_relay_peers` in Godot). Two of them whose NATs can't punch each other, such as two symmetric NATs on phone
 hotspots, then link through it. Bind it to a public address (`PEERWIRE_BIND=[::]:7700` for IPv4 and IPv6, the UDP
 port open) and keep STUN on, or give the host a public IP, so the invite lists an address the peers can reach. With
-`PEERWIRE_DATA` set, the invite stays the same across restarts.
+`PEERWIRE_DATA` set, its peer id stays the same across restarts, so an invite handed out earlier still links while the
+address is the same.
 
 Each peer may have it relay `PEERWIRE_RELAY_RATE` bytes per second (256 KiB by default), summed over everything it
 sends through it; `PEERWIRE_RELAY_TOTAL` caps all peers together. The relay can't read what it forwards, but it sees
 the peers' addresses, which of them talk, and how much. See
-[docs/NAT-TRAVERSAL.md](../../docs/NAT-TRAVERSAL.md#relay-peers).
+[docs/concepts/nat-traversal.md](../../docs/concepts/nat-traversal.md#relay-peers).
 
 ## Example
 
 ```sh
-PEERWIRE_DATA=./peer-data cargo run --release -p peerwire-peer          # run; prints the peer id and invite
-PEERWIRE_DATA=./peer-data cargo run --release -p peerwire-peer -- check # link to it from loopback; exit 0 if it answers
+mkdir -p ~/.local/share/peerwire-peer                 # outside the repo: it holds the secret key
+export PEERWIRE_DATA=~/.local/share/peerwire-peer
+cargo run --release -p peerwire-peer                  # run; prints the peer id and invite
+cargo run --release -p peerwire-peer -- check         # link to it from loopback; exit 0 if it answers
 ```
 
 In Docker, with the examples server next to it:
 
 ```sh
-docker compose up -d --build
-docker compose exec peer peerwire-peer check
+docker compose -f docker/compose.yml up -d --build
+docker compose -f docker/compose.yml exec peer peerwire-peer check
 ```
 
 Settings come from the environment: `PEERWIRE_BIND`, `PEERWIRE_DATA`, `PEERWIRE_STUN`, `PEERWIRE_MAX_PEERS`, `PEERWIRE_RELAY`,
-`PEERWIRE_RELAY_RATE`, `PEERWIRE_RELAY_TOTAL` and `PEERWIRE_STATS_SECS`. [docs/DOCKER.md](../../docs/DOCKER.md) lists their
+`PEERWIRE_RELAY_RATE`, `PEERWIRE_RELAY_TOTAL` and `PEERWIRE_STATS_SECS`. [docs/guides/always-on-peer.md](../../docs/guides/always-on-peer.md) lists their
 defaults and covers exposing the peer, its logs (they hold peer addresses) and the container hardening.
 
 ## Status

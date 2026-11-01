@@ -3,7 +3,7 @@ use crate::signaling::Signaling;
 use crate::traversal::{Birthday, Failure, NatType, Privacy, Role, Signal, Traversal};
 use crate::Event;
 use peerwire_core::{
-    Config, ConnectError, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError, Transmit,
+    Config, ConnectError, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError, Stats, Transmit,
 };
 use rand_core::{OsRng, RngCore};
 use std::collections::{HashMap, VecDeque};
@@ -52,12 +52,16 @@ pub enum Status {
     Connected,
 }
 
-/// Why [`Node::connect`] failed.
+/// Why [`Node::connect`] or [`Node::set_relay_peers`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The string is not an `pw:` invite.
     InvalidInvite,
-    /// The invite names no address or relay this node can use.
+    /// The dial didn't start: the invite names this node ([`ConnectError::SelfConnect`])
+    /// or a key that isn't valid ([`ConnectError::InvalidPeerId`]), it lists no address
+    /// in an IP family this socket reaches and no relay this node is linked to
+    /// ([`ConnectError::NoPath`]), or this node is relay-only and no relay is linked
+    /// ([`ConnectError::NoRelay`]).
     Connect(ConnectError),
 }
 
@@ -273,7 +277,8 @@ impl Node {
         Node::builder().identity(identity).config(config).bind(addr)
     }
 
-    /// Options: identity, config, STUN servers, signaling.
+    /// Options: identity, config, STUN servers, signaling, privacy, router port
+    /// mapping and relay peers. See [`Builder`].
     pub fn builder() -> Builder {
         Builder {
             identity: None,
@@ -357,10 +362,12 @@ impl Node {
         }
     }
 
-    /// Addresses a peer may reach this node at, as put in [`invite`](Node::invite):
-    /// the public address from STUN, any public address connected peers have
-    /// reported, and the bound address (or, when bound to any interface, the LAN
-    /// and loopback addresses), as the [`Privacy`] mode allows.
+    /// Addresses a peer may reach this node at, as put in [`invite`](Node::invite),
+    /// in this order: the public address from STUN, the public port the router
+    /// forwards ([`Builder::port_mapping`]), the last 4 addresses linked peers
+    /// reported seeing it at, and the bound address (or, when bound to any
+    /// interface, the LAN and loopback addresses). At most 8, and only those the
+    /// [`Privacy`] mode allows.
     pub fn addresses(&self) -> Vec<SocketAddr> {
         self.trav.candidates()
     }
@@ -584,7 +591,7 @@ impl Node {
     }
 
     /// Node-wide counters (packets, drops, relaying, hole punching).
-    pub fn stats(&self) -> peerwire_core::Stats {
+    pub fn stats(&self) -> Stats {
         self.ep.stats()
     }
 

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/avinashid/peerwire/security/advisories/new
+    about: Privately, through GitHub's private vulnerability reporting. Please don't open a public issue (see SECURITY.md).
+  - name: Ask how to do something
+    url: https://github.com/avinashid/peerwire/blob/main/docs/README.md
+    about: The docs cover rooms, messages, shared documents, calls, React, Godot and more. If they don't answer it, file a bug against the docs.

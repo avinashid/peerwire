@@ -63,7 +63,7 @@ cargo run --release -p peerwire-sim --example bulk -- --loss 0.01 --cpu 1
   100 Mbit/s link. It measures throughput, peak congestion window, retransmits and urgent
   latency.
 
-See [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md) for the numbers these produce.
+See [docs/project/performance.md](../../docs/project/performance.md) for the numbers these produce.
 
 ## Status
 

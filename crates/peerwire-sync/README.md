@@ -44,7 +44,7 @@ while let Some(e) = docs.poll_event() {
 A doc message is `DOC_TAG` (7, room.js's `T.Doc`) followed by the frame's JSON, on the reliable lane. `Node::send`
 carries raw app bytes, so an app that opens docs tags its own messages too, and hands `receive` every reliable
 message: `receive` takes the ones that start with 7, and gives the rest back. The Godot binding does this itself
-(see [docs/GODOT.md](../../docs/GODOT.md)). Deflated frames (tag 8) are never asked for: this version's asks don't
+(see [docs/guides/godot.md](../../docs/guides/godot.md)). Deflated frames (tag 8) are never asked for: this version's asks don't
 carry `z`, so no member deflates for it.
 
 **The JSON is V8's.** doc.js checks the object `JSON.parse` gives it, so this crate reads and writes JSON as V8 does:

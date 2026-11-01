@@ -1,10 +1,12 @@
 //! `peerwire`: peer-to-peer nodes over UDP, with no server.
 //!
 //! A [`Node`] owns one non-blocking UDP socket and one identity, and drives a
-//! [`peerwire_core::Endpoint`] from it. It never blocks and never spawns threads:
-//! call [`Node::poll`] from your loop (a game's frame tick, a timer, an event
-//! loop) and it drains the socket, fires timers, sends what is queued and
-//! queues events for [`Node::try_recv_event`].
+//! [`peerwire_core::Endpoint`] from it, on the thread that polls it: call
+//! [`Node::poll`] from your loop (a game's frame tick, a timer, an event loop)
+//! and, without blocking, it drains the socket, fires timers, sends what is
+//! queued and queues events for [`Node::try_recv_event`]. Two parts start
+//! threads of their own: router port mapping ([`Builder::port_mapping`]) runs
+//! on one, and `NostrSignaling` runs one per relay.
 //!
 //! ```no_run
 //! use peerwire::{Event, Lane, Node};
@@ -68,8 +70,8 @@ pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]
 pub use nostr::NostrSignaling;
 pub use peerwire_core::{
-    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
-    MAX_URGENT,
+    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, Stats,
+    MAX_UNRELIABLE, MAX_URGENT,
 };
 pub use portmap::{MapProtocol, PortMapping};
 pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};
@@ -85,3 +87,31 @@ pub type Path = peerwire_core::Path<std::net::SocketAddr>;
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+// The Rust samples of the repo's README.md and docs/, one item per page (NB-070): doc tests that compile and never
+// run, as many are host loops or dial public relays. A plain `cargo test` leaves them out; scripts/gate.sh and CI
+// build them with RUSTDOCFLAGS="--cfg docs_samples --test-runtool true". They build as this crate's tests do: `tokio`
+// and `nostr` on, with peerwire_core, peerwire_sim and peerwire_sync beside it. A sample may hide its set-up behind
+// `# ` lines; one that can't build is ```rust,ignore with the reason beside it. rustdoc compiles a bare ``` block as
+// Rust, so every block on these pages names its language (```text). A failing sample's line in its page is the line
+// cargo reports, less that of the item's #[doc], plus one. packages/js/test/docs_samples.mjs fails for a page with a
+// ```rust block that isn't listed here.
+#[cfg(all(doctest, docs_samples))]
+mod doc_samples {
+    #[doc = include_str!("../../../README.md")]
+    struct Readme;
+    #[doc = include_str!("../../../docs/getting-started/quick-start.md")]
+    struct GettingStartedQuickStart;
+    #[doc = include_str!("../../../docs/guides/lan-discovery.md")]
+    struct GuidesLanDiscovery;
+    #[doc = include_str!("../../../docs/guides/messaging.md")]
+    struct GuidesMessaging;
+    #[doc = include_str!("../../../docs/guides/privacy.md")]
+    struct GuidesPrivacy;
+    #[doc = include_str!("../../../docs/guides/rooms.md")]
+    struct GuidesRooms;
+    #[doc = include_str!("../../../docs/guides/shared-documents.md")]
+    struct GuidesSharedDocuments;
+    #[doc = include_str!("../../../docs/reference/rust.md")]
+    struct ReferenceRust;
+}

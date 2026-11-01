@@ -35,6 +35,10 @@ jobs:
       - name: Shared docs in the C ABI (the sync feature, off in the wasm and workspace builds)
         run: cargo clippy -p peerwire-ffi --features sync --all-targets -- -D warnings
       - run: cargo test --workspace --release
+      - name: The docs' Rust samples compile, never run (mod doc_samples in crates/peerwire/src/lib.rs)
+        run: cargo test --doc --workspace --release doc_samples
+        env:
+          RUSTDOCFLAGS: --cfg docs_samples --test-runtool true
       - run: cargo test -p peerwire-ffi --features sync --release
       - name: Fuzz tests in a debug build (integer overflow panics there, wraps in release)
         run: |
@@ -91,6 +95,9 @@ jobs:
         run: npm ci --no-audit --no-fund && npm run build && npm run typecheck
       - run: node packages/react/test/store.mjs
       - run: node packages/react/test/hooks.mjs
+      # The docs' JS samples parse with the TypeScript installed above, and import what src/ and the build export.
+      - run: node packages/js/test/docs_samples.mjs
+      - run: node packages/js/test/docs_links.mjs
 
   docker:
     name: docker build
@@ -98,9 +105,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose config --quiet
-      # Build only, never pushed. The second build reuses the shared build stage from the first.
-      - run: docker build --target peer -t peerwire-peer:ci .
-      - run: docker build --target examples -t peerwire-examples:ci .
+      - run: docker compose -f docker/compose.yml config --quiet
+      # Build only, never pushed. The second build reuses the shared build stage from the first. The context is the
+      # repo root; docker/Dockerfile.dockerignore says what stays out of it.
+      - run: docker build -f docker/Dockerfile --target peer -t peerwire-peer:ci .
+      - run: docker build -f docker/Dockerfile --target examples -t peerwire-examples:ci .
 
   # Next: a `godot` job building the GDExtension (NB-020) goes here, Linux only to start.

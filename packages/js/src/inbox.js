@@ -1,4 +1,4 @@
-// Offline messages to one peer, outside any room (NB-019; docs/STORE-DESIGN.md, "NB-019 (offline delivery), scoped
+// Offline messages to one peer, outside any room (NB-019; docs/project/offline-store-design.md, "NB-019 (offline delivery), scoped
 // down"): a message sealed to a PeerId and left on the Nostr relays, which its recipient reads the next time it is
 // online.
 //

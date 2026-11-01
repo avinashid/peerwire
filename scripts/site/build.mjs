@@ -1,28 +1,41 @@
-// Builds the static site for GitHub Pages (.github/workflows/pages.yml): a landing page, README.md and the docs
-// rendered to HTML, and the browser demos that need no server of ours. Every URL in it is relative, so it works
-// at https://<user>.github.io/peerwire/ as at any other path. No dependencies; scripts/site.sh builds the wasm first.
+// Builds the static site for GitHub Pages (.github/workflows/pages.yml): a landing page, the docs with a sidebar,
+// and the browser demos that need no server of ours. Every URL in it is relative, so it works at
+// https://<user>.github.io/peerwire/ as at any other path. No dependencies; scripts/site.sh builds the wasm first.
 //
 //   node scripts/site/build.mjs [--out target/site] [--wasm packages/js/pkg/peerwire_ffi.wasm]
 //
-// Caching: Pages serves everything with a 10-minute max-age. The demos' modules, the wasm and the stylesheet live
-// under assets/<id>/, where <id> is a hash of their contents, so a page from a new build never runs a module, or
-// loads a wasm, cached from an old one: the demos import each other relatively and load the wasm relative to
-// import.meta.url, so all of it moves to the new directory together. The pages keep stable URLs (invite links
-// point at them); only their <script src> names the directory.
+// The docs: docs/README.md is their index. Its "## Group" headings and "- [Title](path.md): blurb" lines are the
+// sidebar, in order, and the build fails if a docs/**/*.md is missing from it or listed twice. Each page is at its
+// repo path with .html (docs/guides/rooms.md is docs/guides/rooms.html), docs/README.md at docs/index.html; entries
+// outside docs/ (../CHANGELOG.md) are rendered too. The URLs of the first site (README.html, docs/ARCHITECTURE.html,
+// ...) are small pages that refresh to the new ones (REDIRECTS). Code blocks are highlighted here, at build time
+// (highlight.mjs), and docs/assets/ holds the images docs may show, the logo and the favicon.
 //
-// The build fails on a broken link: a relative href or src that names no file of the site, a #fragment that names
-// no id on its page, a doc link to a repo path that doesn't exist, or a link with another scheme than http(s) or
-// mailto. Doc links to repo files that aren't rendered point at GitHub.
+// Caching: Pages serves everything with a 10-minute max-age. The demos' modules, the wasm, the stylesheet and the
+// images live under assets/<id>/, where <id> is a hash of their contents, so a page from a new build never runs a
+// module, or loads a wasm, cached from an old one: the demos import each other relatively and load the wasm relative
+// to import.meta.url, so all of it moves to the new directory together. The pages keep stable URLs (invite links
+// point at them); only their <script src> and <link href> name the directory.
+//
+// The build fails on a broken link: a relative href, src or refresh URL that names no file of the site, a #fragment
+// that names no id on its page, a doc link to a repo path that doesn't exist, or a link with another scheme than
+// http(s) or mailto. Doc links to repo files that aren't rendered point at GitHub. It fails too on an SVG under
+// docs/assets/ that holds a script, a handler, a reference to anything outside it, an element or namespace that
+// isn't SVG's, or a character outside printable ASCII (checkSvg).
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { render, escapeHtml, textOf } from './markdown.mjs';
+import { gzipSync } from 'node:zlib';
+import { render, escapeHtml, textOf, slugger } from './markdown.mjs';
+import { highlight } from './highlight.mjs';
+import { REPO_URL, DEMO_CSP, PAGE_CSP, metas, linker, docPage, redirectPage } from './layout.mjs';
+import { landingPage } from './landing.mjs';
 
+export { REPO_URL, DEMO_CSP, PAGE_CSP };
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-export const REPO_URL = 'https://github.com/avinashid/peerwire';
 
 // The demos on the site: none of them needs a server of ours. crew.html needs crew-server.mjs, so it isn't here.
 export const DEMOS = [
@@ -56,41 +69,125 @@ export const DEMOS = [
   },
 ];
 
-// Rendered markdown, in the order the landing page lists it; every docs/*.md is added after these. The landing
-// page's line for each: [title, blurb]; a doc not named here gets its first heading and first paragraph.
-const DOCS_FIRST = ['README.md', 'packages/js/README.md', 'packages/react/README.md'];
-const DOC_LINES = {
-  'README.md': ['README', 'What Peerwire is, a quick start, how it works, and the status of each part.'],
-  'packages/js/README.md': ['@peerwire/js', 'The JS package: joinRoom, members and routes, shared docs, offline ' +
-    'messages, and the wasm module underneath.'],
-  'packages/react/README.md': ['@peerwire/react', 'React hooks for rooms, members, chat and shared state.'],
-  'docs/ARCHITECTURE.md': ['Architecture', 'How the parts fit: the sans-IO core, its transports and signalling, ' +
-    'and the crates around it.'],
-  'docs/COMPARISON.md': ['How Peerwire compares', 'Next to other peer-to-peer libraries, feature by feature.'],
-  'docs/DOCKER.md': ['Docker', 'The optional always-on peer, and these demos served from a container.'],
-  'docs/GODOT.md': ['Godot 4', "Godot's own multiplayer API (@rpc, synchronizers, spawners) over Peerwire."],
-  'docs/NAT-TRAVERSAL.md': ['NAT traversal', 'How peers behind NATs find and reach each other, and what they fall ' +
-    'back to.'],
-  'docs/PERFORMANCE.md': ['Performance model', 'Measured and theoretical numbers, and how to reproduce each.'],
-  'docs/STORE-DESIGN.md': ['Store design', "Keeping a room's data while nobody is online."],
-  'docs/TEST-PLAN.md': ['Test plan', 'How Peerwire is tested, and the gate every change passes.'],
-  'docs/THREAT-MODEL.md': ['Threat model', "What Peerwire defends against, what it doesn't, and every review " +
-    'finding with its status.'],
+// The first site's pages, which links elsewhere may still name, and where each is now.
+export const REDIRECTS = {
+  'README.html': 'index.html',
+  'packages/js/README.html': 'docs/reference/javascript.html',
+  'packages/react/README.html': 'docs/reference/react.html',
+  'docs/ARCHITECTURE.html': 'docs/concepts/architecture.html',
+  'docs/NAT-TRAVERSAL.html': 'docs/concepts/nat-traversal.html',
+  'docs/GODOT.html': 'docs/guides/godot.html',
+  'docs/DOCKER.html': 'docs/guides/always-on-peer.html',
+  'docs/PERFORMANCE.html': 'docs/project/performance.html',
+  'docs/COMPARISON.html': 'docs/project/comparison.html',
+  'docs/TEST-PLAN.html': 'docs/project/testing.html',
+  'docs/THREAT-MODEL.html': 'docs/project/threat-model.html',
+  'docs/STORE-DESIGN.html': 'docs/project/offline-store-design.html',
 };
 
-// The demos' policy is docker/examples-nginx.conf's, less frame-ancestors (a <meta> policy can't set it). The other
-// pages run no script at all.
-export const DEMO_CSP = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; " +
-  "connect-src 'self' wss:; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'";
-export const PAGE_CSP = "default-src 'none'; style-src 'self'; img-src 'self' data:; base-uri 'none'; " +
-  "form-action 'none'";
-const metas = (csp) => `<meta http-equiv="Content-Security-Policy" content="${csp}">\n` +
-  '<meta name="referrer" content="no-referrer">';
+export const INDEX = 'docs/README.md';
+const ASSETS = 'docs/assets/';
+const IMAGE = /^[\w-]+(?:\/[\w-]+)*\.(?:svg|png|jpe?g|gif|webp)$/;
 
 const posix = path.posix;
-const rel = (from, to) => posix.relative(posix.dirname(from), to);
+const sitePathOf = (source) => (source === INDEX ? 'docs/index.html' : source.replace(/\.md$/, '.html'));
+const inlineText = (md) => textOf(render(md).html).replace(/\s+/g, ' ').trim();
+const sentence = (s) => s && s[0].toUpperCase() + s.slice(1);
 
-// The modules a demo loads, followed from its entry: static and dynamic imports and new URL(…, import.meta.url),
+// Every file under dir (a path from root), symlinks followed, as posix paths from root.
+function walk(root, dir) {
+  const out = [];
+  for (const name of fs.readdirSync(path.join(root, dir)).sort()) {
+    const file = posix.join(dir, name);
+    if (fs.statSync(path.join(root, file)).isDirectory()) out.push(...walk(root, file));
+    else out.push(file);
+  }
+  return out;
+}
+
+// docs/README.md: its text before the first "## " (the overview's), then each "## Group" and its
+// "- [Title](path.md): blurb" lines (a blurb may go on over indented lines): the sidebar, in order. Anything else
+// under a group, a link that isn't a .md file of the repo, and a docs/**/*.md listed twice or not at all throw.
+export function readIndex(root) {
+  const intro = [];
+  const groups = [];
+  let item = null;
+  for (const [k, line] of fs.readFileSync(path.join(root, INDEX), 'utf8').replace(/\r\n?/g, '\n').split('\n').entries()) {
+    const where = `${INDEX}:${k + 1}`;
+    let m;
+    if ((m = /^## +(.*\S)/.exec(line))) {
+      groups.push({ name: inlineText(m[1]), items: [] });
+      item = null;
+    } else if (!groups.length) {
+      intro.push(line);
+    } else if ((m = /^- \[([^\]]+)\]\(([^()\s]+)\)(?::[ \t]+(.*))?$/.exec(line))) {
+      const source = posix.normalize(posix.join(posix.dirname(INDEX), decodeURI(m[2])));
+      if (source.startsWith('../') || !source.endsWith('.md') || !fs.existsSync(path.join(root, source))) {
+        throw new Error(`site: ${where}: ${m[2]} is no .md file of the repo`);
+      }
+      item = { title: inlineText(m[1]), source, blurb: m[3] ?? '', group: groups.at(-1).name };
+      groups.at(-1).items.push(item);
+    } else if (item && /^[ \t]+\S/.test(line)) {
+      item.blurb += `\n${line.trim()}`;
+    } else if (line.trim()) {
+      throw new Error(`site: ${where}: a group holds only "- [Title](path.md): blurb" lines, not ${JSON.stringify(line)}`);
+    } else {
+      item = null;
+    }
+  }
+  const listed = groups.flatMap((g) => g.items.map((i) => i.source));
+  const twice = [...new Set(listed.filter((s, k) => listed.indexOf(s) !== k || s === INDEX))];
+  const missing = walk(root, 'docs').filter((f) => f.endsWith('.md') && f !== INDEX && !listed.includes(f));
+  if (twice.length || missing.length) {
+    throw new Error(`site: ${INDEX} is the docs' sidebar: ${[...twice.map((s) => `${s} is listed twice`),
+      ...missing.map((s) => `${s} isn't listed`)].join('; ')}`);
+  }
+  return { intro: intro.join('\n'), groups };
+}
+
+// An SVG under docs/assets/ is served from the site's origin with no policy of ours: opened on its own, script in
+// it would run there. What it may not hold: a script, an on* handler, a foreignObject, a DTD, or a reference to
+// anything outside itself (href and url() name only #ids; no URL scheme but its xmlns). Opened on its own it's XML,
+// where an element's namespace, not its spelling, makes it a script (<s:script>), and character references and
+// processing instructions are spellings a regex can't see through: so no prefixed element, no &#, and no <? but the
+// XML declaration (NB67-1). An XHTML element needs no prefix in the default namespace (<g xmlns=xhtml><iframe
+// srcdoc>), so the elements are an allow-list of shapes and paint servers, and the only namespaces SVG's and xlink's.
+// With no DTD, &# or processing instruction, every element of the parsed document is a literal <name in the source.
+// Only printable ASCII, tab, LF and CR, so that \s and \w agree with XML's names: U+1680 and U+FEFF are XML name
+// characters that \s matches, so a prefix of g and U+1680 would hide a script behind an allowed <g. No backslash: a CSS
+// escape spells url( as u\72l(. And no // outside the xmlns, since //host is a URL with no scheme (NB67-I4).
+const SVG_ELEMENTS = new Set(['svg', 'g', 'defs', 'title', 'desc', 'symbol', 'use', 'path', 'rect', 'circle', 'ellipse',
+  'line', 'polyline', 'polygon', 'linearGradient', 'radialGradient', 'stop', 'clipPath', 'mask', 'pattern']);
+export function checkSvg(svg) {
+  const problems = [];
+  if (/[^\t\n\r\x20-\x7e]/.test(svg)) problems.push('a character outside printable ASCII');
+  for (const [, name] of svg.matchAll(/<\/?([^\s/>!?]+)/g)) {
+    if (!SVG_ELEMENTS.has(name)) problems.push(`a <${name}>`);
+  }
+  for (const [, prefix, , uri] of svg.matchAll(/\sxmlns(:[\w.-]+)?\s*=\s*(["'])(.*?)\2/gs)) {
+    if (uri !== (prefix === ':xlink' ? 'http://www.w3.org/1999/xlink' : 'http://www.w3.org/2000/svg')) {
+      problems.push(`the namespace ${JSON.stringify(uri)}`);
+    }
+  }
+  if (/<script/i.test(svg)) problems.push('a <script>');
+  if (/<\/?[A-Za-z_][\w.-]*:/.test(svg)) problems.push('an element with a namespace prefix');
+  if (/&#/.test(svg)) problems.push('a character reference');
+  if (/\\/.test(svg)) problems.push('a backslash');
+  if (/<\?(?!xml\s)/.test(svg)) problems.push('a processing instruction');
+  if (/\son[a-z]+\s*=/i.test(svg)) problems.push('an on* handler');
+  if (/<foreignObject/i.test(svg)) problems.push('a <foreignObject>');
+  if (/<!(?:DOCTYPE|ENTITY)/i.test(svg)) problems.push('a DTD');
+  for (const m of svg.matchAll(/(?:href|src)\s*=\s*(["'])(.*?)\1/gis)) {
+    if (!m[2].startsWith('#')) problems.push(`a reference to ${JSON.stringify(m[2])}`);
+  }
+  if (/url\(\s*(?!['"]?#)/i.test(svg) || /@import/i.test(svg)) problems.push('a url() or @import outside it');
+  if (/\/\/|javascript:|data:/i.test(svg.replace(/\sxmlns(?::\w+)?\s*=\s*(["'])[^"']*\1/g, ''))) {
+    problems.push('a URL');
+  }
+  return [...new Set(problems)];
+}
+
+// The demos' module graph, followed from their entries: static and dynamic imports and new URL(…, import.meta.url),
 // relative ones only (packages/js has no others). Paths are relative to packages/js.
 const SPECIFIERS = [
   /\bfrom\s*(['"])(\.{1,2}\/[^'"\n]+)\1/g,
@@ -122,33 +219,6 @@ function git(root, ...args) {
   }
 }
 
-function page({ title, csp, depth, id, body, source, commit }) {
-  const up = '../'.repeat(depth);
-  const from = source ? `<a href="${REPO_URL}/blob/main/${source}">${escapeHtml(source)} on GitHub</a> · ` : '';
-  const built = commit ? ` · built from <a href="${REPO_URL}/commit/${commit}">${commit.slice(0, 7)}</a>` : '';
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-${metas(csp)}
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#0b0d13">
-<title>${escapeHtml(title)}</title>
-<link rel="stylesheet" href="${up}assets/${id}/site.css">
-</head>
-<body>
-<header class="top">
-<a class="brand" href="${up}index.html"><span class="logo"></span>Peerwire</a>
-<nav><a href="${up}index.html#demos">Demos</a><a href="${up}index.html#docs">Docs</a>` +
-    `<a href="${REPO_URL}">GitHub</a></nav>
-</header>
-${body}
-<footer>${from}MIT OR Apache-2.0${built}</footer>
-</body>
-</html>
-`;
-}
-
 // Puts the policy after the demo's <meta charset> and points its module script into assets/<id>/demo/.
 function demoPage(html, id, name) {
   let metaCount = 0;
@@ -164,7 +234,8 @@ function demoPage(html, id, name) {
   });
 }
 
-// Every href and src of every page: relative, naming a file of the site, and a #fragment an id on its page.
+// Every href, src and refresh URL of every page: relative, naming a file of the site, and a #fragment an id on its
+// page.
 export function checkLinks(out, pages) {
   const ids = new Map();
   for (const p of pages) {
@@ -174,7 +245,9 @@ export function checkLinks(out, pages) {
   const problems = [];
   for (const p of pages) {
     const html = fs.readFileSync(path.join(out, p), 'utf8');
-    for (const [, attr, raw] of html.matchAll(/\s(href|src)="([^"]*)"/g)) {
+    const urls = [...html.matchAll(/\s(href|src)="([^"]*)"/g)].map((m) => [m[1], m[2]]);
+    for (const m of html.matchAll(/<meta http-equiv="refresh" content="\d+; *url=([^"]*)"/gi)) urls.push(['refresh', m[1]]);
+    for (const [attr, raw] of urls) {
       const url = textOf(raw);
       if (/^(https?:|mailto:)/i.test(url)) continue;
       if (/^[a-z][a-z\d+.-]*:/i.test(url) || url.startsWith('/') || url === '') {
@@ -201,10 +274,12 @@ export function buildSite({ root, out, wasm }) {
   if (fs.existsSync(out) && fs.readdirSync(out).length && !fs.existsSync(path.join(out, 'assets'))) {
     throw new Error(`site: ${out} isn't empty and holds no earlier site (no assets/): not clearing it`);
   }
+  const nav = readIndex(root);
   fs.rmSync(out, { recursive: true, force: true });
   const commit = process.env.GITHUB_SHA || git(root, 'rev-parse', 'HEAD');
 
-  // 1. assets/<id>/: the demos' module graph, the wasm and the stylesheet, under a hash of all of them.
+  // 1. assets/<id>/: the demos' module graph, the wasm, the stylesheet and docs/assets/ (as img/), under a hash of
+  //    all of them.
   const demoHtml = new Map(DEMOS.map((d) => [d.page, fs.readFileSync(path.join(jsRoot, 'demo', d.page), 'utf8')]));
   const entries = [...demoHtml.values()].flatMap((html) => [...html.matchAll(/<script\b[^>]*\ssrc="([\w.-]+\.js)"/gi)])
     .map((m) => `demo/${m[1]}`);
@@ -212,6 +287,18 @@ export function buildSite({ root, out, wasm }) {
   const assets = modules.map((m) => [m, m === 'pkg/peerwire_ffi.wasm' ? wasm : path.join(jsRoot, m)]);
   if (!modules.includes('pkg/peerwire_ffi.wasm')) throw new Error('site: no demo loads pkg/peerwire_ffi.wasm');
   assets.push(['site.css', path.join(HERE, 'site.css')]);
+  for (const file of walk(root, ASSETS.slice(0, -1))) {
+    const name = file.slice(ASSETS.length);
+    if (!IMAGE.test(name)) throw new Error(`site: ${file}: docs/assets/ holds images only, named [\\w-] (svg, png, jpg, gif, webp)`);
+    if (name.endsWith('.svg')) {
+      const problems = checkSvg(fs.readFileSync(path.join(root, file), 'utf8'));
+      if (problems.length) throw new Error(`site: ${file} holds ${problems.join(', ')}`);
+    }
+    assets.push([`img/${name}`, path.join(root, file)]);
+  }
+  for (const need of ['img/favicon.svg', 'img/logo.svg']) {
+    if (!assets.some(([name]) => name === need)) throw new Error(`site: no docs/assets/${need.slice(4)}`);
+  }
   const hash = createHash('sha256');
   for (const [name, file] of assets.sort(([a], [b]) => (a < b ? -1 : 1))) {
     hash.update(`${name}\0`).update(fs.readFileSync(file)).update('\0');
@@ -223,6 +310,7 @@ export function buildSite({ root, out, wasm }) {
   }
   const pages = [];
   const write = (name, html) => {
+    if (pages.includes(name)) throw new Error(`site: two pages at ${name}`);
     fs.mkdirSync(path.dirname(path.join(out, name)), { recursive: true });
     fs.writeFileSync(path.join(out, name), html);
     pages.push(name);
@@ -231,80 +319,81 @@ export function buildSite({ root, out, wasm }) {
   // 2. The demos, their script pointed into assets/<id>/.
   for (const [name, html] of demoHtml) write(`demo/${name}`, demoPage(html, id, name));
 
-  // 3. The docs: README.md, the package READMEs and docs/*.md, each at its repo path with .html for .md.
-  const docs = [...DOCS_FIRST, ...fs.readdirSync(path.join(root, 'docs')).filter((f) => f.endsWith('.md')).sort()
-    .map((f) => `docs/${f}`)];
-  const sitePath = new Map(docs.map((d) => [d, d.replace(/\.md$/, '.html')]));
+  // 3. The docs, in sidebar order: the overview (docs/README.md), then each group's pages.
+  const home = { source: INDEX, page: sitePathOf(INDEX), title: 'Overview', group: 'Docs', blurb: '' };
+  const order = [home, ...nav.groups.flatMap((g) => g.items)];
+  for (const p of order) p.page = sitePathOf(p.source);
+  const sitePath = new Map(order.map((p) => [p.source, p.page]));
   for (const d of DEMOS) sitePath.set(`packages/js/demo/${d.page}`, `demo/${d.page}`);
-  const listed = [];
-  for (const doc of docs) {
-    const here = sitePath.get(doc);
-    const link = (href) => {
-      if (/^(https?:|mailto:)/i.test(href) || href.startsWith('#')) return href;
-      const [p, frag] = href.split('#');
-      const target = posix.normalize(posix.join(posix.dirname(doc), decodeURI(p))).replace(/\/$/, '');
-      if (target.startsWith('../')) throw new Error(`site: ${doc} links outside the repo: ${href}`);
+  const sidebar = { home, groups: nav.groups };
+  for (const [k, p] of order.entries()) {
+    const href = linker(p.page);
+    const link = (url) => {
+      if (/^(https?:|mailto:)/i.test(url) || url.startsWith('#')) return url;
+      const [file, frag] = url.split('#');
+      const target = posix.normalize(posix.join(posix.dirname(p.source), decodeURI(file))).replace(/\/$/, '');
+      if (target.startsWith('../')) throw new Error(`site: ${p.source} links outside the repo: ${url}`);
       const hashPart = frag === undefined ? '' : `#${frag}`;
-      if (sitePath.has(target)) return rel(here, sitePath.get(target)) + hashPart;
-      const file = path.join(root, target);
-      if (!fs.existsSync(file)) throw new Error(`site: ${doc} links to ${href}: no such file in the repo`);
-      return `${REPO_URL}/${fs.statSync(file).isDirectory() ? 'tree' : 'blob'}/main/${encodeURI(target)}${hashPart}`;
+      if (sitePath.has(target)) return href(sitePath.get(target) + hashPart);
+      if (!fs.existsSync(path.join(root, target))) throw new Error(`site: ${p.source} links to ${url}: no such file in the repo`);
+      const kind = fs.statSync(path.join(root, target)).isDirectory() ? 'tree' : 'blob';
+      return `${REPO_URL}/${kind}/main/${encodeURI(target)}${hashPart}`;
     };
-    // Images from elsewhere (README's shields.io badges) aren't loaded: their alt text stands in.
+    // An image from the repo is a file under docs/assets/; one from elsewhere (a README badge) isn't loaded, and its
+    // alt text stands in.
     const image = (src, alt) => {
       if (/^https?:/i.test(src)) return `<span class="badge">${escapeHtml(alt)}</span>`;
-      throw new Error(`site: ${doc} shows ${src}: images from the repo aren't supported yet`);
+      const target = posix.normalize(posix.join(posix.dirname(p.source), decodeURI(src)));
+      if (!target.startsWith(ASSETS) || !fs.existsSync(path.join(root, target))) {
+        throw new Error(`site: ${p.source} shows ${src}: an image from the repo must be a file under docs/assets/`);
+      }
+      return `<img src="${href(`assets/${id}/img/${target.slice(ASSETS.length)}`)}" alt="${escapeHtml(alt)}" loading="lazy">`;
     };
-    const r = render(fs.readFileSync(path.join(root, doc), 'utf8'), { link, image });
-    const title = r.title ?? doc;
-    const depth = here.split('/').length - 1;
-    write(here, page({ title: `${title} · Peerwire`, csp: PAGE_CSP, depth, id, source: doc, commit,
-      body: `<main class="doc">\n${r.html}\n</main>` }));
-    const first = /<p>([^]*?)<\/p>/.exec(r.html);
-    const [name, blurb] = DOC_LINES[doc] ?? [title, first ? textOf(first[1]).replace(/\s+/g, ' ').trim() : ''];
-    listed.push({ page: here, title: name, blurb });
+    const opts = { link, image, highlight };
+    let body;
+    let headings;
+    let heading;
+    if (p === home) {
+      // The overview: docs/README.md's own text, then a card for each page of each group.
+      const r = render(nav.intro, opts);
+      const slug = slugger();
+      r.ids.forEach(slug);
+      headings = nav.groups.map((g) => ({ level: 2, id: slug(g.name), text: g.name }));
+      body = [r.html, ...nav.groups.map((g, n) => `<h2 id="${escapeHtml(headings[n].id)}">${escapeHtml(g.name)}</h2>
+<ul class="cards">
+${g.items.map((i) => `<li><a href="${href(i.page)}">${escapeHtml(i.title)}</a>\n${render(i.blurb, opts).html}</li>`).join('\n')}
+</ul>`)].join('\n');
+      heading = r.title;
+      home.blurb = (/<p>([^]*?)<\/p>/.exec(r.html) ?? [])[1] ?? '';
+      p.description = textOf(home.blurb).replace(/\s+/g, ' ').trim();
+    } else {
+      const r = render(fs.readFileSync(path.join(root, p.source), 'utf8'), opts);
+      body = r.html;
+      headings = r.headings;
+      heading = r.title;
+      p.description = sentence(inlineText(p.blurb));
+    }
+    write(p.page, docPage({ id, commit, nav: sidebar, page: { ...p, heading: heading ?? p.title }, body, headings,
+      prev: order[k - 1], next: order[k + 1], index: p === home }));
   }
 
   // 4. The landing page.
-  const sentence = (s) => (s.length <= 200 ? s : `${s.slice(0, s.lastIndexOf(' ', 200))} …`);
-  const extra = (d) => (d.extra ?? []).map(([href, text]) => ` <a href="demo/${href}">Open the ${text}</a>.`).join('');
-  const demos = DEMOS.map((d) => `<li class="card"><h3><a href="demo/${d.page}">${d.name}</a></h3>
-<p>${escapeHtml(d.blurb)}</p>
-<p class="how">${escapeHtml(d.how)}${extra(d)}</p></li>`);
-  const docItems = listed.map((d) => `<li><a href="${d.page}">${escapeHtml(d.title)}</a>` +
-    `${d.blurb ? `<span class="dim"> ${escapeHtml(sentence(d.blurb))}</span>` : ''}</li>`);
-  write('index.html', page({ title: 'Peerwire: a direct wire between peers', csp: PAGE_CSP, depth: 0, id, commit,
-    body: `<main class="home">
-<section class="hero">
-<h1>Peerwire</h1>
-<p class="tag">A direct wire between peers.</p>
-<p>Peer-to-peer networking for games, whiteboards, meetings and chat: encrypted, NAT-traversing and real-time, with
-no server to run and no relay to pay for. Rust crates, a zero-import WebAssembly module with a small JS package,
-a C ABI and a Godot binding.</p>
-<p class="links"><a class="button primary" href="README.html">Read the README</a>
-<a class="button" href="#demos">Try a demo</a>
-<a class="button" href="${REPO_URL}">Source on GitHub</a></p>
-</section>
-<section id="demos">
-<h2>Live demos</h2>
-<p class="dim">Each runs in your browser and talks to other browsers directly; nothing goes through a server of
-ours. Open one in two tabs, or on two devices where it says so.</p>
-<ul class="cards">
-${demos.join('\n')}
-</ul>
-</section>
-<section id="docs">
-<h2>Docs</h2>
-<ul class="docs">
-${docItems.join('\n')}
-</ul>
-</section>
-</main>` }));
+  const wasmBytes = fs.readFileSync(wasm);
+  const sizes = { wasm: Math.round(wasmBytes.length / 1024), gzip: Math.round(gzipSync(wasmBytes, { level: 9 }).length / 1024) };
+  write('index.html', landingPage({ id, commit, demos: DEMOS, sizes, highlight }));
 
-  // 5. Every link of every page resolves.
+  // 5. The first site's URLs, each a page that refreshes to where its page is now.
+  const titles = new Map([['index.html', 'the Peerwire home page'], ...order.map((p) => [p.page, p.title])]);
+  for (const [from, to] of Object.entries(REDIRECTS)) {
+    if (!titles.has(to)) throw new Error(`site: the redirect from ${from} names ${to}, which isn't a page`);
+    write(from, redirectPage({ id, from, to, title: titles.get(to) }));
+  }
+
+  // 6. Every link of every page resolves.
   const problems = checkLinks(out, pages);
   if (problems.length) throw new Error(`site: ${problems.length} broken link(s):\n  ${problems.join('\n  ')}`);
-  return { id, pages, assets: assets.map(([name]) => `assets/${id}/${name}`) };
+  return { id, pages, assets: assets.map(([name]) => `assets/${id}/${name}`), redirects: Object.keys(REDIRECTS),
+    docs: order.map((p) => p.page), sizes };
 }
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {

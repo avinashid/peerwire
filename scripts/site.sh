@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the static site (the landing page, README and docs as HTML, the browser demos) into target/site/, as
+# Builds the static site (the landing page, the docs as HTML, the browser demos) into target/site/, as
 # .github/workflows/pages.yml deploys it to GitHub Pages. See scripts/site/build.mjs.
 #
 #   scripts/site.sh            build the wasm (packages/js/build.sh), then the site

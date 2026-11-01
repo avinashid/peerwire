@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Share of the bulk benchmark's CPU spent in RelSend's scans (docs/PERFORMANCE.md).
+# Share of the bulk benchmark's CPU spent in RelSend's scans (docs/project/performance.md).
 #   scripts/perf-relsend.sh [bulk example flags]     e.g. --up 1000
 # Needs perf; set PERF="sudo perf" where perf_event_paranoid forbids user profiling.
 set -euo pipefail

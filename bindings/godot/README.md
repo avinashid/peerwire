@@ -6,7 +6,7 @@ class, `PeerwireMultiplayerPeer`, a `MultiplayerPeer`: one instance hosts, and t
 with its `pw:` invite or find it by room name. Peers learn their public address from STUN,
 swap addresses over Nostr relays and punch through NATs. Every link is encrypted with Noise IK.
 
-The full guide is [docs/GODOT.md](../../docs/GODOT.md): install, API, NAT traversal, router
+The full guide is [docs/guides/godot.md](../../docs/guides/godot.md): install, API, NAT traversal, router
 port mapping, security, privacy and limits.
 
 | | |

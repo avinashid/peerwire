@@ -22,6 +22,7 @@ browser tests.
 | Step | Command | Passes when |
 |---|---|---|
 | Rust tests | `cargo nextest run --workspace --release --profile gate` and `cargo test --doc --workspace --release` (`cargo test --workspace --release` without cargo-nextest) | every test passes (ignored tests are known gaps, below) |
+| Rust doc samples | `RUSTDOCFLAGS="--cfg docs_samples --test-runtool true" cargo test --doc --workspace --release doc_samples`; runs after any Rust or Markdown change, even when the other Rust steps skip | NB-070: every ```` ```rust ```` block in `README.md` and the `docs/` pages listed in `mod doc_samples` (`crates/peerwire/src/lib.rs`) compiles. They never run: rustdoc runs `true` in their place, as many are host loops or dial public relays. A sample may hide its set-up behind `# ` lines (the site hides them too); one that can't compile is ```` ```rust,ignore ```` with the reason beside it |
 | Lints | `cargo clippy --workspace --all-targets` (`-- -D warnings` with `--strict`) | no errors; `--strict` is clean today |
 | Fuzz, debug build (`--strict`) | `cargo nextest run --profile gate --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz` (or `cargo test` with the same arguments) | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
 | Node tests on CI's Node (`--strict`) | CI's `wasm + node` job's `node packages/<pkg>/test/<file>.mjs` steps again, on its `node-version` (22): the newest `~/.nvm/versions/node/v22.*`, or `NODE_CI`. Both are read from `.github/workflows/ci.yml`, so neither drifts from CI; each is its own step, `node22 <name>` | each passes (NB-055: Node 22's `JSON.stringify` recurses and 26's doesn't, so NB-053 failed only in CI); no Node 22 is one SKIP with its reason, a CI test step it can't read a FAIL (`node22 list`) |
@@ -58,7 +59,9 @@ browser tests.
 | Node retry backoff | `node packages/js/test/retry_backoff.mjs` | the retry schedule (`src/retry.js`) on a fake clock: 20, 40, 80, 160 s then every 5 min, each within ±20 %; peers in turn, one in flight, starts ≥ 2 s apart; a silent retry frees the slot after its hold; requests heeded once per 20 s; 20 failing peers for an hour: never two at once, ≤ 8 starts a minute, about one per peer per 5 min at the cap |
 | Node restart budget | `node packages/js/test/restart_budget.mjs` | NB46-1, with a fake RTCPeerConnection: a `restart` ask while our ICE is connected does nothing; a peer looping asks (answering each, ICE reconnecting) gets 3 restarts, not one per round; an offer and 200 copies, or 50 new offers from a linked peer, get 6 answers (per-peer budget, 6 then 1 per 5 s, the rest in `throttled`), another peer's budget is its own; a genuine ICE failure still restarts on either side. NB46-1a/1b/1c/T1, with a fake that finds candidates after each answer: 51 offers get 6 answers and only their candidates (18 `ice` with trickle, 6 `ice-batch` without; 153 and 51 before); a held answer is released by a copy of its offer, made again with the candidates found meanwhile, none sent twice, later ones flowing; a copy of a new offer while it is answered never gets the last offer's answer, sent or held; a minute after the 3rd restart a 4th goes through, and one refused while ICE is down is made once the window frees |
 | Node QR | `node packages/js/test/qr.mjs` | the chat demo's QR encoder (`demo/qr.js`) gives the known answers for every mask of three codes (versions 3, 4 and 11, UTF-8 bytes): taken once it matched the Arase encoder npm vendors module for module at every version, level and mask |
-| Node site build | `node packages/js/test/site_build.mjs` | NB-016, the site's build (`scripts/site/build.mjs`) and its markdown renderer: raw HTML escaped, schemes but http(s) and mailto refused, GitHub's heading ids, the docs' lists, tables and alerts; every page has its Content-Security-Policy first, only the demos run scripts, and every module they import and the wasm live under `assets/<id>/`, an id that is the same for the same inputs and new for a changed wasm; a broken doc link, `#fragment` or page link fails the build |
+| Node site build | `node packages/js/test/site_build.mjs` | NB-016, the site's build (`scripts/site/build.mjs`) and its markdown renderer: raw HTML escaped, schemes but http(s) and mailto refused, GitHub's heading ids, the docs' lists, tables and alerts; every page has its Content-Security-Policy first, only the demos run scripts, and every module they import and the wasm live under `assets/<id>/`, an id that is the same for the same inputs and new for a changed wasm; a broken doc link, `#fragment` or page link fails the build. NB-067: the sidebar is `docs/README.md`'s (a doc missing from it or listed twice fails the build), and each doc page has it with the page marked, its group, "On this page", prev/next and an edit link; highlighted code is spans only and its text is the code; images come only from `docs/assets/`, and an SVG there with a script, a handler or an outside reference fails the build; the first site's 12 URLs refresh to their new pages |
+| Node docs samples | `node packages/js/test/docs_samples.mjs` (needs `packages/react` built) | NB-070: in every tracked `*.md`, ```` ```js ```` blocks and an ```` ```html ```` block's module scripts parse (`node --check`), and ```` ```ts ````, `tsx` and `jsx` blocks parse with packages/react's TypeScript (syntax only); ```` ```ts ignore ```` skips the parse, for a signature that isn't code. Every name imported from `@peerwire/js` or `@peerwire/react` is one the package exports, and a subpath is in its `exports`. Every page with a ```` ```rust ```` block is a doc test, with no bare ```` ``` ```` block (rustdoc compiles it as Rust). `BASELINE` exempts `crates/peerwire-sync/README.md` while its code is unchanged |
+| Node docs links | `node packages/js/test/docs_links.mjs` | NB-070: every relative link, image and HTML `href`/`src` in a tracked `*.md` names a tracked file inside the repo, and every `#anchor` matches a heading as GitHub numbers it (duplicates, case, setext headings, `<a id>`/`name`, `#L12` line anchors) |
 | Browser | `node packages/js/test/browser.mjs 2` | two Chromium tabs form a WebRTC mesh on loopback and exchange data |
 | Arena | `node packages/js/test/arena.mjs 8 10` | every island's checkpoint hashes match, ticks keep confirming |
 | README chat | `node packages/js/test/readme.mjs` | the chat block in `packages/js/README.md` runs in two tabs, messages cross both ways, and it stays ≤ 10 lines |
@@ -75,7 +78,7 @@ browser tests.
 | Netlab carry | `node packages/js/test/netlab_carry.mjs` | two Net Lab tabs linked over signalling (`?rtc=off`) get a real loopback channel as a birthday punch's winner: both move the room link onto it (route direct, the log names the channel's address and pair), chat goes over it, and when it closes both log the link back on signalling and stay linked; Net Lab's hook passes a closed link's handle on to the room (NB48b-5) |
 | Netlab mic | `node packages/js/test/netlab_mic.mjs` | Net Lab's "Use microphone" button with fake media and mDNS hiding on: before, `mediaPermission` 'prompt' and `.local` addresses; after a stored grant and the click, 'granted', real local addresses with the same NAT reading, the pair (over signalling until then) retries WebRTC with no rejoin (the same ids, no leave), and the other tab sees `mic: true`, real local addresses and a direct link; nothing thrown. The global room (MIC-1), with the grant stored before the tabs open or given while they are in it: the other tab gets no local address (`theirHosts` empty, read after Net Lab notes them) and the pair still links; a birthday punch's offer carries no `a=candidate` line. The button pressed in the global room rejoins before its network re-test (held 5 s): a tab that joins during the re-test hears none of the local addresses in any description or candidate (MIC-4). A refused prompt (`--use-fake-ui-for-media-stream=deny`): 'denied', a warning, no rejoin. A hidden local address takes its pair's family from the remote |
 | Netlab punch close | `node packages/js/test/netlab_punch_close.mjs` | MIC-2: a peer (a Net Lab tab driving its live Room) aborts a birthday punch while the other tab's setup is held 1 s: as the hard side while its certificate is made (no fleet opens) and while its fleet opens, as the easy side while its spray connection opens and while it applies the answer, and as the hard side given an offer that isn't SDP, refused by its held fleet after the abort. Every connection made after the end is `closed`, and the card keeps "the peer stopped", not a stale error. A second offer straight after the first opens no second fleet (exactly `fleet` connections, all closed after the abort), and a second answer leaves the punch running; the spray's candidates (at TEST-NET-3) are dropped in the tab, so no check leaves the host |
-| Site | `node packages/js/test/site.mjs [--shots DIR]` | NB-016: the site built and served under `/peerwire/`, as GitHub Pages will. Every page is reachable from the landing page and every relative link and `#fragment` resolves (fetched without running scripts); the landing page and docs load nothing from another host; index, poll, arena and netlab reach ready with every request under `assets/<id>/`; two chat tabs link on a direct route over `?signal=local` and the invite link keeps the subpath; no page logs a CSP violation or throws |
+| Site | `node packages/js/test/site.mjs [--shots DIR]` | NB-016: the site built and served under `/peerwire/`, as GitHub Pages will. Every page is reachable from the landing page and every relative link and `#fragment` resolves (fetched without running scripts); the landing page and docs load nothing from another host; index, poll, arena and netlab reach ready with every request under `assets/<id>/`; two chat tabs link on a direct route over `?signal=local` and the invite link keeps the subpath; no page logs a CSP violation or throws. NB-067: light and dark; the code tabs switch with CSS alone; on a phone no page is wider than the screen and the docs' sidebar is a menu that opens; the old README, THREAT-MODEL and package URLs land on their new pages |
 | Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `nos.lol` / `relay.primal.net` / `nostr.mom` and connect over public STUN |
 
 The script runs every step even after a failure, prints a PASS/FAIL/SKIP summary and exits non-zero if any step
@@ -109,7 +112,7 @@ tests on Node 22 to the same pool: 88 s for the pool alone, against 59 s without
   Property tests use `ChaCha8Rng` seeded from a fixed constant XOR a per-test salt, so a failure reproduces
   by rerunning the test; the failing input is in the assertion message.
 - **Small.** Property tests run ~2000 cases; simulations stay at a few hundred peers and a few simulated seconds.
-  Larger scales go in `docs/PERFORMANCE.md` as **theoretical**, with the formula.
+  Larger scales go in `docs/project/performance.md` as **theoretical**, with the formula.
 - **Local.** Loopback, LAN or the simulator. Only `nostr.mjs` touches public services, the allowed ones.
 - **Known gaps are tests too.** A behaviour we know is wrong gets an `#[ignore = "known gap: …"]` test that
   asserts the intended behaviour. Fixing the gap means removing the `ignore`. `cargo test -- --ignored` runs them.
@@ -195,7 +198,7 @@ tests on Node 22 to the same pool: 88 s for the pool alone, against 59 s without
 
 Lockstep islands agree over super-peers; bundles survive 5 % loss with jitter; islands survive a super-peer
 dying; an overloaded super-peer degrades without stalling. `cargo run -p peerwire-sim --release --example arena`
-is the full harness for `docs/PERFORMANCE.md`.
+is the full harness for `docs/project/performance.md`.
 
 ### peerwire-ffi and packages/js
 
@@ -290,22 +293,23 @@ invite; decoding is now canonical (`b64::rejects_non_canonical_tails`, `invite::
 |---|---|---|
 | Fuzzing is not coverage-guided (cargo-fuzz needs nightly) | — | qa, if the toolchain is approved |
 | `browser.mjs` reports round trips and throughput but asserts only that the mesh forms and data arrives | — | qa |
-| Planned crates (facade, sync, media, store, Godot binding) have no tests yet; each lands with its own, per the plans above | — | backend |
+| CI runs on Linux only: no macOS or Windows test runs, and no browser tests (the gate runs those) | — | ops |
+| The ESP32 prototype is built and run by hand (`ports/esp32`), not by the gate or CI | — | lead |
+| Real mobile carrier-grade NATs and real ESP32 boards are untested | — | — |
 
 ## CI
 
-NB-002 (ops) owns `.github/workflows/ci.yml`. The jobs should call the same commands as the gate so local and CI
-results match:
+`.github/workflows/ci.yml` runs on every push and pull request, on Ubuntu, in three jobs that call the same
+commands as the gate:
 
-| Job | Runs on | Command |
-|---|---|---|
-| test | ubuntu, macos, windows | `cargo test --workspace --release` |
-| clippy | ubuntu | `cargo clippy --workspace --all-targets -- -D warnings` |
-| fmt | ubuntu | `cargo fmt --all -- --check` |
-| wasm + node | ubuntu | `scripts/gate.sh --quick` steps `wasm build`, `wasm size+imports`, `node glue` |
-| browser | ubuntu with `npx playwright install --with-deps chromium` | `PLAYWRIGHT=$(npm root)/playwright/index.mjs node packages/js/test/browser.mjs 2` and `arena.mjs 8 10` |
+| Job | Runs |
+|---|---|
+| fmt + clippy + test | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`, and again for `peerwire-ffi --features sync`; `cargo test --workspace --release` and the `sync` feature's tests; the fuzz tests in a debug build |
+| wasm + node | `./packages/js/build.sh`, the wasm size and import check, the Node tests listed in the job (Node 22), and `@peerwire/react`'s build, types and tests |
+| docker build | `docker compose config` and a build of the peer and examples images (never pushed) |
 
-On Linux CI, `scripts/gate.sh --strict` alone covers every job except the macOS and Windows test runs.
+Browser tests (headless Chromium) run in the gate, not in CI. `scripts/gate.sh --strict` runs CI's Node list again
+on CI's Node version, read from `ci.yml`, so a change that passes the strict gate passes CI's Node job.
 
 `.github/workflows/pages.yml` (NB-016) is not CI. It runs only by hand (`workflow_dispatch`): it builds the site
 with `scripts/site.sh`, runs `site_build.mjs`, and deploys `target/site/` to GitHub Pages. The gate runs both site

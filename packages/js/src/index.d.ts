@@ -221,7 +221,7 @@ export declare class Room {
 
 export interface CallOptions {
   /** The most in the call, us included: 2 to 16, default 6. Each member sends its stream to every other, so its
-   * upload grows with each one (see docs/PERFORMANCE.md §6). A member with no seat for a joiner tells it the call
+   * upload grows with each one (see docs/project/performance.md §6). A member with no seat for a joiner tells it the call
    * is full; the joiner goes only if its own count of who is in agrees. */
   max?: number;
 }
@@ -704,6 +704,10 @@ export declare class WebRtcTransport implements Transport {
       relay?: PeerId;
       /** Offers carry `p: await sign(to)`; an offer is answered only if `check(from, p)` holds. */
       offerProof?: { sign(to: PeerId): Promise<string>; check(from: PeerId, p: unknown): Promise<boolean> };
+      /** Default false. Lets the transport carry datagrams as signalling messages (a pipe) for peers the room allows.
+       * `joinRoom` turns it on for `fallback: 'auto'` and opens the pipes itself. Off, pipe batches that arrive are
+       * refused (`badSignals`). */
+      pipes?: boolean;
       RTCPeerConnection?: typeof globalThis.RTCPeerConnection;
     },
   );
@@ -714,7 +718,8 @@ export declare class WebRtcTransport implements Transport {
   /**
    * Signals refused: a `from` that isn't a PeerId or an empty message, an offer whose `offerProof` fails or whose
    * SDP doesn't apply, a retry offer that would make a peer's second new connection within 2 s, an `ice-batch`
-   * that isn't a list of at most 32, or one that failed unexpectedly. Answers and
+   * that isn't a list of at most 32, or one that failed unexpectedly, and a pipe batch from a peer not allowed one
+   * (or with `pipes` off) or that isn't a list of at most 64 base64 datagrams. Answers and
    * ICE candidates that don't apply are not counted (copies and races are normal). The WebRTC counterpart of
    * NostrSignaling's `stats.rejected`.
    */

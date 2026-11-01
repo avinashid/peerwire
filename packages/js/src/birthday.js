@@ -1,5 +1,5 @@
 // Browser birthday punch (NB-048): the browser counterpart of the native birthday
-// punch (NB-044, docs/NAT-TRAVERSAL.md). When two peers can't punch directly — one
+// punch (NB-044, docs/concepts/nat-traversal.md). When two peers can't punch directly — one
 // behind a symmetric NAT that gives a random public port per destination, the other
 // behind a cone that only lets in ports it has sent to — a single socket each can't
 // meet. A browser's only sockets are inside RTCPeerConnections, so the symmetric

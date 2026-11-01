@@ -6,9 +6,12 @@
 // backslash escapes, entities and <br>.
 //
 // Raw HTML is never passed through: any tag but <br> shows as text. A link or image whose scheme isn't http(s) or
-// mailto throws. Otherwise the caller's link(href) and image(src, alt) decide what each becomes.
+// mailto throws. Otherwise the caller's link(href) and image(src, alt) decide what each becomes, and
+// highlight(code, lang) the HTML of a fenced block with a language (null: the code escaped). A ```rust block shows
+// without the lines rustdoc hides (shownCode).
 //
-//   render(markdown, { link, image }) -> { html, title, ids }   title: the first heading's text; ids: every id made
+//   render(markdown, { link, image, highlight }) -> { html, title, ids, headings }
+//     title: the first heading's text; ids: every id made; headings: [{ level, id, text }] of the h2s and h3s
 
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
 export const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ESC[c]);
@@ -45,6 +48,19 @@ export function safeUrl(dest) {
     throw new Error(`refused link: ${JSON.stringify(dest)}`);
   }
   return dest;
+}
+
+// The docs' Rust samples are doc tests (NB-070), so they may hide their set-up as rustdoc does (map_line in its
+// markdown.rs). In a block whose info string's first word is rust (```rust,no_run), a line that, trimmed as Rust
+// trims, starts with "##" shows with that "##" as "#"; one that starts with "# " or is "#" is hidden; any other
+// (#[derive], #![...]) shows as it is.
+export function shownCode(code, lang) {
+  if (lang.split(',')[0] !== 'rust') return code;
+  return code.split('\n').flatMap((line) => {
+    const t = line.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+    if (t.startsWith('##')) return [line.replace('##', '#')];
+    return t.startsWith('# ') || t === '#' ? [] : [line];
+  }).join('\n');
 }
 
 const FENCE = /^( {0,3})(`{3,}|~{3,})[ \t]*([^\s`]*)[^`]*$/;
@@ -350,11 +366,13 @@ function html(list, ctx, tight = false) {
         const id = ctx.slug(textOf(inner));
         ctx.ids.push(id);
         ctx.title ??= textOf(inner);
+        if (b.level === 2 || b.level === 3) ctx.headings.push({ level: b.level, id, text: textOf(inner) });
         return `<h${b.level} id="${escapeHtml(id)}">${inner}</h${b.level}>`;
       }
       case 'code': {
         const lang = b.lang ? ` class="language-${escapeHtml(b.lang)}"` : '';
-        return `<pre><code${lang}>${escapeHtml(b.text)}</code></pre>`;
+        const code = shownCode(b.text, b.lang);
+        return `<pre><code${lang}>${(b.lang ? ctx.highlight(code, b.lang) : null) ?? escapeHtml(code)}</code></pre>`;
       }
       case 'hr':
         return '<hr>';
@@ -386,9 +404,10 @@ function html(list, ctx, tight = false) {
   }).join('\n');
 }
 
-export function render(markdown, { link = (href) => href, image = (src, alt) => escapeHtml(alt) } = {}) {
+export function render(markdown, { link = (href) => href, image = (src, alt) => escapeHtml(alt),
+  highlight = () => null } = {}) {
   const lines = markdown.replace(/\r\n?/g, '\n').replace(/\t/g, '    ').split('\n');
-  const ctx = { link, image, slug: slugger(), ids: [], title: undefined };
+  const ctx = { link, image, highlight, slug: slugger(), ids: [], headings: [], title: undefined };
   const out = html(blocks(lines), ctx);
-  return { html: out, title: ctx.title, ids: ctx.ids };
+  return { html: out, title: ctx.title, ids: ctx.ids, headings: ctx.headings };
 }

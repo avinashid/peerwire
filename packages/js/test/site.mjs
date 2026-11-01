@@ -3,7 +3,9 @@
 //  - every page is reachable from the landing page, and every link resolves: each page's relative href and src is
 //    fetched (no script runs, so the demos that default to Nostr dial no public relay), none answers an error, and
 //    each #fragment names an id on its page;
-//  - the landing page and two docs load with no request to another host;
+//  - the landing page and two docs load with no request to another host, styled light or dark as the system asks;
+//  - the code tabs switch with no script, the docs' menu opens on a phone, and no page is wider than a phone;
+//  - the first site's URLs land on their new pages;
 //  - each demo loads its modules, the wasm and nothing else from assets/<id>/, and reaches ready over local
 //    signalling (BroadcastChannel), with no request to another host;
 //  - two chat tabs link to each other on a direct route;
@@ -27,7 +29,7 @@ if (shots) fs.mkdirSync(shots, { recursive: true });
 const WAIT = { timeout: 30000 };
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'peerwire-site-'));
-const { id, pages } = buildSite({ root: ROOT, out: path.join(tmp, 'peerwire') });
+const { id, pages, redirects } = buildSite({ root: ROOT, out: path.join(tmp, 'peerwire') });
 const { port, server } = await serve(tmp);
 const origin = `http://127.0.0.1:${port}`;
 const base = `${origin}/peerwire/`;
@@ -106,28 +108,72 @@ try {
     if (!ids.get(target)?.has(frag)) bad.push(`${from}: ${link}: no id "${frag}"`);
   }
   const reachedPages = new Set([...body.keys()].map((u) => (u === base ? 'index.html' : u.slice(base.length))));
-  check(pages.every((p) => reachedPages.has(p)), `all ${pages.length} pages are reachable from the landing page` +
-    `${pages.some((p) => !reachedPages.has(p)) ? ` (not: ${pages.filter((p) => !reachedPages.has(p)).join(', ')})` : ''}`);
+  const listed = pages.filter((p) => !redirects.includes(p));
+  check(listed.every((p) => reachedPages.has(p)), `all ${listed.length} pages but the redirects are reachable from the landing page` +
+    `${listed.some((p) => !reachedPages.has(p)) ? ` (not: ${listed.filter((p) => !reachedPages.has(p)).join(', ')})` : ''}`);
   check(bad.length === 0, `${reached.size} URLs fetched, ${fragments.length} #fragments checked: every link resolves` +
     `${bad.length ? `\n     ${bad.join('\n     ')}` : ''}`);
 
-  // 2. The landing page and two docs, rendered: nothing from another host, no CSP violation.
-  for (const [name, url, full] of [['landing', base, true], ['readme', `${base}README.html`], ['threat-model', `${base}docs/THREAT-MODEL.html#threat-model`]]) {
-    const page = await ctx.newPage();
-    const seen = watch(page, name);
-    await page.goto(url);
-    await page.waitForLoadState('load');
-    const styled = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
-    check(seen.foreign.length === 0 && seen.errors.length === 0 && styled === 'rgb(11, 13, 19)',
-      `${name}: loads styled from assets/${id}/site.css, nothing from another host, no error` +
-      `${[...seen.foreign, ...seen.errors].map((e) => `\n     ${e}`).join('')}`);
-    await shot(page, `site-${name}`, { fullPage: !!full });
+  // 2. The landing page and two docs, rendered light and dark: nothing from another host, no CSP violation.
+  const dark = await browser.newContext({ viewport: { width: 1280, height: 860 }, colorScheme: 'dark' });
+  const light = await browser.newContext({ viewport: { width: 1280, height: 860 }, colorScheme: 'light' });
+  for (const [scheme, c, bg] of [['light', light, 'rgb(255, 255, 255)'], ['dark', dark, 'rgb(11, 13, 19)']]) {
+    for (const [name, url, full] of [['landing', base, true], ['overview', `${base}docs/index.html`],
+      ['threat-model', `${base}docs/project/threat-model.html#threat-model`]]) {
+      const page = await c.newPage();
+      const seen = watch(page, name);
+      await page.goto(url);
+      await page.waitForLoadState('load');
+      const styled = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+      const icon = await page.evaluate(() => document.querySelector('.brand img').naturalWidth);
+      check(seen.foreign.length === 0 && seen.errors.length === 0 && styled === bg && icon > 0,
+        `${name} (${scheme}): loads styled from assets/${id}/site.css (${styled}) with its logo, nothing from another host, no error` +
+        `${[...seen.foreign, ...seen.errors].map((e) => `\n     ${e}`).join('')}`);
+      await shot(page, `site-${name}-${scheme}`, { fullPage: !!full });
+      await page.close();
+    }
+  }
+  // The code tabs: a label shows its code and hides the rest, with no script.
+  const tabs = await light.newPage();
+  await tabs.goto(base);
+  const shown = () => tabs.evaluate(() => [...document.querySelectorAll('.tabs .tab')]
+    .filter((t) => getComputedStyle(t).display !== 'none').map((t) => t.className).join());
+  const before = await shown();
+  await tabs.click('label[for="tab-rust"]');
+  const after = await shown();
+  await tabs.click('label[for="tab-godot"]');
+  check(before === 'tab tab-js' && after === 'tab tab-rust' && await shown() === 'tab tab-godot',
+    `the code tabs switch with CSS alone (${before} -> ${after} -> ${await shown()})`);
+  await tabs.close();
+  // The first site's URLs land on their new pages.
+  for (const [from, to] of [['README.html', 'index.html'], ['docs/THREAT-MODEL.html', 'docs/project/threat-model.html'],
+    ['packages/js/README.html', 'docs/reference/javascript.html']]) {
+    const page = await light.newPage();
+    await page.goto(base + from);
+    const ok = await page.waitForURL(base + to, { timeout: 10000 }).then(() => true, () => false);
+    check(ok, `${from} moves to /peerwire/${to} (${page.url()})`);
     await page.close();
   }
+  await light.close();
+  await dark.close();
+  // On a phone: the sidebar gives way to a menu that opens, and nothing is wider than the screen.
   const mobile = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-  const m = await mobile.newPage();
-  await m.goto(base);
-  await shot(m, 'site-landing-mobile', { fullPage: true });
+  for (const [name, url] of [['landing', base], ['doc', `${base}docs/guides/godot.html`], ['overview', `${base}docs/index.html`]]) {
+    const m = await mobile.newPage();
+    await m.goto(url);
+    await m.waitForLoadState('load');
+    const wide = await m.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    let menu = true;
+    if (name !== 'landing') {
+      const hidden = await m.evaluate(() => getComputedStyle(document.querySelector('.side')).display === 'none');
+      await m.click('.mnav summary');
+      menu = hidden && await m.isVisible('.mnav nav a[aria-current="page"]');
+    }
+    check(wide <= 0 && menu, `${name} on a phone: no wider than the screen (${wide} px over)` +
+      `${name === 'landing' ? '' : ', the sidebar is a menu that opens'}`);
+    await shot(m, `site-${name}-mobile`, { fullPage: name === 'landing' });
+    await m.close();
+  }
   await mobile.close();
 
   // 3. Each demo reaches ready, with its modules and wasm from assets/<id>/ only.

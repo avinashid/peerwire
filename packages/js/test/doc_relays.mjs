@@ -1,5 +1,5 @@
 // room.doc(name, { relays: true }) (src/relays.js): a doc's sealed copy on the signalling relays, so a member that
-// opens it while no other member is online still gets it (docs/STORE-DESIGN.md, route 1). All in this process: relays
+// opens it while no other member is online still gets it (docs/project/offline-store-design.md, route 1). All in this process: relays
 // that keep events as strfry does (an addressable event replaced only by a newer created_at, none taken over 64 KiB
 // or more than 15 min ahead, NIP-40 expiry, NIP-09 deletion), members on a fake network and clock as in
 // doc_crdt.mjs, and the real wasm signer. Checks:

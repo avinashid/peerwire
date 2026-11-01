@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "Shared documents for Peerwire: maps, sets and logs that every member holds and that converge, in the frames of @peerwire/js room.doc()"
+readme = "README.md"
+keywords = ["crdt", "p2p", "collaboration", "local-first", "sync"]
+categories = ["data-structures", "network-programming"]
 
 [dependencies]
 peerwire-core = { path = "../peerwire-core" }

@@ -1,12 +1,12 @@
 # AGENTS.md
 
 Guidance for AI coding agents (and humans) working in this repository. Read this first, then `README.md` and
-`docs/ARCHITECTURE.md`.
+`docs/concepts/architecture.md`.
 
 ## What this is
 
 Peerwire is a peer-to-peer networking toolkit in Rust: multiplayer games, whiteboards,
-chat and meetings without developer-owned servers or paid relays. It ships as Rust crates, a ~300 KB zero-import
+chat and meetings without developer-owned servers or paid relays. It ships as Rust crates, a ~350 KB zero-import
 WebAssembly module with a small JS package, and a C ABI. Status: early development (v0.1).
 
 ## Layout
@@ -14,13 +14,20 @@ WebAssembly module with a small JS package, and a C ABI. Status: early developme
 | Path | What it is |
 |---|---|
 | `crates/peerwire-core` | Sans-IO session core: identity, Noise IK handshake, lanes (reliable/unreliable/urgent), NAT traversal, peer relay, STUN codec, invites (`pw:` prefix) |
+| `crates/peerwire` | Nodes over UDP on the core: `Node` and `AsyncNode` (feature `tokio`), STUN, rooms, signaling (Nostr with feature `nostr`, `LanSignaling`), router port mapping; tests in `crates/peerwire/tests/` |
+| `crates/peerwire-sync` | Shared documents (maps, sets, logs that converge), in the frames of `@peerwire/js` `room.doc()` |
+| `crates/peerwire-ffi` | C ABI (`pw_*` symbols, `PW_ERR_*`), the one surface for wasm and native bindings; shared docs behind feature `sync` |
 | `crates/peerwire-sim` | Deterministic network simulator and the multiplayer arena benchmark; integration tests live in `crates/peerwire-sim/tests/` |
-| `crates/peerwire-ffi` | C ABI (`pw_*` symbols, `PW_ERR_*`), the one surface for wasm and native bindings |
 | `crates/peerwire-game` | Deterministic fixed-point maths, Hilbert-curve islands, desync detection |
+| `crates/peerwire-peer` | The optional always-on peer (a binary): one identity across restarts, relays for linked peers |
+| `bindings/godot` | Godot 4 GDExtension (`peerwire-godot`, a workspace member): `PeerwireMultiplayerPeer` |
 | `packages/js` | `@peerwire/js`: `src/room.js` (`joinRoom`), `src/peerwire.js` (`loadPeerwire`, class `Peerwire`), WebRTC transport, Nostr signaling, types in `src/index.d.ts`, demos, tests |
 | `packages/react` | `@peerwire/react`: React hooks in TypeScript (`src/`, built by `tsc` to `dist/`), a Vite example, tests. Its dev dependencies come from `npm ci` there; the gate runs it |
-| `examples/` | Live examples (in progress) |
-| `docs/` | Architecture, performance model, comparison with other libraries |
+| `examples/` | Runnable examples: `rust/` (examples of the `peerwire` crate) and the Godot demo `godot/`; `examples/README.md` indexes every example in the repo |
+| `ports/esp32` | ESP32-C3 prototype under ESP-IDF, with its own `[workspace]` and pinned nightly: not built by the workspace, CI or the gate |
+| `docker/` | `Dockerfile` (the always-on peer and the examples server), `compose.yml`, the nginx config; the build context is the repo root |
+| `docs/` | `README.md` (the index), `getting-started/`, `guides/`, `concepts/` (architecture, NAT traversal, protocol, security model, scaling), `reference/`, `project/` (status, performance, testing, comparison, threat model, offline-store design) |
+| `scripts/` | `gate.sh` (the gate), `site.sh` and `site/` (the docs and demos site), benchmarks |
 
 ## Setup
 
