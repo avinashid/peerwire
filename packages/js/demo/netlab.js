@@ -244,10 +244,11 @@ async function watchMic() {
 function renderMic() {
   const shares = "this site's pages give the members of named and private rooms this device's local addresses (Wi-Fi, hotspot, VPN), on later visits too";
   // A grant is the whole origin's. On <account>.github.io the account's other Pages sites
-  // share that origin, so they could then open the microphone without asking (NB16-2,
-  // accepted by the owner): say so there, before and after the grant.
+  // share that origin, so they could then open the microphone, and get this device's local
+  // addresses on their WebRTC connections, without asking (NB16-2, accepted by the owner;
+  // NB71-I1): say so there, before and after the grant.
   const scope = location.hostname.endsWith('.github.io')
-    ? `; the permission is for all of ${location.host}, so the other GitHub Pages sites on it could use the microphone without asking`
+    ? `; the permission is for all of ${location.host}, so the other GitHub Pages sites on it could use the microphone, and see this device's local addresses, without asking`
     : '';
   const [cls, text] = {
     granted: ['ok', `allowed: ${shares}${scope}; remove the microphone in the site settings to stop`],
