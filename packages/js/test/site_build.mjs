@@ -171,14 +171,24 @@ const svgs = {
     '<h:script>alert(1)</h:script></s:foreignObject></s:svg>',
   charref: '<svg><a><set attributeName="href" to="&#106;avascript:alert(1)"/></a></svg>',
   pi: '<?xml-stylesheet type="text/xsl" href="#x"?><svg/>',
+  // XHTML in the default namespace needs no prefix: a srcdoc frame's script runs on the origin. Then each rule alone
+  // (an element outside the list, a namespace that isn't SVG's), and a tab the URL parser drops (NB67-I3).
+  srcdoc: '<svg xmlns="http://www.w3.org/2000/svg"><g xmlns="http://www.w3.org/1999/xhtml">' +
+    '<iframe srcdoc="&lt;script&gt;parent.ran=1&lt;/script&gt;"/></g></svg>',
+  htmlroot: '<html xmlns="http://www.w3.org/1999/xhtml">' +
+    '<iframe srcdoc="&lt;script&gt;parent.ran=1&lt;/script&gt;"/></html>',
+  element: '<svg xmlns="http://www.w3.org/2000/svg"><iframe/></svg>',
+  namespace: '<svg xmlns="http://www.w3.org/2000/svg"><g xmlns="http://www.w3.org/1999/xhtml"/></svg>',
+  tab: '<svg><a><set attributeName="href" to="java\tscript:alert(1)"/></a></svg>',
 };
 const passed = Object.entries(svgs).filter(([, s]) => checkSvg(s).length === 0).map(([k]) => k);
 check(passed.length === 0 && checkSvg('<?xml version="1.0" encoding="UTF-8"?>' +
   '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">' +
   '<defs><linearGradient id="g"/></defs><rect fill="url(#g)"/><use href="#g"/></svg>').length === 0,
   `checkSvg refuses a script, handlers, foreignObject, outside references, url(), @import, a DTD, javascript: and data:, ` +
-  `prefixed elements, character references and processing instructions, and allows #ids, xmlns and the XML ` +
-  `declaration${passed.length ? ` (passed: ${passed.join(' ')})` : ''}`);
+  `prefixed elements, character references, processing instructions, elements outside its list and other ` +
+  `namespaces, and allows #ids, SVG's and xlink's xmlns and the XML declaration` +
+  `${passed.length ? ` (passed: ${passed.join(' ')})` : ''}`);
 const logo = fs.readFileSync(path.join(ROOT, 'docs/assets/logo.svg'), 'utf8');
 check(['logo.svg', 'favicon.svg'].every((f) => checkSvg(fs.readFileSync(path.join(ROOT, 'docs/assets', f), 'utf8')).length === 0) &&
   /fill="#5b6cf0"/.test(logo) && !/prefers-color-scheme|<text/.test(logo),

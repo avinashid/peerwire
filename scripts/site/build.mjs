@@ -20,7 +20,8 @@
 // The build fails on a broken link: a relative href, src or refresh URL that names no file of the site, a #fragment
 // that names no id on its page, a doc link to a repo path that doesn't exist, or a link with another scheme than
 // http(s) or mailto. Doc links to repo files that aren't rendered point at GitHub. It fails too on an SVG under
-// docs/assets/ that holds a script, a handler or a reference to anything outside it (checkSvg).
+// docs/assets/ that holds a script, a handler, a reference to anything outside it, or an element or namespace that
+// isn't SVG's (checkSvg).
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -149,9 +150,21 @@ export function readIndex(root) {
 // anything outside itself (href and url() name only #ids; no URL scheme but its xmlns). Opened on its own it's XML,
 // where an element's namespace, not its spelling, makes it a script (<s:script>), and character references and
 // processing instructions are spellings a regex can't see through: so no prefixed element, no &#, and no <? but the
-// XML declaration (NB67-1).
+// XML declaration (NB67-1). An XHTML element needs no prefix in the default namespace (<g xmlns=xhtml><iframe
+// srcdoc>), so the elements are an allow-list of shapes and paint servers, and the only namespaces SVG's and xlink's.
+// With no DTD, &# or processing instruction, every element of the parsed document is a literal <name in the source.
+const SVG_ELEMENTS = new Set(['svg', 'g', 'defs', 'title', 'desc', 'symbol', 'use', 'path', 'rect', 'circle', 'ellipse',
+  'line', 'polyline', 'polygon', 'linearGradient', 'radialGradient', 'stop', 'clipPath', 'mask', 'pattern']);
 export function checkSvg(svg) {
   const problems = [];
+  for (const [, name] of svg.matchAll(/<\/?([^\s/>!?]+)/g)) {
+    if (!SVG_ELEMENTS.has(name)) problems.push(`a <${name}>`);
+  }
+  for (const [, prefix, , uri] of svg.matchAll(/\sxmlns(:[\w.-]+)?\s*=\s*(["'])(.*?)\2/gs)) {
+    if (uri !== (prefix === ':xlink' ? 'http://www.w3.org/1999/xlink' : 'http://www.w3.org/2000/svg')) {
+      problems.push(`the namespace ${JSON.stringify(uri)}`);
+    }
+  }
   if (/<script/i.test(svg)) problems.push('a <script>');
   if (/<\/?[A-Za-z_][\w.-]*:/.test(svg)) problems.push('an element with a namespace prefix');
   if (/&#/.test(svg)) problems.push('a character reference');
@@ -166,7 +179,7 @@ export function checkSvg(svg) {
   if (/[a-z][\w+.-]*:\/\/|javascript:|data:/i.test(svg.replace(/\sxmlns(?::\w+)?\s*=\s*(["'])[^"']*\1/g, ''))) {
     problems.push('a URL');
   }
-  return problems;
+  return [...new Set(problems)];
 }
 
 // The demos' module graph, followed from their entries: static and dynamic imports and new URL(…, import.meta.url),
