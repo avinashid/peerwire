@@ -5,7 +5,8 @@
 //    fenced block in the docs and for random input;
 //  - the sidebar is docs/README.md's: a doc missing from it or listed twice, or a stray line in a group, fails the
 //    build; each doc page has it with the page marked, its group above the title, "On this page", prev and next in
-//    sidebar order and an edit link;
+//    sidebar order and an edit link; a page path is escaped in every link to it, and URL-encoded in the edit link
+//    (NB67-I1);
 //  - every page has its Content-Security-Policy first after <meta charset>, only the demos run scripts, and those
 //    scripts, every module they import, the wasm and the images live under assets/<id>/;
 //  - <id> is a hash of the assets: the same for the same inputs, new when the wasm changes;
@@ -413,6 +414,22 @@ const unlisted = fakeBuild('# A\n', 'fake-unlisted');
 fs.rmSync(path.join(fake, 'docs/B.md'));
 check(/docs\/assets\/evil\.svg holds an on\* handler/.test(evil) && /notes\.txt: docs\/assets\/ holds images only/.test(txt) &&
   /docs\/B\.md isn't listed/.test(unlisted), `an SVG with a handler, a non-image in docs/assets/, or a doc not in the sidebar fails the build`);
+
+// A doc whose path needs escaping and encoding: its edit link is the path through encodeURI, then escaped, and every
+// link to it (the sidebar, the pager, the overview's card) is escaped (NB67-I1).
+const odd = 'q" &amp;.md';
+const readme = fs.readFileSync(path.join(fake, 'docs/README.md'), 'utf8');
+fs.writeFileSync(path.join(fake, 'docs', odd), '# Odd\n');
+fs.writeFileSync(path.join(fake, 'docs/README.md'), `${readme}- [Odd](q%22%20&amp;.md): a page with an odd name.\n`);
+const oddBuild = fakeBuild('# A\n', 'fake-odd');
+fs.writeFileSync(path.join(fake, 'docs/README.md'), readme);
+fs.rmSync(path.join(fake, 'docs', odd));
+const oddRead = (p) => (fs.existsSync(path.join(tmp, 'fake-odd', p)) ? fs.readFileSync(path.join(tmp, 'fake-odd', p), 'utf8') : '');
+const oddLink = 'href="q&quot; &amp;amp;.html"';
+check(!oddBuild && oddRead('docs/q" &amp;.html').includes(`<a href="${REPO_URL}/edit/main/docs/q%22%20&amp;amp;.md">Edit this page`) &&
+  oddRead('docs/q" &amp;.html').includes(`<a ${oddLink} aria-current="page">Odd</a>`) &&
+  oddRead('docs/A.html').includes(`<a class="next" ${oddLink}>`) && oddRead('docs/index.html').includes(`<li><a ${oddLink}>Odd</a>`),
+  `a doc named ${odd}: its edit link names docs/q%22%20&amp;.md, and the sidebar, pager and overview link to it escaped ${oddBuild}`);
 
 // The checker on its own.
 const site = path.join(tmp, 'check');

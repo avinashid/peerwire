@@ -361,7 +361,7 @@ export function buildSite({ root, out, wasm }) {
       headings = nav.groups.map((g) => ({ level: 2, id: slug(g.name), text: g.name }));
       body = [r.html, ...nav.groups.map((g, n) => `<h2 id="${escapeHtml(headings[n].id)}">${escapeHtml(g.name)}</h2>
 <ul class="cards">
-${g.items.map((i) => `<li><a href="${href(i.page)}">${escapeHtml(i.title)}</a>\n${render(i.blurb, opts).html}</li>`).join('\n')}
+${g.items.map((i) => `<li><a href="${escapeHtml(href(i.page))}">${escapeHtml(i.title)}</a>\n${render(i.blurb, opts).html}</li>`).join('\n')}
 </ul>`)].join('\n');
       heading = r.title;
       home.blurb = (/<p>([^]*?)<\/p>/.exec(r.html) ?? [])[1] ?? '';

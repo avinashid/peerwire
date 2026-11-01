@@ -2,7 +2,8 @@
 // with its sidebar, "On this page" list and prev/next, and a redirect. None of them runs a script: the mobile menus
 // are <details>, and light or dark follows prefers-color-scheme in site.css.
 //
-// Every URL is relative: href(to) is the path from the page being written to `to`, a path from the site's root.
+// Every URL is relative: href(to) is the path from the page being written to `to`, a path from the site's root. A
+// page's path goes into an attribute escaped, and into a GitHub URL through encodeURI first, as the docs' links do.
 
 import path from 'node:path';
 import { escapeHtml as esc } from './markdown.mjs';
@@ -64,7 +65,7 @@ ${extra}<div class="foot-line"><span>Peerwire · MIT OR Apache-2.0</span>${built
 
 // The docs' navigation: the overview, then each group of docs/README.md, with the page `here` marked.
 function sideNav(nav, here, href) {
-  const link = (p) => `<a href="${href(p.page)}"${p.page === here ? ' aria-current="page"' : ''}>${esc(p.title)}</a>`;
+  const link = (p) => `<a href="${esc(href(p.page))}"${p.page === here ? ' aria-current="page"' : ''}>${esc(p.title)}</a>`;
   return `<ul class="side-home"><li>${link(nav.home)}</li></ul>\n` + nav.groups.map((g) =>
     `<p class="side-group">${esc(g.name)}</p>\n<ul>\n${g.items.map((p) => `<li>${link(p)}</li>`).join('\n')}\n</ul>`)
     .join('\n');
@@ -79,7 +80,7 @@ export function docPage({ id, commit, nav, page, body, headings, prev, next, ind
   const here = page.page;
   const href = linker(here);
   const side = sideNav(nav, here, href);
-  const pager = (p, cls, label) => (p ? `<a class="${cls}" href="${href(p.page)}"><span>${label}</span>` +
+  const pager = (p, cls, label) => (p ? `<a class="${cls}" href="${esc(href(p.page))}"><span>${label}</span>` +
     `${esc(p.title)}</a>` : '<span></span>');
   return `${head({ href, id, title: `${page.heading ?? page.title} · Peerwire`, description: page.description })}
 <body class="docs">
@@ -101,7 +102,7 @@ ${headings.length ? `<details class="mtoc">\n<summary>On this page</summary>\n${
 ${body}
 </article>
 <nav class="pager" aria-label="Previous and next">${pager(prev, 'prev', 'Previous')}${pager(next, 'next', 'Next')}</nav>
-<p class="edit"><a href="${REPO_URL}/edit/main/${page.source}">Edit this page on GitHub</a></p>
+<p class="edit"><a href="${REPO_URL}/edit/main/${esc(encodeURI(page.source))}">Edit this page on GitHub</a></p>
 </main>
 <aside class="toc" aria-label="On this page">
 ${headings.length ? `<p class="toc-title">On this page</p>\n${tocList(headings)}` : ''}
