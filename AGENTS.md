@@ -6,7 +6,7 @@ Guidance for AI coding agents (and humans) working in this repository. Read this
 ## What this is
 
 Peerwire is a peer-to-peer networking toolkit in Rust: multiplayer games, whiteboards,
-chat and meetings without developer-owned servers or paid relays. It ships as Rust crates, a ~300 KB zero-import
+chat and meetings without developer-owned servers or paid relays. It ships as Rust crates, a ~350 KB zero-import
 WebAssembly module with a small JS package, and a C ABI. Status: early development (v0.1).
 
 ## Layout

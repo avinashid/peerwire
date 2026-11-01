@@ -3,7 +3,7 @@
 A C ABI over the [`peerwire-core`](../peerwire-core) `Endpoint`: one surface for every host
 that isn't Rust.
 
-- Built for `wasm32-unknown-unknown`, it is a WebAssembly module of about 300 KB with
+- Built for `wasm32-unknown-unknown`, it is a WebAssembly module of about 350 KB with
   **no imports** (no wasm-bindgen, no WASI). The browser package [`@peerwire/js`](../../packages/js)
   loads it and supplies WebRTC DataChannels, timers and randomness from JavaScript.
 - Built natively, it is a shared or static library (`cdylib`, `staticlib`) for Dart FFI,

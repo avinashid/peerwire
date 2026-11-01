@@ -290,22 +290,23 @@ invite; decoding is now canonical (`b64::rejects_non_canonical_tails`, `invite::
 |---|---|---|
 | Fuzzing is not coverage-guided (cargo-fuzz needs nightly) | — | qa, if the toolchain is approved |
 | `browser.mjs` reports round trips and throughput but asserts only that the mesh forms and data arrives | — | qa |
-| Planned crates (facade, sync, media, store, Godot binding) have no tests yet; each lands with its own, per the plans above | — | backend |
+| CI runs on Linux only: no macOS or Windows test runs, and no browser tests (the gate runs those) | — | ops |
+| The ESP32 prototype is built and run by hand (`ports/esp32`), not by the gate or CI | — | lead |
+| Real mobile carrier-grade NATs and real ESP32 boards are untested | — | — |
 
 ## CI
 
-NB-002 (ops) owns `.github/workflows/ci.yml`. The jobs should call the same commands as the gate so local and CI
-results match:
+`.github/workflows/ci.yml` runs on every push and pull request, on Ubuntu, in three jobs that call the same
+commands as the gate:
 
-| Job | Runs on | Command |
-|---|---|---|
-| test | ubuntu, macos, windows | `cargo test --workspace --release` |
-| clippy | ubuntu | `cargo clippy --workspace --all-targets -- -D warnings` |
-| fmt | ubuntu | `cargo fmt --all -- --check` |
-| wasm + node | ubuntu | `scripts/gate.sh --quick` steps `wasm build`, `wasm size+imports`, `node glue` |
-| browser | ubuntu with `npx playwright install --with-deps chromium` | `PLAYWRIGHT=$(npm root)/playwright/index.mjs node packages/js/test/browser.mjs 2` and `arena.mjs 8 10` |
+| Job | Runs |
+|---|---|
+| fmt + clippy + test | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`, and again for `peerwire-ffi --features sync`; `cargo test --workspace --release` and the `sync` feature's tests; the fuzz tests in a debug build |
+| wasm + node | `./packages/js/build.sh`, the wasm size and import check, the Node tests listed in the job (Node 22), and `@peerwire/react`'s build, types and tests |
+| docker build | `docker compose config` and a build of the peer and examples images (never pushed) |
 
-On Linux CI, `scripts/gate.sh --strict` alone covers every job except the macOS and Windows test runs.
+Browser tests (headless Chromium) run in the gate, not in CI. `scripts/gate.sh --strict` runs CI's Node list again
+on CI's Node version, read from `ci.yml`, so a change that passes the strict gate passes CI's Node job.
 
 `.github/workflows/pages.yml` (NB-016) is not CI. It runs only by hand (`workflow_dispatch`): it builds the site
 with `scripts/site.sh`, runs `site_build.mjs`, and deploys `target/site/` to GitHub Pages. The gate runs both site
