@@ -1,10 +1,12 @@
 //! `peerwire`: peer-to-peer nodes over UDP, with no server.
 //!
 //! A [`Node`] owns one non-blocking UDP socket and one identity, and drives a
-//! [`peerwire_core::Endpoint`] from it. It never blocks and never spawns threads:
-//! call [`Node::poll`] from your loop (a game's frame tick, a timer, an event
-//! loop) and it drains the socket, fires timers, sends what is queued and
-//! queues events for [`Node::try_recv_event`].
+//! [`peerwire_core::Endpoint`] from it, on the thread that polls it: call
+//! [`Node::poll`] from your loop (a game's frame tick, a timer, an event loop)
+//! and, without blocking, it drains the socket, fires timers, sends what is
+//! queued and queues events for [`Node::try_recv_event`]. Two parts start
+//! threads of their own: router port mapping ([`Builder::port_mapping`]) runs
+//! on one, and `NostrSignaling` runs one per relay.
 //!
 //! ```no_run
 //! use peerwire::{Event, Lane, Node};
@@ -68,8 +70,8 @@ pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]
 pub use nostr::NostrSignaling;
 pub use peerwire_core::{
-    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
-    MAX_URGENT,
+    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, Stats,
+    MAX_UNRELIABLE, MAX_URGENT,
 };
 pub use portmap::{MapProtocol, PortMapping};
 pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};

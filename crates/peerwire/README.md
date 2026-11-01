@@ -6,9 +6,11 @@ socket and adds STUN, rooms, signaling and NAT traversal.
 Design: [docs/concepts/architecture.md](../../docs/concepts/architecture.md), NAT traversal:
 [docs/concepts/nat-traversal.md](../../docs/concepts/nat-traversal.md).
 
-A `Node` owns one non-blocking UDP socket and one identity. It never blocks and never
-spawns threads: call `Node::poll` from your loop (a game's frame tick, a timer, an event
-loop) and read events with `Node::try_recv_event`.
+A `Node` owns one non-blocking UDP socket and one identity, and runs on the thread that
+polls it: call `Node::poll` from your loop (a game's frame tick, a timer, an event loop)
+and read events with `Node::try_recv_event`. `poll` never blocks. Two parts start threads
+of their own: router port mapping (`Builder::port_mapping`) runs on one, and
+`NostrSignaling` runs one per relay.
 
 ## Example
 

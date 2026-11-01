@@ -66,6 +66,7 @@ const COOKIE_EPOCH: Duration = Duration::from_secs(120);
 /// Under load, the half-open handshakes one source may hold (see [`Source`]).
 const PER_SOURCE: usize = 4;
 
+/// Session settings for an [`Endpoint`]: start from [`Config::default`] and change what you need.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Send a PING if nothing was sent for this long (also keeps NAT mappings open).
@@ -76,8 +77,14 @@ pub struct Config {
     /// answered) until the peer is heard again or `idle_timeout` passes, so a
     /// lossy link isn't declared dead after a few lost keepalives.
     pub probe_interval: Duration,
-    /// First handshake retry interval; doubles on each attempt.
+    /// Wait before the first handshake resend. Each wait after it doubles, up to
+    /// 16 times this: with the defaults (500 ms, 6 attempts) a dial that hears
+    /// nothing sends at 0, 0.5, 1.5, 3.5, 7.5 and 15.5 s and fails at 23.5 s.
+    /// Once its handshake is through, the dialling side also pings this often
+    /// until it hears data from the peer.
     pub handshake_retry: Duration,
+    /// Handshake sends, the first included, before a dial fails with
+    /// [`Event::ConnectFailed`].
     pub handshake_attempts: u8,
     /// How long a responder keeps a half-open handshake waiting for the first data packet.
     pub handshake_timeout: Duration,
@@ -239,10 +246,14 @@ pub struct Transmit<A> {
     pub payload: Vec<u8>,
 }
 
+/// Why a dial ([`Endpoint::connect_with`] and the calls built on it) didn't start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectError {
+    /// The peer is this endpoint.
     SelfConnect,
+    /// The [`PeerId`] is not a valid Ed25519 public key.
     InvalidPeerId,
+    /// No address or relay to dial.
     NoPath,
     /// The node is relay-only and no relay is connected to dial through.
     NoRelay,
@@ -281,6 +292,7 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+/// Endpoint-wide counters, from [`Endpoint::stats`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub tx_packets: u64,
@@ -1308,7 +1320,7 @@ impl<A: Address> Endpoint<A> {
     /// times: on the first handshake sends while dialling, or every few punch
     /// rounds while relayed. One becomes the link's path only when the peer
     /// answers from it. Replaces the peer's earlier guesses; keeps at most
-    /// [`MAX_GUESSES`]. The same guesses again change nothing, and new ones are
+    /// 64 (`MAX_GUESSES`). The same guesses again change nothing, and new ones are
     /// sent to at once without repeating the old. Ignored for a peer a relay-only
     /// endpoint reaches through a relay, or linked directly.
     pub fn set_guesses(&mut self, now: Instant, peer: &PeerId, addrs: &[A]) {
@@ -1344,7 +1356,7 @@ impl<A: Address> Endpoint<A> {
     }
 
     /// Birthday punching, from behind a NAT that keeps one port for every
-    /// destination (a cone): probes `count` (at most [`MAX_SPRAY`]) ports of
+    /// destination (a cone): probes `count` (at most 4096, `MAX_SPRAY`) ports of
     /// `addr`'s IP, each once, in a random order, `SPRAY_BATCH` every `SPRAY_GAP`.
     /// The peer is behind a symmetric NAT with random ports and has opened many
     /// sockets towards us ([`opener`](Endpoint::opener)), each with its own
@@ -1364,7 +1376,7 @@ impl<A: Address> Endpoint<A> {
         self.start_spray(now, peer, targets, count);
     }
 
-    /// Probes `addrs` (at most [`MAX_SPRAY`]) in this order, each once, paced as a
+    /// Probes `addrs` (at most 4096, `MAX_SPRAY`) in this order, each once, paced as a
     /// [`spray`](Endpoint::spray), which it replaces, as are the cases it is
     /// ignored in. For two sequential symmetric NATs probing each other's
     /// predicted ports: every probe goes to a new address, so each costs the NAT

@@ -92,11 +92,8 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND` and `NostrStats` | `src/nostr.rs` |
 | `Privacy`, `Role`, `NatType`, `Failure`, `Side` | Which addresses a node gives out, room roles, the NAT type, why a dial failed | `src/traversal.rs` |
 | `PortMapping`, `MapProtocol` | Where router port mapping stands | `src/portmap.rs` |
-| `Config`, `ConnectError`, `DisconnectReason`, `Identity`, `Invite`, `Lane`, `PeerId`, `PeerStats`, `SendError`, `MAX_UNRELIABLE`, `MAX_URGENT` | Re-exported from `peerwire-core` | `crates/peerwire-core/src` |
+| `Config`, `ConnectError`, `DisconnectReason`, `Identity`, `Invite`, `Lane`, `PeerId`, `PeerStats`, `SendError`, `Stats`, `MAX_UNRELIABLE`, `MAX_URGENT` | Re-exported from `peerwire-core` | `crates/peerwire-core/src` |
 | `traversal` (module) | The sans-IO NAT traversal layer (`Traversal`) that `Node` drives; the simulator drives it too | `src/traversal.rs` |
-
-`Node::stats` returns `peerwire_core::Stats`, which `peerwire` doesn't re-export: to name the type, depend on
-`peerwire-core` too.
 
 ### Example: Node
 
@@ -207,7 +204,7 @@ Identity and addresses:
 | `peer_id(&self) -> PeerId` | This node's identity: the key every peer authenticates it by |
 | `local_addr(&self) -> SocketAddr` | The bound address (`0.0.0.0` when `[::]` fell back to IPv4) |
 | `invite(&self) -> String` | A `pw:` invite with this node's `addresses()` and its invite key, which lets a holder ask the node, over signaling, to dial back. Under `Privacy::RelayOnly` it lists no address, only its relay |
-| `addresses(&self) -> Vec<SocketAddr>` | What the invite lists: the public address from STUN, public addresses linked peers reported, a router-mapped port, and the bound address (or, bound to any interface, the LAN and loopback addresses), as the `Privacy` mode allows |
+| `addresses(&self) -> Vec<SocketAddr>` | What the invite lists, in this order: the public address from STUN, the public port the router forwards (`Builder::port_mapping`), the last 4 addresses linked peers reported seeing it at, and the bound address (or, bound to any interface, the LAN and loopback addresses). At most 8, and only those the `Privacy` mode allows |
 | `public_addr(&self) -> Option<SocketAddr>` | The public address STUN reported, once a server answered |
 | `nat_type(&self) -> NatType` | What STUN says about this node's NAT |
 | `privacy(&self) -> Privacy` | Which addresses the node gives out |
@@ -240,7 +237,7 @@ Messages and links:
 | `path(&self, peer: &PeerId) -> Option<&Path>` | The route the link takes: `Path::Direct(addr)` or `Path::Via(relay)` |
 | `via_birthday(&self, peer: &PeerId) -> bool` | Whether the direct link leaves from one of this node's birthday-punch sockets |
 | `birthday_sockets_opened(&self) -> u64` | How many sockets this node has opened for birthday punching |
-| `stats(&self) -> peerwire_core::Stats` | Node-wide counters: packets, drops, relaying, hole punching |
+| `stats(&self) -> Stats` | Node-wide counters: packets, drops, relaying, hole punching |
 
 Driving it:
 
@@ -292,7 +289,7 @@ node.join_room("my-app", "kitchen"); // links with every node in "kitchen" on th
 | `keepalive` | 10 s | Send a PING if nothing was sent for this long (also keeps NAT mappings open) |
 | `idle_timeout` | 30 s | Drop a link if nothing was received for this long |
 | `probe_interval` | 1 s | Once nothing was received for `keepalive`, ping this often until the peer is heard or `idle_timeout` passes |
-| `handshake_retry` | 500 ms | Wait before the first handshake resend; it doubles on each resend, up to 16 times this |
+| `handshake_retry` | 500 ms | Wait before the first handshake resend; each wait after it doubles, up to 16 times this. With the defaults a dial that hears nothing sends at 0, 0.5, 1.5, 3.5, 7.5 and 15.5 s and fails at 23.5 s. Once its handshake is through, the dialling side also pings this often until it hears data from the peer |
 | `handshake_attempts` | 6 | Handshake sends, the first included, before the dial fails (`Event::ConnectFailed`) |
 | `handshake_timeout` | 10 s | How long a responder keeps a half-open handshake waiting for the first data packet |
 | `max_pending_handshakes` | 4096 | Cap on half-open responder handshakes. From three quarters of it, a handshake from a UDP address takes no state until it echoes a cookie, and each source holds at most 4 (`PER_SOURCE`) |
@@ -409,7 +406,8 @@ What STUN says about this node's NAT (`Node::nat_type`). It takes answers from t
 
 `Error` (`Node::connect`, `Node::set_relay_peers`): `InvalidInvite` when the string is not a `pw:` invite, or
 `Connect(ConnectError)` when the dial can't start. `ConnectError` is `SelfConnect` (your own invite),
-`InvalidPeerId`, `NoPath` (no address or relay to dial) or `NoRelay` (relay-only, and no relay is linked).
+`InvalidPeerId` (not a valid Ed25519 key), `NoPath` (no address in an IP family the socket reaches, and no relay
+this node is linked to) or `NoRelay` (relay-only, and no relay is linked).
 
 ### PortMapping
 
