@@ -1,7 +1,7 @@
 # Docker: the always-on peer and the examples server
 
 Peerwire needs no server. An always-on peer is optional: an ordinary peer that stays online, so the peers linked to it
-can relay through it when their NATs can't punch (see [NAT-TRAVERSAL.md](NAT-TRAVERSAL.md)). It keeps one identity
+can relay through it when their NATs can't punch (see [NAT traversal](../concepts/nat-traversal.md)). It keeps one identity
 across restarts, so its invite stays valid for the same peer id. The compose file runs it next to a static server for
 the browser demos.
 
@@ -83,7 +83,7 @@ address. Lower `PEERWIRE_RELAY_TOTAL` and `PEERWIRE_MAX_PEERS` to what you want 
 can also make the server hold about 2.3 MB of received data (about 2.6 MB allocated), so 256 peers can pin about
 0.6 GB of memory; size `PEERWIRE_MAX_PEERS` to the memory you have. Relayed traffic is
 end-to-end encrypted between the two peers; the relay sees their addresses, packet
-sizes and timing. See [THREAT-MODEL.md](THREAT-MODEL.md).
+sizes and timing. See [threat model](../project/threat-model.md).
 
 The examples server is static files only (GET and HEAD; anything else is 403; dotfiles are 403). It sends a
 Content-Security-Policy that allows only same-origin scripts, styles and wasm, `wss:` and same-origin connections, and

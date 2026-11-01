@@ -1,4 +1,4 @@
-# Peerwire images (see docs/DOCKER.md):
+# Peerwire images (see docs/guides/always-on-peer.md):
 #
 #   docker build -t peerwire-peer .                         # the always-on peer (default target)
 #   docker build -t peerwire-examples --target examples .   # the browser demos, served by nginx

@@ -3,8 +3,8 @@
 Peer-to-peer nodes over UDP, with no server. This is the Rust crate most applications
 want: it drives the sans-IO [`peerwire-core`](../peerwire-core) `Endpoint` from a real UDP
 socket and adds STUN, rooms, signaling and NAT traversal.
-Design: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md), NAT traversal:
-[docs/NAT-TRAVERSAL.md](../../docs/NAT-TRAVERSAL.md).
+Design: [docs/concepts/architecture.md](../../docs/concepts/architecture.md), NAT traversal:
+[docs/concepts/nat-traversal.md](../../docs/concepts/nat-traversal.md).
 
 A `Node` owns one non-blocking UDP socket and one identity. It never blocks and never
 spawns threads: call `Node::poll` from your loop (a game's frame tick, a timer, an event

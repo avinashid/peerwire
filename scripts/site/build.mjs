@@ -64,17 +64,17 @@ const DOC_LINES = {
   'packages/js/README.md': ['@peerwire/js', 'The JS package: joinRoom, members and routes, shared docs, offline ' +
     'messages, and the wasm module underneath.'],
   'packages/react/README.md': ['@peerwire/react', 'React hooks for rooms, members, chat and shared state.'],
-  'docs/ARCHITECTURE.md': ['Architecture', 'How the parts fit: the sans-IO core, its transports and signalling, ' +
+  'docs/concepts/architecture.md': ['Architecture', 'How the parts fit: the sans-IO core, its transports and signalling, ' +
     'and the crates around it.'],
-  'docs/COMPARISON.md': ['How Peerwire compares', 'Next to other peer-to-peer libraries, feature by feature.'],
-  'docs/DOCKER.md': ['Docker', 'The optional always-on peer, and these demos served from a container.'],
-  'docs/GODOT.md': ['Godot 4', "Godot's own multiplayer API (@rpc, synchronizers, spawners) over Peerwire."],
-  'docs/NAT-TRAVERSAL.md': ['NAT traversal', 'How peers behind NATs find and reach each other, and what they fall ' +
+  'docs/project/comparison.md': ['How Peerwire compares', 'Next to other peer-to-peer libraries, feature by feature.'],
+  'docs/guides/always-on-peer.md': ['Docker', 'The optional always-on peer, and these demos served from a container.'],
+  'docs/guides/godot.md': ['Godot 4', "Godot's own multiplayer API (@rpc, synchronizers, spawners) over Peerwire."],
+  'docs/concepts/nat-traversal.md': ['NAT traversal', 'How peers behind NATs find and reach each other, and what they fall ' +
     'back to.'],
-  'docs/PERFORMANCE.md': ['Performance model', 'Measured and theoretical numbers, and how to reproduce each.'],
-  'docs/STORE-DESIGN.md': ['Store design', "Keeping a room's data while nobody is online."],
-  'docs/TEST-PLAN.md': ['Test plan', 'How Peerwire is tested, and the gate every change passes.'],
-  'docs/THREAT-MODEL.md': ['Threat model', "What Peerwire defends against, what it doesn't, and every review " +
+  'docs/project/performance.md': ['Performance model', 'Measured and theoretical numbers, and how to reproduce each.'],
+  'docs/project/offline-store-design.md': ['Store design', "Keeping a room's data while nobody is online."],
+  'docs/project/testing.md': ['Test plan', 'How Peerwire is tested, and the gate every change passes.'],
+  'docs/project/threat-model.md': ['Threat model', "What Peerwire defends against, what it doesn't, and every review " +
     'finding with its status.'],
 };
 

@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Guidance for AI coding agents (and humans) working in this repository. Read this first, then `README.md` and
-`docs/ARCHITECTURE.md`.
+`docs/concepts/architecture.md`.
 
 ## What this is
 

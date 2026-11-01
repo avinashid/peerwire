@@ -1,4 +1,4 @@
-# The optional always-on peer and the browser demos, on this machine only (see docs/DOCKER.md).
+# The optional always-on peer and the browser demos, on this machine only (see docs/guides/always-on-peer.md).
 #
 #   docker compose up -d --build
 #   docker compose exec peer peerwire-peer check     # or: docker compose logs peer  (prints the invite)

@@ -1,6 +1,6 @@
 ; Ship this with the built library in a Godot project, for example under
 ; res://addons/peerwire/ next to a bin/ folder holding the libraries named below.
-; Build: cargo build --release -p peerwire-godot (per target; see docs/GODOT.md).
+; Build: cargo build --release -p peerwire-godot (per target; see docs/guides/godot.md).
 
 [configuration]
 entry_symbol = "gdext_rust_init"

@@ -409,7 +409,7 @@ call.leave();
   ('lost'). `privacy` and `iceServers` apply to calls as to the room's links: see [Privacy](#privacy), which matters
   more here, since a page with microphone or camera permission shows its local addresses.
 - **Cost.** Each member uploads its stream once for every other: about 7.5 Mbit/s for six at 720p (1.5 Mbit/s
-  each), more than many uplinks. See docs/PERFORMANCE.md §6. `max` goes up to 16, for audio or small video.
+  each), more than many uplinks. See docs/project/performance.md §6. `max` goes up to 16, for audio or small video.
 - **Bounds.** A member's call frames are checked (64 KiB, a description of 32 KiB with 4 media sections and 64
   candidates, a candidate of 512 characters) and rate-limited: 6 joins, 8 descriptions and 64 candidates at once,
   then one join every 5 s, one description every 3 s and four candidates a second. Past that they are dropped.

@@ -32,7 +32,7 @@ Peerwire is ahead only on the roadmap, the table says *planned*.
 - **One core everywhere.**
   - The same audited Rust core runs in browsers, servers, mobile and embedded hosts.
   - Bugs get fixed once.
-- **Measured, reproducible performance.** Every claim in [PERFORMANCE.md](PERFORMANCE.md) comes from a command
+- **Measured, reproducible performance.** Every claim in [Performance](performance.md) comes from a command
   you can run, or shows its formula.
 
 ## Where others are ahead today

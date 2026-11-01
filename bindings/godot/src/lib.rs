@@ -4,7 +4,7 @@
 //! [`PeerwireDoc`](doc::PeerwireDoc) for shared documents.
 //!
 //! The protocol logic lives in [`session`], free of Godot types, so `cargo test`
-//! covers it without a Godot binary. See `docs/GODOT.md`.
+//! covers it without a Godot binary. See `docs/guides/godot.md`.
 
 use godot::prelude::*;
 

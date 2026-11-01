@@ -109,7 +109,7 @@ tests on Node 22 to the same pool: 88 s for the pool alone, against 59 s without
   Property tests use `ChaCha8Rng` seeded from a fixed constant XOR a per-test salt, so a failure reproduces
   by rerunning the test; the failing input is in the assertion message.
 - **Small.** Property tests run ~2000 cases; simulations stay at a few hundred peers and a few simulated seconds.
-  Larger scales go in `docs/PERFORMANCE.md` as **theoretical**, with the formula.
+  Larger scales go in `docs/project/performance.md` as **theoretical**, with the formula.
 - **Local.** Loopback, LAN or the simulator. Only `nostr.mjs` touches public services, the allowed ones.
 - **Known gaps are tests too.** A behaviour we know is wrong gets an `#[ignore = "known gap: …"]` test that
   asserts the intended behaviour. Fixing the gap means removing the `ignore`. `cargo test -- --ignored` runs them.
@@ -195,7 +195,7 @@ tests on Node 22 to the same pool: 88 s for the pool alone, against 59 s without
 
 Lockstep islands agree over super-peers; bundles survive 5 % loss with jitter; islands survive a super-peer
 dying; an overloaded super-peer degrades without stalling. `cargo run -p peerwire-sim --release --example arena`
-is the full harness for `docs/PERFORMANCE.md`.
+is the full harness for `docs/project/performance.md`.
 
 ### peerwire-ffi and packages/js
 

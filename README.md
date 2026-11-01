@@ -8,8 +8,8 @@ encrypted, NAT-traversing and real-time, with no server to run and no relay to p
 [![CI](https://github.com/avinashid/peerwire/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/avinashid/peerwire/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 2021](https://img.shields.io/badge/rust-2021-orange.svg)](Cargo.toml)
-[![WebAssembly: 300 KB, 0 imports](https://img.shields.io/badge/wasm-300%20KB%2C%200%20imports-654ff0.svg)](docs/PERFORMANCE.md)
-[![Godot 4.3+](https://img.shields.io/badge/godot-4.3%2B-478cbf.svg)](docs/GODOT.md)
+[![WebAssembly: 300 KB, 0 imports](https://img.shields.io/badge/wasm-300%20KB%2C%200%20imports-654ff0.svg)](docs/project/performance.md)
+[![Godot 4.3+](https://img.shields.io/badge/godot-4.3%2B-478cbf.svg)](docs/guides/godot.md)
 [![Status: v0.1 early development](https://img.shields.io/badge/status-v0.1%20early%20development-yellow.svg)](#project-status)
 
 [Quick start](#quick-start) ·
@@ -145,7 +145,7 @@ peer.host_room("my-game", "9f3c1e7a2b8d4f60a1c5e9b7d3f2a8c4")   # on the host
 multiplayer.multiplayer_peer = peer
 ```
 
-Build it with `cargo build --release -p peerwire-godot`. See [docs/GODOT.md](docs/GODOT.md) for installation, the
+Build it with `cargo build --release -p peerwire-godot`. See [docs/guides/godot.md](docs/guides/godot.md) for installation, the
 full API and the demo project in [`examples/godot`](examples/godot).
 
 ### Browser and JavaScript
@@ -335,7 +335,7 @@ The reliable lane is a small, real-time-tuned transport:
 
 ### NAT traversal
 
-Details are in [docs/NAT-TRAVERSAL.md](docs/NAT-TRAVERSAL.md).
+Details are in [docs/concepts/nat-traversal.md](docs/concepts/nat-traversal.md).
 
 | Piece | Design |
 |---|---|
@@ -422,7 +422,7 @@ inputs into one packet per member per tick:
 ## Performance
 
 These figures were measured on a 4-core aarch64 machine and in the deterministic simulator. The full methodology,
-the theoretical models and the commands to reproduce them are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+the theoretical models and the commands to reproduce them are in [docs/project/performance.md](docs/project/performance.md).
 
 | Measurement | Result |
 |---|---|
@@ -443,7 +443,7 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 | Node.js | the same wasm module |
 | Godot 4.3+ desktop | `peerwire-godot` GDExtension |
 | Swift, Kotlin, Dart, C | `peerwire-ffi` native library (C ABI). Higher-level bindings are planned |
-| Docker | an always-on peer is just a node that stays online: `docker compose up` runs one on localhost, with the demos ([docs/DOCKER.md](docs/DOCKER.md)) |
+| Docker | an always-on peer is just a node that stays online: `docker compose up` runs one on localhost, with the demos ([docs/guides/always-on-peer.md](docs/guides/always-on-peer.md)) |
 
 ## Repository layout
 
@@ -456,7 +456,7 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 | [`crates/peerwire-sim`](crates/peerwire-sim) | Deterministic network simulator (latency, jitter, loss, NAT types, uplink limits) and the arena benchmark |
 | [`crates/peerwire-game`](crates/peerwire-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep timing constants |
 | [`crates/peerwire-sync`](crates/peerwire-sync) | Shared documents (maps, sets, logs) for Rust, Godot and C, in the frames of `room.doc()`; sans-IO |
-| [`crates/peerwire-peer`](crates/peerwire-peer) | Optional always-on peer (binary): one identity across restarts, relays for linked peers; see [docs/DOCKER.md](docs/DOCKER.md) |
+| [`crates/peerwire-peer`](crates/peerwire-peer) | Optional always-on peer (binary): one identity across restarts, relays for linked peers; see [docs/guides/always-on-peer.md](docs/guides/always-on-peer.md) |
 | [`packages/js`](packages/js) | JavaScript package: wasm glue, WebRTC transport, Nostr signaling, browser demos |
 | [`packages/react`](packages/react) | React hooks over `@peerwire/js`, in TypeScript: rooms, members, chat, shared and per-peer state |
 | [`examples`](examples) | Rust examples (echo, async echo, a local Nostr relay) and the Godot demo |
@@ -479,19 +479,19 @@ scripts/gate.sh --nostr      # also the opt-in tests against public Nostr relays
 
 Tests run on loopback, in the simulator or against an in-process Nostr relay
 (`cargo run -p peerwire --example nostr_relay --features nostr`). Only `--nostr` reaches the public internet. See
-[docs/TEST-PLAN.md](docs/TEST-PLAN.md).
+[docs/project/testing.md](docs/project/testing.md).
 
 ## Documentation
 
 | Document | |
 |---|---|
-| [Architecture](docs/ARCHITECTURE.md) | principles, layers, connection flow, lanes, super-peers |
-| [NAT traversal](docs/NAT-TRAVERSAL.md) | STUN, signaling, rooms and proofs, message formats, rules, threat analysis, coverage |
-| [Godot](docs/GODOT.md) | install, API, demo, limits |
-| [Docker](docs/DOCKER.md) | the always-on peer, the examples server, settings, exposing them |
-| [Performance model](docs/PERFORMANCE.md) | measured and theoretical numbers for games, whiteboards, chat and meetings |
-| [Test plan](docs/TEST-PLAN.md) | what is tested, and how |
-| [Comparison](docs/COMPARISON.md) | GunJS, Yjs, PeerJS, libp2p, Trystero, Hyperswarm |
+| [Architecture](docs/concepts/architecture.md) | principles, layers, connection flow, lanes, super-peers |
+| [NAT traversal](docs/concepts/nat-traversal.md) | STUN, signaling, rooms and proofs, message formats, rules, threat analysis, coverage |
+| [Godot](docs/guides/godot.md) | install, API, demo, limits |
+| [Docker](docs/guides/always-on-peer.md) | the always-on peer, the examples server, settings, exposing them |
+| [Performance model](docs/project/performance.md) | measured and theoretical numbers for games, whiteboards, chat and meetings |
+| [Test plan](docs/project/testing.md) | what is tested, and how |
+| [Comparison](docs/project/comparison.md) | GunJS, Yjs, PeerJS, libp2p, Trystero, Hyperswarm |
 
 ## Contributing
 

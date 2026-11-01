@@ -24,7 +24,7 @@ port open) and keep STUN on, or give the host a public IP, so the invite lists a
 Each peer may have it relay `PEERWIRE_RELAY_RATE` bytes per second (256 KiB by default), summed over everything it
 sends through it; `PEERWIRE_RELAY_TOTAL` caps all peers together. The relay can't read what it forwards, but it sees
 the peers' addresses, which of them talk, and how much. See
-[docs/NAT-TRAVERSAL.md](../../docs/NAT-TRAVERSAL.md#relay-peers).
+[docs/concepts/nat-traversal.md](../../docs/concepts/nat-traversal.md#relay-peers).
 
 ## Example
 
@@ -41,7 +41,7 @@ docker compose exec peer peerwire-peer check
 ```
 
 Settings come from the environment: `PEERWIRE_BIND`, `PEERWIRE_DATA`, `PEERWIRE_STUN`, `PEERWIRE_MAX_PEERS`, `PEERWIRE_RELAY`,
-`PEERWIRE_RELAY_RATE`, `PEERWIRE_RELAY_TOTAL` and `PEERWIRE_STATS_SECS`. [docs/DOCKER.md](../../docs/DOCKER.md) lists their
+`PEERWIRE_RELAY_RATE`, `PEERWIRE_RELAY_TOTAL` and `PEERWIRE_STATS_SECS`. [docs/guides/always-on-peer.md](../../docs/guides/always-on-peer.md) lists their
 defaults and covers exposing the peer, its logs (they hold peer addresses) and the container hardening.
 
 ## Status

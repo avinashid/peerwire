@@ -18,10 +18,10 @@ Every link is encrypted with Noise IK.
 cargo build --release -p peerwire-godot     # -> target/release/libpeerwire_godot.so (.dll, .dylib)
 ```
 
-Copy the library and [`bindings/godot/peerwire.gdextension`](../bindings/godot/peerwire.gdextension) into your
+Copy the library and [`bindings/godot/peerwire.gdextension`](../../bindings/godot/peerwire.gdextension) into your
 project as `res://addons/peerwire/`, and put the library in `res://addons/peerwire/bin/` under the name the
 `.gdextension` file lists for your platform. Godot loads it at the next start, and `PeerwireMultiplayerPeer`
-appears like a built-in class. The demo's own [`peerwire.gdextension`](../examples/godot/peerwire.gdextension)
+appears like a built-in class. The demo's own [`peerwire.gdextension`](../../examples/godot/peerwire.gdextension)
 points straight at `target/release/` instead.
 
 ## Use
@@ -90,7 +90,7 @@ The rest of the `MultiplayerPeer` API works as documented: `refuse_new_connectio
 
 `open_doc(name)` opens a shared document. Every peer holds it, and it converges: the host, joiners, and a joiner
 that comes late or back after a drop. It is `room.doc()` of `@peerwire/js`: the same maps, sets and logs, the same
-frames ([`crates/peerwire-sync`](../crates/peerwire-sync)).
+frames ([`crates/peerwire-sync`](../../crates/peerwire-sync)).
 
 ```gdscript
 var doc := peer.open_doc("board")           # after host() or join(); the same name on every peer
@@ -144,7 +144,7 @@ var copy := doc.snapshot()                  # keep it on the device (it holds wh
 ## Through NATs
 
 Most players sit behind a NAT, so neither side can simply dial the other. `peerwire` does the traversal (see
-[`NAT-TRAVERSAL.md`](NAT-TRAVERSAL.md)), and the binding drives it from `_poll()`; no threads are exposed to
+[NAT traversal](../concepts/nat-traversal.md)), and the binding drives it from `_poll()`; no threads are exposed to
 GDScript.
 
 1. On `host*()` / `join*()` the peer binds one dual-stack socket (`[::]`; IPv4 only on a machine without IPv6)
@@ -160,7 +160,7 @@ GDScript.
    around it, which punches restricted and port-restricted cones too.
 5. A symmetric NAT with random ports against a *port-restricted* cone (one that only lets in packets from ports
    it has sent to) links by a birthday punch, after about 2 s: the symmetric side opens 256 extra sockets for 10 s
-   and the cone side sprays ports until one hits (see NAT-TRAVERSAL.md). It misses about 0.03% of the time
+   and the cone side sprays ports until one hits (see [NAT traversal](../concepts/nat-traversal.md#birthday-punching)). It misses about 0.03% of the time
    (theoretical), and is tried once per peer per 5 minutes.
 6. Two symmetric NATs that both hand out ports in sequence link by lockstep prediction, after about 1.5 s: each
    probes the other's predicted ports in an order that makes the new mappings line up.
@@ -172,7 +172,7 @@ GDScript.
    from ports it has sent to, ...". Peerwire runs no TURN relay, by design.
 8. IPv6 has no NAT. When both players have a global IPv6 address, as many mobile carriers give, the dial gets
    through both firewalls whatever their IPv4 NATs are: both families are dialled at once, and the first to
-   answer carries the link (see [IPv6](NAT-TRAVERSAL.md#ipv6-dual-stack)).
+   answer carries the link (see [IPv6](../concepts/nat-traversal.md#ipv6-dual-stack)).
 
 ```gdscript
 multiplayer.connection_failed.connect(func(): print("could not reach the host: ", peer.get_connect_error_message()))
@@ -181,7 +181,7 @@ multiplayer.connection_failed.connect(func(): print("could not reach the host: "
 ### Relay peers
 
 Phones on mobile hotspots and players behind carrier NATs often have symmetric NATs on both sides, and those can't
-punch. For them, run one always-on [`peerwire-peer`](../crates/peerwire-peer) on a public address and give every
+punch. For them, run one always-on [`peerwire-peer`](../../crates/peerwire-peer) on a public address and give every
 player its invite. Each peer then keeps a link to it, and a pair that can't punch links through it:
 
 ```gdscript
@@ -196,7 +196,7 @@ peer.host_room("my-game", room)
   `get_peer_route(id)` says which a link uses.
 - The relay peer forwards sealed packets it can't read. It does see both players' IP addresses, which of them
   talk, and how much. It forwards up to 256 KiB/s per player by default (`PEERWIRE_RELAY_RATE`), enough for
-  typical game traffic: see [`NAT-TRAVERSAL.md`](NAT-TRAVERSAL.md#relay-peers).
+  typical game traffic: see [NAT traversal](../concepts/nat-traversal.md#relay-peers).
 - A joiner in `PRIVACY_RELAY_ONLY` links through its host only: it doesn't dial relay peers, and switching a
   running joiner to relay-only closes their links (switching back dials them again). A relay-only host still uses
   them.
@@ -212,7 +212,7 @@ peer.host_room("my-game", room)
 first, then NAT-PMP, then UPnP-IGD. Once the router says yes, the mapped `ip:port` goes into invites and offers
 like a public address. Peers can then reach this peer however its NAT maps or filters, so a host behind a
 symmetric NAT can still be reached. The mapping is renewed while the session lives and deleted on `close()` or when
-the peer is freed. The Rust side is in [`NAT-TRAVERSAL.md`](NAT-TRAVERSAL.md#router-port-mapping).
+the peer is freed. The Rust side is in [NAT traversal](../concepts/nat-traversal.md#router-port-mapping).
 
 ```gdscript
 peer.set_port_mapping(true)                        # before host*() / join*()
@@ -238,7 +238,7 @@ peer.host_room("my-game", room)
   Noise endpoint, the same one peers dial, but it shows up in port scans. That endpoint can also be sent handshake
   floods directly: under one, a handshake must echo a cookie sent to its address, so spoofed ones take nothing,
   but an attacker with many real addresses can still keep others from connecting (SEC-4 in
-  [`THREAT-MODEL.md`](THREAT-MODEL.md)). Turn it on only when the player agrees, or behind a setting.
+  [threat model](../project/threat-model.md)). Turn it on only when the player agrees, or behind a setting.
   - If the game crashes, the router keeps the mapping until its lease runs out (2 hours). With a router that
     only allows permanent UPnP leases, it keeps it until someone deletes it in the router's settings.
   - Any device on the player's LAN can answer the mapping requests. A rogue one can report a false address, and
@@ -277,7 +277,7 @@ two networks still need testing on real devices.
 
 Peerwire guarantees that every byte reaching the `MultiplayerPeer` came from the authenticated peer and was not
 read or changed on the way. Everything Godot does with those bytes is outside that guarantee, and in a P2P game
-**every connected peer is a potential attacker**. (Threat model: SEC-9 to SEC-11 in `docs/THREAT-MODEL.md`.)
+**every connected peer is a potential attacker**. (Threat model: SEC-9 to SEC-11 in `docs/project/threat-model.md`.)
 
 - **Keep `allow_object_decoding` off** on the `SceneMultiplayer`. That is Godot's default, and the demo asserts
   it. With it on, a peer can make you instantiate objects.
@@ -360,7 +360,7 @@ the host. It is personal data. Keep it out of the UI other players see and out o
 
 ## Demo
 
-[`examples/godot/`](../examples/godot): two (or more) instances. One hosts, the others join by invite or by
+[`examples/godot/`](../../examples/godot): two (or more) instances. One hosts, the others join by invite or by
 typing the same room name (Host room / Join room). Each
 player moves a square with the arrow keys, synced by `MultiplayerSynchronizer` and spawned by
 `MultiplayerSpawner`. A text box sends an `@rpc` chat line.

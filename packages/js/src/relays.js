@@ -1,5 +1,5 @@
 // A doc's copy on the relays the room signals over, for room.doc(name, { relays: true }): so a member that opens the
-// doc while no other member is online still gets it (docs/STORE-DESIGN.md, route 1). doc.js drives it; nostr.js
+// doc while no other member is online still gets it (docs/project/offline-store-design.md, route 1). doc.js drives it; nostr.js
 // reads and keeps the events (query(), store()).
 //
 // Keys, all under the room key (proof.js), with `e` the epoch as 4 bytes big-endian (0 for now), `b` the bank and

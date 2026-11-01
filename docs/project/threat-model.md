@@ -8,7 +8,7 @@ the docs and demos site built for GitHub Pages. It records what Peerwire defends
 against, what it does not, and the findings of the first security review (M5, NB-013)
 and of every review since.
 
-Status: pre-1.0, no external audit. See [SECURITY.md](../SECURITY.md).
+Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 
 ## What Peerwire protects
 
@@ -71,12 +71,12 @@ NB-016 (`6107674`) in `888e0d6`, NB-010 (`41f4021`) in `869e4cf` and NB-010a
 | SEC-4 (Medium) | **Fixed** by NB-024 (`85b8460`), merged `208659b` (under load a handshake from a UDP address takes no state until it echoes a cookie, and each source holds at most 4 half-open handshakes), reviewed 2026-10-29; residuals R1–R5, [SEC-4](#sec-4--half-open-handshake-table-exhaustion-medium--nb-024) |
 | NB24-1 (Medium) | **Fixed** by `3e1cab3` (its type named in `ae34744`) before the merge `208659b`, so never on main (a handshake a UDP address took below the mark, which may be spoofed, isn't counted against that address), reviewed 2026-10-29; Info NB24-I1…I6 (accepted or optional; I3 fixed by NB-050), same section |
 | SEC-5…SEC-8 | Open (NB-025…NB-028) |
-| SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 audit and N29-1 fix |
+| SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/guides/godot.md` (Security); NB-029 audit and N29-1 fix |
 | SEC-12 (Info) | Accepted, no card |
 | SEC-13 (Low) | **Fixed** by NB-050 (`2f0c823`), merged `fe6854d` (an HS1's Noise part must be exactly 128 bytes, so a short copy of a half-open handshake's HS1 no longer draws its 57-byte HS2), reviewed 2026-10-30; residual NB50-I1 (Info, accepted), [SEC-13](#sec-13--a-short-copy-of-a-half-open-handshakes-hs1-reflects-its-hs2-low) |
 | N38-1…N38-3 (port mapping) | **Fixed** in NB-038 (`71d83b2`) and NB-041 (`0dfdbc9`) |
 | NPM-1 (Low) | **Fixed** by `4cffbf9` (merged `14f463a`): no port mapping under `RelayOnly` |
-| NPM-2 (Low) | **Fixed** in `docs/GODOT.md` (`9be92d5`); the flood risk itself is SEC-4 |
+| NPM-2 (Low) | **Fixed** in `docs/guides/godot.md` (`9be92d5`); the flood risk itself is SEC-4 |
 | NPM-3 (Low) | **Fixed** by `6f947f3`: a map request in flight at stop gets one delete |
 | NB44-1 (Medium) | **Fixed** by `40e42db` (per-IP punch cap), re-checked 2026-10-23 ([below](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2)) |
 | NB48-1 (Medium) | **Fixed** by `d1b2d25` (fleet checks one public address; Net Lab consent and cooldown), re-checked 2026-10-23 |
@@ -499,7 +499,7 @@ surface in three ways:
   Under a handshake flood that endpoint takes no state for spoofed handshakes
   (SEC-4, fixed by NB-024), but an attacker with many real addresses can still
   keep others from connecting (SEC-4 R1). It also shows up in port scans.
-  `docs/GODOT.md` says this and advises asking the player first (NPM-2).
+  `docs/guides/godot.md` says this and advises asking the player first (NPM-2).
 - **The gateway and the LAN are trusted for the address only.** Any device on the
   LAN can answer the requests. A rogue responder can report a false address,
   which peers would then dial. It can't get into a session: no one finishes a
@@ -523,7 +523,7 @@ Findings:
   deletes the mapping without blocking, and switching out maps again after the
   old delete has gone out. A Godot relay-only host still maps, because it gives
   out its public addresses as under `PublicOnly`.
-- **NPM-2 (Low, fixed in `docs/GODOT.md`, `9be92d5`).** The doc said the port
+- **NPM-2 (Low, fixed in `docs/guides/godot.md`, `9be92d5`).** The doc said the port
   "reaches only the Noise endpoint" without the SEC-4 flood caveat.
 - **NPM-3 (Low, fixed by `6f947f3`).** `Mapper::stop()` deleted only a lease it
   held. A PCP or NAT-PMP map request still unanswered when the worker stopped
@@ -539,7 +539,7 @@ Reviewed on 2026-10-23: native `backend/NB-045-lockstep-prediction` (`3a6c8b8`,
 NB-044 birthday punch and NB-045 lockstep) and browser
 `ui/NB-048-browser-birthday` (`5ee351e`, NB-046 ICE restart and port prediction,
 NB-047 Net Lab rooms, NB-048 browser birthday punch). Mechanisms and costs are in
-`docs/NAT-TRAVERSAL.md` (Birthday punching, Lockstep prediction, Reflection).
+`docs/concepts/nat-traversal.md` (Birthday punching, Lockstep prediction, Reflection).
 
 These features make a node send many packets to an address a remote party names.
 The security question is who can name that address and how much traffic follows.
@@ -1925,7 +1925,7 @@ open in `lostSocket()`. The docs now say "dialled 30 s ago" where that is what c
 `room.doc(name, { relays: true })` (`packages/js/src/relays.js`; `nostr.js` `query()`
 and `store()`) keeps a sealed copy of the doc on the room's Nostr signalling relays, so
 a member who opens it while no other member is online still gets it. The design is
-route 1 of [STORE-DESIGN.md](STORE-DESIGN.md), with security's design review (NB-006g-1
+route 1 of [STORE-DESIGN.md](offline-store-design.md), with security's design review (NB-006g-1
 to -10) written into it. Its "Threats" are the copy's threat model, and the README and
 `index.d.ts` state them for apps.
 
@@ -2794,7 +2794,7 @@ and what it accepted. Values are from main `7b716a2`.
   - Fragments longer than `FRAGMENT`, and reassembly past `max_message` (1 MiB by
     default), are refused.
   - The bound tested in `fuzz.rs` is about 2.31 MB per link (2.17 MB reliable, 0.13
-    MB urgent). `docs/DOCKER.md` sizes `PEERWIRE_MAX_PEERS` from it: 256 peers can pin
+    MB urgent). `docs/guides/always-on-peer.md` sizes `PEERWIRE_MAX_PEERS` from it: 256 peers can pin
     about 0.6 GB.
 - **Retransmission.**
   - RTO is 20 ms to 5 s; backoff `rto·2^min(tries-1, 8)`, at most 10 s.
@@ -3176,7 +3176,7 @@ nodes and set properties on others' scene trees. A malicious peer that the app
 treats as an authority corrupts every client.
 
 **Requirements.**
-- `docs/GODOT.md` must state that Godot's authority model is only as trustworthy
+- `docs/guides/godot.md` must state that Godot's authority model is only as trustworthy
   as the app's topology; in an open mesh, `@rpc("authority")` is not a security
   control.
 - Recommend a pattern: designate the host as the only synchronizer/spawner
@@ -3188,7 +3188,7 @@ treats as an authority corrupts every client.
   don't bypass it).
 
 **Status of SEC-9…SEC-11 as of `ccc3b79`.** The binding shipped (NB-020) and was
-hardened (NB-030). `docs/GODOT.md` (Security) now states each requirement: keep
+hardened (NB-030). `docs/guides/godot.md` (Security) now states each requirement: keep
 `allow_object_decoding` off (the demo asserts it), treat `@rpc("any_peer")`
 arguments as attacker-controlled, ids are labels (the host renumbers collisions,
 only the dialled host is 1, authorize by `get_peer_key`), and Godot's authority
@@ -3196,7 +3196,7 @@ is only as trustworthy as the peer made authority (use the host, or lockstep on
 `peerwire-game`). SEC-11 is a design property: it stays a documented residual, not
 a bug. NB-037's room-key proof does not change it. It only limits who can join a
 room to holders of the room key, and any of them can still be malicious. Godot's
-`server_relay` is on by default; `docs/GODOT.md` names its cost, how to turn it
+`server_relay` is on by default; `docs/guides/godot.md` names its cost, how to turn it
 off, and that a relayed packet's sender id is the host's word (the host can forge
 it).
 

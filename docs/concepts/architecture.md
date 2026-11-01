@@ -42,7 +42,7 @@
    exactly one link results.
 
 For native nodes the `peerwire` crate automates steps 1 and 2: STUN for the public address, rooms and sealed offers
-over a signaling carrier, and simultaneous dials. See [NAT-TRAVERSAL.md](NAT-TRAVERSAL.md).
+over a signaling carrier, and simultaneous dials. See [NAT traversal](nat-traversal.md).
 4. **Upgrade to direct.** If the link is relayed, it keeps punching candidates (with port spraying for
    sequential NATs). It moves to a direct path only after an echoed PUNCH_ACK.
 5. **Rank paths.** Paths rank slow address, then relay, then direct. A host marks an address slow
@@ -85,4 +85,4 @@ The game layer partitions players into islands of at most 12 along a Hilbert cur
 
 The same pattern (super-peer fan-out with failover) is planned for large whiteboards, chat rooms and broadcasts.
 
-Details and measurements: [PERFORMANCE.md](PERFORMANCE.md).
+Details and measurements: [Performance](../project/performance.md).

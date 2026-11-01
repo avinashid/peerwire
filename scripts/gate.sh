@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The release gate: every check a change must pass before merge (see docs/TEST-PLAN.md).
+# The release gate: every check a change must pass before merge (see docs/project/testing.md).
 # Runs every step even after a failure, prints a summary and exits non-zero if any step failed.
 #
 #   scripts/gate.sh             Rust tests, clippy, wasm build and checks, @peerwire/react build and types, Node glue,

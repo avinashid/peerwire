@@ -342,7 +342,7 @@ Two peers that can't punch (two symmetric NATs, as on many phone hotspots and ca
 symmetric NAT against a port-restricted cone when the [birthday punch](#birthday-punching) misses) link through a
 peer both are linked to. In a Godot star or a room of
 two there is no such peer, so `Node::set_relay_peers(&[invite])` (or `Builder::relay_peers`, Godot
-`set_relay_peers`) adds one: an always-on peer such as [`peerwire-peer`](../crates/peerwire-peer), by its invite
+`set_relay_peers`) adds one: an always-on peer such as [`peerwire-peer`](../../crates/peerwire-peer), by its invite
 (NB-041). There is still no TURN server: a relay peer is an ordinary Peerwire node that forwards sealed packets
 with the core's peer relay.
 

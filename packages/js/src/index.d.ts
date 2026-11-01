@@ -221,7 +221,7 @@ export declare class Room {
 
 export interface CallOptions {
   /** The most in the call, us included: 2 to 16, default 6. Each member sends its stream to every other, so its
-   * upload grows with each one (see docs/PERFORMANCE.md §6). A member with no seat for a joiner tells it the call
+   * upload grows with each one (see docs/project/performance.md §6). A member with no seat for a joiner tells it the call
    * is full; the joiner goes only if its own count of who is in agrees. */
   max?: number;
 }
