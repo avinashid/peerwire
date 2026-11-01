@@ -57,6 +57,10 @@ path = "../../examples/rust/echo_async.rs"
 required-features = ["tokio"]
 
 [[example]]
+name = "lan_chat"
+path = "../../examples/rust/lan_chat.rs"
+
+[[example]]
 name = "natcheck"
 path = "../../examples/rust/natcheck.rs"
 required-features = ["nostr"]
