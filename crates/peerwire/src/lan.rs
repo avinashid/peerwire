@@ -9,7 +9,10 @@
 //!
 //! Like any carrier it is untrusted. Hellos and offers are sealed and proved as they
 //! are over a relay (see [`traversal`](crate::traversal)), so a neighbour on the LAN
-//! sees topics, timing and the sender's IP, and can't read, forge or replay them.
+//! sees topics, timing and the sender's IP, and can't read or forge them; a hello it
+//! replays within a minute only makes members offer again. The socket is bound to the
+//! group address, so it takes only datagrams sent to the group, not unicast from off
+//! the link (except on Windows, which can't bind a multicast address).
 //!
 //! A message is at most [`LanSignaling::MAX_PAYLOAD`] bytes, in one datagram: nothing is
 //! fragmented (ESP-IDF's lwIP doesn't reassemble IP fragments). Browsers can't send
@@ -79,7 +82,13 @@ impl LanSignaling {
         let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         // Other carriers on this machine listen on the same port.
         s.set_reuse_address(true)?;
-        s.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, group.port()).into())?;
+        // Bound to the group, the socket takes only datagrams sent to it: TTL 1 keeps
+        // our frames on the link, and this keeps unicast from anywhere else out.
+        #[cfg(not(windows))]
+        let ip = *group.ip();
+        #[cfg(windows)]
+        let ip = Ipv4Addr::UNSPECIFIED;
+        s.bind(&SocketAddrV4::new(ip, group.port()).into())?;
         s.join_multicast_v4(group.ip(), &interface)?;
         if !interface.is_unspecified() {
             s.set_multicast_if_v4(&interface)?;
@@ -262,5 +271,21 @@ mod tests {
         };
         assert_eq!(got, (t, b"wanted".to_vec()));
         assert_eq!(calls, 3, "{calls} calls read {} datagrams", 2 * MAX_READS + 1);
+    }
+
+    /// NB64-1: a frame sent to the carrier's port by unicast, as a host off the link
+    /// could, is never delivered; frames sent to the group still are.
+    #[cfg(not(windows))]
+    #[test]
+    fn unicast_to_the_port_is_not_delivered() {
+        let mut a = carrier(2);
+        let t = Topic([6; 32]);
+        a.subscribe(t);
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        stranger.send_to(&frame(&[2; 8], &t, b"unicast").unwrap(), (Ipv4Addr::LOCALHOST, group(2).port())).unwrap();
+        // Then one to the group: it arrives, and the unicast one, sent first, never does.
+        carrier(2).publish(t, b"multicast");
+        assert_eq!(next(&mut a), Some((t, b"multicast".to_vec())));
+        assert_eq!(next(&mut a), None);
     }
 }
