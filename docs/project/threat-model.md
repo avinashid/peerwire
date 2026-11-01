@@ -133,9 +133,10 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB19-2 (Low) | Accepted (the lead's call, documented in the README and `index.d.ts`): 100 drops or more in a message's second, ordered before it, hide it on that relay, same section |
 | NB10-1, NB10-2 (Low), NB10-I1, NB10-I2 (Info) | **Fixed** by `c578263` and `41f4021` before NB-010 merged, so never on main (merged `869e4cf`), before `room.call()` was published (a member's `full` turns a joiner away only when the joiner's own roster has no seat for it either; 'stream' comes for every peer once its description applies, whatever it sends; a description with more than 64 candidates is dropped; the docs say call frames on a pipe go inside it), reviewed 2026-10-31; NB10-I1a, NB10-I3 (Info) and the residuals accepted, [Calls](#calls-roomcall-nb-010-nb-010a--nb10-1-nb10-2-nb10a-1) |
 | NB10a-1 (Low) | **Fixed** by `f979384` before NB-010a merged, so never on main (merged `4f681b4`): in the meet page, a camera or microphone request still pending at Leave is turned off when it lands, reviewed 2026-10-31, same section |
-| NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; NB16-I1, I2 (Info) open, NB16-I3 done when Pages was enabled, [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1-nb16-2) |
+| NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; NB16-I1, I2 (Info) open, NB16-I3 done when Pages was enabled, [The docs and demos site](#the-docs-and-demos-site-nb-016-nb-067--nb16-1-nb16-2-nb67-1) |
 | The shared origin (Low) | Accepted by the repo owner on 2026-11-01: the site is served from `avinashid.github.io` with no origin of its own. The meet page stays off the site, so NB10a-I1 doesn't arise; it joins only with the owner's approval and a frame check, same section |
 | NB16-2 (Low) | Accepted by the repo owner on 2026-11-01 (NB-071): Net Lab keeps its microphone button on the site, and on a `*.github.io` host its note says, before and after the grant, that the permission covers the whole origin, so the account's other Pages sites could use the microphone, and see the device's local addresses, without asking (`1d434cb`, and `8f4a635` for the addresses, NB71-I1), reviewed 2026-11-01, same section |
+| NB67-1 (Low) | Open: the site build's `checkSvg` passes an SVG whose script has a namespace prefix (`<s:script>`), which runs when the file is opened on its own; NB67-I1, I2 (Info), same section |
 | NB64-1, NB64-2 (Low), NB64-3, NB64-4, NB64-5 (Info) | **Fixed** by `a0fe2b1` and `4c86af7` before NB-064 merged, so never on main (merged `34a35a8`): `LanSignaling` takes only datagrams sent to its group, except on Windows; an inbox message spends a token before it is opened; `lan_chat` escapes member text; the docs say the ESP32 seed fixes the identity only, and what a replayed hello does. Reviewed 2026-11-01; residuals accepted, [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6) |
 | NB64-6 (Low) | Open (NB-065): a neighbour who knows two members' PeerIds can keep them from linking by flooding their inbox topics, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
@@ -2448,26 +2449,44 @@ the three probes reproduces on the fixed heads.
   A relay carrying a pipe sees the sizes and timing of the call frames inside it.
 - **The meet page on the public site.** It stays off it: the owner accepted the shared
   origin on 2026-11-01 with the meet page kept out. Before it ever goes, see the frame
-  check and NB10a-I1 under
-  [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1-nb16-2).
+  check and NB10a-I1 under the
+  [site's section](#the-docs-and-demos-site-nb-016-nb-067--nb16-1-nb16-2-nb67-1).
 
-### The docs and demos site (NB-016) — NB16-1, NB16-2
+### The docs and demos site (NB-016, NB-067) — NB16-1, NB16-2, NB67-1
 
-`scripts/site.sh` builds a static site into `target/site/`: a landing page, the README,
-the package READMEs and `docs/*.md` rendered to HTML by our own renderer
-(`scripts/site/markdown.mjs`), and the demos that need no server of ours (index, chat,
-poll, arena, Net Lab). `.github/workflows/pages.yml` deploys it to GitHub Pages at
-`avinashid.github.io/peerwire/`, run by hand only. It was first deployed on 2026-11-01,
-from `be989d4`, without the meet page. The design:
-- **No third-party code at runtime.** No CDN, font, analytics or remote image; the
-  README's badges become text.
+`scripts/site.sh` builds a static site into `target/site/`: a landing page; the docs
+listed in `docs/README.md`, which is their index and sidebar, and `CHANGELOG.md`,
+`CONTRIBUTING.md` and `SECURITY.md` from the repo's root, rendered to HTML by our own
+renderer (`scripts/site/markdown.mjs`); the demos that need no server of ours (index,
+chat, poll, arena, Net Lab); and 12 pages at the first site's URLs (`README.html`,
+`docs/THREAT-MODEL.html`, …) that refresh to where each page is now. The README and the
+package READMEs are no longer rendered. `.github/workflows/pages.yml` deploys it to
+GitHub Pages at `avinashid.github.io/peerwire/`, run by hand only. It was first deployed
+on 2026-11-01, from `be989d4`, without the meet page; the docs layout (NB-067: sidebar,
+"On this page", prev/next, build-time highlighting, the logo) came with NB-066. The
+design:
+- **No third-party code at runtime.** No CDN, font, analytics or remote image; a remote
+  image in a doc (a badge) becomes its alt text.
 - **The policy is a `<meta>` CSP.** Pages sends no headers we choose, so each page
   carries its own: the demos get `docker/examples-nginx.conf`'s, less
   `frame-ancestors` (a `<meta>` policy can't set it), and the other pages allow no
-  script. No page sends a referrer.
-- **Versioned assets.** Every module, the wasm and the stylesheet live under
+  script: `default-src 'none'`, with styles from the site and images from it or
+  `data:`, so no script, inline style or handler. Their menus are `<details>`, and the
+  landing page's code tabs are CSS radio buttons. No page sends a referrer.
+- **Versioned assets.** Every module, the wasm, the stylesheet and the images live under
   `assets/<id>/`, `<id>` being 12 hex digits of a SHA-256 of their contents. A demo
   page's `<script src>` is the only rewrite.
+- **Images.** A doc may show only a file under `docs/assets/`, named `[\w-]` with an
+  image extension. An SVG there is served from the site's origin with no policy of
+  ours, so the build refuses one that holds a script, an `on*` handler, a
+  `foreignObject`, a DTD, or a reference to anything outside it (`checkSvg`; NB67-1).
+- **Highlighting.** Code is highlighted at build time: `highlight.mjs` wraps escaped
+  text in `<span class>` from a fixed set, and the test checks that the output's text
+  is the code, for every fence in the docs and for 400 random inputs × 10 languages.
+- **Redirects.** Each of the first site's URLs is a page with a
+  `<meta http-equiv="refresh">` to a page of the build, a link to it, and `noindex`.
+  The targets are a fixed list, not taken from the URL, and the link check covers
+  refresh URLs.
 - **Links.** The build fails on any link that isn't relative, http(s), mailto, or a `#`
   anchor that exists. A link to a repo file that isn't rendered goes to GitHub.
 - **Workflow.** `workflow_dispatch` only, with no inputs. `permissions: {}`, then
@@ -2476,7 +2495,9 @@ from `be989d4`, without the meet page. The design:
   environment.
 
 Reviewed 2026-10-31 by reading `2f68aa8..47ce300`, then the fix `6107674`, with one
-probe of the renderer (Node 22). Nothing was sent to Pages or GitHub.
+probe of the renderer (Node 22). The docs layout (NB-067, `6ba7cd9..a2d4029`, merged in
+`2735268`) was reviewed on 2026-11-01 by reading the diff, with a loopback probe of
+`checkSvg` in headless Chromium for NB67-1. Nothing was sent to Pages or GitHub.
 
 **Checked and holding:**
 - The renderer escapes text, code, fence languages, heading ids, table cells, alerts and
@@ -2492,6 +2513,12 @@ probe of the renderer (Node 22). Nothing was sent to Pages or GitHub.
 - Invite secrets ride in the fragment (`#key=`, `#room=`, chat's `#id`), so neither
   Pages nor its CDN sees them in a request.
 - `site.sh --serve` binds 127.0.0.1.
+- The layouts escape every string they put in a page: titles, groups, headings and
+  their ids, descriptions, and a redirect's target. `docs/README.md` may list only
+  `.md` files inside the repo, and a doc missing from it or listed twice fails the
+  build.
+- `logo.svg` and `favicon.svg` hold paths, shapes and a gradient, and refer to nothing
+  but their own `#pw-g`.
 
 **NB16-1 — Third-party actions built what Pages would serve (Low).** The build job ran
 `dtolnay/rust-toolchain@stable` (a branch) and `Swatinem/rust-cache@v2` (a movable
@@ -2506,6 +2533,24 @@ full commit.
 
 **Status: fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed.
 Reviewed 2026-10-31 by reading the workflow. The guard's 7 mutants are all caught.
+
+**NB67-1 — `checkSvg` misses a script with a namespace prefix (Low).** An SVG opened
+on its own is an XML document, where an element's namespace, not its spelling, makes it
+a script: `<s:script>`, with `xmlns:s` bound to the SVG namespace, runs, and so does
+`<h:script>` (XHTML) inside `<s:foreignObject>`. `checkSvg` looks for the text
+`<script` and `<foreignObject`, so both pass it. The build copies an SVG under
+`docs/assets/` to `assets/<id>/img/`, served from `avinashid.github.io` with no policy,
+so a link straight to the file would run its script on the shared origin, with the
+demos' storage (above). It takes such a file merged into `docs/assets/`, which is the
+case the check is there for. Repro, on loopback: both forms pass `checkSvg` (at
+`46b8ad0`), and their script runs when headless Chromium opens the file from a
+127.0.0.1 server as `image/svg+xml`; the plain `<script>` control is refused. An
+embedded XSLT stylesheet (`<?xml-stylesheet href="#x"?>`) didn't run in that Chromium,
+and is refused already. Fix: refuse any element name with a prefix
+(`/<\/?[A-Za-z_][\w.-]*:/`), which the logo and favicon pass; refusing character
+references (`&#`) and processing instructions other than the XML declaration also
+closes the spellings a regex can't see through. **Status: open**, found on 2026-11-01 in
+the review of NB-066 before its push.
 
 **The shared origin (Low): accepted by the repo owner on 2026-11-01.**
 `avinashid.github.io` is one origin for every Pages site of the account. `github.io` is
@@ -2612,6 +2657,14 @@ see. **Before the meet page joins the site's demos,** it must check
   only, with a required reviewer, so a dispatch from another branch can't deploy. Done
   in the repository's settings when Pages was enabled on 2026-11-01: `main` only, the
   owner as required reviewer.
+- **NB67-I1.** The "Edit this page on GitHub" link puts the doc's path in its `href`
+  as it is, neither escaped nor URL-encoded. A path holding `"` could leave the
+  attribute, which `PAGE_CSP` keeps inert, and only a file the repo holds can be a doc.
+  `encodeURI` would do (not written).
+- **NB67-I2.** The build follows symlinks under `docs/assets/`, so a committed symlink
+  named like an image would publish whatever it points at on the build machine. A
+  reviewer sees it in the diff as a one-line file. Refusing symlinks there (`lstat`)
+  would be tighter (not written).
 
 ### LAN signalling, `LanSignaling` (NB-064) — NB64-1…NB64-6
 
