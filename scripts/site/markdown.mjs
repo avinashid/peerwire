@@ -6,9 +6,11 @@
 // backslash escapes, entities and <br>.
 //
 // Raw HTML is never passed through: any tag but <br> shows as text. A link or image whose scheme isn't http(s) or
-// mailto throws. Otherwise the caller's link(href) and image(src, alt) decide what each becomes.
+// mailto throws. Otherwise the caller's link(href) and image(src, alt) decide what each becomes, and
+// highlight(code, lang) the HTML of a fenced block with a language (null: the code escaped).
 //
-//   render(markdown, { link, image }) -> { html, title, ids }   title: the first heading's text; ids: every id made
+//   render(markdown, { link, image, highlight }) -> { html, title, ids, headings }
+//     title: the first heading's text; ids: every id made; headings: [{ level, id, text }] of the h2s and h3s
 
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
 export const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ESC[c]);
@@ -350,11 +352,12 @@ function html(list, ctx, tight = false) {
         const id = ctx.slug(textOf(inner));
         ctx.ids.push(id);
         ctx.title ??= textOf(inner);
+        if (b.level === 2 || b.level === 3) ctx.headings.push({ level: b.level, id, text: textOf(inner) });
         return `<h${b.level} id="${escapeHtml(id)}">${inner}</h${b.level}>`;
       }
       case 'code': {
         const lang = b.lang ? ` class="language-${escapeHtml(b.lang)}"` : '';
-        return `<pre><code${lang}>${escapeHtml(b.text)}</code></pre>`;
+        return `<pre><code${lang}>${(b.lang ? ctx.highlight(b.text, b.lang) : null) ?? escapeHtml(b.text)}</code></pre>`;
       }
       case 'hr':
         return '<hr>';
@@ -386,9 +389,10 @@ function html(list, ctx, tight = false) {
   }).join('\n');
 }
 
-export function render(markdown, { link = (href) => href, image = (src, alt) => escapeHtml(alt) } = {}) {
+export function render(markdown, { link = (href) => href, image = (src, alt) => escapeHtml(alt),
+  highlight = () => null } = {}) {
   const lines = markdown.replace(/\r\n?/g, '\n').replace(/\t/g, '    ').split('\n');
-  const ctx = { link, image, slug: slugger(), ids: [], title: undefined };
+  const ctx = { link, image, highlight, slug: slugger(), ids: [], headings: [], title: undefined };
   const out = html(blocks(lines), ctx);
-  return { html: out, title: ctx.title, ids: ctx.ids };
+  return { html: out, title: ctx.title, ids: ctx.ids, headings: ctx.headings };
 }
