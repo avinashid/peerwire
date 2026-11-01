@@ -107,8 +107,8 @@ multiplayer.multiplayer_peer = peer`,
   numbersNote: ['Measured on a 4-core arm64 machine and in the deterministic simulator.', 'How each is measured',
     'docs/project/performance.html'],
   demosTitle: 'Live demos',
-  demosLead: 'Each runs in your browser and talks to other browsers directly; nothing goes through a server of ours. ' +
-    'Open one in two tabs, or on two devices where it says so.',
+  demosLead: 'Each runs in your browser, and none needs a server of ours. Open one in two tabs, or on two devices ' +
+    'where it says so.',
   status: ['Early development (v0.x): APIs still change. Tested in a NAT simulator, on loopback and LANs, and over ' +
     'public relays; not yet on real mobile carrier-grade NATs.', 'Status and roadmap', 'docs/project/status.html'],
   footer: [
