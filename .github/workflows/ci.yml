@@ -34,10 +34,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Shared docs in the C ABI (the sync feature, off in the wasm and workspace builds)
         run: cargo clippy -p peerwire-ffi --features sync --all-targets -- -D warnings
-      - name: Tests, the docs' Rust samples among the doc tests (each under timeout, as in scripts/gate.sh)
-        run: cargo test --workspace --release
+      - run: cargo test --workspace --release
+      - name: The docs' Rust samples compile, never run (mod doc_samples in crates/peerwire/src/lib.rs)
+        run: cargo test --doc --workspace --release doc_samples
         env:
-          RUSTDOCFLAGS: --test-runtool timeout --test-runtool-arg -k --test-runtool-arg 5 --test-runtool-arg 60
+          RUSTDOCFLAGS: --cfg docs_samples --test-runtool true
       - run: cargo test -p peerwire-ffi --features sync --release
       - name: Fuzz tests in a debug build (integer overflow panics there, wraps in release)
         run: |

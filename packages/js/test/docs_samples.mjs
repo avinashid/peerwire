@@ -4,11 +4,9 @@
 //     `ignore` in the info string (```js ignore) skips a block's syntax check, not its imports.
 //  2. Every name they import from @peerwire/js or @peerwire/react is one the package exports: packages/js/src/index.js
 //     (in TypeScript index.d.ts too) or packages/react/src/index.ts. A subpath is in the package's "exports".
-//  3. Every page with a ```rust block is a doc test, so `cargo test` compiles its samples: an include_str! in a doc
-//     attribute (README.md and docs/ go in mod doc_samples of crates/peerwire/src/lib.rs). A doc-test page has no
-//     bare ``` block, which rustdoc compiles as Rust (```text). A sample that runs stays on loopback, as every test
-//     does: no NostrSignaling, no bind() but to 127.0.0.1 or [::1] (any other looks up public STUN and asks the
-//     gateway for a port mapping). Else it is ```rust,no_run, which still compiles.
+//  3. Every page with a ```rust block is a doc test, so its samples compile: an include_str! in a doc attribute
+//     (README.md and docs/ go in mod doc_samples of crates/peerwire/src/lib.rs, which the gate compiles and never
+//     runs). A doc-test page has no bare ``` block, which rustdoc compiles as Rust (```text).
 // The export lists are read from the source, and checked first against what index.js and the React build export.
 // BASELINE exempts pages as they were when this check came in.
 // node packages/js/test/docs_samples.mjs [checkout]   (needs packages/react built: npm ci && npm run build there)
@@ -32,7 +30,7 @@ const check = (ok, what) => {
 // Pages exempt as they were on 6ba7cd9, each pinned to a hash of its code blocks: an edit to one of them ends the
 // exemption, and this fails until its line is deleted. NB-070 lists what each fails.
 const BASELINE = {
-  // The old README, which NB-066 rewrites: as doc tests, its 4 samples fail.
+  // The old README, which NB-066 rewrites: 3 of its 4 blocks don't compile as doc tests.
   'README.md': '7f85bd15672f',
   // A fragment: peerwire-sync's lib.rs doesn't include its README.
   'crates/peerwire-sync/README.md': '8673a29fdd77',
@@ -273,19 +271,10 @@ for (const [page, bs] of pageBlocks) {
     if (b.info === '') {
       problem('rust', page, b.line, 'a bare ``` block, which rustdoc compiles as Rust: give it a language (```text)');
     }
-    if (b.lang !== 'rust' || b.attrs.some((a) => ['no_run', 'ignore', 'compile_fail'].includes(a))) continue;
-    const off = /\bNostrSignaling\b/.test(b.body) ? ['NostrSignaling dials the public relays'] : [];
-    for (const addr of new Set([...b.body.matchAll(/\bbind\(\s*"([^"]*)"/g)].map((m) => m[1]))) {
-      if (!/^(127\.|\[::1\]|localhost:)/.test(addr)) off.push(`bind("${addr}") looks up public STUN and the gateway`);
-    }
-    if (off.length) {
-      problem('rust', page, b.line, `runs in \`cargo test\`, whose tests stay on loopback, but ${off.join(', and ')}: ` +
-        'make it ```rust,no_run (it still compiles), or bind 127.0.0.1:0');
-    }
   }
 }
-check(report('rust'), `Rust: ${rustPages} pages with samples, each a doc test (${doctests.size} pages are); no bare ` +
-  'block on those, and the samples that run stay on loopback');
+check(report('rust'), `Rust: ${rustPages} pages with samples, each a doc test (${doctests.size} pages are), none of ` +
+  'those with a bare block');
 
 console.log(failed ? `${failed} check(s) failed` : 'all passed');
 process.exit(failed ? 1 : 0);

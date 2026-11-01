@@ -39,6 +39,10 @@ nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:s
 # Test hooks for bindings (Builder::port_mapping_at, a fake gateway's address). Not for apps.
 testing = []
 
+[lints.rust]
+# --cfg docs_samples (rustdoc only) brings in the docs' Rust samples as compile-only doc tests (mod doc_samples).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docs_samples)"] }
+
 [dev-dependencies]
 peerwire-core = { path = "../peerwire-core" }
 # Tests and examples cover the async host and Nostr signaling too.

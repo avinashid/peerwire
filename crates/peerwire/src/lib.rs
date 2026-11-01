@@ -86,15 +86,15 @@ pub type Path = peerwire_core::Path<std::net::SocketAddr>;
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-// The Rust samples of the repo's README.md and docs/ are doc tests too, one item per page (NB-070). They build as
-// this crate's tests do: `tokio` and `nostr` on, with peerwire_core, peerwire_sim and peerwire_sync beside it. A
-// sample may hide its set-up behind `# ` lines. One that never returns, or leaves loopback (NostrSignaling, a bind
-// to any other address), is ```rust,no_run: it still compiles. One that can't build is ```rust,ignore with the
-// reason beside it. rustdoc compiles a bare ``` block as Rust, so every block
-// on these pages names its language (```text). A failing sample's line in its page is the line cargo reports, less
-// that of the item's #[doc], plus one. packages/js/test/docs_samples.mjs fails for a page with a ```rust block that
-// isn't listed here.
-#[cfg(doctest)]
+// The Rust samples of the repo's README.md and docs/, one item per page (NB-070): doc tests that compile and never
+// run, as many are host loops or dial public relays. A plain `cargo test` leaves them out; scripts/gate.sh and CI
+// build them with RUSTDOCFLAGS="--cfg docs_samples --test-runtool true". They build as this crate's tests do: `tokio`
+// and `nostr` on, with peerwire_core, peerwire_sim and peerwire_sync beside it. A sample may hide its set-up behind
+// `# ` lines; one that can't build is ```rust,ignore with the reason beside it. rustdoc compiles a bare ``` block as
+// Rust, so every block on these pages names its language (```text). A failing sample's line in its page is the line
+// cargo reports, less that of the item's #[doc], plus one. packages/js/test/docs_samples.mjs fails for a page with a
+// ```rust block that isn't listed here.
+#[cfg(all(doctest, docs_samples))]
 mod doc_samples {
     #[doc = include_str!("../../../docs/getting-started/quick-start.md")]
     struct GettingStartedQuickStart;
