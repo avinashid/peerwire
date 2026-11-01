@@ -17,11 +17,14 @@
 # (GATE_JOBS at a time) and, once those are done, beside the browser tests (one at a time). The Rust tests run under
 # cargo-nextest when it is installed (doctests through cargo test --doc), else under cargo test. Each step writes its
 # own log, target/gate-logs/<step>.log; a failed step's log is printed in full before the summary.
+# The docs' samples are tested too (NB-070): the Rust ones are doc tests of peerwire, which run in "cargo test", or in
+# "rust doc samples" when only Markdown changed; the JS ones and every link in "node docs samples" and "node docs links".
 #
 # Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs),
 #      GATE_JOBS (Node tests at once, default 4), GATE_BASE (what "changed" is measured against, default origin/main),
 #      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 300),
-#      NODE_CI (the node binary --strict runs CI's Node tests on, default the newest ~/.nvm/versions/node/v<CI's>.*).
+#      NODE_CI (the node binary --strict runs CI's Node tests on, default the newest ~/.nvm/versions/node/v<CI's>.*),
+#      DOCTEST_TIMEOUT (seconds a doc test may run, default 60).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -45,6 +48,7 @@ WASM=packages/js/pkg/peerwire_ffi.wasm
 GATE_JOBS=${GATE_JOBS:-4}
 GATE_BASE=${GATE_BASE:-origin/main}
 GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT:-300}
+DOCTEST_TIMEOUT=${DOCTEST_TIMEOUT:-60}
 LOGS=target/gate-logs
 rm -rf "$LOGS" && mkdir -p "$LOGS"
 trap 'trap - INT TERM; kill 0' INT TERM
@@ -88,6 +92,8 @@ NODE=(
   "node birthday primitives|node packages/js/test/birthday.mjs"
   "node qr|node packages/js/test/qr.mjs"
   "node site build|node packages/js/test/site_build.mjs"
+  "node docs samples|node packages/js/test/docs_samples.mjs"
+  "node docs links|node packages/js/test/docs_links.mjs"
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
 )
@@ -247,6 +253,11 @@ FFI_SYNC=(-p peerwire-ffi --features sync --release)
 # The same in a debug build, beside the fuzzers: its length and buffer sums must not overflow either.
 FFI_SYNC_DEBUG=(-p peerwire-ffi --features sync --lib)
 
+# Each doc test runs under timeout: one that never returns fails and names itself, instead of hanging the gate (the
+# old README's host loop did, NB-070). rustdoc's runtool wraps the run of each doc test, not its build.
+export RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }--test-runtool timeout --test-runtool-arg -k --test-runtool-arg 5 \
+--test-runtool-arg $DOCTEST_TIMEOUT"
+
 # Every Rust test: nextest runs each test in its own process, many at once, but skips doctests.
 rust_tests() {
   local r=0
@@ -259,6 +270,12 @@ rust_tests() {
   cargo nextest run "${FFI_SYNC[@]}" --profile gate || r=1
   cargo test --doc --workspace --release || r=1
   return $r
+}
+
+# The Rust samples of README.md and docs/ (mod doc_samples in crates/peerwire/src/lib.rs) on their own: a change to
+# Markdown and no Rust skips "cargo test", whose doc tests they are.
+doc_samples() {
+  cargo test --doc --workspace --release doc_samples
 }
 
 # Release builds wrap on integer overflow; the parser fuzzers must also run where it panics.
@@ -301,6 +318,12 @@ if [ $full = 0 ] && base=$(git merge-base "$GATE_BASE" HEAD 2>/dev/null); then
     rust_skip="no Rust change since $GATE_BASE $(git rev-parse --short "$base")"
   fi
 fi
+samples_skip="in cargo test"
+if [ -n "$rust_skip" ]; then
+  samples_skip=""
+  grep -qE '\.md$' <<<"$changed" ||
+    samples_skip="no Markdown or Rust change since $GATE_BASE $(git rev-parse --short "$base")"
+fi
 
 # The Node tests, GATE_JOBS at a time. Run in a subshell, so its job table holds only these.
 # --no-wasm-tier-up: on a busy host, Node 26.7 sometimes deadlocks in process.exit() while V8 is still tiering the
@@ -341,6 +364,8 @@ browser_lane() {
 lanes() {
   if [ -z "$rust_skip" ]; then
     { step "cargo test" rust_tests; [ $strict = 0 ] || step "fuzz (debug)" fuzz_tests; } &
+  elif [ -z "$samples_skip" ]; then
+    step "rust doc samples" doc_samples &
   fi
   (node_pool)
   browser_lane
@@ -355,12 +380,16 @@ step "wasm build" ./packages/js/build.sh
 step "wasm size+imports" wasm_check
 step "react build+types" react_build
 if [ -n "$rust_skip" ]; then
-  echo "==> Rust steps skipped: $rust_skip (pass --full to run them)"
+  but=""
+  [ -n "$samples_skip" ] || but=", but for the docs' Rust samples"
+  echo "==> Rust steps skipped: $rust_skip$but (pass --full to run them)"
   skip "cargo test" "$rust_skip"
   skip "cargo clippy" "$rust_skip"
   [ $strict = 0 ] || skip "fuzz (debug)" "$rust_skip"
   skip "cargo fmt" "$rust_skip"
+  [ -z "$samples_skip" ] || skip "rust doc samples" "$samples_skip"
 else
+  skip "rust doc samples" "$samples_skip"
   if [ $strict = 1 ]; then
     step "cargo clippy" clippy -- -D warnings
   else
@@ -387,7 +416,7 @@ else
 fi
 
 # The summary, in the order of the old one-at-a-time gate.
-order=("cargo test" "cargo clippy")
+order=("cargo test" "rust doc samples" "cargo clippy")
 [ $strict = 0 ] || order+=("fuzz (debug)")
 order+=("cargo fmt" "wasm build" "wasm size+imports" "react build+types")
 for s in "${NODE[@]}"; do order+=("${s%%|*}"); done

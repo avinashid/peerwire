@@ -34,7 +34,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Shared docs in the C ABI (the sync feature, off in the wasm and workspace builds)
         run: cargo clippy -p peerwire-ffi --features sync --all-targets -- -D warnings
-      - run: cargo test --workspace --release
+      - name: Tests, the docs' Rust samples among the doc tests (each under timeout, as in scripts/gate.sh)
+        run: cargo test --workspace --release
+        env:
+          RUSTDOCFLAGS: --test-runtool timeout --test-runtool-arg -k --test-runtool-arg 5 --test-runtool-arg 60
       - run: cargo test -p peerwire-ffi --features sync --release
       - name: Fuzz tests in a debug build (integer overflow panics there, wraps in release)
         run: |
@@ -91,6 +94,9 @@ jobs:
         run: npm ci --no-audit --no-fund && npm run build && npm run typecheck
       - run: node packages/react/test/store.mjs
       - run: node packages/react/test/hooks.mjs
+      # The docs' JS samples parse with the TypeScript installed above, and import what src/ and the build export.
+      - run: node packages/js/test/docs_samples.mjs
+      - run: node packages/js/test/docs_links.mjs
 
   docker:
     name: docker build

@@ -46,6 +46,8 @@ peerwire = { path = ".", features = ["tokio", "nostr"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
 # The fuzz harness (peerwire_sim::fuzz); a dev-only cycle, the harness deals in bytes.
 peerwire-sim = { path = "../peerwire-sim" }
+# The docs' samples of shared docs beside a node (mod doc_samples in src/lib.rs).
+peerwire-sync = { path = "../peerwire-sync" }
 
 [[example]]
 name = "echo"

@@ -85,3 +85,28 @@ pub type Path = peerwire_core::Path<std::net::SocketAddr>;
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+// The Rust samples of the repo's README.md and docs/ are doc tests too, one item per page (NB-070). They build as
+// this crate's tests do: `tokio` and `nostr` on, with peerwire_core, peerwire_sim and peerwire_sync beside it. A
+// sample may hide its set-up behind `# ` lines; a host loop, or one that dials out, is ```rust,no_run; one that
+// can't build is ```rust,ignore with the reason beside it. rustdoc compiles a bare ``` block as Rust, so every block
+// on these pages names its language (```text). A failing sample's line in its page is the line cargo reports, less
+// that of the item's #[doc], plus one. packages/js/test/docs_samples.mjs fails for a page with a ```rust block that
+// isn't listed here.
+#[cfg(doctest)]
+mod doc_samples {
+    #[doc = include_str!("../../../docs/getting-started/quick-start.md")]
+    struct GettingStartedQuickStart;
+    #[doc = include_str!("../../../docs/guides/lan-discovery.md")]
+    struct GuidesLanDiscovery;
+    #[doc = include_str!("../../../docs/guides/messaging.md")]
+    struct GuidesMessaging;
+    #[doc = include_str!("../../../docs/guides/privacy.md")]
+    struct GuidesPrivacy;
+    #[doc = include_str!("../../../docs/guides/rooms.md")]
+    struct GuidesRooms;
+    #[doc = include_str!("../../../docs/guides/shared-documents.md")]
+    struct GuidesSharedDocuments;
+    #[doc = include_str!("../../../docs/reference/rust.md")]
+    struct ReferenceRust;
+}
