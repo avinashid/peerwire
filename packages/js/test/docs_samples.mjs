@@ -6,8 +6,9 @@
 //     (in TypeScript index.d.ts too) or packages/react/src/index.ts. A subpath is in the package's "exports".
 //  3. Every page with a ```rust block is a doc test, so `cargo test` compiles its samples: an include_str! in a doc
 //     attribute (README.md and docs/ go in mod doc_samples of crates/peerwire/src/lib.rs). A doc-test page has no
-//     bare ``` block, which rustdoc compiles as Rust (```text), and a sample that runs doesn't use NostrSignaling:
-//     the tests stay off public relays (```rust,no_run).
+//     bare ``` block, which rustdoc compiles as Rust (```text). A sample that runs stays on loopback, as every test
+//     does: no NostrSignaling, no bind() but to 127.0.0.1 or [::1] (any other looks up public STUN and asks the
+//     gateway for a port mapping). Else it is ```rust,no_run, which still compiles.
 // The export lists are read from the source, and checked first against what index.js and the React build export.
 // BASELINE exempts pages as they were when this check came in.
 // node packages/js/test/docs_samples.mjs [checkout]   (needs packages/react built: npm ci && npm run build there)
@@ -91,18 +92,21 @@ function specs(list) {
 }
 
 // The packages: names a sample may import, and the subpaths of "exports".
+const declared = exportsOf('packages/js/src/index.d.ts');
 const packages = {
-  '@peerwire/js': { values: exportsOf('packages/js/src/index.js').values, types: exportsOf('packages/js/src/index.d.ts') },
-  '@peerwire/react': { ...exportsOf('packages/react/src/index.ts') },
+  '@peerwire/js': {
+    values: exportsOf('packages/js/src/index.js').values,
+    types: new Set([...declared.values, ...declared.types]),
+  },
+  '@peerwire/react': exportsOf('packages/react/src/index.ts'),
 };
-packages['@peerwire/js'].types = new Set([...packages['@peerwire/js'].types.values, ...packages['@peerwire/js'].types.types]);
 for (const [name, pkg] of Object.entries(packages)) {
   pkg.subpaths = new Set(Object.keys(JSON.parse(read(`packages/${name.split('/')[1]}/package.json`)).exports ?? { '.': 0 }));
 }
 
 // 0. The export lists, against the modules themselves.
-const differ = (read, runtime) => [...[...read].filter((x) => !runtime.has(x)).map((x) => `-${x}`),
-  ...[...runtime].filter((x) => !read.has(x)).map((x) => `+${x}`)].join(' ');
+const differ = (parsed, runtime) => [...[...parsed].filter((x) => !runtime.has(x)).map((x) => `-${x}`),
+  ...[...runtime].filter((x) => !parsed.has(x)).map((x) => `+${x}`)].join(' ');
 const jsRuntime = new Set(Object.keys(await import(pathToFileURL(path.join(root, 'packages/js/src/index.js')))));
 const jsDiff = differ(packages['@peerwire/js'].values, jsRuntime);
 check(!jsDiff, `@peerwire/js: the ${jsRuntime.size} exports read from src/index.js are the module's${jsDiff && ` ${jsDiff}`}`);
@@ -209,7 +213,7 @@ for (const s of samples) {
     uses.push([m.index, m[2], [], null]);
   }
   for (const m of code.matchAll(/(?:\{([^}]*)\}\s*=\s*(?:await\s+)?)?\bimport\s*\(\s*(['"])([^'"\n]+)\2\s*\)/g)) {
-    const names = (m[1] ?? '').split(',').map((x) => x.trim().split(/\s*:/)[0]).filter((x) => x && !x.startsWith('...'));
+    const names = (m[1] ?? '').split(',').map((x) => x.trim().split(/\s*[:=]/)[0]).filter((x) => x && !x.startsWith('...'));
     uses.push([m.index, m[3], names.map((name) => ({ name })), null]);
   }
   for (const [at, spec, names, ns] of uses) {
@@ -269,14 +273,19 @@ for (const [page, bs] of pageBlocks) {
     if (b.info === '') {
       problem('rust', page, b.line, 'a bare ``` block, which rustdoc compiles as Rust: give it a language (```text)');
     }
-    const runs = b.lang === 'rust' && !b.attrs.some((a) => ['no_run', 'ignore', 'compile_fail'].includes(a));
-    if (runs && /\bNostrSignaling\b/.test(b.body)) {
-      problem('rust', page, b.line, 'runs against the public Nostr relays in `cargo test`: make it ```rust,no_run');
+    if (b.lang !== 'rust' || b.attrs.some((a) => ['no_run', 'ignore', 'compile_fail'].includes(a))) continue;
+    const off = /\bNostrSignaling\b/.test(b.body) ? ['NostrSignaling dials the public relays'] : [];
+    for (const addr of new Set([...b.body.matchAll(/\bbind\(\s*"([^"]*)"/g)].map((m) => m[1]))) {
+      if (!/^(127\.|\[::1\]|localhost:)/.test(addr)) off.push(`bind("${addr}") looks up public STUN and the gateway`);
+    }
+    if (off.length) {
+      problem('rust', page, b.line, `runs in \`cargo test\`, whose tests stay on loopback, but ${off.join(', and ')}: ` +
+        'make it ```rust,no_run (it still compiles), or bind 127.0.0.1:0');
     }
   }
 }
 check(report('rust'), `Rust: ${rustPages} pages with samples, each a doc test (${doctests.size} pages are); no bare ` +
-  'block on those, no sample run on public relays');
+  'block on those, and the samples that run stay on loopback');
 
 console.log(failed ? `${failed} check(s) failed` : 'all passed');
 process.exit(failed ? 1 : 0);

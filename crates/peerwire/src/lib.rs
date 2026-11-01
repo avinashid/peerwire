@@ -88,8 +88,9 @@ struct ReadmeDoctests;
 
 // The Rust samples of the repo's README.md and docs/ are doc tests too, one item per page (NB-070). They build as
 // this crate's tests do: `tokio` and `nostr` on, with peerwire_core, peerwire_sim and peerwire_sync beside it. A
-// sample may hide its set-up behind `# ` lines; a host loop, or one that dials out, is ```rust,no_run; one that
-// can't build is ```rust,ignore with the reason beside it. rustdoc compiles a bare ``` block as Rust, so every block
+// sample may hide its set-up behind `# ` lines. One that never returns, or leaves loopback (NostrSignaling, a bind
+// to any other address), is ```rust,no_run: it still compiles. One that can't build is ```rust,ignore with the
+// reason beside it. rustdoc compiles a bare ``` block as Rust, so every block
 // on these pages names its language (```text). A failing sample's line in its page is the line cargo reports, less
 // that of the item's #[doc], plus one. packages/js/test/docs_samples.mjs fails for a page with a ```rust block that
 // isn't listed here.
