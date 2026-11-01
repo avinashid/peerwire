@@ -38,7 +38,10 @@ its trust boundaries, and the standing findings.
 - **Signaling metadata privacy.** On the Nostr adapter, anyone who knows a room
   name can see its members' PeerIds, and anyone who knows your PeerId can probe
   for your IP candidates. Treat room names as secrets and don't publish PeerIds
-  you want kept private. ([threat model](docs/project/threat-model.md) SEC-2, SEC-3, SEC-5.)
+  you want kept private. ([threat model](docs/project/threat-model.md) SEC-2, SEC-3, SEC-5.) On `LanSignaling`,
+  every device on the local network sees that you run Peerwire, your rooms' topics,
+  your inbox topic and your IP and MAC addresses, and one that knows two members'
+  PeerIds can keep them from linking (NB64-6).
 - **Connection-setup DoS resistance** against an attacker with many real
   addresses: 256 IPv4 addresses or IPv6 /64s (one IPv6 /56, which many ISPs and
   hosts give a single customer), at 4 half-open handshakes each, fill the quarter
