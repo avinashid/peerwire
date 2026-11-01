@@ -135,7 +135,7 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB10a-1 (Low) | **Fixed** by `f979384` before NB-010a merged, so never on main (merged `4f681b4`): in the meet page, a camera or microphone request still pending at Leave is turned off when it lands, reviewed 2026-10-31, same section |
 | NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; NB16-I1, I2 (Info) open, NB16-I3 done when Pages was enabled, [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1-nb16-2) |
 | The shared origin (Low) | Accepted by the repo owner on 2026-11-01: the site is served from `avinashid.github.io` with no origin of its own. The meet page stays off the site, so NB10a-I1 doesn't arise; it joins only with the owner's approval and a frame check, same section |
-| NB16-2 (Low) | Accepted by the repo owner on 2026-11-01 (NB-071): Net Lab keeps its microphone button on the site, and on a `*.github.io` host its note says, before and after the grant, that the permission covers the whole origin, so the account's other Pages sites could use the microphone without asking (`1d434cb`), reviewed 2026-11-01; NB71-I1 (Info) open, same section |
+| NB16-2 (Low) | Accepted by the repo owner on 2026-11-01 (NB-071): Net Lab keeps its microphone button on the site, and on a `*.github.io` host its note says, before and after the grant, that the permission covers the whole origin, so the account's other Pages sites could use the microphone, and see the device's local addresses, without asking (`1d434cb`, and `8f4a635` for the addresses, NB71-I1), reviewed 2026-11-01, same section |
 | NB64-1, NB64-2 (Low), NB64-3, NB64-4, NB64-5 (Info) | **Fixed** by `a0fe2b1` and `4c86af7` before NB-064 merged, so never on main (merged `34a35a8`): `LanSignaling` takes only datagrams sent to its group, except on Windows; an inbox message spends a token before it is opened; `lan_chat` escapes member text; the docs say the ESP32 seed fixes the identity only, and what a replayed hello does. Reviewed 2026-11-01; residuals accepted, [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6) |
 | NB64-6 (Low) | Open (NB-065): a neighbour who knows two members' PeerIds can keep them from linking by flooding their inbox topics, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
@@ -2555,13 +2555,14 @@ only.
 the site, so neither fix was taken. The mitigation is the button's note (`1d434cb`): on
 a `*.github.io` host it adds, before the grant and after it, that the permission is for
 all of that host (`avinashid.github.io` here), so the other GitHub Pages sites on it
-could use the microphone without asking. On other hosts (local, Docker) the note is
-unchanged. Reviewed 2026-11-01 by reading the diff. Residuals:
-- the note names the microphone only. It doesn't say that those sites' WebRTC
-  connections would carry the device's local addresses too, which no indicator shows
-  (NB71-I1, Info);
-- like the shared origin, it holds only while none of the account's other Pages sites
-  runs third-party scripts or user content.
+could use the microphone, and see this device's local addresses, without asking. On
+other hosts (local, Docker) the note is unchanged. Reviewed 2026-11-01 by reading the
+diff. NB71-I1 (Info), that the note named the microphone only, though those sites'
+WebRTC connections would carry the local addresses too with no indicator, is fixed by
+the words on the addresses (`8f4a635`); `test/netlab_mic.mjs` checks the note on a
+faked `avinashid.github.io` origin (NB71-I2). Residual: like the shared origin, it
+holds only while none of the account's other Pages sites runs third-party scripts or
+user content.
 
 **Fix not taken for now: an origin of the site's own.** A custom subdomain on a
 domain the owner holds is the one choice no other site shares: an organisation's
