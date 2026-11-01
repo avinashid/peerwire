@@ -180,14 +180,21 @@ const svgs = {
   element: '<svg xmlns="http://www.w3.org/2000/svg"><iframe/></svg>',
   namespace: '<svg xmlns="http://www.w3.org/2000/svg"><g xmlns="http://www.w3.org/1999/xhtml"/></svg>',
   tab: '<svg><a><set attributeName="href" to="java\tscript:alert(1)"/></a></svg>',
+  // U+1680 and U+FEFF are XML name characters that \s matches: each prefix reads as <g to the other rules. Then
+  // outside fetches with no url( or scheme (NB67-I4): a CSS escape for //, and a scheme-less //host.
+  ogham: '<svg xmlns:g\u1680="http://www.w3.org/2000/svg"><g\u1680:script>alert(1)</g\u1680:script></svg>',
+  bom: '<svg xmlns:g\ufeff="http://www.w3.org/2000/svg"><g\ufeff:script>alert(1)</g\ufeff:script></svg>',
+  escape: '<svg style="background-image:image-set(\'\\2f \\2f x.example/a.png\' 1x)"/>',
+  netpath: '<svg style="background-image:image-set(\'//x.example/a.png\' 1x)"/>',
 };
 const passed = Object.entries(svgs).filter(([, s]) => checkSvg(s).length === 0).map(([k]) => k);
 check(passed.length === 0 && checkSvg('<?xml version="1.0" encoding="UTF-8"?>' +
   '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">' +
   '<defs><linearGradient id="g"/></defs><rect fill="url(#g)"/><use href="#g"/></svg>').length === 0,
   `checkSvg refuses a script, handlers, foreignObject, outside references, url(), @import, a DTD, javascript: and data:, ` +
-  `prefixed elements, character references, processing instructions, elements outside its list and other ` +
-  `namespaces, and allows #ids, SVG's and xlink's xmlns and the XML declaration` +
+  `prefixed elements, character references, processing instructions, elements outside its list, other namespaces, ` +
+  `characters outside printable ASCII, backslashes and //host, and allows #ids, SVG's and xlink's xmlns and the XML ` +
+  `declaration` +
   `${passed.length ? ` (passed: ${passed.join(' ')})` : ''}`);
 const logo = fs.readFileSync(path.join(ROOT, 'docs/assets/logo.svg'), 'utf8');
 check(['logo.svg', 'favicon.svg'].every((f) => checkSvg(fs.readFileSync(path.join(ROOT, 'docs/assets', f), 'utf8')).length === 0) &&

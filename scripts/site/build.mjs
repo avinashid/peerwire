@@ -20,8 +20,8 @@
 // The build fails on a broken link: a relative href, src or refresh URL that names no file of the site, a #fragment
 // that names no id on its page, a doc link to a repo path that doesn't exist, or a link with another scheme than
 // http(s) or mailto. Doc links to repo files that aren't rendered point at GitHub. It fails too on an SVG under
-// docs/assets/ that holds a script, a handler, a reference to anything outside it, or an element or namespace that
-// isn't SVG's (checkSvg).
+// docs/assets/ that holds a script, a handler, a reference to anything outside it, an element or namespace that
+// isn't SVG's, or a character outside printable ASCII (checkSvg).
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -153,10 +153,14 @@ export function readIndex(root) {
 // XML declaration (NB67-1). An XHTML element needs no prefix in the default namespace (<g xmlns=xhtml><iframe
 // srcdoc>), so the elements are an allow-list of shapes and paint servers, and the only namespaces SVG's and xlink's.
 // With no DTD, &# or processing instruction, every element of the parsed document is a literal <name in the source.
+// Only printable ASCII, tab, LF and CR, so that \s and \w agree with XML's names: U+1680 and U+FEFF are XML name
+// characters that \s matches, so a prefix of g and U+1680 would hide a script behind an allowed <g. No backslash: a CSS
+// escape spells url( as u\72l(. And no // outside the xmlns, since //host is a URL with no scheme (NB67-I4).
 const SVG_ELEMENTS = new Set(['svg', 'g', 'defs', 'title', 'desc', 'symbol', 'use', 'path', 'rect', 'circle', 'ellipse',
   'line', 'polyline', 'polygon', 'linearGradient', 'radialGradient', 'stop', 'clipPath', 'mask', 'pattern']);
 export function checkSvg(svg) {
   const problems = [];
+  if (/[^\t\n\r\x20-\x7e]/.test(svg)) problems.push('a character outside printable ASCII');
   for (const [, name] of svg.matchAll(/<\/?([^\s/>!?]+)/g)) {
     if (!SVG_ELEMENTS.has(name)) problems.push(`a <${name}>`);
   }
@@ -168,6 +172,7 @@ export function checkSvg(svg) {
   if (/<script/i.test(svg)) problems.push('a <script>');
   if (/<\/?[A-Za-z_][\w.-]*:/.test(svg)) problems.push('an element with a namespace prefix');
   if (/&#/.test(svg)) problems.push('a character reference');
+  if (/\\/.test(svg)) problems.push('a backslash');
   if (/<\?(?!xml\s)/.test(svg)) problems.push('a processing instruction');
   if (/\son[a-z]+\s*=/i.test(svg)) problems.push('an on* handler');
   if (/<foreignObject/i.test(svg)) problems.push('a <foreignObject>');
@@ -176,7 +181,7 @@ export function checkSvg(svg) {
     if (!m[2].startsWith('#')) problems.push(`a reference to ${JSON.stringify(m[2])}`);
   }
   if (/url\(\s*(?!['"]?#)/i.test(svg) || /@import/i.test(svg)) problems.push('a url() or @import outside it');
-  if (/[a-z][\w+.-]*:\/\/|javascript:|data:/i.test(svg.replace(/\sxmlns(?::\w+)?\s*=\s*(["'])[^"']*\1/g, ''))) {
+  if (/\/\/|javascript:|data:/i.test(svg.replace(/\sxmlns(?::\w+)?\s*=\s*(["'])[^"']*\1/g, ''))) {
     problems.push('a URL');
   }
   return [...new Set(problems)];
