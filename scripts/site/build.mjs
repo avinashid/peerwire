@@ -21,7 +21,8 @@
 // that names no id on its page, a doc link to a repo path that doesn't exist, or a link with another scheme than
 // http(s) or mailto. Doc links to repo files that aren't rendered point at GitHub. It fails too on an SVG under
 // docs/assets/ that holds a script, a handler, a reference to anything outside it, an element or namespace that
-// isn't SVG's, or a character outside printable ASCII (checkSvg).
+// isn't SVG's, or a character outside printable ASCII (checkSvg), and on a symlink under docs/assets/ (or docs/assets
+// itself one), which would publish whatever it names on the machine that builds the site.
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -94,12 +95,14 @@ const sitePathOf = (source) => (source === INDEX ? 'docs/index.html' : source.re
 const inlineText = (md) => textOf(render(md).html).replace(/\s+/g, ' ').trim();
 const sentence = (s) => s && s[0].toUpperCase() + s.slice(1);
 
-// Every file under dir (a path from root), symlinks followed, as posix paths from root.
-function walk(root, dir) {
+// Every file under dir (a path from root), as posix paths from root: symlinks followed, or with links false refused.
+function walk(root, dir, links = true) {
   const out = [];
   for (const name of fs.readdirSync(path.join(root, dir)).sort()) {
     const file = posix.join(dir, name);
-    if (fs.statSync(path.join(root, file)).isDirectory()) out.push(...walk(root, file));
+    const stat = (links ? fs.statSync : fs.lstatSync)(path.join(root, file));
+    if (stat.isSymbolicLink()) throw new Error(`site: ${file} is a symlink: the build would publish what it names`);
+    if (stat.isDirectory()) out.push(...walk(root, file, links));
     else out.push(file);
   }
   return out;
@@ -287,7 +290,12 @@ export function buildSite({ root, out, wasm }) {
   const assets = modules.map((m) => [m, m === 'pkg/peerwire_ffi.wasm' ? wasm : path.join(jsRoot, m)]);
   if (!modules.includes('pkg/peerwire_ffi.wasm')) throw new Error('site: no demo loads pkg/peerwire_ffi.wasm');
   assets.push(['site.css', path.join(HERE, 'site.css')]);
-  for (const file of walk(root, ASSETS.slice(0, -1))) {
+  // docs/assets/ holds files of the repo: a symlink there, or docs/assets itself one, would publish what it names on
+  // the machine that builds the site.
+  if (fs.realpathSync(path.join(root, ASSETS)) !== path.join(fs.realpathSync(root), ASSETS.slice(0, -1))) {
+    throw new Error(`site: ${ASSETS.slice(0, -1)} is a symlink, or under one: the build would publish what it names`);
+  }
+  for (const file of walk(root, ASSETS.slice(0, -1), false)) {
     const name = file.slice(ASSETS.length);
     if (!IMAGE.test(name)) throw new Error(`site: ${file}: docs/assets/ holds images only, named [\\w-] (svg, png, jpg, gif, webp)`);
     if (name.endsWith('.svg')) {

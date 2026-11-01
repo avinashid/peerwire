@@ -11,7 +11,8 @@
 //    scripts, every module they import, the wasm and the images live under assets/<id>/;
 //  - <id> is a hash of the assets: the same for the same inputs, new when the wasm changes;
 //  - doc links point at the rendered page or at GitHub, images at assets/<id>/img/, and a broken link, an image
-//    from outside docs/assets/ or an SVG there with a script or an outside reference fails the build;
+//    from outside docs/assets/, an SVG there with a script or an outside reference, or a symlink there (NB67-I2)
+//    fails the build;
 //  - the first site's URLs refresh to the new pages;
 //  - .github/workflows/pages.yml, which builds what Pages serves, runs no action but GitHub's own actions/* (NB16-1).
 // node packages/js/test/site_build.mjs (needs packages/js/pkg/peerwire_ffi.wasm: packages/js/build.sh)
@@ -364,7 +365,8 @@ check(['js', 'react', 'rust', 'godot'].every((t) => landing.includes(`<input typ
   `the landing page: four code tabs, highlighted (one checked), npm install, 6 features, the wasm's measured size ` +
   `(${wasmKb} KB, shown ${wasmShown}), 5 demos`);
 
-// Docs on a repo of symlinks to this one, with a docs/README.md of its own that lists one more page, docs/A.md.
+// Docs on a repo of symlinks to this one, with a docs/README.md of its own that lists one more page, docs/A.md, and
+// copies of the images (the build refuses a symlink under docs/assets/).
 const fake = path.join(tmp, 'fake');
 fs.mkdirSync(path.join(fake, 'docs/assets'), { recursive: true });
 for (const p of fs.readdirSync(ROOT)) {
@@ -373,7 +375,7 @@ for (const p of fs.readdirSync(ROOT)) {
 for (const p of fs.readdirSync(path.join(ROOT, 'docs'))) {
   if (!['README.md', 'assets'].includes(p)) fs.symlinkSync(path.join(ROOT, 'docs', p), path.join(fake, 'docs', p));
 }
-for (const p of images) fs.symlinkSync(path.join(ROOT, 'docs/assets', p), path.join(fake, 'docs/assets', p));
+for (const p of images) fs.copyFileSync(path.join(ROOT, 'docs/assets', p), path.join(fake, 'docs/assets', p));
 fs.writeFileSync(path.join(fake, 'docs/README.md'), `${fs.readFileSync(path.join(ROOT, 'docs/README.md'), 'utf8')}\n## Test\n\n` +
   '- [A page](A.md): a page of the test.\n');
 const fakeBuild = (md, name) => {
@@ -430,6 +432,29 @@ check(!oddBuild && oddRead('docs/q" &amp;.html').includes(`<a href="${REPO_URL}/
   oddRead('docs/q" &amp;.html').includes(`<a ${oddLink} aria-current="page">Odd</a>`) &&
   oddRead('docs/A.html').includes(`<a class="next" ${oddLink}>`) && oddRead('docs/index.html').includes(`<li><a ${oddLink}>Odd</a>`),
   `a doc named ${odd}: its edit link names docs/q%22%20&amp;.md, and the sidebar, pager and overview link to it escaped ${oddBuild}`);
+
+// A symlink under docs/assets/, to an image (here in a directory) or to a directory of them, or docs/assets itself
+// one, fails the build: it would publish what it names on the machine that builds the site (NB67-I2). Each names
+// good images here. A repo reached through a symlink builds.
+const assetsDir = path.join(fake, 'docs/assets');
+fs.mkdirSync(path.join(assetsDir, 'sub'));
+fs.symlinkSync(path.join(ROOT, 'docs/assets/logo.svg'), path.join(assetsDir, 'sub/linked.svg'));
+const linkedFile = fakeBuild('# A\n', 'fake-link-file');
+fs.rmSync(path.join(assetsDir, 'sub'), { recursive: true });
+fs.symlinkSync(path.join(ROOT, 'docs/assets'), path.join(assetsDir, 'linked'));
+const linkedDir = fakeBuild('# A\n', 'fake-link-dir');
+fs.rmSync(path.join(assetsDir, 'linked'));
+fs.renameSync(assetsDir, path.join(tmp, 'assets-aside'));
+fs.symlinkSync(path.join(tmp, 'assets-aside'), assetsDir);
+const linkedAssets = fakeBuild('# A\n', 'fake-link-assets');
+fs.rmSync(assetsDir);
+fs.renameSync(path.join(tmp, 'assets-aside'), assetsDir);
+fs.symlinkSync(fake, path.join(tmp, 'fake-link'));
+const viaLink = error(() => buildSite({ root: path.join(tmp, 'fake-link'), out: path.join(tmp, 'fake-via-link') }));
+check(/docs\/assets\/sub\/linked\.svg is a symlink/.test(linkedFile) && /docs\/assets\/linked is a symlink/.test(linkedDir) &&
+  /docs\/assets is a symlink, or under one/.test(linkedAssets) && !fs.lstatSync(assetsDir).isSymbolicLink() && !viaLink,
+  `a symlink under docs/assets/ (to an image or a directory), or docs/assets one, fails the build, and a repo ` +
+  `reached through one builds ${JSON.stringify([linkedFile, linkedDir, linkedAssets, viaLink])}`);
 
 // The checker on its own.
 const site = path.join(tmp, 'check');
