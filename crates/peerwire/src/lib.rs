@@ -36,7 +36,8 @@
 //! relays, and [`Node::failure`] says which side was symmetric. See [`traversal`].
 //! With [`Builder::port_mapping`] a node also asks its router (PCP, NAT-PMP or
 //! UPnP-IGD) to forward a public port to it, and offers that address too.
-//! The `nostr` feature adds `NostrSignaling`, over public Nostr relays.
+//! The `nostr` feature adds `NostrSignaling`, over public Nostr relays. On one LAN,
+//! with no internet, [`LanSignaling`] carries rooms over UDP multicast.
 //!
 //! # Privacy
 //!
@@ -52,6 +53,7 @@
 
 #[cfg(feature = "tokio")]
 mod async_node;
+mod lan;
 mod node;
 #[cfg(feature = "nostr")]
 pub mod nostr;
@@ -61,6 +63,7 @@ pub mod traversal;
 
 #[cfg(feature = "tokio")]
 pub use async_node::AsyncNode;
+pub use lan::LanSignaling;
 pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]
 pub use nostr::NostrSignaling;
