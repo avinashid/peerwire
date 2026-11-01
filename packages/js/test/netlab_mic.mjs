@@ -13,11 +13,16 @@
 //   during the re-test hears none either (MIC-4);
 // - a refused prompt (a browser whose fake UI says no): 'denied', a warning, and the
 //   room is not joined again;
-// - a candidate pair whose local address is hidden takes its family from the remote.
+// - a candidate pair whose local address is hidden takes its family from the remote;
+// - on a github.io host the note says, before and after the grant, that the permission
+//   is the whole origin's, which the account's other Pages sites share (NB16-2); on
+//   127.0.0.1 it doesn't. The github.io origin is faked: page.route answers every
+//   request from this tree and DNS is blocked, so nothing leaves the machine.
 //
 //   node packages/js/test/netlab_mic.mjs [screenshot-prefix]
 
 import { serve } from './serve.mjs';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -220,6 +225,42 @@ try {
     ok(false, `global room, the button: ${e.message}`);
   }
   await kctx.close();
+
+  // The note on a github.io host, where the grant is shared with the account's other
+  // Pages sites (NB16-2, NB71-I1), and not on 127.0.0.1 (tab A, granted above).
+  const scopeNote = (host) => `; the permission is for all of ${host}, so the other GitHub Pages sites on it could use the microphone, and see this device's local addresses, without asking`;
+  const aNote = await a.textContent('#micmsg');
+  ok(aNote.startsWith('allowed') && !aNote.includes('the permission is for all of'), 'on 127.0.0.1 the note names no shared origin');
+  const site = 'https://avinashid.github.io';
+  const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm', '.svg': 'image/svg+xml', '.json': 'application/json' };
+  const outside = [];
+  const sb = await chromium.launch({ args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', '--host-resolver-rules=MAP * ~NOTFOUND'] });
+  browsers.push(sb);
+  const sctx = await sb.newContext({ viewport: { width: 1360, height: 900 } });
+  await sctx.route('**/*', async (route) => {
+    const u = new URL(route.request().url());
+    if (u.origin !== site || !u.pathname.startsWith('/peerwire/')) return (outside.push(u.href), route.abort());
+    const file = path.join(root, decodeURIComponent(u.pathname.slice('/peerwire/'.length)));
+    const body = await readFile(file).catch(() => null);
+    return route.fulfill(body ? { contentType: types[path.extname(file)] ?? 'application/octet-stream', body } : { status: 404, body: '' });
+  });
+  try {
+    const s = await open(sctx, `${site}/peerwire/demo/netlab.html?signal=local&rtc=off&name=sierra`);
+    await wait(s, () => document.querySelector('#micmsg')?.textContent, null, 20000);
+    const sBefore = await s.textContent('#micmsg');
+    await sctx.grantPermissions(['microphone'], { origin: site });
+    await s.click('#mic');
+    await wait(s, () => document.querySelector('#micmsg').textContent.startsWith('allowed'), null, 20000);
+    const sAfter = await s.textContent('#micmsg');
+    const note = scopeNote('avinashid.github.io');
+    ok(sBefore.endsWith(note), `on avinashid.github.io (faked), before the grant: "…${sBefore.slice(-150)}"`);
+    ok(sAfter.includes(`${note}; remove the microphone in the site settings to stop`), `and after it: "…${sAfter.slice(-200)}"`);
+    if (shot) await card(s).screenshot({ path: `${shot}-github-io.png` });
+  } catch (e) {
+    ok(false, `on avinashid.github.io (faked): ${e.message}`);
+  }
+  ok(!outside.length, `and no request left the faked origin${outside.length ? `: ${outside.join(', ')}` : ''}`);
+  await sctx.close();
 
   // A refused prompt: 'denied', a warning, still the same member of the room.
   const dctx = await launch('--use-fake-ui-for-media-stream=deny');
