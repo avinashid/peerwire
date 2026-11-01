@@ -17,6 +17,8 @@
 # (GATE_JOBS at a time) and, once those are done, beside the browser tests (one at a time). The Rust tests run under
 # cargo-nextest when it is installed (doctests through cargo test --doc), else under cargo test. Each step writes its
 # own log, target/gate-logs/<step>.log; a failed step's log is printed in full before the summary.
+# The docs' samples are tested too (NB-070): the Rust ones compile, never run, in "rust doc samples" (on a change to
+# Rust or Markdown); the JS ones and every link in "node docs samples" and "node docs links".
 #
 # Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs),
 #      GATE_JOBS (Node tests at once, default 4), GATE_BASE (what "changed" is measured against, default origin/main),
@@ -88,6 +90,8 @@ NODE=(
   "node birthday primitives|node packages/js/test/birthday.mjs"
   "node qr|node packages/js/test/qr.mjs"
   "node site build|node packages/js/test/site_build.mjs"
+  "node docs samples|node packages/js/test/docs_samples.mjs"
+  "node docs links|node packages/js/test/docs_links.mjs"
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
 )
@@ -261,6 +265,14 @@ rust_tests() {
   return $r
 }
 
+# The Rust samples of README.md and docs/ (mod doc_samples in crates/peerwire/src/lib.rs): doc tests that only
+# compile. --cfg docs_samples brings them in (a plain cargo test leaves them out), and rustdoc "runs" each with
+# `true`: many are host loops, or dial public relays.
+doc_samples() {
+  RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }--cfg docs_samples --test-runtool true" \
+    cargo test --doc --workspace --release doc_samples
+}
+
 # Release builds wrap on integer overflow; the parser fuzzers must also run where it panics.
 fuzz_tests() {
   local r=0
@@ -301,6 +313,10 @@ if [ $full = 0 ] && base=$(git merge-base "$GATE_BASE" HEAD 2>/dev/null); then
     rust_skip="no Rust change since $GATE_BASE $(git rev-parse --short "$base")"
   fi
 fi
+samples_skip=""
+if [ -n "$rust_skip" ] && ! grep -qE '\.md$' <<<"$changed"; then
+  samples_skip="no Markdown or Rust change since $GATE_BASE $(git rev-parse --short "$base")"
+fi
 
 # The Node tests, GATE_JOBS at a time. Run in a subshell, so its job table holds only these.
 # --no-wasm-tier-up: on a busy host, Node 26.7 sometimes deadlocks in process.exit() while V8 is still tiering the
@@ -340,7 +356,13 @@ browser_lane() {
 # 12 beside the browser tests.
 lanes() {
   if [ -z "$rust_skip" ]; then
-    { step "cargo test" rust_tests; [ $strict = 0 ] || step "fuzz (debug)" fuzz_tests; } &
+    {
+      step "cargo test" rust_tests
+      step "rust doc samples" doc_samples
+      [ $strict = 0 ] || step "fuzz (debug)" fuzz_tests
+    } &
+  elif [ -z "$samples_skip" ]; then
+    step "rust doc samples" doc_samples &
   fi
   (node_pool)
   browser_lane
@@ -355,11 +377,14 @@ step "wasm build" ./packages/js/build.sh
 step "wasm size+imports" wasm_check
 step "react build+types" react_build
 if [ -n "$rust_skip" ]; then
-  echo "==> Rust steps skipped: $rust_skip (pass --full to run them)"
+  but=""
+  [ -n "$samples_skip" ] || but=", but for the docs' Rust samples"
+  echo "==> Rust steps skipped: $rust_skip$but (pass --full to run them)"
   skip "cargo test" "$rust_skip"
   skip "cargo clippy" "$rust_skip"
   [ $strict = 0 ] || skip "fuzz (debug)" "$rust_skip"
   skip "cargo fmt" "$rust_skip"
+  [ -z "$samples_skip" ] || skip "rust doc samples" "$samples_skip"
 else
   if [ $strict = 1 ]; then
     step "cargo clippy" clippy -- -D warnings
@@ -387,7 +412,7 @@ else
 fi
 
 # The summary, in the order of the old one-at-a-time gate.
-order=("cargo test" "cargo clippy")
+order=("cargo test" "rust doc samples" "cargo clippy")
 [ $strict = 0 ] || order+=("fuzz (debug)")
 order+=("cargo fmt" "wasm build" "wasm size+imports" "react build+types")
 for s in "${NODE[@]}"; do order+=("${s%%|*}"); done
