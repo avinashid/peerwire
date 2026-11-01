@@ -295,25 +295,48 @@ impl std::error::Error for SendError {}
 /// Endpoint-wide counters, from [`Endpoint::stats`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// Datagrams queued for the host to send ([`Endpoint::poll_transmit`]). Packets for a peer linked through a
+    /// relay travel inside the datagrams to that relay.
     pub tx_packets: u64,
+    /// Packets handed in ([`Endpoint::handle_datagram`] and its variants) or unwrapped from a relay's frames,
+    /// counted before any check.
     pub rx_packets: u64,
+    /// Packets that don't parse, HS1s of the wrong length or without a 32-byte identity, and authenticated
+    /// packets that break the protocol (a frame that doesn't parse, a message over the size limit), which close
+    /// the link with [`DisconnectReason::ProtocolViolation`].
     pub rx_malformed: u64,
+    /// HS2, cookie and data packets for no session of ours, data for a session still dialling, and cookies from
+    /// an address the dial didn't send to.
     pub rx_unknown_session: u64,
+    /// Handshakes and data packets that fail to decrypt, and HS1s whose claimed identity isn't the key that ran
+    /// the handshake, or is our own.
     pub rx_auth_failed: u64,
+    /// Data packets the replay window refuses: a nonce already seen, or 2048 or more below the newest.
     pub rx_replayed: u64,
+    /// Handshakes refused unanswered: at [`Config::max_links`], past [`Config::max_pending_handshakes`] or a
+    /// source's share of them under load, or in relay-only mode over a direct path we don't answer on. Also
+    /// inbound links refused at `max_links` as their handshake completes.
     pub rx_handshake_dropped: u64,
+    /// Reliable and urgent fragments sent again, summed over the links live now ([`PeerStats::retransmits`]): a
+    /// link's count leaves the sum when it closes.
     pub retransmits: u64,
+    /// Unreliable messages dropped, oldest first, from a link's full queue ([`Config::unreliable_queue`]).
     pub unreliable_dropped: u64,
+    /// Links that followed their peer's newer packets to another direct address (a NAT rebinding, a new network).
     pub roams: u64,
     /// Packets we forwarded for other peers.
     pub relayed: u64,
     /// Relay requests refused (no such peer, rate limit, queue full, relaying off).
     pub relay_dropped: u64,
+    /// Punch probes sent straight to a peer: to its candidate addresses while its link is relayed, the ports next
+    /// to them, and guessed addresses. Birthday sprays count in `spray_probes`.
     pub punches_sent: u64,
     /// Links moved from relayed to direct.
     pub punch_succeeded: u64,
     /// Punch rounds that ran out without a direct path.
     pub punch_failed: u64,
+    /// Links moved from a direct path back to their relay after nothing came over it for
+    /// [`Config::direct_timeout`].
     pub direct_fallbacks: u64,
     /// Probes sent by birthday sprays ([`Endpoint::spray`]).
     pub spray_probes: u64,
