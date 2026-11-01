@@ -36,8 +36,8 @@ PEERWIRE_DATA=./peer-data cargo run --release -p peerwire-peer -- check # link t
 In Docker, with the examples server next to it:
 
 ```sh
-docker compose up -d --build
-docker compose exec peer peerwire-peer check
+docker compose -f docker/compose.yml up -d --build
+docker compose -f docker/compose.yml exec peer peerwire-peer check
 ```
 
 Settings come from the environment: `PEERWIRE_BIND`, `PEERWIRE_DATA`, `PEERWIRE_STUN`, `PEERWIRE_MAX_PEERS`, `PEERWIRE_RELAY`,

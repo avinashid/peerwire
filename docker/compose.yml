@@ -1,7 +1,10 @@
 # The optional always-on peer and the browser demos, on this machine only (see docs/guides/always-on-peer.md).
+# From the repo root:
 #
-#   docker compose up -d --build
-#   docker compose exec peer peerwire-peer check     # or: docker compose logs peer  (prints the invite)
+#   docker compose -f docker/compose.yml up -d --build
+#   docker compose -f docker/compose.yml exec peer peerwire-peer check   # or: ... logs peer (prints the invite)
+#
+# Compose reads a .env file next to this one (docker/.env), not at the repo root.
 #
 # Logs are capped at three 10 MB files per service; the peer's hold the IP:port of every linked peer.
 #
@@ -9,6 +12,9 @@
 #   peer      UDP 127.0.0.1:7700 (host network, so its invite and the addresses it sees are the real ones);
 #             set PEERWIRE_BIND=0.0.0.0:7700 to make it reachable from other hosts.
 #   examples  http://127.0.0.1:7780 (set PEERWIRE_EXAMPLES_PORT to change the port).
+
+# Without a name, Compose would name the project after this directory ("docker").
+name: peerwire
 
 x-logging: &logging
   driver: json-file
@@ -19,7 +25,8 @@ x-logging: &logging
 services:
   peer:
     build:
-      context: .
+      context: ..
+      dockerfile: docker/Dockerfile
       target: peer
     image: peerwire-peer
     network_mode: host
@@ -42,7 +49,8 @@ services:
 
   examples:
     build:
-      context: .
+      context: ..
+      dockerfile: docker/Dockerfile
       target: examples
     image: peerwire-examples
     ports:
