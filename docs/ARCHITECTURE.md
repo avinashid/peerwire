@@ -29,13 +29,13 @@
  hosts / transports ────────────────────────────────────────────────────────
   native UDP (std / tokio)   WebRTC DataChannel (browser, packages/js)   C ABI (peerwire-ffi)
  signaling adapters ────────────────────────────────────────────────────────
-  invite link / QR · BroadcastChannel · Nostr relays · mDNS (planned) · DHT (planned)
+  invite link / QR · BroadcastChannel · Nostr relays · LAN multicast · DHT (planned)
 ```
 
 ## Connecting two peers
 
 1. **Learn the peer.** A gets B's PeerId and candidate addresses from an invite (`pw:…`), or from an
-   adapter (a Nostr note sealed to B's key, a BroadcastChannel message, mDNS).
+   adapter (a Nostr note sealed to B's key, a BroadcastChannel message, a LAN multicast datagram).
 2. **Dial every path at once.** `connect_with` sends the Noise handshake down every known path: direct
    addresses, and through any mutual peer that can relay.
 3. **Handshake.** It takes one RTT. When both sides dial at once, the dial from the smaller PeerId wins, so

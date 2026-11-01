@@ -958,8 +958,9 @@ fn interface_addrs() -> Vec<(String, IpAddr)> {
         .collect()
 }
 
-/// ESP-IDF has no getifaddrs: a socket bound to any interface offers its default
-/// route's address and loopback only.
+/// ESP-IDF has no getifaddrs, and lwIP's UDP connect picks no source address, so a
+/// socket bound to any interface offers loopback only: bind the device's own address
+/// (as ports/esp32 does).
 #[cfg(target_os = "espidf")]
 fn interface_addrs() -> Vec<(String, IpAddr)> {
     Vec::new()

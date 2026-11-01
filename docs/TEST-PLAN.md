@@ -152,6 +152,18 @@ tests on Node 22 to the same pool: 88 s for the pool alone, against 59 s without
   rounds where only the other relay answers) and the link lives on; after a punch upgrade a packet sealed before
   the answer doesn't roam the link (FL3-1). `Net` runs each endpoint's timers only when its `poll_timeout` is due.
 
+### peerwire LAN signaling (`crates/peerwire/src/lan.rs`, `tests/lan.rs`)
+
+- NB-064, `LanSignaling` on loopback multicast, each test process on its own group port: frames round-trip; a
+  short one, a wrong magic or one longer than 1400 bytes is dropped, and a message too big for one frame is not
+  sent; carriers hear each other on subscribed topics only and never their own frames; 128 junk datagrams cost
+  `poll` at most 64 reads a call, so the frame behind them comes on the third call; a frame sent to the port by
+  unicast is never delivered, one sent to the group after it is (NB64-1, not on Windows).
+- NB64-2 (`traversal.rs`): inbox messages spend a token before they are opened (64, then one per 50 ms), so after
+  64 junk messages a valid room offer isn't acted on until a refill, then one is and the next waits again.
+- Three nodes in one room link over `LanSignaling` alone (no STUN, no invite, about 120 ms) and a message
+  arrives; a node in another room links with none; the only disconnects are `Replaced` (crossing room dials).
+
 ### peerwire-core over the simulator (`crates/peerwire-sim/tests/endpoint.rs`, `nat.rs`)
 
 - Handshake in one RTT; wrong identity fails; simultaneous open converges to one link; replayed handshake does

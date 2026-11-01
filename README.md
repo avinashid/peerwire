@@ -50,6 +50,7 @@ Peerwire is **v0.1 and in early development**. The APIs will change, and nothing
 |---|---|
 | Session core: identity, Noise IK, lanes, congestion control, peer relay, hole punching, invites | ✅ Working, tested |
 | `Node` / `AsyncNode`: UDP host, STUN, rooms, `MemoryHub` and Nostr signaling, NAT traversal | ✅ Working, tested |
+| LAN discovery: rooms over UDP multicast with no internet (`LanSignaling`), on PCs and ESP32 | ✅ Working, tested on loopback, Docker and emulated ESP32-C3s |
 | Godot 4 `PeerwireMultiplayerPeer` (desktop) | ✅ Working, tested |
 | WebAssembly module and JS package (WebRTC transport, Nostr signaling) | ✅ Working, tested in headless browsers |
 | Shared documents in the JS package: `room.doc()` with maps, sets and logs (CRDT, catch-up for late joiners) | ✅ Working, tested |
@@ -58,7 +59,7 @@ Peerwire is **v0.1 and in early development**. The APIs will change, and nothing
 | Deterministic network simulator and multiplayer arena benchmark | ✅ Working |
 | Game layer: fixed-point maths, Hilbert islands, desync detection, lockstep | ✅ Working |
 | Mesh size limit and super-peers in the `Node` facade | 🚧 Planned |
-| mDNS and DHT signaling | 🚧 Planned |
+| DHT signaling | 🚧 Planned |
 | `peerwire-media` (audio and video), `peerwire-store` (offline store-and-forward) | 🚧 Planned |
 | Godot on Android, iOS and web; mobile bindings | 🚧 Planned |
 
@@ -230,7 +231,7 @@ sequenceDiagram
  │ tail-loss probe · keepalive · roaming · peer relay · hole punch · invites  │
  ├────────────────────────── signaling (untrusted) ───────────────────────────┤
  │ invite / QR · MemoryHub · Nostr relays · BroadcastChannel (JS) ·           │
- │ mDNS, DHT (planned)                                                        │
+ │ LAN multicast · DHT (planned)                                              │
  └────────────────────────────────────────────────────────────────────────────┘
 ```
 

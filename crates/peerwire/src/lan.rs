@@ -1,0 +1,291 @@
+//! Signaling on one local network, with no internet: UDP multicast.
+//!
+//! [`LanSignaling`] sends each message as one datagram to an organisation-local
+//! multicast group ([`LanSignaling::GROUP`] by default) with a TTL of 1, so it never
+//! leaves the link. Every carrier on the LAN hears it, other processes on the same
+//! machine too, and each keeps only the topics it subscribed to. Rooms
+//! ([`Node::join_room`](crate::Node::join_room)) then work as they do over Nostr: peers
+//! on one Wi-Fi find each other and link directly, a PC, a container or an ESP32 alike.
+//!
+//! Like any carrier it is untrusted. Hellos and offers are sealed and proved as they
+//! are over a relay (see [`traversal`](crate::traversal)), so a neighbour on the LAN
+//! sees topics, timing and the sender's IP, and can't read or forge them; a hello it
+//! replays within a minute only makes members offer again. The socket is bound to the
+//! group address, so it takes only datagrams sent to the group, not unicast from off
+//! the link (except on Windows, which can't bind a multicast address).
+//!
+//! A message is at most [`LanSignaling::MAX_PAYLOAD`] bytes, in one datagram: nothing is
+//! fragmented (ESP-IDF's lwIP doesn't reassemble IP fragments). Browsers can't send
+//! UDP multicast; they find each other with invites, BroadcastChannel or Nostr.
+//!
+//! A host firewall must let in UDP to the group's port (20567 by default), or the node
+//! hears no one; some guest and public Wi-Fi networks drop multicast or keep clients
+//! apart, and there it finds no one either.
+
+use crate::signaling::{Signaling, Topic};
+use rand_core::{OsRng, RngCore};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashSet;
+use std::io::{self, ErrorKind};
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAGIC: &[u8; 4] = b"PWL1";
+/// Magic, sender tag, topic.
+const HEADER: usize = 4 + 8 + 32;
+/// Largest datagram sent or accepted: one packet on any Ethernet or Wi-Fi link.
+const MAX_FRAME: usize = 1400;
+/// Datagrams read in one [`poll`](Signaling::poll) before it gives up for now, so a
+/// flood of frames for other topics can't hold the caller.
+const MAX_READS: usize = 64;
+
+/// A [`Signaling`] carrier over UDP multicast on the local network.
+///
+/// ```no_run
+/// use peerwire::{LanSignaling, Node};
+///
+/// let mut node = Node::builder().signaling(LanSignaling::new()?).bind("0.0.0.0:0")?;
+/// node.join_room("my-app", "kitchen"); // links with every node in "kitchen" on this LAN
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub struct LanSignaling {
+    sock: UdpSocket,
+    group: SocketAddrV4,
+    /// Tags this carrier's frames, so it drops its own when the group loops them back.
+    sender: [u8; 8],
+    topics: HashSet<Topic>,
+    buf: Vec<u8>,
+}
+
+impl LanSignaling {
+    /// The default group: 239.255.80.87 ("PW"), port 20567, in the organisation-local
+    /// scope that routers don't forward.
+    pub const GROUP: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 80, 87), 20567);
+    /// The largest message [`publish`](Signaling::publish) sends; larger ones are dropped.
+    pub const MAX_PAYLOAD: usize = MAX_FRAME - HEADER;
+
+    /// A carrier on [`GROUP`](LanSignaling::GROUP), on the interface the system picks
+    /// for multicast (normally the default route's).
+    pub fn new() -> io::Result<LanSignaling> {
+        LanSignaling::on(LanSignaling::GROUP, Ipv4Addr::UNSPECIFIED)
+    }
+
+    /// A carrier on `group` (an IPv4 multicast address and port), listening and sending
+    /// on the interface whose address is `interface` (`0.0.0.0`: the system's choice).
+    /// A device with several interfaces names the LAN's here; an ESP32 names its own
+    /// address; tests name `127.0.0.1` to stay on loopback.
+    pub fn on(group: SocketAddrV4, interface: Ipv4Addr) -> io::Result<LanSignaling> {
+        if !group.ip().is_multicast() {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "not an IPv4 multicast group"));
+        }
+        let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        // Other carriers on this machine listen on the same port.
+        s.set_reuse_address(true)?;
+        // Bound to the group, the socket takes only datagrams sent to it: TTL 1 keeps
+        // our frames on the link, and this keeps unicast from anywhere else out.
+        #[cfg(not(windows))]
+        let ip = *group.ip();
+        #[cfg(windows)]
+        let ip = Ipv4Addr::UNSPECIFIED;
+        s.bind(&SocketAddrV4::new(ip, group.port()).into())?;
+        s.join_multicast_v4(group.ip(), &interface)?;
+        if !interface.is_unspecified() {
+            s.set_multicast_if_v4(&interface)?;
+        }
+        s.set_multicast_ttl_v4(1)?;
+        s.set_multicast_loop_v4(true)?;
+        s.set_nonblocking(true)?;
+        Ok(LanSignaling {
+            sock: s.into(),
+            group,
+            sender: sender_tag(),
+            topics: HashSet::new(),
+            buf: vec![0; MAX_FRAME + 1],
+        })
+    }
+}
+
+impl Signaling for LanSignaling {
+    fn subscribe(&mut self, topic: Topic) {
+        self.topics.insert(topic);
+    }
+
+    fn unsubscribe(&mut self, topic: Topic) {
+        self.topics.remove(&topic);
+    }
+
+    fn publish(&mut self, topic: Topic, payload: &[u8]) {
+        if let Some(f) = frame(&self.sender, &topic, payload) {
+            // Best effort, as carriers are: with no network yet, or a full send buffer,
+            // the message is lost, and rooms repeat their hellos.
+            let _ = self.sock.send_to(&f, self.group);
+        }
+    }
+
+    fn poll(&mut self) -> Option<(Topic, Vec<u8>)> {
+        for _ in 0..MAX_READS {
+            let n = match self.sock.recv(&mut self.buf) {
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return None,
+                // ICMP errors surface here on some platforms: keep reading.
+                Err(_) => continue,
+            };
+            match parse(&self.buf[..n]) {
+                Some((sender, topic, payload)) if sender != self.sender && self.topics.contains(&topic) => {
+                    return Some((topic, payload.to_vec()));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+/// Random bytes, mixed with the clock and a counter: an ESP32 that has no entropy yet
+/// (before Wi-Fi) must still not share a tag with another carrier. It tells this
+/// carrier's frames from others' and protects nothing.
+fn sender_tag() -> [u8; 8] {
+    // 32-bit: an ESP32-C3 has no 64-bit atomics.
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let mut tag = [0u8; 8];
+    OsRng.fill_bytes(&mut tag);
+    let mix = nanos ^ u64::from(COUNT.fetch_add(1, Ordering::Relaxed)) << 40;
+    (u64::from_le_bytes(tag) ^ mix).to_le_bytes()
+}
+
+/// `None` if `payload` won't fit in one frame.
+fn frame(sender: &[u8; 8], topic: &Topic, payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.len() > LanSignaling::MAX_PAYLOAD {
+        return None;
+    }
+    let mut f = Vec::with_capacity(HEADER + payload.len());
+    f.extend_from_slice(MAGIC);
+    f.extend_from_slice(sender);
+    f.extend_from_slice(&topic.0);
+    f.extend_from_slice(payload);
+    Some(f)
+}
+
+fn parse(d: &[u8]) -> Option<([u8; 8], Topic, &[u8])> {
+    if d.len() < HEADER || d.len() > MAX_FRAME || &d[..4] != MAGIC {
+        return None;
+    }
+    let sender = d[4..12].try_into().ok()?;
+    let topic = Topic(d[12..HEADER].try_into().ok()?);
+    Some((sender, topic, &d[HEADER..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A group port of this test's own, so parallel tests and test processes don't hear each other.
+    fn group(test: u16) -> SocketAddrV4 {
+        SocketAddrV4::new(*LanSignaling::GROUP.ip(), 30000 + (std::process::id() % 4000) as u16 * 8 + test)
+    }
+
+    fn carrier(test: u16) -> LanSignaling {
+        LanSignaling::on(group(test), Ipv4Addr::LOCALHOST).expect("multicast on loopback")
+    }
+
+    /// Polls `c` for up to half a second.
+    fn next(c: &mut LanSignaling) -> Option<(Topic, Vec<u8>)> {
+        let end = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < end {
+            if let Some(m) = c.poll() {
+                return Some(m);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        None
+    }
+
+    #[test]
+    fn frames_round_trip_and_bad_ones_are_dropped() {
+        let (s, t) = ([7u8; 8], Topic([9; 32]));
+        let f = frame(&s, &t, b"hi").unwrap();
+        assert_eq!(f.len(), HEADER + 2);
+        assert_eq!(parse(&f), Some((s, t, &b"hi"[..])));
+        let full = frame(&s, &t, &[0; LanSignaling::MAX_PAYLOAD]).unwrap();
+        assert_eq!(full.len(), MAX_FRAME);
+        assert!(parse(&full).is_some());
+        assert_eq!(frame(&s, &t, &[0; LanSignaling::MAX_PAYLOAD + 1]), None, "too big for one datagram");
+        assert_eq!(parse(&f[..HEADER - 1]), None, "short");
+        let mut bad = f.clone();
+        bad[0] = b'X';
+        assert_eq!(parse(&bad), None, "wrong magic");
+        let mut big = full.clone();
+        big.push(0);
+        assert_eq!(parse(&big), None, "longer than a frame");
+        assert!(LanSignaling::on(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9), Ipv4Addr::LOCALHOST).is_err());
+    }
+
+    #[test]
+    fn carriers_hear_each_other_on_subscribed_topics_only() {
+        let (mut a, mut b, mut c) = (carrier(0), carrier(0), carrier(0));
+        let (t, other) = (Topic([1; 32]), Topic([2; 32]));
+        a.subscribe(t);
+        b.subscribe(t);
+        a.publish(t, b"from a");
+        a.publish(other, b"not for anyone");
+        assert_eq!(next(&mut b), Some((t, b"from a".to_vec())));
+        assert_eq!(next(&mut a), None, "not echoed to the sender");
+        assert_eq!(next(&mut c), None, "not subscribed");
+        b.unsubscribe(t);
+        c.publish(t, b"x");
+        assert_eq!(next(&mut a), Some((t, b"x".to_vec())));
+        assert_eq!(next(&mut b), None);
+        // Too big for a frame: dropped, not truncated.
+        a.publish(t, &vec![0; LanSignaling::MAX_PAYLOAD + 1]);
+        b.subscribe(t);
+        assert_eq!(next(&mut b), None);
+        a.publish(t, &vec![5; LanSignaling::MAX_PAYLOAD]);
+        assert_eq!(next(&mut b), Some((t, vec![5; LanSignaling::MAX_PAYLOAD])));
+    }
+
+    #[test]
+    fn a_flood_of_junk_costs_a_bounded_read_per_poll() {
+        let mut a = carrier(1);
+        let t = Topic([3; 32]);
+        a.subscribe(t);
+        // Raw datagrams from another carrier's socket, which sends on loopback.
+        let junk = carrier(1);
+        let theirs = frame(&[1; 8], &Topic([4; 32]), b"other topic").unwrap();
+        for i in 0..2 * MAX_READS {
+            let d: &[u8] = if i % 2 == 0 { b"not a frame" } else { &theirs };
+            junk.sock.send_to(d, group(1)).unwrap();
+        }
+        junk.sock.send_to(&frame(&[1; 8], &t, b"wanted").unwrap(), group(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        // Each call reads at most MAX_READS datagrams, so it takes three to reach the wanted one.
+        let mut calls = 0;
+        let got = loop {
+            calls += 1;
+            if let Some(m) = a.poll() {
+                break m;
+            }
+            assert!(calls < 10, "the wanted frame never came");
+        };
+        assert_eq!(got, (t, b"wanted".to_vec()));
+        assert_eq!(calls, 3, "{calls} calls read {} datagrams", 2 * MAX_READS + 1);
+    }
+
+    /// NB64-1: a frame sent to the carrier's port by unicast, as a host off the link
+    /// could, is never delivered; frames sent to the group still are.
+    #[cfg(not(windows))]
+    #[test]
+    fn unicast_to_the_port_is_not_delivered() {
+        let mut a = carrier(2);
+        let t = Topic([6; 32]);
+        a.subscribe(t);
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        stranger.send_to(&frame(&[2; 8], &t, b"unicast").unwrap(), (Ipv4Addr::LOCALHOST, group(2).port())).unwrap();
+        // Then one to the group: it arrives, and the unicast one, sent first, never does.
+        carrier(2).publish(t, b"multicast");
+        assert_eq!(next(&mut a), Some((t, b"multicast".to_vec())));
+        assert_eq!(next(&mut a), None);
+    }
+}

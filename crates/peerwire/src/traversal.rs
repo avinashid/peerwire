@@ -73,6 +73,14 @@ const REFILL: Duration = Duration::from_secs(2);
 /// can't spend the whole offer budget.
 const SENDER_BURST: u32 = 8;
 const SENDER_REFILL: Duration = Duration::from_secs(1);
+/// Messages on this node's inbox opened (NB64-2): a burst, then one per `INBOX_REFILL`.
+/// Opening one costs a Noise_X open (210 µs measured on an aarch64 server core) before
+/// any proof can be checked, and its topic is on the wire, so anyone who can publish to
+/// it (a LAN neighbour, at line rate) could otherwise burn CPU without bound. Real
+/// offers fit well inside: those acted on are capped at `BURST`, then one per `REFILL`.
+const INBOX_BURST: u32 = 64;
+const INBOX_REFILL: Duration = Duration::from_millis(50);
+const _: () = assert!(INBOX_BURST > BURST, "a burst of real offers is opened before their budget runs out");
 /// Most offer nonces remembered (they are only kept for offers acted on).
 const MAX_NONCES: usize = 1024;
 const MAX_CANDIDATES: usize = 8;
@@ -384,6 +392,8 @@ pub struct Traversal<A: Address> {
     nonces: HashMap<(PeerId, u64), Instant>,
     hellos: Bucket,
     offers: Bucket,
+    /// Inbox messages opened, proved or not.
+    opened: Bucket,
     privacy: Privacy,
     /// The room Host a relay-only node picked as its relay (with no `via` and no
     /// pinned host): the first it dialled. Kept while that dial or link lasts.
@@ -437,6 +447,7 @@ impl<A: Address> Traversal<A> {
             nonces: HashMap::new(),
             hellos: Bucket::default(),
             offers: Bucket::default(),
+            opened: Bucket::default(),
             privacy: Privacy::Direct,
             picked: None,
             invite_key,
@@ -639,6 +650,10 @@ impl<A: Address> Traversal<A> {
                 self.on_hello(now, ep, from, role);
             }
         } else if topic == self.inbox {
+            // Spent before the open, the costly part, so a flood of junk waits like the rest.
+            if !self.opened.take(now, INBOX_BURST, INBOX_REFILL) {
+                return;
+            }
             let Some((from, body)) = sealed::open(&self.me, payload) else { return };
             // Room and invite offers end in an HMAC over sender, recipient and body,
             // under the room key or this node's invite key.
@@ -1777,6 +1792,30 @@ mod tests {
             t.handle_signal(later, &mut ep, topic, &room_hello(&key, &member(n), Role::Peer, 0));
         }
         assert_eq!(published(&mut t), 3);
+    }
+
+    /// NB64-2: inbox messages spend a token before they are opened, so after a burst
+    /// of junk a valid offer waits for a refill, and is then acted on.
+    #[test]
+    fn junk_on_the_inbox_spends_the_open_budget() {
+        let me = id(1).peer_id();
+        let (key, inbox) = (room_key(ROOM.0, ROOM.1), Topic::peer(&me));
+        let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        let t0 = Instant::from_millis(10);
+        // What a neighbour can send to a topic it read off the wire: it doesn't open.
+        for n in 0..INBOX_BURST {
+            t.handle_signal(t0, &mut ep, inbox, &[n as u8; 96]);
+        }
+        let valid = |nonce| offer_from(&id(2), &me, Some(&key), nonce, Role::Peer, vec![]);
+        t.handle_signal(t0, &mut ep, inbox, &valid(1));
+        assert_eq!(published(&mut t), 0, "no token left to open it");
+        // One token back after a refill period: one offer is acted on, the next waits again.
+        let later = t0 + INBOX_REFILL;
+        t.handle_signal(later, &mut ep, inbox, &valid(2));
+        assert_eq!(published(&mut t), 1);
+        assert_eq!(t.room_role(&id(2).peer_id()), Some(Role::Peer));
+        t.handle_signal(later, &mut ep, inbox, &offer_from(&id(3), &me, Some(&key), 1, Role::Peer, vec![]));
+        assert_eq!(published(&mut t), 0);
     }
 
     /// NB-032(b): nonces are kept only for offers acted on, and the map is capped.
