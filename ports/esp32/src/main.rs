@@ -63,7 +63,9 @@ fn main() -> anyhow::Result<()> {
     match seed {
         // Fresh host randomness from run.sh. QEMU's RNG gives every chip the same
         // sequence, so a generated identity would be the same on all of them (NB-063:
-        // without Wi-Fi up the ESP-IDF RNG is only pseudo-random).
+        // without Wi-Fi up the ESP-IDF RNG is only pseudo-random). The seed fixes the
+        // identity only; the Node's other random draws still repeat on every chip, so
+        // the emulator shows discovery and memory, not privacy.
         Some(seed) => builder = builder.identity(Identity::from_secret_bytes(&seed)),
         None => warn!("node {n}: no identity seed in flash; generating one from the chip's RNG"),
     }

@@ -33,8 +33,12 @@ Two emulator-only workarounds:
 
 - **Entropy.** QEMU's RNG gives every chip the same sequence: with identities
   generated on the chip, all of them came out the same PeerId. Hence the seed from
-  the host. On a board, the identity must come from real entropy: Wi-Fi up first,
-  or `bootloader_random_enable()`, stored in encrypted NVS (NB-063).
+  the host. The seed fixes the identity only: the Node's other random draws (its
+  endpoint and traversal seeds) still repeat on every chip, so two chips seal their
+  room hellos with the same nonces and a listener can tell who is in the room. The
+  emulator shows discovery and memory, not privacy. On a board, every draw must
+  come from real entropy: Wi-Fi up first, or `bootloader_random_enable()`, with the
+  identity stored in encrypted NVS (NB-063).
 - **Multicast.** ESP-IDF's openeth driver sets no multicast filter and QEMU's
   OpenCores MAC drops multicast frames that miss it, so the firmware puts the MAC in
   promiscuous mode. ESP-IDF logs `failed to add mac filter` when lwIP joins the

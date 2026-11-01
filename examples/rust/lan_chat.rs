@@ -5,7 +5,8 @@
 //! cargo run -p peerwire --example lan_chat -- kitchen   # on two or more machines on one Wi-Fi
 //! ```
 //!
-//! Type a line to send it to everyone in the room.
+//! Type a line to send it to everyone in the room. Anyone on the LAN who guesses the
+//! room's name can join it, so pick one others can't guess.
 
 use peerwire::{Event, LanSignaling, Lane, Node};
 use std::sync::mpsc;
@@ -31,7 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 Event::Connected { peer, path, .. } => println!("+ {peer} ({path:?})"),
                 Event::Disconnected { peer, .. } => println!("- {peer}"),
-                Event::Message { peer, data, .. } => println!("{peer}: {}", String::from_utf8_lossy(&data)),
+                // Escaped, so a member can't fake another's line or send terminal escapes.
+                Event::Message { peer, data, .. } => {
+                    println!("{peer}: {}", String::from_utf8_lossy(&data).escape_debug())
+                }
                 _ => {}
             }
         }
