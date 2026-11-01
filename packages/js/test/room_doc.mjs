@@ -346,8 +346,8 @@ for (const r of [b, c, d]) await r.leave();
     if (!(threw instanceof TypeError)) fail(`persist ${JSON.stringify(persist)} in Node: ${threw}`);
   }
   for (const r of [a2, b2, other]) await r.leave();
-  // The README's store over files. A copy it can't read (here a directory in its place: EISDIR) isn't "no copy":
-  // 'blocked', and that opening writes nothing over it. A save leaves no temp file.
+  // The store over files from docs/guides/shared-documents.md. A copy it can't read (here a directory in its place:
+  // EISDIR) isn't "no copy": 'blocked', and that opening writes nothing over it. A save leaves no temp file.
   const { readFile, writeFile, rename, rm, mkdtemp, mkdir, readdir } = await import('node:fs/promises');
   const files = (dir) => ({
     get: (key) => readFile(`${dir}/${key}`).then((b) => new Uint8Array(b), (e) => {
@@ -364,7 +364,7 @@ for (const r of [b, c, d]) await r.leave();
   f1.doc('board', { persist: disk }).map('meta').set('title', 'On disk');
   await f1.leave();
   const [record, ...more] = await readdir(dir);
-  if (more.length) fail(`the README's file store left ${more}`);
+  if (more.length) fail(`the guide's file store left ${more}`);
   await rename(`${dir}/${record}`, `${dir}/aside`);
   await mkdir(`${dir}/${record}`);
   console.warn = (m) => warned.push(m);
@@ -378,9 +378,9 @@ for (const r of [b, c, d]) await r.leave();
   await rm(`${dir}/${record}`, { recursive: true });
   await rename(`${dir}/aside`, `${dir}/${record}`);
   const fd = f2.doc('board', { persist: disk });
-  if ((await fd.loaded) !== 'loaded' || fd.map('meta').get('title') !== 'On disk' || (await readdir(dir)).length !== 1) fail("the README's file store");
+  if ((await fd.loaded) !== 'loaded' || fd.map('meta').get('title') !== 'On disk' || (await readdir(dir)).length !== 1) fail("the guide's file store");
   await fd.forget();
-  if ((await readdir(dir)).length) fail("forget() with the README's file store left a file");
+  if ((await readdir(dir)).length) fail("forget() with the guide's file store left a file");
   await f2.leave();
   await rm(dir, { recursive: true });
   console.log("a doc kept on this device: back when its member came back, a member never there got it, the copy sealed, forget() deletes it, also in files");

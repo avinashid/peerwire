@@ -35,48 +35,29 @@ CI and `scripts/gate.sh` fail the wasm build if it grows past 350 KiB (`WASM_MAX
 
 ## Functions
 
-| Group | Functions |
-|---|---|
-| Memory | `pw_alloc`, `pw_free` |
-| Endpoint | `pw_endpoint_new` (from a secret key, or a new identity from a 32-byte seed), `pw_endpoint_free`, `pw_secret` |
-| Links | `pw_connect`, `pw_connect_via`, `pw_add_candidate` (a direct address for a relayed peer: punch to it, move there once it answers), `pw_set_slow` (a slow address of a linked peer, such as a signalling pipe), `pw_add_relay` (a relay for a link on its slow address, probed and moved to once it answers, or on another relay, raced and taken if clearly faster), `pw_set_relay_only`, `pw_disconnect`, `pw_is_connected`, `pw_rtt_us`, `pw_path_rtt_us` (RTT over the link's current path: links race other paths of their kind, other relays or direct addresses, and take one clearly faster), `pw_stats` |
-| Data | `pw_send` (lane 0 reliable, 1 unreliable, 2 urgent) |
-| Host loop | `pw_handle_datagram`, `pw_handle_datagram_from` (for a handle only one peer sends on, such as its DataChannel: another peer's packets there are dropped unread), `pw_handle_timeout`, `pw_poll_timeout`, `pw_poll_transmit`, `pw_poll_event` |
-| Sealed messages | `pw_seal`, `pw_open` |
-| Nostr | `pw_nostr_keypair`, `pw_nostr_sign` (BIP-340 Schnorr, for Nostr signaling without a JS crypto library) |
+49 `pw_*` functions: 27 in every build (`src/lib.rs`: memory, the endpoint, links, sending,
+the host loop, sealed messages, Nostr keys) and 22 for shared documents, `pw_docs_*` and
+`pw_doc_*` (`src/sync.rs`), with the `sync` feature, which the wasm build leaves off.
 
-The host loop is the core's, through handles:
-
-```text
-pw_handle_datagram(h, now_us, addr, data, len)      for every datagram received
-                                                    (pw_handle_datagram_from with the peer, on a peer's own channel)
-pw_handle_timeout(h, now_us)                        once pw_poll_timeout(h) has passed
-while (n = pw_poll_transmit(h, now_us, &addr, buf, 1232)) > 0: send buf[..n] to addr
-while (n = pw_poll_event(h, buf, cap)) > 0: handle the event in buf[..n]
-                                             (n < 0: buf needs -n bytes; the event stays queued)
-```
-
-Events are encoded as `kind(u8) peer(32) ...`:
-
-```text
-1 CONNECTED      initiator(u8) path
-2 MESSAGE        lane(u8: 0 reliable, 1 unreliable) data...
-3 DISCONNECTED   reason(u8: 0 timeout, 1 closed, 2 replaced, 3 violation)
-4 CONNECT_FAILED
-5 PATH_CHANGED   path
-6 ADDR_OBSERVED  addr(u32)
-path = 0 addr(u32) | 1 relay_peer(32)
-```
-
-The full contract of each function is in its doc comment in `src/lib.rs`.
+The **[C ABI reference](../../docs/reference/c-abi.md)** lists every function with its C
+declaration, the buffer rules, the event encoding and an example in C. The full contract of
+each function is in its doc comment.
 
 ## Tests
 
-The module is tested from JavaScript, in the gate and in CI: `packages/js/test/node_pair.mjs`
-links two endpoints in Node.js, and the other `packages/js/test/*.mjs` tests cover privacy,
-rooms, peer-id checks, buffer reuse and calls after close. `cargo test -p peerwire-ffi` links
-two endpoints through the C ABI, restores an identity from its secret, round-trips a sealed
-message and verifies a Nostr signature.
+`cargo test -p peerwire-ffi --features sync` runs 9 tests through the C ABI:
+- two endpoints link, restore an identity from its secret, round-trip a sealed message and
+  verify a Nostr signature;
+- a relayed link moves to a direct address (`pw_add_candidate`), and a slow link moves
+  through a relay and back (`pw_add_relay`); a relay-only dial sends nothing direct;
+- `pw_handle_datagram_from` drops another peer's packets; path RTT is timed from the
+  handshake;
+- two members share a doc, and the ABI refuses what `doc.js` throws for;
+- a fuzz of the whole ABI checks every event's encoding.
+
+The wasm module is also tested from JavaScript, in the gate and in CI: the
+`packages/js/test/*.mjs` tests, starting with `node_pair.mjs`, which links two endpoints in
+Node.js.
 
 ## Status
 

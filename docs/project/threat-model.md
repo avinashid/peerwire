@@ -3227,8 +3227,9 @@ and what it accepted. Values are from main `7b716a2`.
 - Net Lab caps its event log at 500, the DOM log at 300 and chat at 200. The
   per-peer route history has no cap.
 - **README examples (`9e4640b`, reviewed 2026-10-24).** "Using with React" in
-  `packages/js/README.md` joins in an effect and leaves in its cleanup. A room `message`
-  is whatever the member chose to send: text, bytes or any JSON.
+  `packages/js/README.md` (since NB-066 [Your own hook](../guides/react.md#your-own-hook))
+  joins in an effect and leaves in its cleanup. A room `message` is whatever the member
+  chose to send: text, bytes or any JSON.
   - **RX-1 (Low):** the example's hook stored every message and rendered `{m.data}`. A
     member who sent an object made React throw while rendering, which unmounted the
     app, and the cleanup then left the room. So one broadcast object took every other
