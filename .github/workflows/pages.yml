@@ -1,6 +1,6 @@
 name: Pages
 
-# Builds the site (scripts/site.sh: the landing page, README and docs as HTML, the browser demos and their wasm)
+# Builds the site (scripts/site.sh: the landing page, the docs as HTML, the browser demos and their wasm)
 # and deploys it to GitHub Pages, at https://avinashid.github.io/peerwire/. Run by hand only (Actions → Pages →
 # Run workflow): nothing deploys on a push. The deploy needs Pages enabled with "GitHub Actions" as its source, and
 # waits on the github-pages environment's protection rules. See scripts/site/build.mjs for what the site holds and
