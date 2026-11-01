@@ -2471,8 +2471,8 @@ design:
   carries its own: the demos get `docker/examples-nginx.conf`'s, less
   `frame-ancestors` (a `<meta>` policy can't set it), and the other pages allow no
   script: `default-src 'none'`, with styles from the site and images from it or
-  `data:`, so no script, inline style or handler. Their menus are `<details>`, and the landing page's
-  code tabs are CSS radio buttons. No page sends a referrer.
+  `data:`, so no script, inline style or handler. Their menus are `<details>`, and the
+  landing page's code tabs are CSS radio buttons. No page sends a referrer.
 - **Versioned assets.** Every module, the wasm, the stylesheet and the images live under
   `assets/<id>/`, `<id>` being 12 hex digits of a SHA-256 of their contents. A demo
   page's `<script src>` is the only rewrite.
