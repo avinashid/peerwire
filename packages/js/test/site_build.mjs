@@ -165,12 +165,20 @@ const svgs = {
   xlink: '<svg><image xlink:href="other.png"/></svg>', url: '<svg><rect fill="url(https://x.example/f)"/></svg>',
   import: '<svg><style>@import "x.css";</style></svg>', dtd: '<!DOCTYPE svg [<!ENTITY x "y">]><svg/>',
   js: '<svg><a><set attributeName="href" to="javascript:alert(1)"/></a></svg>', data: '<svg><animate values="data:x"/></svg>',
+  // NB67-1: XML, where the namespace makes the script, and spellings a regex can't see through.
+  prefixed: '<svg xmlns:s="http://www.w3.org/2000/svg"><s:script>alert(1)</s:script></svg>',
+  xhtml: '<s:svg xmlns:s="http://www.w3.org/2000/svg" xmlns:h="http://www.w3.org/1999/xhtml"><s:foreignObject>' +
+    '<h:script>alert(1)</h:script></s:foreignObject></s:svg>',
+  charref: '<svg><a><set attributeName="href" to="&#106;avascript:alert(1)"/></a></svg>',
+  pi: '<?xml-stylesheet type="text/xsl" href="#x"?><svg/>',
 };
 const passed = Object.entries(svgs).filter(([, s]) => checkSvg(s).length === 0).map(([k]) => k);
-check(passed.length === 0 && checkSvg('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">' +
+check(passed.length === 0 && checkSvg('<?xml version="1.0" encoding="UTF-8"?>' +
+  '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">' +
   '<defs><linearGradient id="g"/></defs><rect fill="url(#g)"/><use href="#g"/></svg>').length === 0,
   `checkSvg refuses a script, handlers, foreignObject, outside references, url(), @import, a DTD, javascript: and data:, ` +
-  `and allows #ids and xmlns${passed.length ? ` (passed: ${passed.join(' ')})` : ''}`);
+  `prefixed elements, character references and processing instructions, and allows #ids, xmlns and the XML ` +
+  `declaration${passed.length ? ` (passed: ${passed.join(' ')})` : ''}`);
 const logo = fs.readFileSync(path.join(ROOT, 'docs/assets/logo.svg'), 'utf8');
 check(['logo.svg', 'favicon.svg'].every((f) => checkSvg(fs.readFileSync(path.join(ROOT, 'docs/assets', f), 'utf8')).length === 0) &&
   /fill="#5b6cf0"/.test(logo) && !/prefers-color-scheme|<text/.test(logo),

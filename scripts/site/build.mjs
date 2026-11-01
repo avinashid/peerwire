@@ -146,10 +146,16 @@ export function readIndex(root) {
 
 // An SVG under docs/assets/ is served from the site's origin with no policy of ours: opened on its own, script in
 // it would run there. What it may not hold: a script, an on* handler, a foreignObject, a DTD, or a reference to
-// anything outside itself (href and url() name only #ids; no URL scheme but its xmlns).
+// anything outside itself (href and url() name only #ids; no URL scheme but its xmlns). Opened on its own it's XML,
+// where an element's namespace, not its spelling, makes it a script (<s:script>), and character references and
+// processing instructions are spellings a regex can't see through: so no prefixed element, no &#, and no <? but the
+// XML declaration (NB67-1).
 export function checkSvg(svg) {
   const problems = [];
   if (/<script/i.test(svg)) problems.push('a <script>');
+  if (/<\/?[A-Za-z_][\w.-]*:/.test(svg)) problems.push('an element with a namespace prefix');
+  if (/&#/.test(svg)) problems.push('a character reference');
+  if (/<\?(?!xml\s)/.test(svg)) problems.push('a processing instruction');
   if (/\son[a-z]+\s*=/i.test(svg)) problems.push('an on* handler');
   if (/<foreignObject/i.test(svg)) problems.push('a <foreignObject>');
   if (/<!(?:DOCTYPE|ENTITY)/i.test(svg)) problems.push('a DTD');
