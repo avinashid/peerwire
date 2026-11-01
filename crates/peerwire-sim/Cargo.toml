@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "Deterministic network simulator for Peerwire: real endpoints over simulated latency, loss, uplinks and NATs, in virtual time"
+readme = "README.md"
+keywords = ["p2p", "simulator", "networking", "deterministic", "testing"]
+categories = ["simulation", "network-programming", "development-tools::testing"]
 
 [dependencies]
 peerwire-core = { path = "../peerwire-core" }

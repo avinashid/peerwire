@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "Godot 4 GDExtension: PeerwireMultiplayerPeer, Godot's high-level multiplayer over Peerwire with no server"
+readme = "README.md"
+keywords = ["godot", "gdextension", "multiplayer", "p2p", "gamedev"]
+categories = ["game-development", "network-programming"]
 publish = false
 
 [lib]

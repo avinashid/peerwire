@@ -98,9 +98,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose config --quiet
-      # Build only, never pushed. The second build reuses the shared build stage from the first.
-      - run: docker build --target peer -t peerwire-peer:ci .
-      - run: docker build --target examples -t peerwire-examples:ci .
+      - run: docker compose -f docker/compose.yml config --quiet
+      # Build only, never pushed. The second build reuses the shared build stage from the first. The context is the
+      # repo root; docker/Dockerfile.dockerignore says what stays out of it.
+      - run: docker build -f docker/Dockerfile --target peer -t peerwire-peer:ci .
+      - run: docker build -f docker/Dockerfile --target examples -t peerwire-examples:ci .
 
   # Next: a `godot` job building the GDExtension (NB-020) goes here, Linux only to start.

@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "C ABI for peerwire-core: one surface for a zero-import WebAssembly module (browsers) and native FFI (Dart, Swift, C)"
+readme = "README.md"
+keywords = ["p2p", "ffi", "wasm", "webassembly", "networking"]
+categories = ["network-programming", "wasm"]
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]

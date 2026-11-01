@@ -120,7 +120,7 @@ BROWSER=(
 
 # Paths that cannot change a Rust test, clippy or fmt result. Anything else runs the Rust steps: a new crate,
 # Cargo.lock, scripts/ (but the site's), examples/, a crate README (they run as doctests).
-NOT_RUST='^(packages/js/|packages/react/|docs/|\.github/|docker/|scripts/site(\.sh$|/)|[^/]+\.md$|LICENSE-|Dockerfile$|docker-compose\.yml$|\.dockerignore$)'
+NOT_RUST='^(packages/js/|packages/react/|docs/|\.github/|docker/|scripts/site(\.sh$|/)|[^/]+\.md$|LICENSE-|\.editorconfig$|Dockerfile$|docker-compose\.yml$|\.dockerignore$)'
 
 slug() { printf '%s' "${1,,}" | tr -cs 'a-z0-9' '-' | sed 's/-$//'; }
 

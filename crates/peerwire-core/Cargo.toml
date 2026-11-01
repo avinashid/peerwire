@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "Sans-IO peer-to-peer session core for Peerwire: Noise IK links, reliable, urgent and unreliable lanes, congestion control, peer relay and hole punching"
+readme = "README.md"
+keywords = ["p2p", "networking", "noise", "nat-traversal", "sans-io"]
+categories = ["network-programming", "cryptography"]
 
 [dependencies]
 snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2"] }

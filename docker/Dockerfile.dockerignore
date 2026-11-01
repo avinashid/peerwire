@@ -1,0 +1,13 @@
+# Only sources go into the build context. BuildKit reads this file for docker/Dockerfile; its paths are relative to
+# the context, the repo root.
+.git
+**/target
+packages/js/pkg
+**/node_modules
+tasks
+examples/godot
+ports/esp32/out
+ports/esp32/.embuild
+**/*.png
+**/.env
+**/*.key
