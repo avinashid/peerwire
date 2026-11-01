@@ -7,7 +7,8 @@
 //
 // Raw HTML is never passed through: any tag but <br> shows as text. A link or image whose scheme isn't http(s) or
 // mailto throws. Otherwise the caller's link(href) and image(src, alt) decide what each becomes, and
-// highlight(code, lang) the HTML of a fenced block with a language (null: the code escaped).
+// highlight(code, lang) the HTML of a fenced block with a language (null: the code escaped). A ```rust block shows
+// without the lines rustdoc hides (shownCode).
 //
 //   render(markdown, { link, image, highlight }) -> { html, title, ids, headings }
 //     title: the first heading's text; ids: every id made; headings: [{ level, id, text }] of the h2s and h3s
@@ -47,6 +48,19 @@ export function safeUrl(dest) {
     throw new Error(`refused link: ${JSON.stringify(dest)}`);
   }
   return dest;
+}
+
+// The docs' Rust samples are doc tests (NB-070), so they may hide their set-up as rustdoc does (map_line in its
+// markdown.rs). In a block whose info string's first word is rust (```rust,no_run), a line that, trimmed as Rust
+// trims, starts with "##" shows with that "##" as "#"; one that starts with "# " or is "#" is hidden; any other
+// (#[derive], #![...]) shows as it is.
+export function shownCode(code, lang) {
+  if (lang.split(',')[0] !== 'rust') return code;
+  return code.split('\n').flatMap((line) => {
+    const t = line.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+    if (t.startsWith('##')) return [line.replace('##', '#')];
+    return t.startsWith('# ') || t === '#' ? [] : [line];
+  }).join('\n');
 }
 
 const FENCE = /^( {0,3})(`{3,}|~{3,})[ \t]*([^\s`]*)[^`]*$/;
@@ -357,7 +371,8 @@ function html(list, ctx, tight = false) {
       }
       case 'code': {
         const lang = b.lang ? ` class="language-${escapeHtml(b.lang)}"` : '';
-        return `<pre><code${lang}>${(b.lang ? ctx.highlight(b.text, b.lang) : null) ?? escapeHtml(b.text)}</code></pre>`;
+        const code = shownCode(b.text, b.lang);
+        return `<pre><code${lang}>${(b.lang ? ctx.highlight(code, b.lang) : null) ?? escapeHtml(code)}</code></pre>`;
       }
       case 'hr':
         return '<hr>';

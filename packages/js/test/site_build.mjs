@@ -1,6 +1,6 @@
 // The site's build (scripts/site/build.mjs), its markdown renderer and its highlighter, with no browser:
 //  - the renderer escapes raw HTML, refuses link schemes but http(s) and mailto, makes GitHub's heading ids, and
-//    renders the lists, tables, alerts and emphasis the docs use;
+//    renders the lists, tables, alerts and emphasis the docs use; a ```rust block hides the lines rustdoc hides;
 //  - the highlighter only wraps the code in <span class="x">: the text of what it returns is the code, for every
 //    fenced block in the docs and for random input;
 //  - the sidebar is docs/README.md's: a doc missing from it or listed twice, or a stray line in a group, fails the
@@ -84,6 +84,21 @@ check(html('---\n\n    indented\n    code') === '<hr>\n<pre><code>indented\ncode
 check(render('## a &#9999999; &amp; b').ids[0] === 'a-9999999--b', 'an entity past U+10FFFF stays text');
 check(render('```rust\nfn x\n```\n\n```\nfn y\n```', { highlight }).html === '<pre><code class="language-rust">' +
   '<span class="k">fn</span> x</code></pre>\n<pre><code>fn y</code></pre>', 'a fence with a language is highlighted, one without isn\'t');
+// rustdoc's hidden lines (NB-070's doc tests): "# x" and "#" go, trimmed as Rust trims (U+0085 and U+00A0 are white
+// space to it, U+FEFF isn't); "##" shows as "#"; attributes stay. Only in ```rust blocks: rustdoc compiles neither
+// ```Rust nor ```rs (highlighted as Rust here) as Rust. rustdoc 1.99 renders these blocks the same.
+const codeText = (md) => [...render(md, { highlight }).html.matchAll(/<code[^>]*>([^]*?)<\/code>/g)].map((m) => textOf(m[1]));
+const sameList = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const RUST_IN = ['# use std::fmt;', '#', 'fn main() {', '    ## shown', '    #[derive(Debug)]', '    #![allow(x)]',
+  '    # let hidden = 1;', '\t#', '    #text', '    let s = "a ## b";', '  ##! ## c', '\u0085# nel', '#\u0085', '#\u00a0 ',
+  '\ufeff# bom', '}'];
+const RUST_OUT = ['fn main() {', '    # shown', '    #[derive(Debug)]', '    #![allow(x)]', '    #text', '    let s = "a ## b";',
+  '  #! ## c', '\ufeff# bom', '}'];
+check(sameList(codeText(`\`\`\`rust,no_run\n${RUST_IN.join('\n')}\n\`\`\`\n\n\`\`\`rust ignore\n# a\nb\n\`\`\``), [RUST_OUT.join('\n'), 'b']) &&
+  sameList(codeText('```sh\n# a\n#\n## b\n```\n\n```toml\n# a\n```\n\n```rs\n# a\n```\n\n```Rust\n# a\n```\n\n```text\n# a\n```\n\n' +
+    '    # a'), ['# a\n#\n## b', '# a', '# a', '# a', '# a', '# a']) &&
+  html('```rust\n# a\n<b>\n```') === '<pre><code class="language-rust">&lt;b&gt;</code></pre>',
+  'a ```rust block hides "# " and "#" lines and shows "##" as "#"; other blocks keep them');
 
 // 2. The highlighter.
 const SPAN = /<span class="[csnkotfmvpga]">|<\/span>/g;
@@ -359,13 +374,13 @@ const fakeBuild = (md, name) => {
 };
 const fakeOk = fakeBuild('# A\n\nSee [rooms](guides/rooms.md), [the group](README.md#test), [core](../crates/peerwire-core), [security](../SECURITY.md), ' +
   '[chat](../packages/js/demo/chat.html), [js](../packages/js/README.md) and [top](#a).\n\n![The logo](assets/logo.svg)\n\n' +
-  '## Two\n\n```rust\nlet x = 1;\n```\n\n### Three\n', 'fake-ok');
+  '## Two\n\n```rust,no_run\n# fn main() {\nlet x = 1;\n# }\n```\n\n### Three\n', 'fake-ok');
 const a = fs.existsSync(path.join(tmp, 'fake-ok/docs/A.html')) ? fs.readFileSync(path.join(tmp, 'fake-ok/docs/A.html'), 'utf8') : '';
 check(!fakeOk && a.includes('href="guides/rooms.html"') && a.includes('href="index.html#test"') && a.includes(`href="${REPO_URL}/tree/main/crates/peerwire-core"`) &&
   a.includes('href="../SECURITY.html"') && a.includes('href="../demo/chat.html"') &&
   a.includes(`href="${REPO_URL}/blob/main/packages/js/README.md"`) && a.includes('href="#a"') &&
   new RegExp(`<img src="\\.\\./assets/[\\da-f]{12}/img/logo\\.svg" alt="The logo" loading="lazy">`).test(a) &&
-  a.includes('<span class="k">let</span> x = <span class="n">1</span>;') &&
+  a.includes('<code class="language-rust,no_run"><span class="k">let</span> x = <span class="n">1</span>;</code>') &&
   /<li class="l2"><a href="#two">Two<\/a><\/li>\n<li class="l3"><a href="#three">Three<\/a><\/li>/.test(a) &&
   a.includes('<p class="eyebrow">Test</p>') && a.includes('<meta name="description" content="A page of the test.">') &&
   /<a class="prev" href="\.\.\/SECURITY\.html">/.test(a) && a.includes('<span></span></nav>'),
