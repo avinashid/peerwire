@@ -760,6 +760,7 @@ build your own for relay-only privacy or a custom room.
 | `privacy` | `'direct'` | `'direct'`, `'public-only'` or `'relay-only'` (needs `relay`): see [Privacy](#privacy). |
 | `relay` | `null` | The relay's PeerId, for `'relay-only'`. |
 | `offerProof` | `null` | `{ sign(to), check(from, p) }`: offers carry `p: await sign(to)`, and an offer is answered only if `check(from, p)` holds. |
+| `pipes` | `false` | Lets the transport carry datagrams as signalling messages (a pipe) for peers the room allows. `joinRoom` turns it on for `fallback: 'auto'` and opens the pipes itself (see [Through any NAT](#through-any-nat)). Off, pipe batches that arrive are refused (`badSignals`). |
 | `RTCPeerConnection` | `globalThis.RTCPeerConnection` | |
 
 **Throws** `Error` for an unknown `privacy`, `TypeError` for `'relay-only'` without a valid `relay`.
@@ -778,7 +779,7 @@ build your own for relay-only privacy or a custom room.
 |---|---|
 | `dropped` | Datagrams dropped by `loss`. |
 | `congested` | Datagrams dropped because the DataChannel had over 1 MiB queued (`MAX_BUFFERED`) or `send` threw. |
-| `badSignals` | Signals refused: a `from` that isn't a PeerId, an empty message, an offer whose proof fails or whose SDP doesn't apply, a second retry connection within 2 s, an `ice-batch` that isn't a list of at most 32. |
+| `badSignals` | Signals refused: a `from` that isn't a PeerId, an empty message, an offer whose proof fails or whose SDP doesn't apply, a second retry connection within 2 s, an `ice-batch` that isn't a list of at most 32, a pipe batch from a peer not allowed one (or with `pipes` off) or that isn't a list of at most 64 base64 datagrams. |
 | `resent` | Offers sent again for want of an answer, and answers sent again for a repeated offer. |
 | `throttled` | Offers, answers and restart asks not sent because the peer's publish budget was spent: 6 at once, then 1 per 5 s per peer. |
 | `restarts` | ICE restarts begun as the dialling side: at most 3 per link a minute. |
