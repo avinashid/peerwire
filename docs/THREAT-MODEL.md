@@ -3,8 +3,9 @@
 Scope of this document: `peerwire-core` (handshake, wire format, lanes, relay, NAT
 traversal, STUN, invites, sealed messages), the C ABI (`peerwire-ffi`), shared docs
 in Rust (`peerwire-sync`), the JavaScript glue and transport (`packages/js`), the
-React hooks (`packages/react`), the Nostr / BroadcastChannel signaling adapters, and
-the docs and demos site built for GitHub Pages. It records what Peerwire defends
+React hooks (`packages/react`), the Nostr, BroadcastChannel and LAN multicast
+(`LanSignaling`) signaling adapters, the ESP32 prototype (`ports/esp32`), and the
+docs and demos site built for GitHub Pages. It records what Peerwire defends
 against, what it does not, and the findings of the first security review (M5, NB-013)
 and of every review since.
 
@@ -33,6 +34,7 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../SECURITY.md).
 | Boundary | Trusted? | Notes |
 |---|---|---|
 | Signaling relay (Nostr, BroadcastChannel) | No | May read, drop, reorder, replay or inject any signaling message. Cannot forge a sealed payload or impersonate a PeerId. |
+| The LAN, for `LanSignaling` | No | Every device on the link, and every program on the machine, hears each frame and can send its own, with no relay to pace it. The same limits as a relay: cannot open or forge a sealed payload. See [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6). |
 | Peer relay (`FWD`/`RELAYED`) | No | Sees only ciphertext; rate-limited; forwards only to already-connected peers. |
 | NAT / on-path network | No | Noise authenticates the endpoints; cannot MITM. Can drop/delay. |
 | Remote peer | Partially | Authenticated, but may be malicious: send malformed frames, flood, probe. Parsers and resource caps are the defence. |
@@ -44,6 +46,8 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../SECURITY.md).
 - On-path attacker who observes and modifies datagrams.
 - A malicious or curious signaling relay, or any party who learns a room name or
   a target PeerId.
+- A device on the same LAN segment, or a program on the same machine, when the node
+  signals over `LanSignaling`.
 - A connected, authenticated peer behaving maliciously.
 
 Out of scope: compromise of the host OS or its CSPRNG; side channels in the
@@ -57,9 +61,9 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `4f681b4` (2026-10-31): NB-058 (`4609955`) merged in `2f68aa8`,
-NB-016 (`6107674`) in `888e0d6`, NB-010 (`41f4021`) in `869e4cf` and NB-010a
-(`0ac7547`) in `4f681b4`.** Fixes merged after `@peerwire/js` 0.2.0 and
+**Status as of main `34a35a8` (2026-11-01): NB-062 (`e6162f8`) merged in `d1f5d0f`
+and NB-064 (`4c86af7`) in `34a35a8`; the site was first deployed from `be989d4`.**
+Fixes merged after `@peerwire/js` 0.2.0 and
 `@peerwire/react` 0.1.1 reach apps with the next release of each.
 
 | Finding | Status |
@@ -129,7 +133,13 @@ NB-016 (`6107674`) in `888e0d6`, NB-010 (`41f4021`) in `869e4cf` and NB-010a
 | NB19-2 (Low) | Accepted (the lead's call, documented in the README and `index.d.ts`): 100 drops or more in a message's second, ordered before it, hide it on that relay, same section |
 | NB10-1, NB10-2 (Low), NB10-I1, NB10-I2 (Info) | **Fixed** by `c578263` and `41f4021` before NB-010 merged, so never on main (merged `869e4cf`), before `room.call()` was published (a member's `full` turns a joiner away only when the joiner's own roster has no seat for it either; 'stream' comes for every peer once its description applies, whatever it sends; a description with more than 64 candidates is dropped; the docs say call frames on a pipe go inside it), reviewed 2026-10-31; NB10-I1a, NB10-I3 (Info) and the residuals accepted, [Calls](#calls-roomcall-nb-010-nb-010a--nb10-1-nb10-2-nb10a-1) |
 | NB10a-1 (Low) | **Fixed** by `f979384` before NB-010a merged, so never on main (merged `4f681b4`): in the meet page, a camera or microphone request still pending at Leave is turned off when it lands, reviewed 2026-10-31, same section |
-| NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; the shared origin (Low, NB10a-I1) is the repo owner's call before the first deploy, and a frame check is a condition before the meet page goes on the site; NB16-I1…I3 (Info), [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1) |
+| NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; NB16-I1, I2 (Info) open, NB16-I3 done when Pages was enabled, [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1-nb16-2) |
+| The shared origin (Low) | Accepted by the repo owner on 2026-11-01: the site is served from `avinashid.github.io` with no origin of its own. The meet page stays off the site, so NB10a-I1 doesn't arise; it joins only with the owner's approval and a frame check, same section |
+| NB16-2 (Low) | Open: Net Lab, which is on the site, asks for the microphone, and a grant the browser keeps belongs to the shared origin, same section |
+| NB64-1, NB64-2 (Low), NB64-3, NB64-4, NB64-5 (Info) | **Fixed** by `a0fe2b1` and `4c86af7` before NB-064 merged, so never on main (merged `34a35a8`): `LanSignaling` takes only datagrams sent to its group, except on Windows; an inbox message spends a token before it is opened; `lan_chat` escapes member text; the docs say the ESP32 seed fixes the identity only, and what a replayed hello does. Reviewed 2026-11-01; residuals accepted, [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6) |
+| NB64-6 (Low) | Open (NB-065): a neighbour who knows two members' PeerIds can keep them from linking by flooding their inbox topics, same section |
+| NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
+| NB62-2 (Info in the emulator, High on a board) | Open (NB-063): before Wi-Fi is up, ESP-IDF's random numbers are only pseudo-random, and in QEMU every chip draws the same ones (measured), same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -378,7 +388,10 @@ The per-peer tag is `sha256("peerwire/peer/<PeerId>")`, a fixed function of the
 public PeerId. Anyone who knows a target's PeerId can compute the tag and
 subscribe to it on the public relays to learn whenever that identity is addressed,
 and to correlate activity across sessions and rooms. (SEC-2 hands out the PeerIds
-to room-name holders; even without it, PeerIds are shared in invites.)
+to room-name holders; even without it, PeerIds are shared in invites.) Rust's inbox
+topic (`Topic::peer`) is the same hash, and over `LanSignaling` it is in clear in every
+offer's frame, so every device on the LAN can do this, not only the relays
+([LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6)).
 
 **Fix.** Derive the routing tag from a rotating, room- or epoch-scoped secret
 rather than from the bare PeerId, so the tag is unlinkable to anyone who only
@@ -395,7 +408,9 @@ observer can replay a captured sealed offer later; the effect is limited (it
 triggers a redundant answer / ICE churn, feeding SEC-3) but non-zero. A re-sent
 retry offer (`retry: true`, Fast lane 1) also closes the recipient's pending connection
 to that peer, one that never opened, and so cancels an upgrade; the fallback link
-carries on.
+carries on. In Rust a room hello is taken again within 60 s of its time, which on
+`LanSignaling` any device on the LAN can replay; offers carry a nonce and a time
+([LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6), Replays).
 
 **Fix.** Put a `created_at`/nonce inside the sealed body and reject stale or
 duplicate (sender, nonce) at the adapter. The Nostr `created_at` is unauthenticated
@@ -2431,17 +2446,19 @@ the three probes reproduces on the fixed heads.
   [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043)).
 - **What the room learns.** Every room member, in the call or not, learns who is in it.
   A relay carrying a pipe sees the sizes and timing of the call frames inside it.
-- **The meet page on the public site.** It isn't there yet. Before it goes, see the
-  frame check and NB10a-I1 under
-  [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1).
+- **The meet page on the public site.** It stays off it: the owner accepted the shared
+  origin on 2026-11-01 with the meet page kept out. Before it ever goes, see the frame
+  check and NB10a-I1 under
+  [The docs and demos site](#the-docs-and-demos-site-nb-016--nb16-1-nb16-2).
 
-### The docs and demos site (NB-016) — NB16-1
+### The docs and demos site (NB-016) — NB16-1, NB16-2
 
 `scripts/site.sh` builds a static site into `target/site/`: a landing page, the README,
 the package READMEs and `docs/*.md` rendered to HTML by our own renderer
 (`scripts/site/markdown.mjs`), and the demos that need no server of ours (index, chat,
 poll, arena, Net Lab). `.github/workflows/pages.yml` deploys it to GitHub Pages at
-`avinashid.github.io/peerwire/`, run by hand only. It hasn't been deployed. The design:
+`avinashid.github.io/peerwire/`, run by hand only. It was first deployed on 2026-11-01,
+from `be989d4`, without the meet page. The design:
 - **No third-party code at runtime.** No CDN, font, analytics or remote image; the
   README's badges become text.
 - **The policy is a `<meta>` CSP.** Pages sends no headers we choose, so each page
@@ -2490,7 +2507,7 @@ full commit.
 **Status: fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed.
 Reviewed 2026-10-31 by reading the workflow. The guard's 7 mutants are all caught.
 
-**The shared origin (Low, the repo owner's call before the first deploy).**
+**The shared origin (Low): accepted by the repo owner on 2026-11-01.**
 `avinashid.github.io` is one origin for every Pages site of the account. `github.io` is
 on the Public Suffix List, so other accounts' sites are kept apart, but any script on
 any of this account's sites can:
@@ -2502,20 +2519,48 @@ any of this account's sites can:
   none today), register a service worker at scope `/` that serves its own JS for every
   `/peerwire/` URL and outlives any fix.
 
+The owner chose to keep the site on `avinashid.github.io`, with no custom domain for
+now (NB-061), so the account's other Pages sites share this origin, and the points above
+are accepted while it stays there. The meet page stays off the site: it joins only with
+the owner's approval and the frame check below.
+
 **NB10a-I1 (Info), the camera.** Browsers keep a camera or microphone grant per origin.
 Once the meet page is on the site, a visitor's "allow" there is a grant to
 `avinashid.github.io`, so every Pages site of the account could then use that visitor's
 camera or microphone without asking again, for as long as the browser keeps the grant.
+With the meet page off the site this doesn't arise for the camera; NB16-2 is the same
+case for the microphone, which a page on the site already asks for.
 
-**Fix, before the first deploy: an origin of the site's own.** A custom subdomain on a
+**NB16-2 — Net Lab's microphone grant goes to the shared origin (Low).** Net Lab is on
+the site, and its "Use microphone" button calls `getUserMedia({ audio: true })` and
+closes the microphone at once: Chrome offers a page's local addresses only while the
+microphone is allowed (MIC-1). The page says the grant is the site's, for later visits
+too. On the shared origin that site is `avinashid.github.io`, so once a visitor allows
+it and the browser keeps the grant:
+- any of the account's other Pages sites can open that visitor's microphone with no
+  prompt (the browser still shows that it is recording);
+- every WebRTC connection those sites make carries the device's local addresses.
+
+Keeping the meet page off the site doesn't cover this. Repro, by reading:
+`packages/js/demo/netlab.js` `useMic()`, and `scripts/site/build.mjs` `DEMOS`, which
+lists `netlab.html`. Nothing was run against the live site. Fix, while the site stays
+on the shared origin: the site build leaves Net Lab's microphone button out and the
+page skips what needs it (Net Lab works without the grant), with a `site_build.mjs`
+check that no page on the site calls `getUserMedia`; the Docker and local copies keep
+the button. An origin of the site's own fixes it with the rest. **Status: open**, found
+on 2026-11-01 while recording the owner's decision; the site review on 2026-10-31
+named the camera only.
+
+**Fix not taken for now: an origin of the site's own.** A custom subdomain on a
 domain the owner holds is the one choice no other site shares: an organisation's
 `<org>.github.io` is still shared by that organisation's other Pages sites. It keeps the
 demos' storage, scripting, service workers and media grants apart from everything else
 the account publishes, and the site needs no change, since its URLs are all relative.
 With a custom domain, verify it in the account's Pages settings and enforce HTTPS, and
 remove its DNS record if the site is ever taken down, so no other Pages site can claim
-it. Recording the shared origin as accepted instead holds only while nothing else on
-the account runs third-party scripts or user content, and it doesn't cover the camera.
+it. Accepting the shared origin, as the owner has, holds only while nothing else on the
+account runs third-party scripts or user content, and it doesn't cover the camera or
+the microphone (NB10a-I1, NB16-2).
 
 **Framing (Info; a condition for the meet page).** A `<meta>` policy can't set
 `frame-ancestors`, so any site can frame the demos. For today's pages that is accepted:
@@ -2550,7 +2595,190 @@ see. **Before the meet page joins the site's demos,** it must check
   exploitable: slots are whole, escaped elements in text positions (fix written, not
   merged).
 - **NB16-I3.** For the first deploy, the `github-pages` environment should take `main`
-  only, with a required reviewer, so a dispatch from another branch can't deploy.
+  only, with a required reviewer, so a dispatch from another branch can't deploy. Done
+  in the repository's settings when Pages was enabled on 2026-11-01: `main` only, the
+  owner as required reviewer.
+
+### LAN signalling, `LanSignaling` (NB-064) — NB64-1…NB64-6
+
+`LanSignaling` (`crates/peerwire/src/lan.rs`) is a `Signaling` carrier over UDP
+multicast, so rooms work on one LAN with no internet. Each message is one datagram to
+the group 239.255.80.87:20567 (organisation-local, TTL 1, multicast loop on,
+`SO_REUSEADDR`): `PWL1`, an 8-byte sender tag, the 32-byte topic and the payload, at
+most 1400 bytes, never fragmented. `poll` reads at most 64 datagrams a call, keeps only
+the topics subscribed to and drops its own frames by their tag. Rooms run over it
+unchanged: hellos sealed under the room key and proved by HMAC, offers sealed to the
+recipient (`Noise_X`) and proved under the room or invite key, and the room's budgets.
+The ESP32 port uses it too
+([below](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2)).
+
+Reviewed 2026-11-01 by reading `4bbde33`, `b80cac1` and `d5978f9`, then the fold-in
+`a0fe2b1` and `4c86af7`. Measured with loopback probes in release builds on a 4-core
+aarch64 host, and with two emulated ESP32 chips on a hub on 127.0.0.1; the probes
+aren't in the tree.
+
+**The LAN is as untrusted as a relay, with two differences.** Every device on the link,
+and every program on the machine (`SO_REUSEADDR` lets it bind the same port), gets a
+copy of each frame and can send its own. That is inherent: anyone on the link can join
+the group. It can't open or forge hellos or offers, and the room's budgets hold. But no
+relay paces what it sends (NB64-2, NB64-6), and as first written the socket also took
+unicast from off the link (NB64-1).
+
+**NB64-1 — The carrier took unicast from any host that reached its port (Low).** The
+socket was bound to `0.0.0.0:20567`, and `poll` never asks where a datagram was sent.
+TTL 1 limits what we send, not what we take, so any host that reached UDP 20567 by
+unicast (a public address with no firewall, a VPN or overlay peer, a container network)
+could inject frames from off the link: forged room or inbox traffic, and NB64-2's
+flood. Repro: a plain UDP socket sent a frame to `127.0.0.1:<port>`, and the carrier's
+`poll` returned it. Fix: bind the group address, so the socket takes only datagrams
+sent to the group; lwIP matches a socket bound to the group the same way (from reading
+its `udp.c`). Test: `lan::tests::unicast_to_the_port_is_not_delivered`.
+
+**Status: fixed** by `a0fe2b1` before NB-064 merged (`34a35a8`), so never on main,
+reviewed 2026-11-01. Measured: a unicast frame to the port is no longer delivered, and
+multicast still is, both ways.
+
+Residual (accepted): **Windows** can't bind a multicast address, so there the carrier
+binds `0.0.0.0` and still takes unicast to the port; NB64-2's budget bounds what that
+costs. A Windows firewall rule that lets UDP 20567 in should be scoped to the local
+subnet. Not measured: there is no Windows host here.
+
+**NB64-2 — Each forged inbox message cost a `Noise_X` open before any budget (Low).**
+Offers go to the recipient's inbox topic (`Topic::peer`), which is in clear on the
+wire, so a neighbour that hears one offer learns it. `handle_signal` ran `sealed::open`
+(210 µs here) on every payload on that topic, and only the proof after it spent a
+budget; `Node::poll` passes up to 256 messages a call. Measured, one `Node::poll` after
+256 junk frames: 46 ms on the inbox topic, against 7.8 µs idle, 83 µs on another topic
+and 0.72 ms on the room topic. Theoretical: CPU share = R × t_open for R junk frames a
+second, a whole core here at R ≈ 4,800 (about 0.7 MB/s). Nostr has the same path, but
+the relays pace what they forward. Fix: a node-wide bucket, a burst of `INBOX_BURST`
+(64) and then one per `INBOX_REFILL` (50 ms), taken before `sealed::open`; a
+compile-time check keeps that burst above the offer budget's (30). Test:
+`traversal::tests::junk_on_the_inbox_spends_the_open_budget`.
+
+**Status: fixed** by `a0fe2b1` before NB-064 merged, so never on main, reviewed
+2026-11-01. The bucket is node-wide, so it covers Nostr too. Measured, one `Node::poll`
+after junk on the inbox topic: 0.39 ms for 256 frames (median), 0.44 ms for 1,000. The
+worst poll is the burst's, 14 ms for 64 opens. Theoretical: at most 20 opens a second
+after the burst, 20 × 210 µs = 4.2 ms of CPU a second here. On an ESP32-C3 an open costs
+far more (not measured). The costliest junk is now on the room topic, one AES-GCM check
+a frame: 0.76 ms per 256 (measured).
+
+**NB64-3, NB64-4, NB64-5 (Info).** Fixed with the fold-in:
+- NB64-3: `lan_chat` printed a member's bytes raw, so anyone who guessed the room could
+  fake another member's line or send terminal escapes. It now prints `escape_debug()`
+  text and says to pick a room name others can't guess (`4c86af7`).
+- NB64-4: the ESP32 README offered the host seed as the answer to QEMU's RNG. It fixes
+  the identity only (NB62-2), as the README and `main.rs` now say (`4c86af7`).
+- NB64-5: the module docs said a neighbour can't replay hellos. They now say what a
+  replay does (below) and how the socket is bound (`a0fe2b1`).
+
+**NB64-6 — A targeted inbox flood can keep two members from linking (Low).** NB64-2's
+bucket hands out its tokens first come, first served, so junk above 20 frames a second
+spends them, and a real offer is opened only when a token is left as it arrives.
+Theoretical: P ≈ 20 / R that a given offer is opened, for R junk frames a second,
+R well above 20. Starving one member only delays the link: the other member opens its
+offer and dials, and the dial is let in, because the hello already made the dialler a
+member. Starving both blocks it. Measured, two nodes joining one room on loopback:
+
+| Junk on… | Linked after |
+|---|---|
+| nothing | 11 ms |
+| one member's inbox topic, ~1,800 frames/s | 2.0 s |
+| both members' inbox topics, ~1,800 frames/s each | not within 45 s |
+
+The attacker must be on the link (or reach the port on Windows), and must know both
+PeerIds beforehand: stable identities give them away (SEC-5, and the privacy list
+below). It is still a better default than a core burnt at 4,800 frames a second, or an
+ESP32 at far fewer. Fix: an outer 16-byte tag, an HMAC over the topic and the sealed
+bytes under a key derived from the room or invite key, checked before the open and
+under a budget of its own. Junk from anyone without the key then costs one HMAC and no
+token; a member, or anyone who has the room name, can still spend the budget. It
+changes the wire format, so its release notes need a compatibility line. Partial fixes:
+a cached keypair in `sealed::open` (one scalar multiplication of three, from reading
+`snow`, not measured), and per-source fairness in `LanSignaling` (a host on the link can
+spoof its source). **Status: open** (NB-065).
+
+**What a LAN neighbour learns.** Without the room key it can't read hellos or offers or
+forge them. It learns:
+- **That the host runs Peerwire at all:** its IGMP join for 239.255.80.87 and its
+  traffic on UDP 20567, before it joins any room.
+- **Room topics, and when each member says hello.** A topic is an unsalted SHA-256 of
+  the app and room names, as on Nostr, so a guessable name can be tested, then joined:
+  `lan_chat`'s default `lobby` and the docs' `kitchen` are such names. Treat room names
+  as secrets, as CHAT-1 says for the chat demo.
+- **Each member's inbox topic**, the hash of its PeerId that SEC-5 describes. Timing
+  ties it to the member's IP (the offers that answer a hello go there), so a neighbour
+  can recognise a device on another day or another network, and one that knows a PeerId
+  can tell which device holds it. On Nostr that takes the relays; here every device on
+  the link sees it.
+- **The sender's IP and MAC addresses, frame sizes, and the 8-byte sender tag**, which
+  links one carrier's frames across rooms and address changes for as long as it lives.
+
+**Replays.** A hello replayed within 60 s (`FRESH_MS`) is taken again: each member not
+yet linked to its sender offers to it again, at most once per 2 s per peer and within
+the hello budget (30, then one per 2 s). A replayed offer is dropped by its nonce, or as
+stale after 60 s. This is the LAN form of SEC-6.
+
+### The ESP32 prototype (NB-062, NB-064) — NB62-1, NB62-2
+
+`ports/esp32` runs the unchanged `peerwire::Node` on an ESP32-C3 under ESP-IDF, tested
+in Espressif's QEMU only. It is a feasibility prototype, not a supported target: it has
+its own workspace and toolchain, and the gate, CI and the site never build it. The
+emulated chips share one virtual LAN through `l2hub.mjs` on 127.0.0.1, so nothing
+leaves the host. NB-062 ran with fixed test identities and invites built from them.
+Since NB-064 each chip binds its own address, joins a room over `LanSignaling` and
+links with whoever answers, with an identity from a 32-byte seed that `run.sh` draws
+from the host's `/dev/urandom` for each node and each run. That seed is one of two
+QEMU-only settings; the other puts the emulated Ethernet MAC in promiscuous mode,
+because it drops multicast otherwise (a real C3 uses Wi-Fi).
+
+Reviewed 2026-11-01 by reading `a5b4d50` and `e6162f8` (NB-062), then `d5978f9` and
+`4c86af7` (NB-064), against ESP-IDF v5.5.5's lwIP and random-number sources. Measured
+with two chips of the NB-064 image on a hub of our own on 127.0.0.1.
+
+On lwIP, NB64-1's fix holds by reading: a socket bound to the group takes only
+datagrams sent to the group and sends from the interface's address. Eight chips of the
+rebuilt image linked 28 of 28 in QEMU before the merge. NB64-2's open costs a C3 far
+more than 210 µs (not measured), so its budget takes a larger share of a chip than of a
+PC.
+
+**NB62-1 — A node bound to any interface offers loopback only (Info).** `a5b4d50` said
+such a socket on ESP-IDF offers its default route's address and loopback. It offers
+`127.0.0.1` alone: ESP-IDF has no `getifaddrs`, and lwIP's UDP `connect` picks no source
+address, so `primary_ip` finds none. A board bound to `0.0.0.0` would give its peers no
+LAN address to dial. Fix: the comment says so, and the port binds the chip's own
+address, as it has since NB-062.
+
+**Status: fixed** by `4bbde33`, merged `34a35a8`, reviewed 2026-11-01.
+
+**NB62-2 — ESP-IDF's random numbers are only pseudo-random before Wi-Fi is up (Info in
+the emulator, High on a board).** `OsRng` reaches `esp_fill_random` through `getrandom`,
+which gives true random numbers only while the radio (Wi-Fi or Bluetooth) is on or
+`bootloader_random_enable()` is in effect. `Node::bind` draws from it up to four times,
+before an app has any reason to start Wi-Fi, and never reseeds: the identity (when the
+app passes none), the endpoint seed (Noise ephemerals, cookie secrets), the traversal
+seed (the invite key, and the nonces of room hellos and offers) and the port-mapping
+seed.
+
+Measured in QEMU, whose random numbers are the same sequence on every chip:
+- With identities generated on the chip, four chips came out with one PeerId.
+- With the host seed, which fixes the identity only, two chips sealed all four of their
+  room hellos with the same AES-GCM nonces under the room key. Two such hellos XOR to
+  the XOR of their plaintexts, so one chip's PeerId gives the other's (checked on the
+  12 hex digits each chip logs): between such chips the hello seal (SEC-2) hides
+  nothing.
+
+By reading, their Noise ephemerals, cookie secrets and invite keys repeat too. A link
+stays confidential while the identity keys are secret, because IK mixes in the
+static-static DH, but repeated ephemerals give it no forward secrecy; and one chip's
+invite key is every chip's, so its invite proves offers to any of them.
+
+Fix (NB-063, before any board): every draw in `bind` from real entropy, with Wi-Fi up
+first or `bootloader_random_enable()` around the draws, and the identity kept in
+encrypted NVS. Its test compares two chips' first hello nonces. Until then the emulator
+shows discovery and memory, not privacy, as the README has said since `4c86af7`
+(NB64-4). **Status: open** (NB-063).
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
@@ -3259,7 +3487,8 @@ mappings that carry over and are already handled in Peerwire:
 - Traffic analysis by a global passive adversary (packet sizes/timing) is not
   addressed.
 - Metadata at the signaling layer (who talks to whom, when) is minimized but not
-  hidden from a relay that correlates tags and timing.
+  hidden from a relay that correlates tags and timing. Over `LanSignaling` every
+  device on the LAN sees what a relay sees, and the sender's IP and MAC addresses.
 - The security of the underlying crypto crates is assumed.
 
 ## Review method
@@ -3273,4 +3502,6 @@ traversal or the FFI) read the diff against the threat model above and reproduce
 each finding on loopback, in the simulator or with unit-level probes in a scratch
 checkout. The probes stay out of the tree unless the fix adopts them as tests. The
 hard-NAT review (2026-10-23) used a `punch_case` probe for NB44-1, a `Node` probe
-for NB44-2 and a Chromium fleet probe for NB48-1.
+for NB44-2 and a Chromium fleet probe for NB48-1. The LAN review (2026-11-01) used
+loopback multicast probes for NB64-1, NB64-2 and NB64-6, and two emulated ESP32 chips on
+a hub on 127.0.0.1 for NB62-2.
