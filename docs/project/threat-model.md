@@ -136,7 +136,7 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB16-1 (Low) | **Fixed** by `6107674`, merged `888e0d6`, before the site was ever deployed (the Pages build job runs no third-party action), reviewed 2026-10-31; NB16-I1, I2 (Info) open, NB16-I3 done when Pages was enabled, [The docs and demos site](#the-docs-and-demos-site-nb-016-nb-067--nb16-1-nb16-2-nb67-1) |
 | The shared origin (Low) | Accepted by the repo owner on 2026-11-01: the site is served from `avinashid.github.io` with no origin of its own. The meet page stays off the site, so NB10a-I1 doesn't arise; it joins only with the owner's approval and a frame check, same section |
 | NB16-2 (Low) | Accepted by the repo owner on 2026-11-01 (NB-071): Net Lab keeps its microphone button on the site, and on a `*.github.io` host its note says, before and after the grant, that the permission covers the whole origin, so the account's other Pages sites could use the microphone, and see the device's local addresses, without asking (`1d434cb`, and `8f4a635` for the addresses, NB71-I1), reviewed 2026-11-01, same section |
-| NB67-1 (Low) | Open: the site build's `checkSvg` passes an SVG whose script has a namespace prefix (`<s:script>`), which runs when the file is opened on its own; NB67-I1, I2 (Info), same section |
+| NB67-1 (Low), NB67-I3, NB67-I4 (Info) | **Fixed** by `41c91ef`, `a7da8c2` and `4386eec` before NB-066 merged, so never on main (an SVG under `docs/assets/` may hold only 20 drawing elements, SVG's and xlink's namespaces and printable ASCII, with no prefix, `&#`, processing instruction, backslash, or `//` but in the `xmlns`), reviewed 2026-11-01; NB67-I1, I2 (Info) open, same section |
 | NB64-1, NB64-2 (Low), NB64-3, NB64-4, NB64-5 (Info) | **Fixed** by `a0fe2b1` and `4c86af7` before NB-064 merged, so never on main (merged `34a35a8`): `LanSignaling` takes only datagrams sent to its group, except on Windows; an inbox message spends a token before it is opened; `lan_chat` escapes member text; the docs say the ESP32 seed fixes the identity only, and what a replayed hello does. Reviewed 2026-11-01; residuals accepted, [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6) |
 | NB64-6 (Low) | Open (NB-065): a neighbour who knows two members' PeerIds can keep them from linking by flooding their inbox topics, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
@@ -2478,8 +2478,17 @@ design:
   page's `<script src>` is the only rewrite.
 - **Images.** A doc may show only a file under `docs/assets/`, named `[\w-]` with an
   image extension. An SVG there is served from the site's origin with no policy of
-  ours, so the build refuses one that holds a script, an `on*` handler, a
-  `foreignObject`, a DTD, or a reference to anything outside it (`checkSvg`; NB67-1).
+  ours, so the build (`checkSvg`; NB67-1) refuses one that holds:
+  - an element outside a list of 20 shapes, groups and paint servers (`svg`, `g`,
+    `path`, `rect`, `use`, `linearGradient`, `stop`, `mask`, …), so no `script`,
+    `foreignObject`, `iframe`, `a`, `image`, `style` or animation;
+  - a namespace but SVG's (and xlink's, as `xmlns:xlink`), or an element with a
+    prefix;
+  - an `on*` handler, a DTD, a character reference (`&#`), a processing instruction
+    other than the XML declaration, a backslash, or a character outside printable
+    ASCII, tab, LF and CR;
+  - a reference to anything outside it: `href` and `url()` name only `#ids`, and no
+    URL scheme, `javascript:`, `data:` or `//` appears but in the `xmlns`.
 - **Highlighting.** Code is highlighted at build time: `highlight.mjs` wraps escaped
   text in `<span class>` from a fixed set, and the test checks that the output's text
   is the code, for every fence in the docs and for 400 random inputs × 10 languages.
@@ -2497,7 +2506,8 @@ design:
 Reviewed 2026-10-31 by reading `2f68aa8..47ce300`, then the fix `6107674`, with one
 probe of the renderer (Node 22). The docs layout (NB-067, `6ba7cd9..a2d4029`, merged in
 `2735268`) was reviewed on 2026-11-01 by reading the diff, with a loopback probe of
-`checkSvg` in headless Chromium for NB67-1. Nothing was sent to Pages or GitHub.
+`checkSvg` in headless Chromium for NB67-1, and its fixes were re-read the same day,
+with the probes re-run on each. Nothing was sent to Pages or GitHub.
 
 **Checked and holding:**
 - The renderer escapes text, code, fence languages, heading ids, table cells, alerts and
@@ -2549,8 +2559,30 @@ embedded XSLT stylesheet (`<?xml-stylesheet href="#x"?>`) didn't run in that Chr
 and is refused already. Fix: refuse any element name with a prefix
 (`/<\/?[A-Za-z_][\w.-]*:/`), which the logo and favicon pass; refusing character
 references (`&#`) and processing instructions other than the XML declaration also
-closes the spellings a regex can't see through. **Status: open**, found on 2026-11-01 in
-the review of NB-066 before its push.
+closes the spellings a regex can't see through. Found on 2026-11-01 in the review of
+NB-066 before its push.
+
+The re-reads found two more forms, reproduced the same way. At `41c91ef`, which refused
+the prefix, `&#` and processing instructions: an XHTML element needs no prefix in the
+default namespace, so `<g xmlns="http://www.w3.org/1999/xhtml">` around
+`<iframe srcdoc="&lt;script&gt;…">` passed, since nothing in it spells `<script`, `&#`
+or a URL, and a srcdoc frame runs with its parent's origin; so did the same under an
+`<html>` root. At `a7da8c2`, which allowed only listed elements and SVG's namespace:
+U+1680 and U+FEFF are XML name characters that JS's `\s` matches, so a prefix of `g`
+and U+1680 read to every rule as an allowed `<g`, and hid a `<g…:script>` in the SVG
+namespace. The fix is all three steps: no prefix, `&#` or processing instruction but
+the XML declaration (`41c91ef`); only 20 drawing elements, and no namespace but SVG's
+and xlink's (`a7da8c2`); and only printable ASCII, tab, LF and CR, so that `\s` and
+`\w` agree with XML's names (`4386eec`). With no DTD, `&#`, processing instruction or
+other character, every element of the parsed file is a literal `<name` in the source,
+where the list sees it. `site_build.mjs` holds each form, and taking out the
+allow-list, the namespace rule or any of `4386eec`'s three rules makes it fail.
+
+**Status: fixed** by `41c91ef`, `a7da8c2` and `4386eec` before NB-066 merged, so never
+on main or on the site. Reviewed 2026-11-01 by reading the diffs and re-running the
+loopback probes on each: every form above is refused, and the logo and favicon pass.
+Residual: the check reads the source with regexes, not an XML parser; it holds because
+what it allows has one reading, as above.
 
 **The shared origin (Low): accepted by the repo owner on 2026-11-01.**
 `avinashid.github.io` is one origin for every Pages site of the account. `github.io` is
@@ -2665,6 +2697,17 @@ see. **Before the meet page joins the site's demos,** it must check
   named like an image would publish whatever it points at on the build machine. A
   reviewer sees it in the diff as a one-line file. Refusing symlinks there (`lstat`)
   would be tighter (not written).
+- **NB67-I3.** `<a><set attributeName="href" to="java…script:…"/>`, with a tab inside
+  `javascript:`, passed the check until the allow-list: the URL parser drops the tab,
+  but the regex saw no `javascript:`. It didn't run on a click in headless Chromium.
+  The allow-list refuses `a` and `set` (`a7da8c2`), and `site_build.mjs` holds the
+  case.
+- **NB67-I4.** Until `4386eec`, an SVG opened on its own could still fetch from another
+  host, with no script: CSS takes a string URL in `image-set('//host/…' 1x)`, with no
+  `url(` or scheme, and a CSS escape spells `url(` as `u\72l(` and `//` as `\2f \2f`,
+  in a `style` or a `fill`. Each fetched from a second loopback port in headless
+  Chromium; that host learns the visitor's IP address. Fixed by `4386eec`: no
+  backslash, and no `//` but in the `xmlns`.
 
 ### LAN signalling, `LanSignaling` (NB-064) — NB64-1…NB64-6
 
