@@ -119,7 +119,7 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB6F-1, NB6F-2, NB6F-3 (Low) | **Fixed** by `2e71dc5`, merged `8140998`, before `persist` was published (an opening that couldn't read the copy never writes it; one save at a time, paced at 256 KiB/s; a 5 s load deadline). The seal is security's call, in `52bb7e3`. Reviewed 2026-10-28; residuals R1–R4, [Docs kept on this device](#docs-kept-on-this-device-persist-nb-006f--nb6f-1nb6f-3) |
 | NB6F-2a (Info) | **Fixed** by `b45e15c`, merged `76bdd64` (each retry of a store that keeps failing waits twice as long, 1 s up to 64 s, until a save succeeds), reviewed 2026-10-29, same section |
 | I3a (Info), I4 (accepted) | **Fixed** by `1b0fc35` (the `VERSION` comment covers a copy read only in part; `close()` and `leave()` say they wait for the store), same section |
-| I2, fixed further (Info) | **Fixed** by `a29ce7c` (NB-077), merged `45a793b` (a save on a connection the browser closed before its close event came is tried once more on a new one, 250 ms later; a request that fails no longer leaves the save hanging), reviewed 2026-11-03; NB77-I1 (Info) open (NB-078), same section |
+| I2, fixed further, NB77-I1 (Info) | **Fixed** by `a29ce7c` (NB-077), merged `45a793b` (a save on a connection the browser closed before its close event came is tried once more on a new one, 250 ms later; a request that fails no longer leaves the save hanging), and NB77-I1 by `1fc707a` (NB-078), merged `9f165e6` (an open the browser aborts, as one made at that close event, is tried once more, 250 ms later), reviewed 2026-11-03, same section |
 | NB6H-1 (Low), NB6H-2, I1, I2 (Info) | **Fixed** by `c1b3878`, merged `71f5c6e`, with NB6H-2's first half by `dc156a3` (relay pacing on a monotonic clock, with clamps; the pipe asks `wait()` again each second; a held relay is sent nothing at close; `wait?()` typed). Reviewed 2026-10-29, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
 | NB6I-1 (Low) | **Fixed** by `dc156a3`, merged `6a60ef0` (a relay slowed behind its queue gives up its turn), beside the lead's close fix `cf4a0a9`. Reviewed 2026-10-29; a relay that answers OK and delivers nothing gets 1/n of the pipe (accepted), same section |
 | Half-open relay (Low) | **Fixed** by `659eb28`, merged `5ae3c4e` (NB-006j: a relay that has answered nothing for 5 s since it was sent an event gets no pipe turns while one that answers is left; its next OK gives them back), reviewed 2026-10-29; residuals NB6J-I1, I3, I4 (Info, accepted), same section |
@@ -1617,12 +1617,19 @@ and `leave()` never resolved.
       overtakes it, and a try that failed never applied.
     - A full disk (`QuotaExceededError`), a refused open (private mode) and a retry
       that fails still fail at once. A late close event drops only its own connection.
-  - **NB77-I1** (open, NB-078). A save started at the old connection's close event opens
-    a new one at once, while the browser is still deleting the site's data. That open is
-    aborted, and isn't retried, so the doc can still warn once: 5 of 5 runs on loopback,
-    with the page busy across the clear. The next save keeps the copy. Retrying an open
-    that fails with `AbortError`, once, `REOPEN_MS` later, fixes it (measured, not
-    merged).
+  - **NB77-I1**, fixed by `1fc707a` (NB-078), merged `9f165e6`, reviewed 2026-11-03. A
+    save started at the old connection's close event opened a new one at once, while the
+    browser was still deleting the site's data. That open was aborted, and wasn't
+    retried, so the doc could still warn once: 5 of 5 runs on loopback, with the page
+    busy across the clear. The next save kept the copy.
+    - An open that fails with `AbortError` is now tried once more, `REOPEN_MS` later. A
+      refused open (`InvalidStateError`, as in some private modes) still fails at once,
+      and a store call opens at most twice.
+    - The doc_store test forces this order. It also fakes opens aborted every time (2
+      tries), refused (1 try) and aborted for 100 ms (the second opens).
+    - Noted: an open whose upgrade transaction aborts (a first open, as a full disk may
+      make it) fails with `AbortError` too, by the spec, so it is also tried once more,
+      250 ms later. Bounded as above.
 - **I3**, fixed by `2e71dc5`: a comment by `VERSION` says to bump it whenever an older
   release's `restore()` would refuse what `snapshot()` now writes.
   - **I3a**, fixed by `1b0fc35`: `parseFrame` and `restore()` ignore fields they don't
