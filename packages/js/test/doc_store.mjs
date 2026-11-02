@@ -260,29 +260,31 @@ try {
   });
   if (tries !== 2 || saveWarnings.length !== 1 || !saveWarnings[0].includes("can't keep a copy")) fail(`a connection closed every time: ${tries} tries, ${saveWarnings.join(' | ')}`);
   // The store's own: an open the browser aborts every time is tried twice, then rejects; one refused (as in some
-  // private modes) rejects at once.
+  // private modes) rejects at once; with opens aborted for 100 ms (the browser still deleting), the second opens.
   const failedOpens = await page2.evaluate(async () => {
     const store = (await import('/src/store.js')).browserStore();
     window.conn.close();
     window.conn.dispatchEvent(new Event('close'));
     const open = IDBFactory.prototype.open;
     const got = [];
-    for (const name of ['AbortError', 'InvalidStateError']) {
+    for (const [name, ms] of [['AbortError', Infinity], ['InvalidStateError', Infinity], ['AbortError', 100]]) {
       let n = 0;
-      IDBFactory.prototype.open = function () {
+      const until = performance.now() + ms;
+      IDBFactory.prototype.open = function (...a) {
         n++;
+        if (performance.now() >= until) return open.apply(this, a);
         const r = { error: new DOMException('failed', name) };
         setTimeout(() => r.onerror());
         return r;
       };
-      const set = store.set('k', new Uint8Array(1)).then(() => 'stored', (e) => e.name);
-      got.push([await Promise.race([set, new Promise((r) => setTimeout(r, 10000, 'hung'))]), n]);
+      const read = store.get('k').then(() => 'read', (e) => e.name);
+      got.push([await Promise.race([read, new Promise((r) => setTimeout(r, 10000, 'hung'))]), n]);
     }
     IDBFactory.prototype.open = open;
     return JSON.stringify(got);
   });
-  if (failedOpens !== '[["AbortError",2],["InvalidStateError",1]]') fail(`opens that fail (the store's answer, the opens tried): ${failedOpens}`);
-  console.log('a save on a connection closed before its close event came, or at it (its open aborted), saved on a new one; one closed every time was tried twice, an open aborted every time twice and one refused once');
+  if (failedOpens !== '[["AbortError",2],["InvalidStateError",1],["read",2]]') fail(`opens that fail (the store's answer, the opens tried): ${failedOpens}`);
+  console.log('a save on a connection closed before its close event came, or at it (its open aborted), saved on a new one; one closed every time was tried twice, an open aborted every time twice, one refused once, and with opens aborted for 100 ms the second opened');
 
   // IndexedDB refusing: 'blocked', one warning, and the doc still syncs with another tab.
   const ctx2 = await browser.newContext();
