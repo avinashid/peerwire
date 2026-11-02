@@ -82,15 +82,17 @@ browser tests.
 | Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `nos.lol` / `relay.primal.net` / `nostr.mom` and connect over public STUN |
 
 The script runs every step even after a failure, prints a PASS/FAIL/SKIP summary and exits non-zero if any step
-failed. It builds first (wasm, clippy, the Rust tests with `--no-run`), then runs the Rust tests beside the Node
-tests (four at a time) and, once those are done, beside the browser tests (one at a time). Each step logs to
-`target/gate-logs/<step>.log`. A full `--strict` run takes about 3 minutes on the 4-core aarch64 dev host with a
-warm build: 163–174 s over four runs on `f253797`, against 273 s for the old one-step-at-a-time script on the same
-commit. The Rust tests take 27 s under cargo-nextest and the debug fuzz run about 30 s; the Node tests take 22 s,
-set by `room_adopt.mjs`; the browser tests take 130–145 s and set the total. A fresh worktree compiles the
-workspace first and takes several times that. With no Rust change since `origin/main`, the Rust steps are skipped.
-Since NB-006d, `doc_catchup.mjs` (72 s) sets the Node tests' time, and starts first. `--strict` adds CI's 24 Node
-tests on Node 22 to the same pool: 88 s for the pool alone, against 59 s without them (four jobs, 30 Oct).
+failed. It builds first (wasm, React, clippy). Then the Rust lane (the Rust test builds, then the tests) runs from
+start to end at a lower CPU priority (nice 10), beside the Node tests (`GATE_JOBS`, default 4, at a time) and then
+the browser tests (`GATE_BROWSER_JOBS`, default 3, at a time, slowest first). The Node tests keep every core busy, so
+the browser tests wait for them; the browser tests mostly wait on timers, so several run at once. Each step logs to
+`target/gate-logs/<step>.log`. A full `--strict` run takes under 4 minutes on the 4-core aarch64 dev host with a
+warm build: 219–222 s over two runs on 2 Nov (NB-075), against 453 s with the browser tests one at a time; `--quick`
+takes about 90 s. The Node tests take about 110 s, set by `doc_catchup.mjs` (70 s, started first) and CI's 24 Node
+tests on Node 22 under `--strict`; the browser tests about 110 s, set by `netlab_punch_close.mjs` (67 s). After a
+change to `peerwire-core` the Rust lane sets the total: 279 s, of which its release test builds took 171 s. A fresh
+worktree compiles the workspace first and takes several times that. With no Rust change since `origin/main`, the
+Rust steps are skipped.
 
 **Release gate:** `scripts/gate.sh --strict` green on `main`, plus `--nostr` once per release, plus the CI matrix
 (below) green on all three OSes.
