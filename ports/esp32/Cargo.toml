@@ -5,14 +5,14 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/avinashid/peerwire"
 homepage = "https://avinashid.github.io/peerwire/"
-description = "A Peerwire prototype on the ESP32-C3 under ESP-IDF: chips find each other over LanSignaling and link peer to peer"
+description = "A Peerwire prototype on the ESP32-C3 and ESP32 under ESP-IDF: chips find each other over LanSignaling and link peer to peer"
 readme = "README.md"
 keywords = ["esp32", "esp-idf", "embedded", "p2p", "iot"]
 categories = ["embedded", "network-programming"]
 publish = false
 rust-version = "1.82"
 
-# Not a member of the repo's workspace: it builds for ESP32-C3 only, with its own toolchain (see README.md).
+# Not a member of the repo's workspace: it builds for the ESP32-C3 and ESP32 only, with their own toolchains (see README.md).
 [workspace]
 
 [[bin]]
