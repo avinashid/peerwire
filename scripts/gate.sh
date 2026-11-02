@@ -13,15 +13,17 @@
 #   scripts/gate.sh --full      run the Rust steps (tests, clippy, fmt, fuzz) even when no Rust changed: they are
 #                               skipped when every file changed since GATE_BASE is JS, docs or another non-Rust path
 #
-# Order: the builds first (wasm, clippy, the Rust tests with --no-run). Then the Rust tests run beside the Node tests
-# (GATE_JOBS at a time) and, once those are done, beside the browser tests (one at a time). The Rust tests run under
-# cargo-nextest when it is installed (doctests through cargo test --doc), else under cargo test. Each step writes its
-# own log, target/gate-logs/<step>.log; a failed step's log is printed in full before the summary.
+# Order: the builds first (wasm, React, clippy). Then the Node tests alone (GATE_JOBS at a time), as they keep every
+# core busy; then the browser tests (GATE_BROWSER_JOBS at a time), which mostly wait on timers, beside the Rust lane
+# (its test builds, then the tests) at a lower CPU priority. The Rust tests run under cargo-nextest when it is
+# installed (doctests through cargo test --doc), else under cargo test. Each step writes its own log,
+# target/gate-logs/<step>.log; a failed step's log is printed in full before the summary.
 # The docs' samples are tested too (NB-070): the Rust ones compile, never run, in "rust doc samples" (on a change to
 # Rust or Markdown); the JS ones and every link in "node docs samples" and "node docs links".
 #
 # Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs),
-#      GATE_JOBS (Node tests at once, default 4), GATE_BASE (what "changed" is measured against, default origin/main),
+#      GATE_JOBS (Node tests at once, default 4), GATE_BROWSER_JOBS (browser tests at once, default 3),
+#      GATE_BASE (what "changed" is measured against, default origin/main),
 #      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 300),
 #      NODE_CI (the node binary --strict runs CI's Node tests on, default the newest ~/.nvm/versions/node/v<CI's>.*).
 set -u
@@ -45,6 +47,7 @@ if ! command -v node >/dev/null && [ -s "$HOME/.nvm/nvm.sh" ]; then . "$HOME/.nv
 WASM_MAX_BYTES=${WASM_MAX_BYTES:-358400}
 WASM=packages/js/pkg/peerwire_ffi.wasm
 GATE_JOBS=${GATE_JOBS:-4}
+GATE_BROWSER_JOBS=${GATE_BROWSER_JOBS:-3}
 GATE_BASE=${GATE_BASE:-origin/main}
 GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT:-300}
 LOGS=target/gate-logs
@@ -96,7 +99,8 @@ NODE=(
   "node react hooks|node packages/react/test/hooks.mjs"
 )
 NODE_FIRST='^node[0-9]* (doc catchup|room adopt|room retry|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
-# Browser tests (headless Chromium on loopback): one at a time, as WebRTC timing suffers under load.
+# Browser tests (headless Chromium on loopback): GATE_BROWSER_JOBS at a time, not more, as WebRTC timing suffers
+# under load. Each serves its page on a port the OS picks (serve.mjs), so they can run side by side.
 BROWSER=(
   "browser|node packages/js/test/browser.mjs 2"
   "arena|node packages/js/test/arena.mjs 8 10"
@@ -121,6 +125,8 @@ BROWSER=(
   "react example|node packages/react/test/example.mjs"
   "site|node packages/js/test/site.mjs"
 )
+# The slowest browser tests (16-66 s on 2 Nov), started first.
+BROWSER_FIRST='^(netlab punch close|netlab mic|call|netlab birthday|meet)$'
 
 # Paths that cannot change a Rust test, clippy or fmt result. Anything else runs the Rust steps: a new crate,
 # Cargo.lock, scripts/ (but the site's), examples/, a crate README (they run as doctests).
@@ -286,8 +292,8 @@ fuzz_tests() {
   return $r
 }
 
-# Build every test binary, so the run phase doesn't wait on cargo's lock: 1 if any build failed. A build error
-# shows up again, and is reported, in the step that runs the tests.
+# Build every test binary first, so a test step's time is the tests': 1 if any build failed. A build error shows up
+# again, and is reported, in the step that runs the tests.
 rust_build() {
   local r=0 run=(cargo test)
   [ $nextest = 0 ] || run=(cargo nextest run)
@@ -340,39 +346,60 @@ node_pool() {
   wait
 }
 
-browser_lane() {
-  local s
+# The browser tests, GATE_BROWSER_JOBS at a time, the slowest first. Run in a subshell, like node_pool.
+browser_pool() {
+  local s first slow
   if [ $quick = 1 ]; then
     for s in "${BROWSER[@]}"; do skip "${s%%|*}" "--quick"; done
-  else
-    for s in "${BROWSER[@]}"; do entry "$s"; done
+    return
   fi
-}
-
-# The Rust tests run from start to end; the Node tests beside them, then the browser tests, which overlap only the
-# Rust tests. That order came in when room_adopt.mjs failed beside Chromium and nextest ("batches still went over
-# signalling"). The flake is fixed: the test by 2c80929, its cause in webrtc.js by 5a7e4ba. On a4299d3 it passed
-# 66 of 66 runs: 20 in the gate's Node mix, 18 pinned to one core with a CPU burner, 16 beside cargo nextest and
-# 12 beside the browser tests.
-lanes() {
-  if [ -z "$rust_skip" ]; then
-    {
-      step "cargo test" rust_tests
-      step "rust doc samples" doc_samples
-      [ $strict = 0 ] || step "fuzz (debug)" fuzz_tests
-    } &
-  elif [ -z "$samples_skip" ]; then
-    step "rust doc samples" doc_samples &
-  fi
-  (node_pool)
-  browser_lane
+  for first in 1 0; do
+    for s in "${BROWSER[@]}"; do
+      slow=0
+      [[ ${s%%|*} =~ $BROWSER_FIRST ]] && slow=1
+      [ $slow = $first ] || continue
+      while [ "$(jobs -rp | wc -l)" -ge "$GATE_BROWSER_JOBS" ]; do wait -n; done
+      entry "$s" &
+    done
+  done
   wait
 }
 
-echo "logs: $LOGS/   rust tests: $([ $nextest = 1 ] && echo cargo-nextest || echo cargo test)   node jobs: $GATE_JOBS"
+# The Rust lane: the test builds, then the tests, at nice 10, so the Node and browser tests beside it keep their
+# timing.
+rust_lane() {
+  renice -n 10 -p $BASHPID >/dev/null
+  if [ -z "$rust_skip" ]; then
+    echo "==> build the Rust tests (log: $LOGS/rust-build.log)"
+    rust_build >"$LOGS/rust-build.log" 2>&1 </dev/null || echo "==> a Rust test build failed: see $LOGS/rust-build.log"
+    step "cargo test" rust_tests
+    step "rust doc samples" doc_samples
+    [ $strict = 0 ] || step "fuzz (debug)" fuzz_tests
+  elif [ -z "$samples_skip" ]; then
+    step "rust doc samples" doc_samples
+  fi
+}
+
+# The Rust lane runs from start to end, at a lower priority; the Node tests beside it, then the browser tests. The
+# Node tests keep every core busy (2 Nov, four at a time: 17% idle) and the known load flakes are theirs, so the
+# browser tests wait for them; they mostly wait on timers themselves (73% idle one at a time), so they run
+# GATE_BROWSER_JOBS at a time, and the Rust lane gets the rest. On 2 Nov a warm --strict took 453 s with the old
+# order (browser tests one at a time, after the Node tests and the Rust tests beside them), 281 s with this one and
+# 2 browser jobs, and 222 s with 3; each slow browser test took as long as when it ran alone. room_adopt.mjs once failed beside Chromium and
+# nextest ("batches still went over signalling"); that flake is fixed: the test by 2c80929, its cause in webrtc.js
+# by 5a7e4ba, and it passed 66 of 66 runs on a4299d3.
+lanes() {
+  rust_lane &
+  (node_pool)
+  (browser_pool)
+  wait
+}
+
+echo "logs: $LOGS/   rust tests: $([ $nextest = 1 ] && echo cargo-nextest || echo cargo test)   node jobs: $GATE_JOBS" \
+  "  browser jobs: $GATE_BROWSER_JOBS"
 [ ${#CI_TESTS[@]} = 0 ] || echo "CI's Node tests: ${#CI_TESTS[@]}, on $CI_NODE"
 
-# 1. Builds, one after another: they share target/ and cargo's lock.
+# 1. Builds, one after another: they share target/ and cargo's lock. The Rust test builds come later, in the Rust lane.
 step "wasm build" ./packages/js/build.sh
 step "wasm size+imports" wasm_check
 step "react build+types" react_build
@@ -396,11 +423,9 @@ else
   else
     skip "cargo fmt" "rustfmt not installed"
   fi
-  echo "==> build the Rust tests (log: $LOGS/rust-build.log)"
-  rust_build >"$LOGS/rust-build.log" 2>&1 </dev/null || echo "==> a Rust test build failed: see $LOGS/rust-build.log"
 fi
 
-# 2. The Rust tests and the Node tests side by side, then the browser tests one at a time.
+# 2. The Node tests, then the browser tests beside the Rust lane.
 lanes
 
 if [ $nostr = 1 ]; then

@@ -56,8 +56,8 @@ All of them, through the gate. It runs every step even after a failure, and prin
 The flags combine. Before you open a pull request, run `scripts/gate.sh --quick`, or `--quick --strict` if you changed
 Rust, and each browser test next to what you changed. CI runs the Rust and Node steps on every pull request, but not
 the browser tests. A change to docs or comments only needs no run. Each step logs to `target/gate-logs/<step>.log`;
-`GATE_JOBS` sets how many Node tests run at once (default 4). [Testing](docs/project/testing.md) describes what each
-test covers.
+`GATE_JOBS` sets how many Node tests run at once (default 4), and `GATE_BROWSER_JOBS` how many browser tests (default
+3). [Testing](docs/project/testing.md) describes what each test covers.
 
 Tests stay local: loopback, the LAN or the simulator. The only outside services they may touch are public STUN
 (Google, Cloudflare) and the Nostr relays `nos.lol`, `relay.primal.net` and `nostr.mom`, in small tests behind
