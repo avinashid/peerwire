@@ -25,7 +25,7 @@
 # Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs),
 #      GATE_JOBS (Node tests at once, default 4), GATE_BROWSER_JOBS (browser tests at once, default 3),
 #      GATE_BASE (what "changed" is measured against, default origin/main),
-#      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 300),
+#      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 180),
 #      GATE_RETRY (1, the default: a Node or browser test that failed runs once more alone, a pass then is FLAKY;
 #      0: no second run), GATE_RETRY_MAX (more failed tests than this, default 5, run no second time),
 #      NODE_CI (the node binary --strict runs CI's Node tests on, default the newest ~/.nvm/versions/node/v<CI's>.*).
@@ -52,7 +52,7 @@ WASM=packages/js/pkg/peerwire_ffi.wasm
 GATE_JOBS=${GATE_JOBS:-4}
 GATE_BROWSER_JOBS=${GATE_BROWSER_JOBS:-3}
 GATE_BASE=${GATE_BASE:-origin/main}
-GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT:-300}
+GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT:-180}
 GATE_RETRY=${GATE_RETRY:-1}
 GATE_RETRY_MAX=${GATE_RETRY_MAX:-5}
 LOGS=target/gate-logs
@@ -221,7 +221,9 @@ ci_tests() {
 }
 [ $strict = 0 ] || ci_tests
 
-# entry "name|command": one step from the NODE or BROWSER list. A step that runs past GATE_STEP_TIMEOUT fails.
+# entry "name|command": one step from the NODE or BROWSER list. A step that runs past GATE_STEP_TIMEOUT fails. The
+# slowest took 103 s under load (doc catchup, 3 Nov); a test that hangs, as doc store once did after printing its
+# result (NB-077), holds the gate up to this long before it runs again alone.
 entry() {
   local cmd
   read -ra cmd <<<"${1#*|}"
