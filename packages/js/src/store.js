@@ -47,8 +47,9 @@ let indexedDbStore = null;
 // (UnknownError in Chromium, AbortError in the spec), or, in Chromium, only its request fails (AbortError) and the
 // transaction never ends.
 const CLOSED = new Set(['InvalidStateError', 'UnknownError', 'AbortError']);
-// How long a run that failed so waits to open the connection again: closing it under a busy page, the browser may
-// still be deleting the site's data, and it aborts an open meanwhile (briefly; test/doc_store.mjs forces this order).
+// How long a run that failed so, or whose open the browser aborted, waits to open the connection again: closing it
+// under a busy page, the browser may still be deleting the site's data, and it aborts an open meanwhile, as one made
+// at the close event (briefly; test/doc_store.mjs forces these orders).
 const REOPEN_MS = 250;
 
 export function browserStore() {
@@ -83,10 +84,18 @@ export function browserStore() {
   };
   // `op` on the object store in a transaction of `mode`: its request's result once committed. One that fails as on a
   // closed connection (CLOSED) runs once more, REOPEN_MS later, on a connection opened anew, as its close event may
-  // not have come yet; any other failure (a full disk), or one on that new connection, rejects.
+  // not have come yet, and so does one whose open the browser aborted (AbortError); any other failure (an open
+  // refused, as in some private modes; a full disk), or one on that new connection, rejects.
   const run = async (mode, op, again = true) => {
     const p = open();
-    const d = await p;
+    let d;
+    try {
+      d = await p;
+    } catch (e) {
+      if (!again || e?.name !== 'AbortError') throw e;
+      await new Promise((resolve) => setTimeout(resolve, REOPEN_MS));
+      return run(mode, op, false);
+    }
     try {
       return await new Promise((resolve, reject) => {
         const tx = d.transaction('docs', mode);
