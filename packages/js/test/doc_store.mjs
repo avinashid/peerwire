@@ -120,7 +120,9 @@ try {
   if ((await open(page2)) !== 'empty') fail('a page opened after forget() found a copy');
   console.log('forget() deleted the record');
 
-  // The browser closes the connection under the page (its site data cleared): the next save opens it again.
+  // The browser closes the connection under the page (its site data cleared): the next save opens it again. A save
+  // that never ends fails here in 10 s, not at the gate's timeout (whose SIGTERM makes Playwright close the browser,
+  // so the waiting evaluate fails with 'Target page, context or browser has been closed').
   const saveWarnings = [];
   page2.on('console', (m) => m.type() === 'warning' && saveWarnings.push(m.text()));
   await page2.evaluate(async () => {
@@ -128,11 +130,15 @@ try {
     await window.doc.save();
   });
   await (await ctx.newCDPSession(page2)).send('Storage.clearDataForOrigin', { origin: `http://127.0.0.1:${port}`, storageTypes: 'indexeddb' });
-  await page2.evaluate(async () => {
+  const left = await page2.evaluate(() => {
     window.doc.set('strokes').add('after clearing');
-    await window.doc.save();
-    await window.room.leave();
+    const saved = (async () => {
+      await window.doc.save();
+      await window.room.leave();
+    })();
+    return Promise.race([saved, new Promise((r) => setTimeout(r, 10000, 'hung'))]);
   });
+  if (left === 'hung') fail('the save after the site data was cleared hung');
   const cleared = await records(page2);
   if (cleared.length !== 1 || saveWarnings.length) fail(`saved after the site data was cleared: ${cleared.length} records, ${saveWarnings.join(' | ')}`);
   console.log('the connection closed by the browser: the next save opened it again');
