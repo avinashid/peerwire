@@ -42,36 +42,66 @@ export function memoryStore() {
 // The page's IndexedDB store (database 'peerwire', object store 'docs'), made on first use.
 let indexedDbStore = null;
 
+// How a transaction fails on a connection the browser closed (site data cleared, a connection lost) before the page
+// heard of it: transaction() throws InvalidStateError once the close is known; until then the transaction aborts
+// (UnknownError in Chromium, AbortError in the spec), or, in Chromium, only its request fails (AbortError) and the
+// transaction never ends.
+const CLOSED = new Set(['InvalidStateError', 'UnknownError', 'AbortError']);
+// How long a run that failed so waits to open the connection again: closing it under a busy page, the browser may
+// still be deleting the site's data, and it aborts an open meanwhile (briefly; test/doc_store.mjs forces this order).
+const REOPEN_MS = 250;
+
 export function browserStore() {
   if (!globalThis.indexedDB) throw new TypeError("persist: true needs IndexedDB; pass a store instead, e.g. memoryStore()");
   if (indexedDbStore) return indexedDbStore;
+  // db: a promise of the connection runs use, until it closes. drop(p) forgets p if it is still db, so the next run
+  // opens another, and an old connection's late close event leaves a newer one be.
   let db = null;
-  const open = () => (db ??= new Promise((resolve, reject) => {
-    const r = indexedDB.open('peerwire', 1);
-    r.onupgradeneeded = () => r.result.createObjectStore('docs');
-    r.onsuccess = () => {
-      // A newer version opened elsewhere: let it, and open again next time; so too once the browser closed it
-      // (site data cleared, a connection lost).
-      r.result.onversionchange = () => {
-        r.result.close();
-        db = null;
+  const drop = (p) => db === p && (db = null);
+  const open = () => {
+    if (db) return db;
+    const p = (db = new Promise((resolve, reject) => {
+      const r = indexedDB.open('peerwire', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('docs');
+      r.onsuccess = () => {
+        const d = r.result;
+        // A newer version opened elsewhere: let it, and open again next time; so too once the browser closed it
+        // (site data cleared, a connection lost).
+        d.onversionchange = () => {
+          d.close();
+          drop(p);
+        };
+        d.onclose = () => drop(p);
+        resolve(d);
       };
-      r.result.onclose = () => (db = null);
-      resolve(r.result);
-    };
-    r.onerror = () => reject(r.error);
-  }).catch((e) => {
-    db = null;
-    throw e;
-  }));
-  const run = async (mode, op) => {
-    const d = await open();
-    return new Promise((resolve, reject) => {
-      const tx = d.transaction('docs', mode);
-      const req = op(tx.objectStore('docs'));
-      tx.oncomplete = () => resolve(req.result);
-      tx.onabort = () => reject(tx.error ?? req.error ?? new Error('IndexedDB transaction aborted'));
-    });
+      r.onerror = () => reject(r.error);
+    }).catch((e) => {
+      drop(p);
+      throw e;
+    }));
+    return p;
+  };
+  // `op` on the object store in a transaction of `mode`: its request's result once committed. One that fails as on a
+  // closed connection (CLOSED) runs once more, REOPEN_MS later, on a connection opened anew, as its close event may
+  // not have come yet; any other failure (a full disk), or one on that new connection, rejects.
+  const run = async (mode, op, again = true) => {
+    const p = open();
+    const d = await p;
+    try {
+      return await new Promise((resolve, reject) => {
+        const tx = d.transaction('docs', mode);
+        const req = op(tx.objectStore('docs'));
+        tx.oncomplete = () => resolve(req.result);
+        req.onerror = () => reject(tx.error ?? req.error);
+        tx.onabort = () => reject(tx.error ?? req.error ?? new Error('IndexedDB transaction aborted'));
+      });
+    } catch (e) {
+      if (!again || !CLOSED.has(e?.name)) throw e;
+      d.close();
+      drop(p);
+      await new Promise((resolve) => setTimeout(resolve, REOPEN_MS));
+      return run(mode, op, false);
+    }
   };
   return (indexedDbStore = {
     get: (key) => run('readonly', (s) => s.get(key)),

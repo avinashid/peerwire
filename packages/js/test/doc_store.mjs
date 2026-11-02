@@ -3,8 +3,8 @@
 // sealed (its key and bytes show neither the room, the doc nor what it holds). A write the page makes just
 // before it is hidden is saved at once, so a tab that then crashes (no pagehide) still has it when it opens the
 // doc again. forget() deletes the record. Once the browser closes the connection (site data cleared), the next
-// save opens it again. With IndexedDB refusing (as in some private modes) the doc says 'blocked', warns once and
-// still syncs with a second tab.
+// save opens it again, also when it runs before the close event comes (each order forced). With IndexedDB refusing
+// (as in some private modes) the doc says 'blocked', warns once and still syncs with a second tab.
 //
 //   node packages/js/test/doc_store.mjs
 
@@ -120,7 +120,9 @@ try {
   if ((await open(page2)) !== 'empty') fail('a page opened after forget() found a copy');
   console.log('forget() deleted the record');
 
-  // The browser closes the connection under the page (its site data cleared): the next save opens it again.
+  // The browser closes the connection under the page (its site data cleared): the next save opens it again. A save
+  // that never ends fails here in 10 s, not at the gate's timeout (whose SIGTERM makes Playwright close the browser,
+  // so the waiting evaluate fails with 'Target page, context or browser has been closed').
   const saveWarnings = [];
   page2.on('console', (m) => m.type() === 'warning' && saveWarnings.push(m.text()));
   await page2.evaluate(async () => {
@@ -128,14 +130,119 @@ try {
     await window.doc.save();
   });
   await (await ctx.newCDPSession(page2)).send('Storage.clearDataForOrigin', { origin: `http://127.0.0.1:${port}`, storageTypes: 'indexeddb' });
-  await page2.evaluate(async () => {
+  const left = await page2.evaluate(() => {
     window.doc.set('strokes').add('after clearing');
-    await window.doc.save();
-    await window.room.leave();
+    const saved = (async () => {
+      await window.doc.save();
+      await window.room.leave();
+    })();
+    return Promise.race([saved, new Promise((r) => setTimeout(r, 10000, 'hung'))]);
   });
+  if (left === 'hung') fail('the save after the site data was cleared hung');
   const cleared = await records(page2);
   if (cleared.length !== 1 || saveWarnings.length) fail(`saved after the site data was cleared: ${cleared.length} records, ${saveWarnings.join(' | ')}`);
   console.log('the connection closed by the browser: the next save opened it again');
+
+  // The same in the orders a loaded page meets it, forced: a save on the connection after the browser closed it,
+  // before its close event came. Closed already, transaction() throws InvalidStateError ('closed'); with the site
+  // data cleared while the page is busy, a transaction made before it hears of it fails only its request
+  // (AbortError) and never ends ('busy before the transaction'), and one whose put succeeded aborts as it commits
+  // (UnknownError, 'busy before the commit'). Each saves on a connection opened anew, without a warning, and the save
+  // after it keeps that one, even if the old one's close event comes late. A connection still open that fails so
+  // ('aborted on an open connection') is closed as it is left. One closed every time is tried twice: the doc warns
+  // once and goes on.
+  await page2.reload();
+  if ((await open(page2)) !== 'loaded') fail('no copy before the forced closes');
+  let go = false;
+  let polled;
+  await page2.route('**/hold', (route) => {
+    polled?.();
+    route.fulfill({ contentType: 'text/plain', body: go ? 'go' : 'wait' });
+  });
+  await page2.evaluate(() => {
+    window.opens = 0;
+    const open = IDBFactory.prototype.open;
+    IDBFactory.prototype.open = function (...a) {
+      window.opens++;
+      return open.apply(this, a);
+    };
+    // f(connection), in the same task as the next transaction made, just before it (every one, with `always`).
+    window.beforeTransaction = (f, always) => {
+      const tx = (window.transaction ??= IDBDatabase.prototype.transaction);
+      IDBDatabase.prototype.transaction = function (...a) {
+        if (!always) IDBDatabase.prototype.transaction = tx;
+        f(this);
+        return tx.apply(this, a);
+      };
+    };
+    // f(request), as the next put is made.
+    window.onPut = (f) => {
+      const put = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function (...a) {
+        IDBObjectStore.prototype.put = put;
+        const req = put.apply(this, a);
+        f(req);
+        return req;
+      };
+    };
+    // Keeps the page busy, hearing nothing, until the test says go (a request made in sync, which it answers).
+    window.busy = () => {
+      for (;;) {
+        const x = new XMLHttpRequest();
+        x.open('GET', '/hold', false);
+        x.send();
+        if (x.responseText === 'go') return;
+      }
+    };
+    // Whether promise p isn't settled in 10 s.
+    window.hung = (p) => Promise.race([p.then(() => false), new Promise((r) => setTimeout(r, 10000, true))]);
+    // Saves a write after `how`, then, once a close event of the connection it failed on came, another: the
+    // connections each opened and whether that one is closed, or 'hung' for a save not done in 10 s.
+    window.forced = async (how) => {
+      let old;
+      if (how === 'closed') window.beforeTransaction((d) => (old = d).close());
+      if (how === 'aborted on an open connection') window.onPut((req) => ((old = req.transaction.db), req.transaction.abort()));
+      if (how === 'busy before the transaction') window.beforeTransaction((d) => ((old = d), window.busy()));
+      if (how === 'busy before the commit') window.onPut((req) => ((old = req.transaction.db), req.addEventListener('success', window.busy)));
+      const opens = window.opens;
+      window.doc.set('strokes').add(how);
+      if (await window.hung(window.doc.save())) return 'hung';
+      const reopened = window.opens - opens;
+      let closed = false;
+      try {
+        old.transaction('docs').abort();
+      } catch (e) {
+        closed = e.name === 'InvalidStateError';
+      }
+      old?.dispatchEvent(new Event('close'));
+      window.doc.set('strokes').add(`${how}, again`);
+      if (await window.hung(window.doc.save())) return 'hung';
+      return [reopened, window.opens - opens - reopened, closed];
+    };
+  });
+  for (const how of ['closed', 'aborted on an open connection', 'busy before the transaction', 'busy before the commit']) {
+    go = false;
+    const busy = new Promise((r) => (polled = r));
+    const opened = page2.evaluate((how) => window.forced(how), how);
+    // Cleared once the page is held (unless the save failed before it got there).
+    if (how.startsWith('busy') && (await Promise.race([busy.then(() => true), opened.then(() => false)]))) {
+      await (await ctx.newCDPSession(page2)).send('Storage.clearDataForOrigin', { origin: `http://127.0.0.1:${port}`, storageTypes: 'indexeddb' });
+    }
+    go = true;
+    const got = await opened;
+    const recs = await records(page2);
+    if (JSON.stringify(got) !== '[1,0,true]' || recs.length !== 1 || saveWarnings.length) fail(`a save on a connection ${how}: ${JSON.stringify(got)} (opened, then, the old one closed), ${recs.length} records, ${saveWarnings.join(' | ')}`);
+  }
+  const tries = await page2.evaluate(async () => {
+    let n = 0;
+    window.beforeTransaction((d) => (n++, d.close()), true);
+    window.doc.set('strokes').add('closed every time');
+    const hung = await window.hung(window.doc.save());
+    IDBDatabase.prototype.transaction = window.transaction;
+    return hung || (await window.hung(window.room.leave())) ? 'hung' : n;
+  });
+  if (tries !== 2 || saveWarnings.length !== 1 || !saveWarnings[0].includes("can't keep a copy")) fail(`a connection closed every time: ${tries} tries, ${saveWarnings.join(' | ')}`);
+  console.log('a save on a connection closed before its close event came saved on a new one; one closed every time was tried twice');
 
   // IndexedDB refusing: 'blocked', one warning, and the doc still syncs with another tab.
   const ctx2 = await browser.newContext();
