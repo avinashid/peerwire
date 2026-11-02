@@ -21,10 +21,10 @@ browser tests.
 
 | Step | Command | Passes when |
 |---|---|---|
-| Rust tests | `cargo nextest run --workspace --release --profile gate` and `cargo test --doc --workspace --release` (`cargo test --workspace --release` without cargo-nextest) | every test passes (ignored tests are known gaps, below) |
-| Rust doc samples | `RUSTDOCFLAGS="--cfg docs_samples --test-runtool true" cargo test --doc --workspace --release doc_samples`; runs after any Rust or Markdown change, even when the other Rust steps skip | NB-070: every ```` ```rust ```` block in `README.md` and the `docs/` pages listed in `mod doc_samples` (`crates/peerwire/src/lib.rs`) compiles. They never run: rustdoc runs `true` in their place, as many are host loops or dial public relays. A sample may hide its set-up behind `# ` lines (the site hides them too); one that can't compile is ```` ```rust,ignore ```` with the reason beside it |
+| Rust tests | `cargo nextest run --workspace --cargo-profile gate --profile gate` and `cargo test --doc --workspace --profile gate` (`cargo test --workspace --profile gate` without cargo-nextest) | every test passes (ignored tests are known gaps, below) |
+| Rust doc samples | `RUSTDOCFLAGS="--cfg docs_samples --test-runtool true" cargo test --doc --workspace --profile gate doc_samples`; runs after any Rust or Markdown change, even when the other Rust steps skip | NB-070: every ```` ```rust ```` block in `README.md` and the `docs/` pages listed in `mod doc_samples` (`crates/peerwire/src/lib.rs`) compiles. They never run: rustdoc runs `true` in their place, as many are host loops or dial public relays. A sample may hide its set-up behind `# ` lines (the site hides them too); one that can't compile is ```` ```rust,ignore ```` with the reason beside it |
 | Lints | `cargo clippy --workspace --all-targets` (`-- -D warnings` with `--strict`) | no errors; `--strict` is clean today |
-| Fuzz, debug build (`--strict`) | `cargo nextest run --profile gate --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz` (or `cargo test` with the same arguments) | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
+| Fuzz, debug build (`--strict`) | `cargo nextest run --profile gate --cargo-profile fuzz --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim -p peerwire-sync fuzz` (or `cargo test --profile fuzz` with the same arguments) | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
 | Node tests on CI's Node (`--strict`) | CI's `wasm + node` job's `node packages/<pkg>/test/<file>.mjs` steps again, on its `node-version` (22): the newest `~/.nvm/versions/node/v22.*`, or `NODE_CI`. Both are read from `.github/workflows/ci.yml`, so neither drifts from CI; each is its own step, `node22 <name>` | each passes (NB-055: Node 22's `JSON.stringify` recurses and 26's doesn't, so NB-053 failed only in CI); no Node 22 is one SKIP with its reason, a CI test step it can't read a FAIL (`node22 list`) |
 | Format | `cargo fmt --all -- --check` | no diff (skipped if rustfmt is not installed) |
 | wasm build | `packages/js/build.sh` | builds `packages/js/pkg/peerwire_ffi.wasm` |
@@ -81,18 +81,27 @@ browser tests.
 | Site | `node packages/js/test/site.mjs [--shots DIR]` | NB-016: the site built and served under `/peerwire/`, as GitHub Pages will. Every page is reachable from the landing page and every relative link and `#fragment` resolves (fetched without running scripts); the landing page and docs load nothing from another host; index, poll, arena and netlab reach ready with every request under `assets/<id>/`; two chat tabs link on a direct route over `?signal=local` and the invite link keeps the subpath; no page logs a CSP violation or throws. NB-067: light and dark; the code tabs switch with CSS alone; on a phone no page is wider than the screen and the docs' sidebar is a menu that opens; the old README, THREAT-MODEL and package URLs land on their new pages |
 | Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `nos.lol` / `relay.primal.net` / `nostr.mom` and connect over public STUN |
 
-The script runs every step even after a failure, prints a PASS/FAIL/SKIP summary and exits non-zero if any step
-failed. It builds first (wasm, React, clippy). Then the Rust lane (the Rust test builds, then the tests) runs from
-start to end at a lower CPU priority (nice 10), beside the Node tests (`GATE_JOBS`, default 4, at a time) and then
-the browser tests (`GATE_BROWSER_JOBS`, default 3, at a time, slowest first). The Node tests keep every core busy, so
-the browser tests wait for them; the browser tests mostly wait on timers, so several run at once. Each step logs to
-`target/gate-logs/<step>.log`. A full `--strict` run takes under 4 minutes on the 4-core aarch64 dev host with a
-warm build: 219–222 s over two runs on 2 Nov (NB-075), against 453 s with the browser tests one at a time; `--quick`
-takes about 90 s. The Node tests take about 110 s, set by `doc_catchup.mjs` (70 s, started first) and CI's 24 Node
-tests on Node 22 under `--strict`; the browser tests about 110 s, set by `netlab_punch_close.mjs` (67 s). After a
-change to `peerwire-core` the Rust lane sets the total: 279 s, of which its release test builds took 171 s. A fresh
-worktree compiles the workspace first and takes several times that. With no Rust change since `origin/main`, the
-Rust steps are skipped.
+The script runs every step even after a failure, prints a PASS/FAIL/FLAKY/SKIP summary and exits non-zero if any
+step failed. Two lanes run from the start. The Rust lane, at a lower CPU priority (nice 10): clippy, fmt, the Rust
+test builds, then the tests. The JS lane: the wasm and React builds, then the Node tests (`GATE_JOBS`, default 4, at
+a time, at nice 5) beside the browser tests (`GATE_BROWSER_JOBS`, default 3, at a time), the slowest of each first.
+Most of those wait on timers, not the CPU, so they share it; the browser tests, whose WebRTC timing suffers most
+under load, get it first. A Node or browser test that fails beside the others runs once more, alone, at the end
+(`GATE_RETRY=0` turns that off): a pass then is FLAKY, a load flake (NB-060) listed with the log of the run that
+failed (`<step>.first.log`), not a failed gate. Over 5 failures (`GATE_RETRY_MAX`) are no load flake and run once.
+Each step logs to `target/gate-logs/<step>.log`.
+
+The Rust tests build with two Cargo profiles in the workspace's `Cargo.toml` that only the gate uses, so the release
+profile, which ships, stays as it is. `gate` is release code built incrementally, so a change rebuilds only what it
+touched. `fuzz` keeps a debug build's overflow checks and debug assertions at opt-level 1, so the fuzzers' fixed
+cases run about 6 times faster (3 s against 18 s alone).
+
+A full `--strict` run takes about 130 s on the 4-core aarch64 dev host with a warm build (128–131 s on 3 Nov,
+NB-076), against 220 s with the browser tests after the Node tests (NB-075) and 453 s with them one at a time.
+After a one-line change to `peerwire-core` it takes 145 s, down from 279 s: the Rust test builds take 36 s beside
+the other tests, not 171 s. `--quick` takes 80–100 s. The Node and browser tests set the total:
+`doc_catchup.mjs` (70 s) and `netlab_punch_close.mjs` (67 s) start first. A fresh worktree compiles the workspace in
+both profiles first, about 5 minutes. With no Rust change since `origin/main`, the Rust steps are skipped.
 
 **Release gate:** `scripts/gate.sh --strict` green on `main`, plus `--nostr` once per release, plus the CI matrix
 (below) green on all three OSes.

@@ -62,10 +62,12 @@ runs share this host's 4 cores, so running it on every branch as well costs more
 - **After merging** (the lead): `scripts/gate.sh --strict` once on the merged `main`, before asking to push. CI runs
   the Rust and Node steps on push but not the browser tests, so this is their only full run.
 
-The gate builds first, then runs the Rust tests (under `cargo-nextest` when it is installed) beside the Node tests,
-`GATE_JOBS` (default 4) at a time, then beside the browser tests, `GATE_BROWSER_JOBS` (default 3) at a time, so no
-Node or browser test may use a fixed port or file. Each step logs to `target/gate-logs/<step>.log`; a failed step's
-log is printed in full above the summary.
+The gate runs two lanes at once: the Rust one (clippy, fmt, the test builds, then the tests, under `cargo-nextest`
+when it is installed) and the JS one (the wasm and React builds, then the Node tests, `GATE_JOBS` (default 4) at a
+time, beside the browser tests, `GATE_BROWSER_JOBS` (default 3) at a time), so no Node or browser test may use a
+fixed port or file. A Node or browser test that fails runs once more alone at the end; a pass then is FLAKY, which
+doesn't fail the gate but goes on the card (NB-060). Each step logs to `target/gate-logs/<step>.log`; a failed
+step's log is printed in full above the summary.
 
 Browser tests use headless Chromium through Playwright (already installed; do not install it):
 `node packages/js/test/browser.mjs [tabs]` and `node packages/js/test/arena.mjs` run on loopback only.
