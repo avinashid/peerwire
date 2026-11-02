@@ -119,6 +119,7 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB6F-1, NB6F-2, NB6F-3 (Low) | **Fixed** by `2e71dc5`, merged `8140998`, before `persist` was published (an opening that couldn't read the copy never writes it; one save at a time, paced at 256 KiB/s; a 5 s load deadline). The seal is security's call, in `52bb7e3`. Reviewed 2026-10-28; residuals R1–R4, [Docs kept on this device](#docs-kept-on-this-device-persist-nb-006f--nb6f-1nb6f-3) |
 | NB6F-2a (Info) | **Fixed** by `b45e15c`, merged `76bdd64` (each retry of a store that keeps failing waits twice as long, 1 s up to 64 s, until a save succeeds), reviewed 2026-10-29, same section |
 | I3a (Info), I4 (accepted) | **Fixed** by `1b0fc35` (the `VERSION` comment covers a copy read only in part; `close()` and `leave()` say they wait for the store), same section |
+| I2, fixed further (Info) | **Fixed** by `a29ce7c` (NB-077), merged `45a793b` (a save on a connection the browser closed before its close event came is tried once more on a new one, 250 ms later; a request that fails no longer leaves the save hanging), reviewed 2026-11-03; NB77-I1 (Info) open (NB-078), same section |
 | NB6H-1 (Low), NB6H-2, I1, I2 (Info) | **Fixed** by `c1b3878`, merged `71f5c6e`, with NB6H-2's first half by `dc156a3` (relay pacing on a monotonic clock, with clamps; the pipe asks `wait()` again each second; a held relay is sent nothing at close; `wait?()` typed). Reviewed 2026-10-29, [Nostr relay pacing](#nostr-relay-pacing-and-pipe-striping-nb-006h-nb-006i--nb6h-1-nb6h-2-nb6i-1) |
 | NB6I-1 (Low) | **Fixed** by `dc156a3`, merged `6a60ef0` (a relay slowed behind its queue gives up its turn), beside the lead's close fix `cf4a0a9`. Reviewed 2026-10-29; a relay that answers OK and delivers nothing gets 1/n of the pipe (accepted), same section |
 | Half-open relay (Low) | **Fixed** by `659eb28`, merged `5ae3c4e` (NB-006j: a relay that has answered nothing for 5 s since it was sent an event gets no pipe turns while one that answers is left; its next OK gives them back), reviewed 2026-10-29; residuals NB6J-I1, I3, I4 (Info, accepted), same section |
@@ -1603,6 +1604,25 @@ and `leave()` never resolved.
   README now makes the store once, and `DocOptions` says to pass the same object.
 - **I2**, fixed by `2e71dc5`: an IndexedDB connection the browser closed (site data
   cleared) was never opened again. `onclose` now drops it.
+  - Fixed further by `a29ce7c` (NB-077), merged `45a793b`, reviewed 2026-11-03. The
+    close event comes some time after the close, and a save made between them used the
+    closed connection, so the doc warned once that it couldn't keep a copy. Worse, in
+    Chromium only the request could fail while its transaction never ended: that doc
+    never saved again, with no warning.
+    - A request that fails now fails the save. A save that fails as the connection
+      closes (`InvalidStateError`, `UnknownError` or `AbortError`) is tried once more,
+      on a new connection, `REOPEN_MS` (250 ms) later.
+    - The retry puts the same sealed bytes, so no AES-GCM nonce seals a second
+      plaintext. It runs in the doc's turn (`queued`), so no later save or `forget()`
+      overtakes it, and a try that failed never applied.
+    - A full disk (`QuotaExceededError`), a refused open (private mode) and a retry
+      that fails still fail at once. A late close event drops only its own connection.
+  - **NB77-I1** (open, NB-078). A save started at the old connection's close event opens
+    a new one at once, while the browser is still deleting the site's data. That open is
+    aborted, and isn't retried, so the doc can still warn once: 5 of 5 runs on loopback,
+    with the page busy across the clear. The next save keeps the copy. Retrying an open
+    that fails with `AbortError`, once, `REOPEN_MS` later, fixes it (measured, not
+    merged).
 - **I3**, fixed by `2e71dc5`: a comment by `VERSION` says to bump it whenever an older
   release's `restore()` would refuse what `snapshot()` now writes.
   - **I3a**, fixed by `1b0fc35`: `parseFrame` and `restore()` ignore fields they don't
