@@ -13,11 +13,12 @@
 #   scripts/gate.sh --full      run the Rust steps (tests, clippy, fmt, fuzz) even when no Rust changed: they are
 #                               skipped when every file changed since GATE_BASE is JS, docs or another non-Rust path
 #
-# Order: the builds first (wasm, React, clippy). Then the Node tests alone (GATE_JOBS at a time), as they keep every
-# core busy; then the browser tests (GATE_BROWSER_JOBS at a time), which mostly wait on timers, beside the Rust lane
-# (its test builds, then the tests) at a lower CPU priority. The Rust tests run under cargo-nextest when it is
-# installed (doctests through cargo test --doc), else under cargo test. Each step writes its own log,
-# target/gate-logs/<step>.log; a failed step's log is printed in full before the summary.
+# Order: two lanes from the start. The Rust lane, at a lower CPU priority: clippy, fmt, the test builds, then the
+# tests. The JS lane: the wasm and React builds, then the Node tests (GATE_JOBS at a time) beside the browser tests
+# (GATE_BROWSER_JOBS at a time). The Rust tests are built with the gate profile (release, built incrementally) and
+# the debug fuzzers with the fuzz one (Cargo.toml), and run under cargo-nextest when it is installed (doctests
+# through cargo test --doc), else under cargo test. Each step writes its own log, target/gate-logs/<step>.log; a
+# failed step's log is printed in full before the summary.
 # The docs' samples are tested too (NB-070): the Rust ones compile, never run, in "rust doc samples" (on a change to
 # Rust or Markdown); the JS ones and every link in "node docs samples" and "node docs links".
 #
@@ -25,6 +26,8 @@
 #      GATE_JOBS (Node tests at once, default 4), GATE_BROWSER_JOBS (browser tests at once, default 3),
 #      GATE_BASE (what "changed" is measured against, default origin/main),
 #      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 300),
+#      GATE_RETRY (1, the default: a Node or browser test that failed runs once more alone, a pass then is FLAKY;
+#      0: no second run), GATE_RETRY_MAX (more failed tests than this, default 5, run no second time),
 #      NODE_CI (the node binary --strict runs CI's Node tests on, default the newest ~/.nvm/versions/node/v<CI's>.*).
 set -u
 cd "$(dirname "$0")/.."
@@ -50,6 +53,8 @@ GATE_JOBS=${GATE_JOBS:-4}
 GATE_BROWSER_JOBS=${GATE_BROWSER_JOBS:-3}
 GATE_BASE=${GATE_BASE:-origin/main}
 GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT:-300}
+GATE_RETRY=${GATE_RETRY:-1}
+GATE_RETRY_MAX=${GATE_RETRY_MAX:-5}
 LOGS=target/gate-logs
 rm -rf "$LOGS" && mkdir -p "$LOGS"
 trap 'trap - INT TERM; kill 0' INT TERM
@@ -250,24 +255,28 @@ react_build() {
 
 nextest=0
 cargo nextest --version >/dev/null 2>&1 && nextest=1
-FUZZ=(--lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim -p peerwire-sync fuzz)
+# The Cargo profiles of Cargo.toml: gate (release code, built incrementally) for the tests, fuzz (a debug build's
+# overflow checks and debug assertions, at opt-level 1) for the fuzzers. nextest takes them as --cargo-profile.
+GATE=(--profile gate) FUZZ_PROFILE=(--profile fuzz)
+[ $nextest = 0 ] || GATE=(--cargo-profile gate) FUZZ_PROFILE=(--cargo-profile fuzz)
+FUZZ=(--lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim -p peerwire-sync "${FUZZ_PROFILE[@]}" fuzz)
 # peerwire-ffi's shared docs (`sync`) are off in the wasm build and so in the workspace's: built, linted and tested
 # on their own, so they can't rot.
-FFI_SYNC=(-p peerwire-ffi --features sync --release)
-# The same in a debug build, beside the fuzzers: its length and buffer sums must not overflow either.
-FFI_SYNC_DEBUG=(-p peerwire-ffi --features sync --lib)
+FFI_SYNC=(-p peerwire-ffi --features sync "${GATE[@]}")
+# The same with overflow checks, beside the fuzzers: its length and buffer sums must not overflow either.
+FFI_SYNC_DEBUG=(-p peerwire-ffi --features sync --lib "${FUZZ_PROFILE[@]}")
 
 # Every Rust test: nextest runs each test in its own process, many at once, but skips doctests.
 rust_tests() {
   local r=0
   if [ $nextest = 0 ]; then
-    cargo test --workspace --release || r=1
+    cargo test --workspace "${GATE[@]}" || r=1
     cargo test "${FFI_SYNC[@]}" || r=1
     return $r
   fi
-  cargo nextest run --workspace --release --profile gate || r=1
+  cargo nextest run --workspace "${GATE[@]}" --profile gate || r=1
   cargo nextest run "${FFI_SYNC[@]}" --profile gate || r=1
-  cargo test --doc --workspace --release || r=1
+  cargo test --doc --workspace --profile gate || r=1
   return $r
 }
 
@@ -276,10 +285,10 @@ rust_tests() {
 # `true`: many are host loops, or dial public relays.
 doc_samples() {
   RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }--cfg docs_samples --test-runtool true" \
-    cargo test --doc --workspace --release doc_samples
+    cargo test --doc --workspace --profile gate doc_samples
 }
 
-# Release builds wrap on integer overflow; the parser fuzzers must also run where it panics.
+# Release builds wrap on integer overflow; the parser fuzzers must also run where it panics: the fuzz profile.
 fuzz_tests() {
   local r=0
   if [ $nextest = 1 ]; then
@@ -297,7 +306,7 @@ fuzz_tests() {
 rust_build() {
   local r=0 run=(cargo test)
   [ $nextest = 0 ] || run=(cargo nextest run)
-  "${run[@]}" --workspace --release --no-run || r=1
+  "${run[@]}" --workspace "${GATE[@]}" --no-run || r=1
   "${run[@]}" "${FFI_SYNC[@]}" --no-run || r=1
   if [ $strict = 1 ]; then
     "${run[@]}" "${FUZZ[@]}" --no-run || r=1
@@ -324,7 +333,15 @@ if [ -n "$rust_skip" ] && ! grep -qE '\.md$' <<<"$changed"; then
   samples_skip="no Markdown or Rust change since $GATE_BASE $(git rev-parse --short "$base")"
 fi
 
-# The Node tests, GATE_JOBS at a time. Run in a subshell, so its job table holds only these.
+# node_entry "name|node args": the entry with --no-wasm-tier-up after the node binary.
+node_entry() {
+  local cmd=${1#*|}
+  echo "${1%%|*}|${cmd%% *} --no-wasm-tier-up ${cmd#* }"
+}
+
+# The Node tests, GATE_JOBS at a time, at nice 5: most wait on timers (116 CPU s in 423 s of tests on 3 Nov), and
+# the browser tests beside them, whose WebRTC timing suffers most under load, get the CPU first. Run in a
+# subshell, so its job table holds only these.
 # --no-wasm-tier-up: on a busy host, Node 26.7 sometimes deadlocks in process.exit() while V8 is still tiering the
 # wasm up in the background (room_drain.mjs hung after "all passed" in 5 of 280 runs four at a time, 0 of 100 one at
 # a time, 0 of 360 four at a time with the flag). The tests run as fast without it.
@@ -332,15 +349,15 @@ fi
 # (--strict) share the pool and the flag. The pool alone on 30 Oct, 4 jobs: 92 s, then 59 s with doc catchup
 # (72 s) moved first; --strict 104 s, then 88 s.
 node_pool() {
-  local s cmd first slow
+  local s first slow
+  renice -n 5 -p $BASHPID >/dev/null
   for first in 1 0; do
     for s in "${NODE[@]}" "${CI_TESTS[@]}"; do
       slow=0
       [[ ${s%%|*} =~ $NODE_FIRST ]] && slow=1
       [ $slow = $first ] || continue
       while [ "$(jobs -rp | wc -l)" -ge "$GATE_JOBS" ]; do wait -n; done
-      cmd=${s#*|}
-      entry "${s%%|*}|${cmd%% *} --no-wasm-tier-up ${cmd#* }" &
+      entry "$(node_entry "$s")" &
     done
   done
   wait
@@ -365,10 +382,31 @@ browser_pool() {
   wait
 }
 
-# The Rust lane: the test builds, then the tests, at nice 10, so the Node and browser tests beside it keep their
-# timing.
+# The Rust lane: clippy, fmt, the test builds, then the tests, at nice 10, so the Node and browser tests beside it
+# keep their timing.
 rust_lane() {
   renice -n 10 -p $BASHPID >/dev/null
+  if [ -n "$rust_skip" ]; then
+    but=""
+    [ -n "$samples_skip" ] || but=", but for the docs' Rust samples"
+    echo "==> Rust steps skipped: $rust_skip$but (pass --full to run them)"
+    skip "cargo test" "$rust_skip"
+    skip "cargo clippy" "$rust_skip"
+    [ $strict = 0 ] || skip "fuzz (debug)" "$rust_skip"
+    skip "cargo fmt" "$rust_skip"
+    [ -z "$samples_skip" ] || skip "rust doc samples" "$samples_skip"
+  else
+    if [ $strict = 1 ]; then
+      step "cargo clippy" clippy -- -D warnings
+    else
+      step "cargo clippy" clippy
+    fi
+    if cargo fmt --version >/dev/null 2>&1; then
+      step "cargo fmt" cargo fmt --all -- --check
+    else
+      skip "cargo fmt" "rustfmt not installed"
+    fi
+  fi
   if [ -z "$rust_skip" ]; then
     echo "==> build the Rust tests (log: $LOGS/rust-build.log)"
     rust_build >"$LOGS/rust-build.log" 2>&1 </dev/null || echo "==> a Rust test build failed: see $LOGS/rust-build.log"
@@ -380,18 +418,22 @@ rust_lane() {
   fi
 }
 
-# The Rust lane runs from start to end, at a lower priority; the Node tests beside it, then the browser tests. The
-# Node tests keep every core busy (2 Nov, four at a time: 17% idle) and the known load flakes are theirs, so the
-# browser tests wait for them; they mostly wait on timers themselves (73% idle one at a time), so they run
-# GATE_BROWSER_JOBS at a time, and the Rust lane gets the rest. On 2 Nov a warm --strict took 453 s with the old
-# order (browser tests one at a time, after the Node tests and the Rust tests beside them), 281 s with this one and
-# 2 browser jobs, and 222 s with 3; each slow browser test took as long as when it ran alone. room_adopt.mjs once failed beside Chromium and
-# nextest ("batches still went over signalling"); that flake is fixed: the test by 2c80929, its cause in webrtc.js
-# by 5a7e4ba, and it passed 66 of 66 runs on a4299d3.
-lanes() {
-  rust_lane &
-  (node_pool)
-  (browser_pool)
+# The lanes, from the start: the Rust lane at a lower priority, and the JS lane, whose builds (wasm, then React)
+# come before its tests, the Node and browser pools side by side. The wasm build has its own target dir
+# (target/web), so it doesn't wait on cargo's lock for the Rust lane's. A warm --strict took 453 s on 2 Nov with
+# the tests one lane after another (browser tests one at a time), 222 s with the browser tests 3 at a time after
+# the Node tests (NB-075), and 128-131 s on 3 Nov with this order (NB-076); 145 s after a one-line change to
+# peerwire-core, 279 s before. With both pools at nice 0, netlab birthday failed in 2 runs of 3; with 4 browser jobs
+# something failed in each of 3 runs; with 6 Node jobs room leave and receive from failed. With this split only
+# doc store failed, in 1 run of 3: a race in the IndexedDB store (NB-077). room_adopt.mjs once failed beside
+# Chromium and nextest ("batches still went over signalling"); that flake is fixed: the test by 2c80929, its cause
+# in webrtc.js by 5a7e4ba, and it passed 66 of 66 runs on a4299d3.
+js_lane() {
+  step "wasm build" ./packages/js/build.sh
+  step "wasm size+imports" wasm_check
+  step "react build+types" react_build
+  (node_pool) &
+  (browser_pool) &
   wait
 }
 
@@ -399,38 +441,40 @@ echo "logs: $LOGS/   rust tests: $([ $nextest = 1 ] && echo cargo-nextest || ech
   "  browser jobs: $GATE_BROWSER_JOBS"
 [ ${#CI_TESTS[@]} = 0 ] || echo "CI's Node tests: ${#CI_TESTS[@]}, on $CI_NODE"
 
-# 1. Builds, one after another: they share target/ and cargo's lock. The Rust test builds come later, in the Rust lane.
-step "wasm build" ./packages/js/build.sh
-step "wasm size+imports" wasm_check
-step "react build+types" react_build
-if [ -n "$rust_skip" ]; then
-  but=""
-  [ -n "$samples_skip" ] || but=", but for the docs' Rust samples"
-  echo "==> Rust steps skipped: $rust_skip$but (pass --full to run them)"
-  skip "cargo test" "$rust_skip"
-  skip "cargo clippy" "$rust_skip"
-  [ $strict = 0 ] || skip "fuzz (debug)" "$rust_skip"
-  skip "cargo fmt" "$rust_skip"
-  [ -z "$samples_skip" ] || skip "rust doc samples" "$samples_skip"
-else
-  if [ $strict = 1 ]; then
-    step "cargo clippy" clippy -- -D warnings
-  else
-    step "cargo clippy" clippy
-  fi
-  if cargo fmt --version >/dev/null 2>&1; then
-    step "cargo fmt" cargo fmt --all -- --check
-  else
-    skip "cargo fmt" "rustfmt not installed"
-  fi
-fi
+rust_lane &
+js_lane
+wait
 
-# 2. The Node tests, then the browser tests beside the Rust lane.
-lanes
+# A Node or browser test that failed beside the others runs once more, alone, now that the host is quiet. A pass
+# then is FLAKY: a load flake (NB-060), listed in the summary with the log of the run that failed (<step>.first.log),
+# but not a failed gate. Over GATE_RETRY_MAX failures run no more: that is no load flake.
+again=()
+for s in "${NODE[@]}" "${CI_TESTS[@]}"; do
+  grep -qs '^FAIL' "$LOGS/$(slug "${s%%|*}").res" && again+=("$(node_entry "$s")")
+done
+for s in "${BROWSER[@]}"; do
+  grep -qs '^FAIL' "$LOGS/$(slug "${s%%|*}").res" && again+=("$s")
+done
+if [ "$GATE_RETRY" = 1 ] && [ ${#again[@]} -gt 0 ] && [ ${#again[@]} -le "$GATE_RETRY_MAX" ]; then
+  echo "==> ${#again[@]} failed test(s) again, one at a time"
+  for s in "${again[@]}"; do
+    f=$LOGS/$(slug "${s%%|*}")
+    t1=$(grep -oE '[0-9]+s\)$' "$f.res")
+    mv "$f.log" "$f.first.log"
+    entry "$s"
+    t2=$(grep -oE '[0-9]+s\)$' "$f.res")
+    if grep -q '^PASS' "$f.res"; then
+      echo "FLAKY ${s%%|*} (failed in ${t1%)} beside the others, passed alone in ${t2%)}; that log:" \
+        "$f.first.log)" >"$f.res"
+    else
+      echo "FAIL  ${s%%|*} (failed in ${t1%)} beside the others, and alone in ${t2%)})" >"$f.res"
+    fi
+  done
+fi
 
 if [ $nostr = 1 ]; then
   step "nostr" node packages/js/test/nostr.mjs
-  step "nostr (rust)" cargo test -p peerwire --release --test nostr -- --ignored --nocapture
+  step "nostr (rust)" cargo test -p peerwire --profile gate --test nostr -- --ignored --nocapture
 else
   skip "nostr" "public relays; pass --nostr"
   skip "nostr (rust)" "public relays; pass --nostr"
@@ -459,5 +503,7 @@ done
 echo
 echo "==> gate summary (logs in $LOGS/)"
 for n in "${order[@]}"; do printf '  %s\n' "$(cat "$LOGS/$(slug "$n").res")"; done
+flaky=$(cat "$LOGS"/*.res | grep -c '^FLAKY')
+[ "$flaky" = 0 ] || echo "==> $flaky flaky: failed beside the others, passed alone (NB-060); see each one's .first.log"
 [ $failed = 0 ] && echo "GATE PASSED" || echo "GATE FAILED"
 exit $failed

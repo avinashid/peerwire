@@ -893,8 +893,9 @@ async function connected(...ms) {
   const cb = b.call(camera());
   for (const [r, call] of [[a, ca], [b, cb]]) for (const e of ['stream', 'ended']) call.on(e, (...x) => got.get(r.self).push([e, ...x]));
   await until('the streams', () => got.get(a.self).some((e) => e[0] === 'stream') && got.get(b.self).some((e) => e[0] === 'stream'));
-  iceUp();
-  await until('connected', () => ca.state(b.self) === 'connected' && cb.state(a.self) === 'connected');
+  // ICE comes up on each pair once its descriptions and candidates have met, which a loaded host can delay past
+  // any one moment: iceUp() on every poll (NB-076, "timed out: d connected").
+  await until('connected', () => (iceUp(), ca.state(b.self) === 'connected' && cb.state(a.self) === 'connected'));
   check(true, 'two rooms: a call signalled over their room link, streams both ways, connected');
   check(c.calls.roster.has(a.self) && c.calls.roster.has(b.self) && !c.calls.call, 'a member not in the call keeps the roster');
   const d = await joinRoom(opts);
@@ -904,8 +905,7 @@ async function connected(...ms) {
   check(d.calls.roster.has(a.self) && d.calls.roster.has(b.self), 'a member joining the room later learns who is in the call');
   const cd = d.call(null);
   await until('d in the call', () => cd.peers.length === 2 && ca.peers.includes(d.self));
-  iceUp();
-  await until('d connected', () => cd.peers.every((p) => cd.state(p) === 'connected'));
+  await until('d connected', () => (iceUp(), cd.peers.every((p) => cd.state(p) === 'connected')));
   check(true, 'it joins the call and connects to both');
   // A call frame on the unreliable lane is dropped.
   c.write(a.self, Uint8Array.of(9, ...bytes({ t: 'join', age: 0 })), Lane.Unreliable);

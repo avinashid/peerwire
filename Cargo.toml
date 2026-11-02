@@ -17,3 +17,17 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/avinashid/peerwire"
 homepage = "https://avinashid.github.io/peerwire/"
+
+# The test builds of scripts/gate.sh (docs/project/testing.md). Neither changes what ships: that is the release
+# profile, left at cargo's defaults.
+# gate: the release tests, built incrementally, so a change rebuilds only what it touched. Same code as release:
+# opt-level 3, no debug assertions, integer overflow wraps.
+[profile.gate]
+inherits = "release"
+incremental = true
+
+# fuzz: the fuzzers with a debug build's checks (overflow panics, debug assertions), optimised a little, so their
+# fixed number of cases runs several times faster.
+[profile.fuzz]
+inherits = "dev"
+opt-level = 1
