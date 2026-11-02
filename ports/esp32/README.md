@@ -1,7 +1,8 @@
 # Peerwire on ESP32 (prototype)
 
 A feasibility prototype, not a supported target: the unchanged `peerwire::Node`
-running on an ESP32-C3 under ESP-IDF, tested in Espressif's QEMU. N emulated
+running under ESP-IDF on an ESP32-C3 and on the original ESP32 (the chip in the
+ESP32-WROOM-32 module), tested in Espressif's QEMU. N emulated
 chips share one virtual LAN, find each other by themselves (NB-064, LAN discovery)
 and link into a full mesh with the same handshake, encryption and reliable lane as
 every other Peerwire node.
@@ -62,6 +63,29 @@ Two emulator-only workarounds:
 - The pairs that link at ~2 s missed the first hello and caught the next (hellos repeat
   at 2 s, 4 s, ... up to 30 s).
 
+### The original ESP32 (NB-074, 2 Nov 2026)
+
+The same code, built with `CHIP=esp32` for Xtensa (`xtensa-esp32-espidf`, Espressif's
+`esp` toolchain 1.97.0.0) and run on QEMU's `esp32` machine. No source changes.
+
+| | |
+|---|---|
+| App image | 1,054,720 B |
+| Free heap at boot | 267,272 B |
+| After Ethernet and the IP stack | 241,972 B |
+| A bound `Node` with `LanSignaling`, no links | 4,708 B |
+| Heap per link, light traffic | ~13.7 KB at 1 link, ~6.3 KB at 3 links |
+| Main task stack | 24 KB configured, ~18 KB used at most |
+| Join to link | 2 nodes: 382 ms. 4 nodes: 6 links in 0.6–1.4 s |
+
+- **2 nodes, 40 s:** linked, messages flowing both ways for the whole run.
+- **4 nodes, 50 s:** all 6 links up, each node at 3 links, 100 messages received by each in
+  ~35 s. No disconnects, failed dials or crashes.
+- **4 nodes with 16 KiB messages, 50 s:** the same; the lowest free heap was 98–129 KB.
+
+The ESP32 starts with ~28 KB less free heap than the C3, and its per-link cost is about
+the same. A board's Wi-Fi driver and a TLS connection for Nostr would take more (see below).
+
 ### Fixed invites (NB-062)
 
 These ran before discovery, with fixed test identities and invites built from them.
@@ -95,8 +119,7 @@ are the emulator and hub, not radio. Real-chip timing needs a board.
 - **Memory caps.** With heavy traffic each link holds its send and reassembly buffers.
   For many links on a plain ESP32-C3, lower `max_message` and `max_send_buffer`
   further. An ESP32-S3 with PSRAM (the Arduino Nano ESP32) has room to spare.
-- **Xtensa chips** (ESP32, ESP32-S3) need Espressif's Rust fork (`espup`); this
-  prototype targets the RISC-V C3 on upstream nightly.
+- **ESP32-S3** should build like the ESP32 with Espressif's Rust fork; not tried.
 
 ## Building
 
@@ -112,13 +135,18 @@ Everything installs under your home directory.
    `target/riscv32imc-esp-espidf/release/build/esp-idf-sys/*/out/build`, and build again.
 4. `./build.sh` writes `out/flash.bin`, a 4 MB image for QEMU or a board.
 
+For the original ESP32 (`CHIP=esp32`), also install Espressif's Rust fork with
+[espup](https://github.com/esp-rs/espup) 0.19: `espup install --targets esp32 --std`, then
+source the `export-esp.sh` it writes (it sets `LIBCLANG_PATH`) and run
+`CHIP=esp32 ./build.sh`. The first build downloads ESP-IDF's Xtensa GCC to `~/.espressif`.
+
 Why the nightly is pinned: from 2026-10-10 an ICE on esp-idf-svc's async traits
 (rust-lang/rust#164093, fixed 2026-10-20), and from 2026-10-16 std no longer builds for
 ESP-IDF against libc 0.2.191 (rust-lang/rust#164555, open).
 
 ## Running
 
-QEMU: `qemu-riscv32-softmmu` from espressif/qemu releases, unpacked to
+QEMU: `qemu-riscv32-softmmu` (and `qemu-xtensa-softmmu` for `CHIP=esp32`) from espressif/qemu releases, unpacked to
 `~/.local/opt/esp-qemu`. On a host without SDL2 and libslirp, `apt-get download` them
 (plus libpulse0, libsamplerate0, libxss1, libdecor-0-0, libsndfile1 and its codecs,
 libasyncns0) and unpack them with `dpkg-deb -x` into `~/.local/opt/esp-qemu/sysroot`;
@@ -128,4 +156,5 @@ libasyncns0) and unpack them with `dpkg-deb -x` into `~/.local/opt/esp-qemu/sysr
 ./run.sh 4 60              # 4 nodes for 60 s; logs in out/node<n>.log
 MSG_KIB=16 ./run.sh 4 45   # the same with 16 KiB messages
 grep report out/node*.log
+CHIP=esp32 ./run.sh 4 50   # the original ESP32
 ```

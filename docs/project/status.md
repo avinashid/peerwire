@@ -20,7 +20,7 @@ what's next. It's updated as parts land; the [changelog](../../CHANGELOG.md) has
 | Session core: identity, Noise IK, lanes, congestion control, peer relay, hole punching, invites | ✅ | unit tests, fuzzing, the simulator |
 | `Node` / `AsyncNode`: UDP host, STUN, rooms, NAT traversal, router port mapping | ✅ | loopback, the simulator, public Nostr relays and STUN (opt-in) |
 | Signaling: Nostr relays, in-process (`MemoryHub`) | ✅ | a local relay; public relays (opt-in) |
-| LAN discovery (`LanSignaling`), on PCs and ESP32 | ✅ | loopback, Docker networks, 8 emulated ESP32-C3s |
+| LAN discovery (`LanSignaling`), on PCs and ESP32 | ✅ | loopback, Docker networks, 8 emulated ESP32-C3s, 4 emulated ESP32s |
 | JavaScript package: rooms over WebRTC, Nostr and BroadcastChannel signaling, fallback routes | ✅ | Node, headless Chromium, local fake relays |
 | Shared documents in JS (`room.doc()`): maps, sets, logs, catch-up, persistence, relay copies | ✅ | Node and browsers, against local fake relays |
 | Shared documents in Rust, Godot and the C ABI (`peerwire-sync`) | ✅ | against `room.doc()`'s own frames |
@@ -31,7 +31,7 @@ what's next. It's updated as parts land; the [changelog](../../CHANGELOG.md) has
 | C ABI and the WebAssembly module (~350 KB, no imports) | ✅ | size and import checks on every build |
 | Always-on peer (`peerwire-peer`) in Docker | ✅ | Docker on loopback |
 | Game layer: fixed-point maths, Hilbert islands, desync detection; arena simulation | ✅ | unit tests, the simulator |
-| ESP32-C3 | 🧪 prototype | Espressif's QEMU only |
+| ESP32-C3 and ESP32 (ESP32-WROOM-32) | 🧪 prototype | Espressif's QEMU only |
 
 ## How far it's been tested
 
