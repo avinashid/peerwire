@@ -75,7 +75,8 @@ What limits it:
   `√((1+b) / (2(1−b)p))`, **theoretical** 2.12 / √p ≈ 21 fragments, 0.23 MB/s. Over seeds 1–40 the 16 MiB run
   gets **0.24 MB/s**, and 0.35 and 0.17 MB/s at 0.5% and 2% loss. Before NB-086 timeouts still halved, about 34
   of its 142 cuts, and it got 0.20, 0.31 and 0.13 MB/s (see tail losses below). At that bound, only a gentler
-  response to random loss goes faster: 0.40 MB/s at 1% needs 36 fragments, **theoretical** `b` ≈ 0.93. A buffer
+  response to random loss goes faster: 0.40 MB/s at 1% needs 36 fragments, **theoretical** `b` ≈ 0.93 (two
+  such builds are measured below, not shipped). A buffer
   that overflows usually shows in the RTT first, so that loss still halves; behind a buffer shorter than 5 ms
   congestive loss looks random too and keeps 80%, as it does for every sender on that link.
 - **A loss at the end of a burst is a tail loss, not a timeout (NB-086).** At a window near 30 the sender goes out
@@ -124,6 +125,19 @@ What limits it:
   duplicate times, and perf (frame pointers, inline-expanded stacks) puts them at **3–4%** of the process, about
   **7–9%** of the sender. At about 6 µs per fragment one core sends roughly 190 MB/s. The simulator output is
   unchanged.
+
+**Past the AIMD bound: measured, not shipped (NB-086).** With the timeouts gone, the window under random loss `p`
+is set by the share `b` kept on each cut, `√((1+b) / (2(1−b)p))`: **theoretical** 21 fragments (0.23 MB/s) at 1%
+for `b` = 0.8. 0.40 MB/s needs about 36, so `b` ≈ 0.93, or faster growth. B and C are one-line changes to
+`reliable.rs` on `892b929`, measured and not shipped. The runs are 16 MiB over seeds 1–40. `cc_fair -- --buffer 1`
+is two flows behind a 1 ms buffer, clean.
+
+| Build | 1% loss | 0.5% | 2% | Timeout cuts at 1% (40 runs) | `cc_fair` 1 ms buffer | Status |
+|---|---|---|---|---|---|---|
+| Before NB-086 | 0.20 MB/s | 0.31 MB/s | 0.13 MB/s | 1341 | 3.51 / 3.54 MB/s, Jain 1.000 | |
+| A: tail losses | 0.24 MB/s | 0.35 MB/s | 0.17 MB/s | 1 | 3.54 / 3.54 MB/s, Jain 1.000 | shipped (NB-086) |
+| B: A, and 90% kept on a random loss (`RANDOM_LOSS_CUT` 0.9) | 0.35 MB/s | 0.50 MB/s | 0.25 MB/s | 9 | 3.49 / 3.46 MB/s, Jain 1.000 | not shipped: needs a check against Reno and CUBIC flows first |
+| C: A, and `cwnd += 3·slots/cwnd` in congestion avoidance under 5 ms of queueing | 0.44 MB/s | 0.60 MB/s | 0.34 MB/s | 31 | 0.08 / 2.88 MB/s, Jain 0.527 | rejected: starves the other flow |
 
 Reproduce with `cargo run --release -p peerwire-sim --example bulk` (all variants), or one variant with flags such
 as `-- --loss 0.01 --cpu 1 --trace 1`. The CPU split is `scripts/perf-relsend.sh [flags]`, for example `--up 1000`
