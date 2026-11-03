@@ -87,7 +87,7 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `Node`, `Builder`, `Status`, `Error`, `DEFAULT_STUN_SERVERS` | The node, its options, where it stands with a peer, `connect`'s error, the default STUN servers | `src/node.rs` |
 | `AsyncNode` (feature `tokio`) | A `Node` driven by tokio | `src/async_node.rs` |
 | `Event`, `Path` | Type aliases: `peerwire_core::Event<SocketAddr>` and `peerwire_core::Path<SocketAddr>` | `src/lib.rs` |
-| `Signaling`, `Topic`, `MemoryHub`, `MemorySignaling` | The carrier trait, its topics, and the in-process carrier | `src/signaling.rs` |
+| `Signaling`, `Topic`, `MemoryHub`, `MemorySignaling`, `MultiSignaling` | The carrier trait, its topics, the in-process carrier, and several carriers as one | `src/signaling.rs` |
 | `LanSignaling` | A carrier over UDP multicast and broadcast on one LAN | `src/lan.rs` |
 | `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND` and `NostrStats` | `src/nostr.rs` |
 | `Privacy`, `Role`, `NatType`, `Failure`, `Side` | Which addresses a node gives out, room roles, the NAT type, why a dial failed | `src/traversal.rs` |
@@ -467,6 +467,7 @@ The carriers:
 | `MemorySignaling`, from a `MemoryHub` | none | Peers in one process (tests) |
 | `NostrSignaling` | `nostr` | The internet, over public Nostr relays |
 | `LanSignaling` | none | One LAN, with no internet |
+| `MultiSignaling` | none | Whatever its carriers reach, such as the LAN and the internet at once |
 
 #### MemoryHub
 
@@ -474,6 +475,14 @@ An in-process hub, for tests and for peers in one process. The hub itself is not
 (also `Default`; a clone shares the hub) makes one, and `hub.connect()` returns a `MemorySignaling`, the carrier. A
 carrier delivers to every other carrier on the hub subscribed to the topic, never back to the sender. A dropped
 carrier leaves the hub.
+
+#### MultiSignaling
+
+`MultiSignaling::new(carriers: Vec<Box<dyn Signaling>>)` is one carrier over several: it subscribes and publishes on
+each and delivers what any of them hears, taking turns so a busy carrier can't hold back the others. A node on
+`LanSignaling` and `NostrSignaling` at once has one room with the peers of both: the ones on its LAN, found with no
+internet, and the ones the relays bring. A message heard on two carriers is delivered twice; rooms and offers already
+drop what they have seen. A complete program is [`examples/rust/room_chat.rs`](../../examples/rust/room_chat.rs).
 
 #### NostrSignaling
 

@@ -12,6 +12,7 @@ Most work on one machine over loopback; the ones marked **public** use public ST
 | [echo.rs](rust/echo.rs) | `peerwire::Node`: a host prints a `pw:` invite, a joiner links to it, says hello and gets the echo |
 | [echo_async.rs](rust/echo_async.rs) | the same with `peerwire::AsyncNode` on tokio |
 | [lan_chat.rs](rust/lan_chat.rs) | chat on one LAN with no internet: copies in the same room find each other over UDP multicast (`LanSignaling`) |
+| [room_chat.rs](rust/room_chat.rs) | the same rooms on the LAN and across the internet at once: `LanSignaling` and `NostrSignaling` in one `MultiSignaling` |
 | [natcheck.rs](rust/natcheck.rs) | **public.** A field test on real networks: what this network's NAT does, then meeting a peer in a Nostr room and whether the link came up direct, relayed or not at all |
 | [nostr_relay.rs](rust/nostr_relay.rs) | a minimal in-memory Nostr relay, for tests and LAN play without internet |
 
@@ -21,6 +22,7 @@ cargo run -p peerwire --example echo -- pw:…                          # in ano
 cargo run -p peerwire --features tokio --example echo_async           # the same pair, async
 cargo run -p peerwire --features tokio --example echo_async -- pw:…
 cargo run -p peerwire --example lan_chat -- kitchen                   # on two or more machines on one LAN
+cargo run -p peerwire --features nostr --example room_chat -- kitchen # on the LAN and over Nostr relays
 cargo run -p peerwire --features nostr --example natcheck             # NAT report only
 cargo run -p peerwire --features nostr --example natcheck -- room <name>   # then meet a peer running the same
 cargo run -p peerwire --features nostr --example nostr_relay -- 127.0.0.1:7447

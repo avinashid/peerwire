@@ -3,10 +3,10 @@
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
-# std threads take this size: the Nostr relay thread's TLS handshake (NB-095) needs
-# far more than 4 KB.
-CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=32768
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 CONFIG_FREERTOS_HZ=1000
+# SNTP asks 0-3.pool.ntp.org in turn, not only the first (NB-095: one went unanswered).
+CONFIG_LWIP_SNTP_MAX_SERVERS=4
 
 # QEMU's emulated Ethernet (the OpenCores MAC). A board would use Wi-Fi instead.
 CONFIG_ETH_ENABLED=y

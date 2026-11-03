@@ -32,11 +32,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a relay thread blocks reading before it looks at its queue again.
 const READ_SLICE: Duration = Duration::from_millis(20);
 /// Events kept while a relay is down; older ones are dropped.
-const MAX_QUEUED: usize = 64;
+const MAX_QUEUED: usize = if SMALL { 8 } else { 64 };
 /// Event ids remembered to drop the copy each relay delivers.
-const MAX_SEEN: usize = 4096;
-/// Events received but not yet polled; past this, relays' events are dropped.
-const MAX_INBOX: usize = 1024;
+const MAX_SEEN: usize = if SMALL { 128 } else { 4096 };
+/// Events received but not yet polled; past this, relays' events are dropped. The
+/// channel holds room for all of them from the start.
+const MAX_INBOX: usize = if SMALL { 32 } else { 1024 };
+/// An ESP32 has about 300 KB of heap: the inbox alone would take 53 KB of it, and the
+/// ids remembered about 170 B each (NB-095).
+const SMALL: bool = cfg!(target_os = "espidf");
 /// Largest websocket message or frame taken from a relay (tungstenite's default is 64 MiB).
 const MAX_MESSAGE: usize = 128 << 10;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);

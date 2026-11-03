@@ -16,6 +16,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use esp_idf_svc::eth::{BlockingEth, EspEth, EthDriver};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 use esp_idf_svc::ipv4::{ClientConfiguration, ClientSettings, Configuration, Mask, Subnet};
 use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -122,8 +124,7 @@ fn main() -> anyhow::Result<()> {
         // router's public address in our offers, for peers beyond the LAN.
         Some(_) => {
             info!("node {n}: signals on the LAN and over {NOSTR_RELAY}");
-            let on_nostr =
-                Counted { n, what: "Nostr", inner: NostrSignaling::new([NOSTR_RELAY]), counts: nostr.clone() };
+            let on_nostr = Counted { n, what: "Nostr", inner: nostr_signaling()?, counts: nostr.clone() };
             builder.signaling(MultiSignaling::new(vec![Box::new(on_lan), Box::new(on_nostr)]))
         }
         None => builder.stun_servers(Vec::<String>::new()).signaling(on_lan),
@@ -216,6 +217,7 @@ fn report(
     let free = free_heap();
     let min = unsafe { sys::esp_get_minimum_free_heap_size() };
     let stack_left = unsafe { sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
+    let relay_stack = nostr_stack_unused().map_or(String::new(), |b| format!(", relay stack unused {b} B"));
     let links = node.peers().count();
     let per_link = if links > 0 { (heap_node.saturating_sub(free) as usize / links).to_string() } else { "-".into() };
     let rtts: Vec<String> = node
@@ -236,7 +238,7 @@ fn report(
     };
     info!(
         "node {n}: report: {links} links, free heap {free} B (min {min} B), heap per link {per_link} B, \
-         stack unused {stack_left} B, rtt [{}], LAN signals sent {} heard {}, Nostr sent {} heard {} relays open {}{signal}",
+         stack unused {stack_left} B, rtt [{}], LAN signals sent {} heard {}, Nostr sent {} heard {} relays open {}{relay_stack}{signal}",
         rtts.join(", "),
         lan.sent.load(Ordering::Relaxed),
         lan.heard.load(Ordering::Relaxed),
@@ -308,6 +310,25 @@ impl<S: Signaling + Health> Signaling for Counted<S> {
     }
 }
 
+/// The relay's thread, named so the report can find it. The TLS handshake needs far more
+/// stack than ESP-IDF's 4 KB default for a thread; the report shows how much went unused.
+const NOSTR_THREAD: &CStr = c"nostr";
+const NOSTR_STACK: usize = 32 * 1024;
+
+fn nostr_signaling() -> anyhow::Result<NostrSignaling> {
+    let conf = ThreadSpawnConfiguration { name: Some(NOSTR_THREAD), stack_size: NOSTR_STACK, ..Default::default() };
+    conf.set()?;
+    let nostr = NostrSignaling::new([NOSTR_RELAY]);
+    ThreadSpawnConfiguration::default().set()?;
+    Ok(nostr)
+}
+
+/// The relay thread's stack that has never been used, if it is running.
+fn nostr_stack_unused() -> Option<u32> {
+    let task = unsafe { sys::xTaskGetHandle(NOSTR_THREAD.as_ptr()) };
+    (!task.is_null()).then(|| unsafe { sys::uxTaskGetStackHighWaterMark(task) })
+}
+
 /// The LAN carrier on this node's address, and on its subnet's broadcast address too
 /// (NB-092): a home router in NB-091 never delivered multicast to the board, but passed
 /// broadcast both ways. ESP-IDF can't list interfaces, so `LanSignaling` can't find it.
@@ -324,7 +345,7 @@ fn lan_signaling(n: u8, ip: Ipv4Addr, prefix: u8) -> std::io::Result<LanSignalin
     lan.broadcast(broadcast)
 }
 
-/// Sets the clock by SNTP, waiting up to 20 s. Room hellos and offers carry the sender's
+/// Sets the clock by SNTP, waiting up to 60 s. Room hellos and offers carry the sender's
 /// clock, and a node drops those more than a minute off its own (a replay guard). A board
 /// has no battery-backed clock: at 1970 it and a PC on the LAN dropped each other's hellos
 /// and never linked (NB-091). The Node reads the clock when it is bound, so this comes
@@ -334,12 +355,15 @@ fn set_clock(n: u8) -> Option<EspSntp<'static>> {
     let sntp = EspSntp::new_default().map_err(|e| warn!("node {n}: SNTP: {e}")).ok()?;
     let start = Instant::now();
     // 2023-11-14: any clock before it was never set.
-    while unix_s() < 1_700_000_000 && start.elapsed() < Duration::from_secs(20) {
+    // lwIP gives a server 15 s to answer, then asks the next (sdkconfig.defaults): one
+    // that never answered left a board with no links (NB-095), as the Node reads the clock
+    // once, when it is bound.
+    while unix_s() < 1_700_000_000 && start.elapsed() < Duration::from_secs(60) {
         std::thread::sleep(Duration::from_millis(100));
     }
     match unix_s() {
         s if s >= 1_700_000_000 => info!("node {n}: clock set by SNTP in {} ms: {s} s", start.elapsed().as_millis()),
-        s => warn!("node {n}: no SNTP answer in 20 s, clock at {s} s: LAN peers with a set clock drop our hellos"),
+        s => warn!("node {n}: no SNTP answer in 60 s, clock at {s} s: LAN peers with a set clock drop our hellos"),
     }
     Some(sntp)
 }
