@@ -532,8 +532,10 @@ also [NAT traversal](../concepts/nat-traversal.md).
    - **Port prediction.** A browser behind a NAT that hands out ports in sequence sees it from its two STUN servers'
      answers (`natFromSdp`: one IPv4 address, two ports 1 to 8 apart). Its offer, answer or late candidates then
      carry `nat: { ip, next, step }`. A peer that isn't behind a symmetric NAT itself adds 32 candidates at the ports
-     around `next` (`predictedCandidates`), so its checks open its NAT to the port the other's will come from. Peers
-     that don't know the field ignore it.
+     around `next` (`predictedCandidates`), so its checks open its NAT to the port the other's will come from. It
+     does so only if `ip` is a public IPv4 address that the other's own server-reflexive candidates name, and adds at
+     most 128 such candidates to a link (`MAX_GUESSES`), however many predictions come. Peers that don't know the
+     field ignore it.
    - **ICE restart.** When a link that was open loses ICE (a Wi-Fi to mobile switch, a hotspot dropping), it isn't
      dropped: after 2 s of `disconnected`, or at once on `failed`, the dialling side renegotiates with new ICE
      credentials; the other side asks it to. The DataChannel and the Peerwire session over it carry on, so the app
@@ -881,7 +883,7 @@ interface Transport {
 | `withoutHostCandidates(sdp)` | The SDP without `host` candidates (LAN, loopback, mDNS). |
 | `candidateSummary(sdp)` | `{ host4, host6, mdns, srflx4, srflx6, prflx, relay }`: an SDP's candidates by type and family. |
 | `natFromSdp(sdp)` | `{ type: 'symmetric' \| 'cone' \| 'unknown', ip?, next?, step? }`: the NAT as the server-reflexive candidates show it, with a prediction for a sequential symmetric one. |
-| `predictedCandidates(nat, sdpMid?)` | ICE candidates at the ports around a peer's prediction, for `addIceCandidate`; `[]` unless it is an IPv4 address and ports in range. |
+| `predictedCandidates(nat, sdpMid?)` | ICE candidates at the ports around a peer's prediction, for `addIceCandidate`; `[]` unless it is a public IPv4 address and ports in range. |
 
 ## Source files and demos
 

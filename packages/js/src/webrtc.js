@@ -20,6 +20,7 @@
 
 import { isPeerId, MAX_DATAGRAM } from './peerwire.js';
 import { b64, unb64 } from './nostr.js';
+import { isPublicV4 } from './birthday.js';
 
 // Above this many bytes queued on a DataChannel, new datagrams are dropped (PERF-1).
 export const MAX_BUFFERED = 1024 * 1024;
@@ -101,9 +102,13 @@ export const RESTART_WINDOW_MS = 60000;
 // an IP and are 1 to MAX_STEP ports apart hands ports out in sequence. A peer not
 // behind a symmetric NAT itself adds GUESS_BEFORE + GUESS_AFTER + 1 candidates around
 // the predicted port, so its checks open its NAT to the port the other's will come from.
+// A prediction counts only at a public IPv4 that the peer's own server-reflexive
+// candidates name, and a link adds at most MAX_GUESSES predicted candidates in all,
+// however many predictions the peer sends (S6).
 export const MAX_STEP = 8;
 export const GUESS_BEFORE = 4;
 export const GUESS_AFTER = 27;
+export const MAX_GUESSES = 128;
 // adopt(): a DataChannel made outside the transport carries a link only once both
 // ends adopt it. Each end sends CARRY every CARRY_EVERY_MS until it hears from the
 // other, and answers a CARRY with CARRIED (which gets no answer), at most once per
@@ -154,9 +159,10 @@ export function srflxV4(text) {
   return out;
 }
 
-// A peer's prediction as sent in signalling, checked: { ip, next, step } or null.
+// A peer's prediction as sent in signalling, checked: { ip, next, step } or null. Only
+// at a public IPv4 (S6): guesses never aim at a LAN, loopback or carrier-NAT address.
 export function checkPrediction(nat) {
-  if (!nat || typeof nat !== 'object' || typeof nat.ip !== 'string' || !IPV4.test(nat.ip)) return null;
+  if (!nat || typeof nat !== 'object' || typeof nat.ip !== 'string' || !isPublicV4(nat.ip)) return null;
   const { next, step } = nat;
   if (!Number.isInteger(next) || !Number.isInteger(step) || step < 1 || step > MAX_STEP || next < 1 || next > 65535) return null;
   return { ip: nat.ip, next, step };
@@ -361,7 +367,7 @@ export class WebRtcTransport {
     // our answer waits for budget (its candidates wait with it).
     const l = { pc, dc, peer, handle: h, dialer: false, timer: null, watchedAt: 0, failed: false, described: false, late: [], lateTimer: null,
       held: [], offerMsg: null, offerSdp: null, answerMsg: null, unsent: false, resends: [],
-      lateSent: 0, opened: false, restartAt: [], restartTimer: null, guessed: null,
+      lateSent: 0, opened: false, restartAt: [], restartTimer: null, guessed: null, guesses: 0,
       mine: new Set(), theirs: new Set(), sameNat: false, heard: false, retry: false };
     dc.onopen = () => {
       clearTimeout(l.timer);
@@ -540,15 +546,18 @@ export class WebRtcTransport {
 
   // A peer's prediction came: unless our own NAT is symmetric (each probe would cost
   // it a port, and its own mapping isn't the one the peer saw), add candidates at the
-  // ports around it, once per prediction.
+  // ports around it, once per prediction. Only at an IP the peer's own server-reflexive
+  // candidates name (`l.theirs`, noted before this is called), and at most MAX_GUESSES
+  // in all on the link (S6).
   async guess(l, nat) {
     const p = checkPrediction(nat);
-    if (!p || !l.pc.remoteDescription || this.privacy === 'relay-only') return;
+    if (!p || !l.pc.remoteDescription || this.privacy === 'relay-only' || !l.theirs.has(p.ip) || l.guesses >= MAX_GUESSES) return;
     const key = `${p.ip}:${p.next}:${p.step}`;
     if (l.guessed === key || natFromSdp(l.pc.localDescription?.sdp).type === 'symmetric') return;
     l.guessed = key;
     const mid = /^a=mid:(\S+)/m.exec(l.pc.remoteDescription.sdp ?? '')?.[1] ?? '0';
-    const cands = predictedCandidates(p, mid);
+    const cands = predictedCandidates(p, mid).slice(0, MAX_GUESSES - l.guesses);
+    l.guesses += cands.length;
     this.tr(l.peer, 'guesses', { ip: p.ip, next: p.next, step: p.step, n: cands.length });
     await this.addCandidates(l, cands);
   }

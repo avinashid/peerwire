@@ -10,7 +10,8 @@
 //   start the count over (NB46-1);
 // - networkChanged() restarts only links whose ICE isn't connected;
 // - an offer carrying a port prediction makes the other side add 32 candidates
-//   around it ('guesses'), and the link still opens; a malformed one adds none.
+//   around it ('guesses'), and the link still opens; a malformed one adds none, nor
+//   one at an IP the offer's own srflx candidates don't name (S6).
 //
 //   node packages/js/test/ice_restart.mjs
 import { serve } from './serve.mjs';
@@ -178,11 +179,17 @@ try {
     }
 
     // 6. Port prediction: an offer that predicts a port makes B add 32 candidates around
-    // it; the link still opens. A malformed prediction adds none.
-    for (const [nat, want] of [[{ ip: '203.0.113.7', next: 40000, step: 1 }, 32], [{ ip: '203.0.113.7 1 typ host', next: 40000, step: 1 }, 0]]) {
-      const p = await pair((from, m) => (from === A && m.kind === 'offer' ? { ...m, nat } : m));
+    // it; the link still opens. A malformed prediction adds none, nor one at an IP that
+    // no srflx candidate in the offer names (S6). `named`: the offer gets one at 203.0.113.7.
+    const srflx = 'a=candidate:9 1 udp 1 203.0.113.7 39999 typ srflx raddr 0.0.0.0 rport 0\r\n';
+    for (const [nat, named, want] of [
+      [{ ip: '203.0.113.7', next: 40000, step: 1 }, true, 32],
+      [{ ip: '203.0.113.7', next: 40000, step: 1 }, false, 0],
+      [{ ip: '203.0.113.7 1 typ host', next: 40000, step: 1 }, true, 0],
+    ]) {
+      const p = await pair((from, m) => (from === A && m.kind === 'offer' ? { ...m, nat, sdp: named ? { ...m.sdp, sdp: m.sdp.sdp + srflx } : m.sdp } : m));
       const g = p.traces.find((t) => t.what === 'guesses' && t.by === 'B');
-      ok(p.opened && (g?.d.n ?? 0) === want, `prediction ${JSON.stringify(nat)}: ${g?.d.n ?? 0} candidates added, linked`);
+      ok(p.opened && (g?.d.n ?? 0) === want, `prediction ${JSON.stringify(nat)}${named ? '' : ', its IP not in the offer'}: ${g?.d.n ?? 0} candidates added, linked`);
       ok(p.b.tr.badSignals === 0, 'no signal refused');
       p.close();
     }
