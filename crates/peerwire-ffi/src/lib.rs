@@ -501,7 +501,8 @@ pub unsafe extern "C" fn pw_open(
 /// Returns 0, or PW_ERR_INVALID if the seed isn't a valid scalar (retry).
 #[no_mangle]
 pub unsafe extern "C" fn pw_nostr_keypair(seed: *const u8, out_secret: *mut u8, out_pub: *mut u8) -> i32 {
-    let (Some(seed), Some(out_secret), Some(out_pub)) = (bytes(seed, 32), writable(out_secret, 32), writable(out_pub, 32))
+    let (Some(seed), Some(out_secret), Some(out_pub)) =
+        (bytes(seed, 32), writable(out_secret, 32), writable(out_pub, 32))
     else {
         return PW_ERR_INVALID;
     };
