@@ -1016,9 +1016,13 @@ fn start_port_mapping(local: SocketAddr, at: Option<(SocketAddr, SocketAddr)>) -
 }
 
 /// Resolves `host:port` names, keeping the first address of the socket's family.
-/// The servers' addresses in family `v6`. A name is resolved once, so its entries on two
-/// ports share one IP though DNS hands out several in turn (NB-083).
 fn resolve(servers: &[String], v6: bool) -> Vec<SocketAddr> {
+    resolve_with(servers, |s| s.to_socket_addrs().ok()?.find(|a| a.is_ipv6() == v6))
+}
+
+/// [`resolve`], with `lookup` for DNS. A name is looked up once, so its entries on two
+/// ports share one IP though DNS hands out several in turn (NB-083).
+fn resolve_with(servers: &[String], mut lookup: impl FnMut(&str) -> Option<SocketAddr>) -> Vec<SocketAddr> {
     let mut names: Vec<(&str, IpAddr)> = Vec::new();
     let mut out = Vec::new();
     for s in servers {
@@ -1026,7 +1030,7 @@ fn resolve(servers: &[String], v6: bool) -> Vec<SocketAddr> {
         let known = names.iter().find(|(n, _)| *n == name).map(|&(_, ip)| ip);
         let addr = match (known, port) {
             (Some(ip), Some(port)) => SocketAddr::new(ip, port),
-            _ => match s.to_socket_addrs().ok().and_then(|mut a| a.find(|a| a.is_ipv6() == v6)) {
+            _ => match lookup(s) {
                 Some(a) => a,
                 None => continue,
             },
@@ -1079,12 +1083,21 @@ mod tests {
     /// next to one at another name.
     #[test]
     fn stun_names_resolve_once_and_the_defaults_ask_one_server_on_two_ports() {
-        let servers = ["localhost:3478", "127.0.0.2:9", "localhost:3479", "localhost:x"].map(String::from);
-        let got = resolve(&servers, false);
-        let lo = got[0].ip();
-        assert!(lo.is_loopback());
-        let want = vec![SocketAddr::new(lo, 3478), "127.0.0.2:9".parse().unwrap(), SocketAddr::new(lo, 3479)];
-        assert_eq!(got, want, "one IP for one name, and an entry that doesn't resolve skipped");
+        // A DNS that hands out the next of a name's IPs on every lookup, as round robin does.
+        let servers = ["stun.example:19302", "other.example:3478", "stun.example:3478", "stun.example:x"];
+        let mut lookups = Vec::new();
+        let got = resolve_with(&servers.map(String::from), |s| {
+            lookups.push(s.to_string());
+            let (name, port) = s.rsplit_once(':')?;
+            let n = lookups.len() as u8;
+            Some(SocketAddr::new([192, 0, 2, n].into(), port.parse().ok()?)).filter(|_| name.ends_with(".example"))
+        });
+        let at = |n: u8, port| SocketAddr::new([192, 0, 2, n].into(), port);
+        assert_eq!(got, vec![at(1, 19302), at(2, 3478), at(1, 3478)], "one IP for one name; a bad port skipped");
+        assert_eq!(lookups, ["stun.example:19302", "other.example:3478", "stun.example:x"]);
+        // The real resolver, on a name every host has.
+        let got = resolve(&["localhost:3478", "localhost:3479"].map(String::from), false);
+        assert!(got.len() == 2 && got[0].ip().is_loopback() && got[0].ip() == got[1].ip(), "{got:?}");
         let name = |s: &str| s.rsplit_once(':').unwrap().0.to_string();
         let names: Vec<String> = DEFAULT_STUN_SERVERS.iter().map(|s| name(s)).collect();
         assert_eq!(names.len(), 3);
