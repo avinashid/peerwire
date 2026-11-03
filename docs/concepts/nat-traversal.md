@@ -236,6 +236,16 @@ once: the punch through a port-restricted cone, with no port to guess.
   - It can name the device more closely than an address shared behind a carrier NAT.
   - Without privacy extensions (RFC 8981), its last 64 bits can stay the same across networks.
   - `RelayOnly` hides it, as it hides every address.
+- **Browsers** gather IPv6 candidates themselves, and `webrtc.js` passes them on unfiltered. Android Chrome lists its
+  mobile-data interface's real addresses even without microphone permission, the global IPv6 one included, and
+  STUN over IPv6 (both default servers have one) answers with that same address as a `srflx` candidate.
+  - **Field test** (3 Nov 2026): two Android Chrome phones on Jio mobile data, one page without microphone
+    permission, linked directly IPv6 host to IPv6 host, 0.2 s after the answer and 1.2 s after joining, at 31 ms
+    ICE RTT and 36 to 248 ms DataChannel pings (25 sent, none lost). Both carrier NATs mapped as cones and the IPv4
+    public pair answered its checks too; ICE chose IPv6.
+  - Under `'public-only'` the host candidates go, but the IPv6 `srflx` one is the device's own address: peers
+    still learn it, and the direct IPv6 path may stay (not field-tested). A page with the permission may send no
+    IPv6 `srflx`, as it repeats a host candidate the browser no longer hides.
 - **Not done:**
   - IPv6 STUN;
   - more than one IPv6 address per host;
