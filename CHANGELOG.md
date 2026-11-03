@@ -35,6 +35,15 @@ and the commit that fixed it.
 - **Godot:** a hub catches up a stalled member afresh instead of disconnecting it; getters for each link's route and
   address.
 
+### `@peerwire/js`
+
+- **Birthday punching in rooms:** a peer reached by fallback, when one of you is behind a cone NAT and the other
+  behind a symmetric one, gets one birthday punch, and the channel it makes takes the link over. One at a time per
+  page, at most 2 at any one IP per 5 minutes, once per peer; `birthday: false` turns it off, as Net Lab's global
+  room does.
+- **Security:** a peer's port prediction counts only at a public IPv4 address that its own candidates name, and a
+  link adds at most 128 predicted candidates.
+
 ## `@peerwire/js` 0.2.1 (2026-11-03)
 
 **Fixed**

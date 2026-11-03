@@ -57,6 +57,7 @@ Joins a room, and resolves once the signalling is ready and our first hello has 
 | `fallbackMs` | `number` | 8000 | How long a WebRTC link may take to open before the fallback starts (`RTC_FALLBACK_MS` in `webrtc.js`). |
 | `sameNatFallbackMs` | `number` | 3000, at most `fallbackMs` | The same, for a peer behind your own public IPv4 (`RTC_SAME_NAT_FALLBACK_MS`). |
 | `retryOnGrant` | `boolean` | `true` | With privacy `'direct'`, try WebRTC again with peers on a fallback when the page is granted the microphone or camera. No effect with `'public-only'`. |
+| `birthday` | `boolean` | `true` | Run one birthday punch with a peer on a fallback when one of you is behind a cone NAT and the other behind a symmetric one: see [A direct channel found later](#a-direct-channel-found-later). `false` turns it off, and refuses peers' punches. |
 | `RTCPeerConnection` | constructor | `globalThis.RTCPeerConnection` | A WebRTC implementation for runtimes without one (Node: node-datachannel's polyfill). |
 
 **Throws** (the promise rejects):
@@ -532,8 +533,10 @@ also [NAT traversal](../concepts/nat-traversal.md).
    - **Port prediction.** A browser behind a NAT that hands out ports in sequence sees it from its two STUN servers'
      answers (`natFromSdp`: one IPv4 address, two ports 1 to 8 apart). Its offer, answer or late candidates then
      carry `nat: { ip, next, step }`. A peer that isn't behind a symmetric NAT itself adds 32 candidates at the ports
-     around `next` (`predictedCandidates`), so its checks open its NAT to the port the other's will come from. Peers
-     that don't know the field ignore it.
+     around `next` (`predictedCandidates`), so its checks open its NAT to the port the other's will come from. It
+     does so only if `ip` is a public IPv4 address that the other's own server-reflexive candidates name, and adds at
+     most 128 such candidates to a link (`MAX_GUESSES`), however many predictions come. Peers that don't know the
+     field ignore it.
    - **ICE restart.** When a link that was open loses ICE (a Wi-Fi to mobile switch, a hotspot dropping), it isn't
      dropped: after 2 s of `disconnected`, or at once on `failed`, the dialling side renegotiates with new ICE
      credentials; the other side asks it to. The DataChannel and the Peerwire session over it carry on, so the app
@@ -604,6 +607,34 @@ channel only one side reads. A link over signalling then sends its datagrams ove
 moves once the endpoint's punch over the channel is answered (`endpoint.addCandidate`). `route(peer)` then says
 `{ kind: 'direct', adopted: true }`. When the channel closes, a link over signalling goes back at once; a relayed one
 goes back to its member after the endpoint's 15 s direct timeout.
+
+**The room's own birthday punch.** When the WebRTC link that failed showed one of you behind a cone NAT (one public
+port) and the other behind a symmetric NAT with no port prediction (two ports far apart), WebRTC can't link you, but a
+[birthday punch](../concepts/nat-traversal.md#in-browsers) can. The room runs one over the fallback, and the channel it
+makes takes the link over as above. Nothing waits on it: the fallback carries the link throughout.
+
+- **Who does what.** The cone side starts, a moment after the peer has joined on a fallback: it opens one connection
+  and sends its offer and its public address in a room frame, sealed like any other. The symmetric side opens 256
+  connections aimed at that address, but only if what it saw of the two NATs agrees and the peer's own candidates
+  named that IP. The cone side then tries up to 1024 ports of the symmetric side's public IP, as its candidates named
+  it; a try that lands on one of the 256 mappings makes the channel.
+- **Limits.** One punch at a time per page, the next at least 30 s after one that ran; at most 2 aimed at any one IP
+  per 5 minutes per page, whichever rooms and peers ask; once per peer while you are in the room (a busy page puts it
+  off, then tries again 15 to 120 s later); 60 s at most. When it ends, and when either side leaves, everything it
+  opened closes. A page here is its `RTCPeerConnection` class: rooms given the same one (the default) and Net Lab's
+  button share these limits, so give every room in a page the same class.
+- **Addresses.** Only public IPv4 addresses that the peer's candidates on the failed link named are tried. The peer
+  writes those candidates, so a member can name a third party's address: your page then checks it from 256
+  connections, or checks 1024 ports of that IP, for up to 60 s. The per-IP limit bounds what any one address gets
+  from a page. Net Lab's global room, which anyone can join, runs no punch of its own (`birthday: false`).
+- **When not.** Two cones (WebRTC links them), two symmetric NATs (no punch can), a symmetric NAT with a prediction
+  (port prediction does it), a NAT that STUN didn't answer for, or one public IP on both sides (one NAT, which
+  doesn't send back to itself). It needs STUN in `iceServers` and a browser's WebRTC (one with
+  `RTCPeerConnection.generateCertificate`). With `birthday: false`, a room starts none and refuses a peer's.
+- **Cost.** The symmetric side holds 256 connections for up to 60 s, each sending ICE checks to one address; the
+  cone side, one connection that checks about 20 ports a second.
+- **Diagnostics.** The transport traces each step as `birthday` (`start`, `fleet`, `spray`, `end` with `why`, then
+  `adopted`); Net Lab logs them.
 
 ### Pipes over Nostr
 
@@ -777,9 +808,10 @@ build your own for relay-only privacy or a custom room.
 | `networkChanged()` | Links that were open but whose ICE isn't connected restart ICE now, rather than after the 2 s grace. `joinRoom` calls it on `online` and on a `navigator.connection` change. |
 | `adopt(peer, pc, dc, { pipe }?)` | Carries `peer`'s link over `dc` once the far end adopts its end too. Resolves to the channel's handle, or -1 if the far end didn't adopt within 5 s or `dc` closed first. `room.adoptChannel` uses it. |
 | `carrier(peer)` | The adopted `{ pc, dc }` carrying `peer`'s link now, or `null`. |
+| `nat(peer)` | What the newest WebRTC link to `peer` that failed showed of the two NATs (before one has, the link now): `{ mine, theirs }`, each a `Map` of server-reflexive IPv4 to its `Set` of ports, or `null`. The room's birthday punches read it. |
 | `retry(peer)` | As the dialling side, dials `peer` again with a new connection while its link runs by other means. `false` if the link is open or a retry is under way. |
 | `askRetry(peer)` | Asks `peer`, the dialling side, for a retry. |
-| `trace` | `(peer, what, detail) => void` or `null`: each link's signalling, retries, ICE states, port guesses, `same-nat` and `throttled`. Net Lab shows it. |
+| `trace` | `(peer, what, detail) => void` or `null`: each link's signalling, retries, ICE states, port guesses, `same-nat`, `throttled` and the room's birthday punches (`birthday`). Net Lab shows it. |
 
 | Counter | |
 |---|---|
@@ -881,7 +913,7 @@ interface Transport {
 | `withoutHostCandidates(sdp)` | The SDP without `host` candidates (LAN, loopback, mDNS). |
 | `candidateSummary(sdp)` | `{ host4, host6, mdns, srflx4, srflx6, prflx, relay }`: an SDP's candidates by type and family. |
 | `natFromSdp(sdp)` | `{ type: 'symmetric' \| 'cone' \| 'unknown', ip?, next?, step? }`: the NAT as the server-reflexive candidates show it, with a prediction for a sequential symmetric one. |
-| `predictedCandidates(nat, sdpMid?)` | ICE candidates at the ports around a peer's prediction, for `addIceCandidate`; `[]` unless it is an IPv4 address and ports in range. |
+| `predictedCandidates(nat, sdpMid?)` | ICE candidates at the ports around a peer's prediction, for `addIceCandidate`; `[]` unless it is a public IPv4 address and ports in range. |
 
 ## Source files and demos
 
@@ -899,6 +931,7 @@ interface Transport {
 | `src/webrtc.js` | `WebRtcTransport`: one negotiated, unordered, no-retransmit DataChannel per peer. `BroadcastSignaling` for tabs of one browser. |
 | `src/retry.js` | When a room tries WebRTC again with the peers it reaches only by fallback. |
 | `src/birthday.js` | A browser birthday punch, for two peers that can't punch directly; Net Lab runs it. |
+| `src/punch.js` | The room's own birthday punch with a peer on a fallback, cone NAT against symmetric (`birthday`). |
 | `src/nostr.js` | `NostrSignaling` over public relays: ephemeral events, a throwaway key per session, payloads sealed to the recipient's PeerId. |
 | `src/local.js` | `LocalTransport`: datagrams over the BroadcastChannel, for Node and tests. |
 | `src/index.d.ts` | TypeScript types. |

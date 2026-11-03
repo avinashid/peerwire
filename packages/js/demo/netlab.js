@@ -25,6 +25,7 @@
 
 import { joinRoom, randomRoomId, DEFAULT_RELAYS } from '../src/index.js';
 import { openFleet, openSpray, randomCredentials, sprayPorts, isPublicV4, stripCandidates, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
+import { punchSlot } from '../src/punch.js';
 
 const APP_ID = 'peerwire-netlab';
 const GLOBAL_ROOM = 'global-v1';
@@ -394,7 +395,7 @@ async function enter(kind, key) {
   const signaling = params.get('signal') === 'local' ? 'local' : 'nostr';
   await micChecked; // a stored grant must be known before choosing the global room's privacy
   const privacy = kind === 'global' && micState === 'granted' ? 'public-only' : 'direct';
-  log('info', `joining the ${kind} room over ${signaling === 'local' ? 'local BroadcastChannel' : `Nostr (${(relays ?? DEFAULT_RELAYS).join(', ')})`}${params.get('rtc') === 'off' ? ', WebRTC disabled (?rtc=off)' : ''}${privacy === 'public-only' ? ', without local addresses (the microphone is allowed)' : ''}`);
+  log('info', `joining the ${kind} room over ${signaling === 'local' ? 'local BroadcastChannel' : `Nostr (${(relays ?? DEFAULT_RELAYS).join(', ')})`}${params.get('rtc') === 'off' ? ', WebRTC disabled (?rtc=off)' : ''}${privacy === 'public-only' ? ', without local addresses (the microphone is allowed)' : ''}${kind === 'global' ? ', with no automatic birthday punch (the button runs one)' : ''}`);
   const started = now();
   try {
     room = await joinRoom({
@@ -406,6 +407,9 @@ async function enter(kind, key) {
       presence: { ...presence(), name: clip($('name').value.trim(), 20) || 'guest' },
       // The global room never makes new connections because of a grant: it rejoins (MIC-1).
       retryOnGrant: kind !== 'global',
+      // Nor opens a fleet a stranger asked for: anyone can open it, and a member names the address
+      // a fleet aims at (NB84-1). There the button runs one, on a click (NB48-1).
+      birthday: kind !== 'global',
       ...(relays?.length && { relays }),
       ...(params.get('rtc') === 'off' && { RTCPeerConnection: NoIcePc }),
     });
@@ -529,6 +533,16 @@ const SIG_TEXT = {
   'ice-batch-received': (d) => `late addresses received (${addrText(d)})`,
   'ice-state': (d) => `ICE ${d.state}`,
   'same-nat': (d) => `same public IP as us (${d.ip}): falling back after ${secs(d.ms)} unless a direct path opens first`,
+  birthday: (d) => AUTO_BDAY[d.step]?.(d) ?? `birthday punch: ${d.step}`,
+};
+// The room's own birthday punch (src/punch.js), step by step.
+const AUTO_BDAY = {
+  start: (d) => `one of you is behind a cone NAT, the other a symmetric one: the room starts a birthday punch, as the ${d.role === 'hard' ? 'symmetric (fleet)' : 'cone (spray)'} side`,
+  fleet: (d) => `birthday punch: opened ${d.n} sockets, answering`,
+  spray: (d) => `birthday punch: spraying ${d.n} ports at ${d.ip}`,
+  end: (d) => (d.why === 'channel open' ? 'birthday punch: a direct channel formed' : `birthday punch ended: ${d.why}`),
+  adopted: () => 'birthday punch: the room link now goes over the punched channel',
+  'not-adopted': () => "birthday punch: the room didn't take the channel, so it closed",
 };
 
 // The WebRTC transport's diagnostics for one link.
@@ -550,7 +564,8 @@ function onTrace(peer, what, d) {
     tryHotspot(p, peer);
     setTimeout(() => { noteTheirHosts(p, peer); tryHotspot(p, peer); }, 500);
   }
-  const bad = d.resend || what === 'ice-restart' || (what === 'ice-state' && (d.state === 'disconnected' || d.state === 'failed'));
+  const bad = d.resend || what === 'ice-restart' || (what === 'ice-state' && (d.state === 'disconnected' || d.state === 'failed'))
+    || (what === 'birthday' && ((d.step === 'end' && d.why !== 'channel open') || d.step === 'not-adopted'));
   log(bad ? 'warn' : 'info', `WebRTC with ${nameOf(peer)}: ${text}${at != null ? ` (${secs(at)} after hearing it)` : ''}`);
 }
 
@@ -586,6 +601,8 @@ function onMessage(data, peer, info) {
 const BDAY_TIMEOUT_MS = 70000;
 const BDAY_COOLDOWN_MS = 300000; // one punch per peer per 5 min (NB48-1); reload to reset
 let bdayBusy = null; // the peer whose punch holds this tab's one slot (NB48-1: one fleet at a time)
+// The page's punch slot, which the room's own punches (src/punch.js) take too: never two fleets at once.
+const pageSlot = () => punchSlot(RTCPeerConnection);
 const rtcAvailable = () => params.get('rtc') !== 'off' && typeof RTCPeerConnection === 'function';
 const bdayIce = () => (params.get('signal') === 'local' ? [] : PROBE_STUN);
 // This device's own public IPv4 (from the network probe), for the hard side's answer.
@@ -644,7 +661,11 @@ function bdayFail(peer, why) {
 // setup, so what it opened meanwhile is closed, not kept running (MIC-2).
 const current = (peer, b) => peers.get(peer)?.bday === b && !!b.ctx;
 function closeBday(peer) {
-  if (bdayBusy === peer) bdayBusy = null; // NB48b-2: only the punch holding the slot frees it, not a refusal
+  // NB48b-2: only the punch holding the slot frees it, not a refusal. No gap after it: a click is the user's.
+  if (bdayBusy === peer) {
+    bdayBusy = null;
+    pageSlot().free(peer, false);
+  }
   const b = peerState(peer).bday;
   if (!b?.ctx) return;
   try { b.ctx.easy?.pc.close(); } catch { /* already closed */ }
@@ -666,7 +687,7 @@ async function tryBirthday(peer) {
     if (prev?.status === 'invited') room.send({ t: 'bday', step: 'abort', why: 'we share a public IP' }, { to: peer });
     return bdayFail(peer, same);
   }
-  if (bdayBusy) return bdayFail(peer, 'another birthday punch is running — one at a time');
+  if (bdayBusy || pageSlot().busy) return bdayFail(peer, 'another birthday punch is running or just ran (the room runs some itself) — one at a time');
   if (prev?.lastRun && now() - prev.lastRun < BDAY_COOLDOWN_MS) {
     return bdayFail(peer, `one punch per peer per 5 min — wait ${Math.ceil((BDAY_COOLDOWN_MS - (now() - prev.lastRun)) / 1000)} s (or reload)`);
   }
@@ -686,6 +707,7 @@ async function tryBirthday(peer) {
   const role = iAmHard ? 'hard' : 'easy';
   const pending = prev?.pendingOffer; // a buffered offer from the easy initiator
   bdayBusy = peer;
+  pageSlot().take(peer);
   bdayStatus(peer, 'running', { role, startedAt: now(), lastRun: now(), ctx: { timer: setTimeout(() => bdayFail(peer, 'timed out (no direct channel formed)'), BDAY_TIMEOUT_MS) } });
   log('info', `birthday punch with ${nameOf(peer)}: starting as the ${role} side (${why})`);
   if (initiated) room.send({ t: 'bday', step: 'start', yourRole: iAmHard ? 'easy' : 'hard' }, { to: peer });
@@ -1426,6 +1448,8 @@ window.netlab = {
   // no same-nat of its own).
   trace: (i, what, d) => room.transport.trace?.(room.peers[i], what, d),
   get room() { return roomKind && { kind: roomKind, label: roomLabel(), link: roomLink() }; },
+  // Whether the room runs its own birthday punches (src/punch.js).
+  get autoPunch() { return room ? room.punches?.on === true : null; },
   roomIdOf,
   joinPrivate: (key) => enter('private', key ?? randomRoomId()),
 };

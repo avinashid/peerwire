@@ -89,6 +89,7 @@ NODE=(
   "node room relay move|node packages/js/test/room_relay_move.mjs"
   "node room relay latency|node packages/js/test/room_relay_latency.mjs"
   "node room adopt|node packages/js/test/room_adopt.mjs"
+  "node room birthday|node packages/js/test/room_birthday.mjs"
   "node room same nat|node packages/js/test/room_same_nat.mjs"
   "node room retry|node packages/js/test/room_retry.mjs"
   "node retry backoff|node packages/js/test/retry_backoff.mjs"
@@ -103,7 +104,7 @@ NODE=(
   "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
 )
-NODE_FIRST='^node[0-9]* (doc catchup|room adopt|room retry|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
+NODE_FIRST='^node[0-9]* (doc catchup|room adopt|room birthday|room retry|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
 # Browser tests (headless Chromium on loopback): GATE_BROWSER_JOBS at a time, not more, as WebRTC timing suffers
 # under load. Each serves its page on a port the OS picks (serve.mjs), so they can run side by side.
 BROWSER=(
@@ -119,6 +120,7 @@ BROWSER=(
   "ice restart|node packages/js/test/ice_restart.mjs"
   "retry direct|node packages/js/test/retry_direct.mjs"
   "birthday fleet|node packages/js/test/birthday_fleet.mjs 32"
+  "room birthday|node packages/js/test/room_birthday_browser.mjs"
   "netlab birthday|node packages/js/test/netlab_birthday.mjs"
   "netlab carry|node packages/js/test/netlab_carry.mjs"
   "tab close|node packages/js/test/leave.mjs --runs=5 --crash=0"

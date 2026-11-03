@@ -1,8 +1,10 @@
 // NB-046: NAT detection from server-reflexive candidates, and the candidates added
-// for a peer's port prediction. Pure functions: no browser, no network.
+// for a peer's port prediction. Pure functions: no browser, no network. S6: a prediction
+// counts only at a public IPv4 that the peer's own server-reflexive candidates name, and
+// a link adds at most MAX_GUESSES predicted candidates (WebRtcTransport.guess, on a stub link).
 //
 //   node packages/js/test/nat_predict.mjs
-import { natFromSdp, predictedCandidates, checkPrediction, GUESS_BEFORE, GUESS_AFTER } from '../src/webrtc.js';
+import { natFromSdp, predictedCandidates, checkPrediction, WebRtcTransport, GUESS_BEFORE, GUESS_AFTER, MAX_GUESSES } from '../src/webrtc.js';
 
 let failed = 0;
 const ok = (cond, what) => {
@@ -55,8 +57,55 @@ for (const bad of [
   { ip: '203.0.113.7', next: 4000, step: 0 },
   { ip: '203.0.113.7', next: '4000', step: 1 },
   { ip: '203.0.113.7', next: 4000.5, step: 1 },
+  // S6: not a public address, so guesses can't be aimed at a LAN, the router, loopback
+  // or the carrier NAT's own range.
+  { ip: '10.1.2.3', next: 4000, step: 1 },
+  { ip: '192.168.1.5', next: 4000, step: 1 },
+  { ip: '172.16.0.9', next: 4000, step: 1 },
+  { ip: '100.64.0.1', next: 4000, step: 1 },
+  { ip: '127.0.0.1', next: 4000, step: 1 },
+  { ip: '169.254.1.1', next: 4000, step: 1 },
+  { ip: '0.0.0.0', next: 4000, step: 1 },
+  { ip: '224.0.0.1', next: 4000, step: 1 },
+  { ip: '255.255.255.255', next: 4000, step: 1 },
 ]) {
   ok(checkPrediction(bad) === null && predictedCandidates(bad).length === 0, `refused: ${JSON.stringify(bad)}`);
+}
+
+// S6, guess(): a prediction from the peer is acted on only at an IP its own srflx
+// candidates named (l.theirs), and a link adds at most MAX_GUESSES predicted candidates,
+// however many distinct predictions come.
+{
+  const t = new WebRtcTransport({}, { onMessage() {} });
+  const traced = [];
+  t.trace = (peer, what, d) => what === 'guesses' && traced.push(d.n);
+  const link = (theirs, mine = '') => {
+    const added = [];
+    const pc = { remoteDescription: { sdp: 'a=mid:0' }, localDescription: { sdp: mine }, addIceCandidate: async (c) => void added.push(c) };
+    return { l: { pc, peer: 'p', theirs: new Set(theirs), guessed: null, guesses: 0 }, added };
+  };
+  const nat = (ip, next) => ({ ip, next, step: 1 });
+  const one = GUESS_BEFORE + GUESS_AFTER + 1;
+  let { l, added } = link(['198.51.100.2']);
+  await t.guess(l, nat('203.0.113.7', 40000));
+  ok(added.length === 0, 'a prediction at an IP the peer\'s srflx candidates never named adds nothing');
+  await t.guess(l, nat('198.51.100.2', 40000));
+  ok(added.length === one && added.every((c) => c.candidate.includes(' 198.51.100.2 ')), `one at a named IP adds ${added.length}`);
+  await t.guess(l, nat('198.51.100.2', 40000));
+  ok(added.length === one, 'the same prediction again adds nothing');
+  // One near port 1 adds fewer (no port 0 or below), so the cap falls inside a prediction.
+  await t.guess(l, nat('198.51.100.2', 3));
+  ok(added.length === one + GUESS_AFTER + 3, `one at port 3 adds ${GUESS_AFTER + 3}`);
+  for (let k = 1; k <= 8; k++) await t.guess(l, nat('198.51.100.2', 40000 + 1000 * k));
+  ok(added.length === MAX_GUESSES && l.guesses === MAX_GUESSES, `10 distinct predictions add ${added.length} in all (the cap is ${MAX_GUESSES})`);
+  ok(traced.length === 5 && traced.at(-1) === MAX_GUESSES - 3 * one - (GUESS_AFTER + 3), `the last traced adds what was left (${traced.join(', ')}); none is traced past the cap`);
+  ({ l, added } = link(['198.51.100.2', '10.0.0.7']));
+  await t.guess(l, nat('10.0.0.7', 40000));
+  ok(added.length === 0, 'a private IP is refused even when the peer named it');
+  // Behind a symmetric NAT ourselves, no guesses (unchanged).
+  ({ l, added } = link(['198.51.100.2'], [srflx('203.0.113.9', 5000), srflx('203.0.113.9', 6000)].join('\n')));
+  await t.guess(l, nat('198.51.100.2', 40000));
+  ok(added.length === 0, 'none while our own NAT is symmetric');
 }
 
 console.log(failed ? `${failed} FAILED` : 'all passed');

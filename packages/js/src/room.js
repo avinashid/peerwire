@@ -29,9 +29,12 @@
 // behind our own public IPv4 (a laptop on a phone's hotspot) falls back after
 // sameNatFallbackMs, not fallbackMs. The link's own DataChannel opening later takes
 // the link back (webrtc.js), and one found by other means (a birthday punch,
-// birthday.js) can take a fallback link over: room.adoptChannel(). Meanwhile the room
-// tries WebRTC again now and then, and on a network change or a microphone or camera
-// grant (retry.js); a retry whose DataChannel opens takes the link over the same way.
+// birthday.js) can take a fallback link over: room.adoptChannel(). The room runs such a
+// punch itself, once, with a peer whose failed link showed one side behind a cone NAT
+// and the other behind a symmetric one (punch.js; `birthday: false` turns it off).
+// Meanwhile the room tries WebRTC again now and then, and on a network change or a
+// microphone or camera grant (retry.js); a retry whose DataChannel opens takes the link
+// over the same way.
 //
 // Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
 // room.poll() / room.receive() return queued events as plain objects (strings,
@@ -56,13 +59,15 @@ import { docCopy, storeOf } from './store.js';
 import { deflate, inflate, deflates } from './zip.js';
 import { RelayCopy } from './relays.js';
 import { Calls } from './call.js';
+import { Punches } from './punch.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
 // Nudge carries nothing (peers ignore tags they don't know): see the 'open' handler. Doc
 // carries a shared document's frame as JSON (doc.js), on the reliable lane; DocZ the same,
-// deflated (raw deflate). Call carries a call frame as JSON (call.js), on the reliable lane.
-const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6, Doc: 7, DocZ: 8, Call: 9 };
+// deflated (raw deflate). Call carries a call frame as JSON (call.js), on the reliable lane, and
+// Punch a birthday punch's (punch.js).
+const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6, Doc: 7, DocZ: 8, Call: 9, Punch: 10 };
 // Doc frames of DEFLATE_MIN bytes or more go deflated to members whose doc reads them, where
 // this platform has 'deflate-raw' streams. One goes plain if it deflates to under 1/DEFLATE_RATIO
 // of its size, and one is inflated only to the lane's limit and DEFLATE_RATIO times its own size,
@@ -166,6 +171,7 @@ export async function joinRoom({
   fallbackMs,
   sameNatFallbackMs,
   retryOnGrant = true,
+  birthday = true,
   RTCPeerConnection = globalThis.RTCPeerConnection,
 } = {}) {
   if (!appId || !roomId) throw new TypeError('joinRoom needs an appId and a roomId');
@@ -203,7 +209,9 @@ export async function joinRoom({
   // A grant shows local addresses only to new connections, and only 'direct' offers them. Calls use the room's
   // iceServers and privacy for their media connections too.
   const media = RTCPeerConnection ? { RTCPeerConnection, MediaStream: globalThis.MediaStream, iceServers: ice, privacy } : null;
-  const room = new Room(endpoint, sig, transport, presence, proof, { fallback, grants: privacy === 'direct' && retryOnGrant, roomId, pw, media });
+  // Birthday punches need STUN, to learn the public address the far side's fleet aims at.
+  const punch = RTCPeerConnection ? { RTCPeerConnection, iceServers: ice, on: birthday } : null;
+  const room = new Room(endpoint, sig, transport, presence, proof, { fallback, grants: privacy === 'direct' && retryOnGrant, roomId, pw, media, punch });
   if (queue) room.queue = [];
   await sig.ready;
   await room.hello();
@@ -213,7 +221,7 @@ export async function joinRoom({
 export class Room {
   static proofMs = PROOF_MS; // tests shorten it
   static peerFirstMs = PEER_FIRST_MS;
-  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off', grants = false, roomId = null, pw = null, media = null } = {}) {
+  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off', grants = false, roomId = null, pw = null, media = null, punch = null } = {}) {
     this.endpoint = endpoint;
     this.signaling = signaling;
     this.roomId = roomId; // for room.doc(name, { relays })
@@ -247,6 +255,8 @@ export class Room {
       else if (state === 'failed') this.rtcFailed(peer);
       else if (state === 'carrier') this.reroute(peer);
       else if (state === 'open' || state === 'retry-failed') this.retries.done(peer);
+      // A link that failed shows the NATs: a birthday punch may help (punch.js).
+      if (state === 'failed' || state === 'retry-failed') this.punches?.consider(peer);
       // A link over signalling moves onto a channel that opened late (a retry's, say) with
       // its first datagram there: one now (its ACK moves the far end's too), not at the next
       // keepalive, up to 10 s on.
@@ -255,6 +265,18 @@ export class Room {
     });
     // Peers on a fallback: WebRTC is tried again now and then (see retryDirect).
     this.retries = new DirectRetries((peer) => this.retryNow(peer), { holdMs: (this.transport.fallbackMs ?? 8000) + 10000 });
+    // And a birthday punch once, with a peer whose NATs call for one (punch.js).
+    this.punches = punch && new Punches({
+      ...punch,
+      room: {
+        send: (peer, m) => this.writePunch(peer, m),
+        route: (peer) => this.routes.get(peer)?.kind ?? null,
+        member: (peer) => this.members.has(peer),
+        nat: (peer) => this.transport.nat?.(peer) ?? null,
+        adopt: (peer, pc, dc) => this.adoptChannel(peer, pc, dc),
+        trace: (peer, what, d) => this.transport.tr?.(peer, what, d),
+      },
+    });
     this.unwatch = []; // removes the permission listeners
     if (grants) this.watchGrants();
     endpoint.onEvent = (e) => this.onEvent(e);
@@ -482,6 +504,16 @@ export class Room {
     }
   }
 
+  // A birthday punch's frame to a member (punch.js): none to a peer gone meanwhile.
+  writePunch(peer, m) {
+    if (this.left || !this.members.has(peer)) return;
+    try {
+      this.write(peer, frame(T.Punch, enc.encode(JSON.stringify(m))), Lane.Reliable);
+    } catch {
+      // A punch frame stays far under the lane's limit.
+    }
+  }
+
   // Doc frames go to a peer in order. One of DEFLATE_MIN bytes or more, to a member whose doc
   // reads deflated frames (`z`), goes deflated where we can, which takes a moment: the frames
   // after it wait for it.
@@ -566,6 +598,7 @@ export class Room {
     globalThis.navigator?.connection?.removeEventListener?.('change', this.onNetwork);
     globalThis.document?.removeEventListener?.('visibilitychange', this.onHidden);
     this.retries.close();
+    this.punches?.close();
     for (const off of this.unwatch) off();
     this.calls.close();
     const saved = [...this.docs.values()].map((d) => d.close());
@@ -662,6 +695,7 @@ export class Room {
       if (!joined) {
         for (const d of this.docs.values()) d.joined(peer);
         this.calls.joinedRoom(peer);
+        this.punches?.consider(peer);
       }
       return;
     }
@@ -670,6 +704,7 @@ export class Room {
     if (!this.members.has(peer)) return;
     if (tag === T.Doc || tag === T.DocZ) return this.onDoc(peer, tag, body);
     if (tag === T.Call) return void (lane === Lane.Reliable && this.calls.receive(peer, body));
+    if (tag === T.Punch) return void (lane === Lane.Reliable && this.punches?.receive(peer, body));
     let value;
     if (tag === T.Bytes) value = body;
     else if (tag === T.Text) value = dec.decode(body);
@@ -810,6 +845,7 @@ export class Room {
     this.paths.delete(peer);
     this.fallingBack.delete(peer);
     this.retries.forget(peer);
+    this.punches?.gone(peer);
     this.docOut.delete(peer);
     this.docIn.delete(peer);
     // Out of the room before the session ends: disconnect() pumps, and a 'disconnected'

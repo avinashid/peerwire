@@ -20,6 +20,7 @@
 
 import { isPeerId, MAX_DATAGRAM } from './peerwire.js';
 import { b64, unb64 } from './nostr.js';
+import { isPublicV4 } from './birthday.js';
 
 // Above this many bytes queued on a DataChannel, new datagrams are dropped (PERF-1).
 export const MAX_BUFFERED = 1024 * 1024;
@@ -101,9 +102,13 @@ export const RESTART_WINDOW_MS = 60000;
 // an IP and are 1 to MAX_STEP ports apart hands ports out in sequence. A peer not
 // behind a symmetric NAT itself adds GUESS_BEFORE + GUESS_AFTER + 1 candidates around
 // the predicted port, so its checks open its NAT to the port the other's will come from.
+// A prediction counts only at a public IPv4 that the peer's own server-reflexive
+// candidates name, and a link adds at most MAX_GUESSES predicted candidates in all,
+// however many predictions the peer sends (S6).
 export const MAX_STEP = 8;
 export const GUESS_BEFORE = 4;
 export const GUESS_AFTER = 27;
+export const MAX_GUESSES = 128;
 // adopt(): a DataChannel made outside the transport carries a link only once both
 // ends adopt it. Each end sends CARRY every CARRY_EVERY_MS until it hears from the
 // other, and answers a CARRY with CARRIED (which gets no answer), at most once per
@@ -125,13 +130,27 @@ const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]
 // browser lists a mapping two servers agree on once, so one server answering looks
 // the same); 'unknown' with no server-reflexive IPv4 candidate.
 export function natFromSdp(sdp) {
-  const ports = new Map(); // IPv4 -> Set of ports
-  for (const l of typeof sdp === 'string' ? sdp.split(/\r?\n/) : []) {
+  return natOfPorts(srflxPorts(sdp));
+}
+
+// The server-reflexive IPv4 addresses in `text` (a description, or candidate lines), each
+// with the ports it came with, added to `into` (a Map of IPv4 -> Set of ports): at most
+// `max` addresses, and MAX_SRFLX_PORTS ports each, as more say nothing more.
+const MAX_SRFLX_PORTS = 4;
+function srflxPorts(text, into = new Map(), max = Infinity) {
+  for (const l of typeof text === 'string' ? text.split(/\r?\n/) : []) {
     const m = CANDIDATE.exec(l.trim());
     if (!m || m[3] !== 'srflx' || !IPV4.test(m[1])) continue;
-    if (!ports.has(m[1])) ports.set(m[1], new Set());
-    ports.get(m[1]).add(Number(m[2]));
+    if (!into.has(m[1]) && into.size < max) into.set(m[1], new Set());
+    const ports = into.get(m[1]);
+    if (ports && ports.size < MAX_SRFLX_PORTS) ports.add(Number(m[2]));
   }
+  return into;
+}
+
+// natFromSdp for server-reflexive addresses already read: `ports`, a Map of IPv4 -> Set of
+// ports (WebRtcTransport.nat gives them).
+export function natOfPorts(ports) {
   if (!ports.size) return { type: 'unknown' };
   for (const [ip, set] of ports) {
     if (set.size < 2) continue;
@@ -144,19 +163,10 @@ export function natFromSdp(sdp) {
   return { type: 'cone' };
 }
 
-// The server-reflexive IPv4 addresses in `text` (a description, or candidate lines).
-export function srflxV4(text) {
-  const out = [];
-  for (const l of typeof text === 'string' ? text.split(/\r?\n/) : []) {
-    const m = CANDIDATE.exec(l.trim());
-    if (m && m[3] === 'srflx' && IPV4.test(m[1])) out.push(m[1]);
-  }
-  return out;
-}
-
-// A peer's prediction as sent in signalling, checked: { ip, next, step } or null.
+// A peer's prediction as sent in signalling, checked: { ip, next, step } or null. Only
+// at a public IPv4 (S6): guesses never aim at a LAN, loopback or carrier-NAT address.
 export function checkPrediction(nat) {
-  if (!nat || typeof nat !== 'object' || typeof nat.ip !== 'string' || !IPV4.test(nat.ip)) return null;
+  if (!nat || typeof nat !== 'object' || typeof nat.ip !== 'string' || !isPublicV4(nat.ip)) return null;
   const { next, step } = nat;
   if (!Number.isInteger(next) || !Number.isInteger(step) || step < 1 || step > MAX_STEP || next < 1 || next > 65535) return null;
   return { ip: nat.ip, next, step };
@@ -313,6 +323,7 @@ export class WebRtcTransport {
     this.piped = { sent: 0, received: 0, dropped: 0, stale: 0 };
     this.carriers = new Map(); // peer hex -> adopted channel (see adopt())
     this.carried = new Map(); // endpoint handle -> the adopted channel carrying it now
+    this.seen = new Map(); // peer hex -> what the newest link to it that failed showed of the NATs (see nat())
     endpoint.onTransmit = (handle, bytes) => {
       if (loss && Math.random() < loss) {
         this.dropped++;
@@ -356,13 +367,14 @@ export class WebRtcTransport {
     dc.binaryType = 'arraybuffer';
     // Without trickle: `described` once the offer or answer is out, `late` holds the
     // candidates found after it, `held` the peer's that came before its description.
-    // `mine` and `theirs`: the public IPv4s each side's candidates name (see sameNat);
+    // `mine` and `theirs`: the public IPv4s each side's candidates name, each with its ports
+    // (see sameNat and nat());
     // `heard` once the DataChannel has carried a datagram from the peer; `unsent` while
     // our answer waits for budget (its candidates wait with it).
     const l = { pc, dc, peer, handle: h, dialer: false, timer: null, watchedAt: 0, failed: false, described: false, late: [], lateTimer: null,
       held: [], offerMsg: null, offerSdp: null, answerMsg: null, unsent: false, resends: [],
-      lateSent: 0, opened: false, restartAt: [], restartTimer: null, guessed: null,
-      mine: new Set(), theirs: new Set(), sameNat: false, heard: false, retry: false };
+      lateSent: 0, opened: false, restartAt: [], restartTimer: null, guessed: null, guesses: 0,
+      mine: new Map(), theirs: new Map(), sameNat: false, heard: false, retry: false };
     dc.onopen = () => {
       clearTimeout(l.timer);
       l.opened = true;
@@ -419,13 +431,13 @@ export class WebRtcTransport {
     if (l.dc.readyState !== 'open') l.timer = setTimeout(() => this.failed(l), Math.max(0, l.watchedAt + ms - Date.now()));
   }
 
-  // Notes the public IPv4s that candidates in `text` name, ours or the peer's (`set`),
-  // and once the two sides share one, shortens the link's clock to sameNatMs (see
-  // RTC_SAME_NAT_FALLBACK_MS). Called for every description and candidate either way.
+  // Notes the public IPv4s that candidates in `text` name, ours or the peer's (`set`), with
+  // their ports, and once the two sides share one, shortens the link's clock to sameNatMs
+  // (see RTC_SAME_NAT_FALLBACK_MS). Called for every description and candidate either way.
   sameNat(l, set, text) {
-    for (const ip of srflxV4(text)) if (set.size < MAX_LATE) set.add(ip);
+    srflxPorts(text, set, MAX_LATE);
     if (l.sameNat || l.opened || l.failed) return;
-    const ip = [...l.mine].find((a) => l.theirs.has(a));
+    const ip = [...l.mine.keys()].find((a) => l.theirs.has(a));
     if (!ip) return;
     l.sameNat = true;
     this.tr(l.peer, 'same-nat', { ip, ms: this.sameNatMs });
@@ -437,6 +449,7 @@ export class WebRtcTransport {
     if (l.opened) return this.restartSoon(l, 0); // was linked: try to get it back
     if (l.failed || l.dc.readyState === 'open' || this.links.get(l.handle) !== l) return;
     l.failed = true;
+    this.seen.set(l.peer, { mine: l.mine, theirs: l.theirs });
     if (!l.retry) return this.onPeer(l.peer, 'failed');
     // A retry that didn't open closes quietly: the link stays on its fallback.
     this.dropRtc(l.peer);
@@ -540,15 +553,18 @@ export class WebRtcTransport {
 
   // A peer's prediction came: unless our own NAT is symmetric (each probe would cost
   // it a port, and its own mapping isn't the one the peer saw), add candidates at the
-  // ports around it, once per prediction.
+  // ports around it, once per prediction. Only at an IP the peer's own server-reflexive
+  // candidates name (`l.theirs`, noted before this is called), and at most MAX_GUESSES
+  // in all on the link (S6).
   async guess(l, nat) {
     const p = checkPrediction(nat);
-    if (!p || !l.pc.remoteDescription || this.privacy === 'relay-only') return;
+    if (!p || !l.pc.remoteDescription || this.privacy === 'relay-only' || !l.theirs.has(p.ip) || l.guesses >= MAX_GUESSES) return;
     const key = `${p.ip}:${p.next}:${p.step}`;
     if (l.guessed === key || natFromSdp(l.pc.localDescription?.sdp).type === 'symmetric') return;
     l.guessed = key;
     const mid = /^a=mid:(\S+)/m.exec(l.pc.remoteDescription.sdp ?? '')?.[1] ?? '0';
-    const cands = predictedCandidates(p, mid);
+    const cands = predictedCandidates(p, mid).slice(0, MAX_GUESSES - l.guesses);
+    l.guesses += cands.length;
     this.tr(l.peer, 'guesses', { ip: p.ip, next: p.next, step: p.step, n: cands.length });
     await this.addCandidates(l, cands);
   }
@@ -843,6 +859,17 @@ export class WebRtcTransport {
     return this.byPeer.has(peer);
   }
 
+  // What the newest WebRTC link to `peer` that failed showed of the two NATs (before one
+  // has, the link now, once it has the peer's description): { mine, theirs }, the
+  // server-reflexive IPv4s each side's candidates named, each with its ports (natOfPorts
+  // reads them), or null. A link counts on its own: a cone gives each connection's socket a
+  // port of its own, so two links together would look symmetric. The room's birthday
+  // punches read it (punch.js).
+  nat(peer) {
+    const l = this.links.get(this.byPeer.get(peer));
+    return this.seen.get(peer) ?? (l?.pc.remoteDescription ? { mine: l.mine, theirs: l.theirs } : null);
+  }
+
   // Lets `peer` (one that proved the room key) send us datagrams over signalling.
   allowPipe(peer) {
     if (!this.pipesOn || this.pipeAllowed.has(peer)) return;
@@ -1076,6 +1103,7 @@ export class WebRtcTransport {
 
   // Forgets every path to `peer`: its WebRTC link, its pipe and an adopted channel.
   drop(peer) {
+    this.seen.delete(peer);
     this.dropRtc(peer);
     this.dropPipe(peer);
     this.dropCarrier(peer, undefined, true);
@@ -1103,6 +1131,7 @@ export class WebRtcTransport {
     this.checking.clear();
     this.retryTaken.clear();
     this.budgets.clear();
+    this.seen.clear();
     for (const peer of [...this.carriers.keys()]) this.dropCarrier(peer, undefined, true);
     this.pipes.clear();
     this.pipeByPeer.clear();
