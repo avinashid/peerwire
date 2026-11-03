@@ -63,10 +63,11 @@ fn main() -> anyhow::Result<()> {
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
     // The driver lives as long as the node: dropping it takes the network down.
-    let (ip, _net): (Ipv4Addr, Box<dyn Any>) = match &wifi {
+    let (ip, prefix, _net): (Ipv4Addr, u8, Box<dyn Any>) = match &wifi {
         Some((ssid, password)) => {
             let w = join_wifi(n, peripherals.modem, sysloop, ssid, password)?;
-            (w.wifi().sta_netif().get_ip_info()?.ip, Box::new(w))
+            let info = w.wifi().sta_netif().get_ip_info()?;
+            (info.ip, info.subnet.mask.0, Box::new(w))
         }
         None => {
             let netif = EspNetif::new_with_conf(&NetifConfiguration {
@@ -85,11 +86,16 @@ fn main() -> anyhow::Result<()> {
             // frames that miss it, so take every frame (QEMU only: a board uses Wi-Fi).
             eth.eth_mut().driver_mut().set_promiscuous(true)?;
             eth.wait_netif_up()?;
-            (addr(n), Box::new(eth))
+            (addr(n), 24, Box::new(eth))
         }
     };
     let heap_net = free_heap();
     info!("node {n}: network up at {ip}, free heap {heap_net} B");
+    std::thread::Builder::new().stack_size(8192).spawn(move || {
+        if let Err(e) = probe(n, ip, prefix) {
+            warn!("node {n}: probe: {e:?}");
+        }
+    })?;
 
     // Its own address, not 0.0.0.0: ESP-IDF can't list interfaces, so a node bound to
     // any interface would offer only loopback.
@@ -255,6 +261,71 @@ impl Signaling for Counted {
             info!("node {}: heard LAN signal {heard}, {} B", self.n, m.1.len());
         }
         Some(m)
+    }
+}
+
+/// The probe's UDP port and the mDNS group: routers with IGMP snooping must still flood
+/// 224.0.0.x, unlike 239.255.80.87.
+const PROBE_PORT: u16 = 20568;
+const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+
+/// Which paths the LAN passes, apart from the node (NB-091: the board and a PC on one
+/// access point heard none of each other's multicast). Every 2 s it sends a probe each to
+/// the LAN group, the mDNS group, 255.255.255.255 and the subnet's broadcast address, and
+/// by unicast to every address it has heard a probe from; `pw_probe.py` on the PC does
+/// the same. It logs the first probe of each kind from each address, and every 10 s what
+/// it heard.
+fn probe(n: u8, ip: Ipv4Addr, prefix: u8) -> anyhow::Result<()> {
+    let sock = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PROBE_PORT))?;
+    sock.set_broadcast(true)?;
+    sock.set_multicast_ttl_v4(1)?;
+    let group = *LanSignaling::GROUP.ip();
+    for g in [group, MDNS_GROUP] {
+        sock.join_multicast_v4(&g, &ip)?;
+    }
+    sock.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let subnet = Ipv4Addr::from(u32::from(ip) | u32::MAX.checked_shr(prefix.into()).unwrap_or(0));
+    let kinds = [("mc239", group), ("mc224", MDNS_GROUP), ("bc255", Ipv4Addr::BROADCAST), ("bcnet", subnet)];
+    info!("node {n}: probe on UDP {PROBE_PORT}: {kinds:?}");
+    let mut heard: std::collections::BTreeMap<(Ipv4Addr, String), u32> = Default::default();
+    let mut failed: HashMap<&str, u32> = HashMap::new();
+    let (mut round, mut next_send, mut next_report) = (0u32, Instant::now(), Instant::now() + Duration::from_secs(10));
+    let mut buf = [0u8; 64];
+    loop {
+        let now = Instant::now();
+        if now >= next_send {
+            next_send = now + Duration::from_secs(2);
+            round += 1;
+            let mut peers: Vec<Ipv4Addr> = heard.keys().map(|k| k.0).collect();
+            peers.dedup();
+            for (kind, to) in kinds.into_iter().chain(peers.into_iter().map(|p| ("uc", p))) {
+                if let Err(e) = sock.send_to(format!("PWPROBE {kind} {round} board").as_bytes(), (to, PROBE_PORT)) {
+                    let f = failed.entry(kind).or_default();
+                    *f += 1;
+                    if *f == 1 {
+                        warn!("node {n}: probe: sending {kind} to {to}: {e}");
+                    }
+                }
+            }
+        }
+        if now >= next_report {
+            next_report = now + Duration::from_secs(10);
+            let counts: Vec<String> = heard.iter().map(|((a, k), c)| format!("{a} {k} {c}")).collect();
+            info!("node {n}: probe: {round} rounds sent, failed {failed:?}, heard [{}]", counts.join(", "));
+        }
+        let Ok((len, std::net::SocketAddr::V4(from))) = sock.recv_from(&mut buf) else { continue };
+        let text = String::from_utf8_lossy(&buf[..len]);
+        let mut words = text.split(' ');
+        let (Some("PWPROBE"), Some(kind)) = (words.next(), words.next()) else { continue };
+        let key = (*from.ip(), kind.to_string());
+        if *from.ip() == ip || (heard.len() >= 32 && !heard.contains_key(&key)) {
+            continue;
+        }
+        let c = heard.entry(key).or_default();
+        *c += 1;
+        if *c == 1 {
+            info!("node {n}: probe heard {kind} from {}: {text}", from.ip());
+        }
     }
 }
 
