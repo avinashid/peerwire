@@ -59,7 +59,7 @@ runs share this host's 4 cores, so running it on every branch as well costs more
   (`SKIP cargo test (no Rust change since origin/main <sha>)`); `--full` runs them anyway.
 - **Reviewing** (security, QA): read the diff against the code. Re-run a test only to reproduce a problem or try a
   mutant, and say which.
-- **After merging** (the lead): `scripts/gate.sh --strict` once on the merged `main`, before asking to push. CI runs
+- **After merging** (the lead): `scripts/gate.sh --strict` once on the merged `main`, before pushing. CI runs
   the Rust and Node steps on push but not the browser tests, so this is their only full run.
 
 The gate runs two lanes at once: the Rust one (clippy, fmt, the test builds, then the tests, under `cargo-nextest`
