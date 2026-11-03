@@ -851,10 +851,17 @@ impl Node {
                 }
                 let open = |r: &u64| self.extra.get(r).is_some_and(|x| x.open(now));
                 let route = self.routes.get(&from).copied().filter(open).unwrap_or(id);
+                // NB44c-2: one route per peer. Its route at another address goes, and
+                // its other sockets close at their `until`, so a peer that sends from
+                // one source port after another holds one socket, not one per port.
+                let extra = &mut self.extra;
+                self.routes.retain(|a, r| *a == from || extra.get(r).is_none_or(|x| x.peer != peer));
                 self.routes.insert(from, route);
-                if route == id {
-                    if let Some(x) = self.extra.get_mut(&id) {
+                for (&i, x) in extra.iter_mut() {
+                    if i == route && route == id {
                         x.last_recv = Some(now);
+                    } else if i != route && x.peer == peer {
+                        x.last_recv = None;
                     }
                 }
             }
@@ -1166,7 +1173,7 @@ mod tests {
         let data = std::iter::from_fn(|| b.ep.poll_transmit(now)).find(|t| t.payload[0] & 0x0f == 3).unwrap();
         let junk = [&[(data.payload[0] & 0xf0) | 2, 7, 0, 0, 0][..], &data.payload[1..5], &[0x55; 48]].concat();
         let t0 = Instant::now();
-        let until = a.now() + Duration::from_millis(300);
+        let until = a.now() + Duration::from_millis(1000);
         a.open_extra(&Birthday { peer: pb, dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until });
         let (socks, _) = a.extra_sockets();
         for _ in 0..3 {
@@ -1174,13 +1181,60 @@ mod tests {
         }
         c.ep.connect(c.now(), socks[1], pa).unwrap();
         poll_until(&mut [&mut a, &mut b, &mut c], |n| linked(n[0], n[2]) && linked(n[2], n[0]));
-        assert!(t0.elapsed() < Duration::from_millis(250), "the test ran past until");
+        assert!(t0.elapsed() < Duration::from_millis(900), "the test ran past until");
         assert_eq!(c.path(&pa), Some(&Path::Direct(a.local_addr())), "c's link is on a's main socket");
         assert_eq!((a.route_count(), a.extra_sockets().1), (0, 0), "no route");
         assert!(!a.via_birthday(&pb) && !a.via_birthday(&pc));
-        poll_until(&mut [&mut a, &mut b, &mut c], |_| t0.elapsed() > Duration::from_millis(400));
+        poll_until(&mut [&mut a, &mut b, &mut c], |_| t0.elapsed() > Duration::from_millis(1100));
         assert!(a.extra_sockets().0.is_empty(), "closed at until");
         assert_eq!((a.status(&pb), a.status(&pc)), (Status::Connected, Status::Connected));
+    }
+
+    /// NB44c-2: a peer keeps one route. Packets of b's link, each sent from a new
+    /// source port to another of the extra sockets opened for b, move the link (it
+    /// roams to the newest), and each makes the socket that heard it the route; the
+    /// last one is b's only route, and b's sockets before it close at `until`. c's
+    /// route, on a socket of a punch to c open meanwhile, stays.
+    #[test]
+    fn birthday_sockets_keep_one_route_per_peer() {
+        let (mut a, mut b, mut c) = (quiet("127.0.0.1:0"), quiet("127.0.0.1:0"), quiet("127.0.0.1:0"));
+        let (pa, pb, pc) = (a.peer_id(), b.peer_id(), c.peer_id());
+        let linked = |x: &Node, y: &Node| x.status(&y.peer_id()) == Status::Connected;
+        a.ep.connect(a.now(), b.local_addr(), pb).unwrap();
+        a.ep.connect(a.now(), c.local_addr(), pc).unwrap();
+        poll_until(&mut [&mut a, &mut b, &mut c], |n| (1..3).all(|i| linked(n[0], n[i]) && linked(n[i], n[0])));
+        // The newest packet `n` sealed for a, sent from a port of its own to `hit`; a reads it.
+        let mut froms = Vec::new();
+        let mut hop = |a: &mut Node, n: &mut Node, hit: SocketAddr| {
+            n.ep.send(&pa, Lane::Unreliable, b"x").unwrap();
+            let now = n.now();
+            let data = std::iter::from_fn(|| n.ep.poll_transmit(now)).filter(|t| t.payload[0] & 0x0f == 3).last();
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.send_to(&data.unwrap().payload, hit).unwrap();
+            let from = s.local_addr().unwrap();
+            froms.push(s);
+            poll_until(&mut [a], |x| x[0].path(&n.peer_id()) == Some(&Path::Direct(from)));
+        };
+        let t0 = Instant::now();
+        let until = a.now() + Duration::from_millis(1000);
+        a.open_extra(&Birthday { peer: pb, dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until });
+        let (socks, _) = a.extra_sockets();
+        a.open_extra(&Birthday { peer: pc, dst: c.local_addr(), sockets: 1, payload: b"x".to_vec(), until });
+        let to_c = a.extra_sockets().0.into_iter().find(|s| !socks.contains(s)).unwrap();
+        hop(&mut a, &mut c, to_c);
+        assert!(a.via_birthday(&pc));
+        for &hit in &socks[..3] {
+            hop(&mut a, &mut b, hit);
+            assert_eq!((a.route_count(), a.extra_sockets().1), (2, 2), "one route each");
+            assert!(a.via_birthday(&pb) && a.via_birthday(&pc));
+        }
+        assert!(t0.elapsed() < Duration::from_millis(900), "the test ran past until");
+        poll_until(&mut [&mut a], |_| t0.elapsed() > Duration::from_millis(1100));
+        let (mut open, routes) = a.extra_sockets();
+        open.sort();
+        let mut kept = vec![socks[2], to_c];
+        kept.sort();
+        assert_eq!((open, routes), (kept, 2), "b's last route and c's are left");
     }
 
     /// NB-042: any interface lists IPv6 only on a dual-stack socket.

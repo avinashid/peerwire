@@ -94,7 +94,8 @@ can, by the birthday paradox, as Tailscale does:
   address, hands the endpoint what they receive, and sends to an address out of the first extra socket that heard
   from it (its route), everything else from the main socket. Only a packet of the punch's peer that authenticated
   on a link whose direct path is that address makes a route, or keeps one (NB44-2, NB44c-1, NB44c-2): not junk, an
-  HS1 or HS2 sent again, or another peer's handshake. Sockets that are no route close after 10 s, a route
+  HS1 or HS2 sent again, or another peer's handshake. A peer has one route: a new one ends its route at another
+  address, and that socket closes as one that is no route. Sockets that are no route close after 10 s, a route
   once it has heard nothing for 60 s. At most 512 are open at once, and while any are, `Node::next_timeout` is at
   most 5 ms, because a host waiting on `Node::socket` can't see them.
 - **Limits.** One try per peer per 5 minutes; per node, a burst of 4, then one per 30 s; and, per destination IP
@@ -641,7 +642,8 @@ Crates added to `peerwire` by NAT traversal:
   extra socket links through it, every reply leaves from it, and the rest close.
   `birthday_sockets_ignore_unauthenticated_floods` and `birthday_sockets_take_only_their_peer_authenticated`: junk,
   an HS2 of junk from the linked peer's own address, and another peer's handshake make no route, and the sockets
-  close at `until`.
+  close at `until`. `birthday_sockets_keep_one_route_per_peer`: a peer sending from one port after another to
+  another socket each time keeps one route, beside another peer's.
 - `crates/peerwire-sim/src/nat.rs` `mapping_and_filtering_per_kind`: each kind's mapping (the port towards another
   port of one IP, and towards another IP) and filtering (which of those a mapping lets in), as in the table in
   [two symmetric NATs](#two-symmetric-nats).
