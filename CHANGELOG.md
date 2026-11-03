@@ -16,6 +16,10 @@ and the commit that fixed it.
   Godot binding (`open_doc`) and the C ABI.
 - **Harder NATs:**
   - birthday punching and lockstep prediction, so 59 of 64 simulated NAT pairings connect directly;
+  - `NatType::SymmetricIp`: STUN asks Google's server on a second port too, which tells a symmetric NAT that maps
+    one port per destination IP; against another symmetric NAT both sides open sockets and probe, so 116 of 144
+    simulated pairings connect directly. Godot's `get_nat_type()` can return `symmetric-ip`, and code that matches
+    on `NatType` needs the new variant;
   - dual-stack IPv4 and IPv6 candidates;
   - relay peers: an always-on `peerwire-peer` kept linked and used when a punch fails.
 - **Faster paths:** a link races its other paths and takes one that's clearly faster.

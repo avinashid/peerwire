@@ -34,7 +34,7 @@ Examples of [`peerwire-core`](../crates/peerwire-core/examples) (endpoints on re
 | Example | Shows |
 |---|---|
 | [udp_pair.rs](../crates/peerwire-core/examples/udp_pair.rs) | two endpoints on loopback UDP driven by a plain loop: handshake time and message rate |
-| [stun_probe.rs](../crates/peerwire-core/examples/stun_probe.rs) | **public.** Asks two STUN servers for this machine's public address, to tell a cone NAT from a symmetric one |
+| [stun_probe.rs](../crates/peerwire-core/examples/stun_probe.rs) | **public.** Asks STUN servers (`peerwire`'s, or `host:port` arguments) for this machine's public address, to tell a cone NAT from a symmetric one, and one that maps per destination IP from one that maps per IP and port |
 | [arena.rs](../crates/peerwire-sim/examples/arena.rs) | a large arena over super-peers: Hilbert islands of up to 12 players, lockstep, confirmation lag and bandwidth per role |
 | [bulk.rs](../crates/peerwire-sim/examples/bulk.rs) | a bulk reliable transfer on a long, fast link, with urgent messages overtaking it |
 | [cc_fair.rs](../crates/peerwire-sim/examples/cc_fair.rs) | two bulk flows sharing one uplink, and how fairly congestion control splits it |

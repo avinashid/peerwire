@@ -61,7 +61,7 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `join_room_host(app_id, room, host_key) -> Error` | `join_room`, accepting only the host whose `get_public_key()` is `host_key` (32 bytes) |
 | `get_invite() -> String` | This peer's invite again (public address first, once STUN answered) |
 | `get_public_address() -> String` | `ip:port` STUN reported, `""` until a server answers |
-| `get_nat_type() -> String` | `open`, `cone`, `symmetric` or `unknown` (needs answers from two STUN servers). `cone` doesn't promise a punch: see [Through NATs](#through-nats) |
+| `get_nat_type() -> String` | `open`, `cone`, `symmetric`, `symmetric-ip` (a new port per peer IP, told apart by one STUN server's second port) or `unknown` (needs answers from two STUN servers). `cone` doesn't promise a punch: see [Through NATs](#through-nats) |
 | `get_connect_error() -> String` | After `connection_failed`: `symmetric` (one side's NAT is symmetric and the other's router filters by port, so punching can't work, and no relay peer linked to both carried the link), `unreachable`, or `""` |
 | `get_connect_error_message() -> String` | After `connection_failed`: the reason as a sentence to show the player, naming the symmetric side; `""` if nothing failed |
 | `set_stun_servers(PackedStringArray)` | `host:port` list, from the next host/join. Default Google + Cloudflare; empty: off |
@@ -148,8 +148,9 @@ Most players sit behind a NAT, so neither side can simply dial the other. `peerw
 GDScript.
 
 1. On `host*()` / `join*()` the peer binds one dual-stack socket (`[::]`; IPv4 only on a machine without IPv6)
-   and asks two STUN servers, on it, what IPv4 address its NAT gave it. Invites list that public address first,
-   then the LAN, global IPv6 and loopback addresses.
+   and asks two STUN servers, on it, what IPv4 address its NAT gave it (one of them on two ports, which tells a NAT
+   that maps per destination IP). Invites list that public address first, then the LAN, global IPv6 and loopback
+   addresses.
 2. In a room, the host announces itself on the room's Nostr topic. A joiner announcing there gets a sealed offer
    from the host (its addresses, encrypted to the joiner's key) and answers with its own. Both then dial each
    other at once, which opens both NATs: the handshake goes through. `join(invite)` does the same over the host's
@@ -164,13 +165,17 @@ GDScript.
    (theoretical), and is tried once per peer per 5 minutes.
 6. Two symmetric NATs that both hand out ports in sequence link by lockstep prediction, after about 1.5 s: each
    probes the other's predicted ports in an order that makes the new mappings line up.
-7. What still fails over IPv4: a symmetric NAT with random ports against another symmetric one. Godot's star has
+7. A `symmetric-ip` NAT (a new port per peer IP, not per IP and port) against any other symmetric one links by a
+   birthday punch on both sides, after about 2 s, if it lets in any port of an IP it has sent to (see
+   [two symmetric NATs](../concepts/nat-traversal.md#two-symmetric-nats)).
+8. What still fails over IPv4: a symmetric NAT with random ports against another symmetric one, unless one of them
+   is such a `symmetric-ip` NAT. Godot's star has
    no third peer both sides are linked to, unless the game sets a [relay peer](#relay-peers). Without one,
    `join*()` fails with
    `get_connect_error() == "symmetric"`, and `get_connect_error_message()` says which side is symmetric, e.g.
    "the peer's NAT is symmetric (a new public port per destination) and this side's router only lets in packets
    from ports it has sent to, ...". Peerwire runs no TURN relay, by design.
-8. IPv6 has no NAT. When both players have a global IPv6 address, as many mobile carriers give, the dial gets
+9. IPv6 has no NAT. When both players have a global IPv6 address, as many mobile carriers give, the dial gets
    through both firewalls whatever their IPv4 NATs are: both families are dialled at once, and the first to
    answer carries the link (see [IPv6](../concepts/nat-traversal.md#ipv6-dual-stack)).
 

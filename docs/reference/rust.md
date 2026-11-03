@@ -261,7 +261,7 @@ Options for a `Node`, from `Node::builder()`. Each takes `self` and returns the 
 |---|---|---|---|
 | `identity` | `Identity` | A fresh one, from the OS's randomness | The identity, to keep the same `PeerId` across runs |
 | `config` | `Config` | `Config::default()` (see [Config](#config)) | The core's session settings |
-| `stun_servers` | `impl IntoIterator<Item = S>`, `S: Into<String>` | `DEFAULT_STUN_SERVERS`: `stun.l.google.com:19302`, `stun.cloudflare.com:3478` | `host:port` servers to learn the public address from; empty turns STUN off. Names are resolved in `bind`, and servers that don't resolve are skipped. A socket bound to loopback asks none; a dual-stack one asks over IPv4 only |
+| `stun_servers` | `impl IntoIterator<Item = S>`, `S: Into<String>` | `DEFAULT_STUN_SERVERS`: `stun.l.google.com:19302`, `stun.cloudflare.com:3478`, `stun.l.google.com:3478` | `host:port` servers to learn the public address from; empty turns STUN off. Names are resolved in `bind`, each once, so one name on two ports is one IP, and servers that don't resolve are skipped. A server on two ports of one IP, next to another at a second IP, tells `NatType::SymmetricIp` from `Symmetric`. A socket bound to loopback asks none; a dual-stack one asks over IPv4 only |
 | `signaling` | `impl Signaling + 'static` | None | A carrier, for rooms and for invites that punch through NATs. Without one, invites work where the host is reachable |
 | `privacy` | `Privacy` | `Privacy::Direct` | Which addresses the node gives out (see [Privacy](#privacy)) |
 | `port_mapping` | `bool` | `false` | Asks the router to forward a public UDP port to this node, by PCP, NAT-PMP or UPnP-IGD (tried in that order), and offers the mapped address like a public one. Runs on a thread of its own, for IPv4 and dual-stack sockets not bound to loopback; renewed while the node lives and removed when it is dropped. Paused under `Privacy::RelayOnly` |
@@ -383,15 +383,17 @@ How a node takes part in a room (`Node::join_room_as`, `Node::join_room_with`).
 
 ### NatType
 
-What STUN says about this node's NAT (`Node::nat_type`). It takes answers from two servers. More in
-[NAT traversal](../concepts/nat-traversal.md).
+What STUN says about this node's NAT (`Node::nat_type`). It takes answers from two servers at different IPs, and
+tells `SymmetricIp` from `Symmetric` with one of them on a second port too. More in
+[NAT traversal](../concepts/nat-traversal.md#stun).
 
 | Variant | |
 |---|---|
 | `Unknown` (default) | No STUN answer yet, or only one server answered |
 | `Open` | No NAT: the public address is the socket's own |
 | `Cone` | One public port for every destination (full, restricted or port-restricted cone; STUN can't tell them apart). Punching works with cone and open peers, and usually, not always, with symmetric ones |
-| `Symmetric` | A new public port per destination. Punching works towards open, full-cone and restricted-cone peers, towards port-restricted ones only if the ports come in a predictable sequence; two symmetric peers need a relay |
+| `Symmetric` | A new public port per destination IP and port. Punching works towards open, full-cone and restricted-cone peers, towards port-restricted ones only if the ports come in a predictable sequence; two symmetric peers need a relay, unless both are sequential (lockstep prediction) or one is `SymmetricIp` and lets in any port of an IP it has sent to |
+| `SymmetricIp` | A new public port per destination IP (one STUN server's two ports saw one mapping). Against a cone it punches as `Symmetric` does; against another symmetric peer both sides open extra sockets and probe, which links if this NAT lets in any port of an IP it has sent to. Offers carry it as `Symmetric` and a tag, so nodes from before it see `Symmetric` |
 
 ### Failure, Status and Error
 

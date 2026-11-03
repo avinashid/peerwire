@@ -21,17 +21,28 @@ unchanged; this layer feeds it addresses.
 
 ## STUN
 
-- Servers: `Builder::stun_servers`, default `stun.l.google.com:19302` and `stun.cloudflare.com:3478`, resolved once
-  at bind (sockets bound to loopback skip STUN). A dual-stack socket asks over IPv4 only (see [IPv6](#ipv6-dual-stack)).
+- Servers: `Builder::stun_servers`, default `stun.l.google.com:19302`, `stun.cloudflare.com:3478` and
+  `stun.l.google.com:3478`, resolved once at bind, each name once, so Google's two entries are one IP (sockets bound
+  to loopback skip STUN). Google's server answers on both ports; Cloudflare's also answers on 53, which some
+  networks intercept as DNS, so it isn't asked there (`cargo run -p peerwire-core --example stun_probe -- <host:port>
+  ...` asks any list, each name resolved once). A dual-stack socket asks over IPv4 only (see
+  [IPv6](#ipv6-dual-stack)).
 - A round every 25 s (it also keeps the mapping alive); each request is retransmitted at 0.5 s and 1 s, then
   dropped until the next round.
 - A response counts only if it comes from the queried server's address and carries the request's random 96-bit
   transaction id.
-- NAT type: no answer, or one, gives `Unknown`. A mapped address equal to a local one is `Open`. Two servers
-  reporting the same mapping is `Cone`, different ones `Symmetric`.
+- NAT type (RFC 5780's mapping test, from the answers): no answer, or one, gives `Unknown`. A mapped address equal to
+  a local one is `Open`. Two servers at different IPs reporting the same mapping is `Cone`, different ones
+  `Symmetric`. One server's two ports reporting the same mapping while the other IP got another is `SymmetricIp`: a
+  new port per destination IP, not per IP and port (NB-083); two ports of one IP that differ are `Symmetric`. One
+  IP's two ports agreeing while no other IP answered says nothing about mapping per IP, so that is `Unknown`. A
+  list whose servers all share one IP (mock servers on loopback) is judged as before NB-083: one mapping for all is
+  `Cone`, else `Symmetric`.
 - `Cone` covers full, restricted and port-restricted cones, which STUN can't tell apart. So `Cone` doesn't
   promise a punch: a port-restricted cone only lets in packets from ports it has sent to, so against a
-  symmetric NAT whose ports can't be predicted it needs a [birthday punch](#birthday-punching).
+  symmetric NAT whose ports can't be predicted it needs a [birthday punch](#birthday-punching). Neither can STUN
+  tell how a symmetric NAT filters: `SymmetricIp` NATs that let in any port of an IP they sent to and ones that
+  don't look the same.
 
 ## Port prediction
 
@@ -39,9 +50,10 @@ A symmetric NAT gives each destination a new public port, so the port it offers 
 packets to the peer come from, and a port-restricted peer drops them. Many symmetric NATs hand ports out in
 sequence, though:
 
-- **Prediction.** If both STUN mappings share an IP and the second is 1 to 8 ports above the first, the NAT looks
-  sequential with that step, and the next mapping is likely `second + step` (`Traversal::predicted_addr`).
-  Random-port NATs give no prediction.
+- **Prediction.** The ports the NAT handed out to the STUN servers, each new one once, in the order asked: if they
+  share an IP and each is 1 to 8 above the one before, the NAT looks sequential with the first two's step, and the
+  next mapping is likely `last + step` (`Traversal::predicted_addr`). With the default servers a NAT that maps per
+  IP and port hands out three, one that maps per IP two. Random-port NATs give no prediction.
 - **Offer.** The prediction rides in the offer's address list as a tagged entry (below), only when the public
   address leads the list. It takes one of the 8 slots.
 - **Probing.** A receiver whose NAT is neither open nor symmetric (open and symmetric ones gain nothing, and a
@@ -68,12 +80,13 @@ A symmetric NAT with random ports gives no prediction, and a port-restricted con
 hasn't sent to, so the two can't punch with one socket each (NB-044). With many sockets on the symmetric side they
 can, by the birthday paradox, as Tailscale does:
 
-- **Who does what.** Decided from the two NAT types in the offer, so the offer format is unchanged:
-  - this node `Symmetric` with no prediction, the peer `Cone`: it opens 256 extra sockets
+- **Who does what.** Decided from the two NAT types in the offer:
+  - this node `Symmetric` or `SymmetricIp` with no prediction, the peer `Cone`: it opens 256 extra sockets
     (`BIRTHDAY_SOCKETS`) and sends one packet from each to the peer's public address. Each gets its own mapping,
     at a random port, that lets the peer's address in;
-  - this node `Cone`, the peer `Symmetric` with no prediction: it sprays up to 2048 ports (`BIRTHDAY_PROBES`) of
-    the peer's IP, each once, in a random order (`Endpoint::spray`).
+  - this node `Cone`, the peer `Symmetric` or `SymmetricIp` with no prediction: it sprays up to 2048 ports
+    (`BIRTHDAY_PROBES`) of the peer's IP, each once, in a random order (`Endpoint::spray`);
+  - a `SymmetricIp` side and another symmetric one: both do both (see [two symmetric NATs](#two-symmetric-nats)).
 
   A probe that lands on one of the 256 mappings reaches its socket. The answer leaves from that socket, and the
   cone lets it in, as it has just sent to that port. The link takes that path.
@@ -89,7 +102,7 @@ can, by the birthday paradox, as Tailscale does:
 - **Odds** (theoretical). Each probe hits one of 256 mappings among 64512 ports with p = 256/64512, so all 2048
   miss with probability (1 - p)^2048 ≈ 0.03%. The spray stops at the first hit, after 1/p ≈ 252 probes on average.
 - **Time.** Probes go 16 every 30 ms (about 530 a second), so a full spray takes about 3.8 s; in the simulator
-  the pair links in about 2.2 s after joining (median).
+  the pair links in about 2.25 s after joining (median).
 - **The host's part** (`Traversal::poll_birthday`, done by `Node`): it opens the sockets on the main socket's
   address, hands the endpoint what they receive, and sends to an address out of the first extra socket that heard
   from it (its route), everything else from the main socket. Sockets that are no route close after 10 s, a route
@@ -104,8 +117,8 @@ can, by the birthday paradox, as Tailscale does:
 - **Cost.** The symmetric side: 256 sockets for 10 s and 256 packets of about 130 bytes (the HS1), about 33 KB.
   The cone side: up to 2048 handshakes or punches to ports of one IP, about 270 KB over 3.8 s, about 32 KB on
   average. Its own router keeps a connection-tracking entry per probe for a while; a router with a small table
-  may drop new flows meanwhile. A random-port symmetric NAT can't punch another symmetric NAT: see
-  [two symmetric NATs](#two-symmetric-nats).
+  may drop new flows meanwhile. A random-port symmetric NAT can't punch another symmetric NAT unless one of them
+  maps per destination IP: see [two symmetric NATs](#two-symmetric-nats).
 
 ## Lockstep prediction
 
@@ -142,10 +155,13 @@ probes the other's predicted ports in a known order, the new mappings line up:
 
 ## Two symmetric NATs
 
-No punch links a random-port symmetric NAT and another symmetric one (NB-080): in the [matrix](#coverage),
-`sym-random` against `sym-random`, `sym-seq` and `cgnat(pr+sym)`. Those links go through a peer both sides are
-linked to: a third room peer, a [relay peer](#relay-peers) (`Node::set_relay_peers`), or, between browsers, another
-member or the signalling relays ([through any NAT](../reference/javascript.md#through-any-nat)).
+No punch links a random-port symmetric NAT and another symmetric one when both map per IP and port (NB-080): in the
+[matrix](#coverage), `sym-random` against `sym-random`, `sym-seq` and `cgnat(pr+sym)`, and their variants that
+filter by IP. Those links go through a peer both sides are linked to: a third room peer, a
+[relay peer](#relay-peers) (`Node::set_relay_peers`), or, between browsers, another member or the signalling relays
+([through any NAT](../reference/javascript.md#through-any-nat)). A NAT that maps one port per destination IP and
+lets in any port of an IP it has sent to (`sym-ip-adf`) is the exception: STUN tells it apart (`SymmetricIp`), and
+a [two-sided birthday punch](#two-sided-birthday-punch) links it with every symmetric kind (NB-083).
 
 - **Mapping and filtering** (RFC 4787). A NAT's *mapping* says which destinations share one outside port: all, those
   at one IP, or only one IP and port. Its *filtering* says whom a mapping lets in: anyone, any port of an IP it has
@@ -162,12 +178,13 @@ member or the signalling relays ([through any NAT](../reference/javascript.md#th
   | `cgnat(pr+sym)` | `port-restr` behind a `sym-seq` carrier NAT | | | `Symmetric`, with a prediction |
   | `sym-seq-adf` | per IP and port | in sequence | per IP | `Symmetric`, with a prediction |
   | `sym-rand-adf` | per IP and port | random | per IP | `Symmetric` |
-  | `sym-ip-adf` | per IP | random | per IP | `Symmetric` |
-  | `sym-ip-apdf` | per IP | random | per IP and port | `Symmetric` |
+  | `sym-ip-adf` | per IP | random | per IP | `SymmetricIp` |
+  | `sym-ip-apdf` | per IP | random | per IP and port | `SymmetricIp` |
 
   Every symmetric kind before NB-080 filters by IP and port. `NatConfig::address_filtered` makes any kind filter by
-  IP only, and `NatConfig::address_dependent` maps per IP. STUN asks two servers at different IPs, so it can't tell
-  `sym-ip` from `sym-random`, and no public server tells filtering apart.
+  IP only, and `NatConfig::address_dependent` maps per IP. The simulator's first STUN server answers on a second
+  port, as Google's does, so [STUN](#stun) tells `sym-ip` from `sym-random`; no public server tells filtering
+  apart, so `sym-ip-apdf` is `SymmetricIp` too.
 - **Why per-port mapping on both sides stops a punch.** A link needs, on each NAT, the mapping that carries its
   packets out to let the other side's in: A's mapping at port P made for B's port Q, and B's at Q made for A's P.
   Each side picks only where it sends; its NAT picks the port. A probe that gets in is answered to its source, a new
@@ -187,22 +204,64 @@ member or the signalling relays ([through any NAT](../reference/javascript.md#th
   - one port per destination IP and filtering by IP (`sym-ip-adf`), against any symmetric NAT: the answer leaves from
     the mapping the probe hit, as against a cone, so 1 - (1 - k/N)^m ≈ 99.97%; filtering by port (`sym-ip-apdf`)
     instead, about m²/N² again.
-- **Considered, not built.** The offer can't say which kind a symmetric NAT is, so a planner for two of them would
-  have both sides open the sockets and probe. That links `sym-ip-adf` with every symmetric kind: 50 of 50 tries over
-  25 seeds each way round against `sym-random`, `sym-seq`, `cgnat(pr+sym)` and `sym-rand-adf`, median 1.67 to
-  1.91 s, max 2.27 to 3.99 s, with no new mappings or roams over 10 s of traffic. Every other pair pays for nothing:
-  0 of 50 (1 of 50, by luck, for `sym-ip-apdf` against `sym-random`). Per try each side sends 256 handshakes (about
-  33 KB) and up to 2048 probes (about 270 KB over 3.8 s), and holds up to about 2300 ports of its own NAT for the
-  NAT's mapping timeout (about 4600 mappings a try over the two NATs). That can use up the block of ports a carrier
-  NAT gives its user, and so fail the user's other new connections meanwhile. With both sides filtering by IP the
-  links come up, 50 of 50, but make 99 mappings and 100 roams in 10 s at 10 packets a second each way. Keeping them
-  would take a change to the core's path model: sending to one address while hearing the peer from another, over a
-  mapping kept open by inbound packets alone, which RFC 4787 leaves optional (REQ-6). From
+- **For two NATs that map per IP and port: considered, not built.** STUN can't tell how they filter, so a planner
+  for them would have both sides open the sockets and probe, and it would pay for nothing: 0 of 50 tries over 25
+  seeds each way round for `sym-random` against `sym-random` and `cgnat(pr+sym)`, and for the variants that filter
+  by IP on one side (1 of 50, by luck, for `sym-random` against `sym-seq`). Per try each side sends 256 handshakes
+  (about 33 KB) and up to 2048 probes (about 270 KB over 3.8 s), and holds up to about 2300 ports of its own NAT for
+  the NAT's mapping timeout (about 4600 mappings a try over the two NATs). That can use up the block of ports a
+  carrier NAT gives its user, and so fail the user's other new connections meanwhile. With both sides filtering by
+  IP the links come up, 50 of 50, but make 99 mappings and 100 roams in 10 s at 10 packets a second each way.
+  Keeping them would take a change to the core's path model: sending to one address while hearing the peer from
+  another, over a mapping kept open by inbound packets alone, which RFC 4787 leaves optional (REQ-6). From
   `cargo test -p peerwire-sim --release --test traversal two_sided -- --nocapture`, which drives both roles from the
   test.
-- **Detection, later.** Asking one STUN server IP on two ports (RFC 5780) tells a NAT that maps per IP from one that
-  maps per port, so only pairs with a `sym-ip` side would punch. It would put a new NAT kind in the offer, which
-  today's decoders reject: a wire change.
+
+### Two-sided birthday punch
+
+A NAT that maps one port per destination IP (NB-083) answers a probe that gets in from the mapping the probe hit,
+as a cone does: the answer goes to the probe's source, a new port at the same IP, so it leaves through the same
+mapping, and the prober's NAT lets it in, as it has just sent there. So such a NAT can take the cone's seat in a
+birthday punch against any symmetric NAT, if it lets in any port of an IP it has sent to.
+
+- **Who does what.** A `SymmetricIp` node and a symmetric peer (`Symmetric` or `SymmetricIp`) whose offer says how
+  its NAT maps (the mapping entry, see [Messages](#messages)), and the other way round: each opens 256 extra sockets
+  towards the other's public address 1 s after the offer, and sprays up to 2048 ports of the other's IP from 1.5 s,
+  as one punch (`Plan::Both`, then `Plan::Then`). What links them is a probe into a socket of a side that maps per
+  IP and filters by IP; with both sides doing both, it doesn't matter which side that is, so it also links one whose
+  second STUN port didn't answer, which reads as `Symmetric`.
+- **Older peers.** A node from before NB-083 reads `SymmetricIp` as `Symmetric` and plans nothing for two symmetric
+  NATs, so towards a peer whose offer doesn't say how its NAT maps, a `SymmetricIp` node is `Symmetric`, as before:
+  no two-sided punch, and lockstep prediction with a sequential peer when both predict.
+- **Limits.** Those of a [birthday punch](#birthday-punching): only towards a public IPv4 address, while the peer
+  isn't linked directly, not under `RelayOnly`, once per peer per 5 minutes, the node's budget (a burst of 4, then
+  one per 30 s), and the per-IP cap (NB44-1); the two halves are one punch. On top of that, a node behind a NAT that
+  maps per IP and port pays one of its NAT's ports per socket and per probe, up to 2304 a try, so it starts at most
+  one such punch per 5 minutes, whichever peers ask (`PER_PORT_PUNCH_GAP`).
+- **Cost.** Each side sends 256 handshakes (about 33 KB) and up to 2048 probes (about 270 KB over 3.8 s), and the
+  spray stops at the first hit. The `SymmetricIp` side's NAT makes 258 mappings: one per socket, and two for the
+  dial to the peer's public and LAN addresses, the first of which the whole spray shares, as it goes to one IP. The
+  other side's makes 256 for its sockets, one per probe until a hit, and the dial's. NAT mappings a try in the
+  simulator, over 25 seeds each way round, on the first kind's side and on the second's:
+
+  | Pair | Direct | Connect median, max | Mappings a try |
+  |---|---|---|---|
+  | `sym-ip-adf` × `sym-seq`, `sym-random` | 50/50 each | 2.36 s, 3.32 s | 258 + 539 |
+  | `sym-ip-adf` × `cgnat(pr+sym)` | 50/50 | 2.24 s, 3.35 s | 258 + 735 |
+  | `sym-ip-adf` × `sym-seq-adf` | 50/50 | 2.07 s, 2.52 s | 258 + 367 |
+  | `sym-ip-adf` × `sym-rand-adf` | 50/50 | 2.21 s, 2.75 s | 258 + 413 |
+  | `sym-ip-adf` × `sym-ip-adf` | 50/50 | 2.21 s, 2.81 s | 258 + 258 |
+  | `sym-ip-adf` × `sym-ip-apdf` | 50/50 | 2.36 s, 3.32 s | 258 + 258 |
+  | `sym-ip-apdf` × `sym-seq`, `sym-random` | 0/50 each | | 258 + 2306 |
+  | `sym-ip-apdf` × `cgnat(pr+sym)` | 0/50 | | 258 + 2561 |
+  | `sym-ip-apdf` × `sym-seq-adf`, `sym-rand-adf` | 2/50, 1/50 (by luck) | | 258 + 1347, 1381 |
+  | `sym-ip-apdf` × `sym-ip-apdf` | 0/50 | | 258 + 258 |
+  | `sym-random` × `sym-random` (nothing planned) | 0/50 | | 2 + 2 |
+
+  Every link that comes up holds: no new mappings and no roams over 10 s of traffic at 10 packets a second each
+  way. `sym-ip-apdf` lets no probe in, so its tries cost the other side a full spray: about 2300 mappings, under the
+  limits above. From `cargo test -p peerwire-sim --release --test traversal sym_ip -- --nocapture`. Not yet
+  measured on real networks, and how many real NATs map per IP, and of those how many filter by IP, is unknown.
 
 ## IPv6 (dual stack)
 
@@ -340,6 +399,8 @@ ts    u64 LE      sender's Unix time in ms
 nonce u64 LE      random
 n     u8 (<= 8)   then n x [len u8][Address::encode], or one port prediction entry:
                   [5][0xfe 0x01][step u8][next port u16 LE]
+                  or, from a symmetric NAT, one entry for how it maps (NB-083):
+                  [3][0xfe 0x02][1 per destination IP | 0 per IP and port]
 m     u8 (<= 8)   then m x 32-byte PeerId (peers the sender is connected to)
 proof 32 B        version 2: HMAC(room key, "pw-offer" || sender || recipient || everything above)
                   version 3: HMAC(recipient's invite key, "pw-invite" || sender || recipient || everything above)
@@ -357,6 +418,14 @@ The decoder rejects:
 Addresses that fail to decode are skipped. Decoders from before port prediction read the prediction entry as
 an address that fails to decode, so old and new nodes still talk; the prediction is just unused. A decoded
 prediction with step 0 or above 8 is dropped.
+
+The mapping entry works the same way. A `SymmetricIp` node sends `nat` 3 (symmetric) and the entry with 1; a
+`Symmetric` one sends it with 0, saying it will do its part of a
+[two-sided birthday punch](#two-sided-birthday-punch). Decoders from before NB-083 skip it, so they read
+`SymmetricIp` as `Symmetric`; offers from them have no entry, which reads as `Symmetric` from a peer that won't do
+its part. The entry counts only with `nat` 3 and only as exactly `[0xfe 0x02]` and 0 or 1, the first one if there
+are more; anything else is skipped. Offers from NATs that aren't symmetric carry no entry, so they are as before,
+byte for byte. With both entries, a full list keeps 6 addresses.
 
 ## Rules
 
@@ -411,10 +480,10 @@ prediction with step 0 or above 8 is dropped.
   limits bound what floods can make a node dial, seal or publish, and are ample for the room sizes this layer
   targets (no mesh limit yet).
 - **Failure.** When a dial ends in `ConnectFailed`, `failure(peer)` is `Symmetric(side)` if one side is
-  symmetric and the other isn't open, and `Unreachable` otherwise. `side` is `Ours`, `Theirs` or `Both`. Its
-  `Display` is a sentence for users, such as "the peer's NAT is symmetric (a new public port per destination)
-  and this side's router only lets in packets from ports it has sent to, so hole punching can't work, and no
-  peer linked to both could relay". Godot shows it as `get_connect_error_message()`.
+  symmetric (`Symmetric` or `SymmetricIp`) and the other isn't open, and `Unreachable` otherwise. `side` is
+  `Ours`, `Theirs` or `Both`. Its `Display` is a sentence for users, such as "the peer's NAT is symmetric (a new
+  public port per destination) and this side's router only lets in packets from ports it has sent to, so hole
+  punching can't work, and no peer linked to both could relay". Godot shows it as `get_connect_error_message()`.
 
 ## Relay peers
 
@@ -555,6 +624,17 @@ traversal privacy_modes_matrix -- --nocapture`:
   triggered it — a reflection amplifier, which is why the per-IP cap bounds what reaches one victim). An offer
   saying `Cone` makes a symmetric node send 256 handshakes (about 33 KB) to the offer's address, from 256 sockets
   it keeps for 10 s.
+- **Two-sided birthday punch** (NB-083). An offer that says `SymmetricIp`, to a symmetric node, or `Symmetric` with
+  the mapping entry, to a `SymmetricIp` node, makes it do both of the above in one punch: 256 handshakes from 256
+  sockets and a spray of up to 2048 ports of the offer's IP, about 300 KB, under the same limits and per-IP cap.
+  What lands on one address is unchanged. New is what a node behind a NAT that maps per IP and port pays: before
+  NB-083 it never sprayed, and each probe and socket now costs its NAT a port, up to 2304 a try, held for the NAT's
+  mapping timeout. A room member minting PeerIds could, under the node budget alone, make it start 4 at once and
+  one per 30 s after, about 9200 ports at once, enough to use up the block a carrier NAT gives its user and fail
+  its other new connections. So such a node starts at most one two-sided punch per 5 minutes, whichever peers ask
+  (`PER_PORT_PUNCH_GAP`): at most about 2300 ports at a time from this, beside the 256 a try that an offer saying
+  `Cone` could already cost it under the node budget. A `SymmetricIp` node's spray costs its NAT one port, as
+  every probe goes to one IP.
 - **Lockstep sweep** (NB-045). An offer with a prediction, to a node behind a sequential symmetric NAT, makes it
   send up to 96 handshakes (about 12 KB) to ports of the offer's IP, under the same limits as the birthday spray.
 - **Nostr relays** (`NostrSignaling`):
@@ -612,14 +692,24 @@ Crates added to `peerwire` by NAT traversal:
   - sealed offers turning into dials, and replay and stale drops;
   - separate budgets under hello and offer floods, the per-sender limit, nonces kept only for offers acted on;
   - the dialable-address filter;
-  - STUN classification and retransmits, port prediction from the two mappings;
+  - STUN classification over two, three and four servers (`SymmetricIp` from one IP's two ports, a silent server
+    on either IP, lists at one IP only judged as before) and retransmits, port prediction from the ports handed
+    out;
   - predictions round-tripping in offers, and cone (not open or symmetric) receivers probing them;
+  - the mapping entry (NB-083): round trips, a full list, entries that don't count, and main's offer codec from
+    before NB-083 (copied into the tests) reading `SymmetricIp` as `Symmetric` with everything else intact, while
+    every offer without the entry is what it sent, byte for byte;
   - birthday punches planned from the NAT types: a spray of every probe, each port once, from a cone towards a
     random-port symmetric peer, sockets with the dial's HS1 the other way round; none towards a private address,
     open or symmetric peers, or under `RelayOnly`; once per peer, at most 4 at once;
+  - two-sided punches: sockets and a spray on a `SymmetricIp` node facing a symmetric peer that says how it maps,
+    and the other way round; none towards a peer that doesn't say (lockstep instead, if both predict), between two
+    `Symmetric` nodes, towards a private address or under `RelayOnly`; once per peer and once per IP; one per 5
+    minutes behind a NAT that maps per IP and port;
   - lockstep sweeps: the peer's predicted ports in order, `next + k·step` (96) from the lower PeerId and
     `next + 2k·step` (64) from the other, a step-3 NAT, none unless both sides predict;
   - failure messages naming the symmetric side.
+- `crates/peerwire/src/node.rs` `stun_names_resolve_once_and_the_defaults_ask_one_server_on_two_ports`.
 - `crates/peerwire/src/portmap.rs` unit tests: PCP mapping, renewal at half the lease and delete; NAT-PMP after a
   PCP version refusal; UPnP after PCP and NAT-PMP refusals, with port conflicts and permanent leases; the timeout
   schedule through every protocol and the 5-minute retry; a failed renewal starting over; CGNAT and private
@@ -641,20 +731,24 @@ Crates added to `peerwire` by NAT traversal:
   port of one IP, and towards another IP) and filtering (which of those a mapping lets in), as in the table in
   [two symmetric NATs](#two-symmetric-nats).
 - `crates/peerwire-sim/tests/traversal.rs`:
-  - NAT types from simulated STUN, and which kinds predict;
+  - NAT types from simulated STUN (the first server on two ports, as in `DEFAULT_STUN_SERVERS`), and which kinds
+    predict;
   - the room-of-two matrix over 12 NAT kinds with 150 ms signaling latency, each failure naming the right side, and
-    every pair linking unless both NATs are symmetric and not both sequential (bar the case in lockstep's limits);
+    every pair linking unless both NATs are symmetric, not both sequential and neither `sym-ip-adf` (bar the case in
+    lockstep's limits);
   - the NB-080 kinds against cones and public peers, and `sym-seq-adf` against sequential NATs, over 25 seeds each
     way round: all direct but `sym-seq-adf` sweeping at stride 2 against a sequential NAT that filters by port
     (`cargo test -p peerwire-sim --release --test traversal address_filtering -- --nocapture`);
-  - a punch for two symmetric NATs in which both sides open sockets and probe, driven from the test
+  - the `sym-ip` kinds against every symmetric kind, with each side's NAT mappings a try
+    ([two-sided birthday punch](#two-sided-birthday-punch));
+  - a punch for two NATs that map per IP and port in which both sides open sockets and probe, driven from the test
     ([considered, not built](#two-symmetric-nats));
   - sequential symmetric NATs against port-restricted ones, over 10 seeds each way round: 80/80 direct;
   - a symmetric pair relayed through a third room peer;
   - birthday punching (`Sim::open_ports`: extra sockets with routes, as `Node` keeps them): random-port symmetric
     against port-restricted and `cgnat(pr+pr)` cones, 100/100 direct over 25 seeds each way round, connect
-    median 2.19 s, max 3.51 s (`cargo test -p peerwire-sim --release --test traversal birthday -- --nocapture`);
-    a link relayed through a relay peer moves to direct in 1.6 to 2.5 s, and only the routed socket stays open;
+    median 2.25 s, max 4.07 s (`cargo test -p peerwire-sim --release --test traversal birthday -- --nocapture`);
+    a link relayed through a relay peer moves to direct in 1.56 to 2.96 s, and only the routed socket stays open;
   - lockstep prediction: `sym-seq` and `cgnat(pr+sym)` pairs, 60/60 direct over 10 seeds each way round (1.51 s),
     also with up to 28 ports used up on both NATs before the sweep (`room_pair_with`), and still failing at 60;
     a sequential pair relayed through a relay peer moves to direct in 1.1 s
@@ -681,27 +775,29 @@ Crates added to `peerwire` by NAT traversal:
 Room of two, signaling only, from `cargo test -p peerwire-sim --release --test traversal -- --nocapture`. D is
 direct, with ms to connect. F S is a failure reported as `Symmetric` on both sides, as A reports it: `S<` A's
 NAT is the symmetric one, `S^` B's, `S2` both. For the first eight kinds, port prediction raised this from 43/64
-direct, birthday punching from 51/64 (the four `sym-random` against port-restricted cells, at 2 to 4.3 s), lockstep
+direct, birthday punching from 51/64 (the four `sym-random` against port-restricted cells, at 2 to 2.4 s), lockstep
 prediction from 55/64 (the four sequential symmetric pairs, at 1.5 s); what still fails is a random-port symmetric
 NAT against another symmetric one, which [no punch links](#two-symmetric-nats). The last four kinds (NB-080) link
 with every cone and public peer, and `sym-seq-adf` with the sequential kinds, but not in this seed as A against
-`sym-seq` (see lockstep's limits). The first eight rows and columns are the same, byte for byte, as before them:
+`sym-seq` (see lockstep's limits). `sym-ip-adf` links with every symmetric kind too (NB-083, the
+[two-sided birthday punch](#two-sided-birthday-punch)): the 13 cells of its row and column that failed before. The
+third STUN query moved the birthday cells' times, as it shifts the simulator's random draws; no other cell changed:
 
 ```text
          A \ B        public     full-cone    restricted    port-restr       sym-seq    sym-random  cgnat(pr+pr) cgnat(pr+sym)   sym-seq-adf  sym-rand-adf    sym-ip-adf   sym-ip-apdf
         public         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360
      full-cone         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360
     restricted         D 510         D 510         D 510         D 530         D 530         D 860         D 510         D 530         D 530         D 880         D 860         D 860
-    port-restr         D 510         D 510         D 510         D 530         D 510        D 4250         D 530         D 530         D 530        D 2240        D 2430        D 2370
-       sym-seq         D 510         D 530         D 510         D 510        D 1510          F S2         D 510        D 1510        D 1510          F S2          F S2          F S2
-    sym-random         D 510         D 530         D 510        D 2010          F S2          F S2        D 2760          F S2          F S2          F S2          F S2          F S2
-  cgnat(pr+pr)         D 530         D 510         D 530         D 530         D 530        D 2700         D 530         D 530         D 530        D 3110        D 2330        D 2880
- cgnat(pr+sym)         D 510         D 530         D 530         D 530        D 1510          F S2         D 530        D 1510        D 1510          F S2          F S2          F S2
-   sym-seq-adf         D 530         D 530         D 530         D 510          F S2          F S2         D 530        D 1510        D 1380          F S2          F S2          F S2
-  sym-rand-adf         D 530         D 530         D 510        D 1980          F S2          F S2        D 1880          F S2          F S2          F S2          F S2          F S2
-    sym-ip-adf         D 510         D 530         D 510        D 2150          F S2          F S2        D 2760          F S2          F S2          F S2          F S2          F S2
-   sym-ip-apdf         D 530         D 510         D 510        D 2340          F S2          F S2        D 2240          F S2          F S2          F S2          F S2          F S2
-direct: 59/64 of the first 8 kinds, 103/144 of all 12
+    port-restr         D 510         D 510         D 510         D 530         D 510        D 2420         D 530         D 530         D 530        D 2240        D 2430        D 2370
+       sym-seq         D 510         D 530         D 510         D 510        D 1510          F S2         D 510        D 1510        D 1510          F S2        D 2190          F S2
+    sym-random         D 510         D 530         D 510        D 2010          F S2          F S2        D 2040          F S2          F S2          F S2        D 2840          F S2
+  cgnat(pr+pr)         D 530         D 510         D 530         D 530         D 530        D 2430         D 530         D 530         D 530        D 2120        D 2030        D 3330
+ cgnat(pr+sym)         D 510         D 530         D 530         D 530        D 1510          F S2         D 530        D 1510        D 1510          F S2        D 2250          F S2
+   sym-seq-adf         D 530         D 530         D 530         D 510          F S2          F S2         D 530        D 1510        D 1380          F S2        D 2040          F S2
+  sym-rand-adf         D 530         D 530         D 510        D 1980          F S2          F S2        D 2000          F S2          F S2          F S2        D 2180          F S2
+    sym-ip-adf         D 510         D 530         D 510        D 2150        D 2210        D 1950        D 2700        D 1920        D 2660        D 2190        D 2070        D 1970
+   sym-ip-apdf         D 530         D 510         D 510        D 2340          F S2          F S2        D 2120          F S2          F S2          F S2        D 2070          F S2
+direct: 59/64 of the first 8 kinds, 116/144 of all 12
 ```
 
 The simulated NATs follow RFC 4787 behaviours. Real carrier-grade NATs, mobile networks and firewalls that block

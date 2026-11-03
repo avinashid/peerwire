@@ -992,6 +992,51 @@ security model for remote candidates (RFC 8826), but the cost is cheap to tighte
 Fix: require `nat.ip` to match one of the peer's server-reflexive addresses, take one
 prediction per description, and cap remote candidates per link (for example at 128).
 
+### Two-sided birthday punch (NB-083) — awaiting review
+
+`backend/NB-083-sym-ip`. STUN now asks Google's server on a second port, which tells a
+symmetric NAT that maps one port per destination IP (`NatType::SymmetricIp`). Against
+another symmetric NAT, both sides open the 256 sockets and spray 2048 ports. The
+mechanism and costs are in `docs/concepts/nat-traversal.md` (STUN, Two-sided birthday
+punch, Messages, What others learn or can do).
+
+What changes for an attacker:
+
+| Trigger | Who can trigger it | Traffic per try | Limits |
+|---|---|---|---|
+| An offer saying `SymmetricIp`, to a symmetric node, or `Symmetric` with the mapping entry, to a `SymmetricIp` node | A room member, an invite holder, or a peer the node dialled | The native open and the native spray above, in one punch: about 34 KB from 256 sockets and up to 272,916 B to ports ≥ 1024 of the offer's first address | As the spray: 5 min per peer; the node budget; the NB44-1 per-IP cap, one entry for both halves. Behind a NAT that maps per IP and port, one per 5 min per node (`PER_PORT_PUNCH_GAP`) |
+
+- **Reflection.** What lands on one address is the spray's, under the same per-IP cap,
+  so NB44-1's bound holds. Before NB-083 only a cone node sprayed. Now a symmetric
+  node does too, so more nodes can be recruited, each within its own cap (NB44-1's
+  per-node residual).
+- **Ports on the node's own NAT (NB44-3).** A node behind a NAT that maps per IP and
+  port pays one port per socket and per probe, up to 2304 a try, held for the NAT's
+  UDP timeout. Before NB-083 it paid 256 a try (an offer saying `Cone`). Under the node
+  budget alone, a member minting PeerIds could start 4 tries at once and 1 per 30 s
+  after, about 9,200 ports. That is enough to use up a carrier NAT's per-subscriber
+  block and fail the user's other new connections. So such a node starts at most one
+  two-sided punch per 5 minutes, whichever peers ask: about 2,300 ports at a time from
+  this, beside the 256 per try an offer saying `Cone` already allowed. A `SymmetricIp`
+  node's spray all goes to one IP, so it costs its NAT one port. Test:
+  `sym_ip_nodes_and_symmetric_peers_both_open_and_spray` (peers at three IPs start
+  one punch on a `Symmetric` node and three on a `SymmetricIp` one).
+- **Lying about the NAT.** A sender picks its own NAT type, as before. Claiming
+  `SymmetricIp`, or the mapping entry, only picks which of the existing punches the
+  node runs. The offer is sealed to the recipient and proved, so no relay can add or
+  strip the entry.
+- **The wire.** The entry is one more tagged item in the address list: `[3][fe 02][0|1]`.
+  It counts only with `nat` 3 and exactly that form, the first if there are several,
+  and takes one of the 8 slots. Decoders from before NB-083 skip it as an address they
+  can't read, so the offer's length bounds and strictness are unchanged. Tests: main's
+  codec, copied into `traversal.rs`, reads new offers, and every offer without the
+  entry is byte-identical. `fuzz_hello_and_offer_parsers` and
+  `fuzz_authenticated_signals` include `SymmetricIp` offers.
+- **STUN.** One more server address is asked, at Google's IP. A forged answer still
+  needs the transaction id and the server's source address. Forged answers from the
+  two Google ports could make a node `SymmetricIp`, or not. That only changes which
+  punch it plans, under the limits above.
+
 ### WebRTC retries (Fast lane 1) — FL1-1, FL1-2
 
 While a link runs on a fallback (a member relay or the signalling pipe), the room tries
