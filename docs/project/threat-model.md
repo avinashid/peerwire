@@ -142,6 +142,7 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB64-6 (Low) | Open (NB-065): a neighbour who knows two members' PeerIds can keep them from linking by flooding their inbox topics, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
 | NB62-2 (Info in the emulator, High on a board) | Open (NB-063): before Wi-Fi is up, ESP-IDF's random numbers are only pseudo-random, and in QEMU every chip draws the same ones (measured), same section |
+| NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -3354,6 +3355,58 @@ and what it accepted. Values are from main `7b716a2`.
   `1385715` (merged `82be3bd`), reviewed 2026-10-26: `withoutHostCandidates` splits on
   `\n` as `stripCandidates` does, and a rejected m-section keeps port 0 in both.
   `privacy.mjs` runs the gathered-SDP case with both line ends.
+- **IPv6 in browsers (NB-079; field test 2026-11-03, docs `9ea2200`).** IPv6 has no
+  NAT, so the public address a browser gives out over IPv6 is the device's own, not
+  one a carrier NAT shares among many subscribers. In the field test two Android
+  Chrome phones on Jio mobile data, one page without microphone permission, linked
+  directly IPv6 host to IPv6 host
+  ([IPv6](../concepts/nat-traversal.md#ipv6-dual-stack)). What a member learns of a
+  browser peer on IPv6 (in a room, each member it links with; in Net Lab's global
+  room, anyone who opens the page):
+  - **`'direct'` without a grant:** the address of the default route. Android Chrome
+    lists it unhidden as a `host` candidate, and STUN over IPv6 repeats it as a
+    `srflx` one (the page without permission sent one each of `host` IPv4, `host`
+    IPv6, `srflx` IPv4 and `srflx` IPv6, and no mDNS name; its `host` IPv4 was
+    `192.0.0.4`, the 464XLAT address every such phone has). A browser that hides
+    `host` candidates behind mDNS names sends the address all the same, as `srflx`:
+    libwebrtc keeps a `srflx` candidate equal to a `host` one it hides (not tested
+    here, as no test host has global IPv6).
+  - **`'direct'` with a grant:** every interface's IPv6 address as a `host`
+    candidate (mobile data, Wi-Fi, a VPN tunnel, ULAs), as for IPv4 (MIC-1).
+  - **`'public-only'` without a grant:** the same address. `withoutHostCandidates`
+    and `candidateFor` drop `typ host` lines only, and the `srflx` one is that
+    address. So on IPv6, `'public-only'` keeps from members only the 464XLAT
+    address, the same on every such phone.
+  - **`'public-only'` with a grant:** the browser may send no IPv6 `srflx`, as it
+    doesn't repeat a `host` candidate it no longer hides, and then the description
+    names no IPv6 address. But our ICE checks to a member's IPv6 candidates leave
+    from that address, so a member that offers one learns it as a peer-reflexive
+    candidate (MIC-3's "Not covered" case, which on IPv6 isn't limited to the same
+    network), and the direct IPv6 path may stay. Not field-tested.
+  - **`'relay-only'`:** the relay peer only, as under `'public-only'`.
+  - Calls send their media candidates through the same filters, so call members
+    learn the same. A Rust node's `PublicOnly` offers its global IPv6 address too;
+    `RelayOnly` offers none.
+  - **What the address tells.** The carrier and a rough place, as a public IPv4
+    address does, and more: on mobile data the /64 is the phone's own (3GPP gives
+    each data connection its own /64, RFC 6459), so a member can tell the same
+    phone across rooms and rejoins for as long as that connection lasts. Temporary
+    addresses (RFC 8981) change only the low 64 bits, by default about once a day;
+    without them those bits can stay the same across networks. And unless the
+    carrier filters inbound IPv6, the address reaches the phone unasked, which a
+    carrier-NAT IPv4 address doesn't.
+  - **NB79-I1 (Info, privacy, open): on IPv6, `'public-only'` doesn't keep the
+    device's own address from members.** The docs say so since `9ea2200` (NAT
+    traversal, the JavaScript reference, the privacy guide). Dropping IPv6 `srflx`
+    candidates under `'public-only'` would keep it only from members that offer no
+    IPv6 candidate themselves: one that does learns it from our checks, as above,
+    and any member on IPv6 under `'direct'`, the default, does. Keeping it from
+    members takes both halves: send no IPv6 candidate and add none of a member's,
+    so our ICE never sends from IPv6. That loses the direct IPv6 path, on mobile
+    data often the only direct one (NB-079). Suggested: keep `'public-only'` as it
+    is, since what it sends is what STUN sees and the docs now say what that is on
+    IPv6; if apps need the address kept from members, add the two-sided filter as
+    its own choice, and consider it for Net Lab's global room.
 
 **Demos**
 - No CSP is sent by `crew-server.mjs`, which serves Net Lab and Crew. Only the Docker
