@@ -156,9 +156,15 @@ fn main() {
         );
         let r = s.recovery;
         println!(
-            "  cuts: delay {}, loss {}, random loss {}, timeout {}; timed-out fragments {}, of which first sends \
-             over 64 above the lowest unacked {}",
-            r.delay_cuts, r.loss_cuts, r.random_cuts, r.timeout_cuts, r.timed_out, r.timed_out_beyond_reach
+            "  cuts: delay {}, loss {}, random loss {}, timeout {}; timed-out fragments {}, of which tail losses {} \
+             and first sends over 64 above the lowest unacked {}",
+            r.delay_cuts,
+            r.loss_cuts,
+            r.random_cuts,
+            r.timeout_cuts,
+            r.timed_out,
+            r.tail_losses,
+            r.timed_out_beyond_reach
         );
         if a.cpu {
             println!(

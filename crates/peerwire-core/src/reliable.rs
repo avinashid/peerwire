@@ -50,7 +50,7 @@ const DELAY_CUT: f64 = 0.85;
 /// A loss found by fast retransmit while the latest RTT sample showed under
 /// this much queueing is taken as random (a lossy radio link, not a full
 /// buffer) and keeps RANDOM_LOSS_CUT of the window instead of LOSS_CUT, as in
-/// TCP Veno. A timeout always halves.
+/// TCP Veno; so is a tail loss (see `write_stream`). A timeout always halves.
 const RANDOM_LOSS_QUEUE: Duration = Duration::from_millis(5);
 const RANDOM_LOSS_CUT: f64 = 0.8;
 /// Tail-loss probe: when nothing has been acknowledged for srtt + 2·rttvar +
@@ -102,6 +102,9 @@ pub struct RecoveryStats {
     /// Of those, first sends more than 64 above the lowest unacknowledged
     /// fragment, beyond the SACK bitmap's reach.
     pub timed_out_beyond_reach: u64,
+    /// Of the timed-out fragments, tail losses: first sends whose timer ran
+    /// out after an ACK acknowledged new data, cut for as fast retransmits are.
+    pub tail_losses: u64,
     /// Cuts above that deepened one made earlier in the same round trip.
     pub deepened: u64,
     /// Timers of fragments beyond the SACK bitmap's reach put off while the
@@ -195,6 +198,9 @@ pub(crate) struct RelSend {
     path_min_rtt: Option<Duration>,
     /// Queueing delay of the latest RTT sample (sample − min_rtt); none before the first.
     queue_delay: Option<Duration>,
+    /// When an ACK last acknowledged new data, on either stream: the path
+    /// still delivered then (see the tail loss in `write_stream`).
+    acked_at: Option<Instant>,
     pub(crate) delay_backoffs: u64,
     pub(crate) urgent_copies: u64,
     pub(crate) recovery: RecoveryStats,
@@ -221,6 +227,7 @@ impl RelSend {
             min_rtt: None,
             path_min_rtt: None,
             queue_delay: None,
+            acked_at: None,
             delay_backoffs: 0,
             urgent_copies: 0,
             recovery: RecoveryStats::default(),
@@ -470,6 +477,7 @@ impl RelSend {
             }
         }
         if newly > 0 {
+            self.acked_at = Some(now);
             self.streams[u].probe_used = false;
             self.arm_probe(u, now);
         }
@@ -554,14 +562,24 @@ impl RelSend {
                 break;
             }
             st.deferred.remove(&seq);
+            // A first send whose timer runs out after an ACK acknowledged new
+            // data is a tail loss: the path still delivers, but the fragments
+            // after it went out too late (the next ACK-clocked burst) for fast
+            // retransmit to find it before its RTO, about 1.3 RTT. A tail-loss
+            // probe (RFC 8985) fires no later than the RTO, so here the expiry
+            // is the probe: the fragment is resent, and as RACK-TLP does for a
+            // loss its probe repairs, the window is cut as for fast retransmit,
+            // not for a timeout. With no ACK since it went out, it is a timeout.
+            let tail = f.tries == 1 && self.acked_at.is_some_and(|a| a > f.sent_at);
             if !f.fast {
                 self.recovery.timed_out += 1;
+                self.recovery.tail_losses += tail as u64;
                 if f.tries == 1 && seq - lo > SACK_BITS {
                     self.recovery.timed_out_beyond_reach += 1;
                 }
             }
             lost = true;
-            timed_out |= !f.fast;
+            timed_out |= !f.fast && !tail;
             resent = true;
             f.fast = false;
             f.epoch = sent_end;
@@ -878,13 +896,64 @@ mod tests {
         assert_eq!(tx.delay_backoffs, 0);
         assert_eq!(drain(&mut tx, Instant::from_millis(200)), vec![(0, true, vec![0])]);
         assert_eq!(tx.ssthresh, 8.0 * LOSS_CUT);
-        // No queueing, but 15 time out (0 was acknowledged): halved too.
+        // No queueing, but 15 sent after the last ACK time out: halved too. An
+        // ACK since then that acknowledges nothing new doesn't make it a tail loss.
         let mut tx = sent();
-        tx.on_ack(Instant::from_millis(100), 1, 0, false);
+        let t = Instant::from_millis(100);
+        tx.on_ack(t, 16, 0, false);
+        for i in 0..15u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        assert_eq!(drain(&mut tx, t).len(), 15);
+        tx.on_ack(t + Duration::from_millis(50), 16, 0, false);
         let due = earliest(&tx.streams[REL].by_due).unwrap();
         assert_eq!(drain(&mut tx, due).len(), 15);
         assert_eq!(tx.retransmits(), 15);
+        assert_eq!((tx.recovery.timeout_cuts, tx.recovery.tail_losses), (1, 0));
         assert_eq!(tx.ssthresh, 15.0 * LOSS_CUT);
+    }
+
+    /// The tail of a flight is lost, 48..63 of 64: nothing sent after it is
+    /// acknowledged, so fast retransmit can't find it. Its timers run out after
+    /// the ACK for 0..47, so the path still delivers: a tail loss, cut as fast
+    /// retransmit cuts (80% kept without queueing, half with), not as a timeout.
+    #[test]
+    fn a_tail_loss_is_cut_as_fast_retransmit() {
+        let sent = || {
+            let mut tx = RelSend::new();
+            tx.seed_rtt(Duration::from_millis(100));
+            tx.cwnd = 100.0;
+            for i in 0..64u8 {
+                tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+            }
+            assert_eq!(drain(&mut tx, Instant::ZERO).len(), 64);
+            tx
+        };
+        let mut tx = sent();
+        tx.on_ack(Instant::from_millis(100), 48, 0, false);
+        let due = earliest(&tx.streams[REL].by_due).unwrap();
+        assert_eq!(seqs(drain(&mut tx, due)), (48..64).collect::<Vec<_>>());
+        let r = tx.recovery;
+        assert_eq!((r.timed_out, r.tail_losses, r.timeout_cuts, r.random_cuts), (16, 16, 0, 1));
+        assert_eq!(tx.ssthresh, 16.0 * RANDOM_LOSS_CUT);
+        // The resends of 49..63 are lost too. 48's arrives, but a resend that
+        // times out is a timeout whatever was acknowledged since: only a first
+        // send's expiry is the probe. A round trip later, it halves the 15 left.
+        tx.on_ack(due + Duration::from_millis(100), 49, 0, false);
+        let due = earliest(&tx.streams[REL].by_due).unwrap();
+        assert_eq!(seqs(drain(&mut tx, due)), (49..64).collect::<Vec<_>>());
+        let r = tx.recovery;
+        assert_eq!((r.timed_out, r.tail_losses, r.timeout_cuts), (31, 16, 1));
+        assert_eq!(tx.ssthresh, 15.0 * LOSS_CUT);
+        // The latest RTT sample showed RANDOM_LOSS_QUEUE of queueing: halved.
+        let mut tx = sent();
+        tx.on_ack(Instant::from_millis(100), 1, 0, false);
+        tx.on_ack(Instant::from_millis(100) + RANDOM_LOSS_QUEUE, 48, 0, false);
+        let due = earliest(&tx.streams[REL].by_due).unwrap();
+        assert_eq!(drain(&mut tx, due).len(), 16);
+        let r = tx.recovery;
+        assert_eq!((r.tail_losses, r.timeout_cuts, r.loss_cuts), (16, 0, 1));
+        assert_eq!(tx.ssthresh, 16.0 * LOSS_CUT);
     }
 
     #[test]
@@ -964,15 +1033,17 @@ mod tests {
     }
 
     /// Only fragments the bitmap can't reach are put off: 64 is reported (or
-    /// not) by the ACK's last bit, so it times out, and 65 waits. A real
-    /// timeout still halves the window.
+    /// not) by the ACK's last bit, so it times out, and 65 waits. 1..=63 were
+    /// acknowledged after 64 went out, so it is a tail loss: a round trip after
+    /// the first cut, it cuts the same flight to 80% again, not to half.
     #[test]
     fn the_last_reportable_fragment_still_times_out() {
         let mut tx = hole_at_zero(u64::MAX >> 1);
         assert_eq!(tx.ssthresh, 137.0 * RANDOM_LOSS_CUT);
         assert_eq!(seqs(drain(&mut tx, Instant::from_millis(340))), vec![64]);
-        assert_eq!((tx.recovery.timed_out, tx.recovery.timeout_cuts), (1, 1));
-        assert_eq!(tx.ssthresh, 137.0 * LOSS_CUT);
+        let r = tx.recovery;
+        assert_eq!((r.timed_out, r.tail_losses, r.timeout_cuts, r.random_cuts), (1, 1, 0, 2));
+        assert_eq!(tx.ssthresh, 137.0 * RANDOM_LOSS_CUT);
         assert_eq!(tx.recovery.deferred, 135);
     }
 
