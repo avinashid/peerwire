@@ -44,16 +44,18 @@ the reliable lane's scans cost more than the crypto.
 
 Setup: two hosts, 100 ms RTT, 100 Mbit/s uplinks. 64 MiB is sent as 1 MiB `Reliable` messages that keep the send
 buffer (4 MiB) full, and a 64 B `Urgent` message goes every 20 ms. The default `Config` is used: a window of 1024
-fragments of 1100 B, so the ceiling is about 11 MB/s at 100 ms. CPU is wall-clock time inside each endpoint, on one
-aarch64 core.
+fragments of 1100 B, so the ceiling is about 11 MB/s at 100 ms. The last two rows set `reliable_window` to 4096 on
+both hosts (`--window 4096`). CPU is wall-clock time inside each endpoint, on one aarch64 core.
 
 | Link | Throughput | Peak cwnd / inflight | Delay backoffs | Retransmits | Urgent p50 / p99 | Sender CPU per fragment |
 |---|---|---|---|---|---|---|
 | Clean | 9.18 MB/s (7.3 s) | 1511 / 1025 | 1 | 0 | 50 / 130 ms | 5 µs |
-| 1% loss | 0.20 MB/s (337 s) | 336 / 336 | 3 | 637 | 71 / 130 ms | 4 µs |
+| 1% loss | 0.24 MB/s (284 s) | 336 / 336 | 3 | 659 | 72 / 133 ms | 4 µs |
 | 0–10 ms jitter, drawn per packet (reorders) | 7.10 MB/s (9.5 s) | 970 / 970 | 2 | 3 | 56 / 119 ms | 6 µs |
 | 0–10 ms jitter, in order | 5.85 MB/s (11.5 s) | 865 / 865 | 2 | 0 | 60 / 128 ms | 5 µs |
 | Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60353 / 1026 | 0 | 0 | 50 / 130 ms | 5 µs |
+| Clean, window 4096 | 10.74 MB/s (6.3 s) | 1511 / 1511 | 2 | 0 | 54 / 130 ms | 5 µs |
+| Clean, 1 Gbit/s uplink, window 4096 | 26.14 MB/s (2.6 s) | 57272 / 3817 | 0 | 0 | 50 / 130 ms | 5 µs |
 
 Inflight counts window slots: a reliable fragment is one, an urgent fragment its share of one by wire size. The
 jitter rows depend on the seed (the table is seed 1): over seeds 1–60 they average 7.39 MB/s per packet and
@@ -71,17 +73,26 @@ What limits it:
   PERF-7V). Since PERF-7V a loss found by fast retransmit while the latest RTT sample showed under 5 ms of queueing
   is taken as random, as in TCP Veno, and keeps 80% of the window: keeping a share `b` gives
   `√((1+b) / (2(1−b)p))`, **theoretical** 2.12 / √p ≈ 21 fragments, 0.23 MB/s. Over seeds 1–40 the 16 MiB run
-  gets **0.20 MB/s** (0.21 before PERF-10), because timeouts still halve: about 34 of its 142 cuts. They are real
-  losses that fast retransmit misses. At a window near 30 the sender goes out in ACK-clocked bursts, and a fragment
-  lost near the end of one has fewer than 3 later fragments acknowledged before its RTO. A buffer that overflows
-  usually shows in the RTT first, so that loss still halves; behind a buffer shorter than 5 ms congestive loss looks
-  random too and keeps 80%, as it does for every sender on that link.
+  gets **0.24 MB/s**, and 0.35 and 0.17 MB/s at 0.5% and 2% loss. Before NB-086 timeouts still halved, about 34
+  of its 142 cuts, and it got 0.20, 0.31 and 0.13 MB/s (see tail losses below). At that bound, only a gentler
+  response to random loss goes faster: 0.40 MB/s at 1% needs 36 fragments, **theoretical** `b` ≈ 0.93. A buffer
+  that overflows usually shows in the RTT first, so that loss still halves; behind a buffer shorter than 5 ms
+  congestive loss looks random too and keeps 80%, as it does for every sender on that link.
+- **A loss at the end of a burst is a tail loss, not a timeout (NB-086).** At a window near 30 the sender goes out
+  in ACK-clocked bursts, and the fragments after one lost near the end of a burst leave a round trip later, so no
+  ACK shows the hole before its timer runs out, at about 1.3 RTT. The tail-loss probe, re-armed by every ACK, never
+  fired first, and a 2·SRTT probe couldn't either: at 1% loss (seed 1) all 25 timeouts were first sends expiring
+  26–30 ms after an ACK. As in RACK-TLP (RFC 8985), where the probe fires no later than the timeout and a loss it
+  repairs is cut for as fast recovery cuts, a first send whose timer runs out after an ACK acknowledged new data is
+  now resent and cut like a fast retransmit. Over seeds 1–40, 1 timeout cut is left of 1341. A timer with no ACK
+  of new data since its fragment went out, or a resend's, is still a timeout and halves. Uplink drops behind a
+  1 ms buffer fell from 1291 to 664, with both flows still even (`cc_fair -- --buffer 1`, Jain index 1.000).
 - **Nothing times out beyond the SACK bitmap's reach (PERF-10).** An ACK reports 64 fragments above the cumulative
   one, so while the lowest unacknowledged fragment is repaired, those further up can't be reported. Their timers
   used to run out first: at 1% loss (seed 1) 340 fragments timed out, 309 of them first sends beyond reach, all
   sent again. They mostly fell in the round trip of an earlier cut, so they cost retransmissions, not cuts. Now
   such a timer waits for the repair's and restarts when the cumulative ACK moves: 25 time out, none beyond reach
-  (`bulk --mib 16 --loss 0.01` prints the breakdown). A wider bitmap would gain at most 1–9% more over seeds 1–40
+  (30 since NB-086, all tail losses; `bulk --mib 16 --loss 0.01` prints the breakdown). A wider bitmap would gain at most 1–9% more over seeds 1–40
   at 0.5–2% loss (measured with a 1024-bit bitmap on a scratch build), not worth a wire change.
 - **A timeout deepens a random-loss cut in the same round trip (PERF-10).** Cuts stay one per round trip, but a
   timeout after a cut that kept 80% takes the window to 50% of the flight that cut was taken from, never
@@ -89,6 +100,12 @@ What limits it:
   (0.31, 0.20 and 0.13 MB/s against 0.32, 0.21 and 0.14). Other signals in that round trip are still ignored: a
   loss deepening a delay backoff cost the jitter runs 15% over seeds 1–60 (6.31 MB/s), for no gain on the loss
   runs.
+- **A long, fast link can use a window of 4096 (NB-086).** The receiver buffers 4096 fragments ahead of the next
+  one expected, and the sender never sends further ahead, so `reliable_window` can go up to 4096 where both ends
+  run this version (an older receiver takes 1024 ahead, so the default stays 1024). Clean, that gives 10.74 MB/s at
+  100 Mbit/s, with two delay backoffs instead of one, and 26.14 MB/s at 1 Gbit/s, where the 4 MiB send buffer is
+  the cap: 3813 fragments, **theoretical** 3813 × 1100 B / 100 ms ≈ 42 MB/s once slow start is done.
+  A peer can make a link hold about 5.7 MB of received data this way (2.3 MB before).
 - **Before PERF-8**, fast retransmit resent a lost fragment on every later ACK, so it reached `MAX_TRIES` in one
   round trip and the link was dropped after 0.54 s. Each copy is now resent once, and only after an ACK for a
   fragment sent after it; reordering within a quarter of the minimum RTT (RACK's window) is not taken as loss, so

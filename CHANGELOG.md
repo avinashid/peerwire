@@ -19,6 +19,9 @@ and the commit that fixed it.
   - dual-stack IPv4 and IPv6 candidates;
   - relay peers: an always-on `peerwire-peer` kept linked and used when a punch fails.
 - **Faster paths:** a link races its other paths and takes one that's clearly faster.
+- **Bulk transfer:** a loss at the end of a burst is repaired as a tail loss (RACK-TLP), not a timeout: 22% faster
+  at 1% loss and 100 ms. The receive window is 4096 fragments, so `reliable_window` can go up to 4096 on long, fast
+  links; a peer can now make a link hold about 5.7 MB (2.3 MB before).
 - **Security:**
   - room hellos are sealed as in JavaScript;
   - handshake cookies under load, and a per-address cap on half-open handshakes;

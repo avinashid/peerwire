@@ -92,15 +92,18 @@ complete host loop on std UDP sockets.
   - Fast retransmit when a fragment is 3 behind the highest acknowledged one and past a
     RACK-style reordering window (RFC 8985).
   - A tail-loss probe resends the newest fragment when ACKs stop, so a lost tail costs
-    about one RTT instead of an RTO.
+    about one RTT instead of an RTO. A first send whose timer runs out after an ACK
+    acknowledged new data is a tail loss: that expiry is its probe, as in RACK-TLP, and the
+    loss is cut for as fast retransmit cuts, not as a timeout.
   - A NewReno-style AIMD congestion window (16 fragments to start, 4 at the floor), shared by
-    both lanes; each lane also stays within `Config::reliable_window` (1024) fragments. It
-    also backs off when queueing delay passes 25 ms, before any loss, which keeps router
-    buffers short for real-time traffic. A loss halves the window, except one found by fast
-    retransmit while the RTT shows under 5 ms of queueing: that is taken as random (TCP
-    Veno) and keeps 80%. One cut per round trip, but a timeout after a random-loss cut
-    deepens it to half of the same flight. Urgent fragments take free slots first, but at
-    most half the window while reliable data waits.
+    both lanes; each lane also stays within `Config::reliable_window` (1024) fragments in
+    flight, and within its receive window (4096 fragments, 64 urgent) of the oldest one
+    unacknowledged. It also backs off when queueing delay passes 25 ms, before any loss,
+    which keeps router buffers short for real-time traffic. A loss halves the window, except
+    one found by fast retransmit or a tail loss while the RTT shows under 5 ms of queueing:
+    that is taken as random (TCP Veno) and keeps 80%. One cut per round trip, but a timeout
+    after a random-loss cut deepens it to half of the same flight. Urgent fragments take
+    free slots first, but at most half the window while reliable data waits.
   - While the lowest unacknowledged fragment is repaired, fragments beyond the SACK
     bitmap's reach (64 above it) don't time out before the repair does; their timers
     restart when the cumulative ACK moves.
