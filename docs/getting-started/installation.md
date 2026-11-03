@@ -23,11 +23,6 @@ Without a bundler, serve the package's files and map the import in your page:
 <script type="importmap">{ "imports": { "@peerwire/js": "/node_modules/@peerwire/js/src/index.js" } }</script>
 ```
 
-> [!NOTE]
-> npm has `@peerwire/js` **0.1.1**, from October 2026. Shared documents (`room.doc()`), calls (`room.call()`) and
-> offline messages (`openInbox()`) came later and are on `main` as 0.2.0, which isn't published yet. To use them
-> now, [build the package from source](#building-from-source).
-
 ## React
 
 ```sh

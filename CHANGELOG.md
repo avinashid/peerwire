@@ -8,9 +8,34 @@ and the commit that fixed it.
 
 ## Unreleased
 
-On `main`, not yet published: `@peerwire/js` 0.2.0 and `@peerwire/react` 0.1.1.
+### Rust crates and Godot
 
-### `@peerwire/js` 0.2.0
+- **LAN discovery:** `LanSignaling` runs rooms over UDP multicast on the local network, with no internet.
+- **ESP32:** `peerwire` builds for ESP-IDF; a prototype runs on emulated ESP32-C3s.
+- **Shared documents:** `peerwire-sync` gives shared documents in Rust, wire-compatible with `room.doc()`, in the
+  Godot binding (`open_doc`) and the C ABI.
+- **Harder NATs:**
+  - birthday punching and lockstep prediction, so 59 of 64 simulated NAT pairings connect directly;
+  - dual-stack IPv4 and IPv6 candidates;
+  - relay peers: an always-on `peerwire-peer` kept linked and used when a punch fails.
+- **Faster paths:** a link races its other paths and takes one that's clearly faster.
+- **Security:**
+  - room hellos are sealed as in JavaScript;
+  - handshake cookies under load, and a per-address cap on half-open handshakes;
+  - an HS1 must be exactly the right length;
+  - incoming offers spend a budget before they're decrypted.
+- **Godot:** a hub catches up a stalled member afresh instead of disconnecting it; getters for each link's route and
+  address.
+
+## `@peerwire/js` 0.2.1 (2026-11-03)
+
+**Fixed**
+
+- `persist`: a save on a connection the browser has just closed, as it does while it clears the site's data, opens
+  the store again, once, instead of failing.
+- `persist`: an open the browser aborts is tried once more a moment later; an open it refuses still fails at once.
+
+## `@peerwire/js` 0.2.0 (2026-11-01)
 
 **Added**
 
@@ -47,31 +72,12 @@ On `main`, not yet published: `@peerwire/js` 0.2.0 and `@peerwire/react` 0.1.1.
 - `'public-only'` strips local addresses from every SDP form browsers produce.
 - Many hardening fixes from security reviews, among them bounds on what members can make a peer store or compute.
 
-### `@peerwire/react` 0.1.1
+## `@peerwire/react` 0.1.1 (2026-11-01)
 
 - A shared write that doesn't fit what members can store is dropped with a warning instead of throwing.
 - Catch-up messages are cut to 512 KiB, so they always fit a reliable message.
 - A member's value nested more than 64 levels deep is dropped before it's stringified.
 - `usePeerwireRoom` fails the join with an error if the presence changes while it's joining.
-
-### Rust crates and Godot
-
-- **LAN discovery:** `LanSignaling` runs rooms over UDP multicast on the local network, with no internet.
-- **ESP32:** `peerwire` builds for ESP-IDF; a prototype runs on emulated ESP32-C3s.
-- **Shared documents:** `peerwire-sync` gives shared documents in Rust, wire-compatible with `room.doc()`, in the
-  Godot binding (`open_doc`) and the C ABI.
-- **Harder NATs:**
-  - birthday punching and lockstep prediction, so 59 of 64 simulated NAT pairings connect directly;
-  - dual-stack IPv4 and IPv6 candidates;
-  - relay peers: an always-on `peerwire-peer` kept linked and used when a punch fails.
-- **Faster paths:** a link races its other paths and takes one that's clearly faster.
-- **Security:**
-  - room hellos are sealed as in JavaScript;
-  - handshake cookies under load, and a per-address cap on half-open handshakes;
-  - an HS1 must be exactly the right length;
-  - incoming offers spend a budget before they're decrypted.
-- **Godot:** a hub catches up a stalled member afresh instead of disconnecting it; getters for each link's route and
-  address.
 
 ## `@peerwire/react` 0.1.0 (2026-10-24)
 
