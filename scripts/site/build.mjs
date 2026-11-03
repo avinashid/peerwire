@@ -21,9 +21,10 @@
 // that names no id on its page, a doc link to a repo path that doesn't exist, or a link with another scheme than
 // http(s) or mailto. Doc links to repo files that aren't rendered point at GitHub. It fails too on an SVG under
 // docs/assets/ that holds a script, a handler, a reference to anything outside it, an element or namespace that
-// isn't SVG's, or a character outside printable ASCII (checkSvg), and on a symlink among the files it reads or
-// publishes, or on their way from the repo's root, which would publish whatever it names on the machine that builds
-// the site (inRepo).
+// isn't SVG's, or a character outside printable ASCII (checkSvg); on a doc whose path is more than [\w-] names and
+// slashes, which its links would have to URL-encode (a%41.md); and on a symlink among the files it reads or publishes,
+// or on their way from the repo's root, which would publish whatever it names on the machine that builds the site
+// (inRepo).
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -90,6 +91,7 @@ export const REDIRECTS = {
 export const INDEX = 'docs/README.md';
 const ASSETS = 'docs/assets/';
 const IMAGE = /^[\w-]+(?:\/[\w-]+)*\.(?:svg|png|jpe?g|gif|webp)$/;
+const DOC = /^[\w-]+(?:\/[\w-]+)*\.md$/;
 const JS = 'packages/js/';
 const WASM = 'pkg/peerwire_ffi.wasm';
 
@@ -126,7 +128,9 @@ function walk(root, dir) {
 
 // docs/README.md: its text before the first "## " (the overview's), then each "## Group" and its
 // "- [Title](path.md): blurb" lines (a blurb may go on over indented lines): the sidebar, in order. Anything else
-// under a group, a link that isn't a .md file of the repo, and a docs/**/*.md listed twice or not at all throw.
+// under a group, a link that isn't a .md file of the repo, a doc's path with more than [\w-] names and slashes (NB73-I2:
+// a%41.md would link to a%41.html, which a browser reads as aA.html), and a docs/**/*.md listed twice or not at all
+// throw.
 export function readIndex(root) {
   const intro = [];
   const groups = [];
@@ -144,6 +148,7 @@ export function readIndex(root) {
       if (source.startsWith('../') || !source.endsWith('.md') || !fs.existsSync(path.join(root, source))) {
         throw new Error(`site: ${where}: ${m[2]} is no .md file of the repo`);
       }
+      if (!DOC.test(source)) throw new Error(`site: ${where}: ${source}: a doc's path is [\\w-] names and slashes, with .md`);
       item = { title: inlineText(m[1]), source, blurb: m[3] ?? '', group: groups.at(-1).name };
       groups.at(-1).items.push(item);
     } else if (item && /^[ \t]+\S/.test(line)) {
