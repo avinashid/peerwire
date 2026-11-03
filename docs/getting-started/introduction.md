@@ -52,7 +52,8 @@ Because every platform runs the same core, a browser, a Rust program and a Godot
 ```
 
 1. **Learn your address.** STUN runs on the session's own socket, so the address it reports is the mapping the link
-   will use. Asking two servers tells an open or cone NAT from a symmetric one.
+   will use. Asking two servers tells an open or cone NAT from a symmetric one, and asking one of them on a second
+   port tells a symmetric NAT that maps per destination IP from one that maps per IP and port.
 2. **Find each other.** Peers announce themselves on a topic derived from the room name, over a publish/subscribe
    carrier: public Nostr relays, LAN multicast, a browser's BroadcastChannel, or in-process. The carrier sees hashes
    and sealed bytes, never addresses.

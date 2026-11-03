@@ -165,8 +165,8 @@ complete host loop on std UDP sockets.
 Examples:
 - `cargo run --release -p peerwire-core --example udp_pair -- [messages] [reliable|unreliable]`: real UDP
   loopback throughput.
-- `cargo run --release -p peerwire-core --example stun_probe`: asks two public STUN servers for
-  your address and classifies your NAT.
+- `cargo run --release -p peerwire-core --example stun_probe [-- host:port ...]`: asks public STUN
+  servers (by default `peerwire`'s: two, one on two ports) for your address and classifies your NAT.
 - `cargo run --release -p peerwire-sim --example bulk`: a bulk transfer with urgent messages
   on a simulated link with a 100 ms RTT and 100 Mbit/s uplinks.
 - `cargo run --release -p peerwire-sim --example arena -- --players 512 --supers 8`:
