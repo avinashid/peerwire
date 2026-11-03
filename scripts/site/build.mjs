@@ -21,8 +21,10 @@
 // that names no id on its page, a doc link to a repo path that doesn't exist, or a link with another scheme than
 // http(s) or mailto. Doc links to repo files that aren't rendered point at GitHub. It fails too on an SVG under
 // docs/assets/ that holds a script, a handler, a reference to anything outside it, an element or namespace that
-// isn't SVG's, or a character outside printable ASCII (checkSvg), and on a symlink under docs/assets/ (or docs/assets
-// itself one), which would publish whatever it names on the machine that builds the site.
+// isn't SVG's, or a character outside printable ASCII (checkSvg); on a doc whose path is more than [\w-] names and
+// slashes, which its links would have to URL-encode (a%41.md); and on a symlink among the files it reads or publishes,
+// or on their way from the repo's root, which would publish whatever it names on the machine that builds the site
+// (inRepo).
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -89,20 +91,36 @@ export const REDIRECTS = {
 export const INDEX = 'docs/README.md';
 const ASSETS = 'docs/assets/';
 const IMAGE = /^[\w-]+(?:\/[\w-]+)*\.(?:svg|png|jpe?g|gif|webp)$/;
+const DOC = /^[\w-]+(?:\/[\w-]+)*\.md$/;
+const JS = 'packages/js/';
+const WASM = 'pkg/peerwire_ffi.wasm';
 
 const posix = path.posix;
 const sitePathOf = (source) => (source === INDEX ? 'docs/index.html' : source.replace(/\.md$/, '.html'));
 const inlineText = (md) => textOf(render(md).html).replace(/\s+/g, ' ').trim();
 const sentence = (s) => s && s[0].toUpperCase() + s.slice(1);
 
-// Every file under dir (a path from root), as posix paths from root: symlinks followed, or with links false refused.
-function walk(root, dir, links = true) {
+// The path of a file the build reads or publishes, given as a normalized posix path from root. A symlink there, or
+// on the way from root, throws: the build would publish what it names on the machine that builds the site (NB67-I2,
+// NB73-I1). The repo tracks none. root itself may be one.
+function inRepo(root, file) {
+  const parts = file.split('/');
+  for (let k = 1; k <= parts.length; k++) {
+    const sub = parts.slice(0, k).join('/');
+    if (fs.lstatSync(path.join(root, sub)).isSymbolicLink()) {
+      throw new Error(`site: ${sub} is a symlink${sub === file ? '' : ` (on the way to ${file})`}: the build would ` +
+        'publish what it names');
+    }
+  }
+  return path.join(root, file);
+}
+
+// Every file under dir (a path from root), as posix paths from root; a symlink there throws (inRepo).
+function walk(root, dir) {
   const out = [];
-  for (const name of fs.readdirSync(path.join(root, dir)).sort()) {
+  for (const name of fs.readdirSync(inRepo(root, dir)).sort()) {
     const file = posix.join(dir, name);
-    const stat = (links ? fs.statSync : fs.lstatSync)(path.join(root, file));
-    if (stat.isSymbolicLink()) throw new Error(`site: ${file} is a symlink: the build would publish what it names`);
-    if (stat.isDirectory()) out.push(...walk(root, file, links));
+    if (fs.statSync(inRepo(root, file)).isDirectory()) out.push(...walk(root, file));
     else out.push(file);
   }
   return out;
@@ -110,12 +128,14 @@ function walk(root, dir, links = true) {
 
 // docs/README.md: its text before the first "## " (the overview's), then each "## Group" and its
 // "- [Title](path.md): blurb" lines (a blurb may go on over indented lines): the sidebar, in order. Anything else
-// under a group, a link that isn't a .md file of the repo, and a docs/**/*.md listed twice or not at all throw.
+// under a group, a link that isn't a .md file of the repo, a doc's path with more than [\w-] names and slashes (NB73-I2:
+// a%41.md would link to a%41.html, which a browser reads as aA.html), and a docs/**/*.md listed twice or not at all
+// throw.
 export function readIndex(root) {
   const intro = [];
   const groups = [];
   let item = null;
-  for (const [k, line] of fs.readFileSync(path.join(root, INDEX), 'utf8').replace(/\r\n?/g, '\n').split('\n').entries()) {
+  for (const [k, line] of fs.readFileSync(inRepo(root, INDEX), 'utf8').replace(/\r\n?/g, '\n').split('\n').entries()) {
     const where = `${INDEX}:${k + 1}`;
     let m;
     if ((m = /^## +(.*\S)/.exec(line))) {
@@ -128,6 +148,7 @@ export function readIndex(root) {
       if (source.startsWith('../') || !source.endsWith('.md') || !fs.existsSync(path.join(root, source))) {
         throw new Error(`site: ${where}: ${m[2]} is no .md file of the repo`);
       }
+      if (!DOC.test(source)) throw new Error(`site: ${where}: ${source}: a doc's path is [\\w-] names and slashes, with .md`);
       item = { title: inlineText(m[1]), source, blurb: m[3] ?? '', group: groups.at(-1).name };
       groups.at(-1).items.push(item);
     } else if (item && /^[ \t]+\S/.test(line)) {
@@ -191,13 +212,14 @@ export function checkSvg(svg) {
 }
 
 // The demos' module graph, followed from their entries: static and dynamic imports and new URL(…, import.meta.url),
-// relative ones only (packages/js has no others). Paths are relative to packages/js.
+// relative ones only (packages/js has no others). Paths are relative to packages/js; each module is read through
+// inRepo, so a symlink is refused before its imports are followed.
 const SPECIFIERS = [
   /\bfrom\s*(['"])(\.{1,2}\/[^'"\n]+)\1/g,
   /\bimport\s*\(?\s*(['"])(\.{1,2}\/[^'"\n]+)\1/g,
   /\bnew URL\(\s*(['"])(\.{1,2}\/[^'"\n]+)\1\s*,\s*import\.meta\.url\s*\)/g,
 ];
-export function moduleGraph(jsRoot, entries) {
+export function moduleGraph(root, entries) {
   const seen = new Set();
   const todo = [...entries];
   while (todo.length) {
@@ -206,7 +228,7 @@ export function moduleGraph(jsRoot, entries) {
     if (!/^(demo|src|pkg)\//.test(file)) throw new Error(`site: ${file} is outside packages/js/{demo,src,pkg}`);
     seen.add(file);
     if (!file.endsWith('.js')) continue;
-    const code = fs.readFileSync(path.join(jsRoot, file), 'utf8');
+    const code = fs.readFileSync(inRepo(root, JS + file), 'utf8');
     for (const re of SPECIFIERS) {
       for (const m of code.matchAll(re)) todo.push(posix.normalize(posix.join(posix.dirname(file), m[2])));
     }
@@ -271,8 +293,9 @@ export function checkLinks(out, pages) {
 }
 
 export function buildSite({ root, out, wasm }) {
-  const jsRoot = path.join(root, 'packages/js');
-  wasm ??= path.join(jsRoot, 'pkg/peerwire_ffi.wasm');
+  // The wasm is the one packages/js/build.sh builds into packages/js/pkg/, a file of the repo, or the one --wasm names.
+  const repoWasm = wasm == null;
+  wasm ??= path.join(root, JS, WASM);
   if (!fs.existsSync(wasm)) throw new Error(`site: no ${wasm}: run packages/js/build.sh first`);
   if (fs.existsSync(out) && fs.readdirSync(out).length && !fs.existsSync(path.join(out, 'assets'))) {
     throw new Error(`site: ${out} isn't empty and holds no earlier site (no assets/): not clearing it`);
@@ -282,20 +305,15 @@ export function buildSite({ root, out, wasm }) {
   const commit = process.env.GITHUB_SHA || git(root, 'rev-parse', 'HEAD');
 
   // 1. assets/<id>/: the demos' module graph, the wasm, the stylesheet and docs/assets/ (as img/), under a hash of
-  //    all of them.
-  const demoHtml = new Map(DEMOS.map((d) => [d.page, fs.readFileSync(path.join(jsRoot, 'demo', d.page), 'utf8')]));
+  //    all of them. Each is a file of the repo (inRepo), but a wasm --wasm names.
+  const demoHtml = new Map(DEMOS.map((d) => [d.page, fs.readFileSync(inRepo(root, `${JS}demo/${d.page}`), 'utf8')]));
   const entries = [...demoHtml.values()].flatMap((html) => [...html.matchAll(/<script\b[^>]*\ssrc="([\w.-]+\.js)"/gi)])
     .map((m) => `demo/${m[1]}`);
-  const modules = moduleGraph(jsRoot, entries);
-  const assets = modules.map((m) => [m, m === 'pkg/peerwire_ffi.wasm' ? wasm : path.join(jsRoot, m)]);
-  if (!modules.includes('pkg/peerwire_ffi.wasm')) throw new Error('site: no demo loads pkg/peerwire_ffi.wasm');
-  assets.push(['site.css', path.join(HERE, 'site.css')]);
-  // docs/assets/ holds files of the repo: a symlink there, or docs/assets itself one, would publish what it names on
-  // the machine that builds the site.
-  if (fs.realpathSync(path.join(root, ASSETS)) !== path.join(fs.realpathSync(root), ASSETS.slice(0, -1))) {
-    throw new Error(`site: ${ASSETS.slice(0, -1)} is a symlink, or under one: the build would publish what it names`);
-  }
-  for (const file of walk(root, ASSETS.slice(0, -1), false)) {
+  const modules = moduleGraph(root, entries);
+  const assets = modules.map((m) => [m, m === WASM && !repoWasm ? wasm : inRepo(root, JS + m)]);
+  if (!modules.includes(WASM)) throw new Error(`site: no demo loads ${WASM}`);
+  assets.push(['site.css', inRepo(root, 'scripts/site/site.css')]);
+  for (const file of walk(root, ASSETS.slice(0, -1))) {
     const name = file.slice(ASSETS.length);
     if (!IMAGE.test(name)) throw new Error(`site: ${file}: docs/assets/ holds images only, named [\\w-] (svg, png, jpg, gif, webp)`);
     if (name.endsWith('.svg')) {
@@ -375,7 +393,7 @@ ${g.items.map((i) => `<li><a href="${escapeHtml(href(i.page))}">${escapeHtml(i.t
       home.blurb = (/<p>([^]*?)<\/p>/.exec(r.html) ?? [])[1] ?? '';
       p.description = textOf(home.blurb).replace(/\s+/g, ' ').trim();
     } else {
-      const r = render(fs.readFileSync(path.join(root, p.source), 'utf8'), opts);
+      const r = render(fs.readFileSync(inRepo(root, p.source), 'utf8'), opts);
       body = r.html;
       headings = r.headings;
       heading = r.title;
