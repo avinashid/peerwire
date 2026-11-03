@@ -8,7 +8,7 @@
 //! ```
 //!
 //! It joins `lan_chat`'s rooms, so `lan_chat kitchen` on the same LAN is in the room too,
-//! and so is the ESP32 port on Wi-Fi (room `esp32`). Type a line to send it to everyone
+//! and so is the ESP32 port on Wi-Fi, in the room its flash names. Type a line to send it to everyone
 //! in the room. Anyone who guesses the room's name can join it, so pick one others can't
 //! guess.
 

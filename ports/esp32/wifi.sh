@@ -5,7 +5,9 @@
 # that network instead of QEMU's Ethernet. The password comes from PW_WIFI_PASS or a
 # prompt, never the command line. The output holds it in the clear: flash it, then
 # delete it. ESP32 radios are 2.4 GHz only; WPA2 or WPA3, or an open network.
-# Usage: [PW_WIFI_PASS=...] ./wifi.sh SSID [IN=out/flash.bin] [OUT=out/board.bin]
+# Then room.sh names the board's room in OUT: PW_ROOM, a random name if unset, or none
+# (the LAN only) if empty.
+# Usage: [PW_WIFI_PASS=...] [PW_ROOM=...] ./wifi.sh SSID [IN=out/flash.bin] [OUT=out/board.bin]
 set -euo pipefail
 export LC_ALL=C
 
@@ -34,3 +36,4 @@ fi
   printf '%s' "$pass"
 } | dd of="$out" bs=1 seek=$((0x3FF040)) conv=notrunc status=none
 echo "wrote $out for $ssid; delete it once the board is flashed"
+"$(dirname "$0")/room.sh" "$out" ${PW_ROOM+"$PW_ROOM"}

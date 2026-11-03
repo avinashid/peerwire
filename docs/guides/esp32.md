@@ -79,9 +79,16 @@ cloud VM, through the home router's NAT. All three linked with each other and he
 | Join to link | 2.9 s to the VM, 3.1 s to the laptop |
 | RTT | ~70 ms to the VM, ~20 ms to the laptop |
 
-On ESP-IDF, `NostrSignaling` gives its relay thread a 32 KB stack and keeps fewer events waiting than elsewhere, as
-an ESP32 has about 300 KB of heap. The
-[port's README](../../ports/esp32/README.md#rooms-across-the-internet-nb-095-4-nov-2026) has what it took.
+The board joins a room over the relay only when its flash names one: `wifi.sh` writes a random name and prints it, and
+`room.sh` changes it. Anyone who has the name can join from anywhere, link with the board directly, and see the home's
+public address and the board's LAN address, so keep it to the people you'd let in. Without a name the board stays on
+the LAN, in room `esp32`.
+
+On ESP-IDF, `NostrSignaling` gives its relay thread a 32 KB stack and takes less than elsewhere, as an ESP32 has about
+300 KB of heap: relay messages of up to 4 KiB, 32 events or 16 KiB waiting, 8 queued. Firmware of your own should run
+the relay thread at the main task's priority, 1, with `ThreadSpawnConfiguration { priority: 1, .. }` around
+`NostrSignaling::new`: ESP-IDF's default, 5, lets a relay that streams events hold off the node's loop on a one-core
+chip. The [port's README](../../ports/esp32/README.md#rooms-across-the-internet-nb-095-4-nov-2026) has what it took.
 
 ## Building and running
 

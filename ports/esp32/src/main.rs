@@ -4,9 +4,10 @@
 //! and takes the address 10.62.0.<10+n> on QEMU's emulated Ethernet. On a board, wifi.sh
 //! writes Wi-Fi credentials into that sector instead: the chip joins the network, takes an
 //! address by DHCP and joins the `lan_chat` example's room "esp32", so a PC on the same
-//! Wi-Fi running `lan_chat esp32` links with it. On Wi-Fi it joins that room over a Nostr
-//! relay too (NB-095), so `room_chat esp32` anywhere on the internet links with it as well.
-//! Either way the node generates a fresh identity and finds the others by itself: it joins
+//! Wi-Fi running `lan_chat esp32` links with it. When room.sh has named a room in that sector
+//! too, it joins that room instead, on the LAN and over a Nostr relay (NB-095), so
+//! `room_chat ROOM` anywhere on the internet links with it as well. Either way the node
+//! generates a fresh identity and finds the others by itself: it joins
 //! a room over `LanSignaling` (UDP multicast on the LAN), so N nodes make a full mesh with
 //! no node knowing another's key or address beforehand. Linked nodes send each other a numbered
 //! reliable message every second, a short line or (run.sh's MSG_KIB) padded to that
@@ -42,12 +43,15 @@ use peerwire::{
 const PORT: u16 = 4040;
 const MAX_NODES: u8 = 16;
 /// Where run.sh writes b"PWN", the node number, the message size in KiB and a 32-byte
-/// identity seed, and wifi.sh writes the Wi-Fi record (at +0x40): the last sector of a
-/// 4 MB flash, past the end of the app image.
+/// identity seed, wifi.sh the Wi-Fi record (at +0x40) and room.sh the room's (at +0xC0):
+/// the last sector of a 4 MB flash, past the end of the app image.
 const NODE_CFG_ADDR: u32 = 0x3F_F000;
 const WIFI_CFG_OFFSET: usize = 0x40;
-/// On Wi-Fi: the room `lan_chat esp32` joins (examples/rust/lan_chat.rs).
-const WIFI_ROOM: (&str, &str) = ("peerwire-lan-chat", "esp32");
+const ROOM_CFG_OFFSET: usize = 0xC0;
+/// On Wi-Fi: the app of `lan_chat` and `room_chat` (examples/rust), and the room on the
+/// LAN when the flash names none.
+const WIFI_APP: &str = "peerwire-lan-chat";
+const LAN_ROOM: &str = "esp32";
 const QEMU_ROOM: (&str, &str) = ("peerwire-esp32", "lab");
 /// On Wi-Fi: one of `NostrSignaling`'s default relays, so PCs on the defaults share it.
 /// One relay, as each costs the chip a thread and a TLS session.
@@ -60,6 +64,8 @@ struct NodeConfig {
     seed: Option<[u8; 32]>,
     /// The SSID and password: a board on Wi-Fi rather than QEMU's Ethernet.
     wifi: Option<(String, String)>,
+    /// On Wi-Fi, the room to join on the LAN and over the relay.
+    room: Option<String>,
 }
 
 fn main() {
@@ -75,7 +81,7 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    let NodeConfig { n, msg_kib, seed, wifi } = node_config();
+    let NodeConfig { n, msg_kib, seed, wifi, room } = node_config();
     info!("node {n}: boot, free heap {} B", free_heap());
 
     let peripherals = Peripherals::take()?;
@@ -128,19 +134,33 @@ fn run() -> anyhow::Result<()> {
     }
     let (lan, nostr) = (Arc::new(Counts::default()), Arc::new(Counts::default()));
     let on_lan = Counted { n, what: "LAN", inner: lan_signaling(n, ip, prefix)?, counts: lan.clone() };
-    builder = match wifi {
+    // The relay only for a room the flash names: anyone who knows the name links with the
+    // board from anywhere and learns its home's public address, so the firmware names no
+    // room of its own (NB95-4).
+    let room = room.filter(|_| wifi.is_some());
+    let on_relay = room.is_some();
+    builder = match &room {
         // The relay's TLS and STUN reach the internet: a board only. STUN puts the
         // router's public address in our offers, for peers beyond the LAN.
-        Some(_) => {
-            info!("node {n}: signals on the LAN and over {NOSTR_RELAY}");
+        Some(room) => {
+            info!("node {n}: room {room:?} on the LAN and over {NOSTR_RELAY}");
             let on_nostr = Counted { n, what: "Nostr", inner: nostr_signaling()?, counts: nostr.clone() };
             builder.signaling(MultiSignaling::new(vec![Box::new(on_lan), Box::new(on_nostr)]))
         }
-        None => builder.stun_servers(Vec::<String>::new()).signaling(on_lan),
+        None => {
+            if wifi.is_some() {
+                info!("node {n}: no room in flash, so the LAN only (room.sh names one to join over the internet)");
+            }
+            builder.stun_servers(Vec::<String>::new()).signaling(on_lan)
+        }
     };
     let mut node = builder.config(config()).bind(SocketAddr::from((ip, PORT)))?;
     let heap_node = free_heap();
-    let (app, room) = if wifi.is_some() { WIFI_ROOM } else { QEMU_ROOM };
+    let (app, room) = match (&wifi, &room) {
+        (Some(_), Some(room)) => (WIFI_APP, room.as_str()),
+        (Some(_), None) => (WIFI_APP, LAN_ROOM),
+        (None, _) => QEMU_ROOM,
+    };
     info!(
         "node {n}: bound {} as {}, the Node took {} B, free heap {heap_node} B; room {room:?} of {app:?}",
         node.local_addr(),
@@ -177,8 +197,12 @@ fn run() -> anyhow::Result<()> {
                 Event::Message { peer, data, .. } => {
                     received += 1;
                     if received <= 8 || received % 50 == 0 {
-                        let text =
-                            String::from_utf8_lossy(&data[..data.len().min(24)]).trim_end_matches('.').to_string();
+                        // Escaped: a member could send terminal escapes to whoever watches
+                        // the serial log (NB64-3, NB95-5).
+                        let text = String::from_utf8_lossy(&data[..data.len().min(24)])
+                            .trim_end_matches('.')
+                            .escape_debug()
+                            .to_string();
                         info!(
                             "node {n}: from {}: {text}, {} B ({received} received)",
                             name(&names, &peer),
@@ -207,7 +231,7 @@ fn run() -> anyhow::Result<()> {
         }
         if now >= next_report {
             next_report = now + Duration::from_secs(10);
-            report(n, &node, heap_node, &names, [&lan, &nostr], wifi.is_some());
+            report(n, &node, heap_node, &names, [&lan, &nostr], wifi.is_some(), on_relay);
         }
         std::thread::sleep(node.next_timeout().unwrap_or(Duration::from_millis(10)).min(Duration::from_millis(10)));
     }
@@ -215,6 +239,7 @@ fn run() -> anyhow::Result<()> {
 
 /// Free heap, the lowest it has been, the main task's unused stack, each link's RTT, the
 /// signals sent and heard on the LAN and over Nostr and, on Wi-Fi, the signal strength.
+#[allow(clippy::too_many_arguments)]
 fn report(
     n: u8,
     node: &Node,
@@ -222,11 +247,24 @@ fn report(
     names: &HashMap<PeerId, String>,
     [lan, nostr]: [&Counts; 2],
     on_wifi: bool,
+    on_relay: bool,
 ) {
     let free = free_heap();
     let min = unsafe { sys::esp_get_minimum_free_heap_size() };
     let stack_left = unsafe { sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
-    let relay_stack = nostr_stack_unused().map_or(String::new(), |b| format!(", relay stack unused {b} B"));
+    let relay = if on_relay {
+        let thread = nostr_thread().map_or(String::new(), |(unused, priority)| {
+            format!(", relay stack unused {unused} B, priority {priority}")
+        });
+        format!(
+            ", Nostr sent {} heard {} relays open {}{thread}",
+            nostr.sent.load(Ordering::Relaxed),
+            nostr.heard.load(Ordering::Relaxed),
+            nostr.open.load(Ordering::Relaxed)
+        )
+    } else {
+        String::new()
+    };
     let links = node.peers().count();
     let per_link = if links > 0 { (heap_node.saturating_sub(free) as usize / links).to_string() } else { "-".into() };
     let rtts: Vec<String> = node
@@ -247,13 +285,10 @@ fn report(
     };
     info!(
         "node {n}: report: {links} links, free heap {free} B (min {min} B), heap per link {per_link} B, \
-         stack unused {stack_left} B, rtt [{}], LAN signals sent {} heard {}, Nostr sent {} heard {} relays open {}{relay_stack}{signal}",
+         stack unused {stack_left} B, rtt [{}], LAN signals sent {} heard {}{relay}{signal}",
         rtts.join(", "),
         lan.sent.load(Ordering::Relaxed),
         lan.heard.load(Ordering::Relaxed),
-        nostr.sent.load(Ordering::Relaxed),
-        nostr.heard.load(Ordering::Relaxed),
-        nostr.open.load(Ordering::Relaxed)
     );
 }
 
@@ -323,17 +358,21 @@ impl<S: Signaling + Health> Signaling for Counted<S> {
 /// (std's own setting wins over this one's); the report shows how much went unused.
 const NOSTR_THREAD: &CStr = c"nostr";
 
+/// The relay thread runs at the main task's priority, 1. ESP-IDF's default for a thread
+/// is 5, and on the C3's one core a relay streaming events at it would hold off the Node's
+/// loop: keepalives, retransmits and polls (NB95-3). ESP-IDF takes the priority from this
+/// config even where std sets the stack.
 fn nostr_signaling() -> anyhow::Result<NostrSignaling> {
-    ThreadSpawnConfiguration { name: Some(NOSTR_THREAD), ..Default::default() }.set()?;
+    ThreadSpawnConfiguration { name: Some(NOSTR_THREAD), priority: 1, ..Default::default() }.set()?;
     let nostr = NostrSignaling::new([NOSTR_RELAY]);
     ThreadSpawnConfiguration::default().set()?;
     Ok(nostr)
 }
 
-/// The relay thread's stack that has never been used, if it is running.
-fn nostr_stack_unused() -> Option<u32> {
+/// The relay thread's stack that has never been used, and its priority, if it is running.
+fn nostr_thread() -> Option<(u32, u32)> {
     let task = unsafe { sys::xTaskGetHandle(NOSTR_THREAD.as_ptr()) };
-    (!task.is_null()).then(|| unsafe { sys::uxTaskGetStackHighWaterMark(task) })
+    (!task.is_null()).then(|| unsafe { (sys::uxTaskGetStackHighWaterMark(task), sys::uxTaskPriorityGet(task)) })
 }
 
 /// The LAN carrier on this node's address, and on its subnet's broadcast address too
@@ -461,13 +500,13 @@ fn join_wifi(
 }
 
 /// This node's number, the size of its messages in KiB (0: a short line), its identity
-/// seed and Wi-Fi credentials from flash; node 1 with short lines, no seed and QEMU's
-/// Ethernet for whatever wasn't written.
+/// seed, Wi-Fi credentials and room from flash; node 1 with short lines, no seed, QEMU's
+/// Ethernet and no room for whatever wasn't written.
 fn node_config() -> NodeConfig {
-    let mut b = [0u8; 192];
+    let mut b = [0u8; 0x110];
     let r = unsafe { sys::esp_flash_read(std::ptr::null_mut(), b.as_mut_ptr().cast(), NODE_CFG_ADDR, b.len() as u32) };
     if r != sys::ESP_OK {
-        return NodeConfig { n: 1, msg_kib: 0, seed: None, wifi: None };
+        return NodeConfig { n: 1, msg_kib: 0, seed: None, wifi: None, room: None };
     }
     let (n, msg_kib, seed) = if b[..3] == *b"PWN" && (1..=MAX_NODES).contains(&b[3]) {
         let seed: [u8; 32] = b[5..37].try_into().unwrap();
@@ -477,7 +516,7 @@ fn node_config() -> NodeConfig {
     } else {
         (1, 0, None)
     };
-    NodeConfig { n, msg_kib, seed, wifi: wifi_config(&b[WIFI_CFG_OFFSET..]) }
+    NodeConfig { n, msg_kib, seed, wifi: wifi_config(&b[WIFI_CFG_OFFSET..]), room: room_config(&b[ROOM_CFG_OFFSET..]) }
 }
 
 /// wifi.sh's record: b"PWW", the SSID's length and the SSID, the password's length and
@@ -488,6 +527,13 @@ fn wifi_config(b: &[u8]) -> Option<(String, String)> {
     let (&len, rest) = rest[ssid.len()..].split_first()?;
     let password = rest.get(..len as usize).filter(|_| len <= 64)?;
     Some((String::from_utf8(ssid.to_vec()).ok()?, String::from_utf8(password.to_vec()).ok()?))
+}
+
+/// room.sh's record: b"PWR", the name's length (1 to 64) and the name.
+fn room_config(b: &[u8]) -> Option<String> {
+    let (&len, rest) = b.strip_prefix(b"PWR")?.split_first()?;
+    let room = rest.get(..len as usize).filter(|_| (1..=64).contains(&len))?;
+    String::from_utf8(room.to_vec()).ok()
 }
 
 fn addr(n: u8) -> Ipv4Addr {

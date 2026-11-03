@@ -154,10 +154,11 @@ in room `esp32` with `lan_chat` on a laptop on the same LAN (on the router's 5 G
 
 ### Rooms across the internet (NB-095, 4 Nov 2026)
 
-On Wi-Fi the firmware joins room `esp32` over the LAN and over the Nostr relay
-`wss://nostr.mom` at once (`MultiSignaling`), with STUN on, so peers anywhere can join.
-The same board, with `room_chat esp32` on the laptop and on a cloud VM with a public
-address:
+On Wi-Fi, when the flash names a room, the firmware joins it over the LAN and over the
+Nostr relay `wss://nostr.mom` at once (`MultiSignaling`), with STUN on, so peers
+anywhere can join with `room_chat ROOM`. Without one it stays on the LAN, in room
+`esp32`. The same board, in room `esp32` on both (before the name moved to flash), with
+`room_chat esp32` on the laptop and on a cloud VM with a public address:
 
 | | |
 |---|---|
@@ -186,6 +187,15 @@ address:
   and waits up to 60 s. The relay's TLS needs the clock too.
 - **Restarts.** A boot that joined Wi-Fi but got no DHCP address stopped there; the
   firmware now restarts 5 s after any setup error.
+- **Security review (NB95-1 to NB95-5).** One relay message of a few KB, parsed whole,
+  could take more heap than the board had free (4.5 KB of empty tags took 192 KB). On
+  ESP-IDF the carrier now takes messages of up to 4 KiB and holds 16 KiB of waiting
+  events; on every target it drops a message of more than 64 JSON values unparsed, and
+  keeps its back-off when a frame over the cap closes the connection. A relay that
+  stopped reading held every later publish; writes now time out after 5 s. The relay
+  thread runs at the main task's priority, 1, not ESP-IDF's 5, which on the C3's one
+  core could hold off the node's loop. The room is no longer fixed and public, and the
+  log escapes what members send.
 
 ## What it would take to go further
 
@@ -239,14 +249,27 @@ CHIP=esp32 ./run.sh 4 50   # the original ESP32
 NO_MULTICAST=1 ./run.sh 2 40  # a LAN that drops multicast: the nodes link by broadcast
 ```
 
-On a board (2.4 GHz Wi-Fi only), write the network into a copy of the image, flash it and
-delete the copy, which holds the password in the clear:
+On a board (2.4 GHz Wi-Fi only), write the network and a room into a copy of the image,
+flash it and delete the copy, which holds the password in the clear:
 
 ```sh
-./wifi.sh "My Wi-Fi"                  # asks for the password; writes out/board.bin
+./wifi.sh "My Wi-Fi"     # asks for the password; writes out/board.bin, prints the room
 espflash write-bin 0x0 out/board.bin && rm out/board.bin
 espflash monitor
-cargo run -p peerwire --example lan_chat -- esp32   # on a PC on the same LAN
+cargo run -p peerwire --features nostr --example room_chat -- ROOM   # on a PC anywhere
+```
+
+`wifi.sh` names a random room unless `PW_ROOM` names one; with `PW_ROOM=` (empty) the
+board stays on the LAN, in room `esp32` (`lan_chat esp32` on a PC on the same LAN).
+Anyone who has the room's name can join from anywhere, link with the board directly, and
+see the home's public address and the board's LAN address. To rename a flashed board's
+room, or remove it, without its Wi-Fi password, patch its config sector (`room.sh FILE
+[ROOM]`; the sector holds the password in the clear, so delete it after):
+
+```sh
+espflash read-flash 0x3FF000 0x1000 cfg.bin
+./room.sh cfg.bin        # a random room, printed; ./room.sh cfg.bin "" for none
+espflash write-bin 0x3FF000 cfg.bin && rm cfg.bin
 ```
 
 The PC's firewall must let in UDP from the LAN: port 20567 and `lan_chat`'s port, which
