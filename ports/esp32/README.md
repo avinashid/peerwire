@@ -152,14 +152,49 @@ in room `esp32` with `lan_chat` on a laptop on the same LAN (on the router's 5 G
   tag and hash keys) comes after Wi-Fi is up too (NB62-2). The identity isn't kept
   across reboots yet.
 
+### Rooms across the internet (NB-095, 4 Nov 2026)
+
+On Wi-Fi the firmware joins room `esp32` over the LAN and over the Nostr relay
+`wss://nostr.mom` at once (`MultiSignaling`), with STUN on, so peers anywhere can join.
+The same board, with `room_chat esp32` on the laptop and on a cloud VM with a public
+address:
+
+| | |
+|---|---|
+| App image | 2,397,856 B: rustls, ring and the webpki roots add ~780 KB |
+| Free heap with a bound `Node` | ~145 KB: the `Node` and the relay's thread took 45 KB, 32 KB of it the thread's stack |
+| Join to link | the VM 2.9 s (offers over the relay, then direct through the home router's NAT); the laptop 3.1 s |
+| Free heap with 2 links | 81–83 KB for the whole run, lowest 63,244 B |
+| Relay thread's stack | 14 KB of 32 KB used |
+| RTT | the VM ~70 ms (630 ms in the first seconds), the laptop ~20 ms |
+
+- **Result:** a full triangle, board↔laptop, board↔VM and laptop↔VM, all direct, with
+  messages each way and no gaps for the whole 145 s run. No resets.
+- **One socket.** ESP-IDF can't duplicate a socket (`TcpStream::try_clone` fails with
+  ENOSYS), so at first every relay connection failed and was retried in silence. The
+  relay's stream now owns its one socket, and the report shows the relays open.
+- **Memory.** The relay inbox reserved room for 1024 events, 53 KB, from the start, and
+  each event id remembered cost ~170 B: the lowest free heap was 3.9 KB with 2 links. On
+  ESP-IDF `NostrSignaling` keeps 32 events, 128 ids and 8 queued.
+- **Stack.** An ESP-IDF thread gets 4 KB unless it asks, and the TLS handshake
+  overflowed it on every boot; the relay thread asks for 32 KB.
+- **Building ring.** `build.sh` names the chip's GCC for ring's C, with `-D__ILP32__` on
+  the C3 and `-mlongcalls` on the ESP32. ring draws its random numbers from
+  `esp_fill_random` (feature `less-safe-getrandom-espidf`), after Wi-Fi is up.
+- **SNTP.** One boot got no answer from its one SNTP server in 20 s; as the Node reads
+  the clock when it is bound, it linked with no one. The firmware now asks four servers
+  and waits up to 60 s. The relay's TLS needs the clock too.
+- **Restarts.** A boot that joined Wi-Fi but got no DHCP address stopped there; the
+  firmware now restarts 5 s after any setup error.
+
 ## What it would take to go further
 
 - **Identity.** A board draws its key after Wi-Fi is up (NB-063) but makes a new one each
   boot. Keeping it needs encrypted NVS.
 - **Clocks.** A board that can't reach an SNTP server can't link with a PC, whose clock
   differs by more than a minute (NB-093).
-- **Beyond the LAN.** `LanSignaling` reaches the local network only. Peers elsewhere
-  need Nostr signalling, which needs TLS (rustls with ring), not yet tried on ESP-IDF.
+- **More relays.** The board uses one Nostr relay, as each costs a thread and a TLS
+  session; peers elsewhere must use that relay too. If it is down, only the LAN is left.
 - **Memory caps.** With heavy traffic each link holds its send and reassembly buffers.
   For many links on a plain ESP32-C3, lower `max_message` and `max_send_buffer`
   further. An ESP32-S3 with PSRAM (the Arduino Nano ESP32) has room to spare.

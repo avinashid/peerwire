@@ -66,6 +66,23 @@ With Wi-Fi up before the node is built, seven boots gave seven different PeerIds
 makes comes after Wi-Fi is up (NB62-2 in the threat model).
 The [port's README](../../ports/esp32/README.md#on-a-board-nb-091-3-nov-2026) has the details and the flashing steps.
 
+### Rooms across the internet
+
+On 4 November 2026 the same board joined its room over the LAN and the Nostr relay `wss://nostr.mom` at once, with
+[`MultiSignaling`](../reference/rust.md#multisignaling), and linked directly with `room_chat` on the laptop and on a
+cloud VM, through the home router's NAT. All three linked with each other and held for the whole 145 s run:
+
+| | |
+|---|---|
+| App image (with TLS: rustls, ring and the webpki roots) | 2,397,856 B |
+| Free heap with a bound `Node` / with 2 links | ~145 KB / 81–83 KB, lowest 63,244 B |
+| Join to link | 2.9 s to the VM, 3.1 s to the laptop |
+| RTT | ~70 ms to the VM, ~20 ms to the laptop |
+
+On ESP-IDF, `NostrSignaling` gives its relay thread a 32 KB stack and keeps fewer events waiting than elsewhere, as
+an ESP32 has about 300 KB of heap. The
+[port's README](../../ports/esp32/README.md#rooms-across-the-internet-nb-095-4-nov-2026) has what it took.
+
 ## Building and running
 
 The port has its own workspace and pinned toolchain (Rust nightly for RISC-V, Espressif's `esp` Rust toolchain for
@@ -93,9 +110,9 @@ versions, how to install them, and every result in detail.
   started, ESP-IDF's random numbers are only pseudo-random, so start it, with modem sleep off, before you build a
   `Node`.
 - **Clocks.** A board that can't reach an SNTP server can't link with a PC, since their clocks differ by more than a
-  minute.
-- **LAN only.** `LanSignaling` reaches the local network. Reaching peers elsewhere needs Nostr signaling, which needs
-  TLS on ESP-IDF; that hasn't been tried.
+  minute, and can't reach a Nostr relay, whose certificate it can't check.
+- **One relay.** The board uses one Nostr relay, as each costs a thread and a TLS session, so peers elsewhere must use
+  that relay too. If it is down, only the LAN is left.
 - **Wi-Fi.** Only 2.4 GHz networks, as on any ESP32. The emulator's numbers above don't include the Wi-Fi driver's
   heap; the board's do.
 - **Other chips.** The ESP32-S3 should build the same way with Espressif's Rust fork, but hasn't been tried.
