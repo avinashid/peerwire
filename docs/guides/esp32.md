@@ -1,8 +1,8 @@
 # ESP32
 
 > [!WARNING]
-> This is a feasibility prototype, not a supported target. It has run only in Espressif's QEMU emulator, never on a
-> board, and the emulated chips have no real entropy (see [Limits](#limits)).
+> This is a feasibility prototype, not a supported target. It has run in Espressif's QEMU emulator and on one
+> ESP32-C3 board, and it doesn't keep its identity across reboots yet (see [Limits](#limits)).
 
 The unchanged `peerwire::Node` runs under ESP-IDF on an ESP32-C3 and on the original ESP32, the chip in the
 ESP32-WROOM-32 module. Emulated chips on one virtual LAN find each other with [LAN discovery](lan-discovery.md) and
@@ -41,6 +41,31 @@ The original ESP32 (Xtensa, as on an ESP32-WROOM-32) builds from the same code w
 | 4 chips, 50 s | 6 of 6 links, 0.6–1.4 s after joining; no timeouts, failed dials or crashes |
 | 4 chips, 16 KiB messages | the same, with the lowest free heap at 98–129 KB |
 
+## On a board
+
+On 3 November 2026 an ESP32-C3 board on a home router's 2.4 GHz Wi-Fi linked with `lan_chat` on a laptop on the same
+LAN, 0.8 s after joining the room, and held the link for the whole ~90 s run with no lost messages:
+
+| | |
+|---|---|
+| App image (with the Wi-Fi driver and SNTP) | 1,617,648 B |
+| Free heap with Wi-Fi up / with a bound `Node` | ~191 KB / ~185–187 KB |
+| Heap per link | 13.4–14.8 KB at 1 link; lowest free heap 167,632 B |
+| RTT to the laptop | 41–123 ms |
+
+Getting there took three fixes, each now in the firmware or the library:
+
+- **Wi-Fi join.** The board got no answer to its association request at full transmit power. The firmware retries,
+  stepping the power down from 20 to 8.5 dBm; the board joined at 20 or 15 dBm.
+- **Multicast.** The router never delivered multicast to the board, though broadcast worked. `LanSignaling` now also
+  sends to the LAN's broadcast address ([LAN discovery](lan-discovery.md)).
+- **Clock.** A board's clock starts at 1970, and room hellos more than a minute off are dropped, so the board and the
+  laptop ignored each other. The firmware sets the clock by SNTP before it joins.
+
+With Wi-Fi up before the node is built, seven boots gave seven different PeerIds. That shows the identity draw
+differs on each boot; whether every random draw comes after Wi-Fi is up is still open (NB62-2 in the threat model).
+The [port's README](../../ports/esp32/README.md#on-a-board-nb-091-3-nov-2026) has the details and the flashing steps.
+
 ## Building and running
 
 The port has its own workspace and pinned toolchain (Rust nightly for RISC-V, Espressif's `esp` Rust toolchain for
@@ -63,10 +88,12 @@ versions, how to install them, and every result in detail.
 - **Entropy.** QEMU gives every chip the same random sequence, so `run.sh` gives each one an identity seed from the
   host. That fixes the identity only: the node's other random draws still repeat on every chip, and two emulated
   chips seal their room hellos with the same nonces, so a listener can tell who's in the room. The emulator shows
-  discovery and memory use, not privacy. A board must draw every random value from real entropy and keep its key in
-  encrypted storage (NB-063, not done).
+  discovery and memory use, not privacy. A board draws its identity after Wi-Fi is up, but makes a new one each
+  boot: keeping it needs encrypted storage, not done yet.
+- **Clocks.** A board that can't reach an SNTP server can't link with a PC, since their clocks differ by more than a
+  minute.
 - **LAN only.** `LanSignaling` reaches the local network. Reaching peers elsewhere needs Nostr signaling, which needs
   TLS on ESP-IDF; that hasn't been tried.
-- **Wi-Fi.** A board would use Wi-Fi rather than the emulated Ethernet, and the Wi-Fi driver takes heap that these
-  numbers don't include.
+- **Wi-Fi.** Only 2.4 GHz networks, as on any ESP32. The emulator's numbers above don't include the Wi-Fi driver's
+  heap; the board's do.
 - **Other chips.** The ESP32-S3 should build the same way with Espressif's Rust fork, but hasn't been tried.

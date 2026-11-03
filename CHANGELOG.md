@@ -10,8 +10,11 @@ and the commit that fixed it.
 
 ### Rust crates and Godot
 
-- **LAN discovery:** `LanSignaling` runs rooms over UDP multicast on the local network, with no internet.
-- **ESP32:** `peerwire` builds for ESP-IDF; a prototype runs on emulated ESP32-C3s.
+- **LAN discovery:** `LanSignaling` runs rooms over UDP multicast and broadcast on the local network, with no
+  internet. Broadcast, to the LAN's broadcast address only, reaches devices that a router never gives multicast to,
+  such as an ESP32 on Wi-Fi.
+- **ESP32:** `peerwire` builds for ESP-IDF; a prototype runs on emulated ESP32-C3s and ESP32s, and links over Wi-Fi
+  with a PC from an ESP32-C3 board.
 - **Shared documents:** `peerwire-sync` gives shared documents in Rust, wire-compatible with `room.doc()`, in the
   Godot binding (`open_doc`) and the C ABI.
 - **Harder NATs:**

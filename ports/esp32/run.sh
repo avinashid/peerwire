@@ -5,7 +5,9 @@
 # peer to 16 KiB (at most the firmware's 16 KiB cap). Each node gets 32 fresh random
 # bytes from the host for its identity: QEMU's RNG gives every chip the same sequence.
 # CHIP=esp32 runs an image built with CHIP=esp32 on QEMU's esp32 (Xtensa) machine.
-# Usage: [CHIP=chip] [MSG_KIB=k] ./run.sh [N] [SECS]
+# NO_MULTICAST=1 makes the LAN drop multicast, as some home routers do to an ESP32
+# (NB-091): the nodes must then find each other by broadcast.
+# Usage: [CHIP=chip] [MSG_KIB=k] [NO_MULTICAST=1] ./run.sh [N] [SECS]
 set -euo pipefail
 cd "$(dirname "$0")"
 
