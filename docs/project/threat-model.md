@@ -138,7 +138,8 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | The shared origin (Low) | Accepted by the repo owner on 2026-11-01: the site is served from `avinashid.github.io` with no origin of its own. The meet page stays off the site, so NB10a-I1 doesn't arise; it joins only with the owner's approval and a frame check, same section |
 | NB16-2 (Low) | Accepted by the repo owner on 2026-11-01 (NB-071): Net Lab keeps its microphone button on the site, and on a `*.github.io` host its note says, before and after the grant, that the permission covers the whole origin, so the account's other Pages sites could use the microphone, and see the device's local addresses, without asking (`1d434cb`, and `8f4a635` for the addresses, NB71-I1), reviewed 2026-11-01, same section |
 | NB67-1 (Low), NB67-I3, NB67-I4 (Info) | **Fixed** by `41c91ef`, `a7da8c2` and `4386eec` before NB-066 merged, so never on main (an SVG under `docs/assets/` may hold only 20 drawing elements, SVG's and xlink's namespaces and printable ASCII, with no prefix, `&#`, processing instruction, backslash, or `//` but in the `xmlns`), reviewed 2026-11-01; NB67-I1, I2 (Info) fixed by NB-073, next row, same section |
-| NB67-I1, NB67-I2 (Info) | **Fixed** by `1f2a492` and `9d3396d` (NB-073): the edit link takes the doc's path through `encodeURI`, then escaped, and every link to a page is escaped; a symlink under `docs/assets/`, or `docs/assets` one or under one, fails the build. Reviewed 2026-11-01; NB73-I1, NB73-I2 (Info) open (the build still follows symlinks to docs and demo modules; a `%` in a doc's name breaks its links), same section |
+| NB67-I1, NB67-I2 (Info) | **Fixed** by `1f2a492` and `9d3396d` (NB-073): the edit link takes the doc's path through `encodeURI`, then escaped, and every link to a page is escaped; a symlink under `docs/assets/`, or `docs/assets` one or under one, fails the build. Reviewed 2026-11-01; NB73-I1, NB73-I2 (Info) fixed by NB-082, next row, same section |
+| NB73-I1, NB73-I2 (Info) | **Fixed** by `b3a569c` and `06623cd` (NB-082): a symlink among the files the build reads or publishes (`docs/README.md` and each page it lists, all of `docs/`, the demo pages and their modules, the repo's wasm, `site.css`), or a directory on their way from the repo's root that is one, fails the build, and a doc's path must be `[\w-]` names and slashes, with `.md`. The site built from main is unchanged. Reviewed 2026-11-03 |
 | NB64-1, NB64-2 (Low), NB64-3, NB64-4, NB64-5 (Info) | **Fixed** by `a0fe2b1` and `4c86af7` before NB-064 merged, so never on main (merged `34a35a8`): `LanSignaling` takes only datagrams sent to its group, except on Windows; an inbox message spends a token before it is opened; `lan_chat` escapes member text; the docs say the ESP32 seed fixes the identity only, and what a replayed hello does. Reviewed 2026-11-01; residuals accepted, [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6) |
 | NB64-6 (Low) | Open (NB-065): a neighbour who knows two members' PeerIds can keep them from linking by flooding their inbox topics, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
@@ -2520,6 +2521,13 @@ design:
     ASCII, tab, LF and CR;
   - a reference to anything outside it: `href` and `url()` name only `#ids`, and no
     URL scheme, `javascript:`, `data:` or `//` appears but in the `xmlns`.
+- **Only files the repo holds.** Since NB-082 the same goes for every file the build
+  reads or publishes: `docs/README.md` and each page it lists, all of `docs/`, the
+  demo pages and every module they load (each checked before it's read), the repo's
+  wasm and `site.css`. A symlink there, or a directory on the way from the repo's root
+  that is one, fails the build (`inRepo`; NB73-I1). A wasm named by `--wasm` is taken
+  as given; Pages (`scripts/site.sh`) builds without it. A doc's path must be `[\w-]`
+  names and slashes, with `.md` (NB73-I2), so its links need no URL-encoding.
 - **Highlighting.** Code is highlighted at build time: `highlight.mjs` wraps escaped
   text in `<span class>` from a fixed set, and the test checks that the output's text
   is the code, for every fence in the docs and for 400 random inputs × 10 languages.
@@ -2540,7 +2548,9 @@ probe of the renderer (Node 22). The docs layout (NB-067, `6ba7cd9..a2d4029`, me
 `checkSvg` in headless Chromium for NB67-1, and its fixes were re-read the same day,
 with the probes re-run on each. NB-073's fixes for NB67-I1 and NB67-I2
 (`cecbb72..9d3396d`) were reviewed the same day by reading the diff, with a probe of
-`buildSite` on a copy of the tree (Node 22), on this machine only. Nothing was sent to
+`buildSite` on a copy of the tree (Node 22), on this machine only. NB-082's fixes for
+NB73-I1 and NB73-I2 (`5e6dba4..06623cd`) were reviewed on 2026-11-03 the same way, the
+probe building `git archive` trees of main and of the branch. Nothing was sent to
 Pages or GitHub.
 
 **Checked and holding:**
@@ -2561,9 +2571,10 @@ Pages or GitHub.
   their ids, descriptions, a redirect's target, and since NB-073 every link to a page
   (sidebar, prev/next, the overview's cards) and the edit link, whose path goes through
   `encodeURI` first. `docs/README.md` may list only `.md` files inside the repo, and a
-  doc missing from it or listed twice fails the build. A doc whose name holds `#` or
-  `?` fails it too: the link check finds no file at the sidebar's link to it, so its
-  edit link can't name another file on GitHub.
+  doc missing from it or listed twice fails the build. Since NB-082 a doc's path must
+  be `[\w-]` names and slashes, so `%`, `#`, `?`, quotes and spaces fail it by rule;
+  before, `#` or `?` failed it at the link check, which finds no file at the sidebar's
+  link to such a doc, so its edit link can't name another file on GitHub.
 - `logo.svg` and `favicon.svg` hold paths, shapes and a gradient, and refer to nothing
   but their own `#pw-g`.
 
@@ -2742,7 +2753,8 @@ see. **Before the meet page joins the site's demos,** it must check
   the build throws unless `docs/assets` resolves to itself under the repo, so neither
   it nor `docs` can be one. A probe of a link inside a real subdirectory, and of `docs`
   as a link, was refused. Git stores no hard links, devices or FIFOs, so a commit can
-  put nothing else there that names a file outside the repo. Residual: NB73-I1.
+  put nothing else there that names a file outside the repo. Residual: NB73-I1, fixed
+  by NB-082, whose `inRepo` replaced both checks.
 - **NB67-I3.** `<a><set attributeName="href" to="java…script:…"/>`, with a tab inside
   `javascript:`, passed the check until the allow-list: the URL parser drops the tab,
   but the regex saw no `javascript:`. It didn't run on a click in headless Chromium.
@@ -2765,13 +2777,29 @@ see. **Before the meet page joins the site's demos,** it must check
   as a one-line file; the Pages build job holds only `contents: read`, no secret and no
   persisted credentials, and the site goes live after that job, and its tokens, have
   ended. The repo tracks no symlinks, so refusing them changes nothing it builds: the
-  same `realpath` check as `docs/assets` for every file the build reads and publishes
-  (not written).
+  same `realpath` check as `docs/assets` for every file the build reads and publishes.
+  Fixed by `b3a569c` (NB-082), reviewed 2026-11-03: `inRepo` `lstat`s each part of the
+  path from the repo's root and throws on a symlink, to a file or on the way to one,
+  for `docs/README.md` and each page it lists (in `docs/` or out), all of `docs/`, the
+  demo pages, each module before it's read (so its imports aren't followed), the
+  repo's wasm and `site.css`, now read from the repo's `scripts/site/`. A probe on
+  `git archive` trees put a canary file from outside the tree on the site built from
+  main `5e6dba4` through a link at each of a listed doc, `CHANGELOG.md`, `docs/guides`,
+  a demo module, `packages/js/src` and `site.css`; `06623cd` refused all six.
+  `site_build.mjs` holds these cases and more (a dangling link, `docs`, `packages`).
+  A wasm named by `--wasm` is taken as given, as whoever builds chooses it; Pages
+  (`scripts/site.sh`) builds without it. The site built from main is byte-identical.
 - **NB73-I2.** A page's links are escaped but not URL-encoded, so a doc named
   `a%41.md` builds with links to `a%41.html`, which a browser reads as `aA.html`; the
   link check reads the raw path and passes it. Only the site's own links break.
   Accepting only `[\w-]` doc names, as for images, would settle it and `#` and `?` by
-  rule rather than by the link check (not written).
+  rule rather than by the link check. Fixed by `06623cd` (NB-082), reviewed
+  2026-11-03: `readIndex` fails the build unless a listed doc's path, decoded and from
+  the repo's root, is `[\w-]` names and slashes ending in `.md`; `site_build.mjs`
+  refuses `a%2541.md` (which decodes to `a%41.md`), `#`, `?`, a quote, a space, a
+  non-ASCII letter and a dot, in `docs/` or out. The probe's doc listed as `a%2541.md`
+  built on main with links to `a%41.html` and failed the build on `06623cd`. Links to
+  repo files that go to GitHub already pass through `encodeURI`.
 
 ### LAN signalling, `LanSignaling` (NB-064) — NB64-1…NB64-6
 
