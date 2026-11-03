@@ -140,6 +140,11 @@ impl Drop for MemorySignaling {
 /// that arrives on two carriers is delivered twice; rooms and offers already drop what
 /// they have seen.
 ///
+/// It publishes on every carrier, so an offer to a peer found on the LAN goes to the
+/// relays too, under that peer's inbox topic, though the peer may never use them: anyone
+/// who knows its PeerId can see on the relays that it is being offered to. And a LAN
+/// neighbour, who sees topics in the clear, can watch the room's internet side.
+///
 /// [`LanSignaling`]: crate::LanSignaling
 pub struct MultiSignaling {
     carriers: Vec<Box<dyn Signaling>>,

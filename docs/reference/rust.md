@@ -482,7 +482,10 @@ carrier leaves the hub.
 each and delivers what any of them hears, taking turns so a busy carrier can't hold back the others. A node on
 `LanSignaling` and `NostrSignaling` at once has one room with the peers of both: the ones on its LAN, found with no
 internet, and the ones the relays bring. A message heard on two carriers is delivered twice; rooms and offers already
-drop what they have seen. A complete program is [`examples/rust/room_chat.rs`](../../examples/rust/room_chat.rs).
+drop what they have seen. It publishes on every carrier, so an offer to a peer found on the LAN goes to the relays too,
+under that peer's inbox topic, though the peer may never use them: anyone who knows its PeerId can see on the relays
+that it is being offered to, and a LAN neighbour, who sees topics in the clear, can watch the room's internet side.
+A complete program is [`examples/rust/room_chat.rs`](../../examples/rust/room_chat.rs).
 
 #### NostrSignaling
 
