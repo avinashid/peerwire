@@ -8,7 +8,7 @@ use peerwire::traversal::{
 };
 use peerwire::Topic;
 use peerwire_core::{Config, Event, Lane, Path, PeerId};
-use peerwire_sim::{NatConfig, NetConfig, Sim, SimAddr};
+use peerwire_sim::{Dependence, NatConfig, NetConfig, PortAlloc, Sim, SimAddr};
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
@@ -57,8 +57,15 @@ fn variants() -> Vec<Kind> {
     ]
 }
 
+/// NB-083: one port per destination IP, handed out in sequence, so STUN reads it as
+/// `SymmetricIp` and predicts its ports. Not in the matrix.
+fn sequential_sym_ip() -> Vec<Kind> {
+    let seq = || NatConfig::new(Dependence::Address, Dependence::AddressPort, PortAlloc::Sequential);
+    vec![Kind::Nat("ipseq-adf", seq().address_filtered()), Kind::Nat("ipseq-apdf", seq())]
+}
+
 fn kind(name: &str) -> Kind {
-    kinds().into_iter().chain(variants()).find(|k| k.name() == name).unwrap()
+    kinds().into_iter().chain(variants()).chain(sequential_sym_ip()).find(|k| k.name() == name).unwrap()
 }
 
 struct Peer {
@@ -667,6 +674,35 @@ fn sym_ip_nats_punch_every_symmetric_kind() {
     ];
     for (a, b, want) in cases {
         let (got, direct) = tries(a, b, 2200, false);
+        assert_eq!(got, want, "{a} x {b}");
+        assert!(want == Fails || direct == 50, "{a} x {b}: {direct}/50");
+    }
+}
+
+/// NB-083: a `sym-ip` NAT that hands out ports in sequence predicts them, as it did when
+/// STUN read it as plain symmetric. With a peer that predicts too, the two sweep in
+/// lockstep as before and link every time (with a `Both` instead, `ipseq-apdf` would link
+/// with none of them); with one that doesn't, both open and spray, which links if a
+/// `sym-ip` side filters by IP only, where before NB-083 nothing was planned.
+#[test]
+fn sequential_sym_ip_nats_still_sweep_in_lockstep() {
+    use Try::*;
+    let cases = [
+        // Both predict: the lockstep sweep.
+        ("ipseq-adf", "sym-seq", Stable),
+        ("ipseq-adf", "ipseq-apdf", Stable),
+        ("ipseq-apdf", "sym-seq", Stable),
+        ("ipseq-apdf", "sym-seq-adf", Stable),
+        ("ipseq-apdf", "cgnat(pr+sym)", Stable),
+        ("ipseq-apdf", "ipseq-apdf", Stable),
+        // One doesn't: both open and spray.
+        ("ipseq-adf", "sym-random", Stable),
+        ("ipseq-adf", "sym-ip-apdf", Stable),
+        ("ipseq-apdf", "sym-ip-adf", Stable),
+        ("ipseq-apdf", "sym-random", Fails),
+    ];
+    for (a, b, want) in cases {
+        let (got, direct) = tries(a, b, 2300, false);
         assert_eq!(got, want, "{a} x {b}");
         assert!(want == Fails || direct == 50, "{a} x {b}: {direct}/50");
     }
