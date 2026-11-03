@@ -2,7 +2,8 @@
 
 A feasibility prototype, not a supported target: the unchanged `peerwire::Node`
 running under ESP-IDF on an ESP32-C3 and on the original ESP32 (the chip in the
-ESP32-WROOM-32 module), tested in Espressif's QEMU. N emulated
+ESP32-WROOM-32 module), tested in Espressif's QEMU and on one ESP32-C3 board on Wi-Fi
+([On a board](#on-a-board-nb-091-3-nov-2026)). N emulated
 chips share one virtual LAN, find each other by themselves (NB-064, LAN discovery)
 and link into a full mesh with the same handshake, encryption and reliable lane as
 every other Peerwire node.
@@ -43,13 +44,14 @@ Two emulator-only workarounds:
   the host. The seed fixes the identity only: the Node's other random draws (its
   endpoint and traversal seeds) still repeat on every chip, so two chips seal their
   room hellos with the same nonces and a listener can tell who is in the room. The
-  emulator shows discovery and memory, not privacy. On a board, every draw must
-  come from real entropy: Wi-Fi up first, or `bootloader_random_enable()`, with the
-  identity stored in encrypted NVS (NB-063).
+  emulator shows discovery and memory, not privacy. On a board the firmware brings
+  Wi-Fi up first, so every draw comes from real entropy (NB-063); the identity isn't
+  yet stored in encrypted NVS.
 - **Multicast.** ESP-IDF's openeth driver sets no multicast filter and QEMU's
   OpenCores MAC drops multicast frames that miss it, so the firmware puts the MAC in
   promiscuous mode. ESP-IDF logs `failed to add mac filter` when lwIP joins the
-  group; that's harmless here. A real C3 uses Wi-Fi, which has neither problem.
+  group; that's harmless here. A board on Wi-Fi has neither problem, though a router
+  may not deliver multicast to it at all (see below).
 
 ## Results (1 Nov 2026, QEMU 9.2.2 esp-develop on a 4-core arm64 VM)
 
@@ -115,13 +117,45 @@ These ran before discovery, with fixed test identities and invites built from th
 Times are emulated: eight QEMU instances share four host cores, and RTTs (12–50 ms)
 are the emulator and hub, not radio. Real-chip timing needs a board.
 
+### On a board (NB-091, 3 Nov 2026)
+
+An ESP32-C3 (rev v0.4, 4 MB flash, native USB only) on a home router's 2.4 GHz Wi-Fi,
+in room `esp32` with `lan_chat` on a laptop on the same LAN (on the router's 5 GHz band).
+
+| | |
+|---|---|
+| App image | 1,617,648 B, with the Wi-Fi driver and SNTP |
+| Wi-Fi join | at 20 or 15 dBm, after at most one failed attempt; signal −55 to −63 dBm |
+| Clock set by SNTP | 4.5 s after joining |
+| Free heap with Wi-Fi up / with a bound `Node` | ~191 KB / ~185–187 KB (the `Node` took 4.5–5.9 KB) |
+| Join to link with the laptop | 0.8 s |
+| Heap per link | 13.4–14.8 KB at 1 link; lowest free heap 167,632 B |
+| RTT to the laptop | 41–123 ms |
+
+- **Result:** linked 0.8 s after joining and held the link for the whole ~90 s run. The
+  laptop got messages #1–#89 with no gaps and the board got the laptop's. The one
+  disconnect was a `Replaced` 3 ms in, when both sides dialled at once. No panics or resets.
+- **Wi-Fi join.** One association attempt at full power got no answer from the AP
+  (reason 4), so the firmware retries, stepping TX power 20 → 15 → 11 → 8.5 dBm and
+  logging each failure's reason. Small C3 boards are known to fail association at full power.
+- **Multicast.** The router never delivered multicast to the board, though broadcast and
+  unicast worked both ways. `LanSignaling` now also sends to the subnet's broadcast
+  address (NB-092); `NO_MULTICAST=1 ./run.sh` makes the emulator's hub do the same.
+- **Clock.** Room hellos carry the sender's clock and are dropped more than a minute off.
+  The board's clock started at 1970, so the board and the laptop each heard the other's
+  hellos and dropped them. The firmware now sets the clock by SNTP before binding.
+- **Entropy (NB-063).** With Wi-Fi up, the chip's RNG draws real entropy: 7 boots gave
+  7 different PeerIds (`cdefbd84e5cb`, `7123e58ee85f`, `43acb61bed00`, `afecca0f71e9`,
+  `16c6673b8508`, `9f571feb83e4`, `1ee1be2aa889`). The identity isn't kept across reboots yet.
+
 ## What it would take to go further
 
-- **Identity.** A board must make its key from real entropy and keep it (NB-063).
+- **Identity.** A board draws its key from real entropy (NB-063) but makes a new one each
+  boot. Keeping it needs encrypted NVS.
+- **Clocks.** A board that can't reach an SNTP server can't link with a PC, whose clock
+  differs by more than a minute (NB-093).
 - **Beyond the LAN.** `LanSignaling` reaches the local network only. Peers elsewhere
   need Nostr signalling, which needs TLS (rustls with ring), not yet tried on ESP-IDF.
-- **Wi-Fi.** A board would use Wi-Fi instead of the emulated Ethernet. ESP-IDF's
-  Wi-Fi driver takes heap of its own, which these numbers don't include.
 - **Memory caps.** With heavy traffic each link holds its send and reassembly buffers.
   For many links on a plain ESP32-C3, lower `max_message` and `max_send_buffer`
   further. An ESP32-S3 with PSRAM (the Arduino Nano ESP32) has room to spare.
@@ -165,3 +199,16 @@ grep report out/node*.log
 CHIP=esp32 ./run.sh 4 50   # the original ESP32
 NO_MULTICAST=1 ./run.sh 2 40  # a LAN that drops multicast: the nodes link by broadcast
 ```
+
+On a board (2.4 GHz Wi-Fi only), write the network into a copy of the image, flash it and
+delete the copy, which holds the password in the clear:
+
+```sh
+./wifi.sh "My Wi-Fi"                  # asks for the password; writes out/board.bin
+espflash write-bin 0x0 out/board.bin && rm out/board.bin
+espflash monitor
+cargo run -p peerwire --example lan_chat -- esp32   # on a PC on the same LAN
+```
+
+The PC's firewall must let in UDP from the LAN: port 20567 and `lan_chat`'s port, which
+is random.
