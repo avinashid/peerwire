@@ -44,8 +44,8 @@ room.send('hello'); // to every member, over a direct encrypted link
   code, or multicast on the local network. What goes over it is sealed, so a relay can't read addresses, join a
   room it doesn't know the name of, or forge a link.
 - **Through NATs.** STUN, simultaneous open, port prediction, and birthday and lockstep punching. When no direct
-  path opens, a peer both sides are linked to relays the ciphertext. In simulation, 59 of 64 NAT pairings connect
-  directly.
+  path opens, a peer both sides are linked to relays the ciphertext. In simulation, 59 of the 64 pairings of eight
+  NAT kinds connect directly.
 - **Encrypted by identity.** A peer's ID *is* its Ed25519 public key, and every link is a one-round-trip Noise IK
   session. Dialling an ID authenticates whoever answers; relays and NATs see only ciphertext.
 - **Built for real time.** Three lanes per link: unreliable for state, reliable for events (ordered, up to 1 MiB)
@@ -140,7 +140,7 @@ than those releases; until the next release, [build the package from source](doc
 
 Peerwire is in **early development**. The APIs will change, and builds before 1.0 don't promise to interoperate.
 
-Every part listed above works and is tested: in a deterministic simulator that models eight NAT behaviours, on
+Every part listed above works and is tested: in a deterministic simulator that models twelve NAT behaviours, on
 loopback and local networks, in headless browsers, and over public Nostr relays. It hasn't yet been tested on real
 mobile carrier-grade NATs. The [status page](docs/project/status.md) has the details, part by part, and the roadmap.
 

@@ -69,7 +69,7 @@ its random number generator is seeded once when it's made. A host drives it with
 Because time and I/O come from outside:
 
 - **The simulator replays any scenario bit for bit**, covering latency, jitter, loss, router buffers, uplink caps and
-  eight NAT behaviours.
+  twelve NAT behaviours.
 - **The WebAssembly build needs no imports**, and the same binary runs in browsers and in Node.
 - **Every platform behaves the same**, because there's only one implementation of the protocol.
 
