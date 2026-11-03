@@ -3,7 +3,7 @@
 //! Signaling is a deterministic in-memory broker with relay-like latency; no
 //! invite or address is exchanged out of band.
 
-use peerwire::traversal::{Failure, NatType, Privacy, Role, Side, Signal, Traversal};
+use peerwire::traversal::{Failure, NatType, Privacy, Role, Side, Signal, Traversal, BIRTHDAY_PROBES, BIRTHDAY_SOCKETS};
 use peerwire::Topic;
 use peerwire_core::{Config, Event, Lane, Path, PeerId};
 use peerwire_sim::{NatConfig, NetConfig, Sim, SimAddr};
@@ -43,8 +43,20 @@ fn kinds() -> Vec<Kind> {
     ]
 }
 
+/// NB-080: symmetric NATs that filter by address only (`-adf`, against `-apdf` or none
+/// for address and port), and ones with one port per destination IP (`sym-ip`).
+/// All four look symmetric to STUN, and only `sym-seq-adf` predicts its ports.
+fn variants() -> Vec<Kind> {
+    vec![
+        Kind::Nat("sym-seq-adf", NatConfig::symmetric_sequential().address_filtered()),
+        Kind::Nat("sym-rand-adf", NatConfig::symmetric_random().address_filtered()),
+        Kind::Nat("sym-ip-adf", NatConfig::address_dependent().address_filtered()),
+        Kind::Nat("sym-ip-apdf", NatConfig::address_dependent()),
+    ]
+}
+
 fn kind(name: &str) -> Kind {
-    kinds().into_iter().find(|k| k.name() == name).unwrap()
+    kinds().into_iter().chain(variants()).find(|k| k.name() == name).unwrap()
 }
 
 struct Peer {
@@ -231,12 +243,16 @@ impl World {
 #[test]
 fn stun_reports_the_nat_type() {
     let mut w = World::new(1);
-    let names = ["public", "full-cone", "port-restr", "sym-seq", "sym-random", "cgnat(pr+pr)", "cgnat(pr+sym)"];
+    let mut names = vec!["public", "full-cone", "port-restr", "sym-seq", "sym-random", "cgnat(pr+pr)", "cgnat(pr+sym)"];
+    names.extend(["sym-seq-adf", "sym-rand-adf", "sym-ip-adf", "sym-ip-apdf"]);
     let ps: Vec<usize> = names.iter().map(|n| w.add(&kind(n))).collect();
     assert!(w.run_until(Duration::from_secs(2), |w| ps.iter().all(|&p| w.peers[p].trav.nat_type() != NatType::Unknown)));
     let got: Vec<NatType> = ps.iter().map(|&p| w.peers[p].trav.nat_type()).collect();
     use NatType::*;
-    assert_eq!(got, vec![Open, Cone, Cone, Symmetric, Symmetric, Cone, Symmetric]);
+    assert_eq!(got, [vec![Open, Cone, Cone, Symmetric, Symmetric, Cone, Symmetric], vec![Symmetric; 4]].concat());
+    // Only sequential NATs predict; one port per destination IP looks random to STUN.
+    let predicts: Vec<bool> = ps.iter().map(|&p| w.peers[p].trav.predicted_addr().is_some()).collect();
+    assert_eq!(predicts, [false, false, false, true, false, false, true, true, false, false, false]);
     // The public address is the NAT's outside one.
     let pr = ps[2];
     let public = *w.peers[pr].trav.public_addr().unwrap();
@@ -250,6 +266,8 @@ struct Outcome {
     connected: bool,
     t_connect: Duration,
     failures: (Option<Failure>, Option<Failure>),
+    /// Whether A has the lower PeerId, which sweeps at stride 1 in lockstep.
+    lower: bool,
 }
 
 /// Two peers join a room; nothing else is shared. Runs until they connect or both give up.
@@ -282,12 +300,14 @@ fn room_pair_with(a: &Kind, b: &Kind, seed: u64, used: (u32, u32)) -> Outcome {
         w.run_until(Duration::from_secs(1), |w| w.peers[pb].events.iter().any(|e| matches!(e, Event::Message { .. })));
         assert_eq!(w.messages(pb), vec![b"ping".to_vec()], "{} -> {}", a.name(), b.name());
     }
-    Outcome { direct, connected, t_connect, failures: (w.failure(pa, pb), w.failure(pb, pa)) }
+    let (failures, lower) = ((w.failure(pa, pb), w.failure(pb, pa)), w.id(pa) < w.id(pb));
+    Outcome { direct, connected, t_connect, failures, lower }
 }
 
 #[test]
 fn nat_matrix_through_signaling() {
-    let ks = kinds();
+    // The variants go last, so the first kinds' cells keep their seeds.
+    let (ks, old): (Vec<Kind>, usize) = (kinds().into_iter().chain(variants()).collect(), kinds().len());
     println!("\nroom of two, signaling only: D = direct (ms to connect), F = failed (U: unreachable;");
     println!("S: symmetric NAT on A's side (S<), B's (S^) or both (S2), as A reports it)");
     print!("{:>14}", "A \\ B");
@@ -295,7 +315,9 @@ fn nat_matrix_through_signaling() {
         print!("{:>14}", b.name());
     }
     println!();
-    let mut direct = 0;
+    let (mut direct, mut first) = (0, 0);
+    let sym = |k: &Kind| k.name().contains("sym");
+    let seq = |k: &Kind| k.name().contains("seq") || k.name() == "cgnat(pr+sym)";
     for (i, a) in ks.iter().enumerate() {
         print!("{:>14}", a.name());
         for (j, b) in ks.iter().enumerate() {
@@ -316,10 +338,18 @@ fn nat_matrix_through_signaling() {
             };
             print!("{cell:>14}");
             direct += o.direct as u32;
+            first += (o.direct && i < old && j < old) as u32;
+            // Two peers link unless both NATs are symmetric and not both sequential
+            // (lockstep); filtering by address only changes nothing (NB-080), but for
+            // one sequential side of two that does (see the variants' own test).
+            let links = !(sym(a) && sym(b)) || (seq(a) && seq(b));
+            let adf = |k: &Kind| k.name().ends_with("-adf");
+            if !(seq(a) && seq(b) && adf(a) != adf(b)) {
+                assert_eq!(o.connected, links, "{} x {}: {o:?}", a.name(), b.name());
+            }
             if !o.connected {
                 // Only symmetric NATs stop two peers, both sides say so, and they
                 // agree on which side is symmetric: the one whose NAT is.
-                let sym = |k: &Kind| k.name().contains("sym");
                 let (sa, sb) = match (sym(a), sym(b)) {
                     (true, true) => (Side::Both, Side::Both),
                     (true, false) => (Side::Ours, Side::Theirs),
@@ -334,7 +364,8 @@ fn nat_matrix_through_signaling() {
         }
         println!();
     }
-    println!("direct: {direct}/{}", ks.len() * ks.len());
+    let all = ks.len();
+    println!("direct: {first}/{} of the first {old} kinds, {direct}/{} of all {all}", old * old, all * all);
     // Cone NATs (and a public peer) on both sides always punch.
     let cone = ["public", "full-cone", "restricted", "port-restr", "cgnat(pr+pr)"];
     for a in cone {
@@ -424,6 +455,181 @@ fn sequential_symmetric_nats_punch_port_restricted_peers() {
     assert_eq!(w.peers[r].trav.predicted_addr(), None);
     let next = w.peers[s].trav.predicted_addr().expect("sequential");
     assert_eq!(next.port, w.peers[s].trav.public_addr().unwrap().port + 2);
+}
+
+/// NB-080: the variants link with every kind their per-port-filtering kin do: cones
+/// and public peers (an ordinary punch, port prediction or a birthday punch), and
+/// `sym-seq-adf` with sequential NATs (lockstep), over 25 seeds each way round. But a
+/// sequential NAT that filters by address, sweeping at stride 2 (the higher PeerId)
+/// against one that filters by port, lets in the other's probes that reach
+/// its new mappings out of step; it answers each from yet another port, which the
+/// other side drops, and each takes the next port and pushes its sweep further out
+/// of step. With the lower PeerId the other's probes come before the mappings they
+/// aim at, and with both NATs filtering by address every answer gets in.
+#[test]
+fn address_filtering_variants_link_as_their_kin_do() {
+    let cones = ["public", "full-cone", "restricted", "port-restr", "cgnat(pr+pr)"];
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    for v in variants() {
+        pairs.extend(cones.iter().map(|c| (v.name(), *c)));
+    }
+    pairs.extend([("sym-seq-adf", "sym-seq"), ("sym-seq-adf", "cgnat(pr+sym)"), ("sym-seq-adf", "sym-seq-adf")]);
+    for (a, b) in pairs {
+        let (mut times, mut higher) = (Vec::new(), (0, 0));
+        for seed in 0..25 {
+            for (x, y) in [(a, b), (b, a)] {
+                let o = room_pair(&kind(x), &kind(y), 2000 + seed);
+                // Whether the `-adf` side (`a`) sweeps at stride 2 against one filtering by port.
+                let out_of_step = !b.ends_with("-adf") && b.contains("sym") && o.lower != (x == a);
+                if out_of_step {
+                    higher = (higher.0 + o.direct as u32, higher.1 + 1);
+                } else {
+                    assert!(o.direct, "{x} x {y}, seed {seed}: {o:?}");
+                }
+                if o.direct {
+                    times.push(o.t_connect);
+                }
+            }
+        }
+        times.sort();
+        let n = times.len();
+        print!("{a:>12} x {b:<13} {n}/50 direct, connect median {:?}, max {:?}", times[n / 2], times[n - 1]);
+        if higher.1 > 0 {
+            print!(" ({}/{} with {a} the higher PeerId)", higher.0, higher.1);
+            assert!(higher.0 * 2 >= higher.1, "{a} x {b}: {higher:?}");
+        }
+        println!();
+    }
+}
+
+/// A [`room_pair`] in which each side also does both halves of a birthday punch, as a
+/// planner for two symmetric NATs would have to, since STUN can't tell their kinds
+/// apart (NB-080, considered and not built). Driven from here: 1 s after joining,
+/// each opens `BIRTHDAY_SOCKETS` sockets with its dial's HS1 towards the other's
+/// public address, and 0.5 s later sprays `BIRTHDAY_PROBES` ports of the other's IP.
+/// Returns the outcome and the NAT mappings the try made on both sides; then, over
+/// 10 s of traffic on a direct link (10 packets a second each way), the mappings
+/// made and the times either end's link roamed.
+fn both_roles_pair(a: &Kind, b: &Kind, seed: u64) -> (Outcome, u64, u64, u64) {
+    let mut w = World::new(seed);
+    let (pa, pb) = (w.add(a), w.add(b));
+    let nats = |k: &Kind| match k {
+        Kind::Public => 0,
+        Kind::Nat(..) => 1,
+        Kind::Cgnat(..) => 2,
+    };
+    let n = nats(a) + nats(b);
+    let mappings = |w: &World| (0..n).map(|i| w.sim.nat_stats(i).mappings_created).sum::<u64>();
+    w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+    let (t0, m0) = (w.sim.now, mappings(&w));
+    w.join(pa, "pair", Role::Peer);
+    w.join(pb, "pair", Role::Peer);
+    w.run_until(Duration::from_secs(1), |_| false);
+    for (p, q) in [(pa, pb), (pb, pa)] {
+        let (node, peer, now) = (w.peers[p].node, w.id(q), w.sim.now);
+        let dst = *w.peers[q].trav.public_addr().unwrap();
+        if let Some(hs1) = w.sim.nodes[node].endpoint.opener(now, &peer) {
+            for port in w.sim.open_ports(node, BIRTHDAY_SOCKETS, now + Duration::from_secs(10)) {
+                w.sim.send_from(node, port, dst, hs1.clone());
+            }
+        }
+    }
+    w.run_until(Duration::from_millis(500), |_| false);
+    for (p, q) in [(pa, pb), (pb, pa)] {
+        let (node, peer, now) = (w.peers[p].node, w.id(q), w.sim.now);
+        let dst = *w.peers[q].trav.public_addr().unwrap();
+        w.sim.nodes[node].endpoint.spray(now, &peer, &dst, BIRTHDAY_PROBES);
+    }
+    let connected = w.run_until(Duration::from_secs(44), |w| {
+        w.connected(pa, pb) || (w.failure(pa, pb).is_some() && w.failure(pb, pa).is_some())
+    }) && w.connected(pa, pb);
+    let t_connect = w.sim.now - t0;
+    let direct = connected && w.run_until(Duration::from_secs(6), |w| w.direct(pa, pb));
+    let tried = mappings(&w) - m0;
+    let (failures, lower) = ((w.failure(pa, pb), w.failure(pb, pa)), w.id(pa) < w.id(pb));
+    let o = Outcome { direct, connected, t_connect, failures, lower };
+    if !direct {
+        return (o, tried, 0, 0);
+    }
+    w.run_until(Duration::from_secs(5), |_| false);
+    let (na, nb) = (w.peers[pa].node, w.peers[pb].node);
+    let roams = |w: &World| w.sim.nodes[na].endpoint.stats().roams + w.sim.nodes[nb].endpoint.stats().roams;
+    let (m1, r1) = (mappings(&w), roams(&w));
+    for _ in 0..100 {
+        w.sim.send(na, nb, Lane::Unreliable, b"a").unwrap();
+        w.sim.send(nb, na, Lane::Unreliable, b"b").unwrap();
+        w.run_until(Duration::from_millis(100), |_| false);
+    }
+    assert!(w.direct(pa, pb), "{} x {}, seed {seed}", a.name(), b.name());
+    (o, tried, mappings(&w) - m1, roams(&w) - r1)
+}
+
+/// NB-080, considered and not built: a both-roles birthday punch ([`both_roles_pair`])
+/// over 25 seeds each way round. With per-port mapping on both sides, a probe that
+/// gets in is answered to its source, a new destination, so from a new port: a NAT
+/// that filters by port drops it, so filtering by address on one side only gains
+/// nothing, and on both sides the link follows every answer to its new port (a new
+/// mapping per packet). One port per destination IP and address filtering, on either
+/// side, keeps one mapping and a stable link.
+#[test]
+fn two_sided_birthday_punch_would_link_only_one_port_per_ip_nats() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Try {
+        Fails,
+        Stable,
+        Chases,
+    }
+    use Try::*;
+    let cases = [
+        ("sym-random", "sym-random", Fails),
+        ("sym-random", "sym-seq", Fails),
+        ("sym-random", "cgnat(pr+sym)", Fails),
+        ("sym-rand-adf", "sym-random", Fails),
+        ("sym-rand-adf", "sym-seq", Fails),
+        ("sym-seq-adf", "sym-random", Fails),
+        ("sym-ip-apdf", "sym-random", Fails),
+        ("sym-ip-adf", "sym-random", Stable),
+        ("sym-ip-adf", "sym-seq", Stable),
+        ("sym-ip-adf", "cgnat(pr+sym)", Stable),
+        ("sym-ip-adf", "sym-rand-adf", Stable),
+        ("sym-rand-adf", "sym-rand-adf", Chases),
+        ("sym-rand-adf", "sym-seq-adf", Chases),
+    ];
+    for (a, b, want) in cases {
+        let (mut direct, mut times, mut tried, mut maps, mut roams) = (0, Vec::new(), 0, 0, 0);
+        for seed in 0..25 {
+            for (x, y) in [(a, b), (b, a)] {
+                let (o, t, m, r) = both_roles_pair(&kind(x), &kind(y), 2100 + seed);
+                if o.direct {
+                    (direct, maps, roams) = (direct + 1, maps + m, roams + r);
+                    times.push(o.t_connect);
+                }
+                tried += t;
+            }
+        }
+        times.sort();
+        let per = |v: u64| if direct > 0 { v / direct } else { 0 };
+        print!("{a:>12} x {b:<13} {direct:>2}/50 direct, {} NAT mappings a try", tried / 50);
+        match times.len() {
+            0 => println!(),
+            n => println!(
+                ", connect median {:?}, max {:?}; in 10 s of traffic per link {} mappings, {} roams",
+                times[n / 2],
+                times[n - 1],
+                per(maps),
+                per(roams)
+            ),
+        }
+        // Where it can't work a try still hits by luck, about m²/N² = 0.1% (theoretical).
+        let got = match (direct, maps) {
+            (0..=2, _) => Fails,
+            (_, 0) if roams == 0 => Stable,
+            _ => Chases,
+        };
+        assert_eq!(got, want, "{a} x {b}");
+        assert!(want == Fails || direct == 50, "{a} x {b}: {direct}/50");
+        assert!(want != Chases || per(maps) >= 50, "{a} x {b}: a new mapping per round trip");
+    }
 }
 
 #[test]

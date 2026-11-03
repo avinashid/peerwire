@@ -56,13 +56,27 @@ impl NatConfig {
     pub fn port_restricted() -> Self {
         NatConfig::new(Dependence::Endpoint, Dependence::AddressPort, PortAlloc::Preserve)
     }
-    /// A new port per destination, allocated in sequence (predictable).
+    /// A new port per destination, allocated in sequence (predictable), letting in
+    /// only the address and port a mapping was made for.
     pub fn symmetric_sequential() -> Self {
         NatConfig::new(Dependence::AddressPort, Dependence::AddressPort, PortAlloc::Sequential)
     }
-    /// A new random port per destination.
+    /// A new random port per destination, letting in only the address and port a
+    /// mapping was made for.
     pub fn symmetric_random() -> Self {
         NatConfig::new(Dependence::AddressPort, Dependence::AddressPort, PortAlloc::Random)
+    }
+    /// One random port per destination IP (address-dependent mapping), letting in
+    /// only the addresses and ports a mapping has sent to. STUN asks two servers at
+    /// different IPs, so it looks symmetric.
+    pub fn address_dependent() -> Self {
+        NatConfig::new(Dependence::Address, Dependence::AddressPort, PortAlloc::Random)
+    }
+    /// The same NAT letting in packets from any port of an IP a mapping has sent to
+    /// (address-dependent filtering), as in `symmetric_random().address_filtered()`.
+    /// `address_dependent().address_filtered()` is a restricted cone towards each IP.
+    pub fn address_filtered(self) -> Self {
+        NatConfig { filtering: Dependence::Address, ..self }
     }
 
     pub fn new(mapping: Dependence, filtering: Dependence, alloc: PortAlloc) -> Self {
@@ -189,5 +203,47 @@ impl Nat {
         }
         m.last_used = now;
         Some(m.inside)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each kind's RFC 4787 behaviour: whether one inside socket keeps its port
+    /// towards another port of the same IP, and towards another IP; and whether the
+    /// mapping it made for `x:1` lets in `x:2`, and `y:1`.
+    #[test]
+    fn mapping_and_filtering_per_kind() {
+        let (x1, x2, y1) = (SimAddr::new(0x0b00_0001, 1), SimAddr::new(0x0b00_0001, 2), SimAddr::new(0x0b00_0002, 1));
+        let inside = SimAddr::new(0x0a00_0002, 5000);
+        let kinds = [
+            ("full-cone", NatConfig::full_cone(), (true, true), (true, true)),
+            ("restricted", NatConfig::restricted_cone(), (true, true), (true, false)),
+            ("port-restr", NatConfig::port_restricted(), (true, true), (false, false)),
+            ("sym-seq", NatConfig::symmetric_sequential(), (false, false), (false, false)),
+            ("sym-random", NatConfig::symmetric_random(), (false, false), (false, false)),
+            ("sym-seq-af", NatConfig::symmetric_sequential().address_filtered(), (false, false), (true, false)),
+            ("sym-rand-af", NatConfig::symmetric_random().address_filtered(), (false, false), (true, false)),
+            ("sym-ip-adf", NatConfig::address_dependent().address_filtered(), (true, false), (true, false)),
+            ("sym-ip-apdf", NatConfig::address_dependent(), (true, false), (false, false)),
+        ];
+        for (name, config, keeps, lets_in) in kinds {
+            let now = Instant::ZERO;
+            let mut nat = Nat::new(config, 0x0b00_0100, 0, 1);
+            let p1 = nat.outbound(now, inside, x1, 7).port;
+            let got = (nat.outbound(now, inside, x2, 8).port == p1, nat.outbound(now, inside, y1, 9).port == p1);
+            assert_eq!(got, keeps, "{name}: same port towards x:2, y:1");
+            // A fresh NAT, so that only the mapping for x:1 exists.
+            let mut nat = Nat::new(nat.config.clone(), 0x0b00_0100, 0, 1);
+            let to = SimAddr::new(nat.ip, nat.outbound(now, inside, x1, 7).port);
+            let got = (nat.inbound(now, x2, to) == Some(inside), nat.inbound(now, y1, to) == Some(inside));
+            assert_eq!(got, lets_in, "{name}: x:1's mapping lets in x:2, y:1");
+            assert_eq!(nat.inbound(now, x1, to), Some(inside), "{name}: the address it sent to");
+        }
+        // Sequential ports come one after another; random ones are drawn.
+        let mut nat = Nat::new(NatConfig::symmetric_sequential().address_filtered(), 0x0b00_0100, 0, 1);
+        let ports: Vec<u16> = [x1, x2, y1].iter().map(|d| nat.outbound(Instant::ZERO, inside, *d, 0).port).collect();
+        assert_eq!(ports, [20_000, 20_001, 20_002]);
     }
 }
