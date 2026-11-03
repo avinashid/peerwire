@@ -153,7 +153,7 @@ release of each.
 | NB92-1, NB92-2 (Low), NB92-I1 (Info) | **Fixed** by `5ef2482` before NB-092 merged, so never on main (`broadcast()` refuses the device's own addresses, and the ESP32 firmware adds no leg on a /31 or /32; `new()` sends only to the broadcast address of the interface the group goes through, if private; the docs say a frame published twice within a second is heard once), reviewed 2026-11-03; NB92-I2 (Info) accepted, [The broadcast leg](#nb-092--the-broadcast-leg--nb92-1nb92-3) |
 | NB92-3 (Low) | **Fixed** by `63f639d` before NB-092 merged, so never on main (on Linux and Android each leg's socket is bound to the interface whose subnet holds its address, so the device's other networks can't send frames to the LAN's broadcast address), reviewed 2026-11-03; residuals accepted, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
-| NB62-2 (Info in the emulator, High on a board) | Open (NB-063): before Wi-Fi is up, ESP-IDF's random numbers are only pseudo-random, and in QEMU every chip draws the same ones (measured), same section |
+| NB62-2 (Info in the emulator, High on a board) | **Fixed** on a board by `c5e13b7` (NB-091), merged `4697a77`: the firmware starts Wi-Fi, with modem sleep off, before any random draw, reviewed 2026-11-03; in QEMU the draws still repeat on every chip (accepted), and the order is the firmware's, not the library's, same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
@@ -3353,15 +3353,16 @@ router that forwards directed broadcasts into the LAN, which is off by default (
 ### The ESP32 prototype (NB-062, NB-064) — NB62-1, NB62-2
 
 `ports/esp32` runs the unchanged `peerwire::Node` on an ESP32-C3 under ESP-IDF, tested
-in Espressif's QEMU only. It is a feasibility prototype, not a supported target: it has
-its own workspace and toolchain, and the gate, CI and the site never build it. The
-emulated chips share one virtual LAN through `l2hub.mjs` on 127.0.0.1, so nothing
-leaves the host. NB-062 ran with fixed test identities and invites built from them.
-Since NB-064 each chip binds its own address, joins a room over `LanSignaling` and
-links with whoever answers, with an identity from a 32-byte seed that `run.sh` draws
-from the host's `/dev/urandom` for each node and each run. That seed is one of two
-QEMU-only settings; the other puts the emulated Ethernet MAC in promiscuous mode,
-because it drops multicast otherwise (a real C3 uses Wi-Fi).
+in Espressif's QEMU and, since NB-091, on one ESP32-C3 board on a home router's Wi-Fi.
+It is a feasibility prototype, not a supported target: it has its own workspace and
+toolchain, and the gate, CI and the site never build it. The emulated chips share one
+virtual LAN through `l2hub.mjs` on 127.0.0.1, so nothing leaves the host. NB-062 ran
+with fixed test identities and invites built from them. Since NB-064 each chip binds its
+own address, joins a room over `LanSignaling` and links with whoever answers, with an
+identity from a 32-byte seed that `run.sh` draws from the host's `/dev/urandom` for each
+node and each run. That seed is one of two QEMU-only settings; the other puts the
+emulated Ethernet MAC in promiscuous mode, because it drops multicast otherwise (a real
+C3 uses Wi-Fi).
 
 Reviewed 2026-11-01 by reading `a5b4d50` and `e6162f8` (NB-062), then `d5978f9` and
 `4c86af7` (NB-064), against ESP-IDF v5.5.5's lwIP and random-number sources. Measured
@@ -3406,9 +3407,40 @@ invite key is every chip's, so its invite proves offers to any of them.
 
 Fix (NB-063, before any board): every draw in `bind` from real entropy, with Wi-Fi up
 first or `bootloader_random_enable()` around the draws, and the identity kept in
-encrypted NVS. Its test compares two chips' first hello nonces. Until then the emulator
-shows discovery and memory, not privacy, as the README has said since `4c86af7`
-(NB64-4). **Status: open** (NB-063).
+encrypted NVS. Its test compares two chips' first hello nonces. The emulator shows
+discovery and memory, not privacy, as the README has said since `4c86af7` (NB64-4).
+
+**Status: fixed** on a board by `c5e13b7` (NB-091), merged `4697a77`, reviewed
+2026-11-03 by reading the firmware at `4697a77` against ESP-IDF v5.5.5's random-number
+docs, which promise true random numbers while the radio is on and awake. With a Wi-Fi
+record in flash, `main` starts Wi-Fi, turns modem sleep off, joins, waits for its DHCP
+address and sets the clock by SNTP, and only then builds the Node; a join that fails is
+retried and never reaches `bind`. Every draw from the chip's random numbers comes after
+that, in `LanSignaling::on` and `bind`:
+- the carrier's sender tag;
+- the main task's hash keys, which std draws for each thread when it makes its first
+  hash map;
+- the identity;
+- the endpoint seed;
+- the traversal seed, which gives the invite key and the nonces of room hellos and
+  offers.
+
+The port-mapping seed is never drawn, since the firmware leaves port mapping off.
+Nothing draws before `main`: no crate in the firmware runs code before it, std draws
+only for hash keys, and the ESP-IDF crates draw nothing. On the board, seven boots gave
+seven different PeerIds.
+
+Residuals:
+- In QEMU every draw but the host-seeded identity still repeats on every chip (Info,
+  accepted): the emulator is for discovery and memory.
+- The order is the firmware's, not `peerwire`'s. An ESP-IDF app of its own that builds a
+  Node before it starts Wi-Fi, with modem sleep on, or on Ethernet draws pseudo-random
+  numbers again; the ESP32 guide says so. On Ethernet an app needs
+  `bootloader_random_enable()` around `bind`.
+- A board makes a new identity each boot: keeping one needs encrypted NVS, its own card
+  when a board needs a stable identity.
+- The two-chip nonce test needs a second board. By reading, the nonces come from the
+  traversal seed, drawn after Wi-Fi.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
