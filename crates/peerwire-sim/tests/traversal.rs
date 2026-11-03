@@ -3,7 +3,9 @@
 //! Signaling is a deterministic in-memory broker with relay-like latency; no
 //! invite or address is exchanged out of band.
 
-use peerwire::traversal::{Failure, NatType, Privacy, Role, Side, Signal, Traversal, BIRTHDAY_PROBES, BIRTHDAY_SOCKETS};
+use peerwire::traversal::{
+    Failure, NatType, Privacy, Role, Side, Signal, Traversal, BIRTHDAY_PROBES, BIRTHDAY_SOCKETS,
+};
 use peerwire::Topic;
 use peerwire_core::{Config, Event, Lane, Path, PeerId};
 use peerwire_sim::{NatConfig, NetConfig, Sim, SimAddr};
@@ -608,7 +610,7 @@ fn two_sided_birthday_punch_would_link_only_one_port_per_ip_nats() {
             }
         }
         times.sort();
-        let per = |v: u64| if direct > 0 { v / direct } else { 0 };
+        let per = |v: u64| v.checked_div(direct).unwrap_or(0);
         print!("{a:>12} x {b:<13} {direct:>2}/50 direct, {} NAT mappings a try", tried / 50);
         match times.len() {
             0 => println!(),

@@ -193,11 +193,11 @@ member or the signalling relays ([through any NAT](../reference/javascript.md#th
   1.91 s, max 2.27 to 3.99 s, with no new mappings or roams over 10 s of traffic. Every other pair pays for nothing:
   0 of 50 (1 of 50, by luck, for `sym-ip-apdf` against `sym-random`). Per try each side sends 256 handshakes (about
   33 KB) and up to 2048 probes (about 270 KB over 3.8 s), and holds up to about 2300 ports of its own NAT for the
-  NAT's mapping timeout (about 4600 mappings a try over the two NATs). That can use up the port block a carrier NAT
-  gives its user, and their other new connections with it. With both sides filtering by IP the links come up, 50 of
-  50, but make 99 mappings and 100 roams in 10 s at 10 packets a second each way. Keeping them would take a change to
-  the core's path model: sending to one address while hearing the peer from another, over a mapping kept open by
-  inbound packets alone, which RFC 4787 leaves optional (REQ-6). From
+  NAT's mapping timeout (about 4600 mappings a try over the two NATs). That can use up the block of ports a carrier
+  NAT gives its user, and so fail the user's other new connections meanwhile. With both sides filtering by IP the
+  links come up, 50 of 50, but make 99 mappings and 100 roams in 10 s at 10 packets a second each way. Keeping them
+  would take a change to the core's path model: sending to one address while hearing the peer from another, over a
+  mapping kept open by inbound packets alone, which RFC 4787 leaves optional (REQ-6). From
   `cargo test -p peerwire-sim --release --test traversal two_sided -- --nocapture`, which drives both roles from the
   test.
 - **Detection, later.** Asking one STUN server IP on two ports (RFC 5780) tells a NAT that maps per IP from one that
