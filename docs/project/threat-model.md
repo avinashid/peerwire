@@ -151,7 +151,7 @@ release of each.
 | NB64-1, NB64-2 (Low), NB64-3, NB64-4, NB64-5 (Info) | **Fixed** by `a0fe2b1` and `4c86af7` before NB-064 merged, so never on main (merged `34a35a8`): `LanSignaling` takes only datagrams sent to its group, except on Windows; an inbox message spends a token before it is opened; `lan_chat` escapes member text; the docs say the ESP32 seed fixes the identity only, and what a replayed hello does. Reviewed 2026-11-01; residuals accepted, [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6) |
 | NB64-6 (Low) | Open (NB-065): a neighbour who knows two members' PeerIds can keep them from linking by flooding their inbox topics, same section |
 | NB92-1, NB92-2 (Low), NB92-I1 (Info) | **Fixed** by `5ef2482` before NB-092 merged, so never on main (`broadcast()` refuses the device's own addresses, and the ESP32 firmware adds no leg on a /31 or /32; `new()` sends only to the broadcast address of the interface the group goes through, if private; the docs say a frame published twice within a second is heard once), reviewed 2026-11-03; NB92-I2 (Info) accepted, [The broadcast leg](#nb-092--the-broadcast-leg--nb92-1nb92-3) |
-| NB92-3 (Low) | Open (found in the NB-092 review, before the merge): on Linux a broadcast leg takes frames that the device's other networks (container bridges, VMs, VPNs) route to the LAN's broadcast address, same section |
+| NB92-3 (Low) | **Fixed** by `63f639d` before NB-092 merged, so never on main (on Linux and Android each leg's socket is bound to the interface whose subnet holds its address, so the device's other networks can't send frames to the LAN's broadcast address), reviewed 2026-11-03; residuals accepted, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
 | NB62-2 (Info in the emulator, High on a board) | Open (NB-063): before Wi-Fi is up, ESP-IDF's random numbers are only pseudo-random, and in QEMU every chip draws the same ones (measured), same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
@@ -3240,8 +3240,9 @@ changes:
   unicast needs an exact match. With `SO_BROADCAST` set, lwIP also gives the group's
   socket limited broadcasts (255.255.255.255) to the port, which stay on the link and
   are kept once. Windows binds neither: its one socket on `0.0.0.0` already heard
-  broadcasts to the port. But a broadcast address is not tied to its interface: on Linux
-  a leg takes a broadcast that comes in on any of them (NB92-3).
+  broadcasts to the port. A broadcast address is not tied to its interface, though:
+  Linux takes one that comes in on any interface, so there each leg's socket is also
+  bound to the interface whose subnet holds it (NB92-3).
 - **TTL 1 for both legs.** Frames go out from the group's socket, with `IP_TTL` 1 as
   well as `IP_MULTICAST_TTL` 1, so a router that forwards directed broadcasts (off by
   default, RFC 2644) doesn't pass ours on. That limits what we send, not what we take
@@ -3262,15 +3263,15 @@ Tests: `lan::tests::the_broadcast_leg_works_alone_and_copies_are_kept_once`,
 `a_frame_heard_again_within_a_second_is_dropped`,
 `broadcast_addresses_are_checked_and_capped`, `own_addresses_are_not_broadcast_legs`,
 `any_interface_means_the_group_routes_interface_only`,
-`unicast_to_the_port_is_not_delivered` (now with a broadcast leg too) and
-`tests/lan.rs`'s `a_room_links_by_broadcast_alone`,
+`a_broadcast_leg_hears_only_its_own_interface`, `unicast_to_the_port_is_not_delivered`
+(now with a broadcast leg too) and `tests/lan.rs`'s `a_room_links_by_broadcast_alone`,
 on loopback's 127.255.255.255 (Linux). In QEMU, two chips linked with `NO_MULTICAST=1`
 (the hub dropped every multicast frame).
 
-Reviewed 2026-11-03 by reading `3d78c44`, the firmware's use of it in `c6b12ad`, the fix
-`5ef2482`, and lwIP as ESP-IDF v5.5.5 ships it. NB92-1 and NB92-2 were measured with
-loopback probes, NB92-3 with two containers on a Docker bridge; the probes aren't in the
-tree.
+Reviewed 2026-11-03 by reading `3d78c44`, the firmware's use of it in `c6b12ad`, the
+fixes `5ef2482` and `63f639d`, and lwIP as ESP-IDF v5.5.5 ships it. NB92-1 and NB92-2
+were measured with loopback probes, NB92-3 with two containers on a Docker bridge,
+before and after its fix; the probes aren't in the tree.
 
 **NB92-1 — `broadcast()` took one of the device's own addresses, which undid NB64-1
 (Low).** `add_broadcast` refused only multicast addresses and `0.0.0.0`. Named with a
@@ -3300,10 +3301,10 @@ connected to the group reports it and sends nothing), and only if private. Test:
 `lan::tests::any_interface_means_the_group_routes_interface_only`.
 
 **Status: fixed** by `5ef2482` before NB-092 merged, so never on main, reviewed
-2026-11-03, for what the node sends: its frames no longer go to other networks. On Linux
-those networks can still send it frames (NB92-3). Residual (accepted): a VPN that
-carries the default route is the interface the group goes through, and the group was
-joined there before NB-092 too.
+2026-11-03, for what the node sends: its frames no longer go to other networks. What
+those networks send to the LAN's broadcast address was NB92-3, fixed by `63f639d`.
+Residual (accepted): a VPN that carries the default route is the interface the group
+goes through, and the group was joined there before NB-092 too.
 
 **NB92-3 — On Linux, a broadcast leg takes frames that come in on any of the device's
 interfaces (Low).** Linux delivers a datagram sent to one of its broadcast addresses
@@ -3320,12 +3321,23 @@ three frames: unicast to that address and multicast to the group were dropped, a
 one to 10.99.0.255 came out of `poll`. lwIP does the same with more than one interface
 (from reading `ip4_input`); the ESP32 firmware has one. BSDs and macOS take a broadcast
 only on the interface whose broadcast address it is (from reading their `ip_input`, not
-tested), and Windows binds no leg. Fix: bind each leg's socket to the interface whose
-subnet has its address, with `SO_BINDTODEVICE` (socket2's `bind_device`, unprivileged
-since Linux 5.7; where it fails, no leg). In a scratch copy with it, the second
-container's frame was dropped, the device's own broadcast was still heard, and the
-`lan::` and `tests/lan.rs` tests passed. A test can read the option back from a leg on
-loopback. **Status: open** (found in the NB-092 review, before the merge).
+tested), and Windows binds no leg. Fix: on Linux and Android, each leg's socket is bound
+to the interface whose subnet holds its address, the narrowest if several do, with
+`SO_BINDTODEVICE` (socket2's `bind_device`, unprivileged since Linux 5.7), and an
+address in none of the device's subnets is refused. Test:
+`lan::tests::a_broadcast_leg_hears_only_its_own_interface` (a leg on loopback reads back
+`lo`, the group's socket no device); it fails with the bind undone. The repro, re-run
+against `63f639d` with `5ef2482` beside it: the second container's frame to 10.99.0.255
+was dropped, and the device's own broadcast was still heard.
+
+**Status: fixed** by `63f639d` before NB-092 merged, so never on main, reviewed
+2026-11-03. Residuals (accepted): where the bind fails there is no leg, only the
+multicast one, so nothing more is let in: on Linux before 5.7 without `CAP_NET_RAW`, and
+for a name the kernel doesn't know as a device, such as an alias label like `eth0:1`
+(from reading `getifaddrs`, which lists an address under its label). If two interfaces
+hold one subnet with the same mask (overlapping networks), the leg hears only the first
+one listed. lwIP with more than one interface would need the same; the ESP32 firmware
+has one.
 
 **NB92-I1 — A frame published twice within a second is heard once (Info).** The dedupe
 can't tell a caller's own repeat from the other leg's copy. Rooms never repeat a frame:
