@@ -114,6 +114,9 @@ pub struct Config {
     pub max_send_buffer: usize,
     /// Reliable fragments in flight per link. Up to 4096, the receive window,
     /// suits a long, fast link; peers from before it take only 1024 ahead.
+    /// Past about 3,800, also raise `max_send_buffer` to at least 4096 × 1100 B
+    /// (≈ 4.3 MiB): it counts unacknowledged bytes too, and its default 4 MiB
+    /// holds 3,813 full fragments.
     pub reliable_window: usize,
     /// Unreliable messages queued per link; the oldest is dropped when full.
     pub unreliable_queue: usize,
