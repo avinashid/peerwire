@@ -91,11 +91,6 @@ fn main() -> anyhow::Result<()> {
     };
     let heap_net = free_heap();
     info!("node {n}: network up at {ip}, free heap {heap_net} B");
-    std::thread::Builder::new().stack_size(8192).spawn(move || {
-        if let Err(e) = probe(n, ip, prefix) {
-            warn!("node {n}: probe: {e:?}");
-        }
-    })?;
 
     // Its own address, not 0.0.0.0: ESP-IDF can't list interfaces, so a node bound to
     // any interface would offer only loopback.
@@ -115,7 +110,7 @@ fn main() -> anyhow::Result<()> {
     let mut node = builder
         .config(config())
         .stun_servers(Vec::<String>::new())
-        .signaling(Counted { n, lan: LanSignaling::on(LanSignaling::GROUP, ip)?, counts: lan.clone() })
+        .signaling(Counted { n, lan: lan_signaling(n, ip, prefix)?, counts: lan.clone() })
         .bind(SocketAddr::from((ip, PORT)))?;
     let heap_node = free_heap();
     let (app, room) = if wifi.is_some() { WIFI_ROOM } else { QEMU_ROOM };
@@ -226,7 +221,7 @@ fn report(n: u8, node: &Node, heap_node: u32, names: &HashMap<PeerId, String>, l
 
 /// What the LAN carrier sent, and heard from other nodes on this node's topics (their
 /// hellos and offers). On a real network discovery can work one way only, such as when
-/// the router doesn't pass multicast between its 2.4 and 5 GHz radios (NB-091).
+/// the router doesn't deliver multicast to the board (NB-091).
 #[derive(Default)]
 struct LanCounts {
     sent: AtomicU32,
@@ -264,69 +259,13 @@ impl Signaling for Counted {
     }
 }
 
-/// The probe's UDP port and the mDNS group: routers with IGMP snooping must still flood
-/// 224.0.0.x, unlike 239.255.80.87.
-const PROBE_PORT: u16 = 20568;
-const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
-
-/// Which paths the LAN passes, apart from the node (NB-091: the board and a PC on one
-/// access point heard none of each other's multicast). Every 2 s it sends a probe each to
-/// the LAN group, the mDNS group, 255.255.255.255 and the subnet's broadcast address, and
-/// by unicast to every address it has heard a probe from; `pw_probe.py` on the PC does
-/// the same. It logs the first probe of each kind from each address, and every 10 s what
-/// it heard.
-fn probe(n: u8, ip: Ipv4Addr, prefix: u8) -> anyhow::Result<()> {
-    let sock = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PROBE_PORT))?;
-    sock.set_broadcast(true)?;
-    sock.set_multicast_ttl_v4(1)?;
-    let group = *LanSignaling::GROUP.ip();
-    for g in [group, MDNS_GROUP] {
-        sock.join_multicast_v4(&g, &ip)?;
-    }
-    sock.set_read_timeout(Some(Duration::from_millis(100)))?;
-    let subnet = Ipv4Addr::from(u32::from(ip) | u32::MAX.checked_shr(prefix.into()).unwrap_or(0));
-    let kinds = [("mc239", group), ("mc224", MDNS_GROUP), ("bc255", Ipv4Addr::BROADCAST), ("bcnet", subnet)];
-    info!("node {n}: probe on UDP {PROBE_PORT}: {kinds:?}");
-    let mut heard: std::collections::BTreeMap<(Ipv4Addr, String), u32> = Default::default();
-    let mut failed: HashMap<&str, u32> = HashMap::new();
-    let (mut round, mut next_send, mut next_report) = (0u32, Instant::now(), Instant::now() + Duration::from_secs(10));
-    let mut buf = [0u8; 64];
-    loop {
-        let now = Instant::now();
-        if now >= next_send {
-            next_send = now + Duration::from_secs(2);
-            round += 1;
-            let mut peers: Vec<Ipv4Addr> = heard.keys().map(|k| k.0).collect();
-            peers.dedup();
-            for (kind, to) in kinds.into_iter().chain(peers.into_iter().map(|p| ("uc", p))) {
-                if let Err(e) = sock.send_to(format!("PWPROBE {kind} {round} board").as_bytes(), (to, PROBE_PORT)) {
-                    let f = failed.entry(kind).or_default();
-                    *f += 1;
-                    if *f == 1 {
-                        warn!("node {n}: probe: sending {kind} to {to}: {e}");
-                    }
-                }
-            }
-        }
-        if now >= next_report {
-            next_report = now + Duration::from_secs(10);
-            let counts: Vec<String> = heard.iter().map(|((a, k), c)| format!("{a} {k} {c}")).collect();
-            info!("node {n}: probe: {round} rounds sent, failed {failed:?}, heard [{}]", counts.join(", "));
-        }
-        let Ok((len, std::net::SocketAddr::V4(from))) = sock.recv_from(&mut buf) else { continue };
-        let text = String::from_utf8_lossy(&buf[..len]);
-        let mut words = text.split(' ');
-        let (Some("PWPROBE"), Some(kind)) = (words.next(), words.next()) else { continue };
-        let key = (*from.ip(), kind.to_string());
-        if *from.ip() == ip || (heard.len() >= 32 && !heard.contains_key(&key)) {
-            continue;
-        }
-        let c = heard.entry(key).or_default();
-        *c += 1;
-        if *c == 1 {
-            info!("node {n}: probe heard {kind} from {}: {text}", from.ip());
-        }
-    }
+/// The LAN carrier on this node's address, and on its subnet's broadcast address too
+/// (NB-092): a home router in NB-091 never delivered multicast to the board, but passed
+/// broadcast both ways. ESP-IDF can't list interfaces, so `LanSignaling` can't find it.
+fn lan_signaling(n: u8, ip: Ipv4Addr, prefix: u8) -> std::io::Result<LanSignaling> {
+    let broadcast = Ipv4Addr::from(u32::from(ip) | u32::MAX.checked_shr(prefix.into()).unwrap_or(0));
+    info!("node {n}: LAN signals to {} and {broadcast}", LanSignaling::GROUP.ip());
+    LanSignaling::on(LanSignaling::GROUP, ip)?.broadcast(broadcast)
 }
 
 fn free_heap() -> u32 {

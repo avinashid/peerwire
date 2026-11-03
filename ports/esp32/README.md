@@ -20,7 +20,8 @@ sector (`run.sh` patches them into each node's copy of the image), and takes:
   `/dev/urandom` for each node and each run.
 
 It binds a `Node` to its own address with no STUN servers and `LanSignaling` (UDP
-multicast on the LAN) as its carrier, and joins one room. No node knows another's
+multicast on the LAN, and broadcast to its subnet: NB-092) as its carrier, and joins
+one room. No node knows another's
 key or address beforehand: they hear each other's room hellos and link. Linked
 nodes send each other a numbered reliable message every second. `Config` caps memory for a chip
 with ~250 KB of free heap: 16 KiB messages, a 32 KiB send buffer and 8 links
@@ -157,4 +158,5 @@ libasyncns0) and unpack them with `dpkg-deb -x` into `~/.local/opt/esp-qemu/sysr
 MSG_KIB=16 ./run.sh 4 45   # the same with 16 KiB messages
 grep report out/node*.log
 CHIP=esp32 ./run.sh 4 50   # the original ESP32
+NO_MULTICAST=1 ./run.sh 2 40  # a LAN that drops multicast: the nodes link by broadcast
 ```
