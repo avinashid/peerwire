@@ -107,6 +107,35 @@ can, by the birthday paradox, as Tailscale does:
   may drop new flows meanwhile. A random-port symmetric NAT can't punch another symmetric NAT: see
   [two symmetric NATs](#two-symmetric-nats).
 
+### In browsers
+
+A browser's only sockets are inside RTCPeerConnections, so `packages/js/src/birthday.js` punches with those (NB-048):
+
+- **The symmetric side** opens 256 connections (`FLEET_SIZE`) that share one certificate and one ICE username and
+  password, so the cone side's one offer gets one answer for all of them. Each is given one remote candidate, the
+  cone side's public address, so its checks open a mapping towards it. The first whose channel opens keeps the link;
+  the rest close.
+- **The cone side** opens one connection and adds the symmetric side's public IPv4 at 1024 ports (`SPRAY_PORTS`, in
+  the native spray's order) as low-priority candidates. ICE checks about 20 a second.
+- **Odds** (theoretical). About 1024 · 256 / 64512 ≈ 4 tries land on a mapping, so all miss with probability
+  (1 - 256/64512)^1024 ≈ 1.7%, and the first lands after about 252 tries, some 13 s.
+- **Addresses.** Neither side checks a candidate from the other's description: both are stripped before use, and
+  the one address each side aims at comes from elsewhere (below), public IPv4 only.
+- **In rooms** (NB-084, `src/punch.js`). `joinRoom` runs one punch per peer it reaches by fallback when the WebRTC
+  link that failed showed this side and that peer as a cone and a symmetric NAT with no prediction: one IPv4 address
+  with one port, and one with two ports more than 8 apart (two STUN servers answering). The cone side offers over the
+  room's encrypted link, with the public address of the connection it offers. The symmetric side opens its fleet only
+  if its own view agrees and the peer's candidates on the failed link named that address's IP, then answers; the
+  cone side sprays the IP the peer's candidates named. The channel takes the link over (`room.adoptChannel`), and
+  the fallback carries it until then. One punch at a time per page, the next at least 30 s after one that ran; once
+  per peer while in the room; 60 s at most, after which, and when either side leaves, it closes what it opened. A
+  pair with one public IP on both sides gets none (a NAT doesn't send back to itself). `birthday: false` turns it
+  off. Tests: `room_birthday.mjs` (the cases, with fake connections), `room_birthday_browser.mjs` (real
+  connections in headless Chromium, the NATs played by a wrapper), `birthday_fleet.mjs` (the fleet alone).
+- **Net Lab's button** runs the same punch between two members, its roles from Net Lab's network probe (a cellular
+  hint when neither reads symmetric). In one field test (October 2026: a Windows PC behind a symmetric carrier NAT
+  and an Android phone on mobile data) the channel formed in 11.1 s.
+
 ## Lockstep prediction
 
 Two symmetric NATs that hand out ports in sequence can't punch with ordinary probes: each new destination costs

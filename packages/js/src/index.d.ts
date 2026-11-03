@@ -109,6 +109,14 @@ export interface JoinRoomOptions {
    * keeps a grant from making new connections (Net Lab's global room rejoins as `'public-only'` instead). Has no
    * effect with `'public-only'`, which never offers them. Default true. */
   retryOnGrant?: boolean;
+  /** A peer reached by fallback whose failed WebRTC link showed one of you behind a cone NAT and the other behind
+   * a symmetric one with no port prediction gets one birthday punch, run over the room's own encrypted link: the
+   * symmetric side opens 256 connections, the cone side sprays up to 1024 ports of its public IP, and a channel
+   * that forms takes the link over (`route(peer)` says `{ kind: 'direct', adopted: true }`). The fallback carries
+   * the link meanwhile. One punch at a time per page, at most once per peer while you are in the room, 60 s at
+   * most; it needs STUN in `iceServers` and a browser's WebRTC. `false` turns it off, and refuses peers' punches.
+   * Default true. */
+  birthday?: boolean;
   /** A WebRTC implementation for runtimes without one (Node: node-datachannel's polyfill).
    * Without WebRTC, `'local'` rooms send datagrams over the BroadcastChannel. */
   RTCPeerConnection?: typeof globalThis.RTCPeerConnection;
@@ -195,7 +203,8 @@ export declare class Room {
   /** Moves `peer`'s link onto `dc`, an open DataChannel to it made outside the room (`pc` its connection; a
    * birthday punch's, say), when the room reaches `peer` only by fallback and the peer adopts its end too.
    * True once the channel carries the link; false, leaving the channel to the caller, if the link is direct
-   * already or the peer didn't adopt within 5 s. When the channel closes, the link goes back to its fallback. */
+   * already or the peer didn't adopt within 5 s. When the channel closes, the link goes back to its fallback.
+   * The room's own birthday punches (see the `birthday` option of `joinRoom`) hand their channel to it. */
   adoptChannel(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel): Promise<boolean>;
   /** The shared document `name` (1 to 128 characters), opened on the first call and the same object until it is
    * closed: the same name on every member is the same document. `options` count when it opens. Throws after
@@ -747,8 +756,10 @@ export declare class WebRtcTransport implements Transport {
    * `retry-failed`), ICE (`ice-state` with `state`, `candidate-error` with the STUN server `url`,
    * `code`, `text`, `address`, `ice-restart` with `n`, `reason`, `dialer`), port prediction (`guesses` with the
    * peer's `ip`, `next`, `step` and the `n` candidates added), `same-nat` (the peer's candidates name our
-   * public IPv4 `ip`, so the link falls back after `ms`) and `throttled` (a message of `kind` not sent: see
-   * `throttled`).
+   * public IPv4 `ip`, so the link falls back after `ms`), `throttled` (a message of `kind` not sent: see
+   * `throttled`) and the room's birthday punches (`birthday` with `step`: `start` with our `role`, `'easy'`
+   * (cone) or `'hard'` (symmetric), `fleet` with the `n` connections opened, `spray` with the `ip` and the `n`
+   * ports, `end` with `role` and `why`, then `adopted` or `not-adopted` once a channel opened).
    */
   trace: ((peer: PeerId, what: string, detail: Record<string, unknown>) => void) | null;
   /**
@@ -767,6 +778,12 @@ export declare class WebRtcTransport implements Transport {
   adopt(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel, options?: { pipe?: boolean }): Promise<number>;
   /** The adopted channel carrying `peer`'s link now, or null. */
   carrier(peer: PeerId): { pc: RTCPeerConnection; dc: RTCDataChannel } | null;
+  /**
+   * What the newest WebRTC link to `peer` that failed showed of the two NATs (before one has, the link now, once
+   * it has the peer's description): the server-reflexive IPv4 addresses our candidates (`mine`) and the peer's
+   * (`theirs`) named, each with its ports; null before that. The room's birthday punches read it.
+   */
+  nat(peer: PeerId): { mine: Map<string, Set<number>>; theirs: Map<string, Set<number>> } | null;
   /**
    * As the dialling side, dials `peer` again with a new RTCPeerConnection while its link runs by other means:
    * the link's own connection, which never opened, is closed, and the offer says `retry`, so the other side
