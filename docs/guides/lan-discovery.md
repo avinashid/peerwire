@@ -31,7 +31,8 @@ Each copy prints `+ <peer>` when it links with another; then type a line to send
 - The same datagram also goes to the LAN's **broadcast address** (such as `192.168.1.255:20567`): that of the
   private network the system sends the group through. Some home routers never deliver multicast to small Wi-Fi
   devices, such as an ESP32, but pass broadcast. A message heard both ways is kept once. Container bridges and VPNs
-  get no broadcast: they are other networks, whose members may be anywhere.
+  get no broadcast: they are other networks, whose members may be anywhere. On Linux they can't send one in either:
+  the broadcast socket hears only the LAN's interface.
 - From there, rooms work exactly as they do over Nostr: sealed hellos, sealed offers, simultaneous dials. Peers link
   over their LAN addresses, so there's nothing to punch.
 - A message is at most 1,356 bytes (`LanSignaling::MAX_PAYLOAD`), so nothing is fragmented: ESP-IDF's network stack
@@ -41,7 +42,7 @@ To use another group or a particular network interface, use `LanSignaling::on(gr
 `LanSignaling::on(LanSignaling::GROUP, "192.168.1.20".parse()?)`. That broadcasts on that interface's network only.
 Where Peerwire can't list interfaces (ESP-IDF), or to reach a second LAN, name the network's broadcast address
 yourself with `.broadcast("192.168.1.255".parse()?)`. It refuses one of the device's own addresses, which would let
-in unicast from anywhere.
+in unicast from anywhere, and on Linux one that isn't on any of the device's networks.
 
 ## Requirements
 

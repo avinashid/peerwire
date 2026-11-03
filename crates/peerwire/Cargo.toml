@@ -37,8 +37,9 @@ serde_json = { version = "1", optional = true }
 [target.'cfg(not(target_os = "espidf"))'.dependencies]
 if-addrs = "0.15"
 
-# SO_REUSEPORT, which BSDs need for a second LanSignaling on one broadcast address.
-[target.'cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+# SO_REUSEPORT, which BSDs need for a second LanSignaling on one broadcast address, and SO_BINDTODEVICE, which keeps
+# a Linux broadcast leg to its own interface (NB92-3).
+[target.'cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "linux", target_os = "android"))'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }
 
 [features]

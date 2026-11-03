@@ -16,7 +16,8 @@
 //! replays within a minute only makes members offer again. Each socket is bound to the
 //! group or to a broadcast address, so it takes only datagrams sent there, not unicast
 //! from off the link (except on Windows, which can bind neither: one socket on any
-//! address hears both legs).
+//! address hears both legs). On Linux a broadcast leg's socket also hears only its own
+//! interface, not a container bridge or VPN that routes to the LAN's broadcast address.
 //!
 //! A message is at most [`LanSignaling::MAX_PAYLOAD`] bytes, in one datagram: nothing is
 //! fragmented (ESP-IDF's lwIP doesn't reassemble IP fragments). Browsers can't send
@@ -155,7 +156,8 @@ impl LanSignaling {
     /// `192.168.1.255`, and hears frames sent to it. [`on`](LanSignaling::on) adds
     /// this itself where it can list interfaces; an ESP32 names its own. At most four;
     /// one named twice is added once. One of this device's own addresses is refused:
-    /// bound to it, the socket would take unicast from anywhere.
+    /// bound to it, the socket would take unicast from anywhere. On Linux `addr` must be
+    /// in one of the device's subnets, and the leg hears only that interface.
     pub fn broadcast(mut self, addr: Ipv4Addr) -> io::Result<LanSignaling> {
         self.add_broadcast(addr)?;
         Ok(self)
@@ -182,6 +184,15 @@ impl LanSignaling {
             // BSDs let a second socket bind a broadcast address and port only with this.
             #[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
             s.set_reuse_port(true)?;
+            // Linux takes a datagram sent to any of its broadcast addresses on whichever
+            // interface it comes in, so a container, VM or VPN peer could route one to the
+            // LAN's through this device: the socket hears only the LAN's interface (NB92-3).
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                let dev = device_of(addr)
+                    .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "not on any of this device's networks"))?;
+                s.bind_device(Some(dev.as_bytes()))?;
+            }
             // lwIP delivers broadcasts only to sockets that allow them, if built to check.
             s.set_broadcast(true)?;
             s.bind(&to.into())?;
@@ -286,6 +297,21 @@ fn route_to(group: SocketAddrV4) -> Option<Ipv4Addr> {
 #[cfg(not(target_os = "espidf"))]
 fn is_local(addr: Ipv4Addr) -> bool {
     if_addrs::get_if_addrs().unwrap_or_default().iter().any(|i| i.ip() == std::net::IpAddr::V4(addr))
+}
+
+/// The interface whose subnet holds `addr`, the narrowest if several do.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn device_of(addr: Ipv4Addr) -> Option<String> {
+    let (a, mut best) = (u32::from(addr), None);
+    for i in if_addrs::get_if_addrs().ok()? {
+        if let if_addrs::IfAddr::V4(v) = &i.addr {
+            let m = u32::from(v.netmask);
+            if a & m == u32::from(v.ip) & m && best.as_ref().is_none_or(|&(bm, _)| m > bm) {
+                best = Some((m, i.name));
+            }
+        }
+    }
+    best.map(|(_, name)| name)
 }
 
 /// ESP-IDF has no getifaddrs: the firmware adds its subnet itself, and names its own
@@ -542,6 +568,18 @@ mod tests {
         if let Some(ip) = own {
             assert!(carrier(6).broadcast(ip).is_err(), "{ip}, another of this host's");
         }
+    }
+
+    /// NB92-3: Linux takes a broadcast to any of its addresses on any interface, so each
+    /// leg hears only the interface whose subnet holds it; an address in none is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_broadcast_leg_hears_only_its_own_interface() {
+        let c = with_broadcast(6, *LanSignaling::GROUP.ip());
+        assert_eq!(socket2::SockRef::from(&c.socks[1]).device().unwrap().as_deref(), Some(&b"lo"[..]));
+        assert_eq!(socket2::SockRef::from(&c.socks[0]).device().unwrap(), None, "the group's socket");
+        // TEST-NET-3 (RFC 5737): no host's subnet.
+        assert!(carrier(6).broadcast(Ipv4Addr::new(203, 0, 113, 255)).is_err());
     }
 
     /// NB92-2: with any interface, the only leg is the group route's interface's, not a
