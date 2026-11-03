@@ -65,7 +65,8 @@ also applies on later visits and on pages of that origin that never ask.
   on mobile data and a laptop on its hotspot), the pair linked directly in 1.2 s at about 10 ms with permission on
   both pages, and over the signaling relays in 5–6 s at about 600 ms without it.
 - With `'public-only'`, none of those go out, and neither does that direct path. Each interface's public address,
-  as STUN sees it, still does.
+  as STUN sees it, still does. On IPv6 there's no NAT, so that public address is the device's own: a phone on
+  mobile data can show peers its IPv6 address in either mode (Android Chrome lists it even without the permission).
 
 ## Who learns what
 
