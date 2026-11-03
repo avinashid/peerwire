@@ -813,7 +813,7 @@ fn fuzz_handshakes_under_load() {
                 ep.handle_datagram_from(now, from, &o, &p);
                 false
             }
-            (1, _) => ep.handle_datagram_direct(now, from, &p),
+            (1, _) => ep.handle_datagram_direct(now, from, &p).is_some(),
             _ => {
                 ep.handle_datagram(now, from, &p);
                 false

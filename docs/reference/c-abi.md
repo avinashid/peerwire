@@ -39,30 +39,33 @@ and CI build, lint and test them on their own (`cargo test -p peerwire-ffi --fea
 `packages/js/build.sh` builds for `wasm32-unknown-unknown` into `target/web` with `opt-level=s`, LTO, one codegen
 unit, stripped symbols and `panic=abort`, then copies the module to `packages/js/pkg/`. `scripts/gate.sh` and CI
 (`.github/scripts/wasm-check.mjs`) fail if the module is over `WASM_MAX_BYTES` (358,400 bytes, 350 KiB) or has any
-import. On `main` it is 355,588 bytes with no imports, as the gate's `wasm size+imports` step reports it after
+import. On `main` it is 356,356 bytes with no imports, as the gate's `wasm size+imports` step reports it after
 `packages/js/build.sh`:
 
 ```text
-packages/js/pkg/peerwire_ffi.wasm: 355588 bytes (limit 358400), 0 imports
+packages/js/pkg/peerwire_ffi.wasm: 356356 bytes (limit 358400), 0 imports
 ```
 
 ## Conventions
 
 - **Handles.** `pw_endpoint_new` and `pw_docs_new` return an opaque pointer (`PwEndpoint *`, `PwDocs *`), or null
   when a required argument is null. Free each once with `pw_endpoint_free` or `pw_docs_free`, which ignore null.
-  Every other function uses the handle without checking it: a null or freed handle is undefined behaviour.
+  Every other function refuses a null handle (see below); a freed handle is undefined behaviour.
 - **Time.** `now_us` is microseconds on the host's monotonic clock, as a `uint64_t`. The deadlines from
   `pw_poll_timeout` and `pw_docs_poll_timeout` are instants on that clock, not delays.
 - **Addresses** are `uint32_t` handles. The host picks them and maps each to its own transport (a socket address, a
   WebRTC DataChannel, a signalling pipe); the endpoint gives them back in `pw_poll_transmit` and in events. Pass
   `share_addresses` 0 to `pw_endpoint_new` when handles are local numbers rather than network addresses: the
   endpoint then doesn't tell peers the addresses it sees them at.
-- **Peer ids** are 32-byte buffers (Ed25519 public keys). A null peer id gets `PW_ERR_INVALID`, is ignored by the
-  functions that return nothing, gives 0 from `pw_is_connected` and -1 from `pw_rtt_us` and `pw_path_rtt_us`.
+- **Peer ids** are 32-byte buffers (Ed25519 public keys).
+- **Null pointers.** A null handle, a null peer id, a null output, or a null input whose length isn't 0 gets
+  `PW_ERR_INVALID` from the functions that return a code, is ignored by the functions that return nothing, gives 0
+  from `pw_is_connected` and -1 from `pw_rtt_us`, `pw_path_rtt_us`, `pw_poll_timeout` and `pw_docs_poll_timeout`.
+  Nothing is read, written or taken from a queue. The `_new` functions give null.
 - **Fixed-size inputs** (peer ids, secrets, seeds, Nostr messages) take no length: exactly 32 bytes are read. A
   shorter buffer is read past its end.
-- **Byte inputs** are a pointer and a length. With length 0 the pointer isn't read and may be null. Strings, in the
-  shared-document functions, are UTF-8 and not NUL-terminated.
+- **Byte inputs** are a pointer and a length. With length 0 the pointer isn't read and may be null, and so may an
+  output whose capacity is 0. Strings, in the shared-document functions, are UTF-8 and not NUL-terminated.
 - **Outputs** go into buffers the caller owns (see the table below). The library never keeps a pointer it was given.
 - **Memory.** `pw_alloc(len)` returns `len` bytes (at least 1) from the library's allocator, and `pw_free(p, len)`
   frees them; it must get the same `len`. A wasm host has to use them, as the module can only reach its own memory.
@@ -92,8 +95,8 @@ packages/js/pkg/peerwire_ffi.wasm: 355588 bytes (limit 358400), 0 imports
 | `out_peer` of `pw_endpoint_new` and `pw_docs_poll_transmit`, `out` of `pw_secret`, `out_from` of `pw_open` | 32 bytes |
 | `out_secret` and `out_pub` of `pw_nostr_keypair` | 32 bytes each |
 | `out_sig` of `pw_nostr_sign` | 64 bytes |
-| `out` of `pw_stats` | 16 `uint64_t` (128 bytes) |
-| `out_addr` of `pw_poll_transmit` | one `uint32_t` |
+| `out` of `pw_stats` | 16 `uint64_t` (128 bytes), at any alignment |
+| `out_addr` of `pw_poll_transmit` | one `uint32_t`, at any alignment |
 | `buf` of `pw_poll_transmit` | at least 1232 bytes (`MAX_DATAGRAM`), else `PW_ERR_BUFFER` |
 | `out` of `pw_open` | at least `len`, the sealed message's length, else `PW_ERR_BUFFER` |
 | `out_id` of `pw_doc_add` | at least 96 bytes, else `PW_ERR_BUFFER` |
@@ -105,8 +108,9 @@ A buffer that is too small is answered in one of two ways, and neither loses any
 - **`PW_ERR_BUFFER`** where the function has a fixed minimum. Nothing was consumed.
 - **`-(needed)`** where the result's size varies: minus the bytes it needs. `pw_poll_event`, `pw_docs_poll_event`
   and `pw_docs_poll_transmit` keep the item first in line; call again with at least that many bytes. These values
-  never read as a `PW_ERR_*` code: those three functions return no error codes, `pw_seal` needs at least 128 bytes,
-  and the doc reads ask for 16 bytes up front.
+  never read as a `PW_ERR_*` code: those three functions return no other code than `PW_ERR_INVALID`, for a null
+  pointer, and what they give is always over 5 bytes (an event at least 33, a doc message a tag and a JSON object);
+  `pw_seal` needs at least 128 bytes, and the doc reads ask for 16 bytes up front.
 
 ## Error codes
 
@@ -159,14 +163,14 @@ void pw_free(uint8_t *p, size_t len);
 ```c
 PwEndpoint *pw_endpoint_new(const uint8_t *secret, const uint8_t *seed, uint32_t share_addresses, uint8_t *out_peer);
 void pw_endpoint_free(PwEndpoint *h);
-void pw_secret(const PwEndpoint *h, uint8_t *out);
+int32_t pw_secret(const PwEndpoint *h, uint8_t *out);
 ```
 
 | Function | What it does | Returns |
 |---|---|---|
 | `pw_endpoint_new` | Creates an endpoint. `secret` is a 32-byte Ed25519 secret key that restores an identity, or null for a new identity drawn from `seed`. `seed` is 32 bytes from a CSPRNG and is always required: it also seeds the endpoint's randomness. `share_addresses`: see [Conventions](#conventions). Writes the 32-byte peer id to `out_peer` | the handle, or null if `seed` or `out_peer` is null |
 | `pw_endpoint_free` | Frees the endpoint. Null is ignored | nothing |
-| `pw_secret` | Copies the 32-byte secret key to `out`, so the host can keep the identity and pass it back to `pw_endpoint_new` | nothing |
+| `pw_secret` | Copies the 32-byte secret key to `out`, so the host can keep the identity and pass it back to `pw_endpoint_new` | 0; `PW_ERR_INVALID`, writing nothing, for a null `h` or `out` |
 
 ### Links
 
@@ -199,7 +203,7 @@ the browser and in the Rust `peerwire` crate.
 uint32_t pw_is_connected(const PwEndpoint *h, const uint8_t *peer_id);
 int64_t pw_rtt_us(const PwEndpoint *h, const uint8_t *peer_id);
 int64_t pw_path_rtt_us(const PwEndpoint *h, const uint8_t *peer_id);
-void pw_stats(const PwEndpoint *h, uint64_t *out);
+int32_t pw_stats(const PwEndpoint *h, uint64_t *out);
 ```
 
 | Function | What it does | Returns |
@@ -207,7 +211,7 @@ void pw_stats(const PwEndpoint *h, uint64_t *out);
 | `pw_is_connected` | Whether `peer_id` is linked | 1, or 0 (also for a null peer id) |
 | `pw_rtt_us` | The link's smoothed round-trip time | µs, or -1 if unknown |
 | `pw_path_rtt_us` | The round-trip time over the path the link is on now, measured since it moved there. Links race other paths of their kind and take one clearly faster | µs, or -1 if unknown |
-| `pw_stats` | Writes 16 counters to `out`, in this order: `tx_packets`, `rx_packets`, `rx_malformed`, `rx_unknown_session`, `rx_auth_failed`, `rx_replayed`, `rx_handshake_dropped`, `retransmits`, `unreliable_dropped`, `roams`, `relayed`, `relay_dropped`, `punches_sent`, `punch_succeeded`, `punch_failed`, `direct_fallbacks` | nothing |
+| `pw_stats` | Writes 16 counters to `out`, in this order: `tx_packets`, `rx_packets`, `rx_malformed`, `rx_unknown_session`, `rx_auth_failed`, `rx_replayed`, `rx_handshake_dropped`, `retransmits`, `unreliable_dropped`, `roams`, `relayed`, `relay_dropped`, `punches_sent`, `punch_succeeded`, `punch_failed`, `direct_fallbacks` | 0; `PW_ERR_INVALID`, writing nothing, for a null `h` or `out` |
 
 The core counts more (`spray_probes`, `rx_wrong_peer`, `path_probes`, `path_switches`, `cookies_sent`); the ABI
 doesn't give those.
@@ -248,8 +252,8 @@ int32_t pw_poll_event(PwEndpoint *h, uint8_t *buf, size_t cap);
 | `pw_handle_datagram_from` | The same, for a handle only `peer_id` sends on (its DataChannel, its signalling pipe). A packet there for another peer's link, or a handshake from anyone else, is dropped unread, so no peer can move another's link onto its own channel | 0; `PW_ERR_INVALID`, with nothing read, for a null peer id |
 | `pw_handle_timeout` | Runs the timers due at `now_us` (retransmits, keepalives, punching). Call it once the `pw_poll_timeout` deadline has passed | nothing |
 | `pw_poll_timeout` | The next deadline | µs on the host's clock, or -1 if none |
-| `pw_poll_transmit` | Writes the next datagram to `buf` and its destination handle to `*out_addr` | its length, 0 if none; `PW_ERR_BUFFER`, taking nothing, if `cap` is under 1232 |
-| `pw_poll_event` | Writes the next event to `buf` (see [Events](#events)) | its length, 0 if none, or `-(needed)`: the event stays queued |
+| `pw_poll_transmit` | Writes the next datagram to `buf` and its destination handle to `*out_addr` | its length, 0 if none; `PW_ERR_BUFFER`, taking nothing, if `cap` is under 1232; `PW_ERR_INVALID`, taking nothing, for a null pointer |
+| `pw_poll_event` | Writes the next event to `buf` (see [Events](#events)) | its length, 0 if none, or `-(needed)`: the event stays queued; `PW_ERR_INVALID`, taking nothing, for a null `h`, or a null `buf` with a `cap` |
 
 The loop, from the crate README:
 
@@ -568,11 +572,13 @@ Rust programs use the crates themselves: see [Rust crates](rust.md).
   through a too-small event buffer first; an identity comes back from `pw_secret`; a sealed message opens for its
   recipient and not for a third endpoint; a Nostr signature verifies. Other tests cover `pw_path_rtt_us`,
   `pw_handle_datagram_from`, `pw_add_candidate`, `pw_set_slow` with `pw_add_relay`, and relay-only dials.
+  `null_pointers_are_refused` passes every function a null handle, and each output and input null in turn, and
+  checks the answer and that nothing was read or taken; it also writes `pw_stats` and `out_addr` at an odd address.
 - `fuzz_the_c_abi` (same file) drives two endpoints with random calls and arguments, random and mutated datagrams
   and sealed blobs. Every return code must be one the ABI documents, a too-small event buffer must keep the event,
   and every event must have the documented encoding.
 - `cargo test -p peerwire-ffi --features sync` adds `src/sync.rs`: two members share a doc through the ABI, a copy
-  opens it again elsewhere, and the ABI refuses what doc.js throws for.
+  opens it again elsewhere, and the ABI refuses what doc.js throws for, and null pointers.
 - `packages/js/test/node_pair.mjs` links two endpoints of the wasm module in Node. Others there cover calls after
   `close()` (`endpoint_closed.mjs`), scratch-buffer reuse across memory growth (`scratch_buffers.mjs`), peer-id
   checks (`peer_id.mjs`), `pw_handle_datagram_from` (`receive_from.mjs`) and the event decoder (`fuzz.mjs`).
@@ -586,5 +592,6 @@ Nothing in the gate or CI compiles C against the library. See [Testing](../proje
 - **The endpoint only.** Rooms, invites, signalling, STUN and transports are not in the ABI. A C host brings its
   own, as `peerwire.js` and `room.js` do in the browser.
 - **One setting.** Only `share_addresses` can be set; the rest of the endpoint's `Config` is the core's default.
-- **Misuse isn't caught.** A null or freed handle, a short fixed-size buffer, or a `pw_free` with the wrong length is
-  undefined behaviour, not an error code.
+- **Misuse isn't caught, past null pointers.** A freed handle, a pointer to too little memory (a short fixed-size
+  buffer, a `len` or `cap` past its buffer's end), or a `pw_free` with the wrong length is undefined behaviour, not
+  an error code.

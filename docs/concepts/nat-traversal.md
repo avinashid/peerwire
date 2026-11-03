@@ -92,9 +92,15 @@ can, by the birthday paradox, as Tailscale does:
   the pair links in about 2.2 s after joining (median).
 - **The host's part** (`Traversal::poll_birthday`, done by `Node`): it opens the sockets on the main socket's
   address, hands the endpoint what they receive, and sends to an address out of the first extra socket that heard
-  from it (its route), everything else from the main socket. Sockets that are no route close after 10 s, a route
-  once it has heard nothing for 60 s. At most 512 are open at once, and while any are, `Node::next_timeout` is at
-  most 5 ms, because a host waiting on `Node::socket` can't see them.
+  from it (its route), everything else from the main socket. Only a packet of the punch's peer that authenticated
+  on a link whose direct path is that address makes a route, or keeps one (NB44-2, NB44c-1, NB44c-2): not junk, an
+  HS1 sent again while its handshake is half-open, an HS2 sent again, or another peer's handshake. The peer's HS1
+  makes a route only for the answer to it, until the socket's `until`, and ends no other route: Noise IK's first
+  message has no freshness check, so a copy of one reads again once its handshake is no longer half-open
+  (NB85-1). Its HS2 to our dial, or a Data packet, makes the route that lasts. A peer has one route: a new one ends
+  its route at another address, and that socket closes as one that is no route. Sockets that are no route close
+  after 10 s, a route once it has heard nothing for 60 s. At most 512 are open at once, and while any are,
+  `Node::next_timeout` is at most 5 ms, because a host waiting on `Node::socket` can't see them.
 - **Limits.** One try per peer per 5 minutes; per node, a burst of 4, then one per 30 s; and, per destination IP
   across all peers (NB44-1), only one punch to an IP at a time and at most 2 per 5 minutes, so a flood of offers
   from many PeerIds (a room-key holder can mint them freely) naming one victim can't make the node punch it four
@@ -637,6 +643,14 @@ Crates added to `peerwire` by NAT traversal:
   from 1024 up, at most 16 per batch, over random seeds, bases and counts.
 - `crates/peerwire/src/node.rs` `birthday_sockets_carry_the_link_they_hear`: over loopback, a peer that reaches one
   extra socket links through it, every reply leaves from it, and the rest close.
+  `birthday_sockets_ignore_unauthenticated_floods` and `birthday_sockets_take_only_their_peer_authenticated`: junk,
+  an HS2 of junk from the linked peer's own address, and another peer's handshake make no route, and the sockets
+  close at `until`. `birthday_sockets_keep_one_route_per_peer`: a peer sending from one port after another to
+  another socket each time keeps one route, beside another peer's.
+  `birthday_sockets_route_a_copied_hs1_only_until_until` and
+  `birthday_sockets_keep_the_route_of_a_copied_hs1_from_the_peer`: a copy of the peer's HS1, sent once the link is
+  up from another host or from the peer's own address, is answered, but the peer's route stays and the socket the
+  copy reached closes at `until` (NB85-1).
 - `crates/peerwire-sim/src/nat.rs` `mapping_and_filtering_per_kind`: each kind's mapping (the port towards another
   port of one IP, and towards another IP) and filtering (which of those a mapping lets in), as in the table in
   [two symmetric NATs](#two-symmetric-nats).

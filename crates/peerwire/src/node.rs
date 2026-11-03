@@ -230,6 +230,9 @@ pub struct Node {
 /// An extra socket, opened for birthday punching.
 struct Extra {
     sock: UdpSocket,
+    /// The peer the punch is to ([`Birthday::peer`]): only a packet of its that
+    /// authenticated makes the socket a route, or keeps it one (NB44c-2).
+    peer: PeerId,
     /// Closed then, unless it is some address's route.
     until: peerwire_core::Instant,
     /// Last heard from an address it is the route for.
@@ -812,18 +815,20 @@ impl Node {
             }
             let _ = sock.send_to(&b.payload, self.wire_addr(b.dst));
             self.next_extra += 1;
-            self.extra.insert(self.next_extra, Extra { sock, until: b.until, last_recv: None });
+            self.extra.insert(self.next_extra, Extra { sock, peer: b.peer, until: b.until, last_recv: None });
             opened.push(self.next_extra);
         }
     }
 
     /// Hands the endpoint what the extra sockets heard. The first open one to hear
-    /// an authenticated packet from an address becomes its route.
+    /// an authenticated packet of its punch's peer from an address becomes its route;
+    /// for an HS1, which may be a copy, only until the socket's `until` (NB85-1).
     fn read_extra(&mut self, now: peerwire_core::Instant) {
         let ids: Vec<u64> = self.extra.keys().copied().collect();
         for id in ids {
             for _ in 0..MAX_READS_PER_POLL {
                 let Some(x) = self.extra.get(&id) else { break };
+                let peer = x.peer;
                 let (n, from) = match x.sock.recv_from(&mut self.buf[..]) {
                     Ok(r) => r,
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -833,11 +838,14 @@ impl Node {
                 if peerwire_core::stun::is_stun(&self.buf[..n]) {
                     continue; // STUN is asked on the main socket only
                 }
-                // NB44-2: adopt `from` as a route only once the datagram has
-                // authenticated to a session on this direct path. An unauthenticated
-                // or spoofed source otherwise made itself a route, redirecting our
-                // egress and holding the socket open; now it is just dropped.
-                if !self.ep.handle_datagram_direct(now, from, &self.buf[..n]) {
+                // NB44-2, NB44c: adopt `from` as a route only once the datagram has
+                // authenticated (its crypto ran) to a session of the punch's peer on
+                // this direct path. An unauthenticated or spoofed source, a handshake
+                // packet sent again, or another peer otherwise made itself a route,
+                // redirecting our egress and holding the socket open; now the
+                // endpoint just has the datagram.
+                let Some((who, fresh)) = self.ep.handle_datagram_direct(now, from, &self.buf[..n]) else { continue };
+                if who != peer {
                     continue;
                 }
                 if self.routes.len() >= MAX_ROUTES && !self.routes.contains_key(&from) {
@@ -845,10 +853,25 @@ impl Node {
                 }
                 let open = |r: &u64| self.extra.get(r).is_some_and(|x| x.open(now));
                 let route = self.routes.get(&from).copied().filter(open).unwrap_or(id);
+                if !fresh {
+                    // NB85-1: an HS1, which anyone holding a copy can send once its
+                    // handshake is no longer half-open. It routes its answer, the HS2
+                    // or our HS1 sent again, but keeps no socket past its `until` and
+                    // ends no other route; the peer's next fresh packet adopts one.
+                    self.routes.insert(from, route);
+                    continue;
+                }
+                // NB44c-2: one route per peer. Its route at another address goes, and
+                // its other sockets close at their `until`, so a peer that sends from
+                // one source port after another holds one socket, not one per port.
+                let extra = &mut self.extra;
+                self.routes.retain(|a, r| *a == from || extra.get(r).is_none_or(|x| x.peer != peer));
                 self.routes.insert(from, route);
-                if route == id {
-                    if let Some(x) = self.extra.get_mut(&id) {
+                for (&i, x) in extra.iter_mut() {
+                    if i == route && route == id {
                         x.last_recv = Some(now);
+                    } else if i != route && x.peer == peer {
+                        x.last_recv = None;
                     }
                 }
             }
@@ -1128,6 +1151,164 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(a.extra_sockets().0.is_empty(), "sockets closed at until, not held by junk");
+    }
+
+    /// Polls `nodes` every millisecond until `done` holds (at most 5 s).
+    fn poll_until(nodes: &mut [&mut Node], mut done: impl FnMut(&mut [&mut Node]) -> bool) {
+        let t0 = Instant::now();
+        while !done(nodes) {
+            assert!(t0.elapsed() < Duration::from_secs(5), "timed out");
+            for n in nodes.iter_mut() {
+                n.poll();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// NB44c-1, NB44c-2: extra sockets opened for a punch to b, which a is linked
+    /// with, make no route of what reaches them unauthenticated from b's own
+    /// address (an HS2 of junk for a's index of the link), nor of a valid
+    /// handshake from c, a peer they weren't opened for. They still close at
+    /// `until`; c links through a's main socket.
+    #[test]
+    fn birthday_sockets_take_only_their_peer_authenticated() {
+        let (mut a, mut b, mut c) = (quiet("127.0.0.1:0"), quiet("127.0.0.1:0"), quiet("127.0.0.1:0"));
+        let (pa, pb, pc) = (a.peer_id(), b.peer_id(), c.peer_id());
+        let linked = |x: &Node, y: &Node| x.status(&y.peer_id()) == Status::Connected;
+        a.ep.connect(a.now(), b.local_addr(), pb).unwrap();
+        poll_until(&mut [&mut a, &mut b], |n| linked(n[0], n[1]) && linked(n[1], n[0]));
+        // A Data packet of b's to a: its receiver index is a's for the link.
+        b.ep.send(&pa, Lane::Unreliable, b"x").unwrap();
+        let now = b.now();
+        let data = std::iter::from_fn(|| b.ep.poll_transmit(now)).find(|t| t.payload[0] & 0x0f == 3).unwrap();
+        let junk = [&[(data.payload[0] & 0xf0) | 2, 7, 0, 0, 0][..], &data.payload[1..5], &[0x55; 48]].concat();
+        let t0 = Instant::now();
+        let until = a.now() + Duration::from_millis(1000);
+        a.open_extra(&Birthday { peer: pb, dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until });
+        let (socks, _) = a.extra_sockets();
+        for _ in 0..3 {
+            b.socket().send_to(&junk, socks[0]).unwrap();
+        }
+        c.ep.connect(c.now(), socks[1], pa).unwrap();
+        poll_until(&mut [&mut a, &mut b, &mut c], |n| linked(n[0], n[2]) && linked(n[2], n[0]));
+        assert!(t0.elapsed() < Duration::from_millis(900), "the test ran past until");
+        assert_eq!(c.path(&pa), Some(&Path::Direct(a.local_addr())), "c's link is on a's main socket");
+        assert_eq!((a.route_count(), a.extra_sockets().1), (0, 0), "no route");
+        assert!(!a.via_birthday(&pb) && !a.via_birthday(&pc));
+        poll_until(&mut [&mut a, &mut b, &mut c], |_| t0.elapsed() > Duration::from_millis(1100));
+        assert!(a.extra_sockets().0.is_empty(), "closed at until");
+        assert_eq!((a.status(&pb), a.status(&pc)), (Status::Connected, Status::Connected));
+    }
+
+    /// NB44c-2: a peer keeps one route. Packets of b's link, each sent from a new
+    /// source port to another of the extra sockets opened for b, move the link (it
+    /// roams to the newest), and each makes the socket that heard it the route; the
+    /// last one is b's only route, and b's sockets before it close at `until`. c's
+    /// route, on a socket of a punch to c open meanwhile, stays.
+    #[test]
+    fn birthday_sockets_keep_one_route_per_peer() {
+        let (mut a, mut b, mut c) = (quiet("127.0.0.1:0"), quiet("127.0.0.1:0"), quiet("127.0.0.1:0"));
+        let (pa, pb, pc) = (a.peer_id(), b.peer_id(), c.peer_id());
+        let linked = |x: &Node, y: &Node| x.status(&y.peer_id()) == Status::Connected;
+        a.ep.connect(a.now(), b.local_addr(), pb).unwrap();
+        a.ep.connect(a.now(), c.local_addr(), pc).unwrap();
+        poll_until(&mut [&mut a, &mut b, &mut c], |n| (1..3).all(|i| linked(n[0], n[i]) && linked(n[i], n[0])));
+        // The newest packet `n` sealed for a, sent from a port of its own to `hit`; a reads it.
+        let mut froms = Vec::new();
+        let mut hop = |a: &mut Node, n: &mut Node, hit: SocketAddr| {
+            n.ep.send(&pa, Lane::Unreliable, b"x").unwrap();
+            let now = n.now();
+            let data = std::iter::from_fn(|| n.ep.poll_transmit(now)).filter(|t| t.payload[0] & 0x0f == 3).last();
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.send_to(&data.unwrap().payload, hit).unwrap();
+            let from = s.local_addr().unwrap();
+            froms.push(s);
+            poll_until(&mut [a], |x| x[0].path(&n.peer_id()) == Some(&Path::Direct(from)));
+        };
+        let t0 = Instant::now();
+        let until = a.now() + Duration::from_millis(1000);
+        a.open_extra(&Birthday { peer: pb, dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until });
+        let (socks, _) = a.extra_sockets();
+        a.open_extra(&Birthday { peer: pc, dst: c.local_addr(), sockets: 1, payload: b"x".to_vec(), until });
+        let to_c = a.extra_sockets().0.into_iter().find(|s| !socks.contains(s)).unwrap();
+        hop(&mut a, &mut c, to_c);
+        assert!(a.via_birthday(&pc));
+        for &hit in &socks[..3] {
+            hop(&mut a, &mut b, hit);
+            assert_eq!((a.route_count(), a.extra_sockets().1), (2, 2), "one route each");
+            assert!(a.via_birthday(&pb) && a.via_birthday(&pc));
+        }
+        assert!(t0.elapsed() < Duration::from_millis(900), "the test ran past until");
+        poll_until(&mut [&mut a], |_| t0.elapsed() > Duration::from_millis(1100));
+        let (mut open, routes) = a.extra_sockets();
+        open.sort();
+        let mut kept = vec![socks[2], to_c];
+        kept.sort();
+        assert_eq!((open, routes), (kept, 2), "b's last route and c's are left");
+    }
+
+    /// NB85-1: a copy of b's HS1 to a (held by a host on the path, or a member that
+    /// relayed b's dial), sent once the link is up to socks[1], an extra socket of a
+    /// punch to b, reads again and is answered with an HS2. From m, a host of its
+    /// own, the answer leaves socks[1] (which is m's route only until `until`), and
+    /// b's route on socks[0] stays. From b's own address (spoofed), the answer
+    /// leaves b's route, which stays. Either way socks[1] closes at `until`.
+    fn a_copied_hs1_routes_only_its_answer(spoofed: bool) {
+        let (mut a, mut b) = (quiet("127.0.0.1:0"), quiet("127.0.0.1:0"));
+        let (pa, pb) = (a.peer_id(), b.peer_id());
+        let linked = |x: &Node, y: &Node| x.status(&y.peer_id()) == Status::Connected;
+        b.ep.connect(b.now(), a.local_addr(), pa).unwrap();
+        let now = b.now();
+        let hs1 = std::iter::from_fn(|| b.ep.poll_transmit(now)).find(|t| t.payload[0] & 0x0f == 1).unwrap().payload;
+        b.socket().send_to(&hs1, a.local_addr()).unwrap();
+        poll_until(&mut [&mut a, &mut b], |n| linked(n[0], n[1]) && linked(n[1], n[0]));
+        let t0 = Instant::now();
+        let until = a.now() + Duration::from_millis(1000);
+        a.open_extra(&Birthday { peer: pb, dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until });
+        let (socks, _) = a.extra_sockets();
+        // b's link moves to a new port of b's, heard on socks[0]: b's route.
+        b.ep.send(&pa, Lane::Unreliable, b"x").unwrap();
+        let now = b.now();
+        let data = std::iter::from_fn(|| b.ep.poll_transmit(now)).filter(|t| t.payload[0] & 0x0f == 3).last().unwrap();
+        let moved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        moved.send_to(&data.payload, socks[0]).unwrap();
+        let b_at = moved.local_addr().unwrap();
+        poll_until(&mut [&mut a], |x| x[0].path(&pb) == Some(&Path::Direct(b_at)));
+        assert!(a.via_birthday(&pb));
+        let m = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let src = if spoofed { &moved } else { &m };
+        src.set_nonblocking(true).unwrap();
+        src.send_to(&hs1, socks[1]).unwrap();
+        let (mut got, mut answer) = ([0u8; 2048], None);
+        poll_until(&mut [&mut a], |_| {
+            while let Ok((n, by)) = src.recv_from(&mut got) {
+                if got[0] & 0x0f == 2 {
+                    answer = Some((n, by));
+                }
+            }
+            answer.is_some()
+        });
+        // From m: m's route, beside b's. From b's address: b's route.
+        let (by, routes) = if spoofed { (socks[0], 1) } else { (socks[1], 2) };
+        assert_eq!(answer, Some((57, by)), "the HS2, and the socket it left");
+        assert!(t0.elapsed() < Duration::from_millis(900), "the test ran past until");
+        assert_eq!(a.path(&pb), Some(&Path::Direct(b_at)), "b's link stays");
+        assert!(a.via_birthday(&pb), "on its route");
+        assert_eq!((a.route_count(), a.extra_sockets().1), (routes, 1), "a copy holds no socket");
+        poll_until(&mut [&mut a], |_| t0.elapsed() > Duration::from_millis(1100));
+        assert_eq!(a.extra_sockets(), (vec![socks[0]], 1), "only b's route is left");
+        assert_eq!(a.route_count(), 1);
+        assert!(a.via_birthday(&pb));
+    }
+
+    #[test]
+    fn birthday_sockets_route_a_copied_hs1_only_until_until() {
+        a_copied_hs1_routes_only_its_answer(false);
+    }
+
+    #[test]
+    fn birthday_sockets_keep_the_route_of_a_copied_hs1_from_the_peer() {
+        a_copied_hs1_routes_only_its_answer(true);
     }
 
     /// NB-042: any interface lists IPv6 only on a dual-stack socket.

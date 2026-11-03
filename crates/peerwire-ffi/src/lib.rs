@@ -11,6 +11,9 @@
 //!   with [`pw_free`].
 //! - Return codes: `>= 0` success (a length where one is returned), `< 0` an
 //!   error from [`PW_ERR_*`](PW_ERR_NOT_CONNECTED).
+//! - A null handle, a null output, or a null input with a length over 0 is
+//!   refused as a null peer id is: PW_ERR_INVALID where an error code can be
+//!   returned, and nothing done by the functions that return nothing.
 //!
 //! Events are encoded as `kind(u8) peer(32) ...`:
 //! ```text
@@ -52,21 +55,30 @@ fn now(us: u64) -> Instant {
     Instant::from_micros(us)
 }
 
-unsafe fn peer(p: *const u8) -> Option<PeerId> {
-    if p.is_null() {
-        return None;
+/// The `len` bytes at `p`, or none if `p` is null and `len` isn't 0 (with 0, `p`
+/// isn't read). Every input buffer goes through it.
+unsafe fn bytes<'a>(p: *const u8, len: usize) -> Option<&'a [u8]> {
+    match len {
+        0 => Some(&[]),
+        _ => (!p.is_null()).then(|| slice::from_raw_parts(p, len)),
     }
-    let mut id = [0u8; 32];
-    id.copy_from_slice(slice::from_raw_parts(p, 32));
-    Some(PeerId(id))
 }
 
-unsafe fn bytes<'a>(p: *const u8, len: usize) -> &'a [u8] {
-    if len == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(p, len)
-    }
+/// The 32 bytes at `p` (a peer id, a key, a seed), or none if `p` is null.
+unsafe fn bytes32(p: *const u8) -> Option<[u8; 32]> {
+    let mut a = [0u8; 32];
+    a.copy_from_slice(bytes(p, 32)?);
+    Some(a)
+}
+
+unsafe fn peer(p: *const u8) -> Option<PeerId> {
+    bytes32(p).map(PeerId)
+}
+
+/// `p`, an output of `len` items, or none if it is null and `len` isn't 0. Every
+/// output buffer goes through it, before anything is taken to write there.
+fn writable<T>(p: *mut T, len: usize) -> Option<*mut T> {
+    (!p.is_null() || len == 0).then_some(p)
 }
 
 #[no_mangle]
@@ -95,21 +107,16 @@ pub unsafe extern "C" fn pw_endpoint_new(
     share_addresses: u32,
     out_peer: *mut u8,
 ) -> *mut PwEndpoint {
-    if seed.is_null() || out_peer.is_null() {
-        return std::ptr::null_mut();
-    }
-    let mut s = [0u8; 32];
-    s.copy_from_slice(bytes(seed, 32));
-    let identity = if secret.is_null() {
-        // Keep the endpoint's seed independent of the key-derivation stream.
-        let mut rng = ChaCha20Rng::from_seed(s);
-        let id = Identity::generate(&mut rng);
-        rand_core::RngCore::fill_bytes(&mut rng, &mut s);
-        id
-    } else {
-        let mut k = [0u8; 32];
-        k.copy_from_slice(bytes(secret, 32));
-        Identity::from_secret_bytes(&k)
+    let (Some(mut s), Some(out_peer)) = (bytes32(seed), writable(out_peer, 32)) else { return std::ptr::null_mut() };
+    let identity = match bytes32(secret) {
+        Some(k) => Identity::from_secret_bytes(&k),
+        None => {
+            // Keep the endpoint's seed independent of the key-derivation stream.
+            let mut rng = ChaCha20Rng::from_seed(s);
+            let id = Identity::generate(&mut rng);
+            rand_core::RngCore::fill_bytes(&mut rng, &mut s);
+            id
+        }
     };
     let config = Config { share_addresses: share_addresses != 0, ..Config::default() };
     let ep = Endpoint::new(&identity, config, s);
@@ -127,9 +134,12 @@ pub unsafe extern "C" fn pw_endpoint_free(h: *mut PwEndpoint) {
 }
 
 /// Copies the 32-byte secret key to `out`, so the host can persist the identity.
+/// Returns 0, or PW_ERR_INVALID (nothing written) for a null `h` or `out`.
 #[no_mangle]
-pub unsafe extern "C" fn pw_secret(h: *const PwEndpoint, out: *mut u8) {
-    slice::from_raw_parts_mut(out, 32).copy_from_slice(&(*h).identity.secret_bytes());
+pub unsafe extern "C" fn pw_secret(h: *const PwEndpoint, out: *mut u8) -> i32 {
+    let (Some(h), Some(out)) = (h.as_ref(), writable(out, 32)) else { return PW_ERR_INVALID };
+    slice::from_raw_parts_mut(out, 32).copy_from_slice(&h.identity.secret_bytes());
+    0
 }
 
 /// Dials `peer_id` at `addr`. A no-op if already linked, or while relay-only if
@@ -137,8 +147,8 @@ pub unsafe extern "C" fn pw_secret(h: *const PwEndpoint, out: *mut u8) {
 /// already running takes `addr` as one more path.
 #[no_mangle]
 pub unsafe extern "C" fn pw_connect(h: *mut PwEndpoint, now_us: u64, addr: u32, peer_id: *const u8) -> i32 {
-    let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
-    match (*h).ep.connect(now(now_us), addr, p) {
+    let (Some(h), Some(p)) = (h.as_mut(), peer(peer_id)) else { return PW_ERR_INVALID };
+    match h.ep.connect(now(now_us), addr, p) {
         Ok(()) => 0,
         Err(_) => PW_ERR_INVALID,
     }
@@ -147,8 +157,8 @@ pub unsafe extern "C" fn pw_connect(h: *mut PwEndpoint, now_us: u64, addr: u32, 
 /// Dials `peer_id` through the connected peer `relay`.
 #[no_mangle]
 pub unsafe extern "C" fn pw_connect_via(h: *mut PwEndpoint, now_us: u64, relay: *const u8, peer_id: *const u8) -> i32 {
-    let (Some(r), Some(p)) = (peer(relay), peer(peer_id)) else { return PW_ERR_INVALID };
-    match (*h).ep.connect_via(now(now_us), r, p, &[]) {
+    let (Some(h), Some(r), Some(p)) = (h.as_mut(), peer(relay), peer(peer_id)) else { return PW_ERR_INVALID };
+    match h.ep.connect_via(now(now_us), r, p, &[]) {
         Ok(()) => 0,
         Err(_) => PW_ERR_INVALID,
     }
@@ -161,8 +171,8 @@ pub unsafe extern "C" fn pw_connect_via(h: *mut PwEndpoint, now_us: u64, relay: 
 /// is sent to `addr`.
 #[no_mangle]
 pub unsafe extern "C" fn pw_add_candidate(h: *mut PwEndpoint, now_us: u64, addr: u32, peer_id: *const u8) -> i32 {
-    let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
-    (*h).ep.add_candidates(now(now_us), &p, &[addr]);
+    let (Some(h), Some(p)) = (h.as_mut(), peer(peer_id)) else { return PW_ERR_INVALID };
+    h.ep.add_candidates(now(now_us), &p, &[addr]);
     0
 }
 
@@ -172,8 +182,8 @@ pub unsafe extern "C" fn pw_add_candidate(h: *mut PwEndpoint, now_us: u64, addr:
 /// it when that relay goes. See `Endpoint::set_slow`.
 #[no_mangle]
 pub unsafe extern "C" fn pw_set_slow(h: *mut PwEndpoint, peer_id: *const u8, addr: u32, on: u32) {
-    if let Some(p) = peer(peer_id) {
-        (*h).ep.set_slow(&p, (on != 0).then_some(addr));
+    if let (Some(h), Some(p)) = (h.as_mut(), peer(peer_id)) {
+        h.ep.set_slow(&p, (on != 0).then_some(addr));
     }
 }
 
@@ -184,8 +194,8 @@ pub unsafe extern "C" fn pw_set_slow(h: *mut PwEndpoint, peer_id: *const u8, add
 /// See `Endpoint::add_relay`.
 #[no_mangle]
 pub unsafe extern "C" fn pw_add_relay(h: *mut PwEndpoint, now_us: u64, relay: *const u8, peer_id: *const u8) -> i32 {
-    let (Some(r), Some(p)) = (peer(relay), peer(peer_id)) else { return PW_ERR_INVALID };
-    (*h).ep.add_relay(now(now_us), r, &p);
+    let (Some(h), Some(r), Some(p)) = (h.as_mut(), peer(relay), peer(peer_id)) else { return PW_ERR_INVALID };
+    h.ep.add_relay(now(now_us), r, &p);
     0
 }
 
@@ -200,41 +210,45 @@ pub unsafe extern "C" fn pw_add_relay(h: *mut PwEndpoint, now_us: u64, relay: *c
 /// relay through it alone.
 #[no_mangle]
 pub unsafe extern "C" fn pw_set_relay_only(h: *mut PwEndpoint, on: u32) {
-    (*h).ep.set_relay_only(on != 0);
+    if let Some(h) = h.as_mut() {
+        h.ep.set_relay_only(on != 0);
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pw_disconnect(h: *mut PwEndpoint, peer_id: *const u8) {
-    if let Some(p) = peer(peer_id) {
-        (*h).ep.disconnect(&p);
+    if let (Some(h), Some(p)) = (h.as_mut(), peer(peer_id)) {
+        h.ep.disconnect(&p);
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pw_is_connected(h: *const PwEndpoint, peer_id: *const u8) -> u32 {
-    peer(peer_id).is_some_and(|p| (*h).ep.is_connected(&p)) as u32
+    h.as_ref().zip(peer(peer_id)).is_some_and(|(h, p)| h.ep.is_connected(&p)) as u32
 }
 
 /// Smoothed RTT in microseconds, or -1 if unknown.
 #[no_mangle]
 pub unsafe extern "C" fn pw_rtt_us(h: *const PwEndpoint, peer_id: *const u8) -> i64 {
-    peer(peer_id).and_then(|p| (*h).ep.rtt(&p)).map_or(-1, |d| d.as_micros() as i64)
+    h.as_ref().zip(peer(peer_id)).and_then(|(h, p)| h.ep.rtt(&p)).map_or(-1, |d| d.as_micros() as i64)
 }
 
 /// RTT over the path the link to the peer is on, measured since it moved there,
 /// in microseconds, or -1 if unknown (see `Endpoint::path_rtt`).
 #[no_mangle]
 pub unsafe extern "C" fn pw_path_rtt_us(h: *const PwEndpoint, peer_id: *const u8) -> i64 {
-    peer(peer_id).and_then(|p| (*h).ep.path_rtt(&p)).map_or(-1, |d| d.as_micros() as i64)
+    h.as_ref().zip(peer(peer_id)).and_then(|(h, p)| h.ep.path_rtt(&p)).map_or(-1, |d| d.as_micros() as i64)
 }
 
 /// Writes 16 counters as u64 to `out`: tx_packets, rx_packets, rx_malformed,
 /// rx_unknown_session, rx_auth_failed, rx_replayed, rx_handshake_dropped,
 /// retransmits, unreliable_dropped, roams, relayed, relay_dropped,
-/// punches_sent, punch_succeeded, punch_failed, direct_fallbacks.
+/// punches_sent, punch_succeeded, punch_failed, direct_fallbacks. `out` needn't
+/// be aligned. Returns 0, or PW_ERR_INVALID (nothing written) for a null `h` or `out`.
 #[no_mangle]
-pub unsafe extern "C" fn pw_stats(h: *const PwEndpoint, out: *mut u64) {
-    let s = (*h).ep.stats();
+pub unsafe extern "C" fn pw_stats(h: *const PwEndpoint, out: *mut u64) -> i32 {
+    let (Some(h), Some(out)) = (h.as_ref(), writable(out, 16)) else { return PW_ERR_INVALID };
+    let s = h.ep.stats();
     let v = [
         s.tx_packets,
         s.rx_packets,
@@ -253,7 +267,9 @@ pub unsafe extern "C" fn pw_stats(h: *const PwEndpoint, out: *mut u64) {
         s.punch_failed,
         s.direct_fallbacks,
     ];
-    slice::from_raw_parts_mut(out, 16).copy_from_slice(&v);
+    // As bytes, so `out` needn't be aligned for u64.
+    std::ptr::copy_nonoverlapping(v.as_ptr().cast::<u8>(), out.cast::<u8>(), std::mem::size_of_val(&v));
+    0
 }
 
 /// `lane`: 0 reliable (up to 1 MiB), 1 unreliable (up to 1100 B), 2 urgent
@@ -266,13 +282,13 @@ pub unsafe extern "C" fn pw_send(
     data: *const u8,
     len: usize,
 ) -> i32 {
-    let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
+    let (Some(h), Some(p), Some(data)) = (h.as_mut(), peer(peer_id), bytes(data, len)) else { return PW_ERR_INVALID };
     let lane = match lane {
         0 => Lane::Reliable,
         2 => Lane::Urgent,
         _ => Lane::Unreliable,
     };
-    match (*h).ep.send(&p, lane, bytes(data, len)) {
+    match h.ep.send(&p, lane, data) {
         Ok(()) => 0,
         Err(SendError::NotConnected) => PW_ERR_NOT_CONNECTED,
         Err(SendError::TooLarge) => PW_ERR_TOO_LARGE,
@@ -282,14 +298,17 @@ pub unsafe extern "C" fn pw_send(
 
 #[no_mangle]
 pub unsafe extern "C" fn pw_handle_datagram(h: *mut PwEndpoint, now_us: u64, addr: u32, data: *const u8, len: usize) {
-    (*h).ep.handle_datagram(now(now_us), addr, bytes(data, len));
+    if let (Some(h), Some(data)) = (h.as_mut(), bytes(data, len)) {
+        h.ep.handle_datagram(now(now_us), addr, data);
+    }
 }
 
 /// Like `pw_handle_datagram`, for handle `addr`, a channel only `peer_id` sends
 /// on (its WebRTC DataChannel, its signalling pipe): a packet on it for another
 /// peer's link, or a handshake from anyone else, is dropped unread, so no peer
 /// can move another's link onto its own channel. PW_ERR_INVALID, and nothing
-/// read, for a null `peer_id`. See `Endpoint::handle_datagram_from`.
+/// read, for a null `peer_id` (or `h`, or `data` with `len` over 0). See
+/// `Endpoint::handle_datagram_from`.
 #[no_mangle]
 pub unsafe extern "C" fn pw_handle_datagram_from(
     h: *mut PwEndpoint,
@@ -299,24 +318,27 @@ pub unsafe extern "C" fn pw_handle_datagram_from(
     data: *const u8,
     len: usize,
 ) -> i32 {
-    let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
-    (*h).ep.handle_datagram_from(now(now_us), addr, &p, bytes(data, len));
+    let (Some(h), Some(p), Some(data)) = (h.as_mut(), peer(peer_id), bytes(data, len)) else { return PW_ERR_INVALID };
+    h.ep.handle_datagram_from(now(now_us), addr, &p, data);
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pw_handle_timeout(h: *mut PwEndpoint, now_us: u64) {
-    (*h).ep.handle_timeout(now(now_us));
+    if let Some(h) = h.as_mut() {
+        h.ep.handle_timeout(now(now_us));
+    }
 }
 
 /// Next deadline in microseconds, or -1 if none.
 #[no_mangle]
 pub unsafe extern "C" fn pw_poll_timeout(h: *const PwEndpoint) -> i64 {
-    (*h).ep.poll_timeout().map_or(-1, |t| t.as_micros() as i64)
+    h.as_ref().and_then(|h| h.ep.poll_timeout()).map_or(-1, |t| t.as_micros() as i64)
 }
 
 /// Writes the next datagram into `buf` (at least `MAX_DATAGRAM` = 1232 bytes)
-/// and its destination handle into `out_addr`. Returns its length, 0 if none.
+/// and its destination handle into `out_addr` (which needn't be aligned).
+/// Returns its length, 0 if none.
 #[no_mangle]
 pub unsafe extern "C" fn pw_poll_transmit(
     h: *mut PwEndpoint,
@@ -325,12 +347,15 @@ pub unsafe extern "C" fn pw_poll_transmit(
     buf: *mut u8,
     cap: usize,
 ) -> i32 {
+    let (Some(h), Some(out_addr), Some(buf)) = (h.as_mut(), writable(out_addr, 1), writable(buf, cap)) else {
+        return PW_ERR_INVALID;
+    };
     if cap < peerwire_core::MAX_DATAGRAM {
         return PW_ERR_BUFFER;
     }
-    match (*h).ep.poll_transmit(now(now_us)) {
+    match h.ep.poll_transmit(now(now_us)) {
         Some(t) => {
-            *out_addr = t.dst;
+            out_addr.write_unaligned(t.dst);
             slice::from_raw_parts_mut(buf, t.payload.len()).copy_from_slice(&t.payload);
             t.payload.len() as i32
         }
@@ -394,7 +419,7 @@ fn encode_event(e: Event<u32>) -> Vec<u8> {
 /// `-(needed)` if `buf` is too small (the event stays queued).
 #[no_mangle]
 pub unsafe extern "C" fn pw_poll_event(h: *mut PwEndpoint, buf: *mut u8, cap: usize) -> i32 {
-    let h = &mut *h;
+    let (Some(h), Some(buf)) = (h.as_mut(), writable(buf, cap)) else { return PW_ERR_INVALID };
     let e = match h.pending.take() {
         Some(e) => e,
         None => match h.ep.poll_event() {
@@ -422,18 +447,18 @@ pub unsafe extern "C" fn pw_seal(
     out: *mut u8,
     cap: usize,
 ) -> i32 {
-    let Some(to) = peer(to) else { return PW_ERR_INVALID };
-    let needed = len + peerwire_core::sealed::SEAL_OVERHEAD;
+    let (Some(h), Some(to), Some(out)) = (h.as_mut(), peer(to), writable(out, cap)) else { return PW_ERR_INVALID };
     if len > peerwire_core::sealed::MAX_SEALED {
         return PW_ERR_TOO_LARGE;
     }
+    let needed = len + peerwire_core::sealed::SEAL_OVERHEAD;
     if cap < needed {
         return -(needed as i32);
     }
-    let h = &mut *h;
+    let Some(data) = bytes(data, len) else { return PW_ERR_INVALID };
     let mut seed = [0u8; 32];
     rand_core::RngCore::fill_bytes(&mut h.rng, &mut seed);
-    match peerwire_core::sealed::seal(&h.identity, &to, seed, bytes(data, len)) {
+    match peerwire_core::sealed::seal(&h.identity, &to, seed, data) {
         Some(s) => {
             slice::from_raw_parts_mut(out, s.len()).copy_from_slice(&s);
             s.len() as i32
@@ -454,10 +479,14 @@ pub unsafe extern "C" fn pw_open(
     out: *mut u8,
     cap: usize,
 ) -> i32 {
+    let (Some(h), Some(out_from), Some(out)) = (h.as_ref(), writable(out_from, 32), writable(out, cap)) else {
+        return PW_ERR_INVALID;
+    };
     if cap < len {
         return PW_ERR_BUFFER;
     }
-    match peerwire_core::sealed::open(&(*h).identity, bytes(data, len)) {
+    let Some(data) = bytes(data, len) else { return PW_ERR_INVALID };
+    match peerwire_core::sealed::open(&h.identity, data) {
         Some((from, pt)) => {
             slice::from_raw_parts_mut(out_from, 32).copy_from_slice(from.as_bytes());
             slice::from_raw_parts_mut(out, pt.len()).copy_from_slice(&pt);
@@ -472,7 +501,12 @@ pub unsafe extern "C" fn pw_open(
 /// Returns 0, or PW_ERR_INVALID if the seed isn't a valid scalar (retry).
 #[no_mangle]
 pub unsafe extern "C" fn pw_nostr_keypair(seed: *const u8, out_secret: *mut u8, out_pub: *mut u8) -> i32 {
-    let Ok(sk) = k256::schnorr::SigningKey::from_bytes(bytes(seed, 32)) else { return PW_ERR_INVALID };
+    let (Some(seed), Some(out_secret), Some(out_pub)) =
+        (bytes(seed, 32), writable(out_secret, 32), writable(out_pub, 32))
+    else {
+        return PW_ERR_INVALID;
+    };
+    let Ok(sk) = k256::schnorr::SigningKey::from_bytes(seed) else { return PW_ERR_INVALID };
     slice::from_raw_parts_mut(out_secret, 32).copy_from_slice(&sk.to_bytes());
     slice::from_raw_parts_mut(out_pub, 32).copy_from_slice(&sk.verifying_key().to_bytes());
     0
@@ -482,10 +516,13 @@ pub unsafe extern "C" fn pw_nostr_keypair(seed: *const u8, out_secret: *mut u8, 
 /// 32 bytes of auxiliary randomness.
 #[no_mangle]
 pub unsafe extern "C" fn pw_nostr_sign(secret: *const u8, msg: *const u8, aux: *const u8, out_sig: *mut u8) -> i32 {
-    let Ok(sk) = k256::schnorr::SigningKey::from_bytes(bytes(secret, 32)) else { return PW_ERR_INVALID };
-    let mut a = [0u8; 32];
-    a.copy_from_slice(bytes(aux, 32));
-    let Ok(sig) = sk.sign_raw(bytes(msg, 32), &a) else { return PW_ERR_INVALID };
+    let (Some(secret), Some(msg), Some(a), Some(out_sig)) =
+        (bytes(secret, 32), bytes(msg, 32), bytes32(aux), writable(out_sig, 64))
+    else {
+        return PW_ERR_INVALID;
+    };
+    let Ok(sk) = k256::schnorr::SigningKey::from_bytes(secret) else { return PW_ERR_INVALID };
+    let Ok(sig) = sk.sign_raw(msg, &a) else { return PW_ERR_INVALID };
     slice::from_raw_parts_mut(out_sig, 64).copy_from_slice(&sig.to_bytes());
     0
 }
@@ -573,6 +610,97 @@ mod tests {
             let s = k256::schnorr::Signature::try_from(&sig[..]).unwrap();
             assert!(vk.verify_raw(&[9u8; 32], &s).is_ok());
             for h in [a, b, c] {
+                pw_endpoint_free(h);
+            }
+        }
+    }
+
+    /// NB-085 (S1): a null handle, a null output, or a null input with a length
+    /// over 0 is refused, and nothing is done or taken: PW_ERR_INVALID where a
+    /// code can be returned, 0 from pw_is_connected, -1 from the i64 getters. A
+    /// null pointer of length 0 is no input, or room for nothing. Outputs for a
+    /// u32 or u64 needn't be aligned (a debug build checks every dereference).
+    #[test]
+    fn null_pointers_are_refused() {
+        unsafe {
+            let (null, nullm, nh) = (std::ptr::null::<u8>(), std::ptr::null_mut::<u8>(), std::ptr::null_mut());
+            let mut ids = [[0u8; 32]; 2];
+            assert!(pw_endpoint_new(null, null, 0, ids[0].as_mut_ptr()).is_null());
+            assert!(pw_endpoint_new(null, [1u8; 32].as_ptr(), 0, nullm).is_null());
+            let eps: Vec<_> =
+                (0..2).map(|i| pw_endpoint_new(null, [i as u8 + 1; 32].as_ptr(), 0, ids[i].as_mut_ptr())).collect();
+            let (a, b, pa, pb) = (eps[0], eps[1], ids[0].as_ptr(), ids[1].as_ptr());
+            let (mut buf, mut out, mut addr, mut st) = (vec![0u8; 2048], vec![0u8; 2048], 0u32, [0u64; 16]);
+            let (mut k, mut x, mut sig) = ([0u8; 32], [0u8; 32], [0u8; 64]);
+            // A null handle.
+            assert_eq!(pw_secret(nh, k.as_mut_ptr()), PW_ERR_INVALID);
+            assert_eq!(pw_connect(nh, 0, 2, pb), PW_ERR_INVALID);
+            assert_eq!(pw_connect_via(nh, 0, pa, pb), PW_ERR_INVALID);
+            assert_eq!(pw_add_candidate(nh, 0, 2, pb), PW_ERR_INVALID);
+            assert_eq!(pw_add_relay(nh, 0, pa, pb), PW_ERR_INVALID);
+            pw_set_slow(nh, pb, 2, 1);
+            pw_set_relay_only(nh, 1);
+            pw_disconnect(nh, pb);
+            assert_eq!(pw_is_connected(nh, pb), 0);
+            assert_eq!((pw_rtt_us(nh, pb), pw_path_rtt_us(nh, pb), pw_poll_timeout(nh)), (-1, -1, -1));
+            assert_eq!(pw_stats(nh, st.as_mut_ptr()), PW_ERR_INVALID);
+            assert_eq!(pw_send(nh, pb, 0, b"x".as_ptr(), 1), PW_ERR_INVALID);
+            pw_handle_datagram(nh, 0, 2, buf.as_ptr(), 64);
+            assert_eq!(pw_handle_datagram_from(nh, 0, 2, pb, buf.as_ptr(), 64), PW_ERR_INVALID);
+            pw_handle_timeout(nh, 0);
+            assert_eq!(pw_poll_transmit(nh, 0, &mut addr, buf.as_mut_ptr(), buf.len()), PW_ERR_INVALID);
+            assert_eq!(pw_poll_event(nh, buf.as_mut_ptr(), buf.len()), PW_ERR_INVALID);
+            assert_eq!(pw_seal(nh, pb, b"x".as_ptr(), 1, out.as_mut_ptr(), out.len()), PW_ERR_INVALID);
+            assert_eq!(pw_open(nh, buf.as_ptr(), 200, k.as_mut_ptr(), out.as_mut_ptr(), out.len()), PW_ERR_INVALID);
+            pw_endpoint_free(nh);
+            // Null outputs, and null inputs with a length.
+            assert_eq!(pw_secret(a, nullm), PW_ERR_INVALID);
+            assert_eq!(pw_stats(a, std::ptr::null_mut()), PW_ERR_INVALID);
+            assert_eq!(pw_send(a, pb, 0, null, 1), PW_ERR_INVALID);
+            pw_handle_datagram(a, 0, 2, null, 64);
+            assert_eq!(pw_handle_datagram_from(a, 0, 2, pb, null, 64), PW_ERR_INVALID);
+            pw_stats(a, st.as_mut_ptr());
+            assert_eq!(st[1], 0, "no datagram was read");
+            assert_eq!(pw_poll_transmit(a, 0, std::ptr::null_mut(), buf.as_mut_ptr(), buf.len()), PW_ERR_INVALID);
+            assert_eq!(pw_poll_transmit(a, 0, &mut addr, nullm, 1232), PW_ERR_INVALID);
+            assert_eq!(pw_poll_event(a, nullm, 64), PW_ERR_INVALID);
+            assert_eq!(pw_seal(a, pb, null, 1, out.as_mut_ptr(), out.len()), PW_ERR_INVALID);
+            assert_eq!(pw_seal(a, pb, b"x".as_ptr(), 1, nullm, 200), PW_ERR_INVALID);
+            let n = pw_seal(a, pb, b"x".as_ptr(), 1, out.as_mut_ptr(), out.len());
+            assert_eq!(n, 129);
+            let sealed = &out[..n as usize];
+            assert_eq!(pw_open(b, null, sealed.len(), k.as_mut_ptr(), buf.as_mut_ptr(), buf.len()), PW_ERR_INVALID);
+            assert_eq!(pw_open(b, sealed.as_ptr(), sealed.len(), nullm, buf.as_mut_ptr(), buf.len()), PW_ERR_INVALID);
+            assert_eq!(pw_open(b, sealed.as_ptr(), sealed.len(), k.as_mut_ptr(), nullm, 200), PW_ERR_INVALID);
+            assert_eq!(pw_open(b, sealed.as_ptr(), sealed.len(), k.as_mut_ptr(), buf.as_mut_ptr(), buf.len()), 1);
+            let seed = [5u8; 32].as_ptr();
+            assert_eq!(pw_nostr_keypair(null, k.as_mut_ptr(), x.as_mut_ptr()), PW_ERR_INVALID);
+            assert_eq!(pw_nostr_keypair(seed, nullm, x.as_mut_ptr()), PW_ERR_INVALID);
+            assert_eq!(pw_nostr_keypair(seed, k.as_mut_ptr(), nullm), PW_ERR_INVALID);
+            assert_eq!(pw_nostr_keypair(seed, k.as_mut_ptr(), x.as_mut_ptr()), 0);
+            let (sk, msg) = (k.as_ptr(), [9u8; 32].as_ptr());
+            assert_eq!(pw_nostr_sign(null, msg, msg, sig.as_mut_ptr()), PW_ERR_INVALID);
+            assert_eq!(pw_nostr_sign(sk, null, msg, sig.as_mut_ptr()), PW_ERR_INVALID);
+            assert_eq!(pw_nostr_sign(sk, msg, null, sig.as_mut_ptr()), PW_ERR_INVALID);
+            assert_eq!(pw_nostr_sign(sk, msg, msg, nullm), PW_ERR_INVALID);
+            assert_eq!(pw_nostr_sign(sk, msg, msg, sig.as_mut_ptr()), 0);
+            // With length 0, a null pointer is fine: no data, or room for nothing.
+            assert_eq!(pw_connect(a, 0, 2, pb), 0);
+            pump(a, b, 1000);
+            assert_eq!(pw_is_connected(a, pb), 1);
+            assert_eq!(pw_send(a, pb, 1, null, 0), 0);
+            assert_eq!(pw_seal(a, pb, null, 0, nullm, 0), -128);
+            assert!(pw_poll_event(a, nullm, 0) < -33, "the CONNECTED event, kept");
+            // Outputs at an odd address.
+            let odd = buf.as_mut_ptr().add(buf.as_ptr() as usize % 2 + 1);
+            let n = pw_poll_transmit(a, 2000, odd.cast(), out.as_mut_ptr(), 1232);
+            assert!(n > 0);
+            assert_eq!(odd.cast::<u32>().read_unaligned(), 2);
+            assert_eq!(pw_stats(a, odd.cast()), 0);
+            pw_stats(a, st.as_mut_ptr());
+            assert!(st[0] > 0);
+            assert_eq!(st, std::array::from_fn(|i| odd.cast::<u64>().add(i).read_unaligned()));
+            for h in eps {
                 pw_endpoint_free(h);
             }
         }

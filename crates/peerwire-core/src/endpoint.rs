@@ -693,6 +693,20 @@ enum State<A> {
     Live(Box<Link>),
 }
 
+/// Whether a packet authenticated (see `on_packet`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Auth {
+    /// No crypto ran: an HS1 matched again by its index and ephemeral key, or an
+    /// HS2 for a link that is already up.
+    No,
+    /// An HS1 that read. Noise IK's first message has no freshness check, so a
+    /// copy reads too once its half-open entry is gone (NB85-1).
+    Copyable,
+    /// An HS2 that finished our dial, or a Data packet whose AEAD tag checked and
+    /// whose nonce had not been seen.
+    Fresh,
+}
+
 struct Session<A> {
     path: Path<A>,
     peer: PeerId,
@@ -1573,23 +1587,33 @@ impl<A: Address> Endpoint<A> {
         self.on_packet(now, Path::Direct(from), Some(*peer), data);
     }
 
-    /// Like [`Endpoint::handle_datagram`], and additionally reports whether the
-    /// datagram authenticated to a session whose direct path is now `from`.
+    /// Like [`Endpoint::handle_datagram`], and additionally gives the peer whose
+    /// session the datagram authenticated to (its AEAD tag, or a handshake
+    /// message, checked), if that session's direct path is now `from`, and
+    /// whether the datagram was fresh: an HS2 that finished our dial, or a Data
+    /// packet with a new nonce. An HS1 is not: Noise IK's first message has no
+    /// freshness check, so a copy of one reads again once its handshake is no
+    /// longer half-open, and names its peer at the copy's address (NB85-1).
     ///
     /// A birthday-punch host (`Node::read_extra`) adopts an extra socket as the
-    /// route to `from` only when this holds, so an unauthenticated or spoofed
-    /// source can neither redirect our egress nor hold an extra socket open past
-    /// its deadline (NB44-2).
-    pub fn handle_datagram_direct(&mut self, now: Instant, from: A, data: &[u8]) -> bool {
-        match self.on_packet(now, Path::Direct(from.clone()), None, data) {
-            Some(idx) => self.sessions.get(&idx).and_then(|s| s.path.direct()) == Some(&from),
-            None => false,
+    /// route to `from` only for the peer it punches to, so an unauthenticated or
+    /// spoofed source, or another peer, can neither redirect our egress nor hold
+    /// an extra socket open past its deadline (NB44-2, NB44c-1, NB44c-2); for an
+    /// HS1, only until that deadline. An HS1 sent again, matched by its index and
+    /// ephemeral key, or an HS2 for a link already up, runs no crypto, so it
+    /// gives none.
+    pub fn handle_datagram_direct(&mut self, now: Instant, from: A, data: &[u8]) -> Option<(PeerId, bool)> {
+        let (idx, auth) = self.on_packet(now, Path::Direct(from.clone()), None, data)?;
+        if auth == Auth::No {
+            return None;
         }
+        self.sessions.get(&idx).filter(|s| s.path.direct() == Some(&from)).map(|s| (s.peer, auth == Auth::Fresh))
     }
 
-    /// Returns the session the packet belonged to. `owner`: the only peer that
-    /// sends on `from` (see `handle_datagram_from`).
-    fn on_packet(&mut self, now: Instant, from: Path<A>, owner: Option<PeerId>, data: &[u8]) -> Option<u32> {
+    /// Returns the session the packet belonged to, and whether it authenticated
+    /// (see `Auth`). `owner`: the only peer that sends on `from` (see
+    /// `handle_datagram_from`).
+    fn on_packet(&mut self, now: Instant, from: Path<A>, owner: Option<PeerId>, data: &[u8]) -> Option<(u32, Auth)> {
         self.stats.rx_packets += 1;
         match wire::parse(data) {
             None => {
@@ -1614,7 +1638,7 @@ impl<A: Address> Endpoint<A> {
         sender: u32,
         cookie: Option<&Cookie>,
         noise: &[u8],
-    ) -> Option<u32> {
+    ) -> Option<(u32, Auth)> {
         // Before anything is sent again (SEC-13): a part of an HS1 draws nothing.
         if noise.len() != wire::HS1_NOISE {
             self.stats.rx_malformed += 1;
@@ -1634,7 +1658,7 @@ impl<A: Address> Endpoint<A> {
                     self.emit(from, peer, hs2);
                 }
             }
-            return Some(idx);
+            return Some((idx, Auth::No)); // matched by index and ephemeral key: no crypto ran
         }
         if self.peers.len() >= self.config.max_links {
             self.stats.rx_handshake_dropped += 1;
@@ -1718,7 +1742,7 @@ impl<A: Address> Endpoint<A> {
                 if let Some(hs1) = resend {
                     self.emit(from, peer, hs1);
                 }
-                return Some(didx);
+                return Some((didx, Auth::Copyable));
             }
             if let Some(s) = self.sessions.remove(&didx) {
                 inherited = (s.relay, s.candidates);
@@ -1765,7 +1789,7 @@ impl<A: Address> Endpoint<A> {
             },
         );
         self.start_punch(now, idx);
-        Some(idx)
+        Some((idx, Auth::Copyable))
     }
 
     /// `None` if `echoed` is the cookie for an HS1 (`sender`, `eph`) from `addr`
@@ -1800,7 +1824,13 @@ impl<A: Address> Endpoint<A> {
     /// A loaded responder's answer to our HS1 on `from`: the cookie to send it
     /// with. Sent at once the first time, else on the next retry. Taken only for a
     /// dial, from an address it dials; unauthenticated, so of no session.
-    fn on_cookie(&mut self, from: Path<A>, owner: Option<PeerId>, receiver: u32, cookie: &Cookie) -> Option<u32> {
+    fn on_cookie(
+        &mut self,
+        from: Path<A>,
+        owner: Option<PeerId>,
+        receiver: u32,
+        cookie: &Cookie,
+    ) -> Option<(u32, Auth)> {
         if self.on_others_channel(owner, receiver) {
             return None;
         }
@@ -1831,7 +1861,7 @@ impl<A: Address> Endpoint<A> {
         sender: u32,
         receiver: u32,
         noise: &[u8],
-    ) -> Option<u32> {
+    ) -> Option<(u32, Auth)> {
         if self.on_others_channel(owner, receiver) {
             return None;
         }
@@ -1840,7 +1870,7 @@ impl<A: Address> Endpoint<A> {
             return None;
         };
         let State::Dialing(dial) = &mut sess.state else {
-            return Some(receiver); // duplicate HS2 for a link that is already up
+            return Some((receiver, Auth::No)); // duplicate HS2 for a link that is already up: not read
         };
         // Relay-only: answered at our own address only if dialled directly (as
         // `answers_directly`), so a dial through a relay alone completes through
@@ -1887,7 +1917,7 @@ impl<A: Address> Endpoint<A> {
         self.sessions.insert(receiver, sess);
         self.announce(receiver);
         self.start_punch(now, receiver);
-        Some(receiver)
+        Some((receiver, Auth::Fresh))
     }
 
     fn on_data(
@@ -1898,7 +1928,7 @@ impl<A: Address> Endpoint<A> {
         receiver: u32,
         nonce: u64,
         ciphertext: &[u8],
-    ) -> Option<u32> {
+    ) -> Option<(u32, Auth)> {
         if self.on_others_channel(owner, receiver) {
             return None;
         }
@@ -2164,14 +2194,16 @@ impl<A: Address> Endpoint<A> {
             self.forward(now, receiver, &to, &packet, origin.as_ref());
         }
         for (packet, hint) in relayed {
-            if let Some(idx) = self.on_packet(now, Path::Via(peer), None, &packet) {
+            // The relay's hint of where the packet came from, only for one that
+            // authenticated (NB85-I1).
+            if let Some((idx, Auth::Copyable | Auth::Fresh)) = self.on_packet(now, Path::Via(peer), None, &packet) {
                 if let Some(a) = hint {
                     self.add_candidate(now, idx, a);
                 }
             }
         }
         if !self.peers.get(&peer).is_some_and(|&i| i == receiver) {
-            return Some(receiver); // lost a race against a newer link to the same peer
+            return Some((receiver, Auth::Fresh)); // lost a race against a newer link to the same peer
         }
         for data in reliable {
             self.events.push_back(Event::Message { peer, lane: Lane::Reliable, data });
@@ -2183,7 +2215,7 @@ impl<A: Address> Endpoint<A> {
             let reason = if closed { DisconnectReason::ClosedByPeer } else { DisconnectReason::ProtocolViolation };
             self.drop_link(receiver, Some(reason));
         }
-        Some(receiver)
+        Some((receiver, Auth::Fresh))
     }
 
     /// Relays `packet` from the peer on link `src` to peer `to`, tagged with the
@@ -4465,7 +4497,7 @@ mod tests {
     /// A dial takes a cookie only from an address it dials and for its own index.
     /// It sends the HS1 again with it there at once the first time; a later cookie
     /// there goes with the next retry, and the other targets still get the plain
-    /// HS1. A cookie is unauthenticated: `handle_datagram_direct` says false. The
+    /// HS1. A cookie is unauthenticated: `handle_datagram_direct` names no one. The
     /// HS1 a winning simultaneous open sends back at once carries it too.
     #[test]
     fn a_dial_echoes_a_cookie_only_where_it_was_given() {
@@ -4486,7 +4518,7 @@ mod tests {
         assert!(sent(&mut a, t).is_empty());
         let s = a.stats();
         assert_eq!((s.rx_unknown_session, s.rx_wrong_peer), (2, 1));
-        assert!(!a.handle_datagram_direct(t, 2, &wire::encode_cookie(idx, &[1; 16])));
+        assert_eq!(a.handle_datagram_direct(t, 2, &wire::encode_cookie(idx, &[1; 16])), None);
         let got: Vec<_> = sent(&mut a, t).into_iter().map(|x| (x.dst, x.payload)).collect();
         assert_eq!(got, vec![(2, wire::with_cookie(&hs1, &[1; 16]))]);
         a.handle_datagram(t, 2, &wire::encode_cookie(idx, &[2; 16]));
@@ -4533,5 +4565,95 @@ mod tests {
             assert_eq!(got, vec![(9, hs2.clone())]);
         }
         assert_eq!((ep.session_count(), ep.stats().rx_malformed), (1, 6));
+    }
+
+    /// NB44c-1: `handle_datagram_direct` names a peer only for a datagram whose
+    /// crypto ran, on a session whose direct path is `from`. From the peer's own
+    /// address, its HS1 sent again while the handshake is half-open, an HS1 forged
+    /// from its index and ephemeral key, its HS2 sent again once the link is up,
+    /// and an HS2 of junk for our index name no one (and fail no check: none ran),
+    /// nor does its Data packet sent again. A real HS2 and Data packet name the
+    /// peer as fresh. A real HS1 names the peer, and a stranger's HS1 the
+    /// stranger, so the host can tell it isn't the peer it punches to (NB44c-2),
+    /// but neither as fresh: once the link is up, a copy of the peer's HS1 from
+    /// another address names the peer there too (NB85-1), and the link stays.
+    #[test]
+    fn direct_datagrams_name_a_peer_only_once_authenticated() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (pa, pb, pc) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let t = Instant::from_millis(1);
+        // a, at 1, dials b at 2.
+        eps[0].connect(t, 2, pb).unwrap();
+        let hs1 = sent(&mut eps[0], t).remove(0).payload;
+        assert_eq!(eps[1].handle_datagram_direct(t, 1, &hs1), Some((pa, false)));
+        let hs2 = sent(&mut eps[1], t).remove(0).payload;
+        let mut forged = hs1.clone();
+        forged[37..].fill(0x55);
+        for p in [&hs1, &forged] {
+            assert_eq!(eps[1].handle_datagram_direct(t, 1, p), None, "{} bytes", p.len());
+        }
+        assert_eq!(eps[0].handle_datagram_direct(t, 2, &hs2), Some((pb, true)));
+        let ours = u32::from_le_bytes(hs2[5..9].try_into().unwrap());
+        let junk = wire::encode_hs2(77, ours, &[0x55; 48]);
+        for p in [&hs2, &junk] {
+            assert_eq!(eps[0].handle_datagram_direct(t, 2, p), None);
+        }
+        assert_eq!((eps[0].stats().rx_auth_failed, eps[1].stats().rx_auth_failed), (0, 0));
+        let ping = sent(&mut eps[0], t).remove(0).payload;
+        assert_eq!(kind(&ping), wire::DATA);
+        assert_eq!(eps[1].handle_datagram_direct(t, 1, &ping), Some((pa, true)));
+        assert!(eps[0].is_connected(&pb) && eps[1].is_connected(&pa));
+        assert_eq!(eps[1].handle_datagram_direct(t, 1, &ping), None);
+        assert_eq!(eps[1].stats().rx_replayed, 1);
+        // NB85-1: the link is up, so its HS1 is no longer half-open.
+        let t2 = Instant::from_millis(5_000);
+        assert_eq!(eps[1].handle_datagram_direct(t2, 9, &hs1), Some((pa, false)));
+        assert_eq!((eps[1].is_connected(&pa), eps[1].path(&pa)), (true, Some(&Path::Direct(1))));
+        // b and c, at 3, dial each other at once. The smaller PeerId's dial wins: the
+        // other's HS1 reaches it mid-dial (see `on_hs1`), and is answered by the
+        // larger. Neither is fresh.
+        eps[1].connect(t, 3, pc).unwrap();
+        eps[2].connect(t, 2, pb).unwrap();
+        let hs1_of = |ep: &mut Endpoint<u32>| sent(ep, t).into_iter().find(|x| kind(&x.payload) == wire::HS1);
+        let (from_b, from_c) = (hs1_of(&mut eps[1]).unwrap().payload, hs1_of(&mut eps[2]).unwrap().payload);
+        assert_eq!(eps[1].handle_datagram_direct(t, 3, &from_c), Some((pc, false)));
+        assert_eq!(eps[2].handle_datagram_direct(t, 2, &from_b), Some((pb, false)));
+    }
+
+    /// NB85-I1: the address a relay tags a relayed packet with is a candidate only
+    /// if the packet authenticated. Relayed to a by c: an HS2 of junk for a's index
+    /// of its live link with b (not read: the link is up) adds no candidate, a Data
+    /// packet of b's adds its tag, and so does the HS1 of d, a peer new to a, to
+    /// the session it makes.
+    #[test]
+    fn a_relayed_packet_adds_its_tag_only_once_authenticated() {
+        let ids: Vec<Identity> = (1..=4u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (pa, pb, pd) = (ids[0].peer_id(), ids[1].peer_id(), ids[3].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, 2, pb).unwrap();
+        eps[2].connect(t, 1, pa).unwrap();
+        eps[2].connect(t, 2, pb).unwrap();
+        route(&mut eps[..3], &mut t, 200, None);
+        let (ab, cb) = (eps[0].peers[&pb], eps[2].peers[&pb]);
+        let junk = wire::encode_hs2(77, ab, &[0x55; 48]);
+        eps[1].send(&pa, Lane::Unreliable, b"x").unwrap();
+        let data = sent(&mut eps[1], t).into_iter().find(|x| kind(&x.payload) == wire::DATA).unwrap().payload;
+        eps[3].connect(t, 1, pa).unwrap();
+        let hs1 = sent(&mut eps[3], t).remove(0).payload;
+        let before = eps[0].sessions[&ab].candidates.clone();
+        for (packet, tag) in [(&junk, 40), (&data, 41), (&hs1, 42)] {
+            eps[2].forward(t, cb, &pa, packet, Some(&tag));
+            for x in sent(&mut eps[2], t).into_iter().filter(|x| x.dst == 1) {
+                eps[0].handle_datagram(t, 3, &x.payload);
+            }
+        }
+        assert_eq!(eps[0].stats().rx_auth_failed, 0);
+        assert_eq!(eps[0].sessions[&ab].candidates, [&before[..], &[41]].concat());
+        let ad: Vec<_> = eps[0].sessions.values().filter(|s| s.peer == pd).map(|s| s.candidates.clone()).collect();
+        assert_eq!(ad, vec![vec![42]]);
     }
 }
