@@ -11,8 +11,8 @@
 //    scripts, every module they import, the wasm and the images live under assets/<id>/;
 //  - <id> is a hash of the assets: the same for the same inputs, new when the wasm changes;
 //  - doc links point at the rendered page or at GitHub, images at assets/<id>/img/, and a broken link, an image
-//    from outside docs/assets/, an SVG there with a script or an outside reference, or a symlink there (NB67-I2)
-//    fails the build;
+//    from outside docs/assets/, an SVG there with a script or an outside reference, or a symlink among the files
+//    the build reads or publishes, or on their way from the repo's root (NB67-I2, NB73-I1), fails the build;
 //  - the first site's URLs refresh to the new pages;
 //  - .github/workflows/pages.yml, which builds what Pages serves, runs no action but GitHub's own actions/* (NB16-1).
 // node packages/js/test/site_build.mjs (needs packages/js/pkg/peerwire_ffi.wasm: packages/js/build.sh)
@@ -365,17 +365,23 @@ check(['js', 'react', 'rust', 'godot'].every((t) => landing.includes(`<input typ
   `the landing page: four code tabs, highlighted (one checked), npm install, 6 features, the wasm's measured size ` +
   `(${wasmKb} KB, shown ${wasmShown}), 5 demos`);
 
-// Docs on a repo of symlinks to this one, with a docs/README.md of its own that lists one more page, docs/A.md, and
-// copies of the images (the build refuses a symlink under docs/assets/).
+// Docs on a copy of this repo, with a docs/README.md of its own that lists one more page, docs/A.md. What the build
+// reads is copied, since it refuses a symlink there (NB73-I1); the rest, which docs only link to, is symlinks to this
+// repo.
 const fake = path.join(tmp, 'fake');
-fs.mkdirSync(path.join(fake, 'docs/assets'), { recursive: true });
-for (const p of fs.readdirSync(ROOT)) {
-  if (!['docs', 'target', 'tasks', '.git'].includes(p)) fs.symlinkSync(path.join(ROOT, p), path.join(fake, p));
-}
-for (const p of fs.readdirSync(path.join(ROOT, 'docs'))) {
-  if (!['README.md', 'assets'].includes(p)) fs.symlinkSync(path.join(ROOT, 'docs', p), path.join(fake, 'docs', p));
-}
-for (const p of images) fs.copyFileSync(path.join(ROOT, 'docs/assets', p), path.join(fake, 'docs/assets', p));
+const COPY = ['docs', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md', 'packages/js/demo', 'packages/js/src', 'packages/js/pkg',
+  'scripts/site'];
+const mirror = (dir) => {
+  fs.mkdirSync(path.join(fake, dir), { recursive: true });
+  for (const name of fs.readdirSync(path.join(ROOT, dir))) {
+    const p = path.posix.join(dir, name);
+    if (['target', 'tasks', '.git'].includes(p)) continue;
+    if (COPY.includes(p)) fs.cpSync(path.join(ROOT, p), path.join(fake, p), { recursive: true });
+    else if (COPY.some((c) => c.startsWith(`${p}/`))) mirror(p);
+    else fs.symlinkSync(path.join(ROOT, p), path.join(fake, p));
+  }
+};
+mirror('');
 fs.writeFileSync(path.join(fake, 'docs/README.md'), `${fs.readFileSync(path.join(ROOT, 'docs/README.md'), 'utf8')}\n## Test\n\n` +
   '- [A page](A.md): a page of the test.\n');
 const fakeBuild = (md, name) => {
@@ -433,9 +439,41 @@ check(!oddBuild && oddRead('docs/q" &amp;.html').includes(`<a href="${REPO_URL}/
   oddRead('docs/A.html').includes(`<a class="next" ${oddLink}>`) && oddRead('docs/index.html').includes(`<li><a ${oddLink}>Odd</a>`),
   `a doc named ${odd}: its edit link names docs/q%22%20&amp;.md, and the sidebar, pager and overview link to it escaped ${oddBuild}`);
 
-// A symlink under docs/assets/, to an image (here in a directory) or to a directory of them, or docs/assets itself
-// one, fails the build: it would publish what it names on the machine that builds the site (NB67-I2). Each names
-// good images here. A repo reached through a symlink builds.
+// A symlink among the files the build reads or publishes, or on their way from the repo's root, fails the build: it
+// would publish what it names on the machine that builds the site (NB67-I2, NB73-I1). Each case moves a file or
+// directory of the fake repo aside and puts a symlink to it in its place, so the link names what was there.
+const viaSymlink = (rel, name, opts = {}) => {
+  const at = path.join(fake, rel);
+  const aside = path.join(tmp, 'aside');
+  fs.renameSync(at, aside);
+  fs.symlinkSync(aside, at);
+  try {
+    return error(() => buildSite({ root: fake, out: path.join(tmp, name), ...opts }));
+  } finally {
+    fs.rmSync(at);
+    fs.renameSync(aside, at);
+  }
+};
+const symlinked = [
+  ['docs/README.md', /^site: docs\/README\.md is a symlink: the build would publish what it names$/],
+  ['docs', /^site: docs is a symlink \(on the way to docs\/README\.md\): /],
+  ['docs/guides/rooms.md', /^site: docs\/guides\/rooms\.md is a symlink: /],
+  ['docs/guides', /^site: docs\/guides is a symlink: /],
+  ['CHANGELOG.md', /^site: CHANGELOG\.md is a symlink: /],
+  ['packages/js/demo/chat.html', /^site: packages\/js\/demo\/chat\.html is a symlink: /],
+  ['packages/js/demo/chat.js', /^site: packages\/js\/demo\/chat\.js is a symlink: /],
+  ['packages/js/src', /^site: packages\/js\/src is a symlink \(on the way to packages\/js\/src\/[\w/]+\.js\): /],
+  ['packages', /^site: packages is a symlink \(on the way to packages\/js\/demo\/chat\.html\): /],
+  ['packages/js/pkg/peerwire_ffi.wasm', /^site: packages\/js\/pkg\/peerwire_ffi\.wasm is a symlink: /],
+  ['scripts/site/site.css', /^site: scripts\/site\/site\.css is a symlink: /],
+  ['docs/assets', /^site: docs\/assets is a symlink: /],
+  ['docs/assets/logo.svg', /^site: docs\/assets\/logo\.svg is a symlink: /],
+];
+const symlinkMisses = symlinked.map(([rel, re], k) => [rel, viaSymlink(rel, `fake-symlink${k}`), re])
+  .filter(([, m, re]) => !re.test(m)).map(([rel, m]) => `${rel}: got ${JSON.stringify(m)}`);
+// A symlink added under docs/assets/, to an image (in a directory of its own) or to a directory of them, or one that
+// names nothing. The wasm --wasm names may be anywhere, so the repo's then doesn't matter. A repo reached through a
+// symlink builds.
 const assetsDir = path.join(fake, 'docs/assets');
 fs.mkdirSync(path.join(assetsDir, 'sub'));
 fs.symlinkSync(path.join(ROOT, 'docs/assets/logo.svg'), path.join(assetsDir, 'sub/linked.svg'));
@@ -444,17 +482,29 @@ fs.rmSync(path.join(assetsDir, 'sub'), { recursive: true });
 fs.symlinkSync(path.join(ROOT, 'docs/assets'), path.join(assetsDir, 'linked'));
 const linkedDir = fakeBuild('# A\n', 'fake-link-dir');
 fs.rmSync(path.join(assetsDir, 'linked'));
-fs.renameSync(assetsDir, path.join(tmp, 'assets-aside'));
-fs.symlinkSync(path.join(tmp, 'assets-aside'), assetsDir);
-const linkedAssets = fakeBuild('# A\n', 'fake-link-assets');
-fs.rmSync(assetsDir);
-fs.renameSync(path.join(tmp, 'assets-aside'), assetsDir);
+fs.symlinkSync(path.join(tmp, 'nowhere.md'), path.join(fake, 'docs/gone.md'));
+const dangling = fakeBuild('# A\n', 'fake-link-dangling');
+fs.rmSync(path.join(fake, 'docs/gone.md'));
+// A module is refused before it's read: chat.js linked to one that imports a file that isn't there fails as a
+// symlink, not on the missing import.
+const chatJs = path.join(fake, 'packages/js/demo/chat.js');
+fs.renameSync(chatJs, path.join(tmp, 'chat-aside.js'));
+fs.writeFileSync(path.join(tmp, 'imports-nothing.js'), "import './nothing-here.js';\n");
+fs.symlinkSync(path.join(tmp, 'imports-nothing.js'), chatJs);
+const unread = fakeBuild('# A\n', 'fake-unread');
+fs.rmSync(chatJs);
+fs.renameSync(path.join(tmp, 'chat-aside.js'), chatJs);
+const givenWasm = viaSymlink('packages/js/pkg/peerwire_ffi.wasm', 'fake-given-wasm', { wasm: wasm2 });
 fs.symlinkSync(fake, path.join(tmp, 'fake-link'));
 const viaLink = error(() => buildSite({ root: path.join(tmp, 'fake-link'), out: path.join(tmp, 'fake-via-link') }));
-check(/docs\/assets\/sub\/linked\.svg is a symlink/.test(linkedFile) && /docs\/assets\/linked is a symlink/.test(linkedDir) &&
-  /docs\/assets is a symlink, or under one/.test(linkedAssets) && !fs.lstatSync(assetsDir).isSymbolicLink() && !viaLink,
-  `a symlink under docs/assets/ (to an image or a directory), or docs/assets one, fails the build, and a repo ` +
-  `reached through one builds ${JSON.stringify([linkedFile, linkedDir, linkedAssets, viaLink])}`);
+check(symlinkMisses.length === 0 && /^site: docs\/assets\/sub\/linked\.svg is a symlink: /.test(linkedFile) &&
+  /^site: docs\/assets\/linked is a symlink: /.test(linkedDir) && /^site: docs\/gone\.md is a symlink: /.test(dangling) &&
+  /^site: packages\/js\/demo\/chat\.js is a symlink: /.test(unread) && !givenWasm && !viaLink &&
+  !fs.lstatSync(assetsDir).isSymbolicLink() && !fakeBuild('# A\n', 'fake-after'),
+  `a symlink fails the build: docs/README.md, a listed doc in docs/ or out, a demo page, a demo module (before it's ` +
+  `read), one under a linked directory, the repo's wasm, site.css, docs/assets or an image, one added there, one ` +
+  `naming nothing; a --wasm builds, and so does a repo reached through a symlink` +
+  `${symlinkMisses.map((m) => `\n     ${m}`).join('')} ${JSON.stringify([linkedFile, linkedDir, dangling, unread, givenWasm, viaLink])}`);
 
 // The checker on its own.
 const site = path.join(tmp, 'check');
