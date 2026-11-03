@@ -541,6 +541,11 @@ also [NAT traversal](../concepts/nat-traversal.md).
      stays down, the next waits for the minute to free. `online` and `navigator.connection` changes restart links
      whose ICE is down at once. Each restart is an offer and an answer over signalling, within the peer's publish
      budget (6 at once, then 1 per 5 s; the candidates of an answer it refused wait with it).
+   - **IPv6.** IPv6 has no NAT, so two phones on mobile data that both have it usually link directly, past the
+     carrier NAT their IPv4 sits behind. Browsers gather the candidates themselves; nothing is filtered. In a field
+     test (November 2026: two Android Chrome phones on Jio mobile data, one without microphone permission) the pair
+     linked direct over IPv6 1.2 s after joining, at 31 ms ICE RTT. See
+     [IPv6](../concepts/nat-traversal.md#ipv6-dual-stack).
 2. **Through another member** (`'peer'`). When a link isn't open `fallbackMs` (8 s) after its offer, or its ICE
    fails, the dialling side dials the peer again through every member it has a direct link to, including members
    that link later. The core forwards for linked peers (`connect_via`, 256 KiB/s per peer) and sees only ciphertext.
@@ -665,7 +670,8 @@ later visits and to pages of that origin that never ask.
   on its hotspot) the pair linked direct in 1.2 s, at about 10 ms, when both pages had microphone permission, and
   over the signalling relays in 5 to 6 s, at about 600 ms, when they didn't.
 - `'public-only'`: none of those, and so not that direct path either. Each interface's public address as STUN sees it
-  still goes (the Wi-Fi's and the mobile network's, or the real network's under a VPN).
+  still goes (the Wi-Fi's and the mobile network's, or the real network's under a VPN). On IPv6 that public address
+  is the device's own, as there is no NAT: the same one `'direct'` sends as a host candidate.
 
 ## loadPeerwire
 
