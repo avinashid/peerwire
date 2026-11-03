@@ -395,7 +395,7 @@ async function enter(kind, key) {
   const signaling = params.get('signal') === 'local' ? 'local' : 'nostr';
   await micChecked; // a stored grant must be known before choosing the global room's privacy
   const privacy = kind === 'global' && micState === 'granted' ? 'public-only' : 'direct';
-  log('info', `joining the ${kind} room over ${signaling === 'local' ? 'local BroadcastChannel' : `Nostr (${(relays ?? DEFAULT_RELAYS).join(', ')})`}${params.get('rtc') === 'off' ? ', WebRTC disabled (?rtc=off)' : ''}${privacy === 'public-only' ? ', without local addresses (the microphone is allowed)' : ''}`);
+  log('info', `joining the ${kind} room over ${signaling === 'local' ? 'local BroadcastChannel' : `Nostr (${(relays ?? DEFAULT_RELAYS).join(', ')})`}${params.get('rtc') === 'off' ? ', WebRTC disabled (?rtc=off)' : ''}${privacy === 'public-only' ? ', without local addresses (the microphone is allowed)' : ''}${kind === 'global' ? ', with no automatic birthday punch (the button runs one)' : ''}`);
   const started = now();
   try {
     room = await joinRoom({
@@ -407,6 +407,9 @@ async function enter(kind, key) {
       presence: { ...presence(), name: clip($('name').value.trim(), 20) || 'guest' },
       // The global room never makes new connections because of a grant: it rejoins (MIC-1).
       retryOnGrant: kind !== 'global',
+      // Nor opens a fleet a stranger asked for: anyone can open it, and a member names the address
+      // a fleet aims at (NB84-1). There the button runs one, on a click (NB48-1).
+      birthday: kind !== 'global',
       ...(relays?.length && { relays }),
       ...(params.get('rtc') === 'off' && { RTCPeerConnection: NoIcePc }),
     });
@@ -1445,6 +1448,8 @@ window.netlab = {
   // no same-nat of its own).
   trace: (i, what, d) => room.transport.trace?.(room.peers[i], what, d),
   get room() { return roomKind && { kind: roomKind, label: roomLabel(), link: roomLink() }; },
+  // Whether the room runs its own birthday punches (src/punch.js).
+  get autoPunch() { return room ? room.punches?.on === true : null; },
   roomIdOf,
   joinPrivate: (key) => enter('private', key ?? randomRoomId()),
 };

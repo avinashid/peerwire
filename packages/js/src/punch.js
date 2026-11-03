@@ -20,40 +20,64 @@
 //
 // Bounds: one punch at a time per WebRTC implementation (a page's RTCPeerConnection: all
 // its rooms, and Net Lab's button), as a fleet is FLEET_SIZE connections and Chrome allows
-// a page about 500; after one that opened a fleet or sprayed, the next waits gapMs. One
-// try per peer for the room's life. A punch whose channel hasn't opened by punchMs ends;
-// everything it opened closes then, when the peer goes, and when we leave.
+// a page about 500; after one that opened a fleet or sprayed, the next waits gapMs. The
+// address a punch aims at comes from the peer's own candidates, which the peer writes, so a
+// member can name a third party's: per destination IP, at most ipMax punches that opened a
+// fleet or sprayed per ipWindowMs, whichever rooms and peers ask (NB84-1, as NB44-1 does
+// natively). One try per peer for the room's life. A punch whose channel hasn't opened by
+// punchMs ends; everything it opened closes then, when the peer goes, and when we leave.
 
 import { openFleet, openSpray, randomCredentials, sprayPorts, stripCandidates, isPublicV4, FLEET_SIZE, SPRAY_PORTS } from './birthday.js';
 import { natOfPorts } from './webrtc.js';
 
 const MAX_SDP = 16 * 1024; // a Punch frame's description; a data-channel-only one is about 600 bytes
 const MAX_TRIED = 1024; // peers punched with in one room; past that, no more punches
+// Destination IPs a slot remembers punches at; when full, a new one is refused, not one evicted.
+// With gapMs between punches that spent something, ipWindowMs holds at most 10 of them.
+export const MAX_IPS = 64;
 const dec = new TextDecoder();
 
 const slots = new WeakMap(); // RTCPeerConnection class -> its punch slot
 
 // The punch slot of `Pc` (a page's RTCPeerConnection): one punch holds it at a time, and after
 // one that spent something (`spent`: a fleet, a spray) it stays shut for Punches.gapMs. Net Lab's
-// button takes it too, so a page never holds two fleets.
+// button takes it too, so a page never holds two fleets. A punch that names the destination IP
+// it aims at (`ip`) is refused once Punches.ipMax punches at that IP spent something in the last
+// Punches.ipWindowMs, or when MAX_IPS other IPs are remembered; one at a time is the slot's.
 export function punchSlot(Pc) {
   let s = slots.get(Pc);
   if (s) return s;
   let holder = null;
+  let holderIp = null;
   let shutUntil = 0;
+  const ips = new Map(); // destination IP -> when punches at it that spent something ended, oldest first
+  // How many punches at `ip` spent something within the window (forgetting older ones).
+  const aimed = (ip) => {
+    const since = performance.now() - Punches.ipWindowMs;
+    for (const [k, times] of ips) {
+      while (times.length && times[0] <= since) times.shift();
+      if (!times.length) ips.delete(k);
+    }
+    return ips.get(ip)?.length ?? 0;
+  };
   s = {
     get busy() {
       return holder !== null || performance.now() < shutUntil;
     },
-    take(who) {
+    take(who, ip = null) {
       if (s.busy) return false;
+      if (ip !== null && (aimed(ip) >= Punches.ipMax || (!ips.has(ip) && ips.size >= MAX_IPS))) return false;
       holder = who;
+      holderIp = ip;
       return true;
     },
     free(who, spent = true) {
       if (holder !== who) return;
       holder = null;
-      if (spent) shutUntil = performance.now() + Punches.gapMs;
+      if (!spent) return;
+      const t = performance.now();
+      shutUntil = t + Punches.gapMs;
+      if (holderIp !== null) ips.set(holderIp, [...(ips.get(holderIp) ?? []), t]);
     },
   };
   slots.set(Pc, s);
@@ -84,6 +108,8 @@ export class Punches {
   static answerMs = 15000; // the easy side waits this long for the fleet's answer
   static punchMs = 60000; // no channel by then: the punch ends (at ICE's ~20 checks/s, ~1200 sprayed ports)
   static gapMs = 30000; // between punches in a page, after one that spent something
+  static ipMax = 2; // punches that spent something at one destination IP, per page per ipWindowMs
+  static ipWindowMs = 300000;
   static busyMs = [15000, 30000, 60000, 120000]; // a punch put off (busy) tries again after these, then no more
   static fleetSize = FLEET_SIZE; // tests use fewer
 
@@ -137,9 +163,10 @@ export class Punches {
     return isPublicV4(ip) ? { ip, theirs: v.theirs } : null;
   }
 
-  // Takes the slot and starts `run` with `peer`: it ends unless something moves it on within `ms`.
-  begin(peer, run, ms) {
-    if (!this.slot.take(run)) return false;
+  // Takes the slot for `run` with `peer`, aimed at `ip`, and starts it: it ends unless something
+  // moves it on within `ms`.
+  begin(peer, run, ms, ip) {
+    if (!this.slot.take(run, ip)) return false;
     this.tried.add(peer);
     this.runs.set(peer, run);
     run.timer = setTimeout(() => this.end(peer, run, 'timed out'), ms);
@@ -152,7 +179,7 @@ export class Punches {
     const v = this.view(peer, 'easy');
     if (!v || this.closed || this.tried.has(peer) || this.runs.has(peer) || this.tried.size >= MAX_TRIED) return;
     const run = { role: 'easy', ip: v.ip, easy: null, answered: false, spent: false, timer: null };
-    if (!this.begin(peer, run, Punches.answerMs)) return this.busy(peer);
+    if (!this.begin(peer, run, Punches.answerMs, v.ip)) return this.busy(peer);
     let easy;
     try {
       easy = await openSpray({ RTCPeerConnection: this.Pc, iceServers: this.iceServers });
@@ -188,7 +215,8 @@ export class Punches {
 
   // As the hard side: the easy side's offer. The fleet opens only if our own view agrees, aimed
   // at the one address the peer gave, if public and one its own candidates named. Else 'no'
-  // ('busy' when later may do: the slot is held, or we can't say yet).
+  // ('busy' when later may do: the slot is held or shut, that IP has had its punches for now,
+  // or we can't say yet).
   async offered(peer, m) {
     if (this.runs.has(peer)) return; // one punch per peer at a time
     const no = (busy = false) => this.room.send(peer, busy ? { p: 'no', busy } : { p: 'no' });
@@ -199,7 +227,7 @@ export class Punches {
     const ip = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(m.addr)?.[1];
     if (!isPublicV4(ip) || !v.theirs.has(ip)) return no();
     const run = { role: 'hard', fleet: null, spent: true, timer: null };
-    if (!this.begin(peer, run, Punches.punchMs)) return no(true);
+    if (!this.begin(peer, run, Punches.punchMs, ip)) return no(true);
     try {
       const cert = await this.Pc.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
       if (this.runs.get(peer) !== run) return;

@@ -32,12 +32,16 @@
 //   sides; a second answer, or a 'no' after the answer, changes nothing; a punch connection
 //   with no public address sends no offer; a cone side that lost the first offer punches
 //   once a retry's failed link shows the NATs; the slot: one holder, freed by it alone, shut
-//   gapMs after a punch that spent something.
+//   gapMs after a punch that spent something;
+// - per destination IP (NB84-1): three peers behind one public IP, as PeerIds a room-key holder
+//   can mint, get 2 punches, not 3, on the symmetric side (fleets) and on the cone side (sprays);
+//   a peer at another IP still gets one; the slot counts only punches that spent something and
+//   named an IP, forgets them after ipWindowMs, and when full refuses a new IP, forgetting none.
 //
 //   node packages/js/test/room_birthday.mjs
 import { joinRoom, Room, peerwireModule } from '../src/room.js';
 import { WebRtcTransport } from '../src/webrtc.js';
-import { Punches, punchSlot } from '../src/punch.js';
+import { Punches, punchSlot, MAX_IPS } from '../src/punch.js';
 import { SPRAY_PORTS } from '../src/birthday.js';
 import { Lane } from '../src/peerwire.js';
 
@@ -218,7 +222,7 @@ WebRtcTransport.prototype.onSignal = function (from, msg) {
   dropOfferTo = null;
   return Promise.resolve();
 };
-const steps = (owner) => traces.filter((t) => t.owner === owner).map((t) => t.step + (t.why ? `(${t.why})` : '')).join(' ');
+const steps = (owner, peer) => traces.filter((t) => t.owner === owner && (!peer || t.peer === peer)).map((t) => t.step + (t.why ? `(${t.why})` : '')).join(' ');
 
 // Two secrets, the first one's PeerId below the second's (the smaller id dials).
 const pw = await peerwireModule();
@@ -620,6 +624,81 @@ for (const hardLeaves of [true, false]) {
   if (slot.busy || !slot.take(x)) fail('still shut after the gap');
   console.log('the slot: one holder, freed only by it, shut for gapMs after a punch that spent something');
   Punches.gapMs = 0;
+}
+
+// 18. The slot per destination IP (NB84-1): ipMax punches that spent something at one IP per
+// ipWindowMs; one that spent nothing, or named no IP, doesn't count; another IP goes; full, it
+// refuses a new IP but not one it holds, and forgets each once the window has passed.
+{
+  const window = Punches.ipWindowMs;
+  Punches.ipWindowMs = 300;
+  const slot = punchSlot(class {});
+  const run = (ip, spent = true) => {
+    const who = {};
+    if (!slot.take(who, ip)) return false;
+    slot.free(who, spent);
+    return true;
+  };
+  const ip = '192.0.2.1';
+  if (!run(ip) || !run(ip, false) || !run(ip)) fail('refused within ipMax');
+  if (run(ip)) fail('a third punch at one IP');
+  if (!run('192.0.2.2') || !run(null) || slot.busy) fail('another IP, or none, refused');
+  await sleep(Punches.ipWindowMs + 50);
+  if (!run(ip)) fail('still refused once the window passed');
+  for (let i = 1; i < MAX_IPS; i++) if (!run(`198.18.0.${i}`)) fail(`refused the ${i + 1}th IP`);
+  if (run('198.18.1.1')) fail(`a new IP past ${MAX_IPS}`);
+  if (!run(ip)) fail('full, it refused an IP it holds');
+  if (!run(null)) fail('full, it refused a punch naming no IP');
+  await sleep(Punches.ipWindowMs + 50);
+  if (!run('198.18.1.1')) fail('full still once the window passed');
+  console.log(`the slot per destination IP: ${Punches.ipMax} punches that spent something per window, then refused; another IP goes; full at ${MAX_IPS} IPs, a new one refused; all forgotten after the window`);
+  Punches.ipWindowMs = window;
+}
+
+// 19, 20. Per destination IP in rooms (NB84-1): three peers behind one public IP get 2 punches
+// within the window, not 3; then a peer at another IP gets one. As the symmetric side, a page
+// opens 2 fleets at the IP and refuses the third offer (busy, so the peer puts it off and gives
+// up); as the cone side, it sprays the IP twice and never offers to the third. They join one at
+// a time; every pair is blocked, so each is reached over signalling.
+for (const symPage of [true, false]) {
+  n++;
+  const busyMs = Punches.busyMs;
+  Punches.busyMs = [200, 200];
+  const tag = symPage ? 'h' : 'e';
+  const [one, other] = symPage ? [cone('203.0.113.40'), cone('203.0.113.41')] : [sym('198.51.100.41'), sym('198.51.100.42')];
+  const page = `${tag}0`;
+  const names = [page, `${tag}1`, `${tag}2`, `${tag}3`, `${tag}4`];
+  for (const x of names) for (const y of names) if (x < y) block(x, y);
+  const p = await room(page, symPage ? sym('198.51.100.40') : cone('203.0.113.42'));
+  const rs = [];
+  const punched = async (i) => {
+    await until(`${names[i]} punched`, () => isAdopted(p.route(rs[i - 1].self)) && isAdopted(rs[i - 1].route(p.self)), 10000);
+    await until('the slot free', () => !p.punches.slot.busy, 5000);
+  };
+  for (let i = 1; i <= 4; i++) {
+    rs.push(await room(names[i], i === 4 ? other : one));
+    if (i !== 3) {
+      await punched(i);
+      continue;
+    }
+    // The third at the same IP: it puts the punch off after each refusal, then gives up (as
+    // the cone side, the page does that itself, and never offers).
+    const [easy, hard] = symPage ? [rs[2], p] : [p, rs[2]];
+    const gaveUp = () => easy.punches.putOff.get(hard.self) === Punches.busyMs.length && !easy.punches.waits.has(hard.self) && !easy.punches.runs.has(hard.self);
+    await until('the third put off to the end', gaveUp, 5000);
+    await sleep(100);
+    const tries = symPage ? Array(1 + Punches.busyMs.length).fill('start end(refused)').join(' ') : '';
+    if (steps(names[3]) !== tries || steps(page, rs[2].self) || p.route(rs[2].self)?.kind !== 'signaling') fail(`the third at one IP: ${steps(names[3])} / ${steps(page, rs[2].self)}`);
+  }
+  // The fleets (each connection given the cone side's address) and the sprays, by IP.
+  const fleet = symPage ? fleets(page) : names.slice(1).flatMap(fleets);
+  const aimed = (ip) => fleet.filter((f) => f.cands[0].includes(` ${ip} `)).length / FLEET;
+  const sprayed = (ip) => traces.filter((t) => names.includes(t.owner) && t.step === 'spray' && t.ip === ip).length;
+  const [at, again] = symPage ? [aimed(one.ip), aimed(other.ip)] : [sprayed(one.ip), sprayed(other.ip)];
+  if (at !== 2 || again !== 1 || fleet.length !== 3 * FLEET) fail(`at ${one.ip}: ${at}, at ${other.ip}: ${again}; ${fleet.length} fleet connections`);
+  console.log(`per destination IP, as the ${symPage ? 'symmetric side: 2 fleets at' : 'cone side: 2 sprays at'} ${one.ip} for three peers there (the third ${symPage ? 'refused, busy, until it gave up' : 'never offered to'}), then one ${symPage ? 'fleet' : 'spray'} at ${other.ip}`);
+  Punches.busyMs = busyMs;
+  await leaveAll(p, ...rs);
 }
 
 console.log('room_birthday: ok');

@@ -113,8 +113,10 @@ export interface JoinRoomOptions {
    * a symmetric one with no port prediction gets one birthday punch, run over the room's own encrypted link: the
    * symmetric side opens 256 connections, the cone side sprays up to 1024 ports of its public IP, and a channel
    * that forms takes the link over (`route(peer)` says `{ kind: 'direct', adopted: true }`). The fallback carries
-   * the link meanwhile. One punch at a time per page, at most once per peer while you are in the room, 60 s at
-   * most; it needs STUN in `iceServers` and a browser's WebRTC. `false` turns it off, and refuses peers' punches.
+   * the link meanwhile. One punch at a time per page (per `RTCPeerConnection` class: give every room in a page the
+   * same one), at most 2 at any one IP per 5 minutes, at most once per peer while you are in the room, 60 s at
+   * most; it needs STUN in `iceServers` and a browser's WebRTC. The peer's own candidates name the address your
+   * connections check, so a member can name a third party's. `false` turns it off, and refuses peers' punches.
    * Default true. */
   birthday?: boolean;
   /** A WebRTC implementation for runtimes without one (Node: node-datachannel's polyfill).

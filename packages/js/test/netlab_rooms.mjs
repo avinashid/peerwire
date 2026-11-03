@@ -4,7 +4,9 @@
 // - typing a name and "Join room" joins it, and the address bar gets #room=<id>;
 // - the room link opens the same room in another tab, which links and pings;
 // - another name is another room: nobody from the first shows up there;
-// - the name joins the recent rooms; the report never holds it.
+// - the name joins the recent rooms; the report never holds it;
+// - a named room runs its own birthday punches; the global room, which anyone can join, runs
+//   none (NB84-1: a member names the address a fleet aims at) and says so when it joins.
 //
 //   node packages/js/test/netlab_rooms.mjs [screenshot-prefix]
 
@@ -50,6 +52,7 @@ try {
   const room = await a.evaluate(() => ({ ...window.netlab.room, hash: location.hash }));
   ok(room.label === id && room.hash === `#room=${id}` && room.link.endsWith(`?signal=local#room=${id}`), `joined ${room.label}; address ${room.hash}, link ${room.link.split('/').pop()}`);
   ok((await a.textContent('#h-room')) === id, 'the header names the room');
+  ok((await a.evaluate(() => window.netlab.autoPunch)) === true, 'a named room runs its own birthday punches');
 
   // The link opens the same room, with no typing.
   const b = await open(room.link.replace('#', '&name=bravo#'));
@@ -80,9 +83,17 @@ try {
     await a.screenshot({ path: `${shot}-room.png`, fullPage: true });
   }
 
+  // The global room runs no birthday punch of its own (the button still does, on a click).
+  const g = await open(`${page}&name=golf&auto=global`);
+  await wait(g, () => window.netlab.self && window.netlab.room?.kind === 'global');
+  const joined = await g.evaluate(() => window.netlab.report().log.find((e) => e.msg.startsWith('joining the global room'))?.msg);
+  ok((await g.evaluate(() => window.netlab.autoPunch)) === false && /no automatic birthday punch/.test(joined), `the global room runs no birthday punch of its own: "${joined}"`);
+  if (shot) await g.screenshot({ path: `${shot}-global.png` });
+
   // Back at the join screen, the room is a recent one.
   await a.click('#leave');
-  await wait(a, () => !window.netlab.self && document.querySelector('#recent [data-room]'));
+  // Leaving reloads the page: window.netlab is gone until the new page's module runs.
+  await wait(a, () => window.netlab && !window.netlab.self && document.querySelector('#recent [data-room]'));
   ok(await a.evaluate((r) => [...document.querySelectorAll('#recent [data-room]')].some((b) => b.dataset.room === r), id), 'recent rooms list it after leaving');
 } catch (e) {
   ok(false, e.stack ?? String(e));

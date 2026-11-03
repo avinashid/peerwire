@@ -31,7 +31,8 @@ and the commit that fixed it.
 
 - **Birthday punching in rooms:** a peer reached by fallback, when one of you is behind a cone NAT and the other
   behind a symmetric one, gets one birthday punch, and the channel it makes takes the link over. One at a time per
-  page, once per peer; `birthday: false` turns it off.
+  page, at most 2 at any one IP per 5 minutes, once per peer; `birthday: false` turns it off, as Net Lab's global
+  room does.
 - **Security:** a peer's port prediction counts only at a public IPv4 address that its own candidates name, and a
   link adds at most 128 predicted candidates.
 
