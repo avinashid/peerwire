@@ -5,12 +5,14 @@
 //    fenced block in the docs and for random input;
 //  - the sidebar is docs/README.md's: a doc missing from it or listed twice, or a stray line in a group, fails the
 //    build; each doc page has it with the page marked, its group above the title, "On this page", prev and next in
-//    sidebar order and an edit link;
+//    sidebar order and an edit link; a page path is escaped in every link to it, and URL-encoded in the edit link
+//    (NB67-I1);
 //  - every page has its Content-Security-Policy first after <meta charset>, only the demos run scripts, and those
 //    scripts, every module they import, the wasm and the images live under assets/<id>/;
 //  - <id> is a hash of the assets: the same for the same inputs, new when the wasm changes;
 //  - doc links point at the rendered page or at GitHub, images at assets/<id>/img/, and a broken link, an image
-//    from outside docs/assets/ or an SVG there with a script or an outside reference fails the build;
+//    from outside docs/assets/, an SVG there with a script or an outside reference, or a symlink there (NB67-I2)
+//    fails the build;
 //  - the first site's URLs refresh to the new pages;
 //  - .github/workflows/pages.yml, which builds what Pages serves, runs no action but GitHub's own actions/* (NB16-1).
 // node packages/js/test/site_build.mjs (needs packages/js/pkg/peerwire_ffi.wasm: packages/js/build.sh)
@@ -363,7 +365,8 @@ check(['js', 'react', 'rust', 'godot'].every((t) => landing.includes(`<input typ
   `the landing page: four code tabs, highlighted (one checked), npm install, 6 features, the wasm's measured size ` +
   `(${wasmKb} KB, shown ${wasmShown}), 5 demos`);
 
-// Docs on a repo of symlinks to this one, with a docs/README.md of its own that lists one more page, docs/A.md.
+// Docs on a repo of symlinks to this one, with a docs/README.md of its own that lists one more page, docs/A.md, and
+// copies of the images (the build refuses a symlink under docs/assets/).
 const fake = path.join(tmp, 'fake');
 fs.mkdirSync(path.join(fake, 'docs/assets'), { recursive: true });
 for (const p of fs.readdirSync(ROOT)) {
@@ -372,7 +375,7 @@ for (const p of fs.readdirSync(ROOT)) {
 for (const p of fs.readdirSync(path.join(ROOT, 'docs'))) {
   if (!['README.md', 'assets'].includes(p)) fs.symlinkSync(path.join(ROOT, 'docs', p), path.join(fake, 'docs', p));
 }
-for (const p of images) fs.symlinkSync(path.join(ROOT, 'docs/assets', p), path.join(fake, 'docs/assets', p));
+for (const p of images) fs.copyFileSync(path.join(ROOT, 'docs/assets', p), path.join(fake, 'docs/assets', p));
 fs.writeFileSync(path.join(fake, 'docs/README.md'), `${fs.readFileSync(path.join(ROOT, 'docs/README.md'), 'utf8')}\n## Test\n\n` +
   '- [A page](A.md): a page of the test.\n');
 const fakeBuild = (md, name) => {
@@ -413,6 +416,45 @@ const unlisted = fakeBuild('# A\n', 'fake-unlisted');
 fs.rmSync(path.join(fake, 'docs/B.md'));
 check(/docs\/assets\/evil\.svg holds an on\* handler/.test(evil) && /notes\.txt: docs\/assets\/ holds images only/.test(txt) &&
   /docs\/B\.md isn't listed/.test(unlisted), `an SVG with a handler, a non-image in docs/assets/, or a doc not in the sidebar fails the build`);
+
+// A doc whose path needs escaping and encoding: its edit link is the path through encodeURI, then escaped, and every
+// link to it (the sidebar, the pager, the overview's card) is escaped (NB67-I1).
+const odd = 'q" &amp;.md';
+const readme = fs.readFileSync(path.join(fake, 'docs/README.md'), 'utf8');
+fs.writeFileSync(path.join(fake, 'docs', odd), '# Odd\n');
+fs.writeFileSync(path.join(fake, 'docs/README.md'), `${readme}- [Odd](q%22%20&amp;.md): a page with an odd name.\n`);
+const oddBuild = fakeBuild('# A\n', 'fake-odd');
+fs.writeFileSync(path.join(fake, 'docs/README.md'), readme);
+fs.rmSync(path.join(fake, 'docs', odd));
+const oddRead = (p) => (fs.existsSync(path.join(tmp, 'fake-odd', p)) ? fs.readFileSync(path.join(tmp, 'fake-odd', p), 'utf8') : '');
+const oddLink = 'href="q&quot; &amp;amp;.html"';
+check(!oddBuild && oddRead('docs/q" &amp;.html').includes(`<a href="${REPO_URL}/edit/main/docs/q%22%20&amp;amp;.md">Edit this page`) &&
+  oddRead('docs/q" &amp;.html').includes(`<a ${oddLink} aria-current="page">Odd</a>`) &&
+  oddRead('docs/A.html').includes(`<a class="next" ${oddLink}>`) && oddRead('docs/index.html').includes(`<li><a ${oddLink}>Odd</a>`),
+  `a doc named ${odd}: its edit link names docs/q%22%20&amp;.md, and the sidebar, pager and overview link to it escaped ${oddBuild}`);
+
+// A symlink under docs/assets/, to an image (here in a directory) or to a directory of them, or docs/assets itself
+// one, fails the build: it would publish what it names on the machine that builds the site (NB67-I2). Each names
+// good images here. A repo reached through a symlink builds.
+const assetsDir = path.join(fake, 'docs/assets');
+fs.mkdirSync(path.join(assetsDir, 'sub'));
+fs.symlinkSync(path.join(ROOT, 'docs/assets/logo.svg'), path.join(assetsDir, 'sub/linked.svg'));
+const linkedFile = fakeBuild('# A\n', 'fake-link-file');
+fs.rmSync(path.join(assetsDir, 'sub'), { recursive: true });
+fs.symlinkSync(path.join(ROOT, 'docs/assets'), path.join(assetsDir, 'linked'));
+const linkedDir = fakeBuild('# A\n', 'fake-link-dir');
+fs.rmSync(path.join(assetsDir, 'linked'));
+fs.renameSync(assetsDir, path.join(tmp, 'assets-aside'));
+fs.symlinkSync(path.join(tmp, 'assets-aside'), assetsDir);
+const linkedAssets = fakeBuild('# A\n', 'fake-link-assets');
+fs.rmSync(assetsDir);
+fs.renameSync(path.join(tmp, 'assets-aside'), assetsDir);
+fs.symlinkSync(fake, path.join(tmp, 'fake-link'));
+const viaLink = error(() => buildSite({ root: path.join(tmp, 'fake-link'), out: path.join(tmp, 'fake-via-link') }));
+check(/docs\/assets\/sub\/linked\.svg is a symlink/.test(linkedFile) && /docs\/assets\/linked is a symlink/.test(linkedDir) &&
+  /docs\/assets is a symlink, or under one/.test(linkedAssets) && !fs.lstatSync(assetsDir).isSymbolicLink() && !viaLink,
+  `a symlink under docs/assets/ (to an image or a directory), or docs/assets one, fails the build, and a repo ` +
+  `reached through one builds ${JSON.stringify([linkedFile, linkedDir, linkedAssets, viaLink])}`);
 
 // The checker on its own.
 const site = path.join(tmp, 'check');
