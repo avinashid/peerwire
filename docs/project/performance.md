@@ -76,9 +76,9 @@ What limits it:
   gets **0.24 MB/s**, and 0.35 and 0.17 MB/s at 0.5% and 2% loss. Before NB-086 timeouts still halved, about 34
   of its 142 cuts, and it got 0.20, 0.31 and 0.13 MB/s (see tail losses below). At that bound, only a gentler
   response to random loss goes faster: 0.40 MB/s at 1% needs 36 fragments, **theoretical** `b` ≈ 0.93 (two
-  such builds are measured below, not shipped). A buffer
-  that overflows usually shows in the RTT first, so that loss still halves; behind a buffer shorter than 5 ms
-  congestive loss looks random too and keeps 80%, as it does for every sender on that link.
+  such builds are measured below, not shipped). A buffer that overflows usually shows in the RTT first, so that
+  loss still halves; behind a buffer shorter than 5 ms congestive loss looks random too and keeps 80%, as it does
+  for every sender on that link.
 - **A loss at the end of a burst is a tail loss, not a timeout (NB-086).** At a window near 30 the sender goes out
   in ACK-clocked bursts, and the fragments after one lost near the end of a burst leave a round trip later, so no
   ACK shows the hole before its timer runs out, at about 1.3 RTT. The tail-loss probe, re-armed by every ACK, never
@@ -93,8 +93,9 @@ What limits it:
   used to run out first: at 1% loss (seed 1) 340 fragments timed out, 309 of them first sends beyond reach, all
   sent again. They mostly fell in the round trip of an earlier cut, so they cost retransmissions, not cuts. Now
   such a timer waits for the repair's and restarts when the cumulative ACK moves: 25 time out, none beyond reach
-  (30 since NB-086, all tail losses; `bulk --mib 16 --loss 0.01` prints the breakdown). A wider bitmap would gain at most 1–9% more over seeds 1–40
-  at 0.5–2% loss (measured with a 1024-bit bitmap on a scratch build), not worth a wire change.
+  (30 since NB-086, all tail losses; `bulk --mib 16 --loss 0.01` prints the breakdown). A wider bitmap would
+  gain at most 1–9% more over seeds 1–40 at 0.5–2% loss (measured with a 1024-bit bitmap on a scratch build), not
+  worth a wire change.
 - **A timeout deepens a random-loss cut in the same round trip (PERF-10).** Cuts stay one per round trip, but a
   timeout after a cut that kept 80% takes the window to 50% of the flight that cut was taken from, never
   compounding. Before, it was ignored, so a timeout could leave 80% in place. This costs 2–6% at 0.5–2% loss
