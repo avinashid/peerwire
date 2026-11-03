@@ -153,7 +153,8 @@ release of each.
 | NB92-1, NB92-2 (Low), NB92-I1 (Info) | **Fixed** by `5ef2482` before NB-092 merged, so never on main (`broadcast()` refuses the device's own addresses, and the ESP32 firmware adds no leg on a /31 or /32; `new()` sends only to the broadcast address of the interface the group goes through, if private; the docs say a frame published twice within a second is heard once), reviewed 2026-11-03; NB92-I2 (Info) accepted, [The broadcast leg](#nb-092--the-broadcast-leg--nb92-1nb92-3) |
 | NB92-3 (Low) | **Fixed** by `63f639d` before NB-092 merged, so never on main (on Linux and Android each leg's socket is bound to the interface whose subnet holds its address, so the device's other networks can't send frames to the LAN's broadcast address), reviewed 2026-11-03; residuals accepted, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
-| NB62-2 (Info in the emulator, High on a board) | **Fixed** on a board by `c5e13b7` (NB-091), merged `4697a77`: the firmware starts Wi-Fi, with modem sleep off, before any random draw, reviewed 2026-11-03; in QEMU the draws still repeat on every chip (accepted), and the order is the firmware's, not the library's, same section |
+| NB62-2 (Info in the emulator, High on a board) | **Fixed** on a board by `c5e13b7` (NB-091), merged `4697a77`: the firmware starts Wi-Fi, with modem sleep off, before any random draw, reviewed 2026-11-03; in QEMU the draws still repeat on every chip (accepted), and the order is the firmware's, not the library's; NB-095's relay carrier draws after Wi-Fi too, reviewed 2026-11-04, same section |
+| NB95-1 (Medium on a board), NB95-2, NB95-3, NB95-4 (Low), NB95-5, NB95-I1 (Info) | Open (NB-095, before merge): one relay message of a few KB can take more heap than an ESP32 has; a relay that stops reading holds every later publish; the relay thread outranks the Node on a C3; the Wi-Fi firmware's room is public; the firmware logs members' bytes raw; a node on several carriers offers on all, [Several carriers](#several-carriers-and-the-esp32-on-nostr-nb-095--nb95-1nb95-5) |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
@@ -3362,7 +3363,8 @@ own address, joins a room over `LanSignaling` and links with whoever answers, wi
 identity from a 32-byte seed that `run.sh` draws from the host's `/dev/urandom` for each
 node and each run. That seed is one of two QEMU-only settings; the other puts the
 emulated Ethernet MAC in promiscuous mode, because it drops multicast otherwise (a real
-C3 uses Wi-Fi).
+C3 uses Wi-Fi). Since NB-095 a board on Wi-Fi joins its room over a Nostr relay too
+([below](#several-carriers-and-the-esp32-on-nostr-nb-095--nb95-1nb95-5)).
 
 Reviewed 2026-11-01 by reading `a5b4d50` and `e6162f8` (NB-062), then `d5978f9` and
 `4c86af7` (NB-064), against ESP-IDF v5.5.5's lwIP and random-number sources. Measured
@@ -3430,6 +3432,19 @@ Nothing draws before `main`: no crate in the firmware runs code before it, std d
 only for hash keys, and the ESP-IDF crates draw nothing. On the board, seven boots gave
 seven different PeerIds.
 
+Since NB-095 a board on Wi-Fi also builds a `NostrSignaling` carrier, after SNTP and
+before `bind` (reviewed 2026-11-04 by reading `6737208`). Its draws come after Wi-Fi is
+up too:
+- the carrier's signing key and subscription id, and each signature's auxiliary random
+  bytes, from `OsRng`;
+- on the relay thread: its hash keys; TLS, through ring, which draws from
+  `esp_fill_random` only with its `less-safe-getrandom-espidf` feature (without it ring
+  has no random source on ESP-IDF); and the websocket's key and masks, from rand's
+  thread generator, seeded from `OsRng`.
+
+None of the crates NB-095 adds runs code before `main`, and the QEMU path builds no
+relay carrier, so ring never draws there.
+
 Residuals:
 - In QEMU every draw but the host-seeded identity still repeats on every chip (Info,
   accepted): the emulator is for discovery and memory.
@@ -3441,6 +3456,139 @@ Residuals:
   when a board needs a stable identity.
 - The two-chip nonce test needs a second board. By reading, the nonces come from the
   traversal seed, drawn after Wi-Fi.
+- The relay's TLS checks certificates against the clock, which SNTP sets without
+  authentication: a device on the LAN that answers first can set the board's clock. TLS
+  then fails closed or, with the clock set back, accepts a certificate expired since
+  (Info, accepted for the prototype).
+
+### Several carriers, and the ESP32 on Nostr (NB-095) — NB95-1…NB95-5
+
+`MultiSignaling` (`crates/peerwire/src/signaling.rs`) is one carrier over several: it
+subscribes and publishes on each and polls them in turn, so a node on `LanSignaling` and
+`NostrSignaling` has one room with the peers of both. With it the ESP32 firmware on
+Wi-Fi joins its room over the LAN and the relay `wss://nostr.mom`, with STUN on (the
+default servers, Google's and Cloudflare's), and `examples/rust/room_chat.rs` does the
+same on a PC. `NostrSignaling` now builds for ESP-IDF. There its relay stream owns its
+one socket, as ESP-IDF can't duplicate one; it keeps 32 received events, 128 seen ids
+and 8 queued; and its relay thread asks for a 32 KB stack.
+
+Reviewed 2026-11-04 by reading `8b089c2`, `027e4cf`, `fa71e65`, `04c20cb` and `6737208`
+against ESP-IDF v5.5.5's pthread and FreeRTOS sources, ring 0.17.14 and tungstenite
+0.24. Measured with a relay of our own on 127.0.0.1 and a counting allocator, in a
+release build on a 4-core aarch64 host; the probe isn't in the tree. Nothing was run on
+a board.
+
+**What holds.**
+- No message crosses from one carrier to another: `MultiSignaling` publishes only what
+  its node publishes. A message heard on two carriers is acted on once. A hello's second
+  copy finds an offer to its sender made under 2 s before (`OFFER_GAP`), and an offer's
+  second copy has a nonce already seen. The budgets are the node's, so two carriers
+  don't double them, and one `Node::poll` takes at most 256 signals, the carriers in
+  turn.
+- On ESP-IDF the relay's stream owns its socket and the read timeout is set through it
+  (`027e4cf`); a connection that fails drops its one socket. The 32-bit counters, where
+  there are no 64-bit atomics, are statistics only.
+- The 4 KB stack that the TLS handshake overflowed (`fa71e65`) hit the C3's stack guard
+  and rebooted the board, rather than writing past it.
+- TLS checks the relay's certificate against the clock: a board whose SNTP got no answer
+  can't reach the relay, and no check is skipped. A boot that fails restarts after 5 s
+  and draws anew, after Wi-Fi (NB62-2).
+
+**NB95-1 — One relay message of a few KB can take more heap than an ESP32 has (Medium on
+a board, Low elsewhere).** `on_relay_message` parses each message from a relay whole
+into a `serde_json::Value`, then builds the event's id from a copy of its `tags`, and
+`MAX_MESSAGE` is still 128 KiB on ESP-IDF. A `Value` costs several times the JSON it
+came from, most of all for many small values. Measured, the carrier's peak heap for one
+message (on a 64-bit host; a 32-bit chip's `Value` is smaller, its byte buffers the
+same):
+
+| Message | Size | Peak heap |
+|---|---|---|
+| an event the size of the largest signal a LAN frame holds | 2.2 KB | +13 KB |
+| an event with 16 KB of content | 16.8 KB | +111 KB |
+| an event of many empty tags | 4.5 KB | +192 KB |
+| the same, near `MAX_MESSAGE` | 123 KB | +5.9 MB |
+
+A board with two links had 81–83 KB free, 63 KB at the lowest, and on ESP-IDF an
+allocation that fails aborts and reboots. Anyone who can publish to the relay on a topic
+the board subscribes to can send such a message, if the relay forwards it: the room
+topic, which the firmware's public room name gives away (NB95-4), or the board's inbox
+topic, from its PeerId. The board reboots, rejoins, and the next message does it again.
+Theoretical on a board: not run on one.
+
+Fix: on ESP-IDF a `MAX_MESSAGE` of 4 KiB (a signal event is at most about 2.3 KB:
+1,356 B, the largest `LanSignaling` payload, is 1,808 B of base64, theoretical). Before
+parsing, on every target, drop a message with more than 64 `[`, `{` or `,` (a Peerwire
+event has 13), or parse into a type that takes one `p` tag only. On ESP-IDF bound the
+inbox in bytes: 32 events under a 4 KiB cap could hold about 120 KB (32 × 3.8 KB,
+theoretical). A connection that a frame over the cap closes should keep its back-off, so
+a sender can't make the board redo the TLS handshake every second. Measured with the cap
+and the pre-parse limit: the tag message is dropped (+6 KB), a 3.9 KB event takes +17 KB
+and a 16 KB frame is refused. Test: a carrier test against a relay on loopback that
+sends each shape, with the heap counted.
+
+**NB95-2 — A relay that stops reading holds every later publish (Low).** The relay
+socket has a read timeout but no write timeout, and while a connection is up nothing
+bounds the queue from the carrier to its relay thread. Once a relay stops reading (a TCP
+window of zero), the thread blocks in its write for good, the relay still counts as
+open, and every publish after that stays in memory. Measured: 20,000 publishes of a
+1,356 B payload to a relay that stopped reading after the subscription held 41.8 MB for
+12 s, with the relay still open; one that read held 10 KB. Theoretical on a board: free
+heap / (publishes a second × event size), about 16 min for 81 KB at the board run's 12
+publishes in 140 s of about 1 KB each. The relay can do it, or anyone who can hold the
+connection's window shut. Older than NB-095 and on every target, it matters most on a
+board. Fix: a write timeout on the socket in `connect` (`CONNECT_TIMEOUT`), which now
+covers TLS too, as the stream owns the socket; and `MAX_QUEUED` while a connection is
+up, as in the back-off. Measured with the write timeout: the connection drops after 5 s
+and the heap falls to +142 KB, the 64 events kept (8 on ESP-IDF).
+
+**NB95-3 — The relay thread outranks the Node on a C3 (Low).** An ESP-IDF pthread runs
+at priority 5 (`CONFIG_PTHREAD_TASK_PRIO_DEFAULT`) unless its thread config says
+otherwise, and the firmware's `ThreadSpawnConfiguration` only names the relay thread;
+`main` runs in the main task at priority 1 (`ESP_TASK_MAIN_PRIO`). The C3 has one core,
+and FreeRTOS runs the highest-priority task that is ready. While a relay streams events
+at the board, the thread decrypts, parses and hashes them in software, and the Node's
+loop waits until it blocks: no keepalives, retransmits or polls, so links time out and
+the inbox fills before the Node drains it. Not measured: it needs a board and a relay of
+our own on the LAN. Fix: the firmware's `ThreadSpawnConfiguration` gives the relay
+thread priority 1, which ESP-IDF takes from the config even where std sets the stack
+(`pthread.c`), and the ESP32 guide tells apps to do the same.
+
+**NB95-4 — The Wi-Fi firmware joins a public room on a public relay (Low).** The room
+(`lan_chat`'s app, room `esp32`, named in the README) and the relay are fixed, so every
+board flashed with the firmware shares one room with everyone who joins it, from
+anywhere; before NB-095 that was the LAN only. Each such peer links directly
+(`Privacy::Direct`, STUN on), so it learns the board's home public address and its LAN
+address from the offers, takes one of its 8 links, and can send it messages (NB95-5).
+Boards of different owners link with each other too, and NB95-1 needs only the room
+topic. The README and guide don't say so. Fix: the room name from the flash record,
+written by `wifi.sh` (a random one by default, printed for `room_chat`), and the relay
+only when the record names a room; the docs say that anyone with the name links directly
+and sees the home's public address.
+
+**NB95-5 — The firmware logs a member's bytes raw (Info).** It logs the first 24 bytes
+of the first 8 messages, and of every 50th, through `from_utf8_lossy`, which keeps
+control bytes, so a member can send terminal escapes to whoever watches the serial log.
+This is NB64-3, fixed in `lan_chat`, in the firmware since NB-062; NB95-4 opens it to
+anyone on the internet. Fix: `escape_debug()`, as `room_chat` prints.
+
+**NB95-I1 — A node on several carriers offers on all of them (Info).** An offer to a
+member found on the LAN goes to the relays as well, under that member's inbox topic
+(SEC-5), from the board's public address, though the member may never use Nostr. One to
+a member found through the relays goes onto the LAN. So anyone who knows the LAN
+member's PeerId can watch for it on the relays, and a LAN neighbour, who sees room and
+inbox topics in clear
+([LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6)), can watch the
+room's internet side from anywhere. A hello replayed on the LAN within 60 s makes the
+node publish an offer to the relays too, within the hello budget. Fix: SEC-5's. Short of
+it, the `MultiSignaling` docs should say so; later, an offer could go only to the
+carrier its hello came on, if `MultiSignaling` said which carrier delivered a message.
+
+Residuals (accepted):
+- With one relay, the relay, or a flood on the board's topics that its 32-event inbox
+  can't hold, can deny the board's internet side; the LAN carries on.
+- The Xtensa build (`CHIP=esp32`) compiles ring but has run no TLS: its QEMU pair uses
+  the LAN only.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
