@@ -996,15 +996,16 @@ prediction per description, and cap remote candidates per link (for example at 1
 
 `backend/NB-083-sym-ip`. STUN now asks Google's server on a second port, which tells a
 symmetric NAT that maps one port per destination IP (`NatType::SymmetricIp`). Against
-another symmetric NAT, both sides open the 256 sockets and spray 2048 ports. The
-mechanism and costs are in `docs/concepts/nat-traversal.md` (STUN, Two-sided birthday
-punch, Messages, What others learn or can do).
+another symmetric NAT, both sides open the 256 sockets and spray 2048 ports, unless both
+predict their ports (then the lockstep sweep, as before). The mechanism and costs are in
+`docs/concepts/nat-traversal.md` (STUN, Two-sided birthday punch, Messages, What others
+learn or can do).
 
 What changes for an attacker:
 
 | Trigger | Who can trigger it | Traffic per try | Limits |
 |---|---|---|---|
-| An offer saying `SymmetricIp`, to a symmetric node, or `Symmetric` with the mapping entry, to a `SymmetricIp` node | A room member, an invite holder, or a peer the node dialled | The native open and the native spray above, in one punch: about 34 KB from 256 sockets and up to 272,916 B to ports ≥ 1024 of the offer's first address | As the spray: 5 min per peer; the node budget; the NB44-1 per-IP cap, one entry for both halves. Behind a NAT that maps per IP and port, one per 5 min per node (`PER_PORT_PUNCH_GAP`) |
+| An offer saying `SymmetricIp`, to a symmetric node, or `Symmetric` with the mapping entry, to a `SymmetricIp` node, unless both the offer and the node have a prediction | A room member, an invite holder, or a peer the node dialled | The native open and the native spray above, in one punch: about 34 KB from 256 sockets and up to 272,916 B to ports ≥ 1024 of the offer's first address | As the spray: 5 min per peer; the node budget; the NB44-1 per-IP cap, one entry for both halves. Behind a NAT that maps per IP and port, one per 5 min per node (`PER_PORT_PUNCH_GAP`) |
 
 - **Reflection.** What lands on one address is the spray's, under the same per-IP cap,
   so NB44-1's bound holds. Before NB-083 only a cone node sprayed. Now a symmetric

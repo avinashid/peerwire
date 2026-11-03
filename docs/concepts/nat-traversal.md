@@ -86,7 +86,9 @@ can, by the birthday paradox, as Tailscale does:
     at a random port, that lets the peer's address in;
   - this node `Cone`, the peer `Symmetric` or `SymmetricIp` with no prediction: it sprays up to 2048 ports
     (`BIRTHDAY_PROBES`) of the peer's IP, each once, in a random order (`Endpoint::spray`);
-  - a `SymmetricIp` side and another symmetric one: both do both (see [two symmetric NATs](#two-symmetric-nats)).
+  - a `SymmetricIp` side and another symmetric one, unless both predict: both do both (see
+    [two-sided birthday punch](#two-sided-birthday-punch)). Two that predict sweep in
+    [lockstep](#lockstep-prediction) instead.
 
   A probe that lands on one of the 256 mappings reaches its socket. The answer leaves from that socket, and the
   cone lets it in, as it has just sent to that port. The link takes that path.
@@ -180,11 +182,13 @@ a [two-sided birthday punch](#two-sided-birthday-punch) links it with every symm
   | `sym-rand-adf` | per IP and port | random | per IP | `Symmetric` |
   | `sym-ip-adf` | per IP | random | per IP | `SymmetricIp` |
   | `sym-ip-apdf` | per IP | random | per IP and port | `SymmetricIp` |
+  | `ipseq-adf` | per IP | in sequence | per IP | `SymmetricIp`, with a prediction |
+  | `ipseq-apdf` | per IP | in sequence | per IP and port | `SymmetricIp`, with a prediction |
 
-  Every symmetric kind before NB-080 filters by IP and port. `NatConfig::address_filtered` makes any kind filter by
-  IP only, and `NatConfig::address_dependent` maps per IP. The simulator's first STUN server answers on a second
-  port, as Google's does, so [STUN](#stun) tells `sym-ip` from `sym-random`; no public server tells filtering
-  apart, so `sym-ip-apdf` is `SymmetricIp` too.
+  Every symmetric kind before NB-080 filters by IP and port. `NatConfig::address_filtered` makes any kind filter by IP
+  only, and `NatConfig::address_dependent` maps per IP. The two `ipseq` kinds are tested outside the matrix. The
+  simulator's first STUN server answers on a second port, as Google's does, so [STUN](#stun) tells `sym-ip` from
+  `sym-random`; no public server tells filtering apart, so `sym-ip-apdf` is `SymmetricIp` too.
 - **Why per-port mapping on both sides stops a punch.** A link needs, on each NAT, the mapping that carries its
   packets out to let the other side's in: A's mapping at port P made for B's port Q, and B's at Q made for A's P.
   Each side picks only where it sends; its NAT picks the port. A probe that gets in is answered to its source, a new
@@ -225,11 +229,16 @@ mapping, and the prober's NAT lets it in, as it has just sent there. So such a N
 birthday punch against any symmetric NAT, if it lets in any port of an IP it has sent to.
 
 - **Who does what.** A `SymmetricIp` node and a symmetric peer (`Symmetric` or `SymmetricIp`) whose offer says how
-  its NAT maps (the mapping entry, see [Messages](#messages)), and the other way round: each opens 256 extra sockets
+  its NAT maps (the mapping entry, see [Messages](#messages)), and the other way round, when at least one of the two
+  has no prediction: each opens 256 extra sockets
   towards the other's public address 1 s after the offer, and sprays up to 2048 ports of the other's IP from 1.5 s,
   as one punch (`Plan::Both`, then `Plan::Then`). What links them is a probe into a socket of a side that maps per
   IP and filters by IP; with both sides doing both, it doesn't matter which side that is, so it also links one whose
   second STUN port didn't answer, which reads as `Symmetric`.
+- **Two that predict** sweep in [lockstep](#lockstep-prediction) instead, as before NB-083, whatever their offers
+  say of how they map: a `sym-ip` NAT that hands out ports in sequence predicts them, and STUN read it as a
+  sequential `Symmetric` NAT before. Each side sees the same two predictions, so both pick the same plan. The sweep
+  links such pairs every time, while a two-sided punch lets no probe into a side that filters by port.
 - **Older peers.** A node from before NB-083 reads `SymmetricIp` as `Symmetric` and plans nothing for two symmetric
   NATs, so towards a peer whose offer doesn't say how its NAT maps, a `SymmetricIp` node is `Symmetric`, as before:
   no two-sided punch, and lockstep prediction with a sequential peer when both predict.
@@ -257,11 +266,19 @@ birthday punch against any symmetric NAT, if it lets in any port of an IP it has
   | `sym-ip-apdf` × `sym-seq-adf`, `sym-rand-adf` | 2/50, 1/50 (by luck) | | 258 + 1347, 1381 |
   | `sym-ip-apdf` × `sym-ip-apdf` | 0/50 | | 258 + 258 |
   | `sym-random` × `sym-random` (nothing planned) | 0/50 | | 2 + 2 |
+  | `ipseq-adf` × `sym-random` | 50/50 | 2.24 s, 3.45 s | 258 + 497 |
+  | `ipseq-adf` × `sym-ip-apdf` | 50/50 | 2.24 s, 3.45 s | 258 + 258 |
+  | `ipseq-apdf` × `sym-ip-adf` | 50/50 | 2.27 s, 4.19 s | 258 + 258 |
+  | `ipseq-apdf` × `sym-random` | 0/50 | | 258 + 2306 |
+  | `ipseq-adf`, `ipseq-apdf` × a kind that predicts (lockstep) | 50/50 each | 1.51 to 1.53 s, 1.53 s | 2 + 2 to 60 |
 
-  Every link that comes up holds: no new mappings and no roams over 10 s of traffic at 10 packets a second each
-  way. `sym-ip-apdf` lets no probe in, so its tries cost the other side a full spray: about 2300 mappings, under the
-  limits above. From `cargo test -p peerwire-sim --release --test traversal sym_ip -- --nocapture`. Not yet
-  measured on real networks, and how many real NATs map per IP, and of those how many filter by IP, is unknown.
+  The last row is six pairs: `ipseq-adf` against `sym-seq` and `ipseq-apdf`, and `ipseq-apdf` against `sym-seq`,
+  `sym-seq-adf`, `cgnat(pr+sym)` and itself. Before NB-083 the planner gave those pairs the same lockstep sweep, and the
+  four `ipseq` pairs above them nothing. Every link that comes up holds: no new mappings and no roams over 10 s of
+  traffic at 10 packets a second each way. `sym-ip-apdf` lets no probe in, so its tries cost the other side a full
+  spray: about 2300 mappings, under the limits above. From
+  `cargo test -p peerwire-sim --release --test traversal sym_ip -- --nocapture`. Not yet measured on real networks, and
+  how many real NATs map per IP, and of those how many filter by IP, is unknown.
 
 ## IPv6 (dual stack)
 
@@ -625,7 +642,8 @@ traversal privacy_modes_matrix -- --nocapture`:
   saying `Cone` makes a symmetric node send 256 handshakes (about 33 KB) to the offer's address, from 256 sockets
   it keeps for 10 s.
 - **Two-sided birthday punch** (NB-083). An offer that says `SymmetricIp`, to a symmetric node, or `Symmetric` with
-  the mapping entry, to a `SymmetricIp` node, makes it do both of the above in one punch: 256 handshakes from 256
+  the mapping entry, to a `SymmetricIp` node, and that leaves out the prediction (or goes to a node without one;
+  with both, it is the lockstep sweep below), makes it do both of the above in one punch: 256 handshakes from 256
   sockets and a spray of up to 2048 ports of the offer's IP, about 300 KB, under the same limits and per-IP cap.
   What lands on one address is unchanged. New is what a node behind a NAT that maps per IP and port pays: before
   NB-083 it never sprayed, and each probe and socket now costs its NAT a port, up to 2304 a try, held for the NAT's
@@ -703,9 +721,10 @@ Crates added to `peerwire` by NAT traversal:
     random-port symmetric peer, sockets with the dial's HS1 the other way round; none towards a private address,
     open or symmetric peers, or under `RelayOnly`; once per peer, at most 4 at once;
   - two-sided punches: sockets and a spray on a `SymmetricIp` node facing a symmetric peer that says how it maps,
-    and the other way round; none towards a peer that doesn't say (lockstep instead, if both predict), between two
-    `Symmetric` nodes, towards a private address or under `RelayOnly`; once per peer and once per IP; one per 5
-    minutes behind a NAT that maps per IP and port;
+    and the other way round, when either has no prediction; lockstep instead when both predict, whether or not the
+    peer says; none towards a peer that doesn't say and doesn't predict, between two `Symmetric` nodes, towards a
+    private address or under `RelayOnly`; once per peer and once per IP; one per 5 minutes behind a NAT that maps
+    per IP and port;
   - lockstep sweeps: the peer's predicted ports in order, `next + k·step` (96) from the lower PeerId and
     `next + 2k·step` (64) from the other, a step-3 NAT, none unless both sides predict;
   - failure messages naming the symmetric side.
@@ -739,7 +758,8 @@ Crates added to `peerwire` by NAT traversal:
   - the NB-080 kinds against cones and public peers, and `sym-seq-adf` against sequential NATs, over 25 seeds each
     way round: all direct but `sym-seq-adf` sweeping at stride 2 against a sequential NAT that filters by port
     (`cargo test -p peerwire-sim --release --test traversal address_filtering -- --nocapture`);
-  - the `sym-ip` kinds against every symmetric kind, with each side's NAT mappings a try
+  - the `sym-ip` kinds against every symmetric kind, with each side's NAT mappings a try, and the `ipseq` kinds,
+    which sweep in lockstep with a peer that predicts and link 50/50 as before
     ([two-sided birthday punch](#two-sided-birthday-punch));
   - a punch for two NATs that map per IP and port in which both sides open sockets and probe, driven from the test
     ([considered, not built](#two-symmetric-nats));

@@ -17,7 +17,8 @@ and the commit that fixed it.
 - **Harder NATs:**
   - birthday punching and lockstep prediction, so 59 of 64 simulated NAT pairings connect directly;
   - `NatType::SymmetricIp`: STUN asks Google's server on a second port too, which tells a symmetric NAT that maps
-    one port per destination IP; against another symmetric NAT both sides open sockets and probe, so 116 of 144
+    one port per destination IP; against another symmetric NAT both sides open sockets and probe (unless both predict
+    their ports, which keeps lockstep prediction), so 116 of 144
     simulated pairings connect directly. Godot's `get_nat_type()` can return `symmetric-ip`, and code that matches
     on `NatType` needs the new variant;
   - dual-stack IPv4 and IPv6 candidates;
