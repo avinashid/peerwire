@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -52,11 +52,17 @@ pub struct NostrStats {
     pub rejected: u64,
 }
 
+// The ESP32-C3 has no 64-bit atomics; its counters wrap at 2^32.
+#[cfg(target_has_atomic = "64")]
+type Counter = std::sync::atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type Counter = std::sync::atomic::AtomicU32;
+
 #[derive(Default)]
 struct Shared {
-    open: AtomicU64,
-    received: AtomicU64,
-    rejected: AtomicU64,
+    open: Counter,
+    received: Counter,
+    rejected: Counter,
 }
 
 enum Cmd {
@@ -136,12 +142,13 @@ impl NostrSignaling {
     }
 
     /// Counters: open relays, events published, received and refused.
+    #[allow(clippy::useless_conversion)] // from u32 where there are no 64-bit atomics
     pub fn stats(&self) -> NostrStats {
         NostrStats {
-            relays_open: self.shared.open.load(Ordering::Relaxed),
+            relays_open: u64::from(self.shared.open.load(Ordering::Relaxed)),
             published: self.published,
-            received: self.shared.received.load(Ordering::Relaxed),
-            rejected: self.shared.rejected.load(Ordering::Relaxed),
+            received: u64::from(self.shared.received.load(Ordering::Relaxed)),
+            rejected: u64::from(self.shared.rejected.load(Ordering::Relaxed)),
         }
     }
 

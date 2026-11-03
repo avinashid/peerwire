@@ -27,10 +27,13 @@ debug = true
 opt-level = "z"
 
 [dependencies]
-peerwire = { path = "../../crates/peerwire" }
+peerwire = { path = "../../crates/peerwire", features = ["nostr"] }
 esp-idf-svc = "0.53"
 log = "0.4"
 anyhow = "1"
+# Nostr signaling's TLS (rustls on ring): ring draws from esp_fill_random only with this
+# feature, and the firmware starts Wi-Fi before any draw (NB62-2).
+ring = { version = "0.17", features = ["less-safe-getrandom-espidf"] }
 
 [build-dependencies]
 embuild = "0.33.5"

@@ -133,6 +133,53 @@ impl Drop for MemorySignaling {
     }
 }
 
+/// Several carriers as one: it subscribes and publishes on each, and delivers what any
+/// of them hears. A node on a LAN and the internet at once, such as [`LanSignaling`]
+/// with `NostrSignaling` (the `nostr` feature), has one room with the peers of both:
+/// the ones it finds on the LAN and the ones it finds through the relays. A message
+/// that arrives on two carriers is delivered twice; rooms and offers already drop what
+/// they have seen.
+///
+/// [`LanSignaling`]: crate::LanSignaling
+pub struct MultiSignaling {
+    carriers: Vec<Box<dyn Signaling>>,
+    next: usize,
+}
+
+impl MultiSignaling {
+    /// One carrier over `carriers`, in no particular order.
+    pub fn new(carriers: Vec<Box<dyn Signaling>>) -> MultiSignaling {
+        MultiSignaling { carriers, next: 0 }
+    }
+}
+
+impl Signaling for MultiSignaling {
+    fn subscribe(&mut self, topic: Topic) {
+        self.carriers.iter_mut().for_each(|c| c.subscribe(topic));
+    }
+
+    fn unsubscribe(&mut self, topic: Topic) {
+        self.carriers.iter_mut().for_each(|c| c.unsubscribe(topic));
+    }
+
+    fn publish(&mut self, topic: Topic, payload: &[u8]) {
+        self.carriers.iter_mut().for_each(|c| c.publish(topic, payload));
+    }
+
+    /// Takes turns, so a busy carrier can't starve the others.
+    fn poll(&mut self) -> Option<(Topic, Vec<u8>)> {
+        let n = self.carriers.len();
+        for i in 0..n {
+            let k = (self.next + i) % n;
+            if let Some(m) = self.carriers[k].poll() {
+                self.next = (k + 1) % n;
+                return Some(m);
+            }
+        }
+        None
+    }
+}
+
 pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -193,5 +240,29 @@ mod tests {
         b.subscribe(t);
         c.publish(t, b"y");
         assert_eq!(b.poll(), Some((t, b"y".to_vec())));
+    }
+
+    #[test]
+    fn multi_carrier_reaches_the_subscribers_of_each() {
+        let (one, two) = (MemoryHub::new(), MemoryHub::new());
+        let mut m = MultiSignaling::new(vec![Box::new(one.connect()), Box::new(two.connect())]);
+        let (mut a, mut b) = (one.connect(), two.connect());
+        let t = Topic::hash("t");
+        for c in [&mut a as &mut dyn Signaling, &mut b, &mut m] {
+            c.subscribe(t);
+        }
+        m.publish(t, b"m");
+        assert_eq!((a.poll(), b.poll()), (Some((t, b"m".to_vec())), Some((t, b"m".to_vec()))));
+        // Turns: a carrier with two queued can't hold back the other's one.
+        a.publish(t, b"a1");
+        a.publish(t, b"a2");
+        b.publish(t, b"b1");
+        let got: Vec<_> = std::iter::from_fn(|| m.poll()).map(|(_, p)| p).collect();
+        assert_eq!(got, [b"a1".to_vec(), b"b1".to_vec(), b"a2".to_vec()]);
+        m.unsubscribe(t);
+        a.publish(t, b"x");
+        b.publish(t, b"y");
+        assert_eq!(m.poll(), None);
+        assert_eq!(MultiSignaling::new(Vec::new()).poll(), None);
     }
 }

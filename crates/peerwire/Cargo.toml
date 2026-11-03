@@ -76,6 +76,11 @@ name = "lan_chat"
 path = "../../examples/rust/lan_chat.rs"
 
 [[example]]
+name = "room_chat"
+path = "../../examples/rust/room_chat.rs"
+required-features = ["nostr"]
+
+[[example]]
 name = "natcheck"
 path = "../../examples/rust/natcheck.rs"
 required-features = ["nostr"]

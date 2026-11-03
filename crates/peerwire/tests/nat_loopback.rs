@@ -1,6 +1,6 @@
 //! STUN and signaling on real loopback sockets: local mock STUN servers and an
 //! in-process signaling hub, no public network.
-use peerwire::{MemoryHub, NatType, Node, PeerId, Role, Status};
+use peerwire::{MemoryHub, MultiSignaling, NatType, Node, PeerId, Role, Status};
 use peerwire_core::stun;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -80,6 +80,26 @@ fn room_peers_find_each_other_through_signaling() {
         linked(n[0], ids[2]) && linked(n[1], ids[2]) && linked(n[2], ids[0]) && linked(n[2], ids[1])
     }));
     assert_eq!(d.peers().count(), 0);
+}
+
+#[test]
+fn a_node_on_two_carriers_has_one_room_with_the_peers_of_both() {
+    // `lan` and `net` stand for a LAN carrier and the internet's relays: b is only on
+    // one, c only on the other, and a is on both.
+    let (lan, net) = (MemoryHub::new(), MemoryHub::new());
+    let both = MultiSignaling::new(vec![Box::new(lan.connect()), Box::new(net.connect())]);
+    let mut a = Node::builder().signaling(both).bind("127.0.0.1:0").unwrap();
+    let (mut b, mut c) = (room_node(&lan), room_node(&net));
+    let ids = [a.peer_id(), b.peer_id(), c.peer_id()];
+    for n in [&mut a, &mut b, &mut c] {
+        n.join_room("pw-test", "lobby");
+    }
+    assert!(pump(&mut [&mut a, &mut b, &mut c], 5, |n| {
+        linked(n[0], ids[1]) && linked(n[0], ids[2]) && linked(n[1], ids[0]) && linked(n[2], ids[0])
+    }));
+    // b and c share no carrier, so they never hear each other.
+    pump(&mut [&mut a, &mut b, &mut c], 1, |_| false);
+    assert_eq!((a.peers().count(), b.peers().count(), c.peers().count()), (2, 1, 1));
 }
 
 #[test]

@@ -74,7 +74,7 @@ pub use peerwire_core::{
     MAX_UNRELIABLE, MAX_URGENT,
 };
 pub use portmap::{MapProtocol, PortMapping};
-pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};
+pub use signaling::{MemoryHub, MemorySignaling, MultiSignaling, Signaling, Topic};
 pub use traversal::{Failure, NatType, Privacy, Role, Side};
 
 /// An event from a [`Node`]: a peer connected or left, a message arrived, a link moved.

@@ -9,8 +9,8 @@ cd "$(dirname "$0")"
 
 CHIP=${CHIP:-esp32c3}
 case "$CHIP" in
-  esp32c3) target=riscv32imc-esp-espidf; toolchain=() ;;
-  esp32) target=xtensa-esp32-espidf; toolchain=(+esp) ;;
+  esp32c3) target=riscv32imc-esp-espidf; toolchain=(); gcc=riscv32-esp-elf ;;
+  esp32) target=xtensa-esp32-espidf; toolchain=(+esp); gcc=xtensa-esp-elf ;;
   *) echo "CHIP must be esp32c3 or esp32" >&2; exit 1 ;;
 esac
 var=CARGO_TARGET_$(echo "$target" | tr a-z- A-Z_)
@@ -24,6 +24,11 @@ export "${var}_RUSTFLAGS=--cfg espidf_time64"
 export ESP_IDF_CMAKE_GENERATOR=Ninja
 ninja_dir=$(dirname "$(ls ~/.espressif/tools/ninja/*/ninja 2>/dev/null | tail -n 1)")
 [ -x "$ninja_dir/ninja" ] && export PATH="$ninja_dir:$PATH"
+# ring (the Nostr relay's TLS, NB-095) compiles C with the chip's GCC, which ESP-IDF
+# installs; Espressif's RISC-V GCC doesn't define __ILP32__, which ring needs to see 32 bits.
+gcc_dir=$(dirname "$(ls ~/.espressif/tools/$gcc/*/$gcc/bin/$gcc-gcc 2>/dev/null | tail -n 1)")
+[ -x "$gcc_dir/$gcc-gcc" ] && export PATH="$gcc_dir:$PATH"
+if [ "$CHIP" = esp32c3 ]; then export "CFLAGS_$(echo "$target" | tr - _)=-D__ILP32__"; fi
 
 cargo "${toolchain[@]}" build --release --target "$target" -Z build-std=std,panic_abort "${@}"
 

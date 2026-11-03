@@ -4,13 +4,14 @@
 //! and takes the address 10.62.0.<10+n> on QEMU's emulated Ethernet. On a board, wifi.sh
 //! writes Wi-Fi credentials into that sector instead: the chip joins the network, takes an
 //! address by DHCP and joins the `lan_chat` example's room "esp32", so a PC on the same
-//! Wi-Fi running `lan_chat esp32` links with it. Either way the node generates a fresh
-//! identity and finds the others by itself: it joins a room over `LanSignaling`
-//! (UDP multicast on the LAN), so N nodes make a full mesh with no node knowing
-//! another's key or address beforehand. Linked nodes send each other a numbered
+//! Wi-Fi running `lan_chat esp32` links with it. On Wi-Fi it joins that room over a Nostr
+//! relay too (NB-095), so `room_chat esp32` anywhere on the internet links with it as well.
+//! Either way the node generates a fresh identity and finds the others by itself: it joins
+//! a room over `LanSignaling` (UDP multicast on the LAN), so N nodes make a full mesh with
+//! no node knowing another's key or address beforehand. Linked nodes send each other a numbered
 //! reliable message every second, a short line or (run.sh's MSG_KIB) padded to that
 //! many KiB. It logs free heap at each step, when each peer linked after the join,
-//! and every 10 s the heap, stack, link RTTs and LAN signals. Peers are named by the node number
+//! and every 10 s the heap, stack, link RTTs and signals. Peers are named by the node number
 //! in their address (QEMU) or by their address (Wi-Fi).
 
 use std::any::Any;
@@ -32,7 +33,9 @@ use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::sys;
 use esp_idf_svc::wifi::{self, AuthMethod, BlockingWifi, EspWifi, WifiEvent};
 use log::{info, warn};
-use peerwire::{Config, Event, Identity, LanSignaling, Lane, Node, Path, PeerId, Signaling, Topic};
+use peerwire::{
+    Config, Event, Identity, LanSignaling, Lane, MultiSignaling, Node, NostrSignaling, Path, PeerId, Signaling, Topic,
+};
 
 const PORT: u16 = 4040;
 const MAX_NODES: u8 = 16;
@@ -44,6 +47,9 @@ const WIFI_CFG_OFFSET: usize = 0x40;
 /// On Wi-Fi: the room `lan_chat esp32` joins (examples/rust/lan_chat.rs).
 const WIFI_ROOM: (&str, &str) = ("peerwire-lan-chat", "esp32");
 const QEMU_ROOM: (&str, &str) = ("peerwire-esp32", "lab");
+/// On Wi-Fi: one of `NostrSignaling`'s default relays, so PCs on the defaults share it.
+/// One relay, as each costs the chip a thread and a TLS session.
+const NOSTR_RELAY: &str = "wss://nostr.mom";
 
 /// What the last flash sector says.
 struct NodeConfig {
@@ -105,16 +111,24 @@ fn main() -> anyhow::Result<()> {
         // identity only; the Node's other random draws still repeat on every chip, so
         // the emulator shows discovery and memory, not privacy.
         Some(seed) => builder = builder.identity(Identity::from_secret_bytes(&seed)),
-        // With the radio on, the ESP-IDF RNG draws on RF noise (NB-063; NB62-2 is open).
+        // With the radio on, the ESP-IDF RNG draws on RF noise (NB-063, NB62-2).
         None if wifi.is_some() => info!("node {n}: identity from the chip's RNG, Wi-Fi on"),
         None => warn!("node {n}: no identity seed in flash; generating one from the chip's RNG"),
     }
-    let lan = Arc::new(LanCounts::default());
-    let mut node = builder
-        .config(config())
-        .stun_servers(Vec::<String>::new())
-        .signaling(Counted { n, lan: lan_signaling(n, ip, prefix)?, counts: lan.clone() })
-        .bind(SocketAddr::from((ip, PORT)))?;
+    let (lan, nostr) = (Arc::new(Counts::default()), Arc::new(Counts::default()));
+    let on_lan = Counted { n, what: "LAN", inner: lan_signaling(n, ip, prefix)?, counts: lan.clone() };
+    builder = match wifi {
+        // The relay's TLS and STUN reach the internet: a board only. STUN puts the
+        // router's public address in our offers, for peers beyond the LAN.
+        Some(_) => {
+            info!("node {n}: signals on the LAN and over {NOSTR_RELAY}");
+            let on_nostr =
+                Counted { n, what: "Nostr", inner: NostrSignaling::new([NOSTR_RELAY]), counts: nostr.clone() };
+            builder.signaling(MultiSignaling::new(vec![Box::new(on_lan), Box::new(on_nostr)]))
+        }
+        None => builder.stun_servers(Vec::<String>::new()).signaling(on_lan),
+    };
+    let mut node = builder.config(config()).bind(SocketAddr::from((ip, PORT)))?;
     let heap_node = free_heap();
     let (app, room) = if wifi.is_some() { WIFI_ROOM } else { QEMU_ROOM };
     info!(
@@ -183,15 +197,22 @@ fn main() -> anyhow::Result<()> {
         }
         if now >= next_report {
             next_report = now + Duration::from_secs(10);
-            report(n, &node, heap_node, &names, &lan, wifi.is_some());
+            report(n, &node, heap_node, &names, [&lan, &nostr], wifi.is_some());
         }
         std::thread::sleep(node.next_timeout().unwrap_or(Duration::from_millis(10)).min(Duration::from_millis(10)));
     }
 }
 
 /// Free heap, the lowest it has been, the main task's unused stack, each link's RTT, the
-/// LAN signals sent and heard and, on Wi-Fi, the signal strength.
-fn report(n: u8, node: &Node, heap_node: u32, names: &HashMap<PeerId, String>, lan: &LanCounts, on_wifi: bool) {
+/// signals sent and heard on the LAN and over Nostr and, on Wi-Fi, the signal strength.
+fn report(
+    n: u8,
+    node: &Node,
+    heap_node: u32,
+    names: &HashMap<PeerId, String>,
+    [lan, nostr]: [&Counts; 2],
+    on_wifi: bool,
+) {
     let free = free_heap();
     let min = unsafe { sys::esp_get_minimum_free_heap_size() };
     let stack_left = unsafe { sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
@@ -215,49 +236,51 @@ fn report(n: u8, node: &Node, heap_node: u32, names: &HashMap<PeerId, String>, l
     };
     info!(
         "node {n}: report: {links} links, free heap {free} B (min {min} B), heap per link {per_link} B, \
-         stack unused {stack_left} B, rtt [{}], LAN signals sent {} heard {}{signal}",
+         stack unused {stack_left} B, rtt [{}], LAN signals sent {} heard {}, Nostr sent {} heard {}{signal}",
         rtts.join(", "),
         lan.sent.load(Ordering::Relaxed),
-        lan.heard.load(Ordering::Relaxed)
+        lan.heard.load(Ordering::Relaxed),
+        nostr.sent.load(Ordering::Relaxed),
+        nostr.heard.load(Ordering::Relaxed)
     );
 }
 
-/// What the LAN carrier sent, and heard from other nodes on this node's topics (their
-/// hellos and offers, counted before the Node checks them). On a real network discovery
-/// can work one way only, such as when the router doesn't deliver multicast to the board
-/// (NB-091).
+/// What a carrier sent, and heard from other nodes on this node's topics (their hellos
+/// and offers, counted before the Node checks them). On a real network discovery can work
+/// one way only, such as when the router doesn't deliver multicast to the board (NB-091).
 #[derive(Default)]
-struct LanCounts {
+struct Counts {
     sent: AtomicU32,
     heard: AtomicU32,
 }
 
-/// `LanSignaling`, counting into `counts` and logging the first signals heard.
-struct Counted {
+/// A carrier, counting into `counts` and logging the first signals heard.
+struct Counted<S> {
     n: u8,
-    lan: LanSignaling,
-    counts: Arc<LanCounts>,
+    what: &'static str,
+    inner: S,
+    counts: Arc<Counts>,
 }
 
-impl Signaling for Counted {
+impl<S: Signaling> Signaling for Counted<S> {
     fn subscribe(&mut self, topic: Topic) {
-        self.lan.subscribe(topic);
+        self.inner.subscribe(topic);
     }
 
     fn unsubscribe(&mut self, topic: Topic) {
-        self.lan.unsubscribe(topic);
+        self.inner.unsubscribe(topic);
     }
 
     fn publish(&mut self, topic: Topic, payload: &[u8]) {
         self.counts.sent.fetch_add(1, Ordering::Relaxed);
-        self.lan.publish(topic, payload);
+        self.inner.publish(topic, payload);
     }
 
     fn poll(&mut self) -> Option<(Topic, Vec<u8>)> {
-        let m = self.lan.poll()?;
+        let m = self.inner.poll()?;
         let heard = self.counts.heard.fetch_add(1, Ordering::Relaxed) + 1;
         if heard <= 4 {
-            info!("node {}: heard LAN signal {heard}, {} B", self.n, m.1.len());
+            info!("node {}: heard {} signal {heard}, {} B", self.n, self.what, m.1.len());
         }
         Some(m)
     }
