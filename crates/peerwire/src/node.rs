@@ -38,8 +38,11 @@ const ROUTE_IDLE: Duration = Duration::from_secs(60);
 /// this often to read them (it can only wait on the main socket).
 const EXTRA_POLL: Duration = Duration::from_millis(5);
 
-/// Public STUN servers [`Node::bind`] asks for the node's public address.
-pub const DEFAULT_STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
+/// Public STUN servers [`Node::bind`] asks for the node's public address. Google's is
+/// asked on two ports of one IP, which tells a NAT that maps per destination IP
+/// ([`NatType::SymmetricIp`](crate::NatType::SymmetricIp)) from one that maps per IP and port.
+pub const DEFAULT_STUN_SERVERS: &[&str] =
+    &["stun.l.google.com:19302", "stun.cloudflare.com:3478", "stun.l.google.com:3478"];
 
 /// Where a node stands with one peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,7 +107,10 @@ impl Builder {
 
     /// STUN servers (`host:port`) to learn the public address from. Default:
     /// [`DEFAULT_STUN_SERVERS`]; empty turns STUN off. Names are resolved in
-    /// [`bind`](Builder::bind), and servers that don't resolve are skipped.
+    /// [`bind`](Builder::bind), each once (one name on two ports is one IP), and
+    /// servers that don't resolve are skipped. A server on two ports of one IP, next
+    /// to another at a second IP, tells [`NatType::SymmetricIp`](crate::NatType::SymmetricIp)
+    /// from `Symmetric`.
     pub fn stun_servers<S: Into<String>>(mut self, servers: impl IntoIterator<Item = S>) -> Self {
         self.stun = servers.into_iter().map(Into::into).collect();
         self
@@ -1010,8 +1016,27 @@ fn start_port_mapping(local: SocketAddr, at: Option<(SocketAddr, SocketAddr)>) -
 }
 
 /// Resolves `host:port` names, keeping the first address of the socket's family.
+/// The servers' addresses in family `v6`. A name is resolved once, so its entries on two
+/// ports share one IP though DNS hands out several in turn (NB-083).
 fn resolve(servers: &[String], v6: bool) -> Vec<SocketAddr> {
-    servers.iter().filter_map(|s| s.to_socket_addrs().ok()?.find(|a| a.is_ipv6() == v6)).collect()
+    let mut names: Vec<(&str, IpAddr)> = Vec::new();
+    let mut out = Vec::new();
+    for s in servers {
+        let (name, port) = s.rsplit_once(':').map_or((s.as_str(), None), |(n, p)| (n, p.parse::<u16>().ok()));
+        let known = names.iter().find(|(n, _)| *n == name).map(|&(_, ip)| ip);
+        let addr = match (known, port) {
+            (Some(ip), Some(port)) => SocketAddr::new(ip, port),
+            _ => match s.to_socket_addrs().ok().and_then(|mut a| a.find(|a| a.is_ipv6() == v6)) {
+                Some(a) => a,
+                None => continue,
+            },
+        };
+        if known.is_none() {
+            names.push((name, addr.ip()));
+        }
+        out.push(addr);
+    }
+    out
 }
 
 /// The address of the interface the default route leaves by. `connect` on a UDP
@@ -1047,6 +1072,23 @@ mod tests {
         assert_eq!(bound.addresses(), vec![bound.local_addr()]);
         assert_eq!((bound.public_addr(), bound.nat_type()), (None, NatType::Unknown));
         assert_eq!(bound.next_timeout(), None, "no STUN on loopback, no signaling: nothing to wake for");
+    }
+
+    /// NB-083: STUN server names are resolved once each, so one name on two ports is one IP
+    /// (the classifier's test for mapping per IP), and the defaults list such a server
+    /// next to one at another name.
+    #[test]
+    fn stun_names_resolve_once_and_the_defaults_ask_one_server_on_two_ports() {
+        let servers = ["localhost:3478", "127.0.0.2:9", "localhost:3479", "localhost:x"].map(String::from);
+        let got = resolve(&servers, false);
+        let lo = got[0].ip();
+        assert!(lo.is_loopback());
+        let want = vec![SocketAddr::new(lo, 3478), "127.0.0.2:9".parse().unwrap(), SocketAddr::new(lo, 3479)];
+        assert_eq!(got, want, "one IP for one name, and an entry that doesn't resolve skipped");
+        let name = |s: &str| s.rsplit_once(':').unwrap().0.to_string();
+        let names: Vec<String> = DEFAULT_STUN_SERVERS.iter().map(|s| name(s)).collect();
+        assert_eq!(names.len(), 3);
+        assert!(names[0] == names[2] && names[0] != names[1] && DEFAULT_STUN_SERVERS[0] != DEFAULT_STUN_SERVERS[2]);
     }
 
     /// NB-044: a birthday punch's extra sockets. A peer that reaches one (as a

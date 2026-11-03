@@ -284,8 +284,10 @@ impl PeerwireMultiplayerPeer {
     /// `"open"` (no NAT), `"cone"` (one public port for every peer: punching usually
     /// works, but not against a symmetric NAT if this router filters by port, which
     /// STUN can't see), `"symmetric"` (a new port per peer: punching works towards
-    /// open and most cone peers, never towards another symmetric one) or `"unknown"`
-    /// (no STUN answer from two servers yet).
+    /// open and most cone peers, but towards another symmetric one only if both hand
+    /// out ports in sequence), `"symmetric-ip"` (a new port per peer IP: it can also
+    /// punch other symmetric NATs, if it lets in any port of an IP it has sent to) or
+    /// `"unknown"` (no STUN answer from two servers yet).
     #[func]
     fn get_nat_type(&self) -> GString {
         let nat = self.session.as_ref().map_or(NatType::Unknown, Session::nat_type);
@@ -294,6 +296,7 @@ impl PeerwireMultiplayerPeer {
             NatType::Open => "open",
             NatType::Cone => "cone",
             NatType::Symmetric => "symmetric",
+            NatType::SymmetricIp => "symmetric-ip",
         })
     }
 
