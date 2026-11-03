@@ -63,9 +63,10 @@ that needs a change is tracked as an NB card.
 
 **Status as of main `0af38e9` (2026-11-03): NB-085 (`ac842cc`) merged in `697dcae`,
 NB-086 (`1f37042`) in `b2ae061`, NB-083 (`56309f9`) in `9665afb` and NB-084
-(`fd2f246`) in `9c7789b`; the site was first deployed from `be989d4`.** Fixes merged
-after `@peerwire/js` 0.2.1 (`b6b66c0`) and `@peerwire/react` 0.1.1 reach apps with
-the next release of each.
+(`fd2f246`) in `9c7789b`; the site was first deployed from `be989d4`.**
+The JS and wasm fixes on this main are in `@peerwire/js` 0.2.2 (2026-11-03);
+`@peerwire/react` is still 0.1.1. Fixes merged after that reach apps with the next
+release of each.
 
 | Finding | Status |
 |---|---|
