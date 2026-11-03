@@ -88,7 +88,7 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `AsyncNode` (feature `tokio`) | A `Node` driven by tokio | `src/async_node.rs` |
 | `Event`, `Path` | Type aliases: `peerwire_core::Event<SocketAddr>` and `peerwire_core::Path<SocketAddr>` | `src/lib.rs` |
 | `Signaling`, `Topic`, `MemoryHub`, `MemorySignaling` | The carrier trait, its topics, and the in-process carrier | `src/signaling.rs` |
-| `LanSignaling` | A carrier over UDP multicast on one LAN | `src/lan.rs` |
+| `LanSignaling` | A carrier over UDP multicast and broadcast on one LAN | `src/lan.rs` |
 | `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND` and `NostrStats` | `src/nostr.rs` |
 | `Privacy`, `Role`, `NatType`, `Failure`, `Side` | Which addresses a node gives out, room roles, the NAT type, why a dial failed | `src/traversal.rs` |
 | `PortMapping`, `MapProtocol` | Where router port mapping stands | `src/portmap.rs` |
@@ -509,21 +509,24 @@ For tests on a LAN, [`examples/rust/nostr_relay.rs`](../../examples/rust/nostr_r
 
 #### LanSignaling
 
-Signaling on one local network with no internet, over UDP multicast (`crates/peerwire/src/lan.rs`). Each message is
-one datagram to the group, with a TTL of 1, so it never leaves the link. Rooms then work as they do over Nostr: peers
+Signaling on one local network with no internet, over UDP multicast and broadcast (`crates/peerwire/src/lan.rs`).
+Each message is one datagram to the group and one to each private interface's broadcast address, with a TTL of 1, so
+it never leaves the link; some home routers never deliver multicast to an ESP32 but pass broadcast. A message heard
+both ways is kept once: a frame identical to one heard in the last second is dropped. Rooms then work as they do over Nostr: peers
 on one Wi-Fi find each other and link directly. Guide: [LAN discovery](../guides/lan-discovery.md).
 
 | Item | |
 |---|---|
-| `LanSignaling::new() -> io::Result<LanSignaling>` | A carrier on `GROUP`, on the interface the system picks for multicast (normally the default route's) |
-| `LanSignaling::on(group: SocketAddrV4, interface: Ipv4Addr) -> io::Result<LanSignaling>` | A carrier on `group` (an IPv4 multicast address and port), sending and listening on the interface whose address is `interface` (`0.0.0.0`: the system's choice). `ErrorKind::InvalidInput` if `group` isn't multicast. An ESP32 names its own address here ([ESP32](../guides/esp32.md)) |
+| `LanSignaling::new() -> io::Result<LanSignaling>` | A carrier on `GROUP`, on the interface the system picks for multicast (normally the default route's), and on the broadcast address of each private (RFC 1918 or link-local) interface |
+| `LanSignaling::on(group: SocketAddrV4, interface: Ipv4Addr) -> io::Result<LanSignaling>` | A carrier on `group` (an IPv4 multicast address and port), sending and listening on the interface whose address is `interface` (`0.0.0.0`: the system's choice), and on that interface's broadcast address (`0.0.0.0`: each private interface's). `ErrorKind::InvalidInput` if `group` isn't multicast. An ESP32 names its own address here ([ESP32](../guides/esp32.md)) |
+| `LanSignaling::broadcast(self, addr: Ipv4Addr) -> io::Result<LanSignaling>` | Also sends each frame to `addr`, a subnet's broadcast address such as `192.168.1.255`, and hears frames sent to it, for where Peerwire can't list interfaces (ESP-IDF). At most 4 (`MAX_LEGS`); one named twice is added once. `ErrorKind::InvalidInput` for a multicast or unspecified address, or a fifth |
 | `LanSignaling::GROUP` | `239.255.80.87:20567`, in the organisation-local scope that routers don't forward |
 | `LanSignaling::MAX_PAYLOAD` | 1356 bytes: a 1400-byte datagram (`MAX_FRAME`) less the 44-byte header (`HEADER`: magic 4, sender tag 8, topic 32). A larger message is dropped, never fragmented |
 
-The socket is bound to the group address, so it takes only datagrams sent to the group (not on Windows, which can't
-bind a multicast address). One `poll` reads at most 64 datagrams (`MAX_READS`). A host firewall must let in UDP to
-the group's port, or the node hears no one; some guest and public Wi-Fi networks drop multicast or keep clients
-apart. Browsers can't send UDP multicast. A complete program is
+Each socket is bound to the group or to a broadcast address, so it takes only datagrams sent there (not on Windows,
+which can bind neither: one socket on any address hears both). One `poll` reads at most 64 datagrams (`MAX_READS`),
+one from each socket in turn. A host firewall must let in UDP to the group's port, or the node hears no one; some
+guest and public Wi-Fi networks keep clients apart. Browsers can't send UDP. A complete program is
 [`examples/rust/lan_chat.rs`](../../examples/rust/lan_chat.rs): run
 `cargo run -p peerwire --example lan_chat -- kitchen` on two or more machines on one Wi-Fi.
 

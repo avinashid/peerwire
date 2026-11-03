@@ -3100,7 +3100,8 @@ see. **Before the meet page joins the site's demos,** it must check
 ### LAN signalling, `LanSignaling` (NB-064) — NB64-1…NB64-6
 
 `LanSignaling` (`crates/peerwire/src/lan.rs`) is a `Signaling` carrier over UDP
-multicast, so rooms work on one LAN with no internet. Each message is one datagram to
+multicast, and since NB-092 broadcast ([below](#nb-092--the-broadcast-leg)), so rooms
+work on one LAN with no internet. Each message is one datagram to
 the group 239.255.80.87:20567 (organisation-local, TTL 1, multicast loop on,
 `SO_REUSEADDR`): `PWL1`, an 8-byte sender tag, the 32-byte topic and the payload, at
 most 1400 bytes, never fragmented. `poll` reads at most 64 datagrams a call, keeps only
@@ -3217,6 +3218,44 @@ forge them. It learns:
 yet linked to its sender offers to it again, at most once per 2 s per peer and within
 the hello budget (30, then one per 2 s). A replayed offer is dropped by its nonce, or as
 stale after 60 s. This is the LAN form of SEC-6.
+
+#### NB-092 — the broadcast leg
+
+NB-091 found a home router that never delivered multicast to an ESP32-C3 on Wi-Fi
+(lwIP joins with IGMPv2) but passed broadcast both ways, so the board and a PC never
+linked. Since NB-092 each frame also goes to a subnet-directed broadcast address: each
+private interface's (RFC 1918 or link-local) for `new()`, the named interface's for
+`on()`, or one the caller names with `broadcast()` (the ESP32 firmware names its own),
+at most 4. The frames and their sealing are unchanged. What changes:
+
+- **NB64-1 still holds.** Each broadcast leg has a socket bound to its broadcast
+  address, which takes only datagrams sent to that address, not unicast to the port.
+  On lwIP by reading `udp_input_local_match`: a broadcast matches a socket bound to an
+  address in the destination's subnet, and unicast needs an exact match. Windows binds
+  neither: its one socket on `0.0.0.0` already heard broadcasts to the port.
+- **TTL 1 for both legs.** Frames go out from the group's socket, with `IP_TTL` 1 as
+  well as `IP_MULTICAST_TTL` 1. Routers don't forward directed broadcasts by default
+  (RFC 2644); TTL 1 stops a router that would.
+- **Every device on the subnet receives each frame**, not only those that joined the
+  group. What a neighbour learns is unchanged (above), but it no longer needs the
+  IGMP join to see the frames.
+- **A frame identical to one heard in the last second is dropped**, so the copy that
+  arrives on the other leg is kept once: 16 hashes are kept, under a per-carrier
+  SipHash key. A neighbour can't use this to suppress a member's frame: it would need
+  the frame's exact bytes before the member sent them, and rooms seal each frame with
+  a fresh nonce. Junk that pushes hashes out of the ring only lets a second copy
+  through, which the room's replay handling already takes.
+- **Reading stays bounded.** One `poll` reads at most 64 datagrams over all sockets,
+  one from each in turn, so a flood on one leg doesn't starve the other.
+
+Tests: `lan::tests::the_broadcast_leg_works_alone_and_copies_are_kept_once`,
+`a_frame_heard_again_within_a_second_is_dropped`,
+`broadcast_addresses_are_checked_and_capped`, `unicast_to_the_port_is_not_delivered`
+(now with a broadcast leg too) and `tests/lan.rs`'s `a_room_links_by_broadcast_alone`,
+on loopback's 127.255.255.255 (Linux). In QEMU, two chips linked with `NO_MULTICAST=1`
+(the hub dropped every multicast frame).
+
+**Status: awaiting security review.**
 
 ### The ESP32 prototype (NB-062, NB-064) — NB62-1, NB62-2
 

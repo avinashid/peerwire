@@ -41,7 +41,7 @@ room.send('hello'); // to every member, over a direct encrypted link
 ## Why Peerwire
 
 - **No backend.** Peers meet over signaling they don't have to trust: public Nostr relays, an invite link or QR
-  code, or multicast on the local network. What goes over it is sealed, so a relay can't read addresses, join a
+  code, or the local network. What goes over it is sealed, so a relay can't read addresses, join a
   room it doesn't know the name of, or forge a link.
 - **Through NATs.** STUN, simultaneous open, port prediction, and birthday and lockstep punching. When no direct
   path opens, a peer both sides are linked to relays the ciphertext. In simulation, 59 of the 64 pairings of eight
@@ -125,7 +125,7 @@ The [quick start](docs/getting-started/quick-start.md) walks through each of the
 |---|---|
 | [`@peerwire/js`](packages/js) | Browsers and Node: rooms over WebRTC, shared documents, calls, offline messages. The core as a ~350 KB WebAssembly module with no imports. |
 | [`@peerwire/react`](packages/react) | React hooks: rooms, members, chat, shared and per-member state. TypeScript. |
-| [`peerwire`](crates/peerwire) | Rust: `Node` and `AsyncNode` on a UDP socket, with STUN, rooms, NAT traversal and signaling over Nostr, LAN multicast or in-process. |
+| [`peerwire`](crates/peerwire) | Rust: `Node` and `AsyncNode` on a UDP socket, with STUN, rooms, NAT traversal and signaling over Nostr, the LAN (multicast and broadcast) or in-process. |
 | [`peerwire-core`](crates/peerwire-core) | The sans-IO session core: identity, Noise IK, lanes, congestion control, peer relay, hole punching. |
 | [`peerwire-sync`](crates/peerwire-sync) | Shared documents in Rust, frame for frame with `room.doc()`. |
 | [`peerwire-godot`](bindings/godot) | Godot 4 GDExtension: `PeerwireMultiplayerPeer`. |

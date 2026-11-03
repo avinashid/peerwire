@@ -71,3 +71,27 @@ fn a_room_links_over_the_lan_alone() {
         assert!(drops.is_empty(), "node {i}: {drops:?}");
     }
 }
+
+/// NB-092: on a network that delivers no multicast (as a router that never gives it to
+/// an ESP32), nodes link by the broadcast leg: here each listens on a group of its own,
+/// and they share only loopback's broadcast address.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_room_links_by_broadcast_alone() {
+    let port = 34001 + (std::process::id() % 4000) as u16 * 2;
+    let node = |g: u8| {
+        let group = SocketAddrV4::new(Ipv4Addr::new(239, 255, 80, g), port);
+        let lan = LanSignaling::on(group, Ipv4Addr::LOCALHOST)
+            .and_then(|c| c.broadcast(Ipv4Addr::new(127, 255, 255, 255)))
+            .expect("broadcast on loopback");
+        Node::builder().signaling(lan).bind("127.0.0.1:0").unwrap()
+    };
+    let (mut a, mut b) = (node(87), node(88));
+    let ids = [a.peer_id(), b.peer_id()];
+    a.join_room("pw-test", "broadcast");
+    b.join_room("pw-test", "broadcast");
+    let mut ev = Vec::new();
+    let started = Instant::now();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 10, |n| n.iter().all(|n| linked(n, &ids))), "linked by broadcast");
+    eprintln!("2 nodes linked by broadcast alone in {:?}", started.elapsed());
+}
