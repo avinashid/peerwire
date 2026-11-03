@@ -595,8 +595,9 @@ fn fuzz_hostile_peer() {
 fn hostile_peer_pins_bounded_receive_memory() {
     // An authenticated peer M makes A hold as much as it can on each stream:
     // full fragments in order without a final one, so a message is partly
-    // assembled, then the next sequence number held back and everything after
-    // it sent, so the out-of-order buffer fills. The urgent stream holds at most
+    // assembled, then the next sequence number held back and a window's worth
+    // after it sent, so the out-of-order buffer fills and the last one falls
+    // past it. The urgent stream holds at most
     // URGENT_RECV_WINDOW - 1 fragments and MAX_URGENT bytes of message, and one
     // fragment past that cap is a violation.
     let keys = identities(2);
@@ -618,7 +619,7 @@ fn hostile_peer_pins_bounded_receive_memory() {
         [(0, false, RECV_WINDOW, Config::default().max_message), (1, true, URGENT_RECV_WINDOW, MAX_URGENT)]
     {
         let assembled = (max / FRAGMENT) as u32;
-        for seq in (0..assembled).chain(assembled + 1..assembled + 2 * window) {
+        for seq in (0..assembled).chain(assembled + 1..=assembled + window) {
             send(&mut net, urgent, seq);
         }
         bound[u] = (window as usize - 1) * FRAGMENT + max;
@@ -627,7 +628,7 @@ fn hostile_peer_pins_bounded_receive_memory() {
         assert!(held <= bound[u]);
     }
     println!("receive memory a peer can pin per link: {} B (urgent {} B)", bound[0] + bound[1], bound[1]);
-    assert!(bound[1] < 140_000 && bound[0] + bound[1] < 2_320_000);
+    assert!(bound[1] < 140_000 && bound[0] + bound[1] < 5_700_000);
     // The held-back fragment completes more than MAX_URGENT of message.
     send(&mut net, true, (MAX_URGENT / FRAGMENT) as u32);
     net.deliver();

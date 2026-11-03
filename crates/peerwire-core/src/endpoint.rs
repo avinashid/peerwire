@@ -112,7 +112,8 @@ pub struct Config {
     /// Per-link cap on bytes queued or unacknowledged, for `Reliable` and for
     /// `Urgent` each, so a full reliable buffer never refuses an urgent message.
     pub max_send_buffer: usize,
-    /// Reliable fragments in flight per link.
+    /// Reliable fragments in flight per link. Up to 4096, the receive window,
+    /// suits a long, fast link; peers from before it take only 1024 ahead.
     pub reliable_window: usize,
     /// Unreliable messages queued per link; the oldest is dropped when full.
     pub unreliable_queue: usize,

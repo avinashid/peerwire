@@ -297,7 +297,7 @@ node.join_room("my-app", "kitchen"); // links with every node in "kitchen" on th
 | `max_links` | `usize::MAX` | Cap on announced links; links this node dials itself are not capped |
 | `max_message` | 1 MiB (`1 << 20`) | Largest `Reliable` message, sent or received; a peer that sends a larger one is dropped |
 | `max_send_buffer` | 4 MiB (`4 << 20`) | Per-link bytes queued or unacknowledged, for `Reliable` and for `Urgent` each |
-| `reliable_window` | 1024 | Reliable fragments in flight per link |
+| `reliable_window` | 1024 | Reliable fragments in flight per link. Up to 4096 (the receive window) suits a long, fast link, if the peer runs this version: older peers take only 1024 ahead |
 | `unreliable_queue` | 256 | Unreliable messages queued per link; the oldest is dropped when full |
 | `relay` | `true` | Forward packets between linked peers that ask (peer relay) |
 | `relay_rate` | 256 KiB/s (`256 << 10`) | Bytes per second each peer may have this node relay |

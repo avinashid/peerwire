@@ -80,11 +80,14 @@ The reliable lane is a small transport tuned for real-time traffic:
   declared lost for good after 16 sends.
 - **Tail-loss probe.** If nothing is acknowledged for `srtt + 2·rttvar + 4 ms`, the newest fragment is sent again,
   so a lost tail is repaired in about one RTT instead of a full timeout. That matters for sparse traffic, such as a
-  lone event.
+  lone event. In a steady transfer the ACKs keep coming, and a fragment lost at the end of a burst reaches its
+  timeout first: if an ACK acknowledged new data after it went out, that expiry is its probe, as in RACK-TLP
+  (RFC 8985), and the loss counts as one found by fast retransmit, not as a timeout.
 - **Congestion control.** The window starts at 16 fragments, with a floor of 4. It backs off on loss, and also when
   queueing delay (RTT above the lowest seen) passes **25 ms**, before any loss. That keeps router and DataChannel
   buffers short.
-- **Receive window.** 1,024 out-of-order fragments are buffered ahead of the next one expected.
+- **Receive window.** 4,096 out-of-order fragments are buffered ahead of the next one expected (64 on the urgent
+  stream), and the sender never sends further ahead than that.
 - **Send buffer.** 4 MiB per link for reliable and for urgent each (`Config::max_send_buffer`); `send` returns
   `WouldBlock` past it.
 - **Liveness.** A keepalive goes out every 10 s, and a link is dropped after 30 s of silence. Links survive address

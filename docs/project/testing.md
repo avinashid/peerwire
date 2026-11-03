@@ -146,9 +146,12 @@ both profiles first, about 5 minutes. With no Rust change since `origin/main`, t
   NB-050): while a handshake is half-open, its HS1 cut to the kind, index and ephemeral key (37 bytes), a byte
   short or a byte long, as an HS1 or an HS1C, draws nothing from anywhere and is malformed; the whole HS1 draws
   its HS2 again.
-- `reliable`: out-of-order reassembly, ACK and retransmit, tail-loss probe beats the RTO, urgent fragments are
+- `reliable`: out-of-order reassembly, ACK and retransmit, tail-loss probe beats the RTO, a first send that times
+  out after an ACK of new data is a tail loss, cut as fast retransmit cuts (80% kept, half with queueing), while
+  one with no ACK of new data since, or a resend, is a timeout and halves (NB-086), urgent fragments are
   sent twice, urgent goes ahead of queued reliable data within the shared window and takes at most half of it,
-  each stream stays within the receiver's window and has its own buffer, urgent fragments in flight span at
+  each stream stays within the receiver's window (the reliable one 4096 past its oldest fragment unacknowledged,
+  however many above a hole are acknowledged) and has its own buffer, urgent fragments in flight span at
   most the 64-fragment urgent window, the urgent receiver buffers at most that and refuses a message over 64 KiB,
   the window grows by the slots acknowledged, buffer limit.
 - `stun`: RFC 5769 IPv4/IPv6 vectors; Peerwire packets are not mistaken for STUN.

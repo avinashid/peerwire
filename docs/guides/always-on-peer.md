@@ -123,9 +123,9 @@ Before you do, size what you give away:
 - **Bandwidth.** Identities are free to make, so one host can take every slot. The most it can have relayed out of
   your server is `PEERWIRE_RELAY_TOTAL` (8 MiB/s by default), and it can aim all of it at one linked peer, from your
   address. Lower `PEERWIRE_RELAY_TOTAL` and `PEERWIRE_MAX_PEERS` to what you want to give.
-- **Memory.** Each linked peer can make the server hold about 2.3 MB of received data (about 2.6 MB allocated), so 256
-  peers can pin about 0.6 GB. Size `PEERWIRE_MAX_PEERS` to the memory you have. The compose file limits the peer's
-  container to 128 MB (`mem_limit`), the worst case for about 45 peers: past that, peers that fill their buffers can
+- **Memory.** Each linked peer can make the server hold about 5.7 MB of received data (about 6.1 MB allocated), so 256
+  peers can pin about 1.6 GB. Size `PEERWIRE_MAX_PEERS` to the memory you have. The compose file limits the peer's
+  container to 128 MB (`mem_limit`), the worst case for about 19 peers: past that, peers that fill their buffers can
   get it killed and restarted. Raise `mem_limit` or lower `PEERWIRE_MAX_PEERS` to match.
 - **Privacy.** The server sees which peers talk to each other, when, and how much, and logs their addresses.
 
