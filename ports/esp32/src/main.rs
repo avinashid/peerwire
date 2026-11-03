@@ -10,13 +10,13 @@
 //! another's key or address beforehand. Linked nodes send each other a numbered
 //! reliable message every second, a short line or (run.sh's MSG_KIB) padded to that
 //! many KiB. It logs free heap at each step, when each peer linked after the join,
-//! and every 10 s the heap, stack and link RTTs. Peers are named by the node number
+//! and every 10 s the heap, stack, link RTTs and LAN signals. Peers are named by the node number
 //! in their address (QEMU) or by their address (Wi-Fi).
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys;
 use esp_idf_svc::wifi::{self, AuthMethod, BlockingWifi, EspWifi, WifiEvent};
 use log::{info, warn};
-use peerwire::{Config, Event, Identity, LanSignaling, Lane, Node, Path, PeerId};
+use peerwire::{Config, Event, Identity, LanSignaling, Lane, Node, Path, PeerId, Signaling, Topic};
 
 const PORT: u16 = 4040;
 const MAX_NODES: u8 = 16;
@@ -105,10 +105,11 @@ fn main() -> anyhow::Result<()> {
         None if wifi.is_some() => info!("node {n}: identity from the chip's RNG, Wi-Fi on"),
         None => warn!("node {n}: no identity seed in flash; generating one from the chip's RNG"),
     }
+    let lan = Arc::new(LanCounts::default());
     let mut node = builder
         .config(config())
         .stun_servers(Vec::<String>::new())
-        .signaling(LanSignaling::on(LanSignaling::GROUP, ip)?)
+        .signaling(Counted { n, lan: LanSignaling::on(LanSignaling::GROUP, ip)?, counts: lan.clone() })
         .bind(SocketAddr::from((ip, PORT)))?;
     let heap_node = free_heap();
     let (app, room) = if wifi.is_some() { WIFI_ROOM } else { QEMU_ROOM };
@@ -178,15 +179,15 @@ fn main() -> anyhow::Result<()> {
         }
         if now >= next_report {
             next_report = now + Duration::from_secs(10);
-            report(n, &node, heap_node, &names, wifi.is_some());
+            report(n, &node, heap_node, &names, &lan, wifi.is_some());
         }
         std::thread::sleep(node.next_timeout().unwrap_or(Duration::from_millis(10)).min(Duration::from_millis(10)));
     }
 }
 
-/// Free heap, the lowest it has been, the main task's unused stack, each link's RTT and,
-/// on Wi-Fi, the signal strength.
-fn report(n: u8, node: &Node, heap_node: u32, names: &HashMap<PeerId, String>, on_wifi: bool) {
+/// Free heap, the lowest it has been, the main task's unused stack, each link's RTT, the
+/// LAN signals sent and heard and, on Wi-Fi, the signal strength.
+fn report(n: u8, node: &Node, heap_node: u32, names: &HashMap<PeerId, String>, lan: &LanCounts, on_wifi: bool) {
     let free = free_heap();
     let min = unsafe { sys::esp_get_minimum_free_heap_size() };
     let stack_left = unsafe { sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
@@ -210,9 +211,51 @@ fn report(n: u8, node: &Node, heap_node: u32, names: &HashMap<PeerId, String>, o
     };
     info!(
         "node {n}: report: {links} links, free heap {free} B (min {min} B), heap per link {per_link} B, \
-         stack unused {stack_left} B, rtt [{}]{signal}",
-        rtts.join(", ")
+         stack unused {stack_left} B, rtt [{}], LAN signals sent {} heard {}{signal}",
+        rtts.join(", "),
+        lan.sent.load(Ordering::Relaxed),
+        lan.heard.load(Ordering::Relaxed)
     );
+}
+
+/// What the LAN carrier sent, and heard from other nodes on this node's topics (their
+/// hellos and offers). On a real network discovery can work one way only, such as when
+/// the router doesn't pass multicast between its 2.4 and 5 GHz radios (NB-091).
+#[derive(Default)]
+struct LanCounts {
+    sent: AtomicU32,
+    heard: AtomicU32,
+}
+
+/// `LanSignaling`, counting into `counts` and logging the first signals heard.
+struct Counted {
+    n: u8,
+    lan: LanSignaling,
+    counts: Arc<LanCounts>,
+}
+
+impl Signaling for Counted {
+    fn subscribe(&mut self, topic: Topic) {
+        self.lan.subscribe(topic);
+    }
+
+    fn unsubscribe(&mut self, topic: Topic) {
+        self.lan.unsubscribe(topic);
+    }
+
+    fn publish(&mut self, topic: Topic, payload: &[u8]) {
+        self.counts.sent.fetch_add(1, Ordering::Relaxed);
+        self.lan.publish(topic, payload);
+    }
+
+    fn poll(&mut self) -> Option<(Topic, Vec<u8>)> {
+        let m = self.lan.poll()?;
+        let heard = self.counts.heard.fetch_add(1, Ordering::Relaxed) + 1;
+        if heard <= 4 {
+            info!("node {}: heard LAN signal {heard}, {} B", self.n, m.1.len());
+        }
+        Some(m)
+    }
 }
 
 fn free_heap() -> u32 {
