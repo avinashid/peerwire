@@ -236,12 +236,13 @@ fn report(
     };
     info!(
         "node {n}: report: {links} links, free heap {free} B (min {min} B), heap per link {per_link} B, \
-         stack unused {stack_left} B, rtt [{}], LAN signals sent {} heard {}, Nostr sent {} heard {}{signal}",
+         stack unused {stack_left} B, rtt [{}], LAN signals sent {} heard {}, Nostr sent {} heard {} relays open {}{signal}",
         rtts.join(", "),
         lan.sent.load(Ordering::Relaxed),
         lan.heard.load(Ordering::Relaxed),
         nostr.sent.load(Ordering::Relaxed),
-        nostr.heard.load(Ordering::Relaxed)
+        nostr.heard.load(Ordering::Relaxed),
+        nostr.open.load(Ordering::Relaxed)
     );
 }
 
@@ -252,6 +253,24 @@ fn report(
 struct Counts {
     sent: AtomicU32,
     heard: AtomicU32,
+    /// Nostr: the relays connected now.
+    open: AtomicU32,
+}
+
+/// What a carrier can tell about itself: Nostr, whether its relays are connected (a
+/// relay that fails to connect only retries, NB-095).
+trait Health {
+    fn relays_open(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl Health for LanSignaling {}
+
+impl Health for NostrSignaling {
+    fn relays_open(&self) -> Option<u64> {
+        Some(self.stats().relays_open)
+    }
 }
 
 /// A carrier, counting into `counts` and logging the first signals heard.
@@ -262,7 +281,7 @@ struct Counted<S> {
     counts: Arc<Counts>,
 }
 
-impl<S: Signaling> Signaling for Counted<S> {
+impl<S: Signaling + Health> Signaling for Counted<S> {
     fn subscribe(&mut self, topic: Topic) {
         self.inner.subscribe(topic);
     }
@@ -277,6 +296,9 @@ impl<S: Signaling> Signaling for Counted<S> {
     }
 
     fn poll(&mut self) -> Option<(Topic, Vec<u8>)> {
+        if let Some(open) = self.inner.relays_open() {
+            self.counts.open.store(open as u32, Ordering::Relaxed);
+        }
         let m = self.inner.poll()?;
         let heard = self.counts.heard.fetch_add(1, Ordering::Relaxed) + 1;
         if heard <= 4 {

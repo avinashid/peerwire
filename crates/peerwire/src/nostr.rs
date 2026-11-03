@@ -230,8 +230,24 @@ fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-trait Stream: Read + Write + Send {}
-impl<T: Read + Write + Send> Stream for T {}
+/// A relay connection's bytes: TCP, or TLS over it. It owns the one socket, as ESP-IDF
+/// can't duplicate one (`TcpStream::try_clone` fails there with ENOSYS).
+trait Stream: Read + Write + Send {
+    fn tcp(&self) -> &TcpStream;
+}
+
+impl Stream for TcpStream {
+    fn tcp(&self) -> &TcpStream {
+        self
+    }
+}
+
+impl Stream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn tcp(&self) -> &TcpStream {
+        &self.sock
+    }
+}
+
 type Ws = tungstenite::WebSocket<Box<dyn Stream>>;
 
 /// One relay: connect, keep the subscription, forward events both ways, reconnect.
@@ -402,9 +418,9 @@ fn connect(url: &str) -> io::Result<Ws> {
         let name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "bad relay host name"))?;
         let conn = rustls::ClientConnection::new(tls_config(), name).map_err(io::Error::other)?;
-        Box::new(rustls::StreamOwned::new(conn, tcp.try_clone()?))
+        Box::new(rustls::StreamOwned::new(conn, tcp))
     } else {
-        Box::new(tcp.try_clone()?)
+        Box::new(tcp)
     };
     let config = WebSocketConfig {
         max_message_size: Some(MAX_MESSAGE),
@@ -413,7 +429,7 @@ fn connect(url: &str) -> io::Result<Ws> {
     };
     let (ws, _) = tungstenite::client::client_with_config(url, stream, Some(config))
         .map_err(|e| io::Error::other(e.to_string()))?;
-    tcp.set_read_timeout(Some(READ_SLICE))?;
+    ws.get_ref().tcp().set_read_timeout(Some(READ_SLICE))?;
     Ok(ws)
 }
 
