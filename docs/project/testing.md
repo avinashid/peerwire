@@ -142,7 +142,9 @@ both profiles first, about 5 minutes. With no Rust change since `origin/main`, t
   handshakes, a peer's channel needs no cookie; 4 HS1s spoofed from an address below the mark don't count
   against it (NB24-1), so a dial from there still links, while 4 taken there on a channel or through a relay do;
   an IPv4 address and an IPv6 /64 are one source; a dial takes a cookie only for its index from an address it
-  dials, and `handle_datagram_direct` says false for it. An HS1's Noise part is 128 bytes exactly (SEC-13,
+  dials, and `handle_datagram_direct` names no peer for it, nor for an HS1 sent again or forged from its index and
+  ephemeral key while half-open, or an HS2 sent again or of junk once the link is up; a real HS1, HS2 or Data
+  packet names its peer (NB44c-1). An HS1's Noise part is 128 bytes exactly (SEC-13,
   NB-050): while a handshake is half-open, its HS1 cut to the kind, index and ephemeral key (37 bytes), a byte
   short or a byte long, as an HS1 or an HS1C, draws nothing from anywhere and is malformed; the whole HS1 draws
   its HS2 again.

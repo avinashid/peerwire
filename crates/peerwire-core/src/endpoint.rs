@@ -1569,23 +1569,25 @@ impl<A: Address> Endpoint<A> {
         self.on_packet(now, Path::Direct(from), Some(*peer), data);
     }
 
-    /// Like [`Endpoint::handle_datagram`], and additionally reports whether the
-    /// datagram authenticated to a session whose direct path is now `from`.
+    /// Like [`Endpoint::handle_datagram`], and additionally gives the peer whose
+    /// session the datagram authenticated to (its AEAD tag, or a handshake
+    /// message, checked), if that session's direct path is now `from`.
     ///
     /// A birthday-punch host (`Node::read_extra`) adopts an extra socket as the
-    /// route to `from` only when this holds, so an unauthenticated or spoofed
-    /// source can neither redirect our egress nor hold an extra socket open past
-    /// its deadline (NB44-2).
-    pub fn handle_datagram_direct(&mut self, now: Instant, from: A, data: &[u8]) -> bool {
-        match self.on_packet(now, Path::Direct(from.clone()), None, data) {
-            Some(idx) => self.sessions.get(&idx).and_then(|s| s.path.direct()) == Some(&from),
-            None => false,
-        }
+    /// route to `from` only for the peer it punches to, so an unauthenticated or
+    /// spoofed source, or another peer, can neither redirect our egress nor hold
+    /// an extra socket open past its deadline (NB44-2, NB44c-1, NB44c-2). An HS1
+    /// sent again, matched by its index and ephemeral key, or an HS2 for a link
+    /// already up, runs no crypto, so it gives none.
+    pub fn handle_datagram_direct(&mut self, now: Instant, from: A, data: &[u8]) -> Option<PeerId> {
+        let (idx, true) = self.on_packet(now, Path::Direct(from.clone()), None, data)? else { return None };
+        self.sessions.get(&idx).filter(|s| s.path.direct() == Some(&from)).map(|s| s.peer)
     }
 
-    /// Returns the session the packet belonged to. `owner`: the only peer that
-    /// sends on `from` (see `handle_datagram_from`).
-    fn on_packet(&mut self, now: Instant, from: Path<A>, owner: Option<PeerId>, data: &[u8]) -> Option<u32> {
+    /// Returns the session the packet belonged to, and whether it authenticated:
+    /// its AEAD tag, or the handshake message, checked. `owner`: the only peer
+    /// that sends on `from` (see `handle_datagram_from`).
+    fn on_packet(&mut self, now: Instant, from: Path<A>, owner: Option<PeerId>, data: &[u8]) -> Option<(u32, bool)> {
         self.stats.rx_packets += 1;
         match wire::parse(data) {
             None => {
@@ -1610,7 +1612,7 @@ impl<A: Address> Endpoint<A> {
         sender: u32,
         cookie: Option<&Cookie>,
         noise: &[u8],
-    ) -> Option<u32> {
+    ) -> Option<(u32, bool)> {
         // Before anything is sent again (SEC-13): a part of an HS1 draws nothing.
         if noise.len() != wire::HS1_NOISE {
             self.stats.rx_malformed += 1;
@@ -1630,7 +1632,7 @@ impl<A: Address> Endpoint<A> {
                     self.emit(from, peer, hs2);
                 }
             }
-            return Some(idx);
+            return Some((idx, false)); // matched by index and ephemeral key: no crypto ran
         }
         if self.peers.len() >= self.config.max_links {
             self.stats.rx_handshake_dropped += 1;
@@ -1714,7 +1716,7 @@ impl<A: Address> Endpoint<A> {
                 if let Some(hs1) = resend {
                     self.emit(from, peer, hs1);
                 }
-                return Some(didx);
+                return Some((didx, true));
             }
             if let Some(s) = self.sessions.remove(&didx) {
                 inherited = (s.relay, s.candidates);
@@ -1761,7 +1763,7 @@ impl<A: Address> Endpoint<A> {
             },
         );
         self.start_punch(now, idx);
-        Some(idx)
+        Some((idx, true))
     }
 
     /// `None` if `echoed` is the cookie for an HS1 (`sender`, `eph`) from `addr`
@@ -1796,7 +1798,13 @@ impl<A: Address> Endpoint<A> {
     /// A loaded responder's answer to our HS1 on `from`: the cookie to send it
     /// with. Sent at once the first time, else on the next retry. Taken only for a
     /// dial, from an address it dials; unauthenticated, so of no session.
-    fn on_cookie(&mut self, from: Path<A>, owner: Option<PeerId>, receiver: u32, cookie: &Cookie) -> Option<u32> {
+    fn on_cookie(
+        &mut self,
+        from: Path<A>,
+        owner: Option<PeerId>,
+        receiver: u32,
+        cookie: &Cookie,
+    ) -> Option<(u32, bool)> {
         if self.on_others_channel(owner, receiver) {
             return None;
         }
@@ -1827,7 +1835,7 @@ impl<A: Address> Endpoint<A> {
         sender: u32,
         receiver: u32,
         noise: &[u8],
-    ) -> Option<u32> {
+    ) -> Option<(u32, bool)> {
         if self.on_others_channel(owner, receiver) {
             return None;
         }
@@ -1836,7 +1844,7 @@ impl<A: Address> Endpoint<A> {
             return None;
         };
         let State::Dialing(dial) = &mut sess.state else {
-            return Some(receiver); // duplicate HS2 for a link that is already up
+            return Some((receiver, false)); // duplicate HS2 for a link that is already up: not read
         };
         // Relay-only: answered at our own address only if dialled directly (as
         // `answers_directly`), so a dial through a relay alone completes through
@@ -1883,7 +1891,7 @@ impl<A: Address> Endpoint<A> {
         self.sessions.insert(receiver, sess);
         self.announce(receiver);
         self.start_punch(now, receiver);
-        Some(receiver)
+        Some((receiver, true))
     }
 
     fn on_data(
@@ -1894,7 +1902,7 @@ impl<A: Address> Endpoint<A> {
         receiver: u32,
         nonce: u64,
         ciphertext: &[u8],
-    ) -> Option<u32> {
+    ) -> Option<(u32, bool)> {
         if self.on_others_channel(owner, receiver) {
             return None;
         }
@@ -2160,14 +2168,14 @@ impl<A: Address> Endpoint<A> {
             self.forward(now, receiver, &to, &packet, origin.as_ref());
         }
         for (packet, hint) in relayed {
-            if let Some(idx) = self.on_packet(now, Path::Via(peer), None, &packet) {
+            if let Some((idx, _)) = self.on_packet(now, Path::Via(peer), None, &packet) {
                 if let Some(a) = hint {
                     self.add_candidate(now, idx, a);
                 }
             }
         }
         if !self.peers.get(&peer).is_some_and(|&i| i == receiver) {
-            return Some(receiver); // lost a race against a newer link to the same peer
+            return Some((receiver, true)); // lost a race against a newer link to the same peer
         }
         for data in reliable {
             self.events.push_back(Event::Message { peer, lane: Lane::Reliable, data });
@@ -2179,7 +2187,7 @@ impl<A: Address> Endpoint<A> {
             let reason = if closed { DisconnectReason::ClosedByPeer } else { DisconnectReason::ProtocolViolation };
             self.drop_link(receiver, Some(reason));
         }
-        Some(receiver)
+        Some((receiver, true))
     }
 
     /// Relays `packet` from the peer on link `src` to peer `to`, tagged with the
@@ -4482,7 +4490,7 @@ mod tests {
         assert!(sent(&mut a, t).is_empty());
         let s = a.stats();
         assert_eq!((s.rx_unknown_session, s.rx_wrong_peer), (2, 1));
-        assert!(!a.handle_datagram_direct(t, 2, &wire::encode_cookie(idx, &[1; 16])));
+        assert_eq!(a.handle_datagram_direct(t, 2, &wire::encode_cookie(idx, &[1; 16])), None);
         let got: Vec<_> = sent(&mut a, t).into_iter().map(|x| (x.dst, x.payload)).collect();
         assert_eq!(got, vec![(2, wire::with_cookie(&hs1, &[1; 16]))]);
         a.handle_datagram(t, 2, &wire::encode_cookie(idx, &[2; 16]));
@@ -4529,5 +4537,46 @@ mod tests {
             assert_eq!(got, vec![(9, hs2.clone())]);
         }
         assert_eq!((ep.session_count(), ep.stats().rx_malformed), (1, 6));
+    }
+
+    /// NB44c-1: `handle_datagram_direct` names a peer only for a datagram whose
+    /// crypto ran, on a session whose direct path is `from`. From the peer's own
+    /// address, its HS1 sent again while the handshake is half-open, an HS1 forged
+    /// from its index and ephemeral key, its HS2 sent again once the link is up,
+    /// and an HS2 of junk for our index name no one (and fail no check: none ran).
+    /// A real HS1, HS2 and Data packet name the peer, and a stranger's HS1 the
+    /// stranger, so the host can tell it isn't the peer it punches to (NB44c-2).
+    #[test]
+    fn direct_datagrams_name_a_peer_only_once_authenticated() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (pa, pb, pc) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let t = Instant::from_millis(1);
+        // a, at 1, dials b at 2.
+        eps[0].connect(t, 2, pb).unwrap();
+        let hs1 = sent(&mut eps[0], t).remove(0).payload;
+        assert_eq!(eps[1].handle_datagram_direct(t, 1, &hs1), Some(pa));
+        let hs2 = sent(&mut eps[1], t).remove(0).payload;
+        let mut forged = hs1.clone();
+        forged[37..].fill(0x55);
+        for p in [&hs1, &forged] {
+            assert_eq!(eps[1].handle_datagram_direct(t, 1, p), None, "{} bytes", p.len());
+        }
+        assert_eq!(eps[0].handle_datagram_direct(t, 2, &hs2), Some(pb));
+        let ours = u32::from_le_bytes(hs2[5..9].try_into().unwrap());
+        let junk = wire::encode_hs2(77, ours, &[0x55; 48]);
+        for p in [&hs2, &junk] {
+            assert_eq!(eps[0].handle_datagram_direct(t, 2, p), None);
+        }
+        assert_eq!((eps[0].stats().rx_auth_failed, eps[1].stats().rx_auth_failed), (0, 0));
+        let ping = sent(&mut eps[0], t).remove(0).payload;
+        assert_eq!(kind(&ping), wire::DATA);
+        assert_eq!(eps[1].handle_datagram_direct(t, 1, &ping), Some(pa));
+        assert!(eps[0].is_connected(&pb) && eps[1].is_connected(&pa));
+        // c, at 3, dials b too.
+        eps[2].connect(t, 2, pb).unwrap();
+        let hs1 = sent(&mut eps[2], t).remove(0).payload;
+        assert_eq!(eps[1].handle_datagram_direct(t, 3, &hs1), Some(pc));
     }
 }
