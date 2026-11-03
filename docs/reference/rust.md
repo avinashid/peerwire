@@ -393,7 +393,7 @@ tells `SymmetricIp` from `Symmetric` with one of them on a second port too. More
 | `Open` | No NAT: the public address is the socket's own |
 | `Cone` | One public port for every destination (full, restricted or port-restricted cone; STUN can't tell them apart). Punching works with cone and open peers, and usually, not always, with symmetric ones |
 | `Symmetric` | A new public port per destination IP and port. Punching works towards open, full-cone and restricted-cone peers, towards port-restricted ones only if the ports come in a predictable sequence; two symmetric peers need a relay, unless both are sequential (lockstep prediction) or one is `SymmetricIp` and lets in any port of an IP it has sent to |
-| `SymmetricIp` | A new public port per destination IP (one STUN server's two ports saw one mapping). Against a cone it punches as `Symmetric` does; against another symmetric peer both sides open extra sockets and probe, which links if this NAT lets in any port of an IP it has sent to, unless both predict their ports (then lockstep prediction, as for two sequential `Symmetric` NATs). Offers carry it as `Symmetric` and a tag, so nodes from before it see `Symmetric` |
+| `SymmetricIp` | A new public port per destination IP (one STUN server's two ports saw one mapping). Against a cone it punches as `Symmetric` does; against another symmetric peer it opens extra sockets and the peer probes them (two `SymmetricIp` peers both do both), which links if this NAT lets in any port of an IP it has sent to, unless both predict their ports (then lockstep prediction, as for two sequential `Symmetric` NATs). Offers carry it as `Symmetric` and a tag, so nodes from before it see `Symmetric` |
 
 ### Failure, Status and Error
 

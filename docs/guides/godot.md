@@ -166,8 +166,10 @@ GDScript.
 6. Two symmetric NATs that both hand out ports in sequence link by lockstep prediction, after about 1.5 s: each
    probes the other's predicted ports in an order that makes the new mappings line up.
 7. A `symmetric-ip` NAT (a new port per peer IP, not per IP and port) against any other symmetric one links by a
-   birthday punch on both sides, after about 2 s, if it lets in any port of an IP it has sent to (see
-   [two symmetric NATs](../concepts/nat-traversal.md#two-symmetric-nats)).
+   birthday punch into its own sockets (both sides' against another `symmetric-ip` NAT), after about 2 s, if it lets in
+   any port of an IP it has sent to; in the simulator 49 of 50 tries link against NATs that map per IP and port (see
+   [two-sided birthday punch](../concepts/nat-traversal.md#two-sided-birthday-punch)). If both hand out ports in
+   sequence they use lockstep prediction instead, as in 6.
 8. What still fails over IPv4: a symmetric NAT with random ports against another symmetric one, unless one of them
    is such a `symmetric-ip` NAT. Godot's star has
    no third peer both sides are linked to, unless the game sets a [relay peer](#relay-peers). Without one,
