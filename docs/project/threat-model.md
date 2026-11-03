@@ -38,7 +38,7 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 | Peer relay (`FWD`/`RELAYED`) | No | Sees only ciphertext; rate-limited; forwards only to already-connected peers. |
 | NAT / on-path network | No | Noise authenticates the endpoints; cannot MITM. Can drop/delay. |
 | Remote peer | Partially | Authenticated, but may be malicious: send malformed frames, flood, probe. Parsers and resource caps are the defence. |
-| Host application / C caller | Yes | The C ABI trusts its caller to pass valid pointers and lengths (see SEC-8). |
+| Host application / C caller | Yes | The C ABI trusts its caller to pass valid pointers and lengths; since NB-085 it refuses null ones (see SEC-8). |
 
 ## Attacker capabilities considered
 
@@ -61,10 +61,11 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of main `34a35a8` (2026-11-01): NB-062 (`e6162f8`) merged in `d1f5d0f`
-and NB-064 (`4c86af7`) in `34a35a8`; the site was first deployed from `be989d4`.**
-Fixes merged after `@peerwire/js` 0.2.0 and
-`@peerwire/react` 0.1.1 reach apps with the next release of each.
+**Status as of main `0af38e9` (2026-11-03): NB-085 (`ac842cc`) merged in `697dcae`,
+NB-086 (`1f37042`) in `b2ae061`, NB-083 (`56309f9`) in `9665afb` and NB-084
+(`fd2f246`) in `9c7789b`; the site was first deployed from `be989d4`.** Fixes merged
+after `@peerwire/js` 0.2.1 (`b6b66c0`) and `@peerwire/react` 0.1.1 reach apps with
+the next release of each.
 
 | Finding | Status |
 |---|---|
@@ -74,7 +75,8 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | SEC-3 (Medium) | Fixed for rooms (NB-031 Rust, NB-037 JS); open for a bare `WebRtcTransport` |
 | SEC-4 (Medium) | **Fixed** by NB-024 (`85b8460`), merged `208659b` (under load a handshake from a UDP address takes no state until it echoes a cookie, and each source holds at most 4 half-open handshakes), reviewed 2026-10-29; residuals R1–R5, [SEC-4](#sec-4--half-open-handshake-table-exhaustion-medium--nb-024) |
 | NB24-1 (Medium) | **Fixed** by `3e1cab3` (its type named in `ae34744`) before the merge `208659b`, so never on main (a handshake a UDP address took below the mark, which may be spoofed, isn't counted against that address), reviewed 2026-10-29; Info NB24-I1…I6 (accepted or optional; I3 fixed by NB-050), same section |
-| SEC-5…SEC-8 | Open (NB-025…NB-028) |
+| SEC-5…SEC-7 | Open (NB-025…NB-027) |
+| SEC-8 (Low) | **Fixed** by `aad222d` (NB-085), merged `697dcae` (every `pw_*` function refuses a null handle, a null output, or a null input with a length over 0, before it reads, writes or takes anything), reviewed 2026-11-03, [SEC-8](#sec-8--c-abi-trusts-caller-pointers-and-lengths-low-by-contract--nb-028) |
 | SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/guides/godot.md` (Security); NB-029 audit and N29-1 fix |
 | SEC-12 (Info) | Accepted, no card |
 | SEC-13 (Low) | **Fixed** by NB-050 (`2f0c823`), merged `fe6854d` (an HS1's Noise part must be exactly 128 bytes, so a short copy of a half-open handshake's HS1 no longer draws its 57-byte HS2), reviewed 2026-10-30; residual NB50-I1 (Info, accepted), [SEC-13](#sec-13--a-short-copy-of-a-half-open-handshakes-hs1-reflects-its-hs2-low) |
@@ -89,11 +91,16 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB48b-2 (Low) | **Fixed** by `de9efea` (the busy slot is held per peer), re-checked 2026-10-24 |
 | NB48b-1, NB48b-3 (Low) | **Fixed** by `de9efea` (the answer is stripped) and `695b38b` (Chrome's line model, checked after apply), re-checked 2026-10-24 |
 | NB48b-4, NB48b-7 (Low) | **Fixed** by `4b6c0f7`, `46a5da3` and `4c37bb7` (relay-only dials through a relay stay relayed, also when switched on mid-dial), re-checked 2026-10-24 |
-| NB44c-1, NB44c-2 (Low) | Open, same section |
+| NB44c-1, NB44c-2 (Low) | **Fixed** by `8095325` and `7742801` (NB-085), merged `697dcae` (an extra birthday socket takes a route only from a packet of its own punch's peer that passed crypto here, and holds one route per peer), reviewed 2026-11-03, same section |
+| NB85-1 (Low), NB85-I1 (Info) | **Fixed** by `df232ba` before NB-085 merged, so never on main (a copy of the peer's HS1, which Noise IK can't tell from a new one, routes only its answer until the socket's `until`; a relay's tag is a candidate only for a packet that authenticated), reviewed 2026-11-03; NB85-I2, NB85-I3 (Info) open, same section |
+| NB85-2 (Low) | Open (on main, found in the NB-085 review): a copy of an HS1 a peer sent on an earlier link cancels our dial to it when our PeerId is the larger, same section |
 | NB46-1 (Low) | **Fixed** by `851a0e2`, merged `bae16c7` (a peer's `restart` ask heeded only while our ICE is down too; at most 3 restarts per link a minute; offers, answers and their copies to one peer under a budget), reviewed 2026-10-26, same section |
 | NB46-1a (Low), NB46-1b, NB46-1c, NB46-T1 (Info) | **Fixed** by `88bbf37`, merged `ee4cbe6` (an answer the budget refused holds its candidates; a copy of a new offer never gets the last answer; a refused restart is made when the window frees), reviewed 2026-10-26, same section |
-| NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
+| NB45-I1, NB44-I2, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 is still open after NB-085 |
+| NB46-I1 (Info) | **Fixed** for port guesses by `0a8a796` (NB-084), merged `9c7789b` (a peer's prediction counts only at a public IPv4 its own server-reflexive candidates name, and a link adds at most 128 predicted candidates), reviewed 2026-11-03; residual: other remote candidates per link have no total cap, same section |
 | NB48b-5, NB48b-6 (Info) | **Fixed** by `08425b8` (a stale link's close keeps the peer) and `2a00ecb` (CARRY replies bounded), re-checked 2026-10-24 |
+| NB83-1 (Low) | **Fixed** by `188987b` before NB-083 merged, so never on main (merged `9665afb`): a node behind a NAT that maps per IP and port only sprays towards a `SymmetricIp` peer, at most 1024 probes with no sockets, so a try costs its NAT at most 1,026 ports, not 2,304; reviewed 2026-11-03; NB83-I1, NB83-I2 (Info) accepted, [Two-sided birthday punch](#two-sided-birthday-punch-nb-083--nb83-1) |
+| NB84-1 (Medium) | **Fixed** by `fd2f246` before NB-084 merged, so never on main (merged `9c7789b`): a page's automatic birthday punches aim at most 2 fleets or sprays at any one IP per 5 min, whichever rooms and peers ask, and Net Lab's open global room runs none; reviewed 2026-11-03; residuals accepted; NB84-I1, NB84-I2 (Info) accepted, NB84-I3 fixed by `0af38e9`, [Automatic birthday punch](#automatic-birthday-punch-in-rooms-nb-084--nb84-1) |
 | MIC-1, MIC-3 (Low) | **Fixed** by `d78d046`, `877d02c` and `6303bd8` (Net Lab's global room and punch offers; `public-only` in `@peerwire/js` 0.1.1 and earlier), reviewed 2026-10-24; residual MIC-4 ([below](#bounds-and-residuals-from-reviews-nb-014nb-043)) |
 | MIC-2 (Info) | **Fixed** by `9282d36` (a punch that ended closes what it opened) and `691dec0` (one offer and one answer per punch, which also closes a Low NB48-1 bypass), reviewed 2026-10-24 |
 | MIC-4 (Low) | **Fixed** by `134fed3` (the button rejoins before it re-tests the network), reviewed 2026-10-24 |
@@ -145,6 +152,7 @@ Fixes merged after `@peerwire/js` 0.2.0 and
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
 | NB62-2 (Info in the emulator, High on a board) | Open (NB-063): before Wi-Fi is up, ESP-IDF's random numbers are only pseudo-random, and in QEMU every chip draws the same ones (measured), same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
+| NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -444,6 +452,19 @@ error code.
 **Fix.** Document the contract explicitly in the header/readme, and add null
 checks on the handle and on buffers where `len > 0` as cheap defence in depth.
 
+**Status: fixed** by `aad222d` (NB-085), merged `697dcae`, reviewed 2026-11-03. Every
+`pw_*` function in `lib.rs` and `sync.rs` checks its handle, each output (`writable`)
+and each input (`bytes` returns an `Option`) before it reads, writes or takes
+anything. A null handle, a null output, or a null input with a length over 0 gets
+`PW_ERR_INVALID`; functions that return nothing ignore the call, as they already did
+a null peer id; `pw_is_connected` returns 0 and the `i64` getters −1. `pw_secret` and
+`pw_stats` now return `int32_t` (an ABI change for native callers; JS ignores it),
+and `pw_stats` and `pw_poll_transmit`'s `out_addr` write at any alignment. `pw_seal`
+checks `MAX_SEALED` before it adds the overhead, so a huge `len` can't overflow. The
+contract is in `docs/reference/c-abi.md`. Test: `null_pointers_are_refused`
+(`lib.rs`, `sync.rs`). Residual (by contract): a pointer that isn't null must still
+point at `len` valid bytes, which no check can tell.
+
 ### SEC-12 — An invite holder can confirm a guessed link by naming it as a relay (Info) — no card
 
 Since NB-033 an invite holder the node never dialled learns none of its linked
@@ -570,7 +591,7 @@ The security question is who can name that address and how much traffic follows.
 | Native open (an offer saying `Cone`, to a random-port symmetric node) | Same | 256 sockets for 10 s, each sending 1 HS1 to the offer's address (about 34 KB) | Same budget; at most 512 extra sockets open at once |
 | Native lockstep sweep (both sides predict) | Same | Up to 96 HS1s (about 13 KB) to predicted ports of the offer's IP, and up to 96 of the node's own NAT ports | Same budget |
 | Browser port guesses (NB-046) | A linked or dialling WebRTC peer | 32 extra remote candidates per new `{ ip, next, step }` | Chrome's ICE pacing (about 16 checks/s per connection) |
-| Browser fleet and spray (NB-048, Net Lab only) | Any member of the Net Lab room, including the open global room | Fleet: 256 connections checking every candidate in the peer's offer. Spray: 1024 checks to the IP the peer names | 70 s per run, no cooldown |
+| Browser fleet and spray (NB-048, Net Lab; in rooms with no click since NB-084, [below](#automatic-birthday-punch-in-rooms-nb-084--nb84-1)) | Any member of the Net Lab room, including the open global room | Fleet: 256 connections checking every candidate in the peer's offer. Spray: 1024 checks to the IP the peer names | 70 s per run, no cooldown |
 
 The core stayed sans-IO and deterministic: `Endpoint::spray`, `sweep` and `opener`
 use the endpoint's seeded RNG and the `now` the host passes in. Sockets, the 5 ms
@@ -661,6 +682,12 @@ when it comes from the peer's current direct address.
 - Fix: report true only when this datagram passed crypto (set a flag after
   `read_message` in `on_hs1`, `on_hs2` and `on_data`; the duplicate returns leave it
   unset). Test: both packets above give false.
+- **Status: fixed** by `8095325` (NB-085), merged `697dcae`, reviewed 2026-11-03.
+  `on_packet` says how a packet authenticated, and the two early returns say it
+  didn't, so `handle_datagram_direct` names a peer only for a packet whose crypto ran
+  here (since `df232ba` it returns `Option<(PeerId, bool)>`, the bool meaning fresh:
+  NB85-1). Test: `direct_datagrams_name_a_peer_only_once_authenticated` (both packets
+  above give `None`).
 
 **NB44c-2 — Any linked identity can hold extra sockets open (Low).** `open_extra`
 does not record `Birthday.peer`, so a valid handshake from any identity that knows
@@ -678,6 +705,92 @@ through N source ports holds N sockets (up to 512) and the 5 ms poll (NB44-I2).
   authenticated session's `PeerId`, adopt a route only for that peer, and keep one
   route per peer. Fold NB44-I2 in: drop the 5 ms poll once every open extra socket
   is a route. Card NB-044c.
+- **Status: fixed** by `8095325` and `7742801` (NB-085), merged `697dcae`, reviewed
+  2026-11-03. `Extra` keeps the punch's peer (`Birthday::peer`), and `read_extra`
+  adopts or refreshes a route only for an authenticated packet of that peer. A new
+  route for the peer at another address ends its old one, whose socket then closes at
+  its `until`, so a peer cycling source ports holds one socket. Tests:
+  `birthday_sockets_take_only_their_peer_authenticated` (a junk HS2 from the peer's
+  address and a stranger's handshake make no route, and the sockets close at `until`)
+  and `birthday_sockets_keep_one_route_per_peer` (another peer's route is kept). The
+  5 ms poll wasn't folded in: NB44-I2 stays open.
+
+**NB85-1 — A copy of the punched peer's HS1 still counted as authenticated (Low).**
+Found in the NB-085 review (`7b0f776`), with the lead. Noise IK's first message has
+no freshness check. Once the link is up, `announce` forgets its half-open entry, so a
+copy of the peer's HS1 runs the DH again, passes, and makes an unannounced responder
+session whose path is the copy's sender. With `8095325`, that made a route and held a
+punch socket past `until` (60 s a copy, and a copy works every 10 s); with
+`7742801`, it also ended the peer's real route.
+- Repro (loopback node test, scratch, on `7b0f776`): a is linked with b and opens 4
+  sockets for it, and b's link moves through `socks[0]`. Host m sends a copy of b's
+  HS1 to `socks[1]`: a's route for b moves to m, m gets the 57-byte HS2 from
+  `socks[1]`, and after `until`, `socks[0]` is closed and `socks[1]` open. Behind a
+  NAT, a's packets to b then leave by a socket b's NAT drops.
+- It needs a copy of an HS1 b sent to a (on the path, or a member that relayed b's
+  dial) and a way into an extra socket, as NB44-2 does.
+- Fix: tell an HS1, which a copy can repeat, from an HS2 that finishes our dial or a
+  Data packet, which a copy can't; let an HS1 route only its answer.
+- **Status: fixed** by `df232ba` before NB-085 merged, so never on main, reviewed
+  2026-11-03. The core marks an HS1 on either path `Copyable`, only an HS2 that
+  finished our dial or Data after the replay check and the AEAD open `Fresh`, and the
+  two early returns `No`. `read_extra` lets a packet that isn't fresh only route its
+  answer, through its address's open route if it has one: it sets no `last_recv` and
+  ends no other route, so its socket closes at `until`. Tests:
+  `birthday_sockets_route_a_copied_hs1_only_until_until` and
+  `birthday_sockets_keep_the_route_of_a_copied_hs1_from_the_peer` (the probe, from m
+  and spoofed from b's address); the core test above checks the fresh flag, the copy
+  after the link is up, a simultaneous open and Data sent again.
+- Residual: a copy's route holds no socket, and each distinct copy works once per
+  10 s, as its own half-open entry matches the next. See NB85-I3.
+
+**NB85-I1 — A relayed packet's tag was a candidate before it authenticated (Info).**
+`on_data`'s relay loop added the origin tag of an inner packet as a candidate whether
+or not that packet authenticated, so a junk HS2 relayed with a tag could make us
+punch at the tag's address; nobody there can answer without the link key. **Fixed**
+by `df232ba`: the tag counts only for `Copyable` or `Fresh`, so a relayed dial's HS1
+still adds its tag (test `a_relayed_packet_adds_its_tag_only_once_authenticated`).
+The relay chooses the tag, as before.
+
+**NB85-I2 — The simulator still uses the route rule from before NB44-2 (Info, test
+gap).** `Sim::open_ports` makes an extra port a route on any datagram, so the
+birthday simulator tests don't measure the node's rule; only loopback node tests do,
+and loopback has no NAT filtering. Fix: adopt a route in the simulator only where
+`handle_datagram_direct` names the punch's peer, split as `read_extra` splits it, and
+rerun the birthday tests against the numbers in `docs/concepts/nat-traversal.md`.
+
+**NB85-I3 — A copied HS1 sent from another peer's address moves that peer's egress
+(Info).** The route added for a packet that isn't fresh steers everything a sends to
+`from` through the punch socket, not only the HS2. If `from` is the direct path of
+another peer c, linked on a's main socket, a's packets to c leave b's punch socket
+until its `until` (10 s); behind a port-restricted NAT, c's NAT drops them, then the
+link recovers.
+- Repro (loopback node test, scratch, on `ac842cc`): c's socket sends b's HS1 to
+  `socks[1]`. c gets the HS2 and a's next Data from `socks[1]`; after `until`, Data
+  leaves the main socket again.
+- It needs a copy of b's HS1, an open punch socket reachable through a's NAT, and
+  c's exact address spoofed, inside the 10 s. Before NB-085 the same input held the
+  socket 60 s and refreshed it.
+- Fix: skip the route when `from` is already a live link's direct path (node only).
+
+**NB85-2 — A copy of a peer's old HS1 cancels our dial to it (Low).** Found in the
+NB-085 review; on main before it. In a simultaneous open, the side with the larger
+PeerId drops its own dial for an HS1 that passes crypto (`on_hs1`). Noise IK's first
+message has no freshness, so a copy of an HS1 the peer sent on an earlier link passes
+too, once its half-open entry is gone.
+- Repro (core test, scratch, on `7b0f776`): b, the smaller PeerId, dials a; the link
+  comes up and both disconnect. At 20 s a dials b, and a copy of b's old HS1 reaches
+  a first, from another address. a answers there and drops its dial, b's answer to
+  that dial meets an unknown session, and the two don't link within 30 s.
+- It needs a copy of an HS1 the peer sent us: an on-path host, or a member that
+  relayed the peer's dial, which sees the inner HS1 and, linked to us, can send the
+  copy itself. A copy works once per 10 s and never expires, as it rests on static
+  keys. Impact: availability only; a dial from the larger PeerId fails until the node
+  dials again.
+- Fix: in a simultaneous open, keep our dial until the session the peer's HS1 made is
+  confirmed by its first Data, then drop it (no wire change); or put a timestamp in
+  HS1 and refuse one no newer than the last (a wire change). Test: the repro links
+  within a round trip of the copy.
 
 **NB44-3 — Local resources a remote peer can spend (Low).**
 - **File descriptors.** An offer saying `Cone` makes a random-port symmetric node
@@ -768,6 +881,7 @@ runs ICE checks to every candidate in that offer.
   `ip:port` the fleet checks. Measured with one candidate per connection: 474
   checks/s from 32 connections, 1,912/s from 128 and 2,705/s from 256; 39,288
   checks in 30 s from 256. That is one click per peer per 5 min, public IPv4 only.
+  Rooms run the same fleet with no click since NB-084, under NB84-1's per-IP cap.
 
 **NB48b-1 — The easy side still checks the candidates in the peer's answer (Low).**
 `openSpray().applyAnswer` passes the answer SDP to `setRemoteDescription` without
@@ -991,16 +1105,26 @@ carry a new one. Remote candidates per link have no total cap, only 32 per messa
 security model for remote candidates (RFC 8826), but the cost is cheap to tighten.
 Fix: require `nat.ip` to match one of the peer's server-reflexive addresses, take one
 prediction per description, and cap remote candidates per link (for example at 128).
+**Status: fixed for port guesses** by `0a8a796` (NB-084), merged `9c7789b`, reviewed
+2026-11-03. A prediction counts only if `nat.ip` is a public IPv4 that the peer's own
+server-reflexive candidates on that link name, and a link adds at most `MAX_GUESSES`
+(128) predicted candidates, however many predictions come. Tests: `nat_predict.mjs`
+(private IPs, an IP the peer never named, the cap) and `ice_restart.mjs` (an offer
+whose server-reflexive candidates don't name the IP). Residual (Info): other remote
+candidates per link still have no total cap, only 32 per message, and Chrome's ICE
+pacing bounds them.
 
-### Two-sided birthday punch (NB-083) — awaiting review
+### Two-sided birthday punch (NB-083) — NB83-1
 
-`backend/NB-083-sym-ip`. STUN now asks Google's server on a second port, which tells a
-symmetric NAT that maps one port per destination IP (`NatType::SymmetricIp`). Against
-another symmetric NAT, unless both predict their ports (then the lockstep sweep, as
-before), the `SymmetricIp` side opens the 256 sockets and the other sprays them, at most
-1024 ports from a NAT that maps per IP and port (NB83-1); two `SymmetricIp` sides each
-do both. The mechanism and costs are in `docs/concepts/nat-traversal.md` (STUN,
-Two-sided birthday punch, Messages, What others learn or can do).
+Reviewed on 2026-11-03: `backend/NB-083-sym-ip` at `d7e3604`, then its fold-in
+`56309f9`, merged `9665afb`. STUN now asks Google's server on a second port, which
+tells a symmetric NAT that maps one port per destination IP (`NatType::SymmetricIp`).
+Against another symmetric NAT, unless both predict their ports (then the lockstep
+sweep, as before), the `SymmetricIp` side opens the 256 sockets and the other sprays
+them, at most 1024 ports from a NAT that maps per IP and port (NB83-1); two
+`SymmetricIp` sides each do both. The mechanism and costs are in
+`docs/concepts/nat-traversal.md` (STUN, Two-sided birthday punch, Messages, What
+others learn or can do).
 
 What changes for an attacker:
 
@@ -1009,9 +1133,10 @@ What changes for an attacker:
 | An offer saying `SymmetricIp`, to a symmetric node, or `Symmetric` with the mapping entry, to a `SymmetricIp` node, unless both the offer and the node have a prediction | A room member, an invite holder, or a peer the node dialled | A `SymmetricIp` node facing `Symmetric`: the native open above, about 34 KB from 256 sockets. A `Symmetric` node: the native spray, at most 1024 probes to ports ≥ 1024 of the offer's first address. Two `SymmetricIp` nodes: both, in one punch, the spray up to 272,916 B | As the spray: 5 min per peer; the node budget; the NB44-1 per-IP cap, one entry for both halves. A `Symmetric` node's spray: one per 5 min per node (`PER_PORT_PUNCH_GAP`) |
 
 - **Reflection.** What lands on one address is the spray's, under the same per-IP cap,
-  so NB44-1's bound holds. Before NB-083 only a cone node sprayed. Now a symmetric
-  node does too, so more nodes can be recruited, each within its own cap (NB44-1's
-  per-node residual).
+  so NB44-1's bound holds, but for the opener's 256 HS1s when two `SymmetricIp` nodes
+  each do both (NB83-I1, +12.5%). Before NB-083 only a cone node sprayed. Now a
+  symmetric node does too, so more nodes can be recruited, each within its own cap
+  (NB44-1's per-node residual).
 - **Ports on the node's own NAT (NB44-3).** A node behind a NAT that maps per IP and
   port pays one port per probe, held for the NAT's UDP timeout, so it opens no sockets
   for this and sprays at most 1024 probes (NB83-1): up to 1026 ports a try with its
@@ -1019,9 +1144,10 @@ What changes for an attacker:
   budget alone, a member minting PeerIds could start 4 tries at once and 1 per 30 s
   after, about 4,100 ports, so such a node sprays at most once per 5 minutes, whichever
   peers ask: about 1,030 ports at a time from this, beside the 256 per try an offer
-  saying `Cone` already allowed. That is still much of a carrier NAT's per-subscriber
-  block of 512 to 2,048 ports. A `SymmetricIp` node's spray all goes to one IP, so it
-  costs its NAT one port. Test: `sym_ip_nodes_open_and_symmetric_peers_spray` (a
+  saying `Cone` already allowed (4 tries at once, then 1 per 30 s, under the node
+  budget). That is still much of a carrier NAT's per-subscriber block of 512 to 2,048
+  ports. A `SymmetricIp` node's spray all goes to one IP, so it costs its NAT one
+  port. Test: `sym_ip_nodes_open_and_symmetric_peers_spray` (a
   `Symmetric` node's spray is 1024 probes and no sockets; peers at three IPs start one
   spray on a `Symmetric` node and three opens on a `SymmetricIp` one).
 - **Lying about the NAT.** A sender picks its own NAT type, as before. Claiming
@@ -1039,6 +1165,127 @@ What changes for an attacker:
   needs the transaction id and the server's source address. Forged answers from the
   two Google ports could make a node `SymmetricIp`, or not. That only changes which
   punch it plans, under the limits above.
+
+Checked and holding (read, no probe): both ends plan the same punch;
+`PER_PORT_PUNCH_GAP` is checked before NB44-1's per-IP cap and the node token; the
+spray half of `Both` is skipped once the link is direct or relay-only; `classify`
+handles empty answers; each STUN name is looked up once; the fuzzers draw
+`SymmetricIp` offers.
+
+**NB83-1 — One two-sided try could use up a per-port carrier NAT's port block
+(Low).** At `d7e3604`, `PER_PORT_PUNCH_GAP` limited how often a node behind a NAT
+that maps per IP and port started a two-sided punch (once per 5 min), but not what a
+try cost: 256 sockets and 2,048 probes, each to a new destination, so 2,304 NAT
+ports, held for the NAT's UDP timeout. A carrier NAT may give a subscriber 512 to
+2,048 (NB44-3), so one try could fail the user's other new connections meanwhile.
+Any room member, invite holder or dialled peer could start one per 5 min with an
+offer saying `SymmetricIp`, and a sequential per-port node, which before could only
+be made to sweep (96 ports), ran the full try.
+- Repro: the unit test of the time gave a `Symmetric` node one 256-socket `Birthday`
+  and 2,048 probes against a `SymmetricIp` offer; in the simulator, a `sym-ip-apdf`
+  × `sym-random` try cost 258 + 2,306 mappings.
+- Fix: direct the punch (the `SymmetricIp` side opens, the per-port side only sprays)
+  and cap that spray at about 1024 probes. The hit chance against 256 sockets over
+  64,512 ports, **theoretical** 1 − (1 − 256/64512)^k, is 98.3% at k = 1024 against
+  99.97% at 2048.
+- **Status: fixed** by `188987b` (docs `56309f9`) before NB-083 merged, so never on
+  main, reviewed 2026-11-03: the plans and the Ports bullet above. In the simulator,
+  `sym-ip-apdf` against the per-port kinds costs 258 + 1,026 mappings a try (was
+  2,306), and the 12-kind matrix still links 116 of 144 pairs directly.
+
+**NB83-I1 — Two `SymmetricIp` nodes add the opener's HS1s to what one address gets
+(Info, accepted).** A `Both` punch counts once against the per-IP cap, and its 256
+opener HS1s go to the address it then sprays. Per node per IP per 5 min that is
+613,928 B, not 545,832 B (+12.5%, **theoretical**: 2 × (272,916 + 256 × 133) B).
+Since `188987b` only two `SymmetricIp` nodes do both, and it stays within NB44-1's
+accepted per-node residual.
+
+**NB83-I2 — A member can spend a per-port node's one spray (Info, accepted).**
+`PER_PORT_PUNCH_GAP` is node-wide, so a member minting PeerIds can use up a
+`Symmetric` node's one spray per 5 min, and a genuine `SymmetricIp` peer then stays
+on the relay until it passes, as with NB44b-I1. An availability cost only.
+
+### Automatic birthday punch in rooms (NB-084) — NB84-1
+
+Reviewed on 2026-11-03: `ui/NB-084-auto-birthday` (`0a8a796`, `82c0117`, then the
+fix `fd2f246`), merged `9c7789b`, with a docs fix in `0af38e9`. `joinRoom` now runs
+the browser birthday punch of NB-048 by itself, with no click, for a member it
+reaches only by fallback, when the WebRTC link that failed showed one side behind a
+cone NAT and the other behind a symmetric one with no prediction. The two sides agree
+over the room's encrypted link (`Punch` frames, tag 10), and a channel that opens
+takes the link over (`room.adoptChannel`). `joinRoom({ birthday: false })` turns it
+off. The mechanism is in `docs/concepts/nat-traversal.md` (In browsers).
+
+| Trigger | Who can trigger it | Traffic per try | Limits |
+|---|---|---|---|
+| A member on a fallback link, with us as the symmetric side | Any member of a room the page joined | A fleet: 256 connections, each checking one public `ip:port` (39,339 checks in 30 s measured, below) | One punch at a time per page, and 30 s after one that ran; per destination IP, 2 per 5 min (NB84-1); once per peer per room; 60 s at most |
+| The same, with us as the cone side | Same | One connection checking 1024 ports of one public IPv4, at ICE's pace (about 20 a second) | Same |
+
+- **Addresses.** Neither side checks a candidate from a description: both are
+  stripped (NB48b-1, NB48b-3). The one address each side aims at is public IPv4 and
+  comes from the peer's own candidates on the failed link, never from a `Punch`
+  frame. The peer writes those candidates, so it can name a third party's (NB84-1).
+- **Who.** Any member, so anyone in a room whose name can be guessed (CHAT-1), with
+  no click on either side. Relay-only runs no punch, and `Punch` frames go only to
+  proven members.
+- **Lifetime.** Everything a punch opened closes when it ends (60 s, `punchMs`), when
+  the peer goes and when we leave.
+- **Port guesses.** `0a8a796` also fixes NB46-I1 for port guesses, in the section
+  [above](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2).
+
+**NB84-1 — A member can aim a visitor's fleet at a third party, with no click, again
+and again (Medium).** At `82c0117`, a member's `Punch` offer made a symmetric-NAT
+member open its 256-connection fleet at the offer's `addr`. The only checks were that
+`addr` is public IPv4 and that the peer's candidates on the failed link named its IP,
+and the peer writes those (as in NB48-2). The cone side was the same: it sprays 1024
+ports of the IP the peer's candidates named. Only the page's one punch slot and its
+30 s gap limited it, so new PeerIds, or other rooms, could aim fleet after fleet at
+one victim. Net Lab's global room, open to anyone, passed no `birthday` option, so it
+ran these punches too, without NB48-1's click.
+- Repro (scratch loopback probe in headless Chromium, run once): one fleet aimed at a
+  listener drew 39,339 checks (3,933,900 B of payload) in about 30 s, then nothing
+  while the fleet stayed open.
+- Fix: a per-destination-IP cap in the page's punch slot (one at a time, 2 per 5 min,
+  a bounded map, as NB44-1 does natively); `birthday: false` for Net Lab's global
+  room; docs; a test with 3 PeerIds at one IP.
+- **Status: fixed** by `fd2f246` before NB-084 merged, so never on main, reviewed
+  2026-11-03.
+  - The slot (`punchSlot(...).take(who, ip)`) allows at most `ipMax` (2) punches per
+    destination IP per `ipWindowMs` (5 min) that opened a fleet or sprayed,
+    whichever rooms and peers ask. The symmetric side counts the IP its fleet aims
+    at, the cone side the IP it sprays. A fleet counts once opened, a spray once
+    answered, so a refused or unanswered offer costs nothing.
+  - It holds at most 64 IPs (`MAX_IPS`) and refuses a new one past that rather than
+    forget one; with the 30 s gap a window holds about 10. An address is read by a
+    strict IPv4 pattern with no leading zeros, so an IP has one spelling and no alias
+    gets a second count.
+  - Net Lab's global room joins with `birthday: false`. Its button still punches, on
+    a click only: it waits for the same slot but adds no gap or per-IP count
+    (NB84-I3).
+  - Tests: `room_birthday.mjs` (three peers at one IP get 2 punches on either side
+    while another IP still gets one) and `netlab_rooms.mjs` (the global room runs
+    none).
+- Residuals (accepted):
+  - The cap is per page, as NB44-1's is per node: N symmetric-NAT members, each aimed
+    by a member, still send one IP 2N fleets per 5 min, each about 39,000 checks.
+  - One page whose targets rotate runs about one fleet a minute (**theoretical**: 30 s
+    of checks, then the peer's `stop`, then the 30 s gap), at most 2 per IP per 5 min.
+  - In a room whose name can be guessed, anyone can start these punches; such an app
+    can pass `birthday: false`.
+
+**NB84-I1 — The punch slot is per `RTCPeerConnection` class (Info, documented).** A
+page's slot and its per-IP counts are kept per class, so rooms given different
+classes get a slot each. `docs/reference/javascript.md` says to give every room in a
+page the same class (`fd2f246`).
+
+**NB84-I2 — Each repeated offer gets a `no` (Info, accepted).** A member sending
+offer after offer gets one `no` frame for each, over the room link: one reply a
+frame, no amplification. Kept, as a prompt `no` frees the slot of a peer that
+rejoined.
+
+**NB84-I3 — The docs said Net Lab's button shares the punch limits (Info).** It
+shares only the slot. **Fixed** by `0af38e9`: `docs/reference/javascript.md` says the
+button waits for the same slot and adds no gap or per-IP count.
 
 ### WebRTC retries (Fast lane 1) — FL1-1, FL1-2
 
@@ -3262,18 +3509,28 @@ both walks found an own `"__proto__"` key 65 deep still dropped.
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
 This section records what each earlier review established about resource bounds,
-and what it accepted. Values are from main `7b716a2`.
+and what it accepted. Values are from main `7b716a2`, with the receive window and the
+congestion rule for tail losses from NB-086 (`b2ae061`, reviewed 2026-11-03).
 
 **Core sessions**
 - **Receive memory per link.**
-  - Reliable lane: `RECV_WINDOW` 1024 fragments of `FRAGMENT` 1100 B.
+  - Reliable lane: `RECV_WINDOW` 4096 fragments of `FRAGMENT` 1100 B (1024 before
+    NB-086). The sender keeps the span of reliable fragments in flight under it, as it
+    does the urgent span, so none is sent only to be dropped.
   - Urgent lane: `URGENT_RECV_WINDOW` 64 fragments, with messages capped at
     `MAX_URGENT` (64 KiB).
   - Fragments longer than `FRAGMENT`, and reassembly past `max_message` (1 MiB by
     default), are refused.
-  - The bound tested in `fuzz.rs` is about 2.31 MB per link (2.17 MB reliable, 0.13
-    MB urgent). `docs/guides/always-on-peer.md` sizes `PEERWIRE_MAX_PEERS` from it: 256 peers can pin
-    about 0.6 GB.
+  - The bound tested in `fuzz.rs` (`hostile_peer_pins_bounded_receive_memory`) is
+    5,687,912 B per link: 4095 · 1100 B + 1 MiB reliable (5.55 MB) and 63 · 1100 B +
+    64 KiB urgent (0.13 MB). Before NB-086 it was about 2.31 MB.
+    `docs/guides/always-on-peer.md` sizes `PEERWIRE_MAX_PEERS` from it: about 6.1 MB
+    allocated per link, so 256 peers can pin about 1.6 GB, and the compose file's
+    128 MB is the worst case for about 19.
+  - **NB86-I1 (Info, accepted):** the window is the receiver's, so this bound grew
+    2.46× on every node, whatever its `reliable_window`. A peer still sends every
+    byte it pins, over its own authenticated links only; size `max_links` to the
+    memory there is.
 - **Retransmission.**
   - RTO is 20 ms to 5 s; backoff `rto·2^min(tries-1, 8)`, at most 10 s.
   - After `MAX_TRIES` (16) the link is dead.
@@ -3284,6 +3541,9 @@ and what it accepted. Values are from main `7b716a2`.
   - Queueing delay above 25 ms cuts it to 0.85 (`DELAY_CUT`).
   - A loss with under 5 ms of queueing cuts it to 0.8 (`RANDOM_LOSS_CUT`, Veno);
     PERF-10 deepens that to 0.5 on a timeout in the same round trip.
+  - A tail loss, a first send whose timer runs out after an ACK acknowledged new
+    data, is cut as fast retransmit cuts, not as a timeout (NB-086, as RACK-TLP
+    does); a resend that times out is still a timeout, with back-off.
   - The minimum window is `MIN_CWND` (4).
   - Congestion state is per link, so a peer that games it affects only its own link.
 - **Links.**
@@ -3352,7 +3612,8 @@ and what it accepted. Values are from main `7b716a2`.
   - An `ice` or `ice-batch` message holds at most 32 candidates, and at most 32 are
     held before the description.
   - Residuals:
-    - No total cap on remote candidates per link (NB46-I1).
+    - No total cap on remote candidates per link but the predicted ones, at most
+      128 since `0a8a796` (NB46-I1).
     - No cap on signals held while an offer's proof is checked (one async check, so
       the window is short).
 - **Fallback pipes (NB-043).**
