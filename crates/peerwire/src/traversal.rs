@@ -136,11 +136,14 @@ const BIRTHDAY_REFILL: Duration = Duration::from_secs(30);
 const BIRTHDAY_IP_MAX: usize = 2;
 const BIRTHDAY_IP_WINDOW: Duration = Duration::from_secs(300);
 const BIRTHDAY_IP_BUSY: Duration = Duration::from_secs(20);
-/// A two-sided birthday punch (NB-083) from behind a NAT that maps per IP and port
-/// (`Symmetric`) costs it a mapping per socket and per probe: up to `BIRTHDAY_SOCKETS +
-/// BIRTHDAY_PROBES` (2304) of its ports, kept for its mapping timeout, which could use up
-/// the block a carrier NAT gives its user. So such a node starts at most one per this,
-/// whichever peers ask: on top of the limits above, which bound the punches of every kind.
+/// Behind a NAT that maps per IP and port (`Symmetric`), facing a [`NatType::SymmetricIp`]
+/// peer's sockets (NB-083), a node sprays only this many probes, as each costs it a port
+/// kept for its mapping timeout (NB83-1): a try costs it about 1026 ports, not 2306. One
+/// hits 256 sockets with probability 1 - (1 - 256/64512)^1024, about 98.3% (theoretical).
+const PER_PORT_PROBES: u16 = 1024;
+/// Such a spray could still use up much of the block of ports a carrier NAT gives its
+/// user, so a node starts at most one per this, whichever peers ask: on top of the
+/// limits above, which bound the punches of every kind.
 const PER_PORT_PUNCH_GAP: Duration = Duration::from_secs(300);
 /// Two-sided prediction, for two sequential symmetric NATs: both probe the other's
 /// predicted ports in order, the side with the lower PeerId at `next + k·step`, the
@@ -177,9 +180,10 @@ pub enum NatType {
     Symmetric,
     /// A symmetric NAT that picks a new public port per destination IP, not per
     /// IP and port: two ports of one STUN server saw one mapping, two servers two.
-    /// Against another symmetric peer both sides open extra sockets and probe
-    /// (a two-sided birthday punch), which links if this NAT also lets in any
-    /// port of an IP it has sent to. Offers carry it as [`Symmetric`](NatType::Symmetric)
+    /// Against another symmetric peer this side opens extra sockets and the peer
+    /// probes them (both do both if the peer is `SymmetricIp` too; two that predict
+    /// their ports sweep in lockstep instead), which links if this NAT also lets in
+    /// any port of an IP it has sent to. Offers carry it as [`Symmetric`](NatType::Symmetric)
     /// plus a tag that older peers skip, so they see `Symmetric`. Needs a STUN
     /// server listed on two ports of one IP ([`DEFAULT_STUN_SERVERS`](crate::DEFAULT_STUN_SERVERS) does).
     SymmetricIp,
@@ -277,14 +281,16 @@ pub struct Birthday<A> {
 /// A punch planned from the two NAT types, past an ordinary one.
 #[derive(Clone, Debug)]
 enum Plan<A> {
-    /// Birthday punch, behind the symmetric NAT: open sockets towards the peer's address.
+    /// Birthday punch, behind the symmetric NAT (or the [`NatType::SymmetricIp`] one facing
+    /// one that maps per IP and port): open sockets towards the peer's address.
     Open(A),
-    /// Birthday punch, behind the cone: spray ports of the peer's IP (this address's).
+    /// Birthday punch, behind the cone (or the NAT that maps per IP and port, facing a
+    /// `SymmetricIp` one, at most [`PER_PORT_PROBES`]): spray ports of the peer's IP.
     Spray(A),
     /// Two sequential symmetric NATs: probe these, in order ([`LOCKSTEP_LOW`]).
     Sweep(Vec<A>),
-    /// A [`NatType::SymmetricIp`] side and a symmetric one (NB-083): both roles of a
-    /// birthday punch, the sockets now, then [`Plan::Then`].
+    /// Two [`NatType::SymmetricIp`] sides (NB-083): both roles of a birthday punch, the
+    /// sockets now, then [`Plan::Then`].
     Both(A),
     /// The spray half of [`Plan::Both`]: part of a punch already started and counted.
     Then(A),
@@ -436,7 +442,7 @@ pub struct Traversal<A: Address> {
     planned: Bucket,
     /// Recent birthday-punch starts per destination IP, for the NB44-1 per-IP cap.
     punch_ips: HashMap<std::net::IpAddr, VecDeque<Instant>>,
-    /// When this node last started a two-sided punch as `Symmetric` ([`PER_PORT_PUNCH_GAP`]).
+    /// When this node last started a spray as `Symmetric` ([`PER_PORT_PUNCH_GAP`]).
     per_port_punch: Option<Instant>,
     sockets: VecDeque<Birthday<A>>,
     transmits: VecDeque<Transmit<A>>,
@@ -871,7 +877,8 @@ impl<A: Address> Traversal<A> {
                 ep.spray(now, &peer, &addr, BIRTHDAY_PROBES);
                 continue;
             }
-            let per_port = matches!(side, Plan::Both(_)) && self.nat == NatType::Symmetric;
+            // Each probe from behind a NAT that maps per IP and port costs it a port.
+            let per_port = matches!(side, Plan::Spray(_)) && self.nat == NatType::Symmetric;
             if per_port && self.per_port_punch.is_some_and(|t| now - t < PER_PORT_PUNCH_GAP) {
                 continue;
             }
@@ -911,7 +918,9 @@ impl<A: Address> Traversal<A> {
                         self.sockets.push_back(Birthday { peer, dst, sockets: BIRTHDAY_SOCKETS, payload, until });
                     }
                 }
-                Plan::Spray(addr) => ep.spray(now, &peer, &addr, BIRTHDAY_PROBES),
+                Plan::Spray(addr) => {
+                    ep.spray(now, &peer, &addr, if per_port { PER_PORT_PROBES } else { BIRTHDAY_PROBES })
+                }
                 Plan::Sweep(addrs) => ep.sweep(now, &peer, &addrs),
                 Plan::Then(_) => {}
             }
@@ -921,10 +930,12 @@ impl<A: Address> Traversal<A> {
     /// Plans a punch with `from` after its offer, if its NAT and ours are a pair an
     /// ordinary punch can't link: a birthday punch for ours symmetric with random
     /// ports and its a cone, or the other way round; a lockstep sweep for two sequential
-    /// symmetric NATs (both predict), whatever each maps per; else both roles of one on
-    /// each side for a [`NatType::SymmetricIp`] side and a symmetric one whose offer says
-    /// how it maps (so it does its part). Aimed at the offer's first address, which is
-    /// public when the sender's STUN answered (and which its prediction is for).
+    /// symmetric NATs (both predict), whatever each maps per; else, for a
+    /// [`NatType::SymmetricIp`] side and a symmetric one whose offer says how it maps (so
+    /// it does its part), the same birthday punch with the `SymmetricIp` side's sockets,
+    /// or both roles on each side for two `SymmetricIp` ones. Aimed at the offer's first
+    /// address, which is public when the sender's STUN answered (and which its prediction
+    /// is for).
     fn plan_punch(&mut self, now: Instant, ep: &Endpoint<A>, from: PeerId, o: &Offer<A>) {
         let (loopback, relay_only) = (self.loopback, matches!(self.privacy, Privacy::RelayOnly { .. }));
         let v4 = |a: &A| a.to_socket_addr().is_some_and(|s| s.is_ipv4());
@@ -945,8 +956,16 @@ impl<A: Address> Traversal<A> {
                     let (stride, count) = if self.id < from { (1, LOCKSTEP_LOW) } else { (2, LOCKSTEP_HIGH) };
                     Plan::Sweep(p.sweep(base, stride, count))
                 }
-                _ if mine == NatType::SymmetricIp || theirs == NatType::SymmetricIp => Plan::Both(base.clone()),
-                _ => return,
+                // Else the `SymmetricIp` side opens sockets, and a side that maps per IP and
+                // port only sprays them: its own sockets would let a probe in only if its NAT
+                // filtered by IP, and each costs it a port (NB83-1). Two `SymmetricIp` sides
+                // each do both, so either one's sockets can take the other's probes.
+                _ => match (mine, theirs) {
+                    (NatType::SymmetricIp, NatType::SymmetricIp) => Plan::Both(base.clone()),
+                    (NatType::SymmetricIp, _) => Plan::Open(base.clone()),
+                    (_, NatType::SymmetricIp) => Plan::Spray(base.clone()),
+                    _ => return,
+                },
             },
             _ => return,
         };
@@ -1389,7 +1408,7 @@ struct Offer<A> {
     nat: NatType,
     /// The sender's NAT is symmetric and the offer says how it maps (an entry that
     /// nodes before NB-083 skip, so they read [`NatType::SymmetricIp`] as `Symmetric`):
-    /// the sender does its part of a punch with a `SymmetricIp` peer ([`Plan::Both`]).
+    /// the sender does its part of a punch with a `SymmetricIp` peer (NB-083).
     says_mapping: bool,
     /// Sender's Unix time in ms, and a random nonce: replays are dropped.
     ts: u64,
@@ -3136,77 +3155,83 @@ mod tests {
         assert_eq!(punch_case(&SEQ, NatType::Symmetric, false, there, direct, (10, 1), &[0], false).1.len(), 4);
     }
 
-    /// NB-083: a `SymmetricIp` node and a symmetric peer whose offer says how it maps both
-    /// open sockets towards each other at 1 s and spray at 1.5 s: one punch, under the same
-    /// limits as a birthday punch, and behind a NAT that maps per IP and port one per 5
-    /// minutes. Not with a peer that predates NB-083 (towards which the node is `Symmetric`,
-    /// as before), nor when both predict (they sweep in lockstep, as before), and two
-    /// `Symmetric` nodes still don't spray.
+    /// NB-083: a `SymmetricIp` node facing a symmetric peer whose offer says how it maps opens
+    /// sockets towards it at 1 s, and the peer sprays them from 1.5 s, as a cone would; two
+    /// `SymmetricIp` nodes each do both. Behind a NAT that maps per IP and port the spray
+    /// opens no sockets and sends `PER_PORT_PROBES`, once per 5 minutes (NB83-1). One punch,
+    /// under the same limits as a birthday punch. Not with a peer that predates NB-083
+    /// (towards which the node is `Symmetric`, as before), nor when both predict (they sweep
+    /// in lockstep, as before), and two `Symmetric` nodes still don't spray.
     #[test]
-    fn sym_ip_nodes_and_symmetric_peers_both_open_and_spray() {
+    fn sym_ip_nodes_open_and_symmetric_peers_spray() {
         let (public, private, direct) = ("198.51.100.9:20000", "192.168.1.50:20000", Privacy::Direct);
-        let (attempts, probes) = (4, usize::from(BIRTHDAY_PROBES));
+        let (attempts, probes, per_port) = (4, usize::from(BIRTHDAY_PROBES), usize::from(PER_PORT_PROBES));
         let case = |mine: &[u16], their, predict, there, privacy, peers, offers_ms: &[u64], old| {
             let (b, sent) = punch_case(mine, their, predict, there, privacy, (10, peers), offers_ms, old);
             (b, sent.len())
         };
         let (dst, until) = (public.parse().unwrap(), Instant::from_millis(1000) + BIRTHDAY_OPEN_FOR);
+        // What a case towards `public` started: sockets, and datagrams past the dial's sends.
+        let what = |(b, sent): (Vec<Birthday<SocketAddr>>, usize)| {
+            assert!(b.iter().all(|b| (b.dst, b.until) == (dst, until)));
+            (b.iter().map(|b| usize::from(b.sockets)).sum::<usize>(), sent - attempts)
+        };
+        let sockets = usize::from(BIRTHDAY_SOCKETS);
+        let (opens, sprays, both, nothing) = ((sockets, 0), (0, per_port), (sockets, probes), (0, 0));
         use NatType::{Cone, Symmetric, SymmetricIp};
-        for (mine, their) in [(&SYM_IP[..], Symmetric), (&SYM_3, SymmetricIp), (&SYM_IP, SymmetricIp)] {
-            let (b, sent) = case(mine, their, false, public, direct, 1, &[0], false);
-            assert_eq!(b.len(), 1, "{mine:?} x {their:?}");
-            assert_eq!((b[0].dst, b[0].sockets, b[0].until), (dst, BIRTHDAY_SOCKETS, until));
-            assert_eq!(sent, attempts + probes, "{mine:?} x {their:?}: every probe, each port once");
+        // When one doesn't predict: the `SymmetricIp` side opens; a side that maps per IP and
+        // port sprays `PER_PORT_PROBES`, each port once, and opens nothing; two `SymmetricIp`
+        // sides do both, the full spray, as it costs each NAT one port.
+        for (mine, their, predict, want) in [
+            (&SYM_IP[..], Symmetric, false, opens),
+            (&SYM_IP, Symmetric, true, opens),
+            (&SEQ_IP, Symmetric, false, opens),
+            (&SYM_3, SymmetricIp, false, sprays),
+            (&SYM_3, SymmetricIp, true, sprays),
+            (&SEQ, SymmetricIp, false, sprays),
+            (&SYM_IP, SymmetricIp, false, both),
+            (&SYM_IP, SymmetricIp, true, both),
+            (&SEQ_IP, SymmetricIp, false, both),
+        ] {
+            let got = what(case(mine, their, predict, public, direct, 1, &[0], false));
+            assert_eq!(got, want, "{mine:?} x {their:?}, predict {predict}");
         }
-        // A peer whose offer doesn't say how its NAT maps wouldn't do its part: nothing.
-        assert_eq!(case(&SYM_IP, Symmetric, false, public, direct, 1, &[0], true), (vec![], attempts));
-        // Two plain symmetric NATs: nothing, as before.
-        assert_eq!(case(&SYM_3, Symmetric, false, public, direct, 1, &[0], false), (vec![], attempts));
-        // Against a cone, a `SymmetricIp` node is the symmetric side of a birthday punch, as before.
-        let (b, sent) = case(&SYM_IP, Cone, false, public, direct, 1, &[0], false);
-        assert_eq!((b.len(), sent), (1, attempts));
-        let (b, sent) = case(&CONE, SymmetricIp, false, public, direct, 1, &[0], false);
-        assert_eq!((b.len(), sent), (0, attempts + probes));
         // Two that predict sweep in lockstep (96 or 64 probes, by PeerId), as before NB-083,
-        // whatever their offers say of how they map; both roles only when one doesn't predict.
-        let sweeps =
-            |(b, sent): (Vec<Birthday<SocketAddr>>, usize)| b.is_empty() && [64, 96].contains(&(sent - attempts));
-        let both = |(b, sent): (Vec<Birthday<SocketAddr>>, usize)| b.len() == 1 && sent == attempts + probes;
+        // whatever their offers say of how they map.
         for (mine, their, old) in [
             (&SEQ_IP[..], Symmetric, false),
             (&SEQ_IP, Symmetric, true),
             (&SEQ_IP, SymmetricIp, false),
             (&SEQ, SymmetricIp, false),
         ] {
-            assert!(sweeps(case(mine, their, true, public, direct, 1, &[0], old)), "{mine:?} x {their:?}, old {old}");
+            let (sockets, swept) = what(case(mine, their, true, public, direct, 1, &[0], old));
+            assert!(sockets == 0 && [64, 96].contains(&swept), "{mine:?} x {their:?}, old {old}: {swept}");
         }
-        for (mine, their, predict) in [
-            (&SEQ_IP[..], Symmetric, false),
-            (&SEQ_IP, SymmetricIp, false),
-            (&SEQ, SymmetricIp, false),
-            (&SYM_IP, Symmetric, true),
-            (&SYM_IP, SymmetricIp, true),
-            (&SYM_3, SymmetricIp, true),
-        ] {
-            let got = case(mine, their, predict, public, direct, 1, &[0], false);
-            assert!(both(got), "{mine:?} x {their:?}, predict {predict}");
-        }
+        // A peer whose offer doesn't say how its NAT maps wouldn't do its part: nothing.
+        assert_eq!(what(case(&SYM_IP, Symmetric, false, public, direct, 1, &[0], true)), nothing);
+        // Two plain symmetric NATs: nothing, as before.
+        assert_eq!(what(case(&SYM_3, Symmetric, false, public, direct, 1, &[0], false)), nothing);
+        // Against a cone, a `SymmetricIp` node is the symmetric side of a birthday punch, as before.
+        assert_eq!(what(case(&SYM_IP, Cone, false, public, direct, 1, &[0], false)), opens);
+        assert_eq!(what(case(&CONE, SymmetricIp, false, public, direct, 1, &[0], false)), (0, probes));
         // The limits: not towards a private address, nor relay-only; once per peer in the
         // cooldown; and many PeerIds naming one IP get one punch there (NB44-1), its spray included.
-        assert_eq!(case(&SYM_IP, Symmetric, false, private, direct, 1, &[0], false), (vec![], attempts));
+        assert_eq!(case(&SYM_IP, SymmetricIp, false, private, direct, 1, &[0], false), (vec![], attempts));
         let relay_only = Privacy::RelayOnly { via: None };
-        assert!(case(&SYM_IP, Symmetric, false, public, relay_only, 1, &[0], false).0.is_empty());
-        let (b, sent) = case(&SYM_IP, Symmetric, false, public, direct, 1, &[0, 2000, 4000], false);
+        assert!(case(&SYM_IP, SymmetricIp, false, public, relay_only, 1, &[0], false).0.is_empty());
+        let quiet = case(&SYM_3, Symmetric, false, public, relay_only, 1, &[0], false).1;
+        assert_eq!(case(&SYM_3, SymmetricIp, false, public, relay_only, 1, &[0], false).1, quiet);
+        let (b, sent) = case(&SYM_IP, SymmetricIp, false, public, direct, 1, &[0, 2000, 4000], false);
         assert_eq!((b.len(), sent), (1, attempts + probes));
-        let (b, sent) = case(&SYM_IP, Symmetric, false, public, direct, 6, &[0], false);
+        let (b, sent) = case(&SYM_IP, SymmetricIp, false, public, direct, 6, &[0], false);
         assert_eq!((b.len(), sent), (1, 6 * attempts + probes));
-        // Behind a NAT that maps per IP and port, each probe costs a port: one such punch per
-        // 5 minutes, node-wide, though the peers are at three IPs; behind one that maps per
-        // IP, the usual limits.
+        // Behind a NAT that maps per IP and port, each probe costs a port: one spray per 5
+        // minutes, node-wide, though the peers are at three IPs; behind one that maps per IP,
+        // the usual limits.
         let ips: Vec<SocketAddr> = (1..=3).map(|i| SocketAddr::from(([198, 51, 100, i], 20_000))).collect();
         let starts = |mine: &[u16], their| punch_case_at(mine, their, false, &ips, direct, 10, &[0], false);
         let (b, sent) = starts(&SYM_3, SymmetricIp);
-        assert_eq!((b.len(), sent.len()), (1, 3 * attempts + probes));
+        assert_eq!((b.len(), sent.len()), (0, 3 * attempts + per_port));
         assert_eq!(starts(&SYM_IP, Symmetric).0.len(), 3);
     }
 

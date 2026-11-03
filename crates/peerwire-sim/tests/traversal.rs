@@ -352,8 +352,8 @@ fn nat_matrix_through_signaling() {
             direct += o.direct as u32;
             first += (o.direct && i < old && j < old) as u32;
             // Two peers link unless both NATs are symmetric and not both sequential
-            // (lockstep), or one maps per IP and filters by IP (`sym-ip-adf`: a two-sided
-            // birthday punch, NB-083); filtering by address only changes nothing else
+            // (lockstep), or one maps per IP and filters by IP (`sym-ip-adf`: its sockets take
+            // the other's probes, NB-083); filtering by address only changes nothing else
             // (NB-080), but for one sequential side of two that does (see the variants' own test).
             let ip_adf = |k: &Kind| k.name() == "sym-ip-adf";
             let links = !(sym(a) && sym(b)) || (seq(a) && seq(b)) || ip_adf(a) || ip_adf(b);
@@ -643,68 +643,79 @@ fn tries(a: &str, b: &str, seed: u64, both_roles: bool) -> (Try, u64) {
     (got, direct)
 }
 
+/// Of 50 tries, how many a `sym-ip-adf` side's sockets take at least, sprayed from a NAT
+/// that maps per IP and port: `PER_PORT_PROBES` (1024) miss 256 sockets 1.7% of the time
+/// (theoretical, 0.85 tries in 50), and more often when a sequential NAT gave the sockets
+/// consecutive ports, as the spray steps through the ports at one stride, whose first
+/// 1024 steps can leave gaps wider than 256.
+const PER_PORT_LINKS: u64 = 45;
+
 /// NB-083: a NAT with one port per destination IP (`sym-ip`), which STUN tells apart by
 /// asking one server on two ports, against every symmetric kind, as planned from the
-/// offers: both sides open sockets and spray. A probe that lands on a `sym-ip` socket's
-/// mapping is answered from that mapping, as from a cone, so with filtering by IP
-/// (`sym-ip-adf`) every try links and the link holds; filtering by port (`sym-ip-apdf`)
-/// lets no probe in, so it links only with `sym-ip-adf`. Prints what a try costs.
+/// offers: the `sym-ip` side opens sockets and the other sprays them (at most
+/// `PER_PORT_PROBES` from a NAT that maps per IP and port), and two `sym-ip` sides each do
+/// both. A probe that lands on a `sym-ip` socket's mapping is answered from that mapping,
+/// as from a cone, so with filtering by IP (`sym-ip-adf`) a try links and the link holds;
+/// filtering by port (`sym-ip-apdf`) lets no probe in, so it links only with `sym-ip-adf`.
+/// Prints what a try costs.
 #[test]
 fn sym_ip_nats_punch_every_symmetric_kind() {
-    use Try::*;
+    // How it goes, and of 50 tries at least how many link.
+    let (all, spray, none) = ((Try::Stable, 50), (Try::Stable, PER_PORT_LINKS), (Try::Fails, 0));
     let cases = [
-        ("sym-ip-adf", "sym-seq", Stable),
-        ("sym-ip-adf", "sym-random", Stable),
-        ("sym-ip-adf", "cgnat(pr+sym)", Stable),
-        ("sym-ip-adf", "sym-seq-adf", Stable),
-        ("sym-ip-adf", "sym-rand-adf", Stable),
-        ("sym-ip-adf", "sym-ip-adf", Stable),
-        ("sym-ip-adf", "sym-ip-apdf", Stable),
-        ("sym-ip-apdf", "sym-seq", Fails),
-        ("sym-ip-apdf", "sym-random", Fails),
-        ("sym-ip-apdf", "cgnat(pr+sym)", Fails),
-        ("sym-ip-apdf", "sym-seq-adf", Fails),
-        ("sym-ip-apdf", "sym-rand-adf", Fails),
-        ("sym-ip-apdf", "sym-ip-apdf", Fails),
+        ("sym-ip-adf", "sym-seq", spray),
+        ("sym-ip-adf", "sym-random", spray),
+        ("sym-ip-adf", "cgnat(pr+sym)", spray),
+        ("sym-ip-adf", "sym-seq-adf", spray),
+        ("sym-ip-adf", "sym-rand-adf", spray),
+        ("sym-ip-adf", "sym-ip-adf", all),
+        ("sym-ip-adf", "sym-ip-apdf", all),
+        ("sym-ip-apdf", "sym-seq", none),
+        ("sym-ip-apdf", "sym-random", none),
+        ("sym-ip-apdf", "cgnat(pr+sym)", none),
+        ("sym-ip-apdf", "sym-seq-adf", none),
+        ("sym-ip-apdf", "sym-rand-adf", none),
+        ("sym-ip-apdf", "sym-ip-apdf", none),
         // No punch is planned for two symmetric NATs that don't map per IP: what the try costs.
-        ("sym-random", "sym-random", Fails),
+        ("sym-random", "sym-random", none),
         // Against a cone, as before NB-083: the sym-ip side opens, the cone sprays.
-        ("sym-ip-adf", "port-restr", Stable),
-        ("sym-ip-apdf", "port-restr", Stable),
+        ("sym-ip-adf", "port-restr", all),
+        ("sym-ip-apdf", "port-restr", all),
     ];
-    for (a, b, want) in cases {
+    for (a, b, (want, links)) in cases {
         let (got, direct) = tries(a, b, 2200, false);
         assert_eq!(got, want, "{a} x {b}");
-        assert!(want == Fails || direct == 50, "{a} x {b}: {direct}/50");
+        assert!(direct >= links, "{a} x {b}: {direct}/50");
     }
 }
 
 /// NB-083: a `sym-ip` NAT that hands out ports in sequence predicts them, as it did when
 /// STUN read it as plain symmetric. With a peer that predicts too, the two sweep in
 /// lockstep as before and link every time (with a `Both` instead, `ipseq-apdf` would link
-/// with none of them); with one that doesn't, both open and spray, which links if a
-/// `sym-ip` side filters by IP only, where before NB-083 nothing was planned.
+/// with none of them); with one that doesn't, the `sym-ip` side opens and the other sprays
+/// (or both do both, for two `sym-ip` sides), which links if a `sym-ip` side that opens
+/// filters by IP only, where before NB-083 nothing was planned.
 #[test]
 fn sequential_sym_ip_nats_still_sweep_in_lockstep() {
-    use Try::*;
+    let (all, spray, none) = ((Try::Stable, 50), (Try::Stable, PER_PORT_LINKS), (Try::Fails, 0));
     let cases = [
         // Both predict: the lockstep sweep.
-        ("ipseq-adf", "sym-seq", Stable),
-        ("ipseq-adf", "ipseq-apdf", Stable),
-        ("ipseq-apdf", "sym-seq", Stable),
-        ("ipseq-apdf", "sym-seq-adf", Stable),
-        ("ipseq-apdf", "cgnat(pr+sym)", Stable),
-        ("ipseq-apdf", "ipseq-apdf", Stable),
-        // One doesn't: both open and spray.
-        ("ipseq-adf", "sym-random", Stable),
-        ("ipseq-adf", "sym-ip-apdf", Stable),
-        ("ipseq-apdf", "sym-ip-adf", Stable),
-        ("ipseq-apdf", "sym-random", Fails),
+        ("ipseq-adf", "sym-seq", all),
+        ("ipseq-adf", "ipseq-apdf", all),
+        ("ipseq-apdf", "sym-seq", all),
+        ("ipseq-apdf", "sym-seq-adf", all),
+        ("ipseq-apdf", "cgnat(pr+sym)", all),
+        ("ipseq-apdf", "ipseq-apdf", all),
+        // One doesn't: the sym-ip side opens and the other sprays, or two sym-ip sides do both.
+        ("ipseq-adf", "sym-random", spray),
+        ("ipseq-adf", "sym-ip-apdf", all),
+        ("ipseq-apdf", "sym-ip-adf", all),
+        ("ipseq-apdf", "sym-random", none),
     ];
-    for (a, b, want) in cases {
+    for (a, b, (want, links)) in cases {
         let (got, direct) = tries(a, b, 2300, false);
         assert_eq!(got, want, "{a} x {b}");
-        assert!(want == Fails || direct == 50, "{a} x {b}: {direct}/50");
+        assert!(direct >= links, "{a} x {b}: {direct}/50");
     }
 }
 
