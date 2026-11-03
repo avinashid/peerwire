@@ -3,7 +3,7 @@
 Peer-to-peer rooms for the browser and Node, with no server of your own. Peers that share a room name find each other
 through public Nostr relays (or a BroadcastChannel, for tabs of one browser), link over WebRTC DataChannels, and talk
 over an end-to-end encrypted session. Underneath is the Peerwire core in Rust, compiled to a WebAssembly module of
-355,588 bytes with no imports (as `packages/js/build.sh` builds it on main), and no wasm-bindgen.
+356,363 bytes with no imports (as `packages/js/build.sh` builds it on main), and no wasm-bindgen.
 
 ```sh
 npm install @peerwire/js
@@ -65,7 +65,7 @@ page: `<script type="importmap">{"imports":{"@peerwire/js":"/path/to/packages/js
 ## From source
 
 ```sh
-./packages/js/build.sh                         # -> packages/js/pkg/peerwire_ffi.wasm (355,588 bytes on main)
+./packages/js/build.sh                         # -> packages/js/pkg/peerwire_ffi.wasm (356,363 bytes on main)
 python3 -m http.server -d packages/js 8000     # any static server; the demos are in demo/
 ```
 

@@ -32,6 +32,8 @@ CI and `scripts/gate.sh` fail the wasm build if it grows past 350 KiB (`WASM_MAX
   `PW_ERR_NOT_CONNECTED` (-1), `PW_ERR_TOO_LARGE` (-2), `PW_ERR_WOULD_BLOCK` (-3),
   `PW_ERR_INVALID` (-4), `PW_ERR_BUFFER` (-5, the output buffer is too small and nothing
   was consumed).
+- A null handle, a null output, or a null input with a length over 0 is refused:
+  `PW_ERR_INVALID`, or nothing done by the functions that return nothing.
 
 ## Functions
 
@@ -45,7 +47,7 @@ each function is in its doc comment.
 
 ## Tests
 
-`cargo test -p peerwire-ffi --features sync` runs 9 tests through the C ABI:
+`cargo test -p peerwire-ffi --features sync` runs 11 tests through the C ABI:
 - two endpoints link, restore an identity from its secret, round-trip a sealed message and
   verify a Nostr signature;
 - a relayed link moves to a direct address (`pw_add_candidate`), and a slow link moves
@@ -53,6 +55,7 @@ each function is in its doc comment.
 - `pw_handle_datagram_from` drops another peer's packets; path RTT is timed from the
   handshake;
 - two members share a doc, and the ABI refuses what `doc.js` throws for;
+- null handles, outputs and inputs are refused, in both files, and nothing is read or taken;
 - a fuzz of the whole ABI checks every event's encoding.
 
 The wasm module is also tested from JavaScript, in the gate and in CI: the
