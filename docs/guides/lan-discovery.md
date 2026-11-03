@@ -32,7 +32,8 @@ Each copy prints `+ <peer>` when it links with another; then type a line to send
   private network the system sends the group through. Some home routers never deliver multicast to small Wi-Fi
   devices, such as an ESP32, but pass broadcast. A message heard both ways is kept once. Container bridges and VPNs
   get no broadcast: they are other networks, whose members may be anywhere. On Linux they can't send one in either:
-  the broadcast socket hears only the LAN's interface.
+  the broadcast socket hears only the LAN's interface. That needs Linux 5.7 or later; on an older kernel a process
+  without `CAP_NET_RAW` gets no broadcast, only multicast.
 - From there, rooms work exactly as they do over Nostr: sealed hellos, sealed offers, simultaneous dials. Peers link
   over their LAN addresses, so there's nothing to punch.
 - A message is at most 1,356 bytes (`LanSignaling::MAX_PAYLOAD`), so nothing is fragmented: ESP-IDF's network stack

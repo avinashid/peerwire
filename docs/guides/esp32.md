@@ -62,9 +62,9 @@ Getting there took three fixes, each now in the firmware or the library:
 - **Clock.** A board's clock starts at 1970, and room hellos more than a minute off are dropped, so the board and the
   laptop ignored each other. The firmware sets the clock by SNTP before it joins.
 
-With Wi-Fi up first, the chip's random number generator draws real entropy: seven boots gave seven different
-PeerIds. The [port's README](../../ports/esp32/README.md#on-a-board-nb-091-3-nov-2026) has the details and the
-flashing steps.
+With Wi-Fi up before the node is built, seven boots gave seven different PeerIds. That shows the identity draw
+differs on each boot; whether every random draw comes after Wi-Fi is up is still open (NB62-2 in the threat model).
+The [port's README](../../ports/esp32/README.md#on-a-board-nb-091-3-nov-2026) has the details and the flashing steps.
 
 ## Building and running
 
@@ -88,8 +88,8 @@ versions, how to install them, and every result in detail.
 - **Entropy.** QEMU gives every chip the same random sequence, so `run.sh` gives each one an identity seed from the
   host. That fixes the identity only: the node's other random draws still repeat on every chip, and two emulated
   chips seal their room hellos with the same nonces, so a listener can tell who's in the room. The emulator shows
-  discovery and memory use, not privacy. A board draws real entropy, but makes a new identity each boot: keeping it
-  needs encrypted storage, not done yet.
+  discovery and memory use, not privacy. A board draws its identity after Wi-Fi is up, but makes a new one each
+  boot: keeping it needs encrypted storage, not done yet.
 - **Clocks.** A board that can't reach an SNTP server can't link with a PC, since their clocks differ by more than a
   minute.
 - **LAN only.** `LanSignaling` reaches the local network. Reaching peers elsewhere needs Nostr signaling, which needs

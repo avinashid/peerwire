@@ -45,8 +45,9 @@ Two emulator-only workarounds:
   endpoint and traversal seeds) still repeat on every chip, so two chips seal their
   room hellos with the same nonces and a listener can tell who is in the room. The
   emulator shows discovery and memory, not privacy. On a board the firmware brings
-  Wi-Fi up first, so every draw comes from real entropy (NB-063); the identity isn't
-  yet stored in encrypted NVS.
+  Wi-Fi up before it builds the Node, and each boot drew a different identity (NB-063).
+  Whether every later draw also comes after Wi-Fi is still open (NB62-2), and the
+  identity isn't yet stored in encrypted NVS.
 - **Multicast.** ESP-IDF's openeth driver sets no multicast filter and QEMU's
   OpenCores MAC drops multicast frames that miss it, so the firmware puts the MAC in
   promiscuous mode. ESP-IDF logs `failed to add mac filter` when lwIP joins the
@@ -144,13 +145,15 @@ in room `esp32` with `lan_chat` on a laptop on the same LAN (on the router's 5 G
 - **Clock.** Room hellos carry the sender's clock and are dropped more than a minute off.
   The board's clock started at 1970, so the board and the laptop each heard the other's
   hellos and dropped them. The firmware now sets the clock by SNTP before binding.
-- **Entropy (NB-063).** With Wi-Fi up, the chip's RNG draws real entropy: 7 boots gave
+- **Entropy (NB-063).** With Wi-Fi up before the Node is built, 7 boots gave
   7 different PeerIds (`cdefbd84e5cb`, `7123e58ee85f`, `43acb61bed00`, `afecca0f71e9`,
-  `16c6673b8508`, `9f571feb83e4`, `1ee1be2aa889`). The identity isn't kept across reboots yet.
+  `16c6673b8508`, `9f571feb83e4`, `1ee1be2aa889`). That shows the identity draw differs;
+  whether every draw comes after Wi-Fi is up is still open (NB62-2). The identity isn't
+  kept across reboots yet.
 
 ## What it would take to go further
 
-- **Identity.** A board draws its key from real entropy (NB-063) but makes a new one each
+- **Identity.** A board draws its key after Wi-Fi is up (NB-063) but makes a new one each
   boot. Keeping it needs encrypted NVS.
 - **Clocks.** A board that can't reach an SNTP server can't link with a PC, whose clock
   differs by more than a minute (NB-093).

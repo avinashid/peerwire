@@ -157,7 +157,9 @@ impl LanSignaling {
     /// this itself where it can list interfaces; an ESP32 names its own. At most four;
     /// one named twice is added once. One of this device's own addresses is refused:
     /// bound to it, the socket would take unicast from anywhere. On Linux `addr` must be
-    /// in one of the device's subnets, and the leg hears only that interface.
+    /// in one of the device's subnets, and the leg hears only that interface. Binding a
+    /// socket to it needs Linux 5.7 or later, or `CAP_NET_RAW`: before that,
+    /// `PermissionDenied`, and `on` adds no leg.
     pub fn broadcast(mut self, addr: Ipv4Addr) -> io::Result<LanSignaling> {
         self.add_broadcast(addr)?;
         Ok(self)
@@ -311,7 +313,14 @@ fn device_of(addr: Ipv4Addr) -> Option<String> {
             }
         }
     }
-    best.map(|(_, name)| name)
+    best.map(|(_, name)| device(&name).to_owned())
+}
+
+/// The device an address's label names: one added with a label is listed as `eth0:1`,
+/// which no socket can bind to. A Linux device's name never holds a `:`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn device(label: &str) -> &str {
+    label.split_once(':').map_or(label, |(dev, _)| dev)
 }
 
 /// ESP-IDF has no getifaddrs: the firmware adds its subnet itself, and names its own
@@ -580,6 +589,8 @@ mod tests {
         assert_eq!(socket2::SockRef::from(&c.socks[0]).device().unwrap(), None, "the group's socket");
         // TEST-NET-3 (RFC 5737): no host's subnet.
         assert!(carrier(6).broadcast(Ipv4Addr::new(203, 0, 113, 255)).is_err());
+        // An address added with `label eth0:1` binds eth0.
+        assert_eq!((device("eth0:1"), device("lo")), ("eth0", "lo"));
     }
 
     /// NB92-2: with any interface, the only leg is the group route's interface's, not a

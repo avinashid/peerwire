@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
         // identity only; the Node's other random draws still repeat on every chip, so
         // the emulator shows discovery and memory, not privacy.
         Some(seed) => builder = builder.identity(Identity::from_secret_bytes(&seed)),
-        // With the radio on, the ESP-IDF RNG draws on RF noise: every draw is truly random.
+        // With the radio on, the ESP-IDF RNG draws on RF noise (NB-063; NB62-2 is open).
         None if wifi.is_some() => info!("node {n}: identity from the chip's RNG, Wi-Fi on"),
         None => warn!("node {n}: no identity seed in flash; generating one from the chip's RNG"),
     }
