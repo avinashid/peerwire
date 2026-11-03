@@ -1090,7 +1090,7 @@ mod tests {
             lookups.push(s.to_string());
             let (name, port) = s.rsplit_once(':')?;
             let n = lookups.len() as u8;
-            Some(SocketAddr::new([192, 0, 2, n].into(), port.parse().ok()?)).filter(|_| name.ends_with(".example"))
+            name.ends_with(".example").then_some(SocketAddr::new([192, 0, 2, n].into(), port.parse().ok()?))
         });
         let at = |n: u8, port| SocketAddr::new([192, 0, 2, n].into(), port);
         assert_eq!(got, vec![at(1, 19302), at(2, 3478), at(1, 3478)], "one IP for one name; a bad port skipped");
