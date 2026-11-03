@@ -46,6 +46,9 @@ Where Peerwire can't list interfaces (ESP-IDF), name the network's broadcast add
 - **The firewall must let in UDP port 20567** (or your group's port). Without that, a node hears nobody.
 - **The network must pass multicast or broadcast between clients.** Home networks pass at least one. Some guest and
   public Wi-Fi networks keep clients apart; there a node finds nobody, and you need invites or Nostr instead.
+- **Clocks must agree within a minute.** Hellos and offers carry the sender's clock, and older or newer ones are
+  dropped. A `Node` reads the clock when it's bound, so a device with no battery-backed clock (such as an ESP32) must
+  set it first, by SNTP for example; otherwise it and its peers ignore each other.
 - **Browsers can't send UDP.** A browser on the same network finds peers through invites, a
   BroadcastChannel (tabs of one browser) or Nostr. A Rust node and a browser can still share a room if both are on
   the same Nostr relays.

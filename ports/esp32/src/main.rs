@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
 use esp_idf_svc::eth::{BlockingEth, EspEth, EthDriver};
@@ -28,6 +28,7 @@ use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::ipv4::{ClientConfiguration, ClientSettings, Configuration, Mask, Subnet};
 use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::sys;
 use esp_idf_svc::wifi::{self, AuthMethod, BlockingWifi, EspWifi, WifiEvent};
 use log::{info, warn};
@@ -91,6 +92,8 @@ fn main() -> anyhow::Result<()> {
     };
     let heap_net = free_heap();
     info!("node {n}: network up at {ip}, free heap {heap_net} B");
+    // Kept, so SNTP keeps the clock in step.
+    let _sntp = if wifi.is_some() { set_clock(n) } else { None };
 
     // Its own address, not 0.0.0.0: ESP-IDF can't list interfaces, so a node bound to
     // any interface would offer only loopback.
@@ -220,8 +223,9 @@ fn report(n: u8, node: &Node, heap_node: u32, names: &HashMap<PeerId, String>, l
 }
 
 /// What the LAN carrier sent, and heard from other nodes on this node's topics (their
-/// hellos and offers). On a real network discovery can work one way only, such as when
-/// the router doesn't deliver multicast to the board (NB-091).
+/// hellos and offers, counted before the Node checks them). On a real network discovery
+/// can work one way only, such as when the router doesn't deliver multicast to the board
+/// (NB-091).
 #[derive(Default)]
 struct LanCounts {
     sent: AtomicU32,
@@ -266,6 +270,26 @@ fn lan_signaling(n: u8, ip: Ipv4Addr, prefix: u8) -> std::io::Result<LanSignalin
     let broadcast = Ipv4Addr::from(u32::from(ip) | u32::MAX.checked_shr(prefix.into()).unwrap_or(0));
     info!("node {n}: LAN signals to {} and {broadcast}", LanSignaling::GROUP.ip());
     LanSignaling::on(LanSignaling::GROUP, ip)?.broadcast(broadcast)
+}
+
+/// Sets the clock by SNTP, waiting up to 20 s. Room hellos and offers carry the sender's
+/// clock, and a node drops those more than a minute off its own (a replay guard). A board
+/// has no battery-backed clock: at 1970 it and a PC on the LAN dropped each other's hellos
+/// and never linked (NB-091). The Node reads the clock when it is bound, so this comes
+/// first. In QEMU every chip's clock starts at 1970, so they agree without it.
+fn set_clock(n: u8) -> Option<EspSntp<'static>> {
+    let unix_s = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let sntp = EspSntp::new_default().map_err(|e| warn!("node {n}: SNTP: {e}")).ok()?;
+    let start = Instant::now();
+    // 2023-11-14: any clock before it was never set.
+    while unix_s() < 1_700_000_000 && start.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    match unix_s() {
+        s if s >= 1_700_000_000 => info!("node {n}: clock set by SNTP in {} ms: {s} s", start.elapsed().as_millis()),
+        s => warn!("node {n}: no SNTP answer in 20 s, clock at {s} s: LAN peers with a set clock drop our hellos"),
+    }
+    Some(sntp)
 }
 
 fn free_heap() -> u32 {

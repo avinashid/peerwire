@@ -28,6 +28,11 @@ with ~250 KB of free heap: 16 KiB messages, a 32 KiB send buffer and 8 links
 (the defaults allow 1 MiB). Every 10 s each node logs free heap, the lowest free
 heap so far, unused main-task stack and its links' RTTs.
 
+On a board's Wi-Fi it sets its clock by SNTP before binding the `Node`. Room hellos and
+offers carry the sender's clock and are dropped more than a minute off the receiver's,
+and a board's clock starts at 1970: unset, the board and a PC never linked (NB-091).
+QEMU's chips all start at 1970, so they agree without it.
+
 `l2hub.mjs` carries Ethernet frames between the QEMU instances (`-netdev dgram`
 on 127.0.0.1), as a hub on one LAN segment would. Nothing leaves the host.
 
