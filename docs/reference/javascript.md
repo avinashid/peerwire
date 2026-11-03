@@ -621,8 +621,8 @@ makes takes the link over as above. Nothing waits on it: the fallback carries th
 - **Limits.** One punch at a time per page, the next at least 30 s after one that ran; at most 2 aimed at any one IP
   per 5 minutes per page, whichever rooms and peers ask; once per peer while you are in the room (a busy page puts it
   off, then tries again 15 to 120 s later); 60 s at most. When it ends, and when either side leaves, everything it
-  opened closes. A page here is its `RTCPeerConnection` class: rooms given the same one (the default) and Net Lab's
-  button share these limits, so give every room in a page the same class.
+  opened closes. A page here is its `RTCPeerConnection` class: rooms given the same one (the default) share these
+  limits, and Net Lab's button waits for the same slot, so give every room in a page the same class.
 - **Addresses.** Only public IPv4 addresses that the peer's candidates on the failed link named are tried. The peer
   writes those candidates, so a member can name a third party's address: your page then checks it from 256
   connections, or checks 1024 ports of that IP, for up to 60 s. The per-IP limit bounds what any one address gets
