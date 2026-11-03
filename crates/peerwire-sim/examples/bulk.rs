@@ -39,6 +39,8 @@ pub struct Args {
     pub seed: u64,
     /// Uplink buffer as queueing delay (tail drop); 0 = unlimited.
     pub buffer_ms: u64,
+    /// `Config::reliable_window` on both hosts.
+    pub window: usize,
 }
 
 impl Default for Args {
@@ -56,6 +58,7 @@ impl Default for Args {
             trace: false,
             seed: 1,
             buffer_ms: 0,
+            window: Config::default().reliable_window,
         }
     }
 }
@@ -116,6 +119,7 @@ fn args() -> Vec<Args> {
             "--trace" => a.trace = val == "1",
             "--seed" => a.seed = val.parse().unwrap(),
             "--buffer" => a.buffer_ms = val.parse().unwrap(),
+            "--window" => a.window = val.parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -126,14 +130,15 @@ fn main() {
     for a in args() {
         let s = run(a.clone());
         println!(
-            "{} MiB, rtt {} ms, jitter {} ms{}, loss {}%, {} Mbps{}",
+            "{} MiB, rtt {} ms, jitter {} ms{}, loss {}%, {} Mbps{}{}",
             a.mib,
             2 * a.latency_ms,
             a.jitter_ms,
             if a.in_order { " in order" } else { "" },
             a.loss * 100.0,
             a.up_mbps,
-            if a.buffer_ms > 0 { format!(", buffer {} ms", a.buffer_ms) } else { String::new() }
+            if a.buffer_ms > 0 { format!(", buffer {} ms", a.buffer_ms) } else { String::new() },
+            if a.window != Args::default().window { format!(", window {}", a.window) } else { String::new() }
         );
         println!(
             "  {}: {:.2} s, {:.2} MB/s; peak cwnd {}, peak inflight {}; delay backoffs {}, retransmits {} of {} fragments",
@@ -195,7 +200,8 @@ pub fn run(a: Args) -> Summary {
         in_order: a.in_order,
     };
     let mut sim = Sim::new(net, a.seed);
-    let (tx, rx) = (sim.add_node(Config::default()), sim.add_node(Config::default()));
+    let config = || Config { reliable_window: a.window, ..Config::default() };
+    let (tx, rx) = (sim.add_node(config()), sim.add_node(config()));
     for n in [tx, rx] {
         sim.nodes[n].uplink_bps = Some(a.up_mbps * 1_000_000);
         sim.nodes[n].uplink_buffer = (a.buffer_ms > 0).then(|| Duration::from_millis(a.buffer_ms));
