@@ -691,8 +691,9 @@ traversal privacy_modes_matrix -- --nocapture`:
   it is the lockstep sweep below), makes it do one or both of the above: a `SymmetricIp` node facing a `Symmetric` offer
   opens 256 sockets with 256 handshakes; a `Symmetric` node facing a `SymmetricIp` offer sprays up to 1024 ports of the
   offer's IP (about 135 KB); two `SymmetricIp` nodes do both, with the full spray, about 300 KB, as one punch. All under
-  the same limits and per-IP cap, so what lands on one address is unchanged. New is what a node behind a NAT that maps
-  per IP and port pays: before NB-083 it never sprayed, and each probe now costs its NAT a port, up to 1026 a try, held
+  the same limits and per-IP cap, so what lands on one address is as before, but two `SymmetricIp` nodes add the
+  opener's 256 handshakes, about 34 KB (+12.5%, NB83-I1). New is what a node behind a NAT that maps per IP and port
+  pays: before NB-083 it never sprayed, and each probe now costs its NAT a port, up to 1026 a try, held
   for the NAT's mapping timeout. That is still much of the 512 to 2048 ports a carrier NAT may give its user (NB44-3),
   so such a node sprays at most once per 5 minutes, whichever peers ask (`PER_PORT_PUNCH_GAP`), and opens no sockets for
   it (NB83-1): about 1030 ports at a time from this at most, beside the 256 a try that an offer saying `Cone` could

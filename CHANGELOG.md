@@ -31,7 +31,12 @@ and the commit that fixed it.
   - room hellos are sealed as in JavaScript;
   - handshake cookies under load, and a per-address cap on half-open handshakes;
   - an HS1 must be exactly the right length;
-  - incoming offers spend a budget before they're decrypted.
+  - incoming offers spend a budget before they're decrypted;
+  - a birthday punch's extra sockets take a route only from their own peer's authenticated packets.
+- **API changes:** every `pw_*` function refuses a null handle, a null output, or a null input with a length over 0
+  (`PW_ERR_INVALID` where it returns a code), and `pw_secret` and `pw_stats` now return `int32_t` (see the
+  [C ABI](docs/reference/c-abi.md)); `Endpoint::handle_datagram_direct` returns `Option<(PeerId, bool)>`, the bool
+  saying the packet was fresh.
 - **Godot:** a hub catches up a stalled member afresh instead of disconnecting it; getters for each link's route and
   address.
 
