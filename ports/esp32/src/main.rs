@@ -34,7 +34,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::sys;
 use esp_idf_svc::wifi::{self, AuthMethod, BlockingWifi, EspWifi, WifiEvent};
-use log::{info, warn};
+use log::{error, info, warn};
 use peerwire::{
     Config, Event, Identity, LanSignaling, Lane, MultiSignaling, Node, NostrSignaling, Path, PeerId, Signaling, Topic,
 };
@@ -62,10 +62,19 @@ struct NodeConfig {
     wifi: Option<(String, String)>,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    // Restart and try again rather than sit idle: a board that joined Wi-Fi but got no
+    // address by DHCP stayed down until it was power-cycled (NB-095).
+    if let Err(e) = run() {
+        error!("{e:#}; restarting in 5 s");
+        std::thread::sleep(Duration::from_secs(5));
+        unsafe { sys::esp_restart() };
+    }
+}
 
+fn run() -> anyhow::Result<()> {
     let NodeConfig { n, msg_kib, seed, wifi } = node_config();
     info!("node {n}: boot, free heap {} B", free_heap());
 
@@ -310,14 +319,12 @@ impl<S: Signaling + Health> Signaling for Counted<S> {
     }
 }
 
-/// The relay's thread, named so the report can find it. The TLS handshake needs far more
-/// stack than ESP-IDF's 4 KB default for a thread; the report shows how much went unused.
+/// The relay's thread, named so the report can find it. `NostrSignaling` sizes its stack
+/// (std's own setting wins over this one's); the report shows how much went unused.
 const NOSTR_THREAD: &CStr = c"nostr";
-const NOSTR_STACK: usize = 32 * 1024;
 
 fn nostr_signaling() -> anyhow::Result<NostrSignaling> {
-    let conf = ThreadSpawnConfiguration { name: Some(NOSTR_THREAD), stack_size: NOSTR_STACK, ..Default::default() };
-    conf.set()?;
+    ThreadSpawnConfiguration { name: Some(NOSTR_THREAD), ..Default::default() }.set()?;
     let nostr = NostrSignaling::new([NOSTR_RELAY]);
     ThreadSpawnConfiguration::default().set()?;
     Ok(nostr)

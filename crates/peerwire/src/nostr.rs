@@ -41,6 +41,9 @@ const MAX_INBOX: usize = if SMALL { 32 } else { 1024 };
 /// An ESP32 has about 300 KB of heap: the inbox alone would take 53 KB of it, and the
 /// ids remembered about 170 B each (NB-095).
 const SMALL: bool = cfg!(target_os = "espidf");
+/// A relay thread's stack on ESP-IDF, where a thread gets 4 KB unless asked: the TLS
+/// handshake overflowed that (NB-095). Elsewhere the platform's default.
+const RELAY_STACK: Option<usize> = if SMALL { Some(32 << 10) } else { None };
 /// Largest websocket message or frame taken from a relay (tungstenite's default is 64 MiB).
 const MAX_MESSAGE: usize = 128 << 10;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -124,10 +127,11 @@ impl NostrSignaling {
             .map(|url| {
                 let (cmd, rx) = channel();
                 let (url, tx, shared) = (url.as_ref().to_string(), tx.clone(), shared.clone());
-                std::thread::Builder::new()
-                    .name("peerwire-nostr".into())
-                    .spawn(move || relay_loop(url, rx, tx, shared))
-                    .expect("spawn relay thread");
+                let mut thread = std::thread::Builder::new().name("peerwire-nostr".into());
+                if let Some(size) = RELAY_STACK {
+                    thread = thread.stack_size(size);
+                }
+                thread.spawn(move || relay_loop(url, rx, tx, shared)).expect("spawn relay thread");
                 cmd
             })
             .collect();
