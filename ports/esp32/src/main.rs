@@ -16,17 +16,20 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use esp_idf_svc::eth::{BlockingEth, EspEth, EthDriver};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::ipv4::{ClientConfiguration, ClientSettings, Configuration, Mask, Subnet};
 use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys;
-use esp_idf_svc::wifi::{self, AuthMethod, BlockingWifi, EspWifi};
+use esp_idf_svc::wifi::{self, AuthMethod, BlockingWifi, EspWifi, WifiEvent};
 use log::{info, warn};
 use peerwire::{Config, Event, Identity, LanSignaling, Lane, Node, Path, PeerId};
 
@@ -62,22 +65,8 @@ fn main() -> anyhow::Result<()> {
     // The driver lives as long as the node: dropping it takes the network down.
     let (ip, _net): (Ipv4Addr, Box<dyn Any>) = match &wifi {
         Some((ssid, password)) => {
-            let nvs = EspDefaultNvsPartition::take()?;
-            let mut w = BlockingWifi::wrap(EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs))?, sysloop)?;
-            w.set_configuration(&wifi::Configuration::Client(wifi::ClientConfiguration {
-                ssid: ssid.as_str().try_into().map_err(|_| anyhow!("SSID over 32 bytes"))?,
-                password: password.as_str().try_into().map_err(|_| anyhow!("password over 64 bytes"))?,
-                auth_method: if password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal },
-                ..Default::default()
-            }))?;
-            w.start()?;
-            // Modem sleep holds our frames until the next beacon, ~100 ms on every RTT.
-            sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
-            info!("node {n}: joining Wi-Fi {ssid:?}");
-            w.connect()?;
-            w.wait_netif_up()?;
-            let ip = w.wifi().sta_netif().get_ip_info()?.ip;
-            (ip, Box::new(w))
+            let w = join_wifi(n, peripherals.modem, sysloop, ssid, password)?;
+            (w.wifi().sta_netif().get_ip_info()?.ip, Box::new(w))
         }
         None => {
             let netif = EspNetif::new_with_conf(&NetifConfiguration {
@@ -228,6 +217,87 @@ fn report(n: u8, node: &Node, heap_node: u32, names: &HashMap<PeerId, String>, o
 
 fn free_heap() -> u32 {
     unsafe { sys::esp_get_free_heap_size() }
+}
+
+/// Joins the Wi-Fi network and waits for a DHCP address, retrying until it does. Each
+/// attempt steps the TX power down (ESP-IDF's quarter-dBm, 20 to 8.5 dBm): small C3
+/// boards with a chip antenna often can't take full power, so the AP hears their short
+/// auth frame but never their association request.
+fn join_wifi(
+    n: u8,
+    modem: Modem<'static>,
+    sysloop: EspSystemEventLoop,
+    ssid: &str,
+    password: &str,
+) -> anyhow::Result<BlockingWifi<EspWifi<'static>>> {
+    const TX_POWER: [i8; 4] = [80, 60, 44, 34];
+    let nvs = EspDefaultNvsPartition::take()?;
+    let mut w = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop.clone())?;
+    w.set_configuration(&wifi::Configuration::Client(wifi::ClientConfiguration {
+        ssid: ssid.try_into().map_err(|_| anyhow!("SSID over 32 bytes"))?,
+        password: password.try_into().map_err(|_| anyhow!("password over 64 bytes"))?,
+        auth_method: if password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal },
+        ..Default::default()
+    }))?;
+    w.start()?;
+    // Modem sleep holds our frames until the next beacon, ~100 ms on every RTT.
+    sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
+    let aps = w.scan()?;
+    let seen: Vec<_> = aps.iter().filter(|ap| ap.ssid == ssid).collect();
+    if seen.is_empty() {
+        warn!("node {n}: {ssid:?} not among the {} networks in range", aps.len());
+    }
+    for ap in seen {
+        let bssid: Vec<_> = ap.bssid.iter().map(|b| format!("{b:02x}")).collect();
+        info!(
+            "node {n}: hears {ssid:?} at {} on channel {}, {} dBm, {:?}",
+            bssid.join(":"),
+            ap.channel,
+            ap.signal_strength,
+            ap.auth_method
+        );
+    }
+    // The last disconnect's reason (ESP-IDF's wifi_err_reason_t); 0 while there is none.
+    let reason = Arc::new(AtomicU16::new(0));
+    let _sub = sysloop.subscribe::<WifiEvent, _>({
+        let reason = reason.clone();
+        move |event| {
+            if let WifiEvent::StaDisconnected(d) = event {
+                reason.store(d.reason(), Ordering::Relaxed);
+            }
+        }
+    })?;
+    for attempt in 1.. {
+        let power = TX_POWER[(attempt - 1) % TX_POWER.len()];
+        sys::esp!(unsafe { sys::esp_wifi_set_max_tx_power(power) })?;
+        info!("node {n}: joining Wi-Fi {ssid:?}, attempt {attempt} at {} dBm", f32::from(power) / 4.0);
+        reason.store(0, Ordering::Relaxed);
+        w.wifi_mut().connect()?;
+        let start = Instant::now();
+        while !w.is_connected()? && reason.load(Ordering::Relaxed) == 0 && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if w.is_connected()? {
+            info!("node {n}: joined on attempt {attempt} at {} dBm", f32::from(power) / 4.0);
+            break;
+        }
+        let r = reason.load(Ordering::Relaxed);
+        let why = match r {
+            0 => "no answer in 10 s",
+            2 => "auth expired",
+            4 => "the AP never answered the association request",
+            15 | 204 => "4-way handshake timed out: wrong password?",
+            201 => "AP not found",
+            202 => "auth failed",
+            203 => "association refused",
+            _ => "see ESP-IDF's wifi_err_reason_t",
+        };
+        warn!("node {n}: attempt {attempt} failed, reason {r}: {why}");
+        let _ = w.wifi_mut().disconnect();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    w.wait_netif_up()?;
+    Ok(w)
 }
 
 /// This node's number, the size of its messages in KiB (0: a short line), its identity
