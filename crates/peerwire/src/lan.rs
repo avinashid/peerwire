@@ -2,9 +2,9 @@
 //!
 //! [`LanSignaling`] sends each message as one datagram to an organisation-local
 //! multicast group ([`LanSignaling::GROUP`] by default) with a TTL of 1, so it never
-//! leaves the link, and the same datagram to the subnet broadcast address of each
-//! private interface: some home routers never deliver multicast to small Wi-Fi devices
-//! (an ESP32 joins with IGMPv2, which they ignore) but pass broadcast. Every carrier on
+//! leaves the link, and the same datagram to the LAN's subnet broadcast address: some
+//! home routers never deliver multicast to small Wi-Fi devices (an ESP32 joins with
+//! IGMPv2, which they ignore) but pass broadcast. Every carrier on
 //! the LAN hears it, other processes on the same machine too, and each keeps only the
 //! topics it subscribed to; a frame heard on both legs is kept once. Rooms
 //! ([`Node::join_room`](crate::Node::join_room)) then work as they do over Nostr: peers
@@ -44,7 +44,7 @@ const MAX_FRAME: usize = 1400;
 /// Datagrams read in one [`poll`](Signaling::poll) before it gives up for now, so a
 /// flood of frames for other topics can't hold the caller.
 const MAX_READS: usize = 64;
-/// Most broadcast addresses one carrier sends to (a host with many bridges has many).
+/// Most broadcast addresses one carrier sends to (a device on several LANs names each).
 const MAX_LEGS: usize = 4;
 /// Frames remembered, and for how long, to drop the copy the other leg delivers: both
 /// copies arrive within milliseconds, and a frame sent again on purpose differs (rooms
@@ -53,6 +53,10 @@ const SEEN: usize = 16;
 const SEEN_FOR: Duration = Duration::from_secs(1);
 
 /// A [`Signaling`] carrier over UDP multicast on the local network.
+///
+/// A frame identical to one heard in the last second is dropped, as the copy the other
+/// leg delivers: a caller that publishes the same bytes twice within a second is heard
+/// once. Rooms seal each message with a fresh nonce, so theirs never repeat.
 ///
 /// ```no_run
 /// use peerwire::{LanSignaling, Node};
@@ -67,6 +71,8 @@ pub struct LanSignaling {
     socks: Vec<UdpSocket>,
     /// Where each frame goes: the group, then each broadcast address.
     to: Vec<SocketAddrV4>,
+    /// The interface named to [`on`](LanSignaling::on): never a broadcast leg.
+    interface: Ipv4Addr,
     /// The socket the next [`poll`](Signaling::poll) reads first, so a flood on one
     /// leg can't starve the other.
     turn: usize,
@@ -87,19 +93,20 @@ impl LanSignaling {
     pub const MAX_PAYLOAD: usize = MAX_FRAME - HEADER;
 
     /// A carrier on [`GROUP`](LanSignaling::GROUP), on the interface the system picks
-    /// for multicast (normally the default route's), and on the broadcast address of
-    /// each private interface.
+    /// for multicast (normally the default route's), and on that interface's broadcast
+    /// address if it is private.
     pub fn new() -> io::Result<LanSignaling> {
         LanSignaling::on(LanSignaling::GROUP, Ipv4Addr::UNSPECIFIED)
     }
 
     /// A carrier on `group` (an IPv4 multicast address and port), listening and sending
     /// on the interface whose address is `interface` (`0.0.0.0`: the system's choice),
-    /// and on that interface's broadcast address (`0.0.0.0`: each private interface's).
-    /// A device with several interfaces names the LAN's here; tests name `127.0.0.1` to
+    /// and on that interface's broadcast address if it is private (RFC 1918 or
+    /// link-local). Only that one: a container bridge or a VPN is another network, whose
+    /// members may be anywhere. A device on several LANs adds the others' broadcast
+    /// addresses with [`broadcast`](LanSignaling::broadcast); tests name `127.0.0.1` to
     /// stay on loopback, which has no broadcast address. ESP-IDF can't list interfaces:
-    /// an ESP32 names its own address and adds its subnet with
-    /// [`broadcast`](LanSignaling::broadcast).
+    /// an ESP32 names its own address and adds its subnet's broadcast address.
     pub fn on(group: SocketAddrV4, interface: Ipv4Addr) -> io::Result<LanSignaling> {
         if !group.ip().is_multicast() {
             return Err(io::Error::new(ErrorKind::InvalidInput, "not an IPv4 multicast group"));
@@ -129,6 +136,7 @@ impl LanSignaling {
         let mut c = LanSignaling {
             socks: vec![s.into()],
             to: vec![group],
+            interface,
             turn: 0,
             sender: sender_tag(),
             topics: HashSet::new(),
@@ -136,7 +144,7 @@ impl LanSignaling {
             hasher: RandomState::new(),
             buf: vec![0; MAX_FRAME + 1],
         };
-        for b in broadcasts(interface) {
+        if let Some(b) = broadcast_of(interface, group) {
             // Best effort: the multicast leg works without it.
             let _ = c.add_broadcast(b);
         }
@@ -145,15 +153,16 @@ impl LanSignaling {
 
     /// Also sends each frame to `addr`, a subnet's broadcast address such as
     /// `192.168.1.255`, and hears frames sent to it. [`on`](LanSignaling::on) adds
-    /// these itself where it can list interfaces; an ESP32 names its own. At most four;
-    /// one named twice is added once.
+    /// this itself where it can list interfaces; an ESP32 names its own. At most four;
+    /// one named twice is added once. One of this device's own addresses is refused:
+    /// bound to it, the socket would take unicast from anywhere.
     pub fn broadcast(mut self, addr: Ipv4Addr) -> io::Result<LanSignaling> {
         self.add_broadcast(addr)?;
         Ok(self)
     }
 
     fn add_broadcast(&mut self, addr: Ipv4Addr) -> io::Result<()> {
-        if addr.is_multicast() || addr.is_unspecified() {
+        if addr.is_multicast() || addr.is_unspecified() || addr == self.interface || is_local(addr) {
             return Err(io::Error::new(ErrorKind::InvalidInput, "not a broadcast address"));
         }
         let to = SocketAddrV4::new(addr, self.to[0].port());
@@ -170,6 +179,9 @@ impl LanSignaling {
         {
             let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
             s.set_reuse_address(true)?;
+            // BSDs let a second socket bind a broadcast address and port only with this.
+            #[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+            s.set_reuse_port(true)?;
             // lwIP delivers broadcasts only to sockets that allow them, if built to check.
             s.set_broadcast(true)?;
             s.bind(&to.into())?;
@@ -244,27 +256,48 @@ impl Signaling for LanSignaling {
     }
 }
 
-/// The broadcast addresses of this device's private IPv4 interfaces (RFC 1918 or
-/// link-local), or of `interface` alone if it is one.
+/// The broadcast address of `interface`, or with `0.0.0.0` of the one the system sends
+/// `group` through, if it is private (RFC 1918 or link-local).
 #[cfg(not(target_os = "espidf"))]
-fn broadcasts(interface: Ipv4Addr) -> Vec<Ipv4Addr> {
-    let mut out = Vec::new();
-    for i in if_addrs::get_if_addrs().unwrap_or_default() {
-        let if_addrs::IfAddr::V4(a) = i.addr else { continue };
-        let private = a.ip.is_private() || a.ip.is_link_local();
-        if let Some(b) = a.broadcast.filter(|&b| b != a.ip) {
-            if private && (interface.is_unspecified() || a.ip == interface) && !out.contains(&b) {
-                out.push(b);
-            }
-        }
+fn broadcast_of(interface: Ipv4Addr, group: SocketAddrV4) -> Option<Ipv4Addr> {
+    let ip = if interface.is_unspecified() { route_to(group)? } else { interface };
+    if !(ip.is_private() || ip.is_link_local()) {
+        return None;
     }
-    out
+    if_addrs::get_if_addrs().ok()?.into_iter().find_map(|i| match i.addr {
+        if_addrs::IfAddr::V4(a) if a.ip == ip => a.broadcast.filter(|&b| b != ip),
+        _ => None,
+    })
 }
 
-/// ESP-IDF has no getifaddrs: the firmware adds its subnet itself.
+/// The address the system sends to `group` from: a UDP socket connected to it says,
+/// and sends nothing.
+#[cfg(not(target_os = "espidf"))]
+fn route_to(group: SocketAddrV4) -> Option<Ipv4Addr> {
+    let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    s.connect(group).ok()?;
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
+/// Whether `addr` is one of this device's own addresses.
+#[cfg(not(target_os = "espidf"))]
+fn is_local(addr: Ipv4Addr) -> bool {
+    if_addrs::get_if_addrs().unwrap_or_default().iter().any(|i| i.ip() == std::net::IpAddr::V4(addr))
+}
+
+/// ESP-IDF has no getifaddrs: the firmware adds its subnet itself, and names its own
+/// address as the interface, which `add_broadcast` refuses.
 #[cfg(target_os = "espidf")]
-fn broadcasts(_interface: Ipv4Addr) -> Vec<Ipv4Addr> {
-    Vec::new()
+fn broadcast_of(_interface: Ipv4Addr, _group: SocketAddrV4) -> Option<Ipv4Addr> {
+    None
+}
+
+#[cfg(target_os = "espidf")]
+fn is_local(_addr: Ipv4Addr) -> bool {
+    false
 }
 
 /// Random bytes, mixed with the clock and a counter: an ESP32 that has no entropy yet
@@ -492,8 +525,31 @@ mod tests {
         let c = (2..=4).try_fold(c, |c, i| c.broadcast(Ipv4Addr::new(127, 0, 0, i))).unwrap();
         assert_eq!(c.to.len(), 1 + MAX_LEGS);
         assert!(c.broadcast(Ipv4Addr::new(127, 0, 0, 5)).is_err(), "more than MAX_LEGS");
-        // Loopback has no broadcast address; whatever else this host has is private.
-        assert_eq!(broadcasts(Ipv4Addr::LOCALHOST), Vec::<Ipv4Addr>::new());
+        // Loopback has no broadcast address.
+        assert_eq!(broadcast_of(Ipv4Addr::LOCALHOST, group(7)), None);
         assert_eq!(carrier(7).to.len(), 1, "on loopback: the group only");
+    }
+
+    /// NB92-1: bound to one of the device's own addresses, a leg would take unicast from
+    /// anywhere, so `broadcast` refuses the carrier's interface and any other.
+    #[test]
+    fn own_addresses_are_not_broadcast_legs() {
+        assert!(carrier(6).broadcast(Ipv4Addr::LOCALHOST).is_err(), "the carrier's interface");
+        let own = if_addrs::get_if_addrs().unwrap_or_default().into_iter().find_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(a) if !a.ip.is_loopback() => Some(a.ip),
+            _ => None,
+        });
+        if let Some(ip) = own {
+            assert!(carrier(6).broadcast(ip).is_err(), "{ip}, another of this host's");
+        }
+    }
+
+    /// NB92-2: with any interface, the only leg is the group route's interface's, not a
+    /// container bridge's or a VPN's.
+    #[test]
+    fn any_interface_means_the_group_routes_interface_only() {
+        let Ok(c) = LanSignaling::on(group(7), Ipv4Addr::UNSPECIFIED) else { return };
+        let leg = route_to(group(7)).and_then(|ip| broadcast_of(ip, group(7)));
+        assert_eq!(c.to[1..].iter().map(|a| *a.ip()).collect::<Vec<_>>(), leg.into_iter().collect::<Vec<_>>());
     }
 }

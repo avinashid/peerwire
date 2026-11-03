@@ -510,16 +510,17 @@ For tests on a LAN, [`examples/rust/nostr_relay.rs`](../../examples/rust/nostr_r
 #### LanSignaling
 
 Signaling on one local network with no internet, over UDP multicast and broadcast (`crates/peerwire/src/lan.rs`).
-Each message is one datagram to the group and one to each private interface's broadcast address, with a TTL of 1, so
+Each message is one datagram to the group and one to the LAN's broadcast address, with a TTL of 1, so
 it never leaves the link; some home routers never deliver multicast to an ESP32 but pass broadcast. A message heard
-both ways is kept once: a frame identical to one heard in the last second is dropped. Rooms then work as they do over Nostr: peers
+both ways is kept once: a frame identical to one heard in the last second is dropped (so a caller that publishes the
+same bytes twice within a second is heard once). Rooms then work as they do over Nostr: peers
 on one Wi-Fi find each other and link directly. Guide: [LAN discovery](../guides/lan-discovery.md).
 
 | Item | |
 |---|---|
-| `LanSignaling::new() -> io::Result<LanSignaling>` | A carrier on `GROUP`, on the interface the system picks for multicast (normally the default route's), and on the broadcast address of each private (RFC 1918 or link-local) interface |
-| `LanSignaling::on(group: SocketAddrV4, interface: Ipv4Addr) -> io::Result<LanSignaling>` | A carrier on `group` (an IPv4 multicast address and port), sending and listening on the interface whose address is `interface` (`0.0.0.0`: the system's choice), and on that interface's broadcast address (`0.0.0.0`: each private interface's). `ErrorKind::InvalidInput` if `group` isn't multicast. An ESP32 names its own address here ([ESP32](../guides/esp32.md)) |
-| `LanSignaling::broadcast(self, addr: Ipv4Addr) -> io::Result<LanSignaling>` | Also sends each frame to `addr`, a subnet's broadcast address such as `192.168.1.255`, and hears frames sent to it, for where Peerwire can't list interfaces (ESP-IDF). At most 4 (`MAX_LEGS`); one named twice is added once. `ErrorKind::InvalidInput` for a multicast or unspecified address, or a fifth |
+| `LanSignaling::new() -> io::Result<LanSignaling>` | A carrier on `GROUP`, on the interface the system picks for multicast (normally the default route's), and on that interface's broadcast address if it is private (RFC 1918 or link-local) |
+| `LanSignaling::on(group: SocketAddrV4, interface: Ipv4Addr) -> io::Result<LanSignaling>` | A carrier on `group` (an IPv4 multicast address and port), sending and listening on the interface whose address is `interface` (`0.0.0.0`: the system's choice), and on that interface's broadcast address if it is private: not a container bridge's or a VPN's. `ErrorKind::InvalidInput` if `group` isn't multicast. An ESP32 names its own address here ([ESP32](../guides/esp32.md)) |
+| `LanSignaling::broadcast(self, addr: Ipv4Addr) -> io::Result<LanSignaling>` | Also sends each frame to `addr`, a subnet's broadcast address such as `192.168.1.255`, and hears frames sent to it, for where Peerwire can't list interfaces (ESP-IDF). At most 4 (`MAX_LEGS`); one named twice is added once. `ErrorKind::InvalidInput` for a multicast or unspecified address, one of the device's own (bound to it, the socket would take unicast from anywhere), or a fifth |
 | `LanSignaling::GROUP` | `239.255.80.87:20567`, in the organisation-local scope that routers don't forward |
 | `LanSignaling::MAX_PAYLOAD` | 1356 bytes: a 1400-byte datagram (`MAX_FRAME`) less the 44-byte header (`HEADER`: magic 4, sender tag 8, topic 32). A larger message is dropped, never fragmented |
 

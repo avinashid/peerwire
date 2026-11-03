@@ -28,9 +28,10 @@ Each copy prints `+ <peer>` when it links with another; then type a line to send
 - Each signaling message goes out as **one datagram** to the multicast group `239.255.80.87:20567`, with a TTL of 1,
   so it never leaves the local network. Every carrier on the network hears it, including other processes on the
   same machine, and keeps only the topics it subscribed to.
-- The same datagram also goes to the **broadcast address** of each private network the device is on (such as
-  `192.168.1.255:20567`). Some home routers never deliver multicast to small Wi-Fi devices, such as an ESP32, but
-  pass broadcast. A message heard both ways is kept once.
+- The same datagram also goes to the LAN's **broadcast address** (such as `192.168.1.255:20567`): that of the
+  private network the system sends the group through. Some home routers never deliver multicast to small Wi-Fi
+  devices, such as an ESP32, but pass broadcast. A message heard both ways is kept once. Container bridges and VPNs
+  get no broadcast: they are other networks, whose members may be anywhere.
 - From there, rooms work exactly as they do over Nostr: sealed hellos, sealed offers, simultaneous dials. Peers link
   over their LAN addresses, so there's nothing to punch.
 - A message is at most 1,356 bytes (`LanSignaling::MAX_PAYLOAD`), so nothing is fragmented: ESP-IDF's network stack
@@ -38,8 +39,9 @@ Each copy prints `+ <peer>` when it links with another; then type a line to send
 
 To use another group or a particular network interface, use `LanSignaling::on(group, interface)`, for example
 `LanSignaling::on(LanSignaling::GROUP, "192.168.1.20".parse()?)`. That broadcasts on that interface's network only.
-Where Peerwire can't list interfaces (ESP-IDF), name the network's broadcast address yourself with
-`.broadcast("192.168.1.255".parse()?)`.
+Where Peerwire can't list interfaces (ESP-IDF), or to reach a second LAN, name the network's broadcast address
+yourself with `.broadcast("192.168.1.255".parse()?)`. It refuses one of the device's own addresses, which would let
+in unicast from anywhere.
 
 ## Requirements
 

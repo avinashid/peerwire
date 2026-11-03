@@ -3223,10 +3223,12 @@ stale after 60 s. This is the LAN form of SEC-6.
 
 NB-091 found a home router that never delivered multicast to an ESP32-C3 on Wi-Fi
 (lwIP joins with IGMPv2) but passed broadcast both ways, so the board and a PC never
-linked. Since NB-092 each frame also goes to a subnet-directed broadcast address: each
-private interface's (RFC 1918 or link-local) for `new()`, the named interface's for
-`on()`, or one the caller names with `broadcast()` (the ESP32 firmware names its own),
-at most 4. The frames and their sealing are unchanged. What changes:
+linked. Since NB-092 each frame also goes to a subnet-directed broadcast address: for
+`new()`, that of the interface the system sends the group through; for `on()`, the
+named interface's; either only if private (RFC 1918 or link-local). A caller may add
+others with `broadcast()` (the ESP32 firmware names its subnet's), at most 4, but not
+one of the device's own addresses. The frames and their sealing are unchanged. What
+changes:
 
 - **NB64-1 still holds.** Each broadcast leg has a socket bound to its broadcast
   address, which takes only datagrams sent to that address, not unicast to the port.
@@ -3250,8 +3252,10 @@ at most 4. The frames and their sealing are unchanged. What changes:
 
 Tests: `lan::tests::the_broadcast_leg_works_alone_and_copies_are_kept_once`,
 `a_frame_heard_again_within_a_second_is_dropped`,
-`broadcast_addresses_are_checked_and_capped`, `unicast_to_the_port_is_not_delivered`
-(now with a broadcast leg too) and `tests/lan.rs`'s `a_room_links_by_broadcast_alone`,
+`broadcast_addresses_are_checked_and_capped`, `own_addresses_are_not_broadcast_legs`,
+`any_interface_means_the_group_routes_interface_only`,
+`unicast_to_the_port_is_not_delivered` (now with a broadcast leg too) and
+`tests/lan.rs`'s `a_room_links_by_broadcast_alone`,
 on loopback's 127.255.255.255 (Linux). In QEMU, two chips linked with `NO_MULTICAST=1`
 (the hub dropped every multicast frame).
 

@@ -267,9 +267,16 @@ impl Signaling for Counted {
 /// (NB-092): a home router in NB-091 never delivered multicast to the board, but passed
 /// broadcast both ways. ESP-IDF can't list interfaces, so `LanSignaling` can't find it.
 fn lan_signaling(n: u8, ip: Ipv4Addr, prefix: u8) -> std::io::Result<LanSignaling> {
-    let broadcast = Ipv4Addr::from(u32::from(ip) | u32::MAX.checked_shr(prefix.into()).unwrap_or(0));
+    let lan = LanSignaling::on(LanSignaling::GROUP, ip)?;
+    // A /31 or /32 has no broadcast address: below, it would give a host's address, the
+    // chip's own on a /32, which `broadcast` refuses (NB92-1).
+    if prefix >= 31 {
+        info!("node {n}: LAN signals to {} only, on a /{prefix}", LanSignaling::GROUP.ip());
+        return Ok(lan);
+    }
+    let broadcast = Ipv4Addr::from(u32::from(ip) | u32::MAX >> prefix);
     info!("node {n}: LAN signals to {} and {broadcast}", LanSignaling::GROUP.ip());
-    LanSignaling::on(LanSignaling::GROUP, ip)?.broadcast(broadcast)
+    lan.broadcast(broadcast)
 }
 
 /// Sets the clock by SNTP, waiting up to 20 s. Room hellos and offers carry the sender's
