@@ -45,7 +45,8 @@ traversal layer:
   300-peer hub, determinism.
 - `tests/nat.rs`: hole punching and relaying across NAT types, including an 8×8 matrix
   (`-- --nocapture nat_matrix`).
-- `tests/traversal.rs`: the `peerwire` traversal layer driven over simulated NATs.
+- `tests/traversal.rs`: the `peerwire` traversal layer driven over simulated NATs, including a
+  12×12 room-of-two matrix (`-- --nocapture nat_matrix_through_signaling`).
 - `tests/bulk.rs`: throughput, congestion window and urgent-message latency on a long, fast link.
 - `tests/arena.rs`: regression runs of the arena benchmark.
 

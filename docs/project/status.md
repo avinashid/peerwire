@@ -35,9 +35,12 @@ what's next. It's updated as parts land; the [changelog](../../CHANGELOG.md) has
 
 ## How far it's been tested
 
-- **NAT traversal** is verified in a deterministic simulator that models eight NAT behaviours: in a room of two with
-  signaling only, 59 of the 64 pairings connect directly, in 0.36–4.25 s. The other five are a random-port symmetric
-  NAT against another symmetric one; in a room with a third peer, those connect through it.
+- **NAT traversal** is verified in a deterministic simulator that models twelve NAT behaviours. In a room of two with
+  signaling only, 59 of the 64 pairings of the first eight connect directly, in 0.36–4.25 s. The other five are a
+  random-port symmetric NAT against another symmetric one, which no hole punch can link
+  ([the odds](../concepts/nat-traversal.md#two-symmetric-nats)); a third peer in the room, or a relay peer, connects
+  them. The other four kinds, symmetric NATs that filter by IP only or map one port per IP, link with every cone NAT
+  (103 of all 144 pairings connect directly).
 - **Real networks:** public Nostr relays and STUN, from one host; and field tests that linked an Android phone on
   mobile data with a laptop on its hotspot, and two Android phones on mobile data directly over IPv6.
 - **Not tested yet:** real mobile carrier-grade NATs at scale, real ESP32 boards, and Godot on Android, iOS or the

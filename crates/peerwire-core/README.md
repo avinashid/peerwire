@@ -154,8 +154,9 @@ complete host loop on std UDP sockets.
   timing, loss/duplication/reordering, tampering, replay, wrong identity, simultaneous open,
   idle timeout, peer restart, HS1 replay, roaming, fuzzed datagrams, a 300-peer hub and
   determinism.
-- NAT and traversal scenarios (`tests/nat.rs`, `tests/traversal.rs`), including an 8×8
-  NAT-type matrix printed with `-- --nocapture nat_matrix`.
+- NAT and traversal scenarios (`tests/nat.rs`, `tests/traversal.rs`), including NAT-type
+  matrices (8×8 in `tests/nat.rs`, 12×12 in `tests/traversal.rs`) printed with
+  `-- --nocapture nat_matrix`.
 - Bulk-transfer and arena regression runs (`tests/bulk.rs`, `tests/arena.rs`).
 
 Examples:
