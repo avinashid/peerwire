@@ -75,7 +75,8 @@ const room = await joinRoom({
   },
 });
 
-// Later, live: hide our address from peers. Links move onto TURN or drop and dial again.
+// Later, live: TURN only from now on. Links move onto TURN or drop and dial again.
+// Addresses peers already have stay known; set the order at join to never send them.
 room.setPolicy({ order: ['turn'] });
 room.route(peer); // { kind: 'direct', turn: true, rttMs: 41 }
 ```
