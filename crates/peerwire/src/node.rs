@@ -406,7 +406,9 @@ impl Node {
     /// (with `Direct` on). One with an allowed relay linked to both is dialled again through it: the old link
     /// carries traffic until the new one replaces it, which raises [`Event::Disconnected`] with
     /// [`DisconnectReason::Replaced`] and then [`Event::Connected`], at both ends. A link that can't move, or
-    /// hasn't within 6 s, is closed: [`Event::Disconnected`] with [`DisconnectReason::PathOff`]. Leaving
+    /// hasn't within 6 s, is closed: [`Event::Disconnected`] with [`DisconnectReason::PathOff`]. A new link on a
+    /// path the policy has off is closed unseen, with whatever came in with it; if it replaced a link (the peer
+    /// restarted, say), that link's [`Event::Disconnected`] says [`DisconnectReason::PathOff`], not `Replaced`. Leaving
     /// [`PathKind::RelayPeers`] out closes the links to [relay peers](Node::set_relay_peers) (they are dialled again
     /// once it is back in), and the policy's `port_mapping` starts or stops router port mapping, as
     /// [`Builder::port_mapping`] does with no policy.
@@ -764,52 +766,85 @@ impl Node {
             self.open_extra(&b);
         }
         self.close_extra(now);
+        // The peers whose new link was refused below: what came in with it is dropped too, until a link to the peer
+        // is admitted (NB97-1).
+        let mut refused: Vec<PeerId> = Vec::new();
+        // A new link's first packet raises its `AddrObserved`, and the `Replaced` of a link it replaces, before its
+        // `Connected`: they wait for the next event, which says whether that link is admitted.
+        let mut held: Vec<Event> = Vec::new();
         while let Some(e) = self.ep.poll_event() {
-            let about = match &e {
-                Event::Connected { peer, .. }
-                | Event::Message { peer, .. }
-                | Event::Disconnected { peer, .. }
-                | Event::PathChanged { peer, .. } => Some(*peer),
-                Event::AddrObserved { by, .. } => Some(*by),
-                Event::ConnectFailed { .. } => None,
-            };
-            if let Some(peer) = about.filter(|p| self.status(p) != Status::Connected && !self.admits(p, &e)) {
-                // In a room, a link from a peer that never proved the room key, a relay-only
-                // node's new direct link to anyone but its relay, or a link on a path the
-                // policy has off: closed unseen.
-                if matches!(e, Event::Connected { .. }) {
+            match e {
+                Event::AddrObserved { .. } | Event::Disconnected { reason: DisconnectReason::Replaced, .. } => {
+                    held.push(e)
+                }
+                // In a room, a link from a peer that never proved the room key, a relay-only node's new direct link
+                // to anyone but its relay, or a link on a path the policy has off: closed unseen, with what came in
+                // with it. A link it replaced was closed for its path (NB97-I1).
+                Event::Connected { peer, .. } if !self.admits(&peer, &e) => {
                     self.ep.disconnect(&peer);
+                    for h in std::mem::take(&mut held) {
+                        match h {
+                            Event::Disconnected { peer: p, .. } if p == peer => {
+                                let off = Event::Disconnected { peer, reason: DisconnectReason::PathOff };
+                                self.take_event(now, wall, off, &refused);
+                            }
+                            h if about(&h) == Some(peer) => {}
+                            h => self.take_event(now, wall, h, &refused),
+                        }
+                    }
+                    refused.push(peer);
                 }
-                continue;
-            }
-            // A dial that moved a link off a path the policy turned off failed: the node's own.
-            let own = matches!(&e, Event::ConnectFailed { peer } if self.trav.redialing(peer));
-            self.trav.handle_event(now, &mut self.ep, &e);
-            if own {
-                continue;
-            }
-            self.track(&e);
-            let subject = match &e {
-                Event::AddrObserved { by, .. } => by,
-                Event::Connected { peer, .. }
-                | Event::Message { peer, .. }
-                | Event::Disconnected { peer, .. }
-                | Event::PathChanged { peer, .. }
-                | Event::ConnectFailed { peer } => peer,
-            };
-            if let Some(r) = self.relay_peers.iter_mut().find(|r| r.peer == *subject) {
-                if matches!(e, Event::Connected { .. }) {
-                    r.linked_at = Some(wall);
+                e => {
+                    if let Event::Connected { peer, .. } = e {
+                        refused.retain(|p| *p != peer);
+                    }
+                    for h in std::mem::take(&mut held) {
+                        self.take_event(now, wall, h, &refused);
+                    }
+                    self.take_event(now, wall, e, &refused);
                 }
-                continue; // a relay link is the node's own business, not the app's
             }
-            self.events.push_back(e);
+        }
+        for h in held {
+            self.take_event(now, wall, h, &refused);
         }
         self.report_dropped();
         self.keep_relay_links(wall);
         self.flush(now);
         self.pump_signals();
         drained
+    }
+
+    /// Hands on an event of the core's: to the traversal and the node, then to the app unless it is the node's own
+    /// business. Dropped if it is about a peer in `refused` (see `poll_drained`), or one whose link isn't up and
+    /// isn't admitted (see `admits`).
+    fn take_event(&mut self, now: peerwire_core::Instant, wall: Instant, e: Event, refused: &[PeerId]) {
+        let unseen = |p: &PeerId| refused.contains(p) || (self.status(p) != Status::Connected && !self.admits(p, &e));
+        if about(&e).is_some_and(|p| unseen(&p)) {
+            return;
+        }
+        // A dial that moved a link off a path the policy turned off failed: the node's own.
+        let own = matches!(&e, Event::ConnectFailed { peer } if self.trav.redialing(peer));
+        self.trav.handle_event(now, &mut self.ep, &e);
+        if own {
+            return;
+        }
+        self.track(&e);
+        let subject = match &e {
+            Event::AddrObserved { by, .. } => by,
+            Event::Connected { peer, .. }
+            | Event::Message { peer, .. }
+            | Event::Disconnected { peer, .. }
+            | Event::PathChanged { peer, .. }
+            | Event::ConnectFailed { peer } => peer,
+        };
+        if let Some(r) = self.relay_peers.iter_mut().find(|r| r.peer == *subject) {
+            if matches!(e, Event::Connected { .. }) {
+                r.linked_at = Some(wall);
+            }
+            return; // a relay link is the node's own business, not the app's
+        }
+        self.events.push_back(e);
     }
 
     /// Reports the links the policy closed ([`Traversal::poll_dropped`]): [`Event::Disconnected`] with
@@ -1043,6 +1078,18 @@ impl Node {
             }
             Event::Message { .. } | Event::PathChanged { .. } | Event::AddrObserved { .. } => {}
         }
+    }
+}
+
+/// The peer `e` is about; none for a failed dial.
+fn about(e: &Event) -> Option<PeerId> {
+    match e {
+        Event::Connected { peer, .. }
+        | Event::Message { peer, .. }
+        | Event::Disconnected { peer, .. }
+        | Event::PathChanged { peer, .. } => Some(*peer),
+        Event::AddrObserved { by, .. } => Some(*by),
+        Event::ConnectFailed { .. } => None,
     }
 }
 

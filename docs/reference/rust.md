@@ -216,7 +216,7 @@ Paths and servers, live:
 | Method | |
 |---|---|
 | `policy(&self) -> Option<&Policy>` | The paths links may take, if a policy is set |
-| `set_policy(&mut self, policy: impl Into<Option<Policy>>) -> Result<(), Error>` | Sets which paths links may take, and in what order (see [Policy](#policy)); `None` takes every path, as with no policy. New dials follow it at once, and dials under way take their next steps by it. A link on a path it turns off moves to one still allowed: through a relay, it punches to a direct path (with `Direct` on); with an allowed relay linked to both, it is dialled again through that one, which replaces it at both ends (`Disconnected` with `Replaced`, then `Connected`). One that can't move, or hasn't within 6 s (`MOVE_WAIT` in `traversal.rs`), is closed: `Disconnected` with `DisconnectReason::PathOff`. Leaving `RelayPeers` out closes the relay peers' links; the policy's `port_mapping` starts or stops router port mapping. Fails, changing nothing, with `Error::InvalidPolicy` |
+| `set_policy(&mut self, policy: impl Into<Option<Policy>>) -> Result<(), Error>` | Sets which paths links may take, and in what order (see [Policy](#policy)); `None` takes every path, as with no policy. New dials follow it at once, and dials under way take their next steps by it. A link on a path it turns off moves to one still allowed: through a relay, it punches to a direct path (with `Direct` on); with an allowed relay linked to both, it is dialled again through that one, which replaces it at both ends (`Disconnected` with `Replaced`, then `Connected`). One that can't move, or hasn't within 6 s (`MOVE_WAIT` in `traversal.rs`), is closed: `Disconnected` with `DisconnectReason::PathOff`. A new link on a path the policy has off is closed unseen, with whatever came in with it; if it replaced a link (the peer restarted, say), that link's `Disconnected` says `PathOff`, not `Replaced`. Leaving `RelayPeers` out closes the relay peers' links; the policy's `port_mapping` starts or stops router port mapping. Fails, changing nothing, with `Error::InvalidPolicy` |
 | `set_stun_servers<S: Into<String>>(&mut self, servers: impl IntoIterator<Item = S>)` | Replaces the STUN servers (as `Builder::stun_servers`; empty turns STUN off) and asks the new ones at once. Names are resolved now, on the calling thread. Links stay up: the servers only give the public address and NAT type that the next offers and invites carry |
 | `set_signaling(&mut self, signaling: impl Signaling + 'static)` | Swaps the carrier, to change relays, say: the old one is dropped, and on the new one the node subscribes to its inbox and its room's topic and says hello at once. Links stay up. Peers meet over it from then on, so those in the room move to it too, or share it |
 
@@ -350,15 +350,17 @@ moves it into `tokio::spawn`. Carriers are polled, not awaited: with one, `next_
 |---|---|
 | `Connected { peer: PeerId, path: Path, initiator: bool }` | A link is up. `initiator`: this side sent the handshake that made it |
 | `Message { peer: PeerId, lane: Lane, data: Vec<u8> }` | A message arrived. `lane` is `Reliable` or `Unreliable`: urgent messages arrive as `Lane::Reliable` |
-| `Disconnected { peer: PeerId, reason: DisconnectReason }` | A link went. `reason` is `Timeout`, `ClosedByPeer`, `Replaced` (the peer completed a new handshake, after a restart or a re-dial: a `Connected` for the new link follows, and reliable data in flight on the old one is lost), `ProtocolViolation` or `PathOff` (this node closed it: its policy turned the link's path off and no path still allowed took it over, see `Node::set_policy`) |
+| `Disconnected { peer: PeerId, reason: DisconnectReason }` | A link went. `reason` is `Timeout`, `ClosedByPeer`, `Replaced` (the peer completed a new handshake, after a restart or a re-dial: a `Connected` for the new link follows, and reliable data in flight on the old one is lost), `ProtocolViolation` or `PathOff` (this node closed it: its policy turned the link's path off and no path still allowed took it over, or the peer replaced the link with one on a path the policy has off, see `Node::set_policy`) |
 | `ConnectFailed { peer: PeerId }` | A dial ran out of handshake attempts (`Config::handshake_attempts`). `Node::failure` says why |
 | `PathChanged { peer: PeerId, path: Path }` | A link moved: relayed to direct after a hole punch, direct to relayed after the direct path went silent, or to a new address (roaming) |
 | `AddrObserved { by: PeerId, addr: SocketAddr }` | A directly linked peer reports the address it sees this node at (its public address, behind a NAT) |
 
 A `Node` doesn't pass on everything the core raises. Events about relay peers stay inside it. In a room, a link from
 a peer that never proved the room key is closed unseen, and so are a relay-only node's new direct link to anyone but
-its relay and a new link on a path the node's policy has off. A failed dial that was moving a link off such a path
-raises no `ConnectFailed`: the link's `Disconnected` with `PathOff` follows instead.
+its relay and a new link on a path the node's policy has off, each with the messages that came in with it. When such a
+link replaced one (the peer restarted, say), the old link's `Disconnected` says `PathOff`, not `Replaced`. A failed
+dial that was moving a link off a path the policy has off raises no `ConnectFailed`: the link's `Disconnected` with
+`PathOff` follows instead.
 
 ### Lane
 
@@ -413,7 +415,8 @@ How the order is read:
   `Birthday` never punches, nor answers the peer's punches, so `[Peers, Direct]` keeps a relayed link relayed.
   `[RelayPeers]` links through relay peers alone.
 - **Answering.** The node answers a dial on any path it allows: a peer with another policy may dial it directly
-  first. It refuses a new link on a path it has off.
+  first. It refuses a new link on a path it has off, with what came in with it, and a link such a one replaced
+  ends with `PathOff`.
 - **Privacy.** Under `Privacy::RelayOnly` links go through its relay whatever the policy says.
 
 ```rust
@@ -697,7 +700,7 @@ test.
 | `spray`, `sweep`, `opener` | Birthday and lockstep punching: probing many ports of a peer's IP (at most 4096, `MAX_SPRAY`), and the packet a host sends from many extra sockets |
 | `add_relay(&mut self, now: Instant, relay: PeerId, peer: &PeerId)`, `set_slow(&mut self, peer: &PeerId, addr: Option<A>)` | Offer a relay for a link, and mark a slow address (such as a signaling channel carrying datagrams) that a relay beats |
 | `set_relay_only(&mut self, on: bool)`, `relay_only(&self) -> bool` | Keep relayed links relayed, so peers reached through a relay never learn this endpoint's address |
-| `set_keep_relayed(&mut self, relays: &[PeerId], listed: bool, others: bool)` | Keeps links on their relay: those through `relays` if `listed`, through any other relay if `others`. Such a link never punches, to its direct candidates or any other address, and answers no punch at this endpoint's address, so neither end moves it to a direct path. Unlike `set_relay_only` it hides no address and leaves dials and direct links alone |
+| `set_keep_relayed(&mut self, relays: &[PeerId], listed: bool, others: bool)` | Keeps links on their relay: those through `relays` if `listed`, through any other relay if `others`. Such a link never punches, to its direct candidates or any other address, and answers no punch at this endpoint's address, so neither end moves it to a direct path; a link that moves onto a kept relay with a punch under way stops it, and an answer to that punch moves it nowhere. Unlike `set_relay_only` it hides no address and leaves dials and direct links alone |
 | `redial(&mut self, now: Instant, peer: PeerId, targets: &[Path<A>]) -> Result<(), ConnectError>` | `connect_with`, also for a peer already linked: the old link carries traffic until the new handshake replaces it (`Disconnected` with `Replaced`, then `Connected`, at both ends). A redial that fails (`ConnectFailed`) leaves the old link up |
 | `handle_datagram_from(&mut self, now: Instant, from: A, peer: &PeerId, data: &[u8])` | `handle_datagram` for a channel only `peer` sends on (a WebRTC DataChannel, a signaling pipe): packets on it for another peer's link are dropped unread |
 | `handle_datagram_direct(&mut self, now: Instant, from: A, data: &[u8]) -> Option<(PeerId, bool)>` | `handle_datagram`, also giving the peer whose session the datagram authenticated to (its crypto ran: not an HS1 sent again while half-open, or an HS2 sent again), if that session's direct path is now `from`, and whether the datagram was fresh: an HS2 that finished our dial, or a Data packet with a new nonce. An HS1 is not: a copy of one reads again once its handshake is no longer half-open (NB85-1) |

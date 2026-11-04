@@ -1,8 +1,10 @@
 //! NB-097: a node's connection policy (`Node::set_policy`) and live server swaps, on loopback sockets with an
 //! in-process signaling hub. What each policy does across NATs is in `peerwire-sim/tests/traversal.rs`.
 use peerwire::{
-    Config, ConnectError, DisconnectReason, Error, Event, Lane, MemoryHub, Node, PathKind, PeerId, Policy, Status,
+    Config, ConnectError, DisconnectReason, Error, Event, Identity, Invite, Lane, MemoryHub, Node, PathKind, PeerId,
+    Policy, Status,
 };
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 /// Polls every node until `done`, keeping their events; false on timeout.
@@ -46,6 +48,30 @@ fn on(hub: &MemoryHub) -> Node {
 
 fn closed(events: &[Event], from: PeerId, why: DisconnectReason) -> bool {
     events.iter().any(|e| matches!(e, Event::Disconnected { peer, reason } if *peer == from && *reason == why))
+}
+
+/// The peer `e` is about.
+fn about(e: &Event) -> PeerId {
+    match e {
+        Event::Connected { peer, .. }
+        | Event::Message { peer, .. }
+        | Event::Disconnected { peer, .. }
+        | Event::PathChanged { peer, .. }
+        | Event::ConnectFailed { peer } => *peer,
+        Event::AddrObserved { by, .. } => *by,
+    }
+}
+
+/// Polls `nodes` until the last, dialling, links to `to`, and has it send `data` at once: polled last, it sends
+/// before `to` reads the link's first packet, so `to` reads the two in one poll. Then polls them all for a second;
+/// their events, as `pump`.
+fn link_and_send(nodes: &mut [&mut Node], to: PeerId, data: &[u8]) -> Vec<Vec<Event>> {
+    let (mut ev, last) = (Vec::new(), nodes.len() - 1);
+    assert!(pump(nodes, &mut ev, 5, |n| n[last].status(&to) == Status::Connected));
+    nodes[last].send(&to, Lane::Reliable, data).unwrap();
+    nodes[last].poll();
+    pump(nodes, &mut ev, 1, |_| false);
+    ev
 }
 
 #[test]
@@ -94,7 +120,8 @@ fn signaling_swaps_live_and_links_stay() {
 }
 
 /// Turning direct paths off closes a direct link that has nowhere else to go (`PathOff`), and the node refuses
-/// the direct links its peer dials again; with no policy it links again.
+/// the direct links its peer dials again, with the messages that come in with them (NB97-1); with no policy it
+/// links again.
 #[test]
 fn direct_off_closes_direct_links_and_refuses_new_ones() {
     let hub = MemoryHub::new();
@@ -104,19 +131,36 @@ fn direct_off_closes_direct_links_and_refuses_new_ones() {
     let got: Vec<Event> = std::iter::from_fn(|| a.try_recv_event()).collect();
     assert!(closed(&got, bid, DisconnectReason::PathOff), "{got:?}");
     assert_eq!(a.status(&bid), Status::Disconnected);
-    // b dials a's invite directly: its handshake completes, and a closes the link unseen.
+    // b dials a's invite directly and sends as it links: its handshake completes, and a closes the link unseen,
+    // with the message.
     let mut ev = Vec::new();
     pump(&mut [&mut a, &mut b], &mut ev, 1, |n| n[1].status(&aid) == Status::Disconnected);
     b.connect(&a.invite()).unwrap();
-    let redialled = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::Connected { peer, .. } if *peer == aid));
-    pump(&mut [&mut a, &mut b], &mut ev, 3, |_| false);
-    assert!(redialled(&ev[1]) && closed(&ev[1], aid, DisconnectReason::ClosedByPeer), "{:?}", ev[1]);
-    assert!(!ev[0].iter().any(|e| matches!(e, Event::Connected { .. })), "{:?}", ev[0]);
+    let ev = link_and_send(&mut [&mut a, &mut b], aid, b"over a path a has off");
+    assert!(closed(&ev[1], aid, DisconnectReason::ClosedByPeer), "{:?}", ev[1]);
+    assert!(!ev[0].iter().any(|e| about(e) == bid), "nothing about b reaches a's app: {:?}", ev[0]);
     assert_eq!(a.peers().count(), 0);
 
     a.set_policy(None).unwrap();
     let mut ev = Vec::new();
     assert!(pump(&mut [&mut a, &mut b], &mut ev, 10, |n| n[0].status(&bid) == Status::Connected));
+}
+
+/// A new link's `AddrObserved`, which the core raises before its `Connected`, waits for that `Connected` to be
+/// admitted: with no policy the answering end still gets the two in that order, and the dialling end the one its
+/// peer's first packet raises on a link already up.
+#[test]
+fn observed_addresses_reach_the_app_as_before() {
+    let (mut a, mut b) = (Node::bind("127.0.0.1:0").unwrap(), Node::bind("127.0.0.1:0").unwrap());
+    let (aid, bid) = (a.peer_id(), b.peer_id());
+    b.connect(&a.invite()).unwrap();
+    let mut ev = Vec::new();
+    pump(&mut [&mut a, &mut b], &mut ev, 1, |_| false);
+    let at = |ev: &[Event], f: &dyn Fn(&Event) -> bool| ev.iter().position(f);
+    let observed = at(&ev[0], &|e| matches!(e, Event::AddrObserved { by, .. } if *by == bid));
+    let connected = at(&ev[0], &|e| matches!(e, Event::Connected { peer, .. } if *peer == bid));
+    assert!(observed.is_some() && connected.is_some() && observed < connected, "{:?}", ev[0]);
+    assert!(at(&ev[1], &|e| matches!(e, Event::AddrObserved { by, .. } if *by == aid)).is_some(), "{:?}", ev[1]);
 }
 
 /// Leaving `RelayPeers` out closes the relay peers' links and stops dialling them; back in, they link again.
@@ -172,4 +216,30 @@ fn a_failed_move_closes_the_link_quietly() {
     assert!(closed(&ev[0], bid, DisconnectReason::PathOff), "{:?}", ev[0]);
     assert!(!ev[0].iter().any(|e| matches!(e, Event::ConnectFailed { .. })), "{:?}", ev[0]);
     assert_eq!(a.relay_peers(), vec![(rid, Status::Connected)]);
+}
+
+/// A peer that replaces its link (it restarted) with one through a member, which the policy has off, ends the
+/// link: `PathOff` rather than `Replaced`, and nothing that came in on the new link reaches the app (NB97-I1).
+#[test]
+fn a_replacement_on_a_path_that_is_off_ends_the_link() {
+    let key = [7u8; 32];
+    let restart = || Node::builder().identity(Identity::from_secret_bytes(&key)).bind("127.0.0.1:0").unwrap();
+    let mut a = Node::builder().policy(Policy::new([PathKind::Direct])).bind("127.0.0.1:0").unwrap();
+    let (mut r, mut b) = (Node::bind("127.0.0.1:0").unwrap(), restart());
+    let (aid, bid, rid) = (a.peer_id(), b.peer_id(), r.peer_id());
+    a.connect(&r.invite()).unwrap();
+    b.connect(&a.invite()).unwrap();
+    let mut ev = Vec::new();
+    let up = |n: &[&mut Node]| n[0].status(&bid) == Status::Connected && n[0].status(&rid) == Status::Connected;
+    assert!(pump(&mut [&mut a, &mut r, &mut b], &mut ev, 5, up));
+    drop(b);
+    let mut b = restart();
+    b.connect(&r.invite()).unwrap();
+    assert!(pump(&mut [&mut a, &mut r, &mut b], &mut ev, 5, |n| n[2].status(&rid) == Status::Connected));
+    let through_r = Invite::<SocketAddr> { peer: aid, key: None, addrs: vec![], relays: vec![(rid, r.addresses()[0])] };
+    b.connect(&through_r.to_link()).unwrap();
+    let ev = link_and_send(&mut [&mut a, &mut r, &mut b], aid, b"through r, which a has off");
+    let about_b: Vec<&Event> = ev[0].iter().filter(|e| about(e) == bid).collect();
+    assert_eq!(about_b, [&Event::Disconnected { peer: bid, reason: DisconnectReason::PathOff }]);
+    assert_eq!(a.status(&bid), Status::Disconnected);
 }

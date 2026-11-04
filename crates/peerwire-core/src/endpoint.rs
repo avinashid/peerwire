@@ -209,8 +209,9 @@ pub enum DisconnectReason {
     /// the old link is lost.
     Replaced,
     ProtocolViolation,
-    /// Closed by this end's host: the path the link took was turned off and no path still allowed took it over
-    /// (the connection policy of a `peerwire` node). The endpoint itself never raises it.
+    /// Closed by this end's host: the path the link took was turned off and no path still allowed took it over, or
+    /// the link was replaced by one on a path that is off (the connection policy of a `peerwire` node). The endpoint
+    /// itself never raises it.
     PathOff,
 }
 
@@ -757,6 +758,14 @@ impl<A: Address> Session<A> {
         on_slow(&self.path, &self.slow)
     }
 
+    /// Stops the link's punching, as a kept one's ([`Endpoint::set_keep_relayed`]): its punch, guesses and spray.
+    fn stop_punching(&mut self) {
+        self.punch = None;
+        self.guesses.clear();
+        self.guess_probes = 0;
+        self.spray = None;
+    }
+
     /// Holds `relay` off for `RELAY_HOLD`, doubled for each earlier stall.
     fn hold(&mut self, relay: PeerId, now: Instant) {
         let i = match self.held.iter().position(|h| h.relay == relay) {
@@ -960,17 +969,15 @@ impl<A: Address> Endpoint<A> {
     /// endpoint's address, so neither end moves it to a direct path; guesses and sprays for it are ignored, and
     /// [`opener`](Endpoint::opener) gives `None`. Unlike [`set_relay_only`](Endpoint::set_relay_only) it hides no
     /// address and leaves dials and direct links alone, and the link may still follow the peer to another relay. A
-    /// kept link stops punching at once; let go, it punches to its candidates once given one more. Replaces the last
-    /// call; by default no link is kept.
+    /// kept link stops punching at once, and so does one that moves onto a kept relay with a punch under way (at its
+    /// next timer; an answer to that punch moves it nowhere); let go, it punches to its candidates once given one
+    /// more. Replaces the last call; by default no link is kept.
     pub fn set_keep_relayed(&mut self, relays: &[PeerId], listed: bool, others: bool) {
         self.keep_relayed = (relays.to_vec(), listed, others);
         let keep = &self.keep_relayed;
         for sess in self.sessions.values_mut() {
             if kept(keep, sess) {
-                sess.punch = None;
-                sess.guesses.clear();
-                sess.guess_probes = 0;
-                sess.spray = None;
+                sess.stop_punching();
             }
         }
     }
@@ -2091,6 +2098,8 @@ impl<A: Address> Endpoint<A> {
         let mut observed = None;
         let mut violation = false;
         let mut closed = false;
+        // Kept on its relay ([`set_keep_relayed`](Endpoint::set_keep_relayed)): no punch moves it.
+        let kept = matches!(&sess.path, Path::Via(r) if keeps(&self.keep_relayed, r));
         for f in wire::frames(&pt[..n]) {
             match f {
                 // Answered with an ACK, so a silent-side probe gets a reply.
@@ -2127,7 +2136,6 @@ impl<A: Address> Endpoint<A> {
                 }
                 // A relay-only endpoint never answers at its own address on a relayed link, nor any on a kept one.
                 Ok(Frame::Punch(t)) => {
-                    let kept = matches!(&sess.path, Path::Via(r) if keeps(&self.keep_relayed, r));
                     let stays = (self.relay_only && matches!(sess.path, Path::Via(_))) || kept;
                     if let (Some(a), false) = (&direct_from, stays) {
                         punch_acks.push((a.clone(), t));
@@ -2145,7 +2153,8 @@ impl<A: Address> Endpoint<A> {
                 }
                 Ok(Frame::PunchAck(t)) => {
                     match (&from, &sess.punch) {
-                        (Path::Direct(a), Some(p)) if p.token == t && sess.slow.as_ref() != Some(a) => {
+                        // Not on a kept link: the answer to a punch sent before it moved onto its relay (NB97-I2).
+                        (Path::Direct(a), Some(p)) if p.token == t && sess.slow.as_ref() != Some(a) && !kept => {
                             upgraded = Some(a.clone())
                         }
                         // A relay probe answered through the relay: it carries both ways.
@@ -2385,6 +2394,10 @@ impl<A: Address> Endpoint<A> {
         let spray = self.config.punch_spray as i32;
         let (direct, max) = (self.config.share_addresses, self.config.max_candidates);
         for (&idx, sess) in self.sessions.iter_mut() {
+            // A punch under way stops once its link is kept on a relay: it moved onto one (NB97-I2).
+            if kept(&self.keep_relayed, sess) {
+                sess.stop_punching();
+            }
             let racing = !self.relay_only && matches!(&sess.state, State::Live(l) if l.announced);
             if racing {
                 sess.race(direct, max);
@@ -2932,26 +2945,34 @@ mod tests {
     ) -> Vec<(usize, u32)> {
         let mut sent = Vec::new();
         for _ in 0..ms / 10 {
-            for _ in 0..100 {
-                let mut quiet = true;
-                for i in 0..eps.len() {
-                    let out: Vec<_> = std::iter::from_fn(|| eps[i].poll_transmit(*t)).collect();
-                    for tx in out {
-                        quiet = false;
-                        sent.push((i, tx.dst));
-                        let to = (!lost(i, tx.dst, &tx.payload)).then(|| (tx.dst as usize).checked_sub(1)).flatten();
-                        if let Some(ep) = to.and_then(|j| eps.get_mut(j)) {
-                            ep.handle_datagram(*t, i as u32 + 1, &tx.payload);
-                        }
-                    }
-                }
-                if quiet {
-                    break;
-                }
-            }
+            sent.extend(deliver(eps, *t, &lost));
             *t = *t + Duration::from_millis(10);
             for ep in eps.iter_mut() {
                 ep.handle_timeout(*t);
+            }
+        }
+        sent
+    }
+
+    /// Delivers what `eps` send at `t`, and what they send in answer, until they are quiet (at most 100 rounds),
+    /// with no timer run; `lost` and what it returns as in `route_sized`.
+    fn deliver(eps: &mut [Endpoint<u32>], t: Instant, lost: impl Fn(usize, u32, &[u8]) -> bool) -> Vec<(usize, u32)> {
+        let mut sent = Vec::new();
+        for _ in 0..100 {
+            let mut quiet = true;
+            for i in 0..eps.len() {
+                let out: Vec<_> = std::iter::from_fn(|| eps[i].poll_transmit(t)).collect();
+                for tx in out {
+                    quiet = false;
+                    sent.push((i, tx.dst));
+                    let to = (!lost(i, tx.dst, &tx.payload)).then(|| (tx.dst as usize).checked_sub(1)).flatten();
+                    if let Some(ep) = to.and_then(|j| eps.get_mut(j)) {
+                        ep.handle_datagram(t, i as u32 + 1, &tx.payload);
+                    }
+                }
+            }
+            if quiet {
+                break;
             }
         }
         sent
@@ -3028,6 +3049,7 @@ mod tests {
             eps[0].set_guesses(t, &b, &[20, 21]);
             eps[0].spray(t, &b, &2, 64);
             assert_eq!(eps[0].opener(t, &b), None);
+            assert!(eps[0].sessions[&eps[0].peers[&b]].punch.is_none(), "a kept link arms no punch");
             route(&mut eps, &mut t, 6000, None);
             assert!(eps[1].stats().punches_sent > 0, "b punches to a's address, learned from r");
             assert_eq!((eps[0].stats().punches_sent, eps[0].stats().spray_probes), (0, 0));
@@ -3038,6 +3060,53 @@ mod tests {
             route(&mut eps, &mut t, 1000, None);
             assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(2)), Some(&Path::Direct(1))));
         }
+    }
+
+    /// NB97-I2: a link that moves onto a kept relay with a punch under way (here it follows the peer there) punches
+    /// no more, and the peer's answer to a punch sent before the move doesn't take it to a direct path.
+    #[test]
+    fn a_punch_under_way_stops_when_its_link_moves_onto_a_kept_relay() {
+        let ids: Vec<Identity> = (1..=4u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b, r1, r2) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id(), ids[3].peer_id());
+        assert!(b < a, "a follows b to another relay");
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        for ep in &mut eps[..2] {
+            ep.connect(t, 3, r1).unwrap();
+            ep.connect(t, 4, r2).unwrap();
+        }
+        route(&mut eps, &mut t, 100, None);
+        // Linked through r1, which a doesn't keep, with the direct path between a and b losing everything for now.
+        let direct = |i: usize, dst: u32, _: &[u8]| (i, dst) == (0, 2) || (i, dst) == (1, 1);
+        eps[0].set_keep_relayed(&[r2], true, false);
+        eps[0].connect_via(t, r1, b, &[]).unwrap();
+        route_sized(&mut eps, &mut t, 200, direct);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(r1)), Some(&Path::Via(r1))));
+        // a punches to b's address, learned from r1's origin tag; one punch is kept back.
+        let punch = loop {
+            t = t + Duration::from_millis(10);
+            eps[0].handle_timeout(t);
+            if let Some(tx) = std::iter::from_fn(|| eps[0].poll_transmit(t)).find(|tx| tx.dst == 2) {
+                break tx;
+            }
+        };
+        let sent = eps[0].stats().punches_sent;
+        assert!(sent > 0);
+        // b moves onto r2 and sends; a follows, onto the relay it keeps.
+        let idx = eps[1].peers[&a];
+        let sess = eps[1].sessions.get_mut(&idx).unwrap();
+        (sess.path, sess.path_nonce) = (Path::Via(r2), None);
+        eps[1].send(&a, Lane::Reliable, b"through r2").unwrap();
+        deliver(&mut eps, t, direct);
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(r2)));
+        // The punch kept back reaches b, which answers it at a's address before a's next timer.
+        eps[1].handle_datagram(t, 1, &punch.payload);
+        deliver(&mut eps, t, |_, _, _| false);
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(r2)), "the answer moves a kept link nowhere");
+        route(&mut eps, &mut t, 2000, None);
+        assert_eq!(eps[0].stats().punches_sent, sent, "a punches no more");
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(r2)), Some(&Path::Via(r2))));
     }
 
     /// NB-097: `redial` dials a linked peer anyway. The old link carries traffic until the new handshake replaces
