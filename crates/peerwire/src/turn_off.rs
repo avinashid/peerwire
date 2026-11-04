@@ -1,6 +1,6 @@
 //! Without feature `turn`: no TURN client, and the traversal's TURN calls do nothing.
 
-use peerwire_core::{Instant, Transmit};
+use peerwire_core::{Instant, PeerId, Transmit};
 use std::marker::PhantomData;
 use std::net::{IpAddr, SocketAddr};
 
@@ -28,7 +28,8 @@ impl<A> TurnSet<A> {
     pub fn up(&self) -> Vec<(A, SocketAddr)> {
         Vec::new()
     }
-    pub fn permit(&mut self, _now: Instant, _ips: &[IpAddr]) {}
+    pub fn permit(&mut self, _now: Instant, _peer: PeerId, _ips: &[IpAddr]) {}
+    pub fn retain_peers(&mut self, _keep: impl Fn(&PeerId) -> bool) {}
     pub fn handle(&mut self, _now: Instant, _from: &A, _data: &[u8]) -> Option<Option<(A, Vec<u8>)>> {
         None
     }

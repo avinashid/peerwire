@@ -1278,6 +1278,7 @@ impl<A: Address> Traversal<A> {
         self.remotes.retain(|p, r| now - r.seen_at < FORGET || ep.is_connected(p));
         let remotes = &self.remotes;
         self.relayed_of.retain(|_, p| remotes.contains_key(p));
+        self.turn.retain_peers(|p| remotes.contains_key(p));
         self.nonces.retain(|_, t| now - *t < Duration::from_millis(2 * FRESH_MS));
         self.punch_ips.retain(|_, times| {
             while times.front().is_some_and(|t| now - *t >= BIRTHDAY_IP_WINDOW) {
@@ -1545,7 +1546,7 @@ impl<A: Address> Traversal<A> {
         }
         if step & PathKind::Turn.bit() != 0 {
             let addrs = if invite { o.addrs.clone() } else { self.dial_addrs(o) };
-            for t in self.turn_targets(now, &addrs, &o.relayed) {
+            for t in self.turn_targets(now, peer, &addrs, &o.relayed) {
                 if !targets.contains(&t) {
                     targets.push(t);
                 }
@@ -1633,7 +1634,7 @@ impl<A: Address> Traversal<A> {
         let on_live = |a: &A| a.turn_parts().is_none_or(|(s, _)| up.iter().any(|u| u.0 == s));
         let on_turn = matches!(&path, Path::Direct(a) if a.relayed() && on_live(a));
         if p.allows(PathKind::Turn) && !on_turn {
-            targets.extend(self.turn_targets(now, &addrs, &relayed));
+            targets.extend(self.turn_targets(now, peer, &addrs, &relayed));
         }
         let redialled = !targets.is_empty() && ep.redial(now, peer, &targets).is_ok();
         match (tried || redialled, self.remotes.get_mut(&peer)) {
@@ -1800,12 +1801,12 @@ impl<A: Address> Traversal<A> {
     /// The paths through TURN to a peer at `addrs` with relayed addresses `relayed`: those, from this node's socket,
     /// and its addresses of a family each of this node's allocations relays to, through it (asking for the
     /// permissions). At most `MAX_TURN_TARGETS`.
-    fn turn_targets(&mut self, now: Instant, addrs: &[A], relayed: &[A]) -> Vec<Path<A>> {
+    fn turn_targets(&mut self, now: Instant, peer: PeerId, addrs: &[A], relayed: &[A]) -> Vec<Path<A>> {
         let mut out: Vec<Path<A>> =
             relayed.iter().filter(|a| self.reaches(a)).filter_map(A::relayed_hop).map(Path::Direct).collect();
         let peers: Vec<SocketAddr> = addrs.iter().chain(relayed).filter_map(Address::to_socket_addr).collect();
         let ips: Vec<IpAddr> = peers.iter().map(|s| s.ip()).collect();
-        self.turn.permit(now, &ips);
+        self.turn.permit(now, peer, &ips);
         for (server, at) in self.turn.up() {
             for p in peers.iter().filter(|p| p.is_ipv4() == at.is_ipv4()) {
                 out.extend(A::turn_hop(&server, *p).map(Path::Direct));
@@ -1956,7 +1957,7 @@ impl<A: Address> Traversal<A> {
             }
         }
         let ips: Vec<IpAddr> = addrs.iter().chain(&o.relayed).filter_map(|a| Some(a.to_socket_addr()?.ip())).collect();
-        self.turn.permit(now, &ips);
+        self.turn.permit(now, from, &ips);
         let mut relay = self.relay();
         let reachable = ep.is_connected(&from) || !addrs.is_empty();
         if relay.is_none()
@@ -1987,7 +1988,7 @@ impl<A: Address> Traversal<A> {
                 vias.sort_by_key(|p| !self.relay_peers.contains(p)); // ours first, else the sender's order
                 let mut targets: Vec<Path<A>> = vias.into_iter().take(VIA_PER_DIAL).map(Path::Via).collect();
                 // Its relayed addresses too (with no policy this node has no TURN of its own).
-                let turn = self.turn_targets(now, &addrs, &o.relayed);
+                let turn = self.turn_targets(now, from, &addrs, &o.relayed);
                 targets.extend(addrs.into_iter().map(Path::Direct));
                 targets.extend(turn);
                 if !targets.is_empty() {
@@ -4640,6 +4641,28 @@ mod tests {
             })
             .collect();
         assert!(sent.contains(&Hop::Net("203.0.113.2:7000".parse().unwrap())), "let go, it punches: {sent:?}");
+    }
+
+    /// NB99-2: peers the traversal forgets (unlinked, unheard for `FORGET`) no longer hold the IPs they were let in
+    /// at through its allocations.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn forgotten_peers_hold_no_ips() {
+        let me = Hop::Net("192.0.2.10:7000".parse().unwrap());
+        let mut t = Traversal::new(&id(1), [1; 32], 1_700_000_000_000, vec![me], vec![]);
+        let mut ep = Endpoint::new(&id(1), Config::default(), [2; 32]);
+        let (peers, now) = ([id(2).peer_id(), id(3).peer_id()], Instant::from_millis(500));
+        for (i, p) in peers.iter().enumerate() {
+            t.on_offer(
+                now,
+                &mut ep,
+                *p,
+                hop_offer(&t, now + Duration::from_millis(i as u64), &["203.0.113.2:7000"], &[]),
+            );
+        }
+        assert!(peers.iter().all(|p| t.turn.holds(p)));
+        t.handle_timeout(now + FORGET, &mut ep);
+        assert!(peers.iter().all(|p| !t.turn.holds(p)));
     }
 
     /// NB-099: an allocation made after this node offered to a peer, which hasn't answered yet, offers again, with

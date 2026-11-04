@@ -459,8 +459,9 @@ Feature `turn` (`crates/peerwire/src/turn.rs`). A TURN server (RFC 8656, over UD
 `addr` is `host:port` (a `turn:` prefix is dropped). The client allocates with the 401 challenge and
 MESSAGE-INTEGRITY, takes a stale nonce's new one, refreshes at half the lifetime, makes a new allocation when one is
 lost, asks for permissions for the peers' IPs and a channel for each peer address it sends to (both refreshed every
-4 minutes while wanted, at most 64 of each), and counts only what comes from the server's address, a success
-response only under its key. TCP and TLS (`turns:`) are not supported.
+4 minutes while wanted, at most 64 of each: a new one takes the place of the one wanted longest ago, a peer holds
+only its last offer's IPs, and a channel number let go is bound again only 15 minutes on), and counts only what comes
+from the server's address, a success response only under its key. TCP and TLS (`turns:`) are not supported.
 
 ### Role
 

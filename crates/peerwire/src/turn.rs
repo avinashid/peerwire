@@ -7,15 +7,17 @@
 //! - The allocation is refreshed at half its lifetime; one lost (the server restarted: 437, or no answer to a
 //!   refresh) is made again, with a new relayed address.
 //! - Permissions for the peers' IPs ([`TurnClient::permit`]) and a channel for each peer address it sends to, each
-//!   refreshed every 4 minutes while wanted (permitted or sent to in the last 10 minutes), at most 64 of each.
-//!   Until its channel is bound, a peer gets Send indications.
+//!   refreshed every 4 minutes while wanted (permitted or sent to in the last 10 minutes), at most 64 of each: a
+//!   new one takes the place of the one wanted longest ago, and a channel number let go is bound again only once
+//!   quiet. Until its channel is bound, a peer gets Send indications. A peer's IPs are its last offer's
+//!   ([`TurnSet::permit`]).
 //! - Only what comes from the server's address counts, and a success response only under the key: a forged one is
 //!   ignored, and the request is retransmitted (0.5 s, doubling, 5 tries).
 //!
 //! Credentials, the key and MESSAGE-INTEGRITY are never in a `Debug` output or an error.
 
 use peerwire_core::stun::{self, attr, method, Class, Message, MessageBuilder, TxId};
-use peerwire_core::{Address, Instant, Transmit};
+use peerwire_core::{Address, Instant, PeerId, Transmit};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use std::collections::{BTreeMap, VecDeque};
@@ -40,6 +42,9 @@ const REFRESH: Duration = Duration::from_secs(240);
 const KEEP: Duration = Duration::from_secs(600);
 pub const MAX_PERMISSIONS: usize = 64;
 pub const MAX_CHANNELS: usize = 64;
+/// A channel number let go is bound to no other peer until its binding at the server has lapsed (10 minutes after
+/// the last refresh, at most) and 5 more minutes have passed (RFC 8656 section 12).
+const CHANNEL_QUIET: Duration = Duration::from_secs(900);
 
 /// A TURN server, and the credentials for it ([`Builder::turn_servers`](crate::Builder::turn_servers)). Its
 /// `Debug` output shows the address only.
@@ -175,6 +180,8 @@ pub(crate) struct TurnClient<A> {
     perms: BTreeMap<IpAddr, Grant>,
     chans: BTreeMap<SocketAddr, (u16, Grant)>,
     next_channel: u16,
+    /// Channel numbers let go, and when each may be bound again.
+    freed: Vec<(u16, Instant)>,
     reqs: BTreeMap<TxId, Req>,
     out: VecDeque<Transmit<A>>,
     events: VecDeque<TurnEvent>,
@@ -198,6 +205,7 @@ impl<A: Address> TurnClient<A> {
             perms: BTreeMap::new(),
             chans: BTreeMap::new(),
             next_channel: 0x4000,
+            freed: Vec::new(),
             reqs: BTreeMap::new(),
             out: VecDeque::new(),
             events: VecDeque::new(),
@@ -227,6 +235,7 @@ impl<A: Address> TurnClient<A> {
         self.reqs.clear();
         self.chans.clear();
         self.next_channel = 0x4000;
+        self.freed.clear();
         for p in self.perms.values_mut() {
             (p.refresh_at, p.asked) = (None, false);
         }
@@ -410,11 +419,14 @@ impl<A: Address> TurnClient<A> {
                 }
             }
             // No channel: Send indications carry the peer's packets.
-            Ask::Bind(peer, _) => {
+            Ask::Bind(peer, ch) => {
                 if code == Some(437) {
                     return self.lost(now);
                 }
-                self.chans.remove(&peer);
+                if self.chans.get(&peer).is_some_and(|(n, _)| *n == ch) {
+                    self.chans.remove(&peer);
+                    self.freed.push((ch, now + CHANNEL_QUIET));
+                }
             }
         }
     }
@@ -427,21 +439,28 @@ impl<A: Address> TurnClient<A> {
     }
 
     /// Lets the peers at `ips` send to us through the allocation (CreatePermission), for the next 10 minutes and
-    /// as long as this is called again; at most `MAX_PERMISSIONS`.
+    /// as long as this is called again. With `MAX_PERMISSIONS` held, a new one takes the place of the one wanted
+    /// longest ago (NB99-2).
     pub fn permit(&mut self, now: Instant, ips: impl IntoIterator<Item = IpAddr>) {
         for ip in ips {
-            let full = self.perms.len() >= MAX_PERMISSIONS;
-            match self.perms.get_mut(&ip) {
-                Some(p) => p.keep_until = now + KEEP,
-                None if !full => {
-                    self.perms.insert(ip, Grant::new(now));
-                }
-                None => {}
+            if let Some(p) = self.perms.get_mut(&ip) {
+                p.keep_until = now + KEEP;
+                continue;
             }
+            if self.perms.len() >= MAX_PERMISSIONS {
+                let oldest = self.perms.iter().min_by_key(|(_, p)| p.keep_until).map(|(ip, _)| *ip);
+                self.perms.remove(&oldest.expect("full"));
+            }
+            self.perms.insert(ip, Grant::new(now));
         }
         if self.relayed().is_some() {
             self.handle_timeout(now);
         }
+    }
+
+    /// Stops refreshing the permissions for `ips`, which lapse at the server within 5 minutes.
+    pub fn forget(&mut self, ips: &[IpAddr]) {
+        self.perms.retain(|ip, _| !ips.contains(ip));
     }
 
     /// Sends `payload` to `peer` through the allocation: over its channel once bound, else in a Send indication,
@@ -457,9 +476,7 @@ impl<A: Address> TurnClient<A> {
                 self.out.push_back(Transmit { dst: self.server.clone(), payload: data });
                 return true;
             }
-        } else if self.chans.len() < MAX_CHANNELS && stun::is_channel(self.next_channel) {
-            let ch = self.next_channel;
-            self.next_channel += 1;
+        } else if let Some(ch) = self.new_channel(now) {
             self.chans.insert(peer, (ch, Grant { asked: true, ..Grant::new(now) }));
             self.request(now, Ask::Bind(peer, ch), 0);
         }
@@ -471,6 +488,26 @@ impl<A: Address> TurnClient<A> {
             .finish();
         self.out.push_back(Transmit { dst: self.server.clone(), payload: ind });
         true
+    }
+
+    /// A channel number for a new peer. With `MAX_CHANNELS` bound, the channel wanted longest ago is let go first
+    /// (NB99-2). The number is the first let go that is past its quiet time, else one never used; `None` while
+    /// all 4096 are bound or quiet.
+    fn new_channel(&mut self, now: Instant) -> Option<u16> {
+        if self.chans.len() >= MAX_CHANNELS {
+            let oldest = self.chans.iter().min_by_key(|(_, (_, g))| g.keep_until).map(|(p, _)| *p);
+            if let Some((ch, _)) = oldest.and_then(|p| self.chans.remove(&p)) {
+                self.freed.push((ch, now + CHANNEL_QUIET));
+            }
+        }
+        if let Some(i) = self.freed.iter().position(|&(_, at)| now >= at) {
+            return Some(self.freed.remove(i).0);
+        }
+        let ch = self.next_channel;
+        stun::is_channel(ch).then(|| {
+            self.next_channel += 1;
+            ch
+        })
     }
 
     /// Releases the allocation (a Refresh with LIFETIME 0, sent once), and asks for no other.
@@ -527,7 +564,14 @@ impl<A: Address> TurnClient<A> {
             return;
         }
         self.perms.retain(|_, p| now < p.keep_until);
-        self.chans.retain(|_, (_, g)| now < g.keep_until);
+        let freed = &mut self.freed;
+        self.chans.retain(|_, (ch, g)| {
+            let wanted = now < g.keep_until;
+            if !wanted {
+                freed.push((*ch, now + CHANNEL_QUIET));
+            }
+            wanted
+        });
         let perms: Vec<IpAddr> = self.perms.iter().filter(|(_, p)| p.due(now)).map(|(ip, _)| *ip).collect();
         for ip in perms {
             self.perms.get_mut(&ip).expect("listed").asked = true;
@@ -561,12 +605,15 @@ pub(crate) struct TurnSet<A> {
     /// What released clients still had to send.
     out: VecDeque<Transmit<A>>,
     events: VecDeque<(A, TurnEvent)>,
+    /// Each peer's IPs, as last permitted.
+    held: BTreeMap<PeerId, Vec<IpAddr>>,
 }
 
 impl<A: Address> TurnSet<A> {
     pub fn new(unix_ms: u64, seed: [u8; 32]) -> TurnSet<A> {
         let (servers, clients, out, events) = (Vec::new(), Vec::new(), VecDeque::new(), VecDeque::new());
-        TurnSet { servers, clients, on: false, unix_ms, rng: ChaCha20Rng::from_seed(seed), out, events }
+        let (rng, held) = (ChaCha20Rng::from_seed(seed), BTreeMap::new());
+        TurnSet { servers, clients, on: false, unix_ms, rng, out, events, held }
     }
 
     /// Replaces the servers: a client whose server and credentials stay keeps its allocation, the others release
@@ -626,11 +673,27 @@ impl<A: Address> TurnSet<A> {
         self.servers.iter().map(|(a, _)| (a.clone(), relayed(a))).collect()
     }
 
-    /// Lets the peers at `ips` send through every allocation.
-    pub fn permit(&mut self, now: Instant, ips: &[IpAddr]) {
+    /// Lets `peer`, at `ips`, send through every allocation. These replace the IPs `peer` was let in at before:
+    /// those no other peer is at are let go, so a peer holds no more than one offer's worth (NB99-2).
+    pub fn permit(&mut self, now: Instant, peer: PeerId, ips: &[IpAddr]) {
+        let old = self.held.insert(peer, ips.to_vec()).unwrap_or_default();
+        let held = &self.held;
+        let gone: Vec<IpAddr> = old.into_iter().filter(|ip| !held.values().any(|h| h.contains(ip))).collect();
         for c in &mut self.clients {
+            c.forget(&gone);
             c.permit(now, ips.iter().copied());
         }
+    }
+
+    /// Forgets which IPs the peers `keep` turns down were let in at; those stay until no longer wanted.
+    pub fn retain_peers(&mut self, keep: impl Fn(&PeerId) -> bool) {
+        self.held.retain(|p, _| keep(p));
+    }
+
+    /// Whether `peer` holds IPs it was let in at.
+    #[cfg(test)]
+    pub fn holds(&self, peer: &PeerId) -> bool {
+        self.held.contains_key(peer)
     }
 
     /// A datagram from `from`: `None` if it isn't one of the servers, or is a STUN message that server's client
@@ -883,6 +946,99 @@ mod tests {
         assert_eq!(set.handle(t, &addr(S), &binding), None);
         assert_eq!(set.handle(t, &addr(S), &[16; 40]), Some(None));
         assert_eq!((set.handle(t, &addr(P), &binding), set.handle(t, &addr(P), &[16; 40])), (None, None));
+    }
+
+    /// Peer `i`'s address, at an IP of its own.
+    fn nth(i: u32) -> SocketAddr {
+        SocketAddr::new(IpAddr::from([10, 0, (i >> 8) as u8, i as u8]), 7000)
+    }
+
+    /// NB99-2: with 64 permissions and 64 channels held, each wanted, a peer met later still gets through, both
+    /// ways: its permission and channel take the places of those wanted longest ago (unfixed: nothing either way).
+    #[test]
+    fn full_tables_make_room_for_a_later_peer() {
+        let mut n = Net::up();
+        for i in 0..64 {
+            n.c.permit(n.t, [nth(i).ip()]);
+            assert!(n.c.send(n.t, nth(i), b"hi"));
+            n.run(20);
+        }
+        assert_eq!((n.c.perms.len(), n.c.chans.len(), n.s.channels(n.t, addr(C)).len()), (64, 64, 64));
+        let later = addr(P);
+        n.c.permit(n.t, [later.ip()]);
+        n.run(100);
+        assert!(n.c.send(n.t, later, b"to a later peer"));
+        n.run(100);
+        n.peer_sends(later, b"from a later peer");
+        assert!(n.at_peers.iter().any(|(_, to, d)| *to == later && d == b"to a later peer"), "{:?}", n.s.stats);
+        assert!(n.got.iter().any(|(from, d)| *from == later && d == b"from a later peer"), "{:?}", n.s.stats);
+        assert!(!n.c.perms.contains_key(&nth(0).ip()) && !n.c.chans.contains_key(&nth(0)), "the first went");
+        assert_eq!((n.c.perms.len(), n.c.chans.len()), (64, 64));
+    }
+
+    /// NB99-2: a channel let go for a newer peer frees its number, which is bound again only past its quiet time
+    /// (the server's 10 minutes and 5 more); meanwhile a new peer gets a number never used.
+    #[test]
+    fn a_channel_number_let_go_waits_out_its_quiet_time() {
+        let mut n = Net::up();
+        let t0 = n.t;
+        for i in 0..64 {
+            assert!(n.c.send(t0 + Duration::from_millis(i.into()), nth(i), b"hi"));
+        }
+        let first = n.c.chans[&nth(0)].0;
+        let t1 = t0 + Duration::from_secs(1);
+        n.c.send(t1, nth(64), b"hi");
+        assert!(!n.c.chans.contains_key(&nth(0)), "the one wanted longest ago went");
+        assert_eq!((first, n.c.chans[&nth(64)].0), (0x4000, 0x4040), "a number never used: the freed one is quiet");
+        n.c.send(t1 + (CHANNEL_QUIET - Duration::from_millis(1)), nth(65), b"hi");
+        assert_eq!(n.c.chans[&nth(65)].0, 0x4041);
+        n.c.send(t1 + CHANNEL_QUIET, nth(66), b"hi");
+        assert_eq!(n.c.chans[&nth(66)].0, first, "past its quiet time");
+    }
+
+    /// NB99-2: the IPs a peer is let in at are those it was let in at last: its earlier ones go, but not one another
+    /// peer is at too.
+    #[test]
+    fn a_peers_last_ips_replace_its_earlier_ones() {
+        let (t, mut set) = (Instant::from_millis(1), TurnSet::<SocketAddr>::new(UNIX_MS, [3; 32]));
+        set.set_servers(t, vec![(addr(S), TurnServer::new(S, "app", "secret"))]);
+        set.set_on(t, true);
+        let [p, q] = [1u8, 2].map(|i| peerwire_core::Identity::from_secret_bytes(&[i; 32]).peer_id());
+        let ip = |i: u32| nth(i).ip();
+        let held = |set: &TurnSet<SocketAddr>| set.clients[0].perms.keys().copied().collect::<Vec<_>>();
+        set.permit(t, p, &[ip(1), ip(2), ip(3)]);
+        set.permit(t, q, &[ip(3), ip(4)]);
+        set.permit(t, p, &[ip(5)]);
+        assert_eq!(held(&set), [ip(3), ip(4), ip(5)], "p's 1 and 2 go; 3 stays, as q's");
+        set.permit(t, q, &[ip(4)]);
+        assert_eq!(held(&set), [ip(4), ip(5)]);
+        set.permit(t, p, &[ip(4), ip(5)]);
+        set.retain_peers(|x| *x != q);
+        set.permit(t, p, &[ip(5)]);
+        assert_eq!(held(&set), [ip(5)], "q forgotten: 4 is p's alone");
+    }
+
+    /// NB99-2: a channel let go any other way frees its number too, once: one no longer wanted, and one whose bind
+    /// went unanswered. A new allocation starts with none freed (its numbers start again).
+    #[test]
+    fn channels_let_go_free_their_numbers() {
+        let mut n = Net::up();
+        n.c.send(n.t, nth(0), b"hi");
+        for _ in 0..11 {
+            n.c.send(n.t, nth(1), b"still wanted");
+            n.run(60_000);
+        }
+        assert!(!n.c.chans.contains_key(&nth(0)) && n.c.chans.contains_key(&nth(1)));
+        assert_eq!(n.c.freed.iter().map(|f| f.0).collect::<Vec<_>>(), [0x4000], "no longer wanted");
+        n.lose = true;
+        n.c.send(n.t, nth(2), b"hi");
+        n.run(20_000);
+        assert!(!n.c.chans.contains_key(&nth(2)));
+        assert_eq!(n.c.freed.iter().map(|f| f.0).collect::<Vec<_>>(), [0x4000, 0x4002], "unanswered");
+        n.lose = false;
+        n.s.restart();
+        n.run(301_000);
+        assert!(n.c.relayed().is_some() && n.c.freed.is_empty(), "{:?}", n.events);
     }
 
     #[test]
