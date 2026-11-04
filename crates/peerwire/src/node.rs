@@ -807,7 +807,10 @@ impl Node {
                         Some(Some((hop, data))) => self.ep.handle_datagram(now, hop, &data),
                         Some(None) => {}
                         None if self.trav.handle_stun(&from, &self.buf[..n]) => {}
-                        None => self.ep.handle_datagram(now, self.trav.hop(from), &self.buf[..n]),
+                        None => {
+                            let hop = self.trav.hop(&self.ep, from, &self.buf[..n]);
+                            self.ep.handle_datagram(now, hop, &self.buf[..n]);
+                        }
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {

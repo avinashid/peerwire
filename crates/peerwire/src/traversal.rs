@@ -904,13 +904,14 @@ impl<A: Address> Traversal<A> {
 
     /// Whether the policy lets a link to `peer` take `path`. Any path with no policy, under
     /// [`Privacy::RelayOnly`], and to a relay peer (the host links those, or not, by [`PathKind::RelayPeers`]).
+    /// An address `peer` offered as its relayed one is TURN's, as its link there is once retagged (NB99-I1).
     pub fn allows(&self, peer: &PeerId, path: &Path<A>) -> bool {
         let Some(p) = &self.policy else { return true };
         if matches!(self.privacy, Privacy::RelayOnly { .. }) || self.relay_peers.contains(peer) {
             return true;
         }
         match path {
-            Path::Direct(a) if a.relayed() => p.allows(PathKind::Turn),
+            Path::Direct(a) if a.relayed() || self.relayed_of.get(a) == Some(peer) => p.allows(PathKind::Turn),
             Path::Direct(_) => p.allows(PathKind::Direct) || p.allows(PathKind::Birthday),
             Path::Via(r) => p.allows(self.relay_kind(r)),
         }
@@ -1784,12 +1785,15 @@ impl<A: Address> Traversal<A> {
         self.turn.send(now, dst, payload)
     }
 
-    /// The address the endpoint takes a datagram the socket got from `from` to be from: a peer's relayed address,
-    /// which it offered, as a [relayed hop](Address::relayed_hop); else `from`.
-    pub fn hop(&self, from: A) -> A {
-        match self.relayed_of.contains_key(&from) {
-            true => A::relayed_hop(&from).unwrap_or(from),
-            false => from,
+    /// The address the endpoint takes `data`, which the socket got from `from`, to be from: a [relayed
+    /// hop](Address::relayed_hop) if `from` is a relayed address a peer offered and `data` names that peer's link or
+    /// dial ([`Endpoint::peer_of`]); else `from`. Another peer's packets from there stay as they are, whoever claims
+    /// the address (NB99-1). A handshake's first message names no link: one it makes there is retagged when it comes
+    /// up.
+    pub fn hop(&self, ep: &Endpoint<A>, from: A, data: &[u8]) -> A {
+        match self.relayed_of.get(&from) {
+            Some(p) if ep.peer_of(data) == Some(*p) => A::relayed_hop(&from).unwrap_or(from),
+            _ => from,
         }
     }
 
@@ -1941,11 +1945,13 @@ impl<A: Address> Traversal<A> {
             if self.relayed_of.len() < MAX_RELAYED_OF {
                 self.relayed_of.insert(a.clone(), from);
             }
-            // Linked there before this offer said what it is (its dial through its allocation came first).
+            // Linked there before this offer said what it is (its dial through its allocation came first): a link
+            // through TURN now, which the policy may have off (NB99-I1).
             if let (Some(Path::Direct(at)), Some(hop)) = (ep.path(&from), A::relayed_hop(a)) {
                 if at == a {
                     let at = at.clone();
-                    ep.retag(now, &from, &at, hop);
+                    ep.retag(now, &from, &at, hop.clone());
+                    self.follow_policy(now, ep, from, &Path::Direct(hop));
                 }
             }
         }
@@ -4513,6 +4519,95 @@ mod tests {
         assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Net(r))));
         tb.handle_event(now, &mut eb, &up);
         assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Relayed(r))), "retagged on Connected");
+    }
+
+    /// NB99-I1: under `[Direct]`, a link at a peer's relayed address is TURN's whichever came first, the link (its
+    /// dial through its allocation) or the offer that names the address: the policy reads the retagged path, and
+    /// the link moves off it either way. `allows` takes the address as TURN's for that peer only, before the retag.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn a_link_at_a_relayed_address_follows_the_policy_in_either_order() {
+        let (r, b): (SocketAddr, SocketAddr) = (R.parse().unwrap(), "203.0.113.2:7000".parse().unwrap());
+        let (a, now) = (id(1).peer_id(), Instant::from_millis(500));
+        let direct = || Some(Policy::new([PathKind::Direct]));
+        let moving = |t: &Traversal<Hop<SocketAddr>>| t.remotes.get(&a).is_some_and(|r| r.moving.is_some());
+
+        let [_, mut eb] = hop_link(Hop::Net(r), Hop::Net(b));
+        let mut tb = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
+        tb.set_policy(now, &mut eb, direct());
+        for e in std::iter::from_fn(|| eb.poll_event()).collect::<Vec<_>>() {
+            tb.handle_event(now, &mut eb, &e);
+        }
+        assert!(eb.is_connected(&a) && !moving(&tb), "a direct link, as far as b knows");
+        tb.on_offer(now, &mut eb, a, hop_offer(&tb, now, &["203.0.113.9:7000"], &[R]));
+        assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Relayed(r))));
+        assert!(moving(&tb), "the link first, then the offer");
+
+        let mut tb = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
+        let mut dialler = Endpoint::new(&id(2), Config::default(), [9; 32]);
+        tb.set_policy(now, &mut dialler, direct());
+        tb.on_offer(now, &mut dialler, a, hop_offer(&tb, now, &["203.0.113.9:7000"], &[R]));
+        let at_r = Path::Direct(Hop::Net(r));
+        assert!(!tb.allows(&a, &at_r) && tb.allows(&id(3).peer_id(), &at_r));
+        let [_, mut eb] = hop_link(Hop::Net(r), Hop::Net(b));
+        let up = std::iter::from_fn(|| eb.poll_event()).find(|e| matches!(e, Event::Connected { .. })).unwrap();
+        assert!(!moving(&tb));
+        tb.handle_event(now, &mut eb, &up);
+        assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Relayed(r))));
+        assert!(moving(&tb), "the offer first, then the link");
+    }
+
+    /// NB99-1: m (`id(3)`) names v's address as its relayed one. v's packets from there are still from a network
+    /// address, under any policy, and v links with this node on the direct path (unfixed: a TURN link, through m
+    /// under the default policy, none under `[Direct]`). A claimant's own packets from its relayed address are
+    /// relayed; an HS1 from there, which names no link, isn't.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn a_relayed_claim_takes_only_the_claimants_packets() {
+        let (a_at, v_at): (SocketAddr, SocketAddr) =
+            ("192.0.2.1:7000".parse().unwrap(), "203.0.113.2:7000".parse().unwrap());
+        let (a, v, m) = (id(1).peer_id(), id(2).peer_id(), id(3).peer_id());
+        for policy in [None, Some(Policy::default()), Some(Policy::new([PathKind::Direct]))] {
+            let mut now = Instant::from_millis(500);
+            let mut ta = Traversal::new(&id(1), [6; 32], 1_700_000_000_000, vec![Hop::Net(a_at)], vec![]);
+            let mut ea = Endpoint::new(&id(1), Config::default(), [3; 32]);
+            let mut ev = Endpoint::new(&id(2), Config::default(), [4; 32]);
+            ta.set_policy(now, &mut ea, policy.clone());
+            ta.on_offer(now, &mut ea, m, hop_offer(&ta, now, &[], &[&v_at.to_string()]));
+            ev.connect(now, Hop::Net(a_at), a).unwrap();
+            for _ in 0..50 {
+                while let Some(t) = ev.poll_transmit(now) {
+                    let hop = ta.hop(&ea, Hop::Net(v_at), &t.payload);
+                    assert_eq!(hop, Hop::Net(v_at), "{policy:?}");
+                    ea.handle_datagram(now, hop, &t.payload);
+                }
+                while let Some(e) = ea.poll_event() {
+                    ta.handle_event(now, &mut ea, &e);
+                }
+                // To v's socket, as on the wire: the dials to m's claimed address too.
+                for t in std::iter::from_fn(|| ea.poll_transmit(now)).filter(|t| *t.dst.addr() == v_at) {
+                    ev.handle_datagram(now, Hop::Net(a_at), &t.payload);
+                }
+                now = now + Duration::from_millis(20);
+                ea.handle_timeout(now);
+                ev.handle_timeout(now);
+            }
+            assert_eq!(ea.path(&v), Some(&Path::Direct(Hop::Net(v_at))), "{policy:?}");
+            assert!(ev.is_connected(&a), "{policy:?}");
+        }
+
+        let r: SocketAddr = R.parse().unwrap();
+        let now = Instant::from_millis(500);
+        let [mut ea, mut eb] = hop_link(Hop::Net(r), Hop::Relayed(r));
+        let mut ta = Traversal::new(&id(1), [6; 32], 1_700_000_000_000, vec![Hop::Net(a_at)], vec![]);
+        ta.on_offer(now, &mut ea, id(2).peer_id(), hop_offer(&ta, now, &[], &[R]));
+        eb.send(&a, peerwire_core::Lane::Reliable, b"from r").unwrap();
+        let data = eb.poll_transmit(now).unwrap().payload;
+        assert_eq!(ta.hop(&ea, Hop::Net(r), &data), Hop::Relayed(r), "the claimant's own");
+        let mut dialler = Endpoint::new(&id(3), Config::default(), [8; 32]);
+        dialler.connect(now, Hop::Net(a_at), a).unwrap();
+        let hs1 = dialler.poll_transmit(now).unwrap().payload;
+        assert_eq!(ta.hop(&ea, Hop::Net(r), &hs1), Hop::Net(r), "an HS1 names no link");
     }
 
     /// NB-099: under `[Turn, Direct]` a link at a relayed address is kept there, by the endpoint too: given a direct

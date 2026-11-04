@@ -1695,6 +1695,17 @@ impl<A: Address> Endpoint<A> {
         self.on_packet(now, Path::Direct(from), None, data);
     }
 
+    /// The peer whose link, or dial, a datagram names by its receiver index (an HS2, a Data or a Cookie packet; an
+    /// HS1 names none), read from its header alone: unauthenticated, so a hint, such as which of the host's hops it
+    /// came on. A datagram with a forged index still fails that link's keys.
+    pub fn peer_of(&self, data: &[u8]) -> Option<PeerId> {
+        let receiver = match wire::parse(data)? {
+            Packet::Hs2 { receiver, .. } | Packet::Data { receiver, .. } | Packet::Cookie { receiver, .. } => receiver,
+            Packet::Hs1 { .. } => return None,
+        };
+        self.sessions.get(&receiver).map(|s| s.peer)
+    }
+
     /// Like [`Endpoint::handle_datagram`], for a datagram from a channel that only
     /// `peer` sends on, such as a WebRTC DataChannel to it or a signalling pipe: a
     /// packet on it for another peer's link, or a handshake from anyone else, is
@@ -3672,6 +3683,30 @@ mod tests {
         assert!(!ex.is_connected(&y));
         ex.handle_datagram_from(t, 2, &y, &hs2);
         assert!(ex.is_connected(&y));
+    }
+
+    /// NB99-1: `peer_of` names a peer by the receiver index of an HS2 (to its dial) or a Data packet, read from the
+    /// header; an HS1, an index no link has, or a datagram that isn't a packet names none.
+    #[test]
+    fn peer_of_reads_the_receiver_index() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (x, y) = (ids[0].peer_id(), ids[1].peer_id());
+        let mut ex = Endpoint::<u32>::new(&ids[0], Config::default(), [1; 32]);
+        let mut ey = Endpoint::<u32>::new(&ids[1], Config::default(), [2; 32]);
+        let t = Instant::from_millis(1);
+        ex.connect(t, 2, y).unwrap();
+        let hs1 = ex.poll_transmit(t).unwrap().payload;
+        assert_eq!((ex.peer_of(&hs1), ey.peer_of(&hs1)), (None, None));
+        ey.handle_datagram(t, 1, &hs1);
+        let hs2 = ey.poll_transmit(t).unwrap().payload;
+        assert_eq!((ex.peer_of(&hs2), ey.peer_of(&hs2)), (Some(y), None), "the index of x's dial");
+        ex.handle_datagram(t, 2, &hs2);
+        ex.send(&y, Lane::Reliable, b"hi").unwrap();
+        let data: Vec<Vec<u8>> = std::iter::from_fn(|| ex.poll_transmit(t)).map(|t| t.payload).collect();
+        assert!(!data.is_empty() && data.iter().all(|d| ey.peer_of(d) == Some(x) && ex.peer_of(d).is_none()));
+        let mut forged = data[0].clone();
+        forged[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!((ey.peer_of(&forged), ey.peer_of(&[7]), ey.peer_of(&[])), (None, None, None));
     }
 
     /// A relay probe's answer, sent on from an address of its own by a relay that

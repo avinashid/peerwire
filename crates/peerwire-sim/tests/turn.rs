@@ -82,7 +82,10 @@ impl World {
                     Some(Some((hop, payload))) => p.ep.handle_datagram(now, hop, &payload),
                     Some(None) => {}
                     None if p.trav.handle_stun(&from, &data) => {}
-                    None => p.ep.handle_datagram(now, p.trav.hop(from), &data),
+                    None => {
+                        let hop = p.trav.hop(&p.ep, from, &data);
+                        p.ep.handle_datagram(now, hop, &data);
+                    }
                 }
             }
             if p.ep.poll_timeout().is_some_and(|t| t <= now) {
