@@ -5179,4 +5179,25 @@ mod tests {
         assert!(sent.contains(&(0, Tr(2 | TR))), "the guess is punched to");
         assert_eq!(eps[0].path(&b), Some(&Path::Via(r)));
     }
+
+    /// NB-099: `retag` relabels a link's address and the candidates that are it, with no event; a link it makes
+    /// relayed ends its race and punches to its candidates. A peer not linked is ignored.
+    #[test]
+    fn retag_makes_a_link_at_the_address_relayed() {
+        let (mut eps, ids) = tr_endpoints(2);
+        let (a, b) = (ids[0], ids[1]);
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, Tr(2), b).unwrap();
+        route_tr(&mut eps, &mut t, 300, to);
+        tr_events(&mut eps[0]);
+        eps[0].add_candidates(t, &b, &[Tr(5)]);
+        assert!(eps[0].sessions[&eps[0].peers[&b]].race.is_some());
+        eps[0].retag(t, &b, &Tr(2), Tr(2 | TR));
+        eps[0].retag(t, &a, &Tr(1), Tr(1 | TR));
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(Tr(2 | TR))));
+        let s = &eps[0].sessions[&eps[0].peers[&b]];
+        assert!(s.punch.is_some() && s.race.is_none());
+        assert!(s.candidates.contains(&Tr(2 | TR)) && !s.candidates.contains(&Tr(2)), "{:?}", s.candidates);
+        assert!(tr_events(&mut eps[0]).is_empty());
+    }
 }

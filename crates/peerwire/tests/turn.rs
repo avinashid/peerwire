@@ -2,7 +2,7 @@
 //! UDP sockets of its own, one for the server and one per allocation, polled with the nodes. The client's protocol
 //! (challenges, stale nonces, refreshes, permissions, channels, restarts) is tested against the same server in
 //! `src/turn.rs`; across NATs, in `peerwire-sim/tests/turn.rs`.
-use peerwire::{DisconnectReason, Event, Lane, MemoryHub, Node, PathKind, PeerId, Policy, Status, TurnServer};
+use peerwire::{DisconnectReason, Event, Lane, MemoryHub, Node, PathKind, PeerId, Policy, Privacy, Status, TurnServer};
 use peerwire_sim::turn::{Out, ServerStats, TurnServer as Server};
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
@@ -214,6 +214,25 @@ fn turn_taken_out_moves_the_link() {
     let direct = |_: &MockTurn, n: &[&mut Node]| n[0].path_kind(&n[1].peer_id()) == Some(PathKind::Direct);
     assert!(pump(&mut turn, &mut [&mut a, &mut b], &mut ev, 10.0, direct), "{ev:?}");
     assert!(linked(&a, &b) && turn.stats().deallocations == 1, "{ev:?} {:?}", turn.stats());
+    let moved = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::PathChanged { .. }));
+    assert!(moved(&ev[0]) && !ev.iter().flatten().any(|e| matches!(e, Event::Disconnected { .. })), "moved: {ev:?}");
+}
+
+/// New credentials for a server make a new allocation, at a new relayed address; the old one is released.
+#[test]
+fn new_credentials_make_a_new_allocation() {
+    let (hub, mut turn) = (MemoryHub::new(), MockTurn::new());
+    turn.server = std::mem::replace(&mut turn.server, Server::new(turn.sock.local_addr().unwrap(), "x", || None))
+        .user("app2", "secret2");
+    let mut a = node(&hub, Some(&turn), Some(Policy::new([PathKind::Turn])));
+    let mut ev = Vec::new();
+    assert!(pump(&mut turn, &mut [&mut a], &mut ev, 5.0, |_, n| n[0].turn_status()[0].1.is_some()));
+    let first = a.turn_status()[0].1;
+    a.set_turn_servers([TurnServer::new(turn.addr(), "app2", "secret2")]);
+    let renewed = |t: &MockTurn, n: &[&mut Node]| t.stats().allocations == 2 && n[0].turn_status()[0].1.is_some();
+    assert!(pump(&mut turn, &mut [&mut a], &mut ev, 5.0, renewed), "{:?}", turn.stats());
+    assert_ne!(a.turn_status()[0].1, first);
+    assert_eq!(turn.stats().deallocations, 1);
 }
 
 /// The server dropped with `set_turn_servers([])` and nowhere else to go (`[Turn]`): the link closes with `PathOff`,
@@ -246,4 +265,20 @@ fn no_policy_or_no_servers_change_nothing() {
     assert_eq!(turn.stats(), ServerStats::default(), "nothing reached the server");
     assert_eq!(a.turn_status(), vec![(a.turn_status()[0].0, None)]);
     assert_eq!(a.path_kind(&b.peer_id()), Some(PathKind::Direct));
+}
+
+/// Under `Privacy::RelayOnly` TURN stays off, `Turn` in the policy or not; out of it, the allocation is made.
+#[test]
+fn relay_only_keeps_turn_off() {
+    let (hub, mut turn) = (MemoryHub::new(), MockTurn::new());
+    let b = Node::builder().signaling(hub.connect()).turn_servers([turn.creds()]);
+    let b = b.policy(Policy::new([PathKind::Turn])).privacy(Privacy::RelayOnly { via: None });
+    let mut a = b.bind("127.0.0.1:0").unwrap();
+    let mut ev = Vec::new();
+    pump(&mut turn, &mut [&mut a], &mut ev, 1.0, |_, _| false);
+    assert_eq!(turn.stats(), ServerStats::default());
+    a.set_privacy(Privacy::Direct);
+    assert!(pump(&mut turn, &mut [&mut a], &mut ev, 5.0, |_, n| n[0].turn_status()[0].1.is_some()));
+    a.set_privacy(Privacy::RelayOnly { via: None });
+    assert!(pump(&mut turn, &mut [&mut a], &mut ev, 5.0, |t, _| t.stats().deallocations == 1));
 }

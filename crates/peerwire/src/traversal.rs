@@ -675,6 +675,8 @@ pub struct Traversal<A: Address> {
     dropped: VecDeque<PeerId>,
     /// This node's TURN servers and allocations.
     turn: TurnSet<A>,
+    /// The privacy changed: TURN starts or stops at the next timer, at once.
+    turn_stale: bool,
     /// Peers' relayed addresses, from their offers: what comes from one is from a [relayed hop](Address::relayed_hop).
     relayed_of: HashMap<A, PeerId>,
     sockets: VecDeque<Birthday<A>>,
@@ -732,6 +734,7 @@ impl<A: Address> Traversal<A> {
             keep_stale: false,
             dropped: VecDeque::new(),
             turn: TurnSet::new(unix_ms, turn_seed),
+            turn_stale: false,
             relayed_of: HashMap::new(),
             sockets: VecDeque::new(),
             transmits: VecDeque::new(),
@@ -817,6 +820,7 @@ impl<A: Address> Traversal<A> {
     /// relayed. Links already up keep their path.
     pub fn set_privacy(&mut self, ep: &mut Endpoint<A>, privacy: Privacy) {
         self.privacy = privacy;
+        self.turn_stale = true; // TURN is off under relay-only
         ep.set_relay_only(matches!(privacy, Privacy::RelayOnly { .. }));
     }
 
@@ -1289,7 +1293,7 @@ impl<A: Address> Traversal<A> {
         let steps = self.remotes.values().filter_map(|r| Some(r.ladder.as_ref()?.at));
         let moves = self.remotes.values().filter_map(|r| r.moving);
         let keep = self.keep_stale.then_some(Instant::ZERO); // the relay peers changed: tell the endpoint at once
-        let turn = self.turn.poll_timeout();
+        let turn = self.turn.poll_timeout().into_iter().chain(self.turn_stale.then_some(Instant::ZERO)).min();
         stun.into_iter().chain(retry).chain(hello).chain(plans).chain(steps).chain(moves).chain(keep).chain(turn).min()
     }
 
@@ -1728,6 +1732,7 @@ impl<A: Address> Traversal<A> {
 
     /// Starts or stops TURN as the servers, the policy and the privacy say, and acts on what the allocations did.
     fn sync_turn(&mut self, now: Instant, ep: &mut Endpoint<A>) {
+        self.turn_stale = false;
         let listed = self.policy.as_ref().is_some_and(|p| p.allows(PathKind::Turn));
         let on = self.turn.has_servers() && listed && !matches!(self.privacy, Privacy::RelayOnly { .. });
         self.turn.set_on(now, on);
@@ -4373,5 +4378,205 @@ mod tests {
         }
         println!("fuzz signals: {hellos} hellos, {dialled} dials");
         assert!(dialled > 0, "authenticated offers must reach the dialler");
+    }
+
+    /// A traversal with TURN (`Hop` addresses) at 192.0.2.10:7000, with an allocation on the simulator's TURN server:
+    /// it, its endpoint, and the relayed address.
+    #[cfg(feature = "turn")]
+    fn with_allocation() -> (Traversal<Hop<SocketAddr>>, Endpoint<Hop<SocketAddr>>, SocketAddr) {
+        use peerwire_sim::turn::{Out, TurnServer as Server};
+        let (s, me): (SocketAddr, SocketAddr) =
+            ("198.51.100.1:3478".parse().unwrap(), "192.0.2.10:7000".parse().unwrap());
+        let mut port = 50000;
+        let next = move || {
+            port += 1;
+            Some(SocketAddr::new(s.ip(), port))
+        };
+        let mut server = Server::new(s, "peerwire.test", next).user("app", "secret");
+        let mut t = Traversal::new(&id(1), [1; 32], 1_700_000_000_000, vec![Hop::Net(me)], vec![]);
+        let mut ep = Endpoint::new(&id(1), Config::default(), [2; 32]);
+        let now = Instant::from_millis(1);
+        t.set_policy(now, &mut ep, Some(Policy::new([PathKind::Direct, PathKind::Turn])));
+        t.set_turn_servers(now, &mut ep, vec![(Hop::Net(s), TurnServer::new(s.to_string(), "app", "secret"))]);
+        while let Some(tx) = t.poll_transmit() {
+            for o in server.handle_client(now, me, &tx.payload) {
+                if let Out::ToClient { data, .. } = o {
+                    assert_eq!(t.handle_turn(now, &Hop::Net(s), &data), Some(None));
+                }
+            }
+        }
+        let relayed = t.turn_status()[0].1.expect("allocated");
+        (t, ep, relayed)
+    }
+
+    /// NB-099: where this node's TURN server relays from isn't where its NAT maps it: an observed address that is
+    /// its relayed address isn't taken (another is), and its offers carry it only in the relayed entry, which
+    /// decoders that predate it skip as an address they can't read.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn a_relayed_address_stays_out_of_the_nat_view() {
+        let (mut t, mut ep, relayed) = with_allocation();
+        let (now, by, seen) = (Instant::from_millis(2), id(2).peer_id(), "203.0.113.5:4000".parse().unwrap());
+        for addr in [relayed, seen] {
+            t.handle_event(now, &mut ep, &Event::AddrObserved { by, addr: Hop::Net(addr) });
+        }
+        assert!(t.candidates().contains(&Hop::Net(seen)) && !t.candidates().contains(&Hop::Net(relayed)));
+        let to = id(3);
+        t.handle_timeout(now, &mut ep);
+        std::iter::from_fn(|| t.poll_signal()).for_each(drop);
+        t.offer(now, &ep, to.peer_id(), false, false);
+        let offers: Vec<Offer<Hop<SocketAddr>>> = std::iter::from_fn(|| t.poll_signal())
+            .filter_map(|s| match s {
+                Signal::Publish(_, p) => Offer::decode(&sealed::open(&to, &p)?.1),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offers.len(), 1);
+        assert!(!offers[0].addrs.contains(&Hop::Net(relayed)), "{:?}", offers[0].addrs);
+        assert_eq!(offers[0].relayed, [Hop::Net(relayed)]);
+        let mut entry = RELAYED_TAG.to_vec();
+        relayed.encode(&mut entry);
+        assert_eq!(<SocketAddr as Address>::decode(&entry), None);
+    }
+
+    /// Two endpoints with `Hop` addresses linked: a (`id(1)`) dials b (`id(2)`) at `b_at`, and b sees a at `a_at`.
+    #[cfg(feature = "turn")]
+    fn hop_link(a_at: Hop<SocketAddr>, b_at: Hop<SocketAddr>) -> [Endpoint<Hop<SocketAddr>>; 2] {
+        let mut eps = [1u8, 2].map(|i| Endpoint::new(&id(i), Config::default(), [i + 2; 32]));
+        let mut now = Instant::from_millis(1);
+        eps[0].connect(now, b_at, id(2).peer_id()).unwrap();
+        for _ in 0..30 {
+            while let Some(t) = eps[0].poll_transmit(now) {
+                eps[1].handle_datagram(now, a_at, &t.payload);
+            }
+            while let Some(t) = eps[1].poll_transmit(now) {
+                eps[0].handle_datagram(now, b_at, &t.payload);
+            }
+            now = now + Duration::from_millis(10);
+            eps.iter_mut().for_each(|e| e.handle_timeout(now));
+        }
+        assert!(eps[0].is_connected(&id(2).peer_id()) && eps[1].is_connected(&id(1).peer_id()));
+        eps
+    }
+
+    /// An offer from `t`'s point of view: plain, with these addresses and relayed addresses, as of `now`.
+    #[cfg(feature = "turn")]
+    fn hop_offer(
+        t: &Traversal<Hop<SocketAddr>>,
+        now: Instant,
+        addrs: &[&str],
+        relayed: &[&str],
+    ) -> Offer<Hop<SocketAddr>> {
+        let hops = |v: &[&str]| v.iter().map(|a| Hop::Net(a.parse().unwrap())).collect();
+        Offer {
+            kind: Proof::None,
+            reply: false,
+            role: Role::Peer,
+            nat: NatType::Cone,
+            says_mapping: false,
+            ts: t.wall_ms(now),
+            nonce: now.as_micros(),
+            addrs: hops(addrs),
+            predict: None,
+            relays: vec![],
+            relayed: hops(relayed),
+        }
+    }
+
+    const R: &str = "198.51.100.20:50001";
+
+    /// NB-099: b linked a at an address before a's offer said it is a's relayed one (a's dial through its allocation
+    /// beat the offer): the offer retags the link; and the other way round, the link coming up after the offer is
+    /// retagged on its `Connected`.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn a_link_at_a_relayed_address_offered_is_retagged() {
+        let (r, b): (SocketAddr, SocketAddr) = (R.parse().unwrap(), "203.0.113.2:7000".parse().unwrap());
+        let a = id(1).peer_id();
+        let now = Instant::from_millis(500);
+        let [_, mut eb] = hop_link(Hop::Net(r), Hop::Net(b));
+        let mut tb = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
+        let o = hop_offer(&tb, now, &[], &[R]);
+        tb.on_offer(now, &mut eb, a, o);
+        assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Relayed(r))), "retagged by the offer");
+
+        let mut tb = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
+        let mut dialler = Endpoint::new(&id(2), Config::default(), [9; 32]);
+        let o = hop_offer(&tb, now, &[], &[R]);
+        tb.on_offer(now, &mut dialler, a, o);
+        assert!(std::iter::from_fn(|| dialler.poll_transmit(now)).any(|t| t.dst == Hop::Relayed(r)), "dialled there");
+        let [_, mut eb] = hop_link(Hop::Net(r), Hop::Net(b));
+        let up = std::iter::from_fn(|| eb.poll_event()).find(|e| matches!(e, Event::Connected { .. })).unwrap();
+        assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Net(r))));
+        tb.handle_event(now, &mut eb, &up);
+        assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Relayed(r))), "retagged on Connected");
+    }
+
+    /// NB-099: under `[Turn, Direct]` a link at a relayed address is kept there, by the endpoint too: given a direct
+    /// candidate, it punches to none. Under `[Direct, Turn]` it is let go, and given the peer's addresses (from its
+    /// offer), it punches.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn a_turn_link_is_kept_while_turn_ranks_first() {
+        let (a_at, b_at): (SocketAddr, SocketAddr) = ("192.0.2.1:7000".parse().unwrap(), R.parse().unwrap());
+        let b = id(2).peer_id();
+        let [mut ea, _] = hop_link(Hop::Net(a_at), Hop::Relayed(b_at));
+        let mut ta = Traversal::new(&id(1), [6; 32], 1_700_000_000_000, vec![Hop::Net(a_at)], vec![]);
+        let mut now = Instant::from_millis(500);
+        ta.set_policy(now, &mut ea, Some(Policy::new([PathKind::Turn, PathKind::Direct])));
+        let o = hop_offer(&ta, now, &["203.0.113.2:7000"], &[]);
+        ta.on_offer(now, &mut ea, b, o);
+        ea.add_candidates(now, &b, &[Hop::Net("203.0.113.3:7000".parse().unwrap())]);
+        for _ in 0..50 {
+            now = now + Duration::from_millis(20);
+            ea.handle_timeout(now);
+            std::iter::from_fn(|| ea.poll_transmit(now)).for_each(drop);
+        }
+        assert_eq!(ea.stats().punches_sent, 0, "kept");
+        ta.set_policy(now, &mut ea, Some(Policy::new([PathKind::Direct, PathKind::Turn])));
+        let sent: Vec<_> = (0..20)
+            .flat_map(|_| {
+                now = now + Duration::from_millis(20);
+                ea.handle_timeout(now);
+                std::iter::from_fn(|| ea.poll_transmit(now)).map(|t| t.dst).collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(sent.contains(&Hop::Net("203.0.113.2:7000".parse().unwrap())), "let go, it punches: {sent:?}");
+    }
+
+    /// NB-099: an allocation made after this node offered to a peer, which hasn't answered yet, offers again, with
+    /// the relayed address.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn an_allocation_made_is_offered_to_peers_offered_to_before() {
+        use peerwire_sim::turn::{Out, TurnServer as Server};
+        let (s, me): (SocketAddr, SocketAddr) =
+            ("198.51.100.1:3478".parse().unwrap(), "192.0.2.10:7000".parse().unwrap());
+        let mut server =
+            Server::new(s, "peerwire.test", move || Some(SocketAddr::new(s.ip(), 50001))).user("app", "secret");
+        let mut t = Traversal::new(&id(1), [1; 32], 1_700_000_000_000, vec![Hop::Net(me)], vec![]);
+        let mut ep = Endpoint::new(&id(1), Config::default(), [2; 32]);
+        let now = Instant::from_millis(1);
+        let to = id(3);
+        t.set_policy(now, &mut ep, Some(Policy::new([PathKind::Direct, PathKind::Turn])));
+        t.offer(now, &ep, to.peer_id(), true, false);
+        t.set_turn_servers(now, &mut ep, vec![(Hop::Net(s), TurnServer::new(s.to_string(), "app", "secret"))]);
+        while let Some(tx) = t.poll_transmit() {
+            for o in server.handle_client(now, me, &tx.payload) {
+                if let Out::ToClient { data, .. } = o {
+                    t.handle_turn(now, &Hop::Net(s), &data);
+                }
+            }
+        }
+        assert_eq!(t.poll_timeout(), Some(Instant::ZERO), "the allocation's news is due");
+        t.handle_timeout(now, &mut ep);
+        let offers: Vec<Offer<Hop<SocketAddr>>> = std::iter::from_fn(|| t.poll_signal())
+            .filter_map(|s| match s {
+                Signal::Publish(_, p) => Offer::decode(&sealed::open(&to, &p)?.1),
+                _ => None,
+            })
+            .collect();
+        let relayed: Vec<_> = offers.iter().map(|o| o.relayed.clone()).collect();
+        assert_eq!(relayed, [vec![], vec![Hop::Net(SocketAddr::new(s.ip(), 50001))]]);
     }
 }
