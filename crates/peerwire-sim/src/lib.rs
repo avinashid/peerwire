@@ -108,6 +108,8 @@ enum Owner {
     Node6(usize),
     Nat(usize),
     Stun,
+    /// A TURN server ([`Sim::add_turn_server`]): its index in `Sim::turns`.
+    Turn(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -169,8 +171,11 @@ pub struct Node {
     pub tx_bytes: u64,
     pub rx_packets: u64,
     pub rx_bytes: u64,
-    /// STUN datagrams that arrived for this node, with their source; the host takes them.
+    /// STUN datagrams that arrived for this node, with their source; the host takes them. Every datagram, for an
+    /// external node ([`Sim::set_external`]).
     pub stun_inbox: Vec<(SimAddr, Vec<u8>)>,
+    /// Its host runs an endpoint of its own ([`Sim::set_external`]).
+    pub external: bool,
     /// Wall-clock time spent inside this node's endpoint calls, when
     /// [`Sim::measure_cpu`] is on. Not virtual time, so not deterministic.
     pub cpu: Duration,
@@ -254,6 +259,7 @@ pub struct Sim {
     pub measure_cpu: bool,
     owners: HashMap<u32, Owner>,
     nats: Vec<Nat>,
+    turns: Vec<turn::TurnServer>,
     queue: BinaryHeap<InFlight>,
     /// Latest arrival per (from, to), for `NetConfig::in_order`.
     last_arrival: HashMap<(SimAddr, SimAddr), Instant>,
@@ -279,6 +285,7 @@ impl Sim {
             measure_cpu: false,
             owners: HashMap::new(),
             nats: Vec::new(),
+            turns: Vec::new(),
             queue: BinaryHeap::new(),
             last_arrival: HashMap::new(),
             seq: 0,
@@ -377,6 +384,7 @@ impl Sim {
             rx_packets: 0,
             rx_bytes: 0,
             stun_inbox: Vec::new(),
+            external: false,
             cpu: Duration::ZERO,
             tx_free_at: Instant::ZERO,
             extra: HashMap::new(),
@@ -472,6 +480,35 @@ impl Sim {
         SimAddr::new(ip, 3478)
     }
 
+    /// Adds a TURN server on the internet at port 3478 ([`turn::TurnServer`], user `user` with `password`), whose
+    /// allocations get ports from 50000 up at its IP; returns its address.
+    pub fn add_turn_server(&mut self, user: &str, password: &str) -> SimAddr {
+        let ip = self.alloc_ip(0, false);
+        self.owners.insert(ip, Owner::Turn(self.turns.len()));
+        let at = SimAddr::new(ip, 3478).to_socket_addr().expect("an IP");
+        let mut port = 49_999;
+        let next = move || {
+            port += 1;
+            Some(std::net::SocketAddr::new(at.ip(), port))
+        };
+        self.turns.push(turn::TurnServer::new(at, "peerwire.sim", next).user(user, password));
+        SimAddr::new(ip, 3478)
+    }
+
+    /// The TURN server at `addr` ([`Sim::add_turn_server`]).
+    pub fn turn_server(&mut self, addr: SimAddr) -> Option<&mut turn::TurnServer> {
+        match self.owners.get(&addr.ip) {
+            Some(&Owner::Turn(k)) => self.turns.get_mut(k),
+            _ => None,
+        }
+    }
+
+    /// Node `i`'s host runs an endpoint of its own: every datagram for it goes to its `stun_inbox`, and its host
+    /// sends with [`send_raw`](Sim::send_raw). The simulator's endpoint for it stays idle.
+    pub fn set_external(&mut self, i: usize) {
+        self.nodes[i].external = true;
+    }
+
     /// Sends a datagram from node `i`'s socket (out through its NATs), as a host
     /// does for traffic that isn't the endpoint's, such as STUN.
     pub fn send_raw(&mut self, i: usize, to: SimAddr, data: Vec<u8>) {
@@ -523,6 +560,26 @@ impl Sim {
         let data = stun::binding_response(&tx, seen);
         let at = self.now + self.net.latency;
         self.queue.push(InFlight { at, seq: self.seq, from: p.to, to: p.from, realm: 0, exits: Vec::new(), data });
+    }
+
+    /// Hands a datagram that reached TURN server `k` to it, at its own port from a client, at a relayed address
+    /// from a peer, and puts what it sends on the wire.
+    fn answer_turn(&mut self, k: usize, p: &InFlight) {
+        let (Some(from), Some(to)) = (p.from.to_socket_addr(), p.to.to_socket_addr()) else { return };
+        let outs = match p.to.port {
+            3478 => self.turns[k].handle_client(self.now, from, &p.data),
+            _ => self.turns[k].handle_peer(self.now, to, from, &p.data).into_iter().collect(),
+        };
+        for o in outs {
+            let (from, to, data) = match o {
+                turn::Out::ToClient { to: c, data } => (SimAddr::new(p.to.ip, 3478), c, data),
+                turn::Out::ToPeer { from, to, data } => (SimAddr::from_socket_addr(from).expect("ours"), to, data),
+            };
+            let Some(to) = SimAddr::from_socket_addr(to) else { continue };
+            self.seq += 1;
+            let at = self.now + self.net.latency;
+            self.queue.push(InFlight { at, seq: self.seq, from, to, realm: 0, exits: Vec::new(), data });
+        }
     }
 
     /// Delivers a raw datagram to whatever node holds `to`, right now.
@@ -675,6 +732,11 @@ impl Sim {
                 self.answer_stun(&p);
                 continue;
             }
+            if let (0, Some(&Owner::Turn(k))) = (p.realm, self.owners.get(&p.to.ip)) {
+                self.stats.delivered += 1;
+                self.answer_turn(k, &p);
+                continue;
+            }
             match self.descend(&p) {
                 Some((i, port)) => {
                     self.stats.delivered += 1;
@@ -692,7 +754,7 @@ impl Sim {
                     }
                     n.rx_packets += 1;
                     n.rx_bytes += p.data.len() as u64 + 28;
-                    if stun::is_stun(&p.data) {
+                    if stun::is_stun(&p.data) || n.external {
                         n.stun_inbox.push((p.from, p.data));
                     } else {
                         let t0 = self.wall();
@@ -754,7 +816,7 @@ impl Sim {
             Some(&Owner::Node(i)) => self.nodes[i].realm == realm,
             Some(&Owner::Node6(_)) => realm == 0,
             Some(&Owner::Nat(n)) => self.nats[n].outer == realm,
-            Some(&Owner::Stun) => realm == 0,
+            Some(&Owner::Stun | &Owner::Turn(_)) => realm == 0,
             None => false,
         }
     }
@@ -793,7 +855,7 @@ impl Sim {
                     dst = self.nats[n].inbound(self.now, p.from, dst)?;
                     realm = self.nats[n].inner;
                 }
-                Owner::Stun => return None,
+                Owner::Stun | Owner::Turn(_) => return None,
             }
         }
     }
