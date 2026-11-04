@@ -432,7 +432,10 @@ fn set_clock(n: u8) -> Option<EspSntp<'static>> {
             }
             Err(e) => warn!("node {n}: SNTP {server}: {e}"),
         }
-        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        // A failed ask waits out its 2 s, so a DNS error doesn't spin; a set clock goes on.
+        if !clock_set() {
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        }
     }
     if !clock_set() {
         warn!("node {n}: no SNTP answer in 60 s, clock at 1970: LAN peers with a set clock drop our hellos");
