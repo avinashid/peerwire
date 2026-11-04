@@ -636,8 +636,11 @@ impl<A: Address> TurnSet<A> {
         self.out.pop_front().or_else(|| self.clients.iter_mut().find_map(|c| c.poll_transmit()))
     }
 
+    /// Also due at once while an allocation's news (made, lost) waits for the traversal.
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.clients.iter().filter_map(|c| c.poll_timeout()).min()
+        let news = !self.events.is_empty() || self.clients.iter().any(|c| !c.events.is_empty());
+        let news = news.then_some(Instant::ZERO);
+        self.clients.iter().filter_map(|c| c.poll_timeout()).chain(news).min()
     }
 
     pub fn handle_timeout(&mut self, now: Instant) {

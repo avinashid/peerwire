@@ -871,9 +871,19 @@ impl<A: Address> Traversal<A> {
             }
         }
         let linked: Vec<PeerId> = ep.connected_peers().copied().collect();
+        let direct = self.policy.as_ref().is_some_and(|p| p.allows(PathKind::Direct));
         for peer in linked {
-            if ep.path(&peer).is_some_and(|path| !self.allows(&peer, path)) {
-                self.move_off(now, ep, peer);
+            match ep.path(&peer) {
+                Some(path) if !self.allows(&peer, path) => self.move_off(now, ep, peer),
+                // A link at a relayed address the policy no longer keeps there punches to the peer's addresses,
+                // and asks for its offer, so the peer punches too: it moves once one answers.
+                Some(Path::Direct(a)) if direct && a.relayed() && !self.kept(&Path::Direct(a.clone())) => {
+                    let addrs = self.remotes.get(&peer).map(|r| r.addrs.clone()).unwrap_or_default();
+                    ep.add_candidates(now, &peer, &addrs);
+                    let room = self.room_role(&peer).is_some();
+                    self.offer(now, ep, peer, true, room);
+                }
+                _ => {}
             }
         }
     }
@@ -1100,6 +1110,7 @@ impl<A: Address> Traversal<A> {
                 if let Some(r) = self.remotes.get_mut(peer) {
                     (r.failure, r.ladder, r.redial) = (None, None, false);
                 }
+                self.retag(now, ep, peer, path);
                 if !self.follow_policy(now, ep, *peer, path) {
                     return; // on a path that is off: no relay for others
                 }
@@ -1179,6 +1190,7 @@ impl<A: Address> Traversal<A> {
                 }
             }
             Event::PathChanged { peer, path } => {
+                self.retag(now, ep, peer, path);
                 self.follow_policy(now, ep, *peer, path);
             }
             Event::AddrObserved { addr, .. } => {
@@ -1194,6 +1206,17 @@ impl<A: Address> Traversal<A> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A link to `peer` came up or moved to `path`: if that is a relayed address the peer offered, which its packets
+    /// reached the link at before the offer did, the endpoint takes it as one ([`Endpoint::retag`]).
+    fn retag(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: &PeerId, path: &Path<A>) {
+        let Path::Direct(at) = path else { return };
+        if self.relayed_of.get(at) == Some(peer) {
+            if let Some(hop) = A::relayed_hop(at) {
+                ep.retag(now, peer, at, hop);
+            }
         }
     }
 
@@ -1711,14 +1734,16 @@ impl<A: Address> Traversal<A> {
         self.turn_events(now, ep);
     }
 
-    /// An allocation made: offered to the peers still to link with (their dials take it). One gone: its links
-    /// move or close, as for a path turned off.
+    /// An allocation made: offered, with its relayed address, to the peers still to link with (their dials take
+    /// it). One gone: its links move or close, as for a path turned off.
     fn turn_events(&mut self, now: Instant, ep: &mut Endpoint<A>) {
         while let Some((server, e)) = self.turn.poll_event() {
             match e {
+                // Also to those offered to before it was made, which haven't answered yet.
                 TurnEvent::Allocated(_) => {
+                    let met = |r: &Remote<A>| r.heard || r.offered_at.is_some();
                     let waiting: Vec<PeerId> =
-                        self.remotes.iter().filter(|(p, r)| r.heard && !ep.is_connected(p)).map(|(p, _)| *p).collect();
+                        self.remotes.iter().filter(|(p, r)| met(r) && !ep.is_connected(p)).map(|(p, _)| *p).collect();
                     for p in waiting {
                         let room = self.room_role(&p).is_some();
                         self.offer(now, ep, p, true, room);
@@ -1907,6 +1932,13 @@ impl<A: Address> Traversal<A> {
         for a in o.relayed.iter().take(MAX_RELAYED) {
             if self.relayed_of.len() < MAX_RELAYED_OF {
                 self.relayed_of.insert(a.clone(), from);
+            }
+            // Linked there before this offer said what it is (its dial through its allocation came first).
+            if let (Some(Path::Direct(at)), Some(hop)) = (ep.path(&from), A::relayed_hop(a)) {
+                if at == a {
+                    let at = at.clone();
+                    ep.retag(now, &from, &at, hop);
+                }
             }
         }
         let ips: Vec<IpAddr> = addrs.iter().chain(&o.relayed).filter_map(|a| Some(a.to_socket_addr()?.ip())).collect();

@@ -1346,6 +1346,23 @@ impl<A: Address> Endpoint<A> {
         }
     }
 
+    /// Says that `old`, an address the linked `peer` is at, is `new`: the same address, of another kind (the host
+    /// learnt that a peer's address it linked at is a relayed one, [`Address::relayed`]). The link's path and
+    /// candidates take `new`; a link now on a relayed address punches off it, its race ends. No event. Ignored for
+    /// a peer that isn't linked.
+    pub fn retag(&mut self, now: Instant, peer: &PeerId, old: &A, new: A) {
+        let Some(&idx) = self.peers.get(peer) else { return };
+        let Some(sess) = self.sessions.get_mut(&idx) else { return };
+        if sess.path.direct() == Some(old) {
+            sess.path = Path::Direct(new.clone());
+            sess.race = None;
+        }
+        for c in sess.candidates.iter_mut().filter(|c| *c == old) {
+            *c = new.clone();
+        }
+        self.start_punch(now, idx);
+    }
+
     /// Marks `addr` as a slow address of the linked `peer`, or clears the mark
     /// (`None`): a path that relaying through another peer beats, such as a
     /// signalling channel carrying datagrams. Paths rank slow address, then relay,
