@@ -183,7 +183,22 @@ export class NostrSignaling {
     const again = this.sockets.some((s) => s.relayUrl === url);
     for (const s of this.sockets) if (s.relayUrl === url) this.forget(s);
     this.sockets = this.sockets.filter((s) => s.relayUrl !== url);
-    const ws = new WebSocket(url);
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      // A url the constructor refuses (a port the browser blocks, say) is a socket that failed at once: it waits
+      // and is dialled again as one that closed, and the error, which may name the url, goes nowhere.
+      ws = { readyState: WebSocket.CLOSED, close() {}, send() {} };
+      ws.relayUrl = url;
+      ws.dialled = clock();
+      this.sockets.push(ws);
+      setTimeout(() => {
+        opened();
+        this.lostSocket(ws);
+      });
+      return;
+    }
     ws.relayUrl = url;
     ws.onopen = () => {
       this.stats.relaysOpen++;

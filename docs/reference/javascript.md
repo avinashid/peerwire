@@ -242,7 +242,7 @@ The policy says which paths a link may take and in what order. A path missing fr
 |---|---|---|---|
 | `order` | `('direct' \| 'turn' \| 'peers' \| 'signaling')[]` | all four, in this order | `'direct'`: WebRTC over host and STUN candidates, with port prediction and birthday punches. `'turn'`: WebRTC through a TURN server in `iceServers`. `'peers'`: relayed by another member. `'signaling'`: over the signalling relays. |
 | `iceServers` | `RTCIceServer[]` | as `joinRoom`'s | `stun:`, `stuns:`, `turn:` and `turns:` urls. TURN ones are used only with `'turn'`, STUN ones only with `'direct'`, by links, calls and birthday punches alike. |
-| `relays` | `string[]` | as `joinRoom`'s | `ws://` or `wss://` urls, for `signaling: 'nostr'`. |
+| `relays` | `string[]` | as `joinRoom`'s | `ws://` or `wss://` urls with no fragment, for `signaling: 'nostr'`. One the browser still refuses (a blocked port) is a relay it can't reach: dialled again now and then. |
 | `fallbackMs`, `sameNatFallbackMs`, `birthday`, `privacy` | | as `joinRoom`'s | `birthday` needs `'direct'` too. `privacy` is set when the room is joined. |
 
 **Order.** The side that dials (the smaller PeerId) tries the first path, and each later one when those before it
@@ -255,9 +255,10 @@ fail:
   and `'signaling'` next to each other are one fallback, the first dialled 1 s before the other, as without a policy.
   So `['direct', 'peers', 'signaling', 'turn']` makes a WebRTC attempt without TURN first, and one through TURN only
   once the fallback has failed; its offer says `retry`, so the peer drops its first connection.
-- With `'turn'` and no `'direct'`, WebRTC takes relay candidates alone (`iceTransportPolicy: 'relay'`), and none of
-  your addresses reach the peer. An attempt without `'turn'` says `turn: false` in its offer, and the peer leaves its
-  own TURN servers out of it too. `'turn'` with no TURN server in `iceServers` is skipped.
+- With `'turn'` and no `'direct'`, WebRTC takes relay candidates alone (`iceTransportPolicy: 'relay'`), the room
+  sends only relay candidates whatever WebRTC gathers, and none of your addresses reach the peer. An attempt without
+  `'turn'` says `turn: false` in its offer, and the peer leaves its own TURN servers out of it too. `'turn'` with no
+  TURN server in `iceServers` is skipped.
 - A link moves only to a path earlier than its own. WebRTC retries, a DataChannel that opens late and birthday
   punches need a WebRTC path before the link's; a member takes over a link on signalling only with `'peers'` before
   `'signaling'`. So `['peers', 'direct']` keeps a relayed link relayed, and `['signaling', 'peers']` keeps a link on
@@ -273,11 +274,18 @@ fail:
   signalling relays (a punch over them, which the peer answers if its policy has `'signaling'`), or from signalling to
   a member (the relay probe, which the peer joins if its policy puts `'peers'` before `'signaling'` too). Otherwise it
   drops, with `'peer-leave'` reason `'policy'` (the peer, told the link closed, sees `'closed'`), and the two dial
-  again under the new order. A WebRTC
-  link on a path now off (over our TURN with `'turn'` off, or not with `'direct'` off) drops at once the same way.
+  again under the new order. A WebRTC link on a path now off (over our TURN with `'turn'` off, or not with
+  `'direct'` off) drops at once the same way.
 - New `iceServers` go to every WebRTC connection (`setConfiguration`) for its next ICE restart. A link over our TURN
   restarts ICE at once if we dialled it (the other side's restart ask is heeded only while ICE is down), and peers on
-  a fallback try WebRTC again.
+  a fallback try WebRTC again. With `'direct'` turned off, a link kept on our TURN restarts ICE the same way, so it
+  leaves the host pairs its old session kept, and every connection sends relay candidates alone from then on.
+- A call's connections take the new servers and candidate types too, and restart ICE on our side when `'direct'` or
+  `'turn'` goes off or the servers change. With no WebRTC path left (no `'direct'`, and no TURN server or no
+  `'turn'`), the call fails for each peer (`'state'` `'failed'`, `'no-path'`) at once. WebRTC keeps a call's old pair
+  until the new session connects, which with no path under the policy it never does, so a call still on a path now
+  off 20 s after its restart fails the same way.
+- An address sent before a change can't be taken back: to keep yours from peers, set the order when you join.
 - New `relays`: the room dials those it hasn't, subscribes and says hello there, and closes those dropped. Links
   stay; what was on its way through a dropped relay is lost, and the session sends it again. Members find each other,
   and link over signalling, only through a relay they share.
@@ -290,10 +298,15 @@ still dial us over a path ours has off: that link moves to a path ours allows, o
 through a member that relays for it, after we have moved off that member, isn't ours to refuse: the core takes
 relayed packets from any member that forwards them.
 
+**The order binds the side that dials.** Answering a WebRTC offer, this end uses every WebRTC path its policy allows,
+whatever comes first in its order: `['signaling', 'direct']` still sends your addresses to a peer that dials WebRTC
+first, and `'turn'` last still gathers on your TURN server for it. Only leaving a path out keeps it unused.
+
 **Throws** `TypeError` for an empty `order`, an unknown path or one given twice, an unknown key, an `iceServers` entry
-whose urls aren't STUN or TURN (the message names it by index, never a url or a credential), `relays` that aren't
-`ws://` or `wss://` urls or without Nostr signalling, a negative `fallbackMs`, and a `privacy` other than the room's.
-Nothing changes when it throws; `Error` after `leave()`.
+whose urls aren't STUN or TURN, a relay url that doesn't parse, isn't `ws:` or `wss:` or has a fragment (each message
+names the entry by index, never a url or a credential), `relays` without Nostr signalling, a negative `fallbackMs`,
+and a `privacy` other than the room's. Nothing changes when it throws: every check comes first. `Error` after
+`leave()`.
 
 ### retryDirect
 

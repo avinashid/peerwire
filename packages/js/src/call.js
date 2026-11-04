@@ -14,7 +14,10 @@
 // only their sizes and timing. The smaller PeerId offers, with one audio and one video transceiver, and the
 // other answers on them, so a stream set later (a camera turned on, a screen shared) only replaces tracks and
 // never renegotiates. Descriptions follow perfect negotiation (the larger PeerId is polite); only the smaller
-// restarts ICE, so our own offers never cross, but a polite side whose offer is rolled back recovers.
+// restarts ICE when it fails, so our own offers never cross, but a polite side whose offer is rolled back
+// recovers. A room policy set later (room.setPolicy) reaches every connection: its servers and candidate types
+// for what ICE gathers next, and an ICE restart on our side when it turns a WebRTC path off or brings new
+// servers (Calls.configure). Without 'direct', only relay candidates go out, whatever WebRTC gathers.
 //
 // Seats. A member in the call says so (`join`, with how long it has been in it, `age`) to every room member,
 // and to each that joins the room later, so every member knows who is in the call, in it or not (the
@@ -30,10 +33,12 @@
 // last seat may both go, or one stay with a member that turned it away (that pair fails, 'no-path').
 //
 // A peer whose media isn't connected CONNECT_MS after its link was made (no direct path, and no TURN server
-// in iceServers) fails ('no-path') and stays failed until it or we join the call again. One that connected
+// in iceServers), or whose media is still on a path the room's policy has turned off CONNECT_MS after the ICE
+// restart that change made (Calls.configure), fails ('no-path') and stays failed until it or we join the call again. One that connected
 // and then lost ICE gets MAX_RESTARTS ICE restarts in RESTART_WINDOW_MS, CONNECT_MS each, then fails ('lost').
 
-import { withoutHostCandidates, candidateFor } from './webrtc.js';
+import { withoutHostCandidates, onlyRelayCandidates, candidateFor, relayedStats } from './webrtc.js';
+import { hasTurn } from './policy.js';
 
 export const DEFAULT_MAX = 6;
 export const MAX_CALL = 16;
@@ -157,6 +162,36 @@ export class Calls {
   // We leave the room: our call ends with no word to anyone (the room's goodbye says it).
   close() {
     this.call?.end(null, false);
+  }
+
+  // The room's policy changed: each media connection takes the configuration `media` gives now (setConfiguration),
+  // so what it gathers from then on, and what we send of it, follow the policy. With `restart` (a WebRTC path turned
+  // off, or new servers), ICE restarts on each now, on whichever side we are: only ours knows (perfect negotiation
+  // settles two restarts that cross); one still on a path the policy has off CONNECT_MS later fails (onPath). With
+  // relay candidates alone and no TURN server, the call has no path: each fails ('no-path'), as it would have at
+  // the start; one that can't take the configuration fails ('error') rather than gather under its old one.
+  configure(restart) {
+    const call = this.call;
+    if (!call || !this.media) return;
+    const { iceServers = [], iceTransportPolicy } = this.media;
+    const config = iceTransportPolicy ? { iceServers, iceTransportPolicy } : { iceServers };
+    const none = iceTransportPolicy === 'relay' && !hasTurn(iceServers);
+    for (const l of [...call.links.values()]) {
+      if (l.closed) continue;
+      if (none) {
+        call.fail(l, 'no-path');
+        continue;
+      }
+      try {
+        l.pc.setConfiguration(config);
+      } catch {
+        call.fail(l, 'error');
+        continue;
+      }
+      if (!restart) continue;
+      l.pc.restartIce();
+      call.onPath(l);
+    }
   }
 
   // Whether `peer` may send a frame of `kind` now (see BUDGETS).
@@ -335,11 +370,11 @@ export class Call {
     const { RTCPeerConnection: Pc, MediaStream: Ms, iceServers = [], iceTransportPolicy, privacy = 'direct' } = this.calls.media;
     const pc = new Pc(iceTransportPolicy ? { iceServers, iceTransportPolicy } : { iceServers });
     const l = { peer, pc, polite: this.calls.self > peer, remote: new Ms(), tx: null, state: null, shown: false, closed: false,
-      makingOffer: false, chain: Promise.resolve(), timer: null, connected: false, restarts: [] };
+      makingOffer: false, chain: Promise.resolve(), timer: null, check: null, connected: false, restarts: [] };
     this.links.set(peer, l);
     pc.onicecandidate = ({ candidate }) => {
       if (!candidate?.candidate || l.closed) return;
-      const c = candidateFor(privacy, candidate.toJSON());
+      const c = candidateFor(privacy, candidate.toJSON(), this.calls.media.iceTransportPolicy === 'relay');
       if (c) this.calls.send(peer, { t: 'ice', c: { candidate: c.candidate, sdpMid: c.sdpMid ?? null, sdpMLineIndex: c.sdpMLineIndex ?? null } });
     };
     pc.onnegotiationneeded = () => this.offer(l);
@@ -364,9 +399,11 @@ export class Call {
     }
   }
 
+  // Our description, as the room's privacy and policy allow: relay candidates alone without 'direct'.
   describe(l) {
     const d = l.pc.localDescription;
-    const sdp = this.calls.media.privacy === 'public-only' ? withoutHostCandidates(d.sdp) : d.sdp;
+    const { privacy, iceTransportPolicy } = this.calls.media;
+    const sdp = iceTransportPolicy === 'relay' ? onlyRelayCandidates(d.sdp) : privacy === 'public-only' ? withoutHostCandidates(d.sdp) : d.sdp;
     this.calls.send(l.peer, { t: 'sdp', d: { type: d.type, sdp } });
   }
 
@@ -462,6 +499,20 @@ export class Call {
     }
   }
 
+  // After an ICE restart for the room's policy: the link fails ('no-path') if CONNECT_MS on its selected pair is still
+  // on a path the policy has off, ours a relay one with no TURN server now, or another with relay candidates alone.
+  // WebRTC keeps its old pair until the new session connects, which one with no path under the policy never does.
+  onPath(l) {
+    l.check?.();
+    l.check = this.calls.after(CONNECT_MS, async () => {
+      l.check = null;
+      const relay = await relayedStats(l.pc).catch(() => null);
+      if (l.closed || relay === null) return;
+      const { iceServers = [], iceTransportPolicy } = this.calls.media;
+      if (relay ? !hasTurn(iceServers) : iceTransportPolicy === 'relay') this.fail(l, 'no-path');
+    });
+  }
+
   // Fails the link with `reason` unless it connects within CONNECT_MS.
   wait(l, reason) {
     l.timer?.();
@@ -479,6 +530,8 @@ export class Call {
     l.closed = true;
     l.timer?.();
     l.timer = null;
+    l.check?.();
+    l.check = null;
     try {
       l.pc.close();
     } catch {

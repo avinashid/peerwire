@@ -218,6 +218,13 @@ export function withoutHostCandidates(sdp) {
   return sdp.split('\n').filter((l) => !(/^\s*a=candidate:/i.test(l) && HOST.test(l))).map(unaddressed).join('\n');
 }
 const HOST = / typ host(\s|$)/;
+const RELAY = / typ relay(\s|$)/;
+
+// `sdp` with relay (TURN) candidates alone, each line naming no local address as in withoutHostCandidates: what a
+// connection without 'direct' sends (a policy's), whatever its WebRTC gathered.
+export function onlyRelayCandidates(sdp) {
+  return sdp.split('\n').filter((l) => !/^\s*a=candidate:/i.test(l) || RELAY.test(l)).map(unaddressed).join('\n');
+}
 
 // A candidate (with or without `a=`) or SDP line that names no local address. A port of 0
 // marks a rejected m-section and is kept.
@@ -227,10 +234,12 @@ function unaddressed(l) {
 }
 
 // A candidate (as RTCIceCandidate.toJSON() gives it) to send under `privacy`, as WebRtcTransport sends
-// its own: unless 'direct', null for a host one, and any other with its related address cleared.
-// Calls (call.js) send their media candidates through it.
-export function candidateFor(privacy, j) {
-  if (privacy === 'direct') return j;
+// its own: unless 'direct', null for a host one, and any other with its related address cleared. With
+// `relayOnly` (a policy without 'direct'), null for any but a relay one, which goes without its related
+// address. Calls (call.js) send their media candidates through it.
+export function candidateFor(privacy, j, relayOnly = false) {
+  if (relayOnly && !RELAY.test(j.candidate ?? '')) return null;
+  if (privacy === 'direct' && !relayOnly) return j;
   if (HOST.test(j.candidate ?? '')) return null;
   return { ...j, candidate: unaddressed(j.candidate ?? '') };
 }
@@ -251,8 +260,9 @@ function relayedNow(pc) {
   }
 }
 
-// The same from getStats(): the transport's selected pair (Chrome), or the pair marked selected (Firefox).
-async function relayedStats(pc) {
+// The same from getStats(): the transport's selected pair (Chrome), or the pair marked selected (Firefox). Calls
+// (call.js) read their media connections' with it.
+export async function relayedStats(pc) {
   const stats = await pc.getStats();
   const byId = new Map();
   let pair = null;
@@ -444,11 +454,12 @@ export class WebRtcTransport {
       const c = e.candidate;
       if (c) this.sameNat(l, l.mine, c.candidate);
       if (c && this.privacy !== 'direct' && HOST.test(c.candidate)) return;
-      if (this.trickle) return void (c && !l.unsent && this.signal(peer, { kind: 'ice', candidate: this.outgoing(c) }));
+      if (c && this.relayOnly(l) && !RELAY.test(c.candidate)) return;
+      if (this.trickle) return void (c && !l.unsent && this.signal(peer, { kind: 'ice', candidate: this.outgoing(c, l) }));
       if (!l.described) return; // still to go in the description
       if (!c) return void this.sendLate(l); // gathering complete: send what is buffered
       if (l.lateSent + l.late.length >= MAX_LATE) return; // bounded
-      l.late.push(this.outgoing(c));
+      l.late.push(this.outgoing(c, l));
       // The first batch waits for gathering to settle (describe()'s LATE_ICE_MS timer);
       // a candidate found after that batch is sent LATE_FLUSH_MS later, so a slow public
       // address (a device that gathered mDNS first) still reaches the peer.
@@ -589,8 +600,10 @@ export class WebRtcTransport {
   }
 
   // Our NAT's port prediction, for a message carrying our description: { nat } when
-  // our server-reflexive candidates show a sequential symmetric NAT, else nothing.
+  // our server-reflexive candidates show a sequential symmetric NAT, else nothing (and
+  // nothing for a link that sends relay candidates alone).
   prediction(l, extra = []) {
+    if (this.relayOnly(l)) return {};
     const sdp = [l.pc.localDescription?.sdp ?? '', ...extra.map((c) => `a=${c.candidate}`)].join('\n');
     const nat = natFromSdp(sdp);
     return nat.next ? { nat: { ip: nat.ip, next: nat.next, step: nat.step } } : {};
@@ -619,16 +632,25 @@ export class WebRtcTransport {
     return this.privacy !== 'relay-only' || peer === this.relay;
   }
 
-  // A candidate to send: unless 'direct', with its related address (a local socket) cleared.
-  outgoing(c) {
+  // A candidate of `l`'s to send: unless 'direct' (the privacy and the policy), with its related address (a local
+  // socket) cleared.
+  outgoing(c, l) {
     const j = c.toJSON();
-    return this.privacy === 'direct' ? j : { ...j, candidate: unaddressed(j.candidate ?? '') };
+    return this.privacy === 'direct' && !this.relayOnly(l) ? j : { ...j, candidate: unaddressed(j.candidate ?? '') };
   }
 
-  // The local description to send, with host candidates left out unless 'direct'.
-  description(pc) {
-    const d = pc.localDescription.toJSON();
+  // `l`'s local description to send: with relay candidates alone where the policy has no 'direct' (whatever this
+  // WebRTC gathered), else with host candidates left out unless 'direct'.
+  description(l) {
+    const d = l.pc.localDescription.toJSON();
+    if (this.relayOnly(l)) return { type: d.type, sdp: onlyRelayCandidates(d.sdp) };
     return this.privacy === 'direct' ? d : { type: d.type, sdp: withoutHostCandidates(d.sdp) };
+  }
+
+  // Whether `l` sends relay candidates alone: it was made without 'direct', or the policy has turned 'direct' off
+  // since (configure()).
+  relayOnly(l) {
+    return !(l.use.direct && this.rtc.direct);
   }
 
   // Sends a signal; a closed or failing signalling channel loses it, like a relay would.
@@ -671,7 +693,7 @@ export class WebRtcTransport {
 
   // Takes the description to send (and starts collecting late candidates).
   describe(l) {
-    const d = this.description(l.pc);
+    const d = this.description(l);
     l.described = true;
     this.sameNat(l, l.mine, l.pc.localDescription?.sdp);
     if (!this.trickle && l.pc.iceGatheringState !== 'complete') l.lateTimer = setTimeout(() => this.sendLate(l), LATE_ICE_MS);
@@ -803,7 +825,7 @@ export class WebRtcTransport {
         if (sdp !== null && sdp === l.offerSdp) {
           // One never sent is made again, with the candidates found since in it (none while
           // it is being made: the description is still the last offer's).
-          const msg = l.answerMsg && l.unsent ? { kind: 'answer', sdp: this.description(l.pc), ...this.prediction(l) } : l.answerMsg;
+          const msg = l.answerMsg && l.unsent ? { kind: 'answer', sdp: this.description(l), ...this.prediction(l) } : l.answerMsg;
           if (msg && this.publish(from, msg)) {
             if (l.unsent) Object.assign(l, { answerMsg: msg, unsent: false, late: [] });
             this.resent++;
@@ -929,7 +951,8 @@ export class WebRtcTransport {
   }
 
   // New iceServers, and the WebRTC paths allowed (`rtc`): connections made from now on use them, and every
-  // connection now takes them for its next ICE restart (setConfiguration), within the paths it was made for.
+  // connection now takes them for its next ICE restart (setConfiguration), within the paths it was made for; with
+  // 'direct' off, each sends relay candidates alone from now on (relayOnly()).
   configure(iceServers, rtc) {
     this.iceServers = iceServers;
     this.rtc = rtc;

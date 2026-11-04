@@ -24,7 +24,6 @@ const RTC = new Set(['direct', 'turn']);
 const KEYS = new Set(['order', 'iceServers', 'relays', 'fallbackMs', 'sameNatFallbackMs', 'birthday', 'privacy']);
 const ICE_URL = /^(stuns?|turns?):/i;
 const TURN_URL = /^turns?:/i;
-const RELAY_URL = /^wss?:\/\//i;
 
 // `order` checked: a frozen copy. TypeError for anything but a non-empty list of distinct path names.
 export function checkOrder(order) {
@@ -95,13 +94,24 @@ export function serversFor(list, { direct, turn }) {
 // Whether `list` has a TURN server.
 export const hasTurn = (list) => list.some((s) => [s.urls].flat().some((u) => TURN_URL.test(u)));
 
-// `list` checked: the relay URLs, each once. The message never names one (a URL may carry a token).
+// `list` checked: the relay URLs, each once. TypeError unless each is one the WebSocket constructor takes: it
+// parses, ws: or wss:, with no fragment. The message names one by its index only (a URL may carry a token).
 export function checkRelays(list) {
-  if (!Array.isArray(list) || !list.length || !list.every((u) => typeof u === 'string' && RELAY_URL.test(u))) {
-    throw new TypeError('relays must be a non-empty array of ws:// or wss:// URLs');
-  }
+  if (!Array.isArray(list) || !list.length) throw new TypeError('relays must be a non-empty array of ws:// or wss:// URLs');
+  list.forEach((u, i) => {
+    if (!(typeof u === 'string' && wsUrl(u))) throw new TypeError(`relays[${i}] must be a ws:// or wss:// URL with no fragment`);
+  });
   return [...new Set(list)];
 }
+
+const wsUrl = (u) => {
+  try {
+    const url = new URL(u);
+    return (url.protocol === 'ws:' || url.protocol === 'wss:') && !url.href.includes('#');
+  } catch {
+    return false;
+  }
+};
 
 const ms = (k, v) => {
   if (!Number.isFinite(v) || v < 0) throw new TypeError(`${k} must be a number of ms, 0 or more`);

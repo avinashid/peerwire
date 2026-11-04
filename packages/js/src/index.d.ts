@@ -59,14 +59,17 @@ export interface RoomPolicy {
    * - `'direct'` and `'turn'` next to each other are one WebRTC attempt (ICE prefers the direct pairs); `'peers'` and
    *   `'signaling'` next to each other are one fallback, the first dialled 1 s before the other. So `['direct',
    *   'peers', 'signaling', 'turn']` uses TURN only once the fallback fails. With `'turn'` and no `'direct'`, WebRTC
-   *   takes relay candidates alone (`iceTransportPolicy: 'relay'`). A WebRTC attempt without `'turn'` asks the peer
-   *   to leave its TURN servers out too.
+   *   takes relay candidates alone (`iceTransportPolicy: 'relay'`), and only relay candidates are sent. A WebRTC
+   *   attempt without `'turn'` asks the peer to leave its TURN servers out too.
    * - A link moves only to a path earlier than its own: WebRTC retries, a DataChannel that opens late and birthday
    *   punches need a WebRTC path before its own, and a member takes over a link on signalling only with `'peers'`
    *   before `'signaling'`. So `['peers', 'direct']` keeps a relayed link relayed.
    * - It governs this end: a peer whose policy differs can still dial us over a path ours has off. Such a link
    *   moves to a path ours allows (a member's link to signalling, a signalling link to a member, if the peer takes
    *   it), or drops: `'peer-leave'` with reason `'policy'`.
+   * - The order binds the side that dials. Answering a WebRTC offer, this end uses every WebRTC path its policy
+   *   allows, whatever comes first in its order: `['signaling', 'direct']` still sends our addresses to a peer that
+   *   dials WebRTC first, and `'turn'` last still gathers on our TURN server.
    * TypeError for an empty order, an unknown path, or one given twice. */
   order?: RoomPath[];
   /** STUN and TURN servers: urls of `stun:`, `stuns:`, `turn:` or `turns:`. Default: none for `'local'`, Google and
@@ -75,7 +78,9 @@ export interface RoomPolicy {
    * entry by its index alone, never a url or a credential. */
   iceServers?: RTCIceServer[];
   /** Nostr relays, for `signaling: 'nostr'`: `ws://` or `wss://` urls. Members find each other, and link over
-   * signalling, only through a relay they share. TypeError for an empty list or another url. */
+   * signalling, only through a relay they share. TypeError for an empty list, or a url that doesn't parse, isn't
+   * `ws:` or `wss:`, or has a fragment, naming it by its index alone. A url the browser still refuses (a blocked
+   * port) is a relay that can't be reached: dialled again now and then, as one that closed. */
   relays?: string[];
   /** As `joinRoom`'s. */
   fallbackMs?: number;
@@ -264,13 +269,18 @@ export declare class Room {
    *   dial again under the new order. A WebRTC link on a path now off (over our TURN with `'turn'` off, or not with
    *   `'direct'` off) drops at once the same way;
    * - new `iceServers` go to every WebRTC connection for its next ICE restart, a link over our TURN restarts ICE
-   *   at once (from the side that dialled it), and peers on a fallback try WebRTC again;
+   *   at once (from the side that dialled it), and peers on a fallback try WebRTC again. With `'direct'` turned off,
+   *   a link kept on our TURN restarts ICE the same way, and every connection sends relay candidates alone;
+   * - a call's connections take the new servers and candidate types too, and restart ICE (on our side) when
+   *   `'direct'` or `'turn'` goes off or the servers change. With no WebRTC path left, the call fails (`'no-path'`),
+   *   and so does one still on a path now off 20 s after its restart. Addresses sent before the change can't be
+   *   taken back;
    * - new `relays`: the room dials those it hasn't, says hello there, and closes those dropped. Links stay; what
    *   was on its way through a relay dropped is lost, and the session resends it;
    * - `fallbackMs`, `sameNatFallbackMs` and `birthday` count for links and punches from then on. `privacy` is set
    *   when the room is joined.
    * Throws TypeError as `joinRoom` does, for `relays` without Nostr signalling, and for a `privacy` other than the
-   * room's; nothing changes when it throws. */
+   * room's; nothing changes when it throws (every check comes first). */
   setPolicy(policy: RoomPolicy): void;
   /** Tries WebRTC again, now, with `peer` (or every peer) the room reaches only by fallback: a new connection,
    * so one made after a network change, or a microphone or camera grant (privacy `'direct'`), offers the new

@@ -10,22 +10,26 @@
 //   through the member or over signalling, TURN servers given to no connection;
 // - TURN after a fallback (['direct', 'peers', 'turn']): the first attempt leaves TURN out on both ends,
 //   the TURN attempt comes once the fallback has nothing, relay-only, and route() says `turn: true`; with
-//   a member to relay, no TURN attempt, and retries leave TURN out; ['turn'] with no TURN server dials nothing;
+//   a member to relay, no TURN attempt, and retries leave TURN out; a relay-only link's description has relay
+//   candidates alone and no address of ours, and it predicts no ports; ['turn'] with no TURN server dials nothing;
 //   after a pipe the peer doesn't take (['direct', 'signaling', 'turn']), TURN once the core's dial gives up;
 // - a fallback first: ['signaling', 'direct'] links over signalling with no WebRTC at all, a peer whose
 //   policy has no WebRTC path answers no offer, and a link on 'peers' under ['peers', 'direct'] is never
 //   retried over WebRTC;
 // - a peer that dials a path ours has off (through a member, ours without 'peers'): the link moves to
-//   signalling; with 'signaling' before 'peers', a member isn't dialled while the pipe gets its head start,
+//   signalling, or with neither fallback drops as it comes up, with no proof deadline left (NB98-I1); with 'signaling' before 'peers', a member isn't dialled while the pipe gets its head start,
 //   and a peer whose policy offers a member doesn't pull the pipe link onto it;
 // - live: dropping 'peers' moves a relayed link to signalling (and it stays there), or drops it
 //   ('peer-leave' reason 'policy') with no signalling, or when the peer won't take the pipe, after
 //   Room.moveMs; dropping 'signaling' moves a pipe link to a member, or drops it (the peer sees it go at
-//   once, and no pipe is made after); new iceServers go to
-//   every connection with an ICE restart for a link over TURN; turning 'turn' off drops a TURN link,
-//   which links again over what is left;
-// - live relays (Nostr, an in-process relay per URL): a swap keeps the link and its messages, keeps the
-//   socket of a relay in both sets, closes the one dropped, and says hello on the one added.
+//   once, and no pipe is made after); new iceServers go to every connection with an ICE restart for a link
+//   over TURN; turning 'direct' off keeps that link, restarts ICE on it, sends relay candidates alone after
+//   (whatever WebRTC gathers) and tells the call to restart; turning 'turn' off drops a TURN link, which links
+//   again over what is left;
+// - live relays (Nostr, an in-process relay per URL): a url that doesn't parse, isn't ws: or wss: or has a fragment
+//   is a TypeError naming it by index alone, with nothing changed (NB98-2); one the WebSocket constructor refuses
+//   is a socket that failed (at join too), dialled again after a wait until dropped; a swap keeps the link and its
+//   messages, keeps the socket of a relay in both sets, closes the one dropped, and says hello on the one added.
 //
 //   node packages/js/test/room_policy.mjs
 import { joinRoom, Room, Endpoint } from '../src/index.js';
@@ -210,6 +214,12 @@ const ordered = () => {
 };
 
 const STUN = { urls: 'stun:stun.test:3478' };
+// Candidates a WebRTC may gather, whatever its iceTransportPolicy says: the room sends what its policy allows.
+const HOSTC = 'candidate:1 1 udp 2113937151 192.168.1.5 50000 typ host generation 0';
+const SRFLXC = 'candidate:2 1 udp 1677729535 203.0.113.7 40000 typ srflx raddr 192.168.1.5 rport 50000 generation 0';
+const SRFLXC2 = 'candidate:4 1 udp 1677729535 203.0.113.7 40002 typ srflx raddr 192.168.1.5 rport 50001 generation 0';
+const RELAYC = 'candidate:3 1 udp 41885439 198.51.100.9 60000 typ relay raddr 203.0.113.7 rport 40000 generation 0';
+const cand = (c) => ({ candidate: c, toJSON: () => ({ candidate: c, sdpMid: '0', sdpMLineIndex: 0 }) });
 const TURN = { urls: ['turn:turn.test:3478', 'turns:turn.test:5349'], username: 'u-1', credential: 'SECRET-1' };
 let n = 0;
 const room = (name, extra) => joinRoom({
@@ -329,6 +339,15 @@ const both = (rs) => Promise.all(rs.map((r) => r.leave()));
   const theirs = ofOwner(y === a ? 'a4' : 'b4');
   if (turnIn(theirs[0]) || !turnIn(theirs[1])) fail("the answerer didn't follow the offers' turn");
   if (!x.route(y.self)?.turn || x.route(y.self).kind !== 'direct') fail(`route ${JSON.stringify(x.route(y.self))}`);
+  // What a connection without 'direct' sends, whatever its WebRTC gathered: relay candidates alone, none naming an
+  // address of ours, and no port prediction; one with 'direct' sends all of it.
+  const tl = x.transport.links.get(x.transport.byPeer.get(y.self));
+  const SDP = ['v=0', 'm=application 50000 UDP/DTLS/SCTP webrtc-datachannel', 'c=IN IP4 192.168.1.5', ...[HOSTC, SRFLXC, SRFLXC2, RELAYC].map((c) => `a=${c}`), ''].join('\r\n');
+  const as = (use) => ({ ...tl, use, pc: { localDescription: { sdp: SDP, toJSON: () => ({ type: 'offer', sdp: SDP }) } } });
+  const sent = x.transport.description(as(tl.use)).sdp;
+  if (tl.use.direct || !sent.includes('typ relay raddr 0.0.0.0 rport 0') || /typ (host|srflx)|192\.168|203\.0\.113/.test(sent)) fail(`a relay-only description sent ${JSON.stringify(sent)}`);
+  if (Object.keys(x.transport.prediction(as(tl.use))).length || !x.transport.prediction(as({ direct: true, turn: true })).nat) fail('a relay-only link predicts ports, or a direct one not');
+  if (x.transport.description(as({ direct: true, turn: true })).sdp !== SDP) fail("a description with 'direct' filtered");
   await talk(a, b, 'over TURN');
   await both([a, b]);
 
@@ -473,6 +492,29 @@ const both = (rs) => Promise.all(rs.map((r) => r.leave()));
   Room.peerFirstMs = 300;
   await both([j, k, m]);
   console.log("a peer dialled through a member, ours without 'peers': the link moved to signalling and stayed linked");
+
+  // e. The same, ours with neither 'peers' nor 'signaling': dropped as the link comes up, with no proof deadline left
+  // (it would drop a WebRTC dial under way, as 'unproven', Room.proofMs on) and no proof sent.
+  n = '6e';
+  steps.length = 0;
+  hang('a6e', 'b6e');
+  const [lo2, hi2] = ordered();
+  const [p, q, r] = await Promise.all([
+    room('a6e', { secret: lo2, fallbackMs: 1500 }),
+    room('b6e', { secret: hi2, fallbackMs: 1500, policy: { order: ['direct'] } }),
+    room('c6e', { fallbackMs: 1500 }),
+  ]);
+  const seen = [];
+  const onEvent = q.endpoint.onEvent;
+  q.endpoint.onEvent = (e) => {
+    onEvent(e);
+    if (e.type === 'connected' && e.peer === p.self) seen.push([q.linked.has(p.self), q.deadlines.has(p.self), q.proofSent.has(p.self)]);
+  };
+  await until('p linked to q through r', () => seen.length > 0, 20000);
+  if (!steps.some((s) => s.kind === 'connectVia' && s.from === p.self && s.peer === q.self)) fail('p never dialled q through r');
+  if (seen[0].some(Boolean)) fail(`q kept the link, a proof deadline or a proof: ${seen[0]}`);
+  await both([p, q, r]);
+  console.log("a peer dialled through a member, ours with neither fallback: dropped as it came up, no proof deadline left");
 }
 
 // 7. Live: 'signaling' off. a|b on the pipe, and a member that could relay under signaling-before-peers.
@@ -534,14 +576,34 @@ const both = (rs) => Promise.all(rs.map((r) => r.leave()));
   const live = made.filter((pc) => pc.connectionState === 'connected');
   if (live.length !== 2 || live.some((pc) => pc.config.iceServers[1] !== TURN2)) fail('a connection kept its old servers');
   await until('the dialler restarted ICE', () => x.transport.restarts === restarts + 1, 3000);
-  // 'turn' off: the TURN link drops and links again over what is left (signalling: two members).
+  // 'direct' off: the link (on our TURN) stays and the dialler restarts ICE on it, so its old session's host pairs
+  // go; it takes relay candidates alone and sends only those from now on; the call is told to restart too.
+  const asked = [];
+  const configure = x.calls.configure;
+  x.calls.configure = (restart) => (asked.push(restart), configure.call(x.calls, restart));
+  const xl = x.transport.links.get(x.transport.byPeer.get(y.self));
+  const kept = leaves(x);
+  x.setPolicy({ order: ['turn', 'peers', 'signaling'] });
+  x.calls.configure = configure;
+  await until("the dialler restarted ICE for 'direct' off", () => x.transport.restarts === restarts + 2, 3000);
+  if (kept.length || !x.route(y.self)?.turn || x.transport.links.get(x.transport.byPeer.get(y.self)) !== xl || !relayOnly(xl.pc) || asked.join() !== 'true') {
+    fail(`'direct' off: left ${JSON.stringify(kept)}, route ${JSON.stringify(x.route(y.self))}, relay-only ${relayOnly(xl.pc)}, call asked ${asked}`);
+  }
+  const signals = [];
+  const signal = x.transport.signal;
+  x.transport.signal = (peer, msg) => signals.push(msg);
+  for (const c of [HOSTC, SRFLXC, RELAYC]) xl.pc.onicecandidate({ candidate: cand(c) });
+  x.transport.signal = signal;
+  if (signals.length !== 1 || signals[0].candidate.candidate !== RELAYC.replace('raddr 203.0.113.7 rport 40000', 'raddr 0.0.0.0 rport 0')) fail(`sent after 'direct' off: ${JSON.stringify(signals)}`);
+  // 'turn' off (and 'direct' on again): the TURN link drops and links again over what is left (signalling: two
+  // members).
   const left = leaves(x);
   x.setPolicy({ order: ['direct', 'peers', 'signaling'] });
   if (left.length !== 1 || left[0][1] !== 'policy') fail(`x's leaves ${JSON.stringify(left)}`);
   await until('linked again, over signalling', () => x.route(y.self)?.kind === 'signaling' && y.peers.includes(x.self), 20000);
   await talk(a, b, "after 'turn' off");
   await both([a, b]);
-  console.log("new iceServers: every connection took them, the dialler restarted ICE on its TURN link; 'turn' off: dropped ('policy') and linked again over signalling");
+  console.log("new iceServers: every connection took them, the dialler restarted ICE on its TURN link; 'direct' off: kept, ICE restarted, relay candidates alone sent, the call told; 'turn' off: dropped ('policy') and linked again over signalling");
 }
 
 // 9. Live relays over Nostr: an in-process relay per URL.
@@ -553,6 +615,8 @@ const both = (rs) => Promise.all(rs.map((r) => r.leave()));
     static open = new Set();
     static events = []; // [url, tag] of every EVENT published
     constructor(url) {
+      // As Chromium refuses a blocked port, naming the url.
+      if (new URL(url).hostname === 'refuse.test') throw new DOMException(`Failed to construct 'WebSocket': ${url}`, 'SyntaxError');
       this.url = url;
       this.readyState = RelaySocket.CONNECTING;
       setTimeout(() => {
@@ -590,7 +654,25 @@ const both = (rs) => Promise.all(rs.map((r) => r.leave()));
   const left = [leaves(a), leaves(b)];
   const r2 = a.signaling.sockets.find((s) => s.url === 'wss://r2.test');
   const r1 = a.signaling.sockets.find((s) => s.url === 'wss://r1.test');
+  // A relay url the WebSocket constructor can't take: a TypeError naming it by index alone, and nothing changed (the
+  // order and relays given with it, the transport, the sockets).
+  const snap = () => JSON.stringify([a.policy, a.transport.rtc, a.transport.pipesOn]);
+  const was = snap();
+  const sockets = [...a.signaling.sockets];
+  for (const bad of ['wss://relay.test:99999/?token=SECRET', 'wss://relay.test/?token=SECRET#frag', 'wss://relay.test/?token=SECRET#', 'https://relay.test/?token=SECRET', 'wss://']) {
+    const e = await rejects(`relay url ${bad}`, () => a.setPolicy({ order: ['turn'], relays: ['wss://r2.test', bad, 'wss://r3.test'] }), (e) => e.message.includes('relays[1]'));
+    if (/SECRET|relay\.test|99999/.test(e.message)) fail(`the error names the url: ${e.message}`);
+  }
+  if (snap() !== was || a.signaling.sockets.length !== sockets.length || a.signaling.sockets.some((s, i) => s !== sockets[i])) fail('a setPolicy that threw changed something');
+  await rejects('a relay url with a fragment at join', room('v9', { signaling: 'nostr', relays: ['wss://r1.test/#x'] }));
+  // One that parses but the constructor refuses (a blocked port): taken, as a relay whose socket failed at once,
+  // dialled again after a wait.
+  a.setPolicy({ relays: ['wss://r1.test', 'wss://r2.test', 'wss://refuse.test/'] });
+  const refused = a.signaling.sockets.find((s) => s.relayUrl === 'wss://refuse.test/');
+  if (refused?.readyState !== RelaySocket.CLOSED || a.signaling.sockets.length !== 3) fail('the refused relay is no failed socket');
+  await until('the refused relay waits to be dialled again', () => a.signaling.retry.get('wss://refuse.test/')?.timer, 3000);
   a.setPolicy({ relays: ['wss://r2.test', 'wss://r3.test'] });
+  if (a.signaling.retry.has('wss://refuse.test/')) fail('a dropped relay still waits to be dialled');
   b.setPolicy({ relays: ['wss://r3.test'] });
   const urls = a.signaling.sockets.map((s) => s.url).sort().join();
   if (urls !== 'wss://r2.test,wss://r3.test' || !a.signaling.sockets.includes(r2) || r1.readyState !== RelaySocket.CLOSED) fail(`a's sockets ${urls}`);
@@ -599,11 +681,11 @@ const both = (rs) => Promise.all(rs.map((r) => r.leave()));
   await talk(a, b, 'after the relay swap');
   if (left.some((l) => l.length) || a.route(b.self)?.kind !== 'signaling') fail(`the swap dropped the link: ${JSON.stringify(left)}`);
   // A member on r3 alone finds both.
-  const c = await room('c9', { signaling: 'nostr', relays: ['wss://r3.test'] });
+  const c = await room('c9', { signaling: 'nostr', relays: ['wss://refuse.test/', 'wss://r3.test'] });
   await until('c finds a and b on r3', () => c.peers.length === 2, 20000);
   await both([a, b, c]);
   globalThis.WebSocket = Real;
-  console.log("live relays: a swap kept the link and its messages, kept r2's socket, closed r1's, said hello on r3, where a newcomer found both");
+  console.log("live relays: a url the constructor can't take a TypeError naming none, nothing changed; one it refuses a failed socket; a swap kept the link and its messages, kept r2's socket, closed r1's, said hello on r3, where a newcomer found both");
 }
 
 console.log('room_policy: ok');

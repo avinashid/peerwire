@@ -467,10 +467,12 @@ export class Room {
 
   // Changes the policy: the keys given, the rest as they were. New dials follow it at once, and links follow it
   // here: one on a path now off moves to one it allows or drops (evict, recheck); new iceServers go to every
-  // WebRTC connection (an ICE restart for those over our TURN, a retry for peers on a fallback); new relays move
-  // the signalling to them (NostrSignaling.setRelays), links kept. fallbackMs, sameNatFallbackMs and birthday
-  // count from the next link or punch. TypeError as joinRoom's, for relays without Nostr signalling, and for a
-  // privacy other than the room's (set at joinRoom). Nothing changes when it throws.
+  // WebRTC connection (an ICE restart for those over our TURN, a retry for peers on a fallback), and so does
+  // 'direct' turned off (a restart for a link kept on TURN); a call's connections take them too, with an ICE
+  // restart when a WebRTC path goes off or the servers change (Calls.configure); new relays move the signalling to
+  // them (NostrSignaling.setRelays), links kept. fallbackMs, sameNatFallbackMs and birthday count from the next
+  // link or punch. TypeError as joinRoom's, for relays without Nostr signalling, and for a privacy other than the
+  // room's (set at joinRoom). Nothing changes when it throws: all that can throw comes before the policy is set.
   setPolicy(policy) {
     if (this.left) throw new Error('left the room');
     const was = this.plan;
@@ -481,7 +483,12 @@ export class Room {
     if (policy.relays !== undefined) this.signaling.setRelays(p.relays);
     const servers = p.iceServers !== was.iceServers;
     const order = p.order.join() !== was.order.join();
-    if (servers || order) this.transport.configure?.(p.iceServers, rtcOf(p));
+    const [then, now] = [rtcOf(was), rtcOf(p)];
+    const directOff = then.direct && !now.direct;
+    if (servers || order) {
+      this.transport.configure?.(p.iceServers, now);
+      this.calls.configure(servers || directOff || (then.turn && !now.turn));
+    }
     this.transport.setPipes?.(p.rank.has('signaling'));
     if (typeof this.transport.fallbackMs === 'number') {
       this.transport.fallbackMs = p.fallbackMs;
@@ -497,7 +504,7 @@ export class Room {
       for (const peer of new Set([...this.fallingBack, ...this.stageOf.keys()])) if (!this.linked.has(peer)) this.lost(peer, 'policy');
       this.helloSoon();
     }
-    for (const peer of [...this.linked]) this.recheck(peer, servers);
+    for (const peer of [...this.linked]) this.recheck(peer, servers || directOff);
     this.offerRelays();
     if (servers || order) this.retries.soon();
   }
@@ -842,6 +849,8 @@ export class Room {
       this.linked.add(peer);
       this.paths.set(peer, e.path);
       this.reroute(peer);
+      // On a path our policy has off, with nowhere to move: dropped just now (checkPath), so no proof deadline.
+      if (!this.linked.has(peer)) return;
       this.fallingBack.delete(peer);
       this.viaOk.delete(peer);
       this.stageOf.delete(peer);
@@ -996,9 +1005,10 @@ export class Room {
 
   // `peer`'s link against a policy just set: its route again, so its upgrades are as the policy now allows; on a
   // path now off (or a WebRTC link that can't say which of its paths it is on, one of them now off), moved or
-  // dropped (evict). With new iceServers (`servers`), one over our TURN (or that can't say) restarts ICE on them. A
-  // fallback link's WebRTC attempt it can no longer move to (no WebRTC path before its own) is closed.
-  recheck(peer, servers) {
+  // dropped (evict). With `restart` (new iceServers, or 'direct' turned off), one kept on our TURN restarts ICE, so
+  // it gathers with the new servers, or leaves the host pairs its old session kept. A fallback link's WebRTC
+  // attempt it can no longer move to (no WebRTC path before its own) is closed.
+  recheck(peer, restart) {
     const path = this.paths.get(peer);
     if (!path) return;
     this.setRoute(peer, path);
@@ -1006,7 +1016,7 @@ export class Room {
     const on = this.pathOf(peer);
     if (!(on === null ? this.allows('direct') && this.allows('turn') : this.allows(on))) return this.evict(peer, on, true);
     if (r.kind !== 'direct' && !this.retryUse(peer)) this.transport.dropRtc?.(peer);
-    else if (servers && r.kind === 'direct' && !r.adopted && on !== 'direct') this.transport.restart?.(peer);
+    else if (restart && r.kind === 'direct' && !r.adopted && on !== 'direct') this.transport.restart?.(peer);
   }
 
   // `peer`'s link is on `on`, a path the policy has off. It moves where the room can move it: from a member to the

@@ -3,7 +3,7 @@
 // did. In one process, with a fake clock:
 // - parseCall: every frame kind, and each cap (frame size, SDP length and m-sections, candidate, mid, index);
 //   a description with more than MAX_SDP_CANDIDATES candidates; the budgets (join, sdp, ice; leave and full have
-//   none); candidateFor and the description sent per privacy.
+//   none); candidateFor and the description sent per privacy, and with relay candidates alone.
 // - Two members: the smaller id offers both transceivers and the other answers on them; one 'stream' each with
 //   an audio and a video track, then 'connected'. setStream replaces tracks and sends no description. ICE
 //   restarted on both ends at once (glare): the larger id rolls its offer back, answers, and sets its tracks
@@ -18,11 +18,19 @@
 //   `age` and a `full`; one not seated gives way to an earlier member, and goes on its `full` (but not on a
 //   later one's, nor on one from outside the call) only when its own roster has no seat for it either. Two
 //   joining for the last seat at once: nobody holds more than max - 1 links.
+// - A policy set later (Calls.configure): 'direct' off takes relay alone and the TURN server and restarts ICE, on the
+//   impolite side and on the polite one, and from then on only relay candidates go out, with no address of ours,
+//   though the fake gathers host and server-reflexive ones too; a path turned on is the configuration alone; still
+//   on a host pair (or on TURN with 'turn' off) CONNECT_MS after the restart is 'no-path', not before, nor when
+//   getStats can't say; both ends restarting at once settle; no WebRTC path left is 'no-path' at once, and a
+//   configuration the connection refuses 'error'.
 // - leave() tells the members and fires nothing more; a member leaving is 'ended' ('left'), leaving the room
 //   'ended' ('gone'); the room leaving tells nobody. The API's argument checks.
 // Then in real rooms (local signalling, the core in wasm, media still fake): calls signalled over room links,
 // a member not in the call keeps the roster, a member joining the room later learns who is in and joins, a
-// call frame on the unreliable lane is dropped, and a member leaving the room is 'ended' ('gone').
+// call frame on the unreliable lane is dropped, and a member leaving the room is 'ended' ('gone'); room.setPolicy
+// reaches a call: 'turn' off drops its TURN server and restarts ICE, 'turn' on again doesn't restart, new servers
+// do, another key touches nothing.
 //
 //   node packages/js/test/call.mjs
 import { parseCall, Calls, BUDGETS, MAX_FRAME, MAX_SDP, MAX_SECTIONS, MAX_SDP_CANDIDATES, MAX_CANDIDATE, CONNECT_MS, MAX_RESTARTS, RESTART_WINDOW_MS, NEAR_MS, DEFAULT_MAX, MAX_CALL } from '../src/call.js';
@@ -69,6 +77,10 @@ class FakeStream {
 const camera = () => new FakeStream([new FakeTrack('audio'), new FakeTrack('video')]);
 const HOST = 'candidate:1 1 udp 2113937151 192.168.1.5 50000 typ host generation 0';
 const SRFLX = 'candidate:2 1 udp 1677729535 203.0.113.5 40000 typ srflx raddr 192.168.1.5 rport 50000 generation 0';
+const RELAY = 'candidate:3 1 udp 41885439 198.51.100.9 60000 typ relay raddr 203.0.113.5 rport 40000 generation 0';
+// A connection gathers a relay candidate when it has a TURN server, and host and server-reflexive ones whatever its
+// iceTransportPolicy says: what the room sends must not rest on WebRTC's own filter.
+const gathers = (pc) => [HOST, SRFLX, ...((pc.config?.iceServers ?? []).some((x) => /^turns?:/.test([x.urls].flat()[0])) ? [RELAY] : [])];
 // A description with `n` candidates in its one m-section.
 const cands = (n) => `v=0\r\nm=audio 9 x\r\n${`a=candidate:${HOST.slice(10)}\r\n`.repeat(n)}a=end-of-candidates\r\n`;
 const pcs = [];
@@ -90,7 +102,14 @@ class FakePc {
     this.restarts = 0; // restartIce() calls
     this.rollbacks = 0;
     this.gathered = new Set();
+    this.configs = [config];
+    this.selected = null; // our end of the selected pair: 'host', 'relay', or null (getStats can't say)
     pcs.push(this);
+  }
+  setConfiguration(c) {
+    if (this.refuse) throw new Error('InvalidModificationError');
+    this.config = c;
+    this.configs.push(c);
   }
   addTransceiver(x, { direction = 'sendrecv' } = {}) {
     const t = transceiver(typeof x === 'string' ? x : x.kind, direction, typeof x === 'string' ? null : x);
@@ -118,7 +137,7 @@ class FakePc {
   sdp(type) {
     const lines = ['v=0', `o=- 1 1 IN IP4 127.0.0.1`, `a=ice-ufrag:${this.ufrag}`];
     for (const t of this.ts.filter((t) => t.mid !== null)) {
-      lines.push(`m=${t.kind} 50000 UDP/TLS/RTP/SAVPF 96`, 'c=IN IP4 192.168.1.5', `a=mid:${t.mid}`, `a=${t.direction}`, `a=candidate:${HOST.slice(10)}`, `a=candidate:${SRFLX.slice(10)}`);
+      lines.push(`m=${t.kind} 50000 UDP/TLS/RTP/SAVPF 96`, 'c=IN IP4 192.168.1.5', `a=mid:${t.mid}`, `a=${t.direction}`, ...gathers(this).map((c) => `a=${c}`));
     }
     return { type, sdp: `${lines.join('\r\n')}\r\n` };
   }
@@ -185,7 +204,7 @@ class FakePc {
     if (this.gathered.has(this.ufrag)) return;
     this.gathered.add(this.ufrag);
     setImmediate(() => {
-      for (const c of [HOST, SRFLX]) {
+      for (const c of gathers(this)) {
         if (this.signalingState === 'closed') return;
         const j = { candidate: c, sdpMid: '0', sdpMLineIndex: 0, usernameFragment: this.ufrag };
         this.onicecandidate?.({ candidate: { ...j, toJSON: () => ({ ...j }) } });
@@ -209,7 +228,14 @@ class FakePc {
     this.connectionState = 'closed';
   }
   getStats() {
-    return Promise.resolve(new Map([['in', { type: 'inbound-rtp' }]]));
+    if (this.signalingState === 'closed') return Promise.reject(new Error('InvalidStateError: closed'));
+    const stats = new Map([['in', { type: 'inbound-rtp' }]]);
+    if (this.selected) {
+      stats.set('T', { id: 'T', type: 'transport', selectedCandidatePairId: 'P' });
+      stats.set('P', { id: 'P', type: 'candidate-pair', localCandidateId: 'L' });
+      stats.set('L', { id: 'L', type: 'local-candidate', candidateType: this.selected });
+    }
+    return Promise.resolve(stats);
   }
 }
 function transceiver(kind, direction, track) {
@@ -380,6 +406,7 @@ async function connected(...ms) {
   check(candidateFor('direct', j(HOST)).candidate === HOST && candidateFor('direct', j(SRFLX)).candidate === SRFLX, "'direct': every candidate as it is");
   check(candidateFor('public-only', j(HOST)) === null, "'public-only': no host candidate");
   check(candidateFor('public-only', j(SRFLX)).candidate.includes('raddr 0.0.0.0 rport 0') && !candidateFor('public-only', j(SRFLX)).candidate.includes('192.168'), "'public-only': a server-reflexive one with its related address cleared");
+  check(['direct', 'public-only'].every((p) => candidateFor(p, j(HOST), true) === null && candidateFor(p, j(SRFLX), true) === null && candidateFor(p, j(RELAY), true).candidate.includes('typ relay raddr 0.0.0.0 rport 0')), 'relay candidates alone (a policy without direct): no host or server-reflexive one, a relay one without its related address');
   for (const privacy of ['direct', 'public-only']) {
     reset();
     const [a, b] = [member(ID('a'), { privacy }), member(ID('b'), { privacy })];
@@ -645,6 +672,125 @@ async function connected(...ms) {
   k.calls.receive(i.id, bytes({ t: 'sdp', d: { type: 'answer', sdp: 'v=0\r\n' } }));
   await settle();
   check(evs(k, 'state').length === 2, 'frames for a failed link are ignored');
+}
+
+// ---- A policy set later (room.setPolicy -> Calls.configure) ----
+
+{
+  const TURN = { urls: 'turn:turn.test:3478', username: 'u', credential: 'SECRET' };
+  const STUN = { urls: 'stun:stun.test:3478' };
+  const set = (m, iceServers, iceTransportPolicy) => Object.assign(m.calls.media, { iceServers, iceTransportPolicy });
+  const pair = async () => {
+    reset();
+    const [a, b] = [member(ID('a')), member(ID('b'))];
+    for (const m of [a, b]) set(m, [STUN, TURN], undefined);
+    meet(a, b);
+    join(a);
+    join(b);
+    const up = await connected(a, b);
+    return { a, b, pa: link(a, b.id).pc, pb: link(b, a.id).pc, up };
+  };
+  const sentSince = (id, from) => world.log.slice(from).filter((x) => x.from === id).map((x) => JSON.stringify(x.msg)).join('\n');
+
+  // 'direct' off on the impolite side (a): relay alone with its TURN; a restarts ICE, sends only relay candidates.
+  const { a, b, pa, pb, up } = await pair();
+  check(up && sentBy(a.id, 'ice').some((x) => x.msg.c.candidate.includes('typ host')), 'policy: a call connected, host candidates sent while the policy had direct');
+  const ufrags = [pa.ufrag, pb.ufrag];
+  let from = world.log.length;
+  set(a, [TURN], 'relay');
+  a.calls.configure(true);
+  await settle();
+  iceUp();
+  await settle();
+  check(pa.config.iceTransportPolicy === 'relay' && pa.config.iceServers.length === 1 && pa.config.iceServers[0] === TURN && pa.restarts === 1, "direct off: the connection takes relay alone and the TURN server, and restarts ICE");
+  check(pa.ufrag !== ufrags[0] && pb.ufrag !== ufrags[1] && pb.remoteUfrag === pa.ufrag && pa.signalingState === 'stable' && pb.signalingState === 'stable', 'the restart went through: new ICE credentials on both ends');
+  const sent = sentSince(a.id, from);
+  check(sent.includes('typ relay') && !/typ (host|srflx)/.test(sent) && !sent.includes('192.168.1.5') && !sent.includes('203.0.113.5'), 'and from then on only relay candidates go out, in its description and trickled, with no address of ours (though WebRTC gathered host and server-reflexive ones)');
+  check(a.call.state(b.id) === 'connected' && pb.restarts === 0, 'the call stays connected; the peer restarted nothing of its own');
+  // It moved to TURN: CONNECT_MS on, it stays.
+  pa.selected = 'relay';
+  await advance(CONNECT_MS);
+  await settle();
+  check(a.call.state(b.id) === 'connected', `on a relay pair ${CONNECT_MS} ms after: it stays`);
+
+  // The polite side (b) turns 'direct' off too: it restarts ICE itself, a answers.
+  from = world.log.length;
+  set(b, [TURN], 'relay');
+  b.calls.configure(true);
+  await settle();
+  check(pb.restarts === 1 && pa.remoteOffers === 1 && pb.signalingState === 'stable' && pa.remoteUfrag === pb.ufrag, 'the polite side restarts ICE on its own policy change, and the impolite one answers');
+  const sentB = sentSince(b.id, from);
+  check(sentB.includes('typ relay') && !/typ (host|srflx)/.test(sentB), 'it too sends relay candidates alone');
+
+  // Without restart (a path turned on): the configuration only.
+  const before = [pa.restarts, pa.configs.length];
+  set(a, [STUN, TURN], undefined);
+  a.calls.configure(false);
+  await settle();
+  check(pa.restarts === before[0] && pa.configs.length === before[1] + 1 && !pa.config.iceTransportPolicy, 'a path turned on: the new configuration, no restart');
+
+  // Still on a host pair CONNECT_MS after a restart for 'direct' off (WebRTC keeps the old pair while the new
+  // session can't connect): 'no-path'. Before then, and with getStats unable to say, it stays.
+  {
+    const { a, b, pa } = await pair();
+    set(a, [TURN], 'relay');
+    a.calls.configure(true);
+    await settle();
+    pa.selected = 'host';
+    await advance(CONNECT_MS - 1);
+    await settle();
+    check(a.call.state(b.id) === 'connected', 'still on a host pair, before CONNECT_MS: it stays');
+    await advance(1);
+    await settle();
+    check(a.call.state(b.id) === 'failed' && evs(a, 'state').at(-1)[3] === 'no-path', `still on a host pair ${CONNECT_MS} ms after the restart for direct off: 'no-path'`);
+  }
+  {
+    const { a, b, pa } = await pair();
+    set(a, [STUN], undefined); // 'turn' off
+    a.calls.configure(true);
+    await settle();
+    pa.selected = 'relay';
+    await advance(CONNECT_MS);
+    await settle();
+    check(a.call.state(b.id) === 'failed' && evs(a, 'state').at(-1)[3] === 'no-path' && pa.restarts === 1, `still on our TURN ${CONNECT_MS} ms after the restart for turn off: 'no-path'`);
+  }
+  {
+    const { a, b } = await pair();
+    set(a, [TURN], 'relay');
+    a.calls.configure(true);
+    await settle();
+    await advance(CONNECT_MS);
+    await settle();
+    check(a.call.state(b.id) === 'connected', "getStats can't say which pair: it stays");
+  }
+  {
+    // Both ends restart at once (each turned 'direct' off): perfect negotiation settles it.
+    const { a, b, pa, pb } = await pair();
+    set(a, [TURN], 'relay');
+    set(b, [TURN], 'relay');
+    a.calls.configure(true);
+    b.calls.configure(true);
+    await settle();
+    iceUp();
+    await settle();
+    check(pa.signalingState === 'stable' && pb.signalingState === 'stable' && pa.remoteUfrag === pb.ufrag && pb.remoteUfrag === pa.ufrag && a.call.state(b.id) === 'connected' && b.call.state(a.id) === 'connected', 'both ends restarting for their policies at once: settled, both connected');
+  }
+  {
+    // No WebRTC path left (relay alone, no TURN server): each link fails at once; one that can't take the
+    // configuration fails ('error') without restarting.
+    const { a, b } = await pair();
+    set(a, [], 'relay');
+    a.calls.configure(true);
+    check(a.call.state(b.id) === 'failed' && evs(a, 'state').at(-1)[3] === 'no-path', "no WebRTC path left: 'no-path' at once");
+    const { a: c, b: d, pa: pc } = await pair();
+    pc.refuse = true;
+    set(c, [TURN], 'relay');
+    c.calls.configure(true);
+    check(c.call.state(d.id) === 'failed' && evs(c, 'state').at(-1)[3] === 'error' && pc.restarts === 0, "a connection that can't take the configuration: 'error', no restart");
+    a.calls.configure(true); // not in a call any more on that link, nor without one
+    member(ID('z'), { media: false }).calls.configure(true);
+    check(true, 'configure with no live link, or no WebRTC: nothing');
+  }
 }
 
 // ---- Seats ----
@@ -919,6 +1065,36 @@ async function connected(...ms) {
   check(got.get(a.self).some((e) => e[0] === 'ended' && e[1] === b.self && e[2] === 'gone'), "b leaving the room: 'ended' ('gone') on a");
   throws(() => b.call(null), Error, 'room.call() after leaving the room');
   await Promise.all([a, c, d].map((r) => r.leave()));
+
+  // room.setPolicy reaches the call: its connections take the servers the policy allows now (rtcConfig), and restart
+  // ICE when a WebRTC path goes off or the servers change, not for a path turned on or another key.
+  reset();
+  const STUN = { urls: 'stun:stun.test:3478' };
+  const TURN = { urls: 'turn:turn.test:3478', username: 'u', credential: 'SECRET' };
+  const TURN2 = { urls: 'turn:turn2.test:3478', username: 'u2', credential: 'SECRET2' };
+  // As joinRoom gives a room with WebRTC (Node has none: its links here are local).
+  const roomMedia = (r) => Object.defineProperties({ RTCPeerConnection: FakePc, MediaStream: FakeStream, privacy: 'direct' }, {
+    iceServers: { get: () => r.rtcConfig().iceServers },
+    iceTransportPolicy: { get: () => r.rtcConfig().iceTransportPolicy },
+  });
+  const [p, q] = await Promise.all([0, 1].map(() => joinRoom({ ...opts, roomId: `call-policy-${process.pid}`, iceServers: [STUN, TURN] })));
+  for (const r of [p, q]) r.calls.media = roomMedia(r);
+  await until('p and q linked', () => p.peers.length === 1 && q.peers.length === 1);
+  const [cp, cq] = [p.call(null), q.call(null)];
+  await until('p and q in a call', () => (iceUp(), cp.state(q.self) === 'connected' && cq.state(p.self) === 'connected'));
+  const pc = cp.links.get(q.self).pc;
+  const turns = (c) => c.iceServers.filter((x) => x === TURN || x === TURN2).length;
+  check(pc.config.iceServers.length === 2 && !pc.config.iceTransportPolicy, 'policy: a call made under every path gets STUN and TURN');
+  p.setPolicy({ fallbackMs: 100 });
+  check(pc.configs.length === 1 && pc.restarts === 0, 'another key: the call untouched');
+  p.setPolicy({ order: ['direct', 'peers', 'signaling'] });
+  check(pc.configs.length === 2 && !turns(pc.config) && pc.config.iceServers[0] === STUN && pc.restarts === 1, "'turn' off: the call drops the TURN server and restarts ICE");
+  p.setPolicy({ order: ['direct', 'turn', 'peers', 'signaling'] });
+  check(pc.configs.length === 3 && turns(pc.config) === 1 && pc.restarts === 1, "'turn' on again: the TURN server back, no restart");
+  p.setPolicy({ iceServers: [STUN, TURN2] });
+  check(pc.configs.length === 4 && pc.config.iceServers[1] === TURN2 && pc.restarts === 2, 'new servers: taken, and ICE restarted');
+  await until('the restarts settled', () => (iceUp(), cp.state(q.self) === 'connected' && pc.signalingState === 'stable'));
+  await Promise.all([p, q].map((r) => r.leave()));
 }
 
 console.log(failed ? `FAIL: ${failed} check(s)` : 'PASS');
