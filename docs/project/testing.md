@@ -192,11 +192,15 @@ both profiles first, about 5 minutes. With no Rust change since `origin/main`, t
 ### peerwire connection policy (`crates/peerwire/tests/policy.rs`, `traversal.rs`, `peerwire-sim/tests/traversal.rs`)
 
 - NB-097: an empty order or a kind listed twice is `Error::InvalidPolicy`; a signaling swap keeps links and a
-  newcomer links over the new hub; `Direct` off closes direct links and refuses new ones; relay peers follow
-  `RelayPeers`; invite dials follow the policy; a move that fails closes the link quietly (`PathOff`).
+  newcomer links over the new hub; `Direct` off closes direct links and refuses new ones, and nothing that came in
+  with a refused link reaches the app (NB97-1); a peer that replaces a link with one on a path that's off ends it
+  with exactly `Disconnected { PathOff }` (NB97-I1); with no policy, `AddrObserved` still comes before `Connected`
+  at both ends; relay peers follow `RelayPeers`; invite dials follow the policy; a move that fails closes the link
+  quietly (`PathOff`).
 - Dials take the policy's steps in order; `port_mapping` follows the policy live; resubscribe subscribes again and
-  says hello. Core: a link kept on its relay punches, guesses and sprays to none and answers no punch; `redial`
-  replaces a live link, and a failed one leaves it.
+  says hello. Core: a link kept on its relay punches, guesses and sprays to none, arms no punch and answers no
+  punch; a link that moves onto a kept relay with a punch under way punches no more, and an answer to that punch
+  leaves it on the relay (NB97-I2); `redial` replaces a live link, and a failed one leaves it.
 - Simulator: `[Peers, Direct]` stays relayed with 0 punches either side (no policy goes direct); turning `Peers` off
   upgrades the link, redials it through a relay peer (`Replaced` at both ends) or closes it after 6 s; a STUN swap
   keeps the link. No policy leaves the 12x12 NAT matrix as it was, to the byte.

@@ -39,11 +39,11 @@ and CI build, lint and test them on their own (`cargo test -p peerwire-ffi --fea
 `packages/js/build.sh` builds for `wasm32-unknown-unknown` into `target/web` with `opt-level=s`, LTO, one codegen
 unit, stripped symbols and `panic=abort`, then copies the module to `packages/js/pkg/`. `scripts/gate.sh` and CI
 (`.github/scripts/wasm-check.mjs`) fail if the module is over `WASM_MAX_BYTES` (358,400 bytes, 350 KiB) or has any
-import. On `main` it is 356,584 bytes with no imports, as the gate's `wasm size+imports` step reports it after
+import. On `main` it is 356,763 bytes with no imports, as the gate's `wasm size+imports` step reports it after
 `packages/js/build.sh`:
 
 ```text
-packages/js/pkg/peerwire_ffi.wasm: 356584 bytes (limit 358400), 0 imports
+packages/js/pkg/peerwire_ffi.wasm: 356763 bytes (limit 358400), 0 imports
 ```
 
 ## Conventions
