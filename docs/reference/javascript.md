@@ -18,7 +18,7 @@ npm install @peerwire/js
 | Version | 0.2.2 (`packages/js/package.json`) |
 | Runtimes | Browsers; Node 20 or later (`engines`), with no WebRTC unless you pass one |
 | Module | ES module, `sideEffects: false`; importing it touches no browser globals |
-| wasm | `pkg/peerwire_ffi.wasm`, 356,356 bytes on main (as `packages/js/build.sh` builds it and the gate reports it), no imports |
+| wasm | `pkg/peerwire_ffi.wasm`, 356,584 bytes on main (as `packages/js/build.sh` builds it and the gate reports it), no imports |
 
 **Exports.** For apps: [`joinRoom`](#joinroom), [`Room`](#room), [`randomRoomId`](#randomroomid),
 [`memoryStore`](#memorystore), [`openInbox`](#openinbox) and the [constants](#constants). The lower layers, which

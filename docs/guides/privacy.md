@@ -50,9 +50,11 @@ const room = await joinRoom({ appId: 'my-app', roomId, signaling: 'nostr', priva
 SDP, and clears any local address from a candidate's related address and the SDP's `c=` line. Only what STUN reports
 goes out, so two tabs on one machine with no STUN server can't link this way. The room's calls use the same filter.
 
-Rooms don't offer relay-only. The lower layer does: `new WebRtcTransport(endpoint, signaling, { privacy:
-'relay-only', relay })` opens WebRTC to the relay only. There's no TURN, so a peer that isn't linked to the relay
-can't be reached. See the [JavaScript API](../reference/javascript.md).
+Rooms don't offer relay-only through a peer. To keep your addresses from every member, give the room your own TURN
+server and the policy `order: ['turn']`: WebRTC then offers relay candidates alone (see
+[choosing paths](connection-paths.md)). The lower layer has relay-only through a peer: `new WebRtcTransport(endpoint,
+signaling, { privacy: 'relay-only', relay })` opens WebRTC to the relay only, and a peer that isn't linked to the
+relay can't be reached. See the [JavaScript API](../reference/javascript.md).
 
 #### Microphone and camera permission
 

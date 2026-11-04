@@ -102,6 +102,8 @@ mod doc_samples {
     struct Readme;
     #[doc = include_str!("../../../docs/getting-started/quick-start.md")]
     struct GettingStartedQuickStart;
+    #[doc = include_str!("../../../docs/guides/connection-paths.md")]
+    struct GuidesConnectionPaths;
     #[doc = include_str!("../../../docs/guides/lan-discovery.md")]
     struct GuidesLanDiscovery;
     #[doc = include_str!("../../../docs/guides/messaging.md")]

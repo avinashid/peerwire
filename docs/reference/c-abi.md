@@ -39,11 +39,11 @@ and CI build, lint and test them on their own (`cargo test -p peerwire-ffi --fea
 `packages/js/build.sh` builds for `wasm32-unknown-unknown` into `target/web` with `opt-level=s`, LTO, one codegen
 unit, stripped symbols and `panic=abort`, then copies the module to `packages/js/pkg/`. `scripts/gate.sh` and CI
 (`.github/scripts/wasm-check.mjs`) fail if the module is over `WASM_MAX_BYTES` (358,400 bytes, 350 KiB) or has any
-import. On `main` it is 356,356 bytes with no imports, as the gate's `wasm size+imports` step reports it after
+import. On `main` it is 356,584 bytes with no imports, as the gate's `wasm size+imports` step reports it after
 `packages/js/build.sh`:
 
 ```text
-packages/js/pkg/peerwire_ffi.wasm: 356356 bytes (limit 358400), 0 imports
+packages/js/pkg/peerwire_ffi.wasm: 356584 bytes (limit 358400), 0 imports
 ```
 
 ## Conventions
@@ -277,7 +277,7 @@ An event is `kind(u8) peer(32)` and then:
 |---|---|---|
 | 1 | CONNECTED | `initiator` (u8: 1 if this side dialled), then a path |
 | 2 | MESSAGE | `lane` (u8: 0 reliable or urgent, 1 unreliable), then the data, to the end |
-| 3 | DISCONNECTED | `reason` (u8: 0 timeout, 1 closed by the peer, 2 replaced, 3 protocol violation) |
+| 3 | DISCONNECTED | `reason` (u8: 0 timeout, 1 closed by the peer, 2 replaced, 3 protocol violation, 4 path off: never raised here, as it comes only from a `peerwire` node's connection policy) |
 | 4 | CONNECT_FAILED | nothing |
 | 5 | PATH_CHANGED | a path. The link moved: relayed to direct after a punch, direct to relayed after the direct path went silent, or to a new address |
 | 6 | ADDR_OBSERVED | `addr` (u32, little-endian): the address a directly connected peer, `peer`, sees this endpoint at |

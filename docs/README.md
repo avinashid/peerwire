@@ -26,6 +26,8 @@ New here? Start with the [introduction](getting-started/introduction.md), then t
 - [Godot 4](guides/godot.md): Godot's own multiplayer API (`@rpc`, synchronizers, spawners) over Peerwire.
 - [LAN discovery](guides/lan-discovery.md): rooms on a local network with no internet, on PCs and ESP32.
 - [Privacy](guides/privacy.md): what peers learn about each other's addresses, and the modes that limit it.
+- [Choosing paths](guides/connection-paths.md): which paths links take and in what order, your own STUN, TURN and
+  relays, changed live.
 - [Always-on peer](guides/always-on-peer.md): a peer that stays online to relay, with Docker or without.
 - [ESP32](guides/esp32.md): the microcontroller prototype, and how to run it in an emulator.
 

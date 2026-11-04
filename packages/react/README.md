@@ -9,7 +9,7 @@ npm install @peerwire/react @peerwire/js
 ```
 
 `react` (18 or later) and `@peerwire/js` are peer dependencies. The hooks are a thin layer over `@peerwire/js`, whose
-core is a WebAssembly module of 355,588 bytes with no imports (as `packages/js/build.sh` builds it on main).
+core is a WebAssembly module of 356,584 bytes with no imports (as `packages/js/build.sh` builds it on main).
 
 ## A shared counter in a dozen lines
 

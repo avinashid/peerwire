@@ -8,8 +8,30 @@ and the commit that fixed it.
 
 ## Unreleased
 
+### `@peerwire/js`
+
+**Added**
+
+- **Connection policy:** `joinRoom({ policy })` and `room.setPolicy()` choose which paths a link may take
+  (`'direct'`, `'turn'`, `'peers'`, `'signaling'`) and in what order, with your own STUN and TURN servers
+  (`iceServers`) and Nostr relays (`relays`). Each can change live: links on a path turned off move or drop with
+  `'peer-leave'` reason `'policy'`, new servers reach open connections, and a relay swap keeps links. With
+  `order: ['turn']`, WebRTC offers relay candidates alone, so members never see your addresses. `room.policy` shows
+  the policy, with `iceServers` as urls only. `fallback` still works, as shorthand for the order. See
+  [choosing paths](docs/guides/connection-paths.md).
+- `room.route(peer)` says `turn: true` for a link whose end runs through a TURN server.
+
+**Fixed**
+
+- A room that left while its hello was being signed no longer posts it on the closed channel (Node 22 threw).
+
 ### Rust crates and Godot
 
+- **Connection policy:** `Policy` orders the paths links take (`PathKind::Direct`, `Birthday`, `Peers`,
+  `RelayPeers`) and turns the rest off: `Builder::policy`, and `Node::set_policy` live, where a link on a path turned
+  off moves or closes with `DisconnectReason::PathOff`. `Node::set_stun_servers` and `Node::set_signaling` swap
+  servers live, links kept. No policy behaves as before. `PathKind` is `#[non_exhaustive]`, and code that matches on
+  `DisconnectReason` needs the new variant. See [choosing paths](docs/guides/connection-paths.md).
 - **LAN discovery:** `LanSignaling` runs rooms over UDP multicast and broadcast on the local network, with no
   internet. Broadcast, to the LAN's broadcast address only, reaches devices that a router never gives multicast to,
   such as an ESP32 on Wi-Fi.
