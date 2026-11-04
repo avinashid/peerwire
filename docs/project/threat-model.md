@@ -154,8 +154,9 @@ release of each.
 | NB92-3 (Low) | **Fixed** by `63f639d` before NB-092 merged, so never on main (on Linux and Android each leg's socket is bound to the interface whose subnet holds its address, so the device's other networks can't send frames to the LAN's broadcast address), reviewed 2026-11-03; residuals accepted, same section |
 | NB62-1 (Info) | **Fixed** by `4bbde33`, merged `34a35a8` (the ESP-IDF comment says a socket bound to any interface offers loopback only, and the port binds the chip's own address), [The ESP32 prototype](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2) |
 | NB62-2 (Info in the emulator, High on a board) | **Fixed** on a board by `c5e13b7` (NB-091), merged `4697a77`: the firmware starts Wi-Fi, with modem sleep off, before any random draw, reviewed 2026-11-03; in QEMU the draws still repeat on every chip (accepted), and the order is the firmware's, not the library's; NB-095's relay carrier draws after Wi-Fi too, reviewed 2026-11-04, same section |
-| NB95-1 (Medium on a board), NB95-2, NB95-3, NB95-4 (Low), NB95-5, NB95-I1 (Info) | **Fixed** by `0b909e3` and `d5c2cfb` before NB-095 merged, so never on main: on ESP-IDF a relay message is at most 4 KiB and the inbox 16 KiB, and on every target a message of more than 64 `[`, `{` and `,` is dropped unparsed; relay writes time out after 5 s; the relay thread runs at the main task's priority; the firmware goes on the relay only in a room its flash names, random by default; the log escapes members' bytes; NB95-I1 is documented (its fix is SEC-5's), reviewed 2026-11-04, [Several carriers](#several-carriers-and-the-esp32-on-nostr-nb-095--nb95-1nb95-6) |
-| NB95-1a, NB95-6 (Low) | Open (NB-095): a relay message under the cap can still nest 50 objects, 738 B taking +65.6 KB of heap and 33 KB of stack on a 64-bit host; the firmware keeps an entry for every peer that ever linked, same section |
+| NB95-1 (Medium on a board), NB95-2, NB95-3, NB95-4 (Low), NB95-5, NB95-I1 (Info) | **Fixed** by `0b909e3` and `d5c2cfb` before NB-095 merged: on ESP-IDF a relay message is at most 4 KiB and the inbox 16 KiB, and on every target a message of more than 64 `[`, `{` and `,` is dropped unparsed; relay writes time out after 5 s; the relay thread runs at the main task's priority; the firmware goes on the relay only in a room its flash names, random by default; the log escapes members' bytes; NB95-I1 is documented (its fix is SEC-5's), reviewed 2026-11-04, [Several carriers](#several-carriers-and-the-esp32-on-nostr-nb-095--nb95-1nb95-6) |
+| NB95-1a, NB95-6 (Low) | **Fixed** by `51d3ba9` and `a777178` before NB-095 merged: a relay message with more than 2 `{` or 8 `[` is dropped unparsed too; the firmware forgets the address of a peer that left, reviewed 2026-11-04, same section |
+| NB95-I2 (Info) | Open (NB-095): the firmware's own SNTP ask checks its answer, but lwIP's SNTP, which keeps the clock in step after boot, takes a time from any device on the LAN; the Node reads the clock only at `bind`, so this reaches the relay carrier's TLS and timestamps, not the replay guard, same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
@@ -3458,9 +3459,9 @@ Residuals:
 - The two-chip nonce test needs a second board. By reading, the nonces come from the
   traversal seed, drawn after Wi-Fi.
 - The relay's TLS checks certificates against the clock, which SNTP sets without
-  authentication: a device on the LAN that answers first can set the board's clock. TLS
-  then fails closed or, with the clock set back, accepts a certificate expired since
-  (Info, accepted for the prototype).
+  authentication: at boot anyone on the path, and after it any device on the LAN, can
+  set the board's clock (NB95-I2). TLS then fails closed or, with the clock set back,
+  accepts a certificate expired since (Info, accepted for the prototype).
 
 ### Several carriers, and the ESP32 on Nostr (NB-095) — NB95-1…NB95-6
 
@@ -3482,10 +3483,11 @@ against ESP-IDF v5.5.5's pthread and FreeRTOS sources, ring 0.17.14 and tungsten
 release build on a 4-core aarch64 host; the probe isn't in the tree. Nothing was run on
 a board.
 
-The fixes, `0b909e3` (the library) and `d5c2cfb` (the firmware), were re-reviewed
-2026-11-04 by reading, and measured on the same host with the relay of our own and the
-counting allocator of `crates/peerwire/tests/nostr_heap.rs`, and a probe that paints a
-thread's stack, which isn't in the tree.
+The fixes, `0b909e3` and `51d3ba9` (the library) and `d5c2cfb` and `a777178` (the
+firmware), were re-reviewed 2026-11-04 by reading, and measured on the same host with
+the relay of our own and the counting allocator of
+`crates/peerwire/tests/nostr_heap.rs`, and a probe that paints a thread's stack, which
+isn't in the tree.
 
 **What holds.**
 - No message crosses from one carrier to another: `MultiSignaling` publishes only what
@@ -3574,6 +3576,15 @@ object of 48 keys or arrays 5 deep, peaks at +13.5 KB and +5.9 KB of heap with 3
 and 4.0 KB of stack, about what a signal-size event takes; the `nostr` tests pass, and
 the unit test's case of 20 extra tags needs 5 or fewer. Test: the shapes above in
 `tests/nostr_heap.rs`, dropped.
+
+**Status: fixed** by `51d3ba9`, reviewed 2026-11-04. Before parsing, `on_relay_message`
+counts `[`, `{` and `,` apart and, on every target, drops a message with more than 64 in
+all, more than 2 `{` (`MAX_OBJECTS`) or more than 8 `[` (`MAX_ARRAYS`).
+`tests/nostr_heap.rs` now sends the three shapes above; re-run on `a777178`, each was
+dropped, at +452 B, +248 B and +52 B, and a signal-size event was delivered at +13.2 KB.
+The unit test passes an event with 5 extra tags and drops one with 6. Residual: the
+worst message still parsed is the one measured above, an object of 48 keys or arrays 5
+deep, about what a signal-size event takes.
 
 **NB95-2 — A relay that stops reading holds every later publish (Low).** The relay
 socket has a read timeout but no write timeout, and while a connection is up nothing
@@ -3679,6 +3690,54 @@ is still held, more than a board with 63–83 KB free, in pieces, is likely to h
 allocation that fails reboots the board. In the firmware since `d5978f9` (NB-064) on the
 LAN; NB-095 opens it to anyone with the room's name. Fix: remove the entry on
 `Disconnected`, after logging it, and keep only `node.peers()` at each report.
+
+**Status: fixed** by `a777178`, reviewed 2026-11-04 by reading. On `Disconnected` the
+firmware logs the peer, then removes its entry unless `node.peers()` still has it, as
+when a new link replaced the old one (`Replaced`); at each report, every 10 s, it keeps
+only the entries of linked peers. So after each report the map holds at most the board's
+8 links. In the author's QEMU run a name outlived a `Replaced` re-dial.
+
+**NB95-I2 — lwIP's SNTP sets the clock from any answer (Info).** Reviewed 2026-11-04 by
+reading `a777178`, `a97e0f5` and ESP-IDF v5.5.5's lwIP. Since `a777178` the firmware
+sets the clock at boot with an ask of its own (`ask_ntp`): one request to each of
+`0.pool.ntp.org` to `3.pool.ntp.org` in turn, 2 s each, for up to 60 s. It takes an
+answer only from the address and port it asked, in mode 4 (a server's), of stratum 1 or
+more (not a kiss-o'-death), that echoes the request's 8 random bytes, drawn after Wi-Fi
+is up (NB62-2), and gives a time from 2023-11-14 on. So at boot only the server, or a
+sender that sees the request, can set the clock. The firmware then starts lwIP's SNTP to
+keep the clock in step, and ESP-IDF builds it with `SNTP_CHECK_RESPONSE` 0: it takes any
+48 B datagram in mode 4 of stratum 1 or more, from any address, at any time, and sets
+the clock to its time, whatever that is. A device on the LAN that finds its UDP port,
+one of lwIP's 16,384, can set the board's clock, and set it again after each real
+answer, which comes hourly.
+
+The Node reads the clock once, at `bind`, and counts on from it by the monotonic clock
+(`Traversal::wall_ms`), so this doesn't move the replay guard. The relay carrier reads
+the clock for each event's `created_at` and, on each new connection, for its
+subscription's `since` and TLS's certificate check. With the clock set forward, the
+relay sends the board nothing and may refuse its events; set outside a certificate's
+dates, TLS fails; set back to when an expired certificate of the relay's was valid, TLS
+accepts it (the NB62-2 residual). So a device on the LAN can cut the board's internet
+side, as it mostly can anyway by spoofing the router's address; the LAN and links
+already made carry on.
+
+The boot ask itself:
+- One answer sets the clock, so a pool server, or anyone on the path, can set any time
+  from 2023-11-14 on, and the Node keeps it until the board reboots. More than 60 s off,
+  the board's hellos and offers are dropped (`FRESH_MS`), and peers' hellos and offers
+  from that time are fresh to it.
+- An unsynchronised server's answer, leap indicator 3 or stratum 16 or more, is taken.
+- From 2036-02-07 the server's seconds wrap (NTP era 1), so `checked_sub` fails and no
+  answer is taken.
+- The Node's clock drifts with the chip's crystal, and lwIP's SNTP doesn't reach it:
+  theoretical for a crystal within 10 ppm, 60 s / 10 ppm = 6,000,000 s, about 69 days up
+  before a peer with a right clock drops the board's hellos.
+
+Fix, none urgent: drop lwIP's SNTP, as the Node never reads the clock again and the
+relay carrier's uses bear a drift of about a second a day, or re-ask with `ask_ntp`
+every few hours; skip leap indicator 3 and stratum 16 or more; read a seconds field
+under `1 << 31` as era 1 (RFC 4330 §3); and, for the Node, take the time only when two
+servers agree within a few seconds.
 
 Residuals (accepted):
 - With one relay, the relay, or anyone who publishes on the board's topics, can deny the
