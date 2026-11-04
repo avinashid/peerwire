@@ -358,9 +358,10 @@ moves it into `tokio::spawn`. Carriers are polled, not awaited: with one, `next_
 A `Node` doesn't pass on everything the core raises. Events about relay peers stay inside it. In a room, a link from
 a peer that never proved the room key is closed unseen, and so are a relay-only node's new direct link to anyone but
 its relay and a new link on a path the node's policy has off, each with the messages that came in with it. When such a
-link replaced one (the peer restarted, say), the old link's `Disconnected` says `PathOff`, not `Replaced`. A failed
-dial that was moving a link off a path the policy has off raises no `ConnectFailed`: the link's `Disconnected` with
-`PathOff` follows instead.
+link replaced one (the peer restarted, say), the old link's `Disconnected` says `PathOff`, not `Replaced`. When an
+allowed link of the same peer replaces the refused one in the same poll (two instances with one key, say), that link is
+kept, and the app sees its `Connected` with nothing about the refused one. A failed dial that was moving a link off a
+path the policy has off raises no `ConnectFailed`: the link's `Disconnected` with `PathOff` follows instead.
 
 ### Lane
 

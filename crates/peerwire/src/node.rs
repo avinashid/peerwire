@@ -767,7 +767,7 @@ impl Node {
         }
         self.close_extra(now);
         // The peers whose new link was refused below: what came in with it is dropped too, until a link to the peer
-        // is admitted (NB97-1).
+        // is admitted (NB97-1). Those still refused after the pass are closed then.
         let mut refused: Vec<PeerId> = Vec::new();
         // A new link's first packet raises its `AddrObserved`, and the `Replaced` of a link it replaces, before its
         // `Connected`: they wait for the next event, which says whether that link is admitted.
@@ -781,7 +781,6 @@ impl Node {
                 // to anyone but its relay, or a link on a path the policy has off: closed unseen, with what came in
                 // with it. A link it replaced was closed for its path (NB97-I1).
                 Event::Connected { peer, .. } if !self.admits(&peer, &e) => {
-                    self.ep.disconnect(&peer);
                     for h in std::mem::take(&mut held) {
                         match h {
                             Event::Disconnected { peer: p, .. } if p == peer => {
@@ -796,6 +795,10 @@ impl Node {
                 }
                 e => {
                     if let Event::Connected { peer, .. } = e {
+                        if refused.contains(&peer) {
+                            // It replaced the refused link, which the app never saw (NB97-I4).
+                            held.retain(|h| !matches!(h, Event::Disconnected { peer: p, .. } if *p == peer));
+                        }
                         refused.retain(|p| *p != peer);
                     }
                     for h in std::mem::take(&mut held) {
@@ -807,6 +810,11 @@ impl Node {
         }
         for h in held {
             self.take_event(now, wall, h, &refused);
+        }
+        // Closed only now: `disconnect` closes the peer's link as the core has it, which is a later one if a link
+        // announced after the refused one replaced it, and a peer still here has had no link admitted since (NB97-I4).
+        for p in &refused {
+            self.ep.disconnect(p);
         }
         self.report_dropped();
         self.keep_relay_links(wall);

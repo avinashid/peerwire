@@ -1,8 +1,8 @@
 //! NB-097: a node's connection policy (`Node::set_policy`) and live server swaps, on loopback sockets with an
 //! in-process signaling hub. What each policy does across NATs is in `peerwire-sim/tests/traversal.rs`.
 use peerwire::{
-    Config, ConnectError, DisconnectReason, Error, Event, Identity, Invite, Lane, MemoryHub, Node, PathKind, PeerId,
-    Policy, Status,
+    Config, ConnectError, DisconnectReason, Error, Event, Identity, Invite, Lane, MemoryHub, Node, Path, PathKind,
+    PeerId, Policy, Status,
 };
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -163,6 +163,33 @@ fn observed_addresses_reach_the_app_as_before() {
     assert!(at(&ev[1], &|e| matches!(e, Event::AddrObserved { by, .. } if *by == aid)).is_some(), "{:?}", ev[1]);
 }
 
+/// A peer that restarts (same key) and dials again replaces its link: the app still gets the old link's `Replaced`,
+/// then the new one's `Connected` and what came in with it. Only a refused link's `Replaced` is dropped (NB97-I4).
+#[test]
+fn a_replaced_link_reaches_the_app_as_before() {
+    let key = [5u8; 32];
+    let restart = || Node::builder().identity(Identity::from_secret_bytes(&key)).bind("127.0.0.1:0").unwrap();
+    let (mut a, mut b) = (Node::bind("127.0.0.1:0").unwrap(), restart());
+    let (aid, bid) = (a.peer_id(), b.peer_id());
+    b.connect(&a.invite()).unwrap();
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 5, |n| n[0].status(&bid) == Status::Connected));
+    drop(b);
+    let mut b = restart();
+    b.connect(&a.invite()).unwrap();
+    let ev = link_and_send(&mut [&mut a, &mut b], aid, b"again");
+    let links = |e: &&Event| about(e) == bid && !matches!(e, Event::AddrObserved { .. });
+    let about_b: Vec<&Event> = ev[0].iter().filter(links).collect();
+    assert!(
+        matches!(about_b[..], [
+            Event::Disconnected { reason: DisconnectReason::Replaced, .. },
+            Event::Connected { .. },
+            Event::Message { data, .. },
+        ] if data == b"again"),
+        "{about_b:?}"
+    );
+}
+
 /// Leaving `RelayPeers` out closes the relay peers' links and stops dialling them; back in, they link again.
 #[test]
 fn relay_peers_follow_their_kind() {
@@ -242,4 +269,56 @@ fn a_replacement_on_a_path_that_is_off_ends_the_link() {
     let about_b: Vec<&Event> = ev[0].iter().filter(|e| about(e) == bid).collect();
     assert_eq!(about_b, [&Event::Disconnected { peer: bid, reason: DisconnectReason::PathOff }]);
     assert_eq!(a.status(&bid), Status::Disconnected);
+}
+
+/// Two links of one peer (two instances with one key) announced in one read: the first through a member, which
+/// the policy has off, the second direct, which replaces it. The refused link's close is the core's current link's,
+/// so it waits for the end of the pass: the admitted link stays up at both ends, and the app gets its `Connected`
+/// and message, with no `Replaced` for the link it never saw and nothing that came in on that one (NB97-I4).
+#[test]
+fn refused_link_replaced_by_an_admitted_one_in_one_batch() {
+    let key = [9u8; 32];
+    let b = || Node::builder().identity(Identity::from_secret_bytes(&key)).bind("127.0.0.1:0").unwrap();
+    let mut a = Node::builder().policy(Policy::new([PathKind::Direct])).bind("127.0.0.1:0").unwrap();
+    let (mut r, mut b1, mut b2) = (Node::bind("127.0.0.1:0").unwrap(), b(), b());
+    let (aid, bid, rid) = (a.peer_id(), b1.peer_id(), r.peer_id());
+    a.connect(&r.invite()).unwrap();
+    b1.connect(&r.invite()).unwrap();
+    let mut ev = Vec::new();
+    let up = |n: &[&mut Node]| n[0].status(&rid) == Status::Connected && n[2].status(&rid) == Status::Connected;
+    assert!(pump(&mut [&mut a, &mut r, &mut b1], &mut ev, 5, up));
+    let step = |n: &mut Node| {
+        n.poll();
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let through_r = Invite::<SocketAddr> { peer: aid, key: None, addrs: vec![], relays: vec![(rid, r.addresses()[0])] };
+    b1.connect(&through_r.to_link()).unwrap();
+    b2.connect(&a.invite()).unwrap();
+    step(&mut b1); // HS1 to r
+    step(&mut r); // on to a
+    step(&mut b2); // HS1 straight to a
+    step(&mut a); // both answered; an answering end announces a link at its first data packet
+    step(&mut r); // HS2 to b1
+    step(&mut b1); // linked: its first data packet goes to r
+    assert_eq!(b1.status(&aid), Status::Connected);
+    b1.send(&aid, Lane::Reliable, b"b1 through r, off").unwrap();
+    step(&mut b1);
+    step(&mut r); // both on to a
+    step(&mut b2); // linked: its first data packet goes straight to a
+    assert_eq!(b2.status(&aid), Status::Connected);
+    b2.send(&aid, Lane::Reliable, b"b2 direct, allowed").unwrap();
+    step(&mut b2);
+    a.poll(); // one read: b1's link (refused), then b2's, which replaces it
+    let batch: Vec<Event> = std::iter::from_fn(|| a.try_recv_event()).collect();
+    let direct = batch.iter().any(|e| matches!(e, Event::Connected { path: Path::Direct(_), .. } if about(e) == bid));
+    let message = batch.iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"b2 direct, allowed"));
+    assert!(direct && message, "the admitted link's Connected and message reach the app: {batch:?}");
+    a.send(&bid, Lane::Reliable, b"back to b2").unwrap();
+    let mut ev = vec![batch];
+    pump(&mut [&mut a, &mut r, &mut b1, &mut b2], &mut ev, 1, |_| false);
+    assert!(!ev[0].iter().any(|e| matches!(e, Event::Disconnected { peer, .. } if *peer == bid)), "{:?}", ev[0]);
+    assert!(!ev[0].iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"b1 through r, off")));
+    assert!(ev[3].iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"back to b2")), "{:?}", ev[3]);
+    assert_eq!((a.status(&bid), b2.status(&aid)), (Status::Connected, Status::Connected));
+    assert!(a.path(&bid).is_some_and(|p| matches!(p, Path::Direct(_))));
 }

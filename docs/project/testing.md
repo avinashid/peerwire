@@ -194,9 +194,11 @@ both profiles first, about 5 minutes. With no Rust change since `origin/main`, t
 - NB-097: an empty order or a kind listed twice is `Error::InvalidPolicy`; a signaling swap keeps links and a
   newcomer links over the new hub; `Direct` off closes direct links and refuses new ones, and nothing that came in
   with a refused link reaches the app (NB97-1); a peer that replaces a link with one on a path that's off ends it
-  with exactly `Disconnected { PathOff }` (NB97-I1); with no policy, `AddrObserved` still comes before `Connected`
-  at both ends; relay peers follow `RelayPeers`; invite dials follow the policy; a move that fails closes the link
-  quietly (`PathOff`).
+  with exactly `Disconnected { PathOff }` (NB97-I1); a refused link that an allowed one of the same key replaces in
+  the same read leaves that one up at both ends, its `Connected` and message reaching the app with no `Replaced`
+  (NB97-I4); with no policy, `AddrObserved` still comes before `Connected` at both ends, and a restarted peer's
+  `Replaced` still reaches the app before its new `Connected`; relay peers follow `RelayPeers`; invite dials follow
+  the policy; a move that fails closes the link quietly (`PathOff`).
 - Dials take the policy's steps in order; `port_mapping` follows the policy live; resubscribe subscribes again and
   says hello. Core: a link kept on its relay punches, guesses and sprays to none, arms no punch and answers no
   punch; a link that moves onto a kept relay with a punch under way punches no more, and an answer to that punch
