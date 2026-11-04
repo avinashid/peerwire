@@ -210,6 +210,10 @@ impl<A: Address> TurnClient<A> {
         &self.server
     }
 
+    fn creds(&self) -> &Credentials {
+        &self.creds
+    }
+
     /// The relayed address, while allocated.
     pub fn relayed(&self) -> Option<SocketAddr> {
         match self.state {
@@ -426,11 +430,6 @@ impl<A: Address> TurnClient<A> {
         }
     }
 
-    /// Whether the peers at `ip` may send to us through the allocation (asked for, if not yet installed).
-    pub fn permits(&self, ip: IpAddr) -> bool {
-        self.perms.contains_key(&ip)
-    }
-
     /// Sends `payload` to `peer` through the allocation: over its channel once bound, else in a Send indication,
     /// asking for a channel. `false` with no allocation.
     pub fn send(&mut self, now: Instant, peer: SocketAddr, payload: &[u8]) -> bool {
@@ -534,6 +533,126 @@ impl<A: Address> TurnClient<A> {
 
     pub fn poll_event(&mut self) -> Option<TurnEvent> {
         self.events.pop_front()
+    }
+}
+
+/// This node's TURN servers and their allocations, as the traversal runs them: a [`TurnClient`] for each server
+/// while TURN is on (servers set, `Turn` in the policy, not relay-only).
+pub(crate) struct TurnSet<A> {
+    servers: Vec<(A, TurnServer)>,
+    clients: Vec<TurnClient<A>>,
+    on: bool,
+    unix_ms: u64,
+    rng: ChaCha20Rng,
+    /// What released clients still had to send.
+    out: VecDeque<Transmit<A>>,
+    events: VecDeque<(A, TurnEvent)>,
+}
+
+impl<A: Address> TurnSet<A> {
+    pub fn new(unix_ms: u64, seed: [u8; 32]) -> TurnSet<A> {
+        let (servers, clients, out, events) = (Vec::new(), Vec::new(), VecDeque::new(), VecDeque::new());
+        TurnSet { servers, clients, on: false, unix_ms, rng: ChaCha20Rng::from_seed(seed), out, events }
+    }
+
+    /// Replaces the servers: a client whose server and credentials stay keeps its allocation, the others release
+    /// theirs ([`TurnEvent::Lost`]).
+    pub fn set_servers(&mut self, now: Instant, servers: Vec<(A, TurnServer)>) {
+        self.servers = servers;
+        self.sync(now);
+    }
+
+    pub fn has_servers(&self) -> bool {
+        !self.servers.is_empty()
+    }
+
+    pub fn set_on(&mut self, now: Instant, on: bool) {
+        if self.on != on {
+            self.on = on;
+            self.sync(now);
+        }
+    }
+
+    fn sync(&mut self, now: Instant) {
+        let (on, servers) = (self.on, &self.servers);
+        let wanted = |c: &TurnClient<A>| on && servers.iter().any(|(a, t)| a == c.server() && t.creds == *c.creds());
+        let (keep, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.clients).into_iter().partition(wanted);
+        self.clients = keep;
+        for mut c in gone {
+            c.close();
+            self.out.extend(std::iter::from_fn(|| c.poll_transmit()));
+            let server = c.server().clone();
+            self.events.extend(std::iter::from_fn(|| c.poll_event()).map(|e| (server.clone(), e)));
+        }
+        if !on {
+            return;
+        }
+        for (addr, turn) in self.servers.clone() {
+            if !self.clients.iter().any(|c| *c.server() == addr) {
+                let mut seed = [0u8; 32];
+                self.rng.fill_bytes(&mut seed);
+                self.clients.push(TurnClient::new(now, addr, &turn, self.unix_ms, seed));
+            }
+        }
+    }
+
+    /// The relayed addresses of the allocations.
+    pub fn relayed(&self) -> Vec<A> {
+        self.clients.iter().filter_map(|c| A::from_socket_addr(c.relayed()?)).collect()
+    }
+
+    /// The servers this node has an allocation on, and its relayed address there.
+    pub fn up(&self) -> Vec<(A, SocketAddr)> {
+        self.clients.iter().filter_map(|c| Some((c.server().clone(), c.relayed()?))).collect()
+    }
+
+    /// Each server, and its relayed address while allocated.
+    pub fn status(&self) -> Vec<(A, Option<SocketAddr>)> {
+        let relayed = |a: &A| self.clients.iter().find(|c| c.server() == a).and_then(|c| c.relayed());
+        self.servers.iter().map(|(a, _)| (a.clone(), relayed(a))).collect()
+    }
+
+    /// Lets the peers at `ips` send through every allocation.
+    pub fn permit(&mut self, now: Instant, ips: &[IpAddr]) {
+        for c in &mut self.clients {
+            c.permit(now, ips.iter().copied());
+        }
+    }
+
+    /// A datagram from `from`: `None` if it isn't one of the servers; else what it carried for the endpoint, as from
+    /// the peer through that server ([`Address::turn_hop`]), if anything.
+    pub fn handle(&mut self, now: Instant, from: &A, data: &[u8]) -> Option<Option<(A, Vec<u8>)>> {
+        let c = self.clients.iter_mut().find(|c| c.server() == from)?;
+        Some(c.handle(now, data).and_then(|(peer, payload)| Some((A::turn_hop(from, peer)?, payload))))
+    }
+
+    /// Sends `payload` to a TURN hop's peer through that server's allocation. `false` with none.
+    pub fn send(&mut self, now: Instant, dst: &A, payload: &[u8]) -> bool {
+        let Some((server, peer)) = dst.turn_parts() else { return false };
+        self.clients.iter_mut().find(|c| *c.server() == server).is_some_and(|c| c.send(now, peer, payload))
+    }
+
+    pub fn poll_transmit(&mut self) -> Option<Transmit<A>> {
+        self.out.pop_front().or_else(|| self.clients.iter_mut().find_map(|c| c.poll_transmit()))
+    }
+
+    pub fn poll_timeout(&self) -> Option<Instant> {
+        self.clients.iter().filter_map(|c| c.poll_timeout()).min()
+    }
+
+    pub fn handle_timeout(&mut self, now: Instant) {
+        for c in &mut self.clients {
+            if c.poll_timeout().is_some_and(|t| t <= now) {
+                c.handle_timeout(now);
+            }
+        }
+    }
+
+    pub fn poll_event(&mut self) -> Option<(A, TurnEvent)> {
+        if let Some(e) = self.events.pop_front() {
+            return Some(e);
+        }
+        self.clients.iter_mut().find_map(|c| Some((c.server().clone(), c.poll_event()?)))
     }
 }
 

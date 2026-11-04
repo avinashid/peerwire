@@ -64,6 +64,9 @@ mod signaling;
 pub mod traversal;
 #[cfg(feature = "turn")]
 mod turn;
+#[cfg(not(feature = "turn"))]
+#[path = "turn_off.rs"]
+mod turn;
 
 #[cfg(feature = "tokio")]
 pub use async_node::AsyncNode;
@@ -77,7 +80,7 @@ pub use peerwire_core::{
 };
 pub use portmap::{MapProtocol, PortMapping};
 pub use signaling::{MemoryHub, MemorySignaling, MultiSignaling, Signaling, Topic};
-pub use traversal::{Failure, NatType, PathKind, Policy, Privacy, Role, Side};
+pub use traversal::{Failure, Hop, NatType, PathKind, Policy, Privacy, Role, Side};
 #[cfg(feature = "turn")]
 pub use turn::TurnServer;
 

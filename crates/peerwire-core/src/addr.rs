@@ -39,6 +39,21 @@ pub trait Address: Clone + Eq + Hash + Debug {
     fn relayed(&self) -> bool {
         false
     }
+    /// For a host with TURN: `peer` (as the TURN server reports it) reached through this host's allocation on
+    /// the server at `server` (where the host sends to it); [`relayed`](Address::relayed). `None`, the default,
+    /// for a host without.
+    fn turn_hop(_server: &Self, _peer: SocketAddr) -> Option<Self> {
+        None
+    }
+    /// The server and peer of a [`turn_hop`](Address::turn_hop).
+    fn turn_parts(&self) -> Option<(Self, SocketAddr)> {
+        None
+    }
+    /// For a host with TURN: `addr`, a peer's relayed address (on its TURN server), which this host sends to from
+    /// its own socket; [`relayed`](Address::relayed). `None`, the default, for a host without.
+    fn relayed_hop(_addr: &Self) -> Option<Self> {
+        None
+    }
 }
 
 pub const MAX_ADDR_LEN: usize = 19;
