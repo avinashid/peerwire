@@ -157,6 +157,8 @@ release of each.
 | NB95-1 (Medium on a board), NB95-2, NB95-3, NB95-4 (Low), NB95-5, NB95-I1 (Info) | **Fixed** by `0b909e3` and `d5c2cfb` before NB-095 merged: on ESP-IDF a relay message is at most 4 KiB and the inbox 16 KiB, and on every target a message of more than 64 `[`, `{` and `,` is dropped unparsed; relay writes time out after 5 s; the relay thread runs at the main task's priority; the firmware goes on the relay only in a room its flash names, random by default; the log escapes members' bytes; NB95-I1 is documented (its fix is SEC-5's), reviewed 2026-11-04, [Several carriers](#several-carriers-and-the-esp32-on-nostr-nb-095--nb95-1nb95-6) |
 | NB95-1a, NB95-6 (Low) | **Fixed** by `51d3ba9` and `a777178` before NB-095 merged: a relay message with more than 2 `{` or 8 `[` is dropped unparsed too; the firmware forgets the address of a peer that left, reviewed 2026-11-04, same section |
 | NB95-I2 (Info) | Open (NB-095): the firmware's own SNTP ask checks its answer, but lwIP's SNTP, which keeps the clock in step after boot, takes a time from any device on the LAN; the Node reads the clock only at `bind`, so this reaches the relay carrier's TLS and timestamps, not the replay guard, same section |
+| NB98-1, NB98-2 (Low) | Open (NB-098, `7821d87`): a call's connections don't follow a live policy, so one kept after `'direct'` is turned off sends host and server-reflexive candidates at its next ICE restart; a relay url the WebSocket constructor refuses makes `setPolicy` throw an error that names it and leaves the policy half applied, [Connection policy](#connection-policy-nb-098--nb98-1-nb98-2) |
+| NB98-I1, NB98-I2, NB98-I3, NB98-I4 (Info) | Open (NB-098): a proof deadline outlives a link dropped as it came up; an order binds the dialling side only; relay-only rests on the WebRTC runtime; a link kept on TURN keeps its old ICE session, same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
@@ -2770,7 +2772,9 @@ the three probes reproduces on the fixed heads.
 - **Calls that meet.** After a room splits and joins again, its two calls stay partial
   meshes, each member linking at most `max − 1`.
 - **No TURN.** A pair with no direct path fails `'no-path'` after 20 s and isn't retried
-  until one of them joins again. An app can pass a TURN server in `iceServers`.
+  until one of them joins again. An app can pass a TURN server in `iceServers`. Since
+  NB-098 a call's connection takes the servers and the relay-only setting of the room's
+  policy when it is made, not a policy set later (NB98-1).
 - **Addresses.** Under `'direct'` with a microphone or camera grant, call members get
   every local address, as data links do. Under `'public-only'`, a member on the same
   network can still see a local address as a peer-reflexive candidate from our ICE
@@ -3748,6 +3752,127 @@ Residuals (accepted):
   need a websocket reader that discards it unbuffered.
 - The Xtensa build (`CHIP=esp32`) compiles ring but has run no TLS: its QEMU pair uses
   the LAN only.
+
+### Connection policy (NB-098) — NB98-1, NB98-2
+
+`joinRoom({ policy })` and `room.setPolicy()` (`packages/js/src/policy.js`, `room.js`,
+`webrtc.js`) say which paths a room's links may take, in order: `'direct'` (WebRTC over
+host and server-reflexive candidates), `'turn'` (WebRTC through a TURN server in
+`iceServers`), `'peers'` (relayed by a member) and `'signaling'` (the pipe over the
+signalling relays). A path left out is off; no policy is every path, as before. The
+dialling side runs the order's stages, and a link moves only to a path earlier than its
+own. An offer without TURN says `turn: false`. `setPolicy` moves or drops links on a
+path it turns off, gives new `iceServers` to the room's connections, and moves
+`NostrSignaling` to new relays (`setRelays`).
+
+Reviewed 2026-11-04 by reading `7821d87` against the core's path rules (`endpoint.rs`).
+Measured in headless Chromium 153 on loopback with a TURN server of our own
+(allocations, permissions, channels) whose mapped address is a TEST-NET-3 one,
+`203.0.113.7`, so a server-reflexive address anywhere is plain to see; and with the
+fakes of `packages/js/test/room_policy.mjs`. The probes aren't in the tree.
+
+**What holds.**
+- With `'turn'` and no `'direct'` in the policy the room is joined with, every
+  connection it makes (a link's, at any stage or retry, and a call's) has
+  `iceTransportPolicy: 'relay'` and the TURN urls alone. Birthday punches are off and
+  answer a peer's with `'no'`; retries, a channel that opens late and `adoptChannel`
+  need a WebRTC path before the link's. Measured: two tabs linked and in a call; each
+  connection gathered one relay candidate, `raddr 0.0.0.0 rport 0`, no signal named a
+  host, server-reflexive or peer-reflexive address, and `route()` said `turn: true` at
+  both ends. Chromium clears a relay candidate's `raddr` only under `'relay'`: under
+  `'all'` it is the server-reflexive address.
+- An offer's port prediction (`nat`) reads server-reflexive lines only, so without
+  `'direct'` it is empty.
+- `turn: false` only narrows: the answerer takes TURN only if its own policy and the
+  offer both allow it, and `'direct'` from its own policy alone; an answerer with no
+  WebRTC path answers nothing. The field comes in an offer sealed by a member that
+  proved the room key.
+- A link a peer dials over a fallback our policy has off moves to one it allows or drops
+  (`checkPath`), and with pipes off a pipe datagram is dropped before the core sees it.
+  The core moves a link on a direct address to a member only when that address is the
+  slow one, which the room marks only with `'peers'` before `'signaling'`, so a peer's
+  relayed packets can't pull our sends onto a member. What a peer sends through a member
+  still reaches us, as the docs say.
+- `room.policy` gives each ICE server as `{ urls }`; one it gave, passed back, maps to
+  the entry it stands for through a `WeakMap`, and errors name an entry by its index.
+  Chromium's `icecandidateerror` gives the server's url without its username or
+  credential, and masks the local address (`0.0.0.x`), so the `candidate-error` trace
+  names no secret.
+- A relay `setRelays` drops is closed for good: its handlers are cleared first, its
+  redial cancelled, and what waited on it fails. A doc's copy reads and stores through
+  the relays listed only. One added subscribes with the room tag and says hello there.
+
+**NB98-1 — A call doesn't follow a live policy (Low, privacy).** `setPolicy` gives the
+room's links their new configuration (`configure()`) but not a call's connections, which
+take theirs when made (`rtcConfig()`). So a call connection made under `'direct'` keeps
+STUN and `'all'` after `setPolicy({ order: ['turn'] })` whenever its room link stays
+(one whose end is on our TURN), and its next ICE restart (`call.js` restarts a
+connection that fails, as after a network change) gathers host and server-reflexive
+candidates and sends them to the call member. Measured: two tabs with every path, linked
+and in a call; the tab whose end was on TURN set `['turn']`. Its link stayed, now under
+`'relay'`; its call connection kept `'all'` and the STUN url, and a restart gathered a
+server-reflexive candidate (`203.0.113.7`), an mDNS host and a relay one with
+`raddr 203.0.113.7`. In the same way a call keeps its servers when `'turn'` is turned
+off or new `iceServers` come. The docs say new `iceServers` go to every connection, and
+that without `'direct'` none of our addresses reach the peer.
+
+Fix: `setPolicy` gives each call connection `rtcConfig()` (`setConfiguration`) and, when
+it turns `'direct'` or `'turn'` off or brings new servers, the impolite side restarts
+ICE, as it does when a connection fails. Measured in Chromium: after `setConfiguration`
+to `'relay'` a restart gathers one relay candidate, `raddr 0.0.0.0`. The docs should
+also say that a policy changed live can't take back the addresses connections sent
+before it. Test: after `setPolicy`, a call connection has the room's configuration and
+its restart offers relay candidates only.
+
+**NB98-2 — A relay url the WebSocket constructor refuses (Low).** `checkRelays` checks
+the `ws://` or `wss://` prefix only. Chromium's `WebSocket` constructor throws a
+`SyntaxError` that names the url, as for `wss://relay.test:99999/?token=…`, and
+`setRelays()` calls it after `setPolicy` has set the new policy. Measured with the
+test's fake socket throwing as Chromium's does: `setPolicy({ order: ['turn'], relays })`
+threw that `SyntaxError`, not a `TypeError`, with the token in its message.
+`room.policy` then said `['turn']` and the new relays, while the transport still
+answered with `'direct'` and kept pipes on; the relay dropped was closed and the one
+after the bad url never dialled. At join the same url fails `joinRoom` with the same
+message (before NB-098 nothing checked relays at all).
+
+Fix: check each url with the URL parser (`ws:` or `wss:`, no fragment), the message
+naming none; in `setPolicy`, do what can throw before the new policy is set; and have
+`dial()` take a constructor that throws as a socket that failed, with its back-off.
+Test: the validation section with `wss://r.test:99999/?token=SECRET` and a fake socket
+that throws.
+
+**NB98-I1 — A proof deadline outlives a link dropped as it came up (Info).** When
+`checkPath` drops a link inside its `'connected'` event (a peer dialled a path ours has
+off and there is nowhere to move it), the handler goes on to arm the proof deadline.
+`Room.proofMs` (10 s) later `lost(peer, 'unproven')` runs `transport.drop()`, which ends
+a WebRTC dial with that peer under way then, and forgets its greeting, retries and
+punch. Measured with the test's fakes: armed, and `lost` ran 2,993 ms later
+(`Room.proofMs` 3000); with the handler stopping once the link is gone, neither. Fix:
+return from `'connected'` when `reroute()` has dropped the peer.
+
+**NB98-I2 — An order binds the dialling side only (Info, privacy and cost).** The
+answering side answers an offer over every WebRTC path its policy allows, whatever their
+place in its order, and a channel that opens for a link on a fallback takes it over
+(`dc.onopen`). So `['signaling', 'direct']` or `['peers', 'direct']` still sends our
+host and server-reflexive addresses to a member whose policy dials or retries WebRTC
+first, and the link moves there; and `['direct', 'peers', 'signaling', 'turn']` gathers
+on our TURN server for a member's attempt that includes TURN (an older peer's, or one
+under the default order). No path the policy has off is used. Fix: the docs say that
+only leaving `'direct'` out keeps our addresses from members; or the answering side
+leaves out the WebRTC paths its order puts after the link's own.
+
+**NB98-I3 — Relay-only rests on the WebRTC runtime (Info).** Without `'direct'` the room
+relies on `iceTransportPolicy: 'relay'` to gather relay candidates only and to clear
+their `raddr`. Chromium 153 does both (above); Firefox, Safari and node-datachannel
+weren't checked. Fix (hardening): for a connection made without `'direct'`, send only
+`typ relay` candidates, with `raddr` and `c=` cleared as `'public-only'` does.
+
+**NB98-I4 — A link kept on TURN keeps its old ICE session (Info).** A link made with
+both WebRTC paths whose end is on TURN stays when `'direct'` is turned off. It gets the
+relay-only configuration for its next restart, but until then its session keeps its host
+and server-reflexive pairs, and ICE may switch to one of them, a path now off, with
+nothing to check it again. Fix: when `'direct'` is turned off, the dialling side
+restarts ICE on such a link, as it does for new servers.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
