@@ -357,8 +357,8 @@ impl Policy {
 }
 
 impl Default for Policy {
-    /// Every kind, in the order `Node` prefers paths with no policy: `[Direct, Birthday, RelayPeers, Peers]`.
-    /// Unlike no policy, the relays wait their turn (`fallback`).
+    /// Every kind but `Turn`, in the order `Node` prefers paths with no policy: `[Direct, Birthday, RelayPeers,
+    /// Peers]`. Unlike no policy, the relays wait their turn (`fallback`). List `Turn` to use TURN.
     fn default() -> Policy {
         let order = vec![PathKind::Direct, PathKind::Birthday, PathKind::RelayPeers, PathKind::Peers];
         Policy { order, port_mapping: false, fallback: Policy::FALLBACK }
@@ -372,8 +372,9 @@ pub enum Failure {
     Unreachable,
     /// The NAT on `Side` is symmetric (a new public port per destination) and the
     /// other side's router only lets in packets from ports it has sent to, so
-    /// punching can't work, and no peer connected to both could relay. Peerwire has
-    /// no TURN server; a third peer in the room that both can reach fixes it.
+    /// punching can't work, and no peer connected to both could relay. Peerwire runs
+    /// no TURN server; a third peer in the room that both can reach fixes it, and so
+    /// does a TURN server of your own ([`PathKind::Turn`], feature `turn`).
     Symmetric(Side),
 }
 

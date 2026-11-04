@@ -31,7 +31,7 @@ message.
 |---|---|---|
 | Reliable messages over UDP loopback, one core (aarch64) | ~1.2 M msg/s | `cargo run --release -p peerwire-core --example udp_pair` |
 | Handshake | 1 RTT (Noise IK) | `tests/endpoint.rs` |
-| WebAssembly module | ~350 KB (356,763 B on 4 Nov 2026), 0 imports | `./packages/js/build.sh` |
+| WebAssembly module | ~350 KB (356,750 B on 5 Nov 2026), 0 imports | `./packages/js/build.sh` |
 | Two endpoints in Node: connect, then 1000 × 64 B + 64 KiB | connect 53 ms, transfer 51 ms | `node packages/js/test/node_pair.mjs` |
 | Super-peer dies mid-game | detected in 267 ms; affected players' p99 316 ms; 0 stalls; every event delivered | `tests/arena.rs` |
 

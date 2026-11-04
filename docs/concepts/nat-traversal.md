@@ -554,8 +554,9 @@ symmetric NAT against a port-restricted cone when the [birthday punch](#birthday
 peer both are linked to. In a Godot star or a room of
 two there is no such peer, so `Node::set_relay_peers(&[invite])` (or `Builder::relay_peers`, Godot
 `set_relay_peers`) adds one: an always-on peer such as [`peerwire-peer`](../../crates/peerwire-peer), by its invite
-(NB-041). There is still no TURN server: a relay peer is an ordinary Peerwire node that forwards sealed packets
-with the core's peer relay.
+(NB-041). Peerwire runs no TURN server: a relay peer is an ordinary Peerwire node that forwards sealed packets
+with the core's peer relay. A Rust node can use a TURN server of your own instead, or as well (`PathKind::Turn`,
+NB-099; see [choosing paths](../guides/connection-paths.md)).
 
 - **The link.** `Node` dials each relay peer when the list is set and keeps the link. When it drops, or a dial
   fails, it dials again at once, then after 1 s, 2 s, 4 s, ... up to every 30 s; `next_timeout` wakes the host for

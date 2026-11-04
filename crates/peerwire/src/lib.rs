@@ -84,10 +84,13 @@ pub use traversal::{Failure, Hop, NatType, PathKind, Policy, Privacy, Role, Side
 #[cfg(feature = "turn")]
 pub use turn::TurnServer;
 
-/// An event from a [`Node`]: a peer connected or left, a message arrived, a link moved.
+/// An event from a [`Node`]: a peer connected or left, a message arrived, a link moved. A path in one shows where the
+/// link's packets go, as [`Node::path`] does; [`Node::path_kind`] tells a link through TURN apart, and a move between
+/// TURN and a direct path raises `PathChanged` though both show `Direct(addr)`.
 pub type Event = peerwire_core::Event<std::net::SocketAddr>;
 
-/// How a link reaches its peer: a UDP address, or through a relaying peer.
+/// How a link reaches its peer: a UDP address (where its packets go: through TURN, the peer's address as relayed),
+/// or through a relaying peer.
 pub type Path = peerwire_core::Path<std::net::SocketAddr>;
 
 // The README examples run as doc tests (`cargo test --doc`).
