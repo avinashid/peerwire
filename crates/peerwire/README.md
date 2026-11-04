@@ -83,6 +83,10 @@ cargo run -p peerwire --features nostr --example nostr_relay -- 127.0.0.1:7447  
 - **Privacy:** `Privacy::Direct` (every address), `PublicOnly` (no LAN or loopback addresses)
   or `RelayOnly` (no address at all, every link through a relay). A node dials back only
   peers that hold its invite, share its room, or that it dialled: a `PeerId` alone gets nothing.
+- **Paths:** a `Policy` (`Builder::policy`, `Node::set_policy`) orders the paths links may take
+  (`PathKind::Direct`, `Birthday`, `Peers`, `RelayPeers`) and turns the rest off, live: links
+  on a path turned off move or close. STUN servers and the signaling carrier swap live too
+  (`Node::set_stun_servers`, `Node::set_signaling`), keeping links up.
 - **Async:** with feature `tokio`, `AsyncNode` waits on the socket and timers itself:
   `node.next_event().await`.
 

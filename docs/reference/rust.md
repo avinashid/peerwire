@@ -211,11 +211,20 @@ Identity and addresses:
 | `set_privacy(&mut self, privacy: Privacy)` | Changes that from the next offer and invite on. Links already up keep their path; disconnect a peer to stop it knowing an address it has. Switching to `RelayOnly` closes the links to relay peers (except the relay it names) and removes a router mapping; switching out of it dials them and maps again |
 | `port_mapping(&self) -> PortMapping` | Where router port mapping stands; updated by `poll` |
 
+Paths and servers, live:
+
+| Method | |
+|---|---|
+| `policy(&self) -> Option<&Policy>` | The paths links may take, if a policy is set |
+| `set_policy(&mut self, policy: impl Into<Option<Policy>>) -> Result<(), Error>` | Sets which paths links may take, and in what order (see [Policy](#policy)); `None` takes every path, as with no policy. New dials follow it at once, and dials under way take their next steps by it. A link on a path it turns off moves to one still allowed: through a relay, it punches to a direct path (with `Direct` on); with an allowed relay linked to both, it is dialled again through that one, which replaces it at both ends (`Disconnected` with `Replaced`, then `Connected`). One that can't move, or hasn't within 6 s (`MOVE_WAIT` in `traversal.rs`), is closed: `Disconnected` with `DisconnectReason::PathOff`. Leaving `RelayPeers` out closes the relay peers' links; the policy's `port_mapping` starts or stops router port mapping. Fails, changing nothing, with `Error::InvalidPolicy` |
+| `set_stun_servers<S: Into<String>>(&mut self, servers: impl IntoIterator<Item = S>)` | Replaces the STUN servers (as `Builder::stun_servers`; empty turns STUN off) and asks the new ones at once. Names are resolved now, on the calling thread. Links stay up: the servers only give the public address and NAT type that the next offers and invites carry |
+| `set_signaling(&mut self, signaling: impl Signaling + 'static)` | Swaps the carrier, to change relays, say: the old one is dropped, and on the new one the node subscribes to its inbox and its room's topic and says hello at once. Links stay up. Peers meet over it from then on, so those in the room move to it too, or share it |
+
 Peers and rooms:
 
 | Method | |
 |---|---|
-| `connect(&mut self, invite: &str) -> Result<PeerId, Error>` | Dials the invite's peer at every address it lists, and through any listed relay this node is linked to. With a carrier it also sends the peer this node's addresses, so the peer dials back and both punch through their NATs. Returns the peer's id; `Event::Connected` or `Event::ConnectFailed` follows. Under `RelayOnly` it dials through the relay only, and fails with `ConnectError::NoRelay` while none is linked |
+| `connect(&mut self, invite: &str) -> Result<PeerId, Error>` | Dials the invite's peer at every address it lists, and through any listed relay this node is linked to. With a carrier it also sends the peer this node's addresses, so the peer dials back and both punch through their NATs. Returns the peer's id; `Event::Connected` or `Event::ConnectFailed` follows. Under `RelayOnly` it dials through the relay only, and fails with `ConnectError::NoRelay` while none is linked. Under a `Policy` it dials the paths the policy allows, a step at a time, and fails with `ConnectError::NoPath` if no step has anything to dial |
 | `join_room(&mut self, app_id: &str, room: &str)` | Joins room `room` of application `app_id` as a `Role::Peer` (a full mesh) and leaves any other room. Needs a carrier. Hellos repeat at 2 s, 4 s, … up to every 30 s for peers that join later (`HELLO_FIRST`, `HELLO_MAX` in `traversal.rs`). The room's name is its password: in a room the node closes links from anyone who didn't prove it, except peers it dialled itself |
 | `join_room_as(&mut self, app_id: &str, room: &str, role: Role)` | `join_room` with a role: a `Host` links with clients and peers, a `Client` with hosts only (a star) |
 | `join_room_with(&mut self, app_id: &str, room: &str, role: Role, host: Option<PeerId>)` | `join_room_as`, linking with `host` only when given, so a client that knows its host's key can't be taken in by another member |
@@ -264,11 +273,12 @@ Options for a `Node`, from `Node::builder()`. Each takes `self` and returns the 
 | `stun_servers` | `impl IntoIterator<Item = S>`, `S: Into<String>` | `DEFAULT_STUN_SERVERS`: `stun.l.google.com:19302`, `stun.cloudflare.com:3478`, `stun.l.google.com:3478` | `host:port` servers to learn the public address from; empty turns STUN off. Names are resolved in `bind`, each once, so one name on two ports is one IP, and servers that don't resolve are skipped. A server on two ports of one IP, next to another at a second IP, tells `NatType::SymmetricIp` from `Symmetric`. A socket bound to loopback asks none; a dual-stack one asks over IPv4 only |
 | `signaling` | `impl Signaling + 'static` | None | A carrier, for rooms and for invites that punch through NATs. Without one, invites work where the host is reachable |
 | `privacy` | `Privacy` | `Privacy::Direct` | Which addresses the node gives out (see [Privacy](#privacy)) |
-| `port_mapping` | `bool` | `false` | Asks the router to forward a public UDP port to this node, by PCP, NAT-PMP or UPnP-IGD (tried in that order), and offers the mapped address like a public one. Runs on a thread of its own, for IPv4 and dual-stack sockets not bound to loopback; renewed while the node lives and removed when it is dropped. Paused under `Privacy::RelayOnly` |
+| `port_mapping` | `bool` | `false` | Asks the router to forward a public UDP port to this node, by PCP, NAT-PMP or UPnP-IGD (tried in that order), and offers the mapped address like a public one. Runs on a thread of its own, for IPv4 and dual-stack sockets not bound to loopback; renewed while the node lives and removed when it is dropped. Paused under `Privacy::RelayOnly`. With a `policy`, the policy's `port_mapping` decides instead |
 | `relay_peers` | `impl IntoIterator<Item = S>`, `S: Into<String>` | None | Invites of always-on peers to keep linked as relays (see `Node::set_relay_peers`) |
+| `policy` | `Policy` | None: every path, as before policies | Which paths links may take, and in what order (see [Policy](#policy) and `Node::set_policy`) |
 
 `bind(self, addr: impl ToSocketAddrs) -> io::Result<Node>` binds the socket as `Node::bind` describes. It fails with
-`ErrorKind::InvalidInput` if a relay peer is not an invite.
+`ErrorKind::InvalidInput` if a relay peer is not an invite, or if the policy is not valid (`Policy::is_valid`).
 
 A chain, from the doc example in `crates/peerwire/src/lan.rs` (inside a function that returns a `Result`):
 
@@ -340,14 +350,15 @@ moves it into `tokio::spawn`. Carriers are polled, not awaited: with one, `next_
 |---|---|
 | `Connected { peer: PeerId, path: Path, initiator: bool }` | A link is up. `initiator`: this side sent the handshake that made it |
 | `Message { peer: PeerId, lane: Lane, data: Vec<u8> }` | A message arrived. `lane` is `Reliable` or `Unreliable`: urgent messages arrive as `Lane::Reliable` |
-| `Disconnected { peer: PeerId, reason: DisconnectReason }` | A link went. `reason` is `Timeout`, `ClosedByPeer`, `Replaced` (the peer completed a new handshake, after a restart or a re-dial: a `Connected` for the new link follows, and reliable data in flight on the old one is lost) or `ProtocolViolation` |
+| `Disconnected { peer: PeerId, reason: DisconnectReason }` | A link went. `reason` is `Timeout`, `ClosedByPeer`, `Replaced` (the peer completed a new handshake, after a restart or a re-dial: a `Connected` for the new link follows, and reliable data in flight on the old one is lost), `ProtocolViolation` or `PathOff` (this node closed it: its policy turned the link's path off and no path still allowed took it over, see `Node::set_policy`) |
 | `ConnectFailed { peer: PeerId }` | A dial ran out of handshake attempts (`Config::handshake_attempts`). `Node::failure` says why |
 | `PathChanged { peer: PeerId, path: Path }` | A link moved: relayed to direct after a hole punch, direct to relayed after the direct path went silent, or to a new address (roaming) |
 | `AddrObserved { by: PeerId, addr: SocketAddr }` | A directly linked peer reports the address it sees this node at (its public address, behind a NAT) |
 
 A `Node` doesn't pass on everything the core raises. Events about relay peers stay inside it. In a room, a link from
-a peer that never proved the room key is closed unseen, and so is a relay-only node's new direct link to anyone but
-its relay.
+a peer that never proved the room key is closed unseen, and so are a relay-only node's new direct link to anyone but
+its relay and a new link on a path the node's policy has off. A failed dial that was moving a link off such a path
+raises no `ConnectFailed`: the link's `Disconnected` with `PathOff` follows instead.
 
 ### Lane
 
@@ -370,6 +381,52 @@ and [privacy modes](../concepts/nat-traversal.md#privacy-modes).
 | `Direct` (default) | Every candidate: public, LAN, loopback. The lowest latency; peers on one LAN link over it |
 | `PublicOnly` | Public addresses only: LAN, loopback, link-local, CGNAT (100.64/10) and other private ranges are left out of invites and offers. Two peers behind one NAT then link only if it hairpins, or through a relay |
 | `RelayOnly { via: Option<PeerId> }` | No address at all, except to the relay: every other link goes through it (`Path::Via`) and never moves to a direct path. The relay is `via`, or, in a host/client room, the host. Costs the relay's upload (it carries every packet twice) and a detour in latency |
+
+### Policy
+
+Which paths a node's links may take, and in what order (`Builder::policy`, `Node::set_policy`; source in
+`crates/peerwire/src/traversal.rs`). A node with none takes every path, as it always has: a dial tries the direct
+and relayed paths at once and the planned punches a second later, and a relayed link moves to a direct path that
+works.
+
+| Field | Default | |
+|---|---|---|
+| `order: Vec<PathKind>` | `[Direct, Birthday, RelayPeers, Peers]` | The kinds of path allowed, most preferred first. A kind left out is off. Not empty, and each kind at most once (`Policy::is_valid`; else `Error::InvalidPolicy`) |
+| `port_mapping: bool` | `false` | Router port mapping (as `Builder::port_mapping`), which runs only with `Direct` in `order` |
+| `fallback: Duration` | 2 s (`Policy::FALLBACK`) | How long each step of a dial has to link before the next starts too |
+
+`Policy::new(order)` takes the defaults for the rest; `Policy::allows(kind)` says whether a kind is in.
+
+| `PathKind` | |
+|---|---|
+| `Direct` | Straight to the peer's addresses (LAN, public from STUN, mapped by its router, seen by its peers), the ports around one its NAT will likely pick, and the punches that move a relayed link to one of them |
+| `Birthday` | The punches planned for symmetric NATs, which an ordinary one can't link: a birthday punch or a lockstep sweep (see [NAT traversal](../concepts/nat-traversal.md)). Each costs NAT ports, and they are rate-limited |
+| `Peers` | Through another peer linked to both (`Path::Via`), such as a room member. A peer relays only over its direct links, so with `Direct` and `Birthday` off only relay peers can relay |
+| `RelayPeers` | Through this node's own always-on relay peers (`Node::set_relay_peers`), as you would run your own TURN server. Left out, they aren't linked at all |
+
+How the order is read:
+
+- **Dialling.** A dial takes the kinds one step at a time. Each next one starts once the earlier ones have had
+  `fallback` to link, or at once if an earlier one has nothing to try (no relay linked to both, say). `Direct` and
+  `Birthday` side by side are one step, as a planned punch waits a second for an ordinary one anyway.
+- **Moving.** A link moves only to a kind earlier in the order. One through a relay ranked before `Direct` and
+  `Birthday` never punches, nor answers the peer's punches, so `[Peers, Direct]` keeps a relayed link relayed.
+  `[RelayPeers]` links through relay peers alone.
+- **Answering.** The node answers a dial on any path it allows: a peer with another policy may dial it directly
+  first. It refuses a new link on a path it has off.
+- **Privacy.** Under `Privacy::RelayOnly` links go through its relay whatever the policy says.
+
+```rust
+use peerwire::{Node, PathKind, Policy};
+
+// Through room peers and relay peers first, directly only if neither links within 2 s:
+// a link that comes up through a relay stays there.
+let order = [PathKind::Peers, PathKind::RelayPeers, PathKind::Direct];
+let mut node = Node::builder().policy(Policy::new(order)).bind("0.0.0.0:0")?;
+// Later, live: direct paths first again, with router port mapping.
+node.set_policy(Policy { port_mapping: true, ..Policy::default() })?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ### Role
 
@@ -407,10 +464,11 @@ tells `SymmetricIp` from `Symmetric` with one of them on a second port too. More
 `Status` (`Node::status`): `Disconnected` (not linked, not dialling), `Connecting` (the handshake is under way) or
 `Connected`.
 
-`Error` (`Node::connect`, `Node::set_relay_peers`): `InvalidInvite` when the string is not a `pw:` invite, or
-`Connect(ConnectError)` when the dial can't start. `ConnectError` is `SelfConnect` (your own invite),
-`InvalidPeerId` (not a valid Ed25519 key), `NoPath` (no address in an IP family the socket reaches, and no relay
-this node is linked to) or `NoRelay` (relay-only, and no relay is linked).
+`Error` (`Node::connect`, `Node::set_relay_peers`, `Node::set_policy`): `InvalidInvite` when the string is not a
+`pw:` invite, `InvalidPolicy` when a policy's order is empty or lists a kind twice, or `Connect(ConnectError)` when
+the dial can't start. `ConnectError` is `SelfConnect` (your own invite), `InvalidPeerId` (not a valid Ed25519 key),
+`NoPath` (no address in an IP family the socket reaches, and no relay this node is linked to; under a policy, no
+step with anything to dial) or `NoRelay` (relay-only, and no relay is linked).
 
 ### PortMapping
 
@@ -419,7 +477,7 @@ is one. Details: [router port mapping](../concepts/nat-traversal.md#router-port-
 
 | Variant | |
 |---|---|
-| `Off` | Not asked for: `Builder::port_mapping` is off |
+| `Off` | Not asked for: `Builder::port_mapping` is off, or under a policy its `port_mapping` is, or `Direct` is |
 | `Trying` | Asking the gateway |
 | `Mapped { addr: SocketAddr, protocol: MapProtocol }` | The router forwards `addr` to this node, which offers it to peers as a public address |
 | `NotPublic { addr: SocketAddr, protocol: MapProtocol }` | The router's own address is not public (CGNAT or a private range): not offered, and the mapping is removed |
@@ -639,6 +697,8 @@ test.
 | `spray`, `sweep`, `opener` | Birthday and lockstep punching: probing many ports of a peer's IP (at most 4096, `MAX_SPRAY`), and the packet a host sends from many extra sockets |
 | `add_relay(&mut self, now: Instant, relay: PeerId, peer: &PeerId)`, `set_slow(&mut self, peer: &PeerId, addr: Option<A>)` | Offer a relay for a link, and mark a slow address (such as a signaling channel carrying datagrams) that a relay beats |
 | `set_relay_only(&mut self, on: bool)`, `relay_only(&self) -> bool` | Keep relayed links relayed, so peers reached through a relay never learn this endpoint's address |
+| `set_keep_relayed(&mut self, relays: &[PeerId], listed: bool, others: bool)` | Keeps links on their relay: those through `relays` if `listed`, through any other relay if `others`. Such a link takes no direct candidates, never punches and answers no punch at this endpoint's address, so neither end moves it to a direct path. Unlike `set_relay_only` it hides no address and leaves dials and direct links alone |
+| `redial(&mut self, now: Instant, peer: PeerId, targets: &[Path<A>]) -> Result<(), ConnectError>` | `connect_with`, also for a peer already linked: the old link carries traffic until the new handshake replaces it (`Disconnected` with `Replaced`, then `Connected`, at both ends). A redial that fails (`ConnectFailed`) leaves the old link up |
 | `handle_datagram_from(&mut self, now: Instant, from: A, peer: &PeerId, data: &[u8])` | `handle_datagram` for a channel only `peer` sends on (a WebRTC DataChannel, a signaling pipe): packets on it for another peer's link are dropped unread |
 | `handle_datagram_direct(&mut self, now: Instant, from: A, data: &[u8]) -> Option<(PeerId, bool)>` | `handle_datagram`, also giving the peer whose session the datagram authenticated to (its crypto ran: not an HS1 sent again while half-open, or an HS2 sent again), if that session's direct path is now `from`, and whether the datagram was fresh: an HS2 that finished our dial, or a Data packet with a new nonce. An HS1 is not: a copy of one reads again once its handshake is no longer half-open (NB85-1) |
 | `peer_id`, `stats`, `session_count`, `connected_peers`, `is_connected`, `path`, `rtt`, `min_rtt`, `path_rtt`, `peer_stats` | This endpoint's id, its counters (`Stats`), and each link's state, route and timings |

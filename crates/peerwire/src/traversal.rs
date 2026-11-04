@@ -44,7 +44,7 @@ use crate::signaling::{hex, unhex, Topic};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
-use peerwire_core::{sealed, stun, Address, Endpoint, Event, Identity, Instant, Path, PeerId, Transmit};
+use peerwire_core::{sealed, stun, Address, ConnectError, Endpoint, Event, Identity, Instant, Path, PeerId, Transmit};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
@@ -157,6 +157,11 @@ const PER_PORT_PUNCH_GAP: Duration = Duration::from_secs(300);
 pub const LOCKSTEP_LOW: u16 = 96;
 pub const LOCKSTEP_HIGH: u16 = 64;
 const LOCKSTEP_AFTER: Duration = Duration::from_millis(1000);
+/// A link that [`Traversal::set_policy`] moves off a path that is now off gets this long to move (core punches for
+/// `punch_duration`, 5 s by default), then is closed.
+const MOVE_WAIT: Duration = Duration::from_secs(6);
+/// Every [`PathKind::bit`]: a dial step with no policy.
+const ALL_KINDS: u8 = 0b1111;
 
 /// What STUN says about this node's NAT.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -225,6 +230,120 @@ pub enum Privacy {
     /// or, in a host/client room, the host. Costs the relay's upload (it carries
     /// every packet twice) and a detour in latency.
     RelayOnly { via: Option<PeerId> },
+}
+
+/// A way a link can reach its peer, as a [`Policy`] orders them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PathKind {
+    /// Straight to the peer's addresses: those its offers and invites carry (LAN, public from STUN, mapped by its
+    /// router, seen by its peers), the ports around one its NAT will likely pick, and the punches that move a link
+    /// on a relay to one of them.
+    Direct,
+    /// The punches planned for symmetric NATs, which an ordinary one can't link: a birthday punch (extra sockets
+    /// and a spray of probes, [`BIRTHDAY_SOCKETS`] and [`BIRTHDAY_PROBES`]) or a lockstep sweep. Each costs NAT
+    /// ports, and they are rate-limited.
+    Birthday,
+    /// Through another peer linked to both ([`Path::Via`]), such as a room member. A peer relays only over its
+    /// direct links, so with `Direct` and `Birthday` off only relay peers can relay.
+    Peers,
+    /// Through this node's own always-on relay peers ([`Node::set_relay_peers`](crate::Node::set_relay_peers)), as
+    /// you would run your own TURN server. Left out, they aren't linked at all.
+    RelayPeers,
+}
+
+impl PathKind {
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// Which paths a node's links may take, in the order it prefers them ([`Node::set_policy`](crate::Node::set_policy)).
+/// A node with none takes every path, as [`Node`](crate::Node) always has: a dial tries the direct and relayed
+/// paths at once and the planned punches a second later, and a relayed link moves to a direct path that works.
+///
+/// With a policy, a dial takes the kinds in `order` one step at a time: each next one starts once the earlier ones
+/// have had `fallback` to link, at once if an earlier one has nothing to try (no relay linked to both, say).
+/// `Direct` and `Birthday` side by side are one step, as the planned punches wait a second for an ordinary one
+/// anyway. A link moves only to a kind earlier in the order: one through a relay ranked before `Direct` and
+/// `Birthday` never punches (nor answers the peer's punches), so `[Peers, Direct]` keeps a relayed link relayed,
+/// and `[RelayPeers]` links through relay peers alone. The node still answers a dial on any path it allows (a peer
+/// with another policy may dial it directly first), and refuses links on paths it doesn't. Under
+/// [`Privacy::RelayOnly`] links go through its relay whatever the policy says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Policy {
+    /// The kinds of path allowed, most preferred first. A kind left out is off. Not empty, each kind at most once.
+    pub order: Vec<PathKind>,
+    /// Router port mapping ([`Builder::port_mapping`](crate::Builder::port_mapping)), which runs only with
+    /// `Direct` in `order`. Default: off.
+    pub port_mapping: bool,
+    /// How long each step of a dial has to link before the next one starts too. Default: [`Policy::FALLBACK`].
+    pub fallback: Duration,
+}
+
+impl Policy {
+    /// The default `fallback`: a direct punch between two NATs it can get through mostly links within 2.5 s in the
+    /// simulator's NAT matrix.
+    pub const FALLBACK: Duration = Duration::from_secs(2);
+
+    /// A policy with this `order`, no port mapping and the default `fallback`.
+    pub fn new(order: impl IntoIterator<Item = PathKind>) -> Policy {
+        Policy { order: order.into_iter().collect(), ..Policy::default() }
+    }
+
+    /// Whether `kind` is in the order.
+    pub fn allows(&self, kind: PathKind) -> bool {
+        self.order.contains(&kind)
+    }
+
+    /// Whether the order lists at least one kind, and none twice.
+    pub fn is_valid(&self) -> bool {
+        let mut seen = 0u8;
+        for k in &self.order {
+            if seen & k.bit() != 0 {
+                return false;
+            }
+            seen |= k.bit();
+        }
+        seen != 0
+    }
+
+    /// Where `kind` comes in the order, or `None` if it is off.
+    fn rank(&self, kind: PathKind) -> Option<usize> {
+        self.order.iter().position(|k| *k == kind)
+    }
+
+    /// Where a direct path ranks: the earlier of `Direct` and `Birthday`.
+    fn direct_rank(&self) -> Option<usize> {
+        [self.rank(PathKind::Direct), self.rank(PathKind::Birthday)].into_iter().flatten().min()
+    }
+
+    /// Whether links through a relay of `kind` stay on it: it ranks before both direct kinds.
+    fn keeps(&self, kind: PathKind) -> bool {
+        self.rank(kind).is_some_and(|r| self.direct_rank().is_none_or(|d| r < d))
+    }
+
+    /// The steps of a dial, as bits of [`PathKind::bit`]: each kind in order, `Direct` and `Birthday` side by side
+    /// together.
+    fn steps(&self) -> Vec<u8> {
+        let direct = PathKind::Direct.bit() | PathKind::Birthday.bit();
+        let mut steps: Vec<u8> = Vec::new();
+        for k in &self.order {
+            match steps.last_mut() {
+                Some(last) if *last & direct != 0 && k.bit() & direct != 0 => *last |= k.bit(),
+                _ => steps.push(k.bit()),
+            }
+        }
+        steps
+    }
+}
+
+impl Default for Policy {
+    /// Every kind, in the order `Node` prefers paths with no policy: `[Direct, Birthday, RelayPeers, Peers]`.
+    /// Unlike no policy, the relays wait their turn (`fallback`).
+    fn default() -> Policy {
+        let order = vec![PathKind::Direct, PathKind::Birthday, PathKind::RelayPeers, PathKind::Peers];
+        Policy { order, port_mapping: false, fallback: Policy::FALLBACK }
+    }
 }
 
 /// Why a dial to a peer failed.
@@ -371,6 +490,23 @@ struct Remote<A> {
     /// A punch to start then (birthday or lockstep), and when the last one started.
     plan: Option<(Instant, Plan<A>)>,
     plan_at: Option<Instant>,
+    /// The addresses in its last offer acted on that this node can dial: a link moved off a relay punches to them.
+    addrs: Vec<A>,
+    /// A dial to it under a [`Policy`], step by step.
+    ladder: Option<Ladder<A>>,
+    /// Its link is moving off a path that is off, and is closed if it hasn't by then.
+    moving: Option<Instant>,
+    /// A dial that moves its link ([`Endpoint::redial`]) is under way: its `ConnectFailed` is this node's own.
+    redial: bool,
+}
+
+/// A dial run in the steps of a [`Policy`]: the offer it dials, the step to start next, and when.
+struct Ladder<A> {
+    offer: Offer<A>,
+    next: usize,
+    at: Instant,
+    /// The offer stands for an invite, whose addresses the host checked: dialled as they are.
+    invite: bool,
 }
 
 impl<A> Default for Remote<A> {
@@ -388,6 +524,10 @@ impl<A> Default for Remote<A> {
             offers: Bucket::default(),
             plan: None,
             plan_at: None,
+            addrs: Vec::new(),
+            ladder: None,
+            moving: None,
+            redial: false,
         }
     }
 }
@@ -444,6 +584,13 @@ pub struct Traversal<A: Address> {
     punch_ips: HashMap<std::net::IpAddr, VecDeque<Instant>>,
     /// When this node last started a spray as `Symmetric` ([`PER_PORT_PUNCH_GAP`]).
     per_port_punch: Option<Instant>,
+    /// The paths links may take; `None`: every one, as before policies.
+    policy: Option<Policy>,
+    /// The endpoint's kept relays ([`Endpoint::set_keep_relayed`]) need setting again (the policy or relay peers
+    /// changed).
+    keep_stale: bool,
+    /// Peers whose links this node closed because their path is off ([`Traversal::poll_dropped`]).
+    dropped: VecDeque<PeerId>,
     sockets: VecDeque<Birthday<A>>,
     transmits: VecDeque<Transmit<A>>,
     signals: VecDeque<Signal>,
@@ -493,6 +640,9 @@ impl<A: Address> Traversal<A> {
             planned: Bucket::default(),
             punch_ips: HashMap::new(),
             per_port_punch: None,
+            policy: None,
+            keep_stale: false,
+            dropped: VecDeque::new(),
             sockets: VecDeque::new(),
             transmits: VecDeque::new(),
             signals: VecDeque::from([Signal::Subscribe(inbox)]),
@@ -594,6 +744,128 @@ impl<A: Address> Traversal<A> {
     /// offer names. Linking with them is the host's job ([`Node`](crate::Node) does it).
     pub fn set_relay_peers(&mut self, peers: Vec<PeerId>) {
         self.relay_peers = peers;
+        self.keep_stale = true;
+    }
+
+    /// The paths links may take; `None`: every one.
+    pub fn policy(&self) -> Option<&Policy> {
+        self.policy.as_ref()
+    }
+
+    /// Sets the paths links may take (`None`: every one, as before policies), for new dials at once; dials under
+    /// way take their next steps by it, from its first. A link on a path it turns off moves: one through a relay
+    /// punches to the peer's addresses if `Direct` is on and offers again, so the peer punches too (and a planned
+    /// punch may follow, with `Birthday` on); and one with an allowed relay linked to both (named in the peer's last
+    /// offer, or a relay peer) is dialled again through it ([`Endpoint::redial`]), keeping the old link until the
+    /// new one replaces it. A link that had nowhere to go, whose redial failed, or that is still on its path after
+    /// 6 s is closed: see [`poll_dropped`](Traversal::poll_dropped). Links to relay peers and those under
+    /// [`Privacy::RelayOnly`] are left alone. The host checks [`Policy::is_valid`].
+    pub fn set_policy(&mut self, now: Instant, ep: &mut Endpoint<A>, policy: Option<Policy>) {
+        self.policy = policy;
+        self.keep_stale = true;
+        self.sync_keep(ep);
+        let ladders: Vec<PeerId> = self.remotes.iter().filter(|(_, r)| r.ladder.is_some()).map(|(p, _)| *p).collect();
+        for r in self.remotes.values_mut() {
+            r.moving = None;
+        }
+        for peer in ladders {
+            if self.policy.is_some() {
+                if let Some(l) = self.remotes.get_mut(&peer).and_then(|r| r.ladder.as_mut()) {
+                    (l.next, l.at) = (0, now);
+                }
+                self.climb(now, ep, peer);
+            } else if let Some(l) = self.remotes.get_mut(&peer).and_then(|r| r.ladder.take()) {
+                // Every path at once, as an offer is dialled with no policy.
+                self.dial_step(now, ep, peer, &l.offer, ALL_KINDS, l.invite);
+            }
+        }
+        let linked: Vec<PeerId> = ep.connected_peers().copied().collect();
+        for peer in linked {
+            if ep.path(&peer).is_some_and(|path| !self.allows(&peer, path)) {
+                self.move_off(now, ep, peer);
+            }
+        }
+    }
+
+    /// The next peer whose link this node closed because the policy turned its path off and no allowed path took
+    /// it over (see [`set_policy`](Traversal::set_policy)). The endpoint raises no event for it: the host reports it
+    /// ([`Node`](crate::Node) as [`Event::Disconnected`] with [`DisconnectReason::PathOff`]).
+    ///
+    /// [`DisconnectReason::PathOff`]: peerwire_core::DisconnectReason::PathOff
+    pub fn poll_dropped(&mut self) -> Option<PeerId> {
+        self.dropped.pop_front()
+    }
+
+    /// Whether the policy lets a link to `peer` take `path`. Any path with no policy, under
+    /// [`Privacy::RelayOnly`], and to a relay peer (the host links those, or not, by [`PathKind::RelayPeers`]).
+    pub fn allows(&self, peer: &PeerId, path: &Path<A>) -> bool {
+        let Some(p) = &self.policy else { return true };
+        if matches!(self.privacy, Privacy::RelayOnly { .. }) || self.relay_peers.contains(peer) {
+            return true;
+        }
+        match path {
+            Path::Direct(_) => p.allows(PathKind::Direct) || p.allows(PathKind::Birthday),
+            Path::Via(r) => p.allows(self.relay_kind(r)),
+        }
+    }
+
+    /// A link to `peer` came up or moved to `path`: if the policy has that path off, the link moves (or goes);
+    /// if not, any move is over. Whether the path is allowed.
+    fn follow_policy(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: PeerId, path: &Path<A>) -> bool {
+        if !self.allows(&peer, path) {
+            self.move_off(now, ep, peer);
+            return false;
+        }
+        if let Some(r) = self.remotes.get_mut(&peer) {
+            r.moving = None;
+        }
+        true
+    }
+
+    /// The kind of path a link through relay `r` takes.
+    fn relay_kind(&self, r: &PeerId) -> PathKind {
+        match self.relay_peers.contains(r) {
+            true => PathKind::RelayPeers,
+            false => PathKind::Peers,
+        }
+    }
+
+    /// Whether a link on `path` stays on its relay: the policy ranks the relay's kind before both direct kinds.
+    fn kept(&self, path: &Path<A>) -> bool {
+        matches!(path, Path::Via(r) if self.policy.as_ref().is_some_and(|p| p.keeps(self.relay_kind(r))))
+    }
+
+    /// Tells the endpoint which relayed links stay relayed, if the policy or the relay peers changed.
+    fn sync_keep(&mut self, ep: &mut Endpoint<A>) {
+        if self.keep_stale {
+            self.keep_stale = false;
+            let keeps = |k| self.policy.as_ref().is_some_and(|p| p.keeps(k));
+            let (listed, others) = (keeps(PathKind::RelayPeers), keeps(PathKind::Peers));
+            ep.set_keep_relayed(&self.relay_peers, listed, others);
+        }
+    }
+
+    /// Replaces the STUN servers (empty: none) and asks the new ones at once. The public address and NAT type stay
+    /// until they answer; with none, they are forgotten.
+    pub fn set_stun_servers(&mut self, servers: Vec<A>) {
+        let server =
+            |addr| Server { addr, tx: [0; 12], sent_at: Instant::ZERO, tries: 0, pending: false, mapped: None };
+        self.servers = servers.into_iter().map(server).collect();
+        self.next_round = Instant::ZERO;
+        if self.servers.is_empty() {
+            (self.public, self.nat, self.prediction) = (None, NatType::Unknown, None);
+        }
+    }
+
+    /// Subscribes the inbox and the room's topic again and says hello in the room at once, then at 2 s, 4 s, ...:
+    /// for a new signaling carrier, which has heard nothing yet.
+    pub fn resubscribe(&mut self, now: Instant) {
+        self.signals.push_back(Signal::Subscribe(self.inbox));
+        if let Some(r) = self.room.as_mut() {
+            self.signals.push_back(Signal::Subscribe(r.topic));
+            (r.interval, r.next_hello) = (HELLO_FIRST, now + HELLO_FIRST);
+        }
+        self.announce(now);
     }
 
     /// The key this node's invites carry: an offer proved with it is from a peer
@@ -680,6 +952,7 @@ impl<A: Address> Traversal<A> {
 
     /// Handles a message from the signaling carrier.
     pub fn handle_signal(&mut self, now: Instant, ep: &mut Endpoint<A>, topic: Topic, payload: &[u8]) {
+        self.sync_keep(ep);
         if let Some(room) = self.room.as_ref().filter(|r| r.topic == topic) {
             // A hello that doesn't open under the room's key (plaintext, another room's, altered) is dropped.
             let Some(body) = open_room(&room.enc, payload) else { return };
@@ -722,10 +995,14 @@ impl<A: Address> Traversal<A> {
 
     /// Feeds an event from the endpoint (call for every one, before handling it).
     pub fn handle_event(&mut self, now: Instant, ep: &mut Endpoint<A>, event: &Event<A>) {
+        self.sync_keep(ep);
         match event {
-            Event::Connected { peer, .. } => {
+            Event::Connected { peer, path, .. } => {
                 if let Some(r) = self.remotes.get_mut(peer) {
-                    r.failure = None;
+                    (r.failure, r.ladder, r.redial) = (None, None, false);
+                }
+                if !self.follow_policy(now, ep, *peer, path) {
+                    return; // on a path that is off: no relay for others
                 }
                 // A new link may be the relay a waiting dial needed: offer again, with it listed.
                 let waiting: Vec<PeerId> = self
@@ -749,7 +1026,9 @@ impl<A: Address> Traversal<A> {
                     let waiting: Vec<PeerId> = self
                         .remotes
                         .iter()
-                        .filter(|(p, r)| r.heard && r.relays.contains(peer) && !ep.is_connected(p))
+                        .filter(|(p, r)| {
+                            r.heard && r.relays.contains(peer) && !ep.is_connected(p) && self.via_due(r, peer)
+                        })
                         .map(|(p, _)| *p)
                         .collect();
                     for p in waiting {
@@ -765,7 +1044,19 @@ impl<A: Address> Traversal<A> {
                     }
                 }
             }
+            // A dial that moved a link off a path that is off failed: the link is still there, so it goes.
+            Event::ConnectFailed { peer } if self.remotes.get(peer).is_some_and(|r| r.redial) => {
+                if let Some(r) = self.remotes.get_mut(peer) {
+                    r.redial = false;
+                }
+                if ep.is_connected(peer) && ep.path(peer).is_some_and(|path| !self.allows(peer, path)) {
+                    self.close(ep, *peer);
+                }
+            }
             Event::ConnectFailed { peer } => {
+                if let Some(r) = self.remotes.get_mut(peer) {
+                    r.ladder = None;
+                }
                 if self.picked == Some(*peer) {
                     self.picked = None; // another Host may be tried
                 }
@@ -780,7 +1071,17 @@ impl<A: Address> Traversal<A> {
                     (false, false) => Failure::Unreachable,
                 });
             }
-            Event::Disconnected { peer, .. } if self.picked == Some(*peer) => self.picked = None,
+            Event::Disconnected { peer, .. } => {
+                if self.picked == Some(*peer) {
+                    self.picked = None;
+                }
+                if let Some(r) = self.remotes.get_mut(peer) {
+                    r.moving = None;
+                }
+            }
+            Event::PathChanged { peer, path } => {
+                self.follow_policy(now, ep, *peer, path);
+            }
             Event::AddrObserved { addr, .. } => {
                 let addr = &canonical(addr.clone());
                 let real = dialable(addr, false); // a peer that sees us on loopback is on this host
@@ -795,9 +1096,10 @@ impl<A: Address> Traversal<A> {
         }
     }
 
-    /// Fires due timers: STUN queries and retransmits, room hellos.
+    /// Fires due timers: STUN queries and retransmits, room hellos, planned punches, the steps of dials under a
+    /// [`Policy`] and links that haven't moved off a path it turned off.
     pub fn handle_timeout(&mut self, now: Instant, ep: &mut Endpoint<A>) {
-        let _ = ep;
+        self.sync_keep(ep);
         if !self.servers.is_empty() && now >= self.next_round {
             self.next_round = now + STUN_INTERVAL;
             for i in 0..self.servers.len() {
@@ -824,6 +1126,21 @@ impl<A: Address> Traversal<A> {
             self.announce(now);
         }
         self.start_plans(now, ep);
+        let due = |r: &Remote<A>| r.ladder.as_ref().is_some_and(|l| l.at <= now);
+        let due: Vec<PeerId> = self.remotes.iter().filter(|(_, r)| due(r)).map(|(p, _)| *p).collect();
+        for peer in due {
+            self.climb(now, ep, peer);
+        }
+        let late: Vec<PeerId> =
+            self.remotes.iter().filter(|(_, r)| r.moving.is_some_and(|t| t <= now)).map(|(p, _)| *p).collect();
+        for peer in late {
+            if let Some(r) = self.remotes.get_mut(&peer) {
+                r.moving = None;
+            }
+            if ep.path(&peer).is_some_and(|path| !self.allows(&peer, path)) {
+                self.close(ep, peer);
+            }
+        }
         self.remotes.retain(|p, r| now - r.seen_at < FORGET || ep.is_connected(p));
         self.nonces.retain(|_, t| now - *t < Duration::from_millis(2 * FRESH_MS));
         self.punch_ips.retain(|_, times| {
@@ -840,7 +1157,10 @@ impl<A: Address> Traversal<A> {
         let retry = self.servers.iter().filter(|s| s.pending).map(|s| s.sent_at + STUN_RTO * (1 << (s.tries - 1)));
         let hello = self.room.as_ref().map(|r| r.next_hello);
         let plans = self.remotes.values().filter_map(|r| r.plan.as_ref().map(|b| b.0));
-        stun.into_iter().chain(retry).chain(hello).chain(plans).min()
+        let steps = self.remotes.values().filter_map(|r| Some(r.ladder.as_ref()?.at));
+        let moves = self.remotes.values().filter_map(|r| r.moving);
+        let keep = self.keep_stale.then_some(Instant::ZERO); // the relay peers changed: tell the endpoint at once
+        stun.into_iter().chain(retry).chain(hello).chain(plans).chain(steps).chain(moves).chain(keep).min()
     }
 
     /// Extra sockets to open for birthday punching. A peer behind a symmetric NAT
@@ -870,7 +1190,8 @@ impl<A: Address> Traversal<A> {
         for peer in due {
             let Some((_, side)) = self.remotes.get_mut(&peer).and_then(|r| r.plan.take()) else { continue };
             let direct = matches!(ep.path(&peer), Some(Path::Direct(_)));
-            if direct || relay_only {
+            // A link kept on its relay (NB-097) takes no punch: none is started, nor counted.
+            if direct || relay_only || ep.path(&peer).is_some_and(|p| self.kept(p)) {
                 continue;
             }
             if let Plan::Then(addr) = side {
@@ -927,6 +1248,255 @@ impl<A: Address> Traversal<A> {
         }
     }
 
+    /// Acts on offer `o` from `from` under the policy. A linked peer whose link may move to a direct path is given
+    /// its addresses and guesses (with `Direct` on) and a planned punch (with `Birthday` on). Any other is dialled
+    /// step by step ([`climb`](Traversal::climb)); a newer offer from a peer being dialled replaces the one dialled,
+    /// and the steps already started dial its paths too.
+    fn dial_by_policy(
+        &mut self,
+        now: Instant,
+        ep: &mut Endpoint<A>,
+        from: PeerId,
+        o: &Offer<A>,
+        addrs: &[A],
+        guesses: &[A],
+    ) {
+        let Some(p) = self.policy.clone() else { return };
+        if let Some(path) = ep.path(&from) {
+            if self.kept(path) {
+                return;
+            }
+            if p.allows(PathKind::Direct) {
+                ep.add_candidates(now, &from, addrs);
+                if !guesses.is_empty() {
+                    ep.set_guesses(now, &from, guesses);
+                }
+            }
+            if p.allows(PathKind::Birthday) {
+                self.plan_punch(now, ep, from, o);
+            }
+            return;
+        }
+        let r = self.remotes.entry(from).or_default();
+        let started = match r.ladder.as_mut() {
+            Some(l) => {
+                l.offer = o.clone();
+                l.next
+            }
+            None => {
+                r.ladder = Some(Ladder { offer: o.clone(), next: 0, at: now, invite: false });
+                0
+            }
+        };
+        for step in p.steps().into_iter().take(started) {
+            self.dial_step(now, ep, from, o, step, false);
+        }
+        self.climb(now, ep, from);
+    }
+
+    /// Dials `peer` from its invite under the policy, step by step as an offer is ([`Policy`]): directly at
+    /// `addrs` (the invite's, as the host checked them) and through `relays` (those it lists). Fails with
+    /// [`ConnectError::NoPath`] if no step of the policy has anything to dial, and as
+    /// [`Endpoint::connect_with`] does for `peer` itself. Does nothing once linked.
+    pub fn dial_invite(
+        &mut self,
+        now: Instant,
+        ep: &mut Endpoint<A>,
+        peer: PeerId,
+        addrs: Vec<A>,
+        relays: Vec<PeerId>,
+    ) -> Result<(), ConnectError> {
+        // With no targets the endpoint only checks `peer` (this node, or a key that isn't valid), then has no path.
+        match ep.connect_with(now, peer, &[]) {
+            Err(ConnectError::NoPath) | Ok(()) => {}
+            Err(e) => return Err(e),
+        }
+        if ep.is_connected(&peer) {
+            return Ok(());
+        }
+        let offer = Offer {
+            kind: Proof::None,
+            reply: false,
+            role: Role::Peer,
+            nat: NatType::Unknown,
+            says_mapping: false,
+            ts: 0,
+            nonce: 0,
+            addrs,
+            predict: None,
+            relays,
+        };
+        let r = self.remotes.entry(peer).or_default();
+        r.seen_at = now;
+        r.ladder = Some(Ladder { offer, next: 0, at: now, invite: true });
+        match self.climb(now, ep, peer) {
+            true => Ok(()),
+            false => {
+                if let Some(r) = self.remotes.get_mut(&peer) {
+                    r.ladder = None;
+                }
+                Err(ConnectError::NoPath)
+            }
+        }
+    }
+
+    /// Whether a dial that moves `peer`'s link off a path the policy turned off ([`Endpoint::redial`]) is under
+    /// way: its `ConnectFailed` is this node's own, not the app's.
+    pub fn redialing(&self, peer: &PeerId) -> bool {
+        self.remotes.get(peer).is_some_and(|r| r.redial)
+    }
+
+    /// Starts the steps of the dial to `peer` that are due ([`dial_by_policy`](Traversal::dial_by_policy)): the
+    /// next one once the last has had the policy's `fallback`, at once after one with nothing to try. Done once the
+    /// peer is linked or every step has started. Whether a step dialled anything.
+    fn climb(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: PeerId) -> bool {
+        let Some(p) = &self.policy else { return false };
+        let (steps, fallback) = (p.steps(), p.fallback);
+        let mut dialled = false;
+        loop {
+            let linked = ep.is_connected(&peer);
+            let Some(r) = self.remotes.get_mut(&peer) else { return dialled };
+            let Some(l) = r.ladder.as_mut() else { return dialled };
+            if linked || l.next >= steps.len() {
+                r.ladder = None;
+                return dialled;
+            }
+            if l.at > now {
+                return dialled;
+            }
+            let (step, offer, invite) = (steps[l.next], l.offer.clone(), l.invite);
+            l.next += 1;
+            if self.dial_step(now, ep, peer, &offer, step, invite) {
+                dialled = true;
+                if let Some(l) = self.remotes.get_mut(&peer).and_then(|r| r.ladder.as_mut()) {
+                    l.at = now + fallback;
+                }
+            }
+        }
+    }
+
+    /// Dials `peer`'s paths of the kinds in `step` (bits of [`PathKind::bit`]) from its offer `o`: relays it names
+    /// that this node is linked to (relay peers first, two at most), its addresses and the ports around its
+    /// prediction, and a planned punch, which dials the address it aims at. `invite`: the addresses are an
+    /// invite's, dialled as they are. Whether there was anything to dial.
+    fn dial_step(
+        &mut self,
+        now: Instant,
+        ep: &mut Endpoint<A>,
+        peer: PeerId,
+        o: &Offer<A>,
+        step: u8,
+        invite: bool,
+    ) -> bool {
+        let usable =
+            |p: &&PeerId| **p != peer && **p != self.id && ep.is_connected(p) && step & self.relay_kind(p).bit() != 0;
+        let mut vias: Vec<PeerId> = o.relays.iter().filter(usable).copied().collect();
+        vias.sort_by_key(|p| !self.relay_peers.contains(p)); // ours first, else the sender's order
+        let mut targets: Vec<Path<A>> = vias.into_iter().take(VIA_PER_DIAL).map(Path::Via).collect();
+        let direct = step & PathKind::Direct.bit() != 0;
+        if direct {
+            let addrs = if invite { o.addrs.clone() } else { self.dial_addrs(o) };
+            targets.extend(addrs.into_iter().map(Path::Direct));
+        }
+        if step & PathKind::Birthday.bit() != 0 {
+            if let Some(base) = self.plan_punch(now, ep, peer, o).map(Path::Direct) {
+                if !targets.contains(&base) {
+                    targets.push(base);
+                }
+            }
+        }
+        if targets.is_empty() {
+            return false;
+        }
+        let _ = ep.connect_with(now, peer, &targets);
+        let guesses = if direct { self.guesses(o) } else { Vec::new() };
+        if !guesses.is_empty() {
+            ep.set_guesses(now, &peer, &guesses);
+        }
+        true
+    }
+
+    /// The addresses in offer `o` this node dials: worth dialling, in a family its socket reaches, not its own.
+    fn dial_addrs(&self, o: &Offer<A>) -> Vec<A> {
+        let usable = |a: &&A| dialable(*a, self.loopback) && self.reaches(a) && !self.local.contains(a);
+        o.addrs.iter().filter(usable).cloned().collect()
+    }
+
+    /// The ports to probe around the prediction in offer `o`. A sequential symmetric NAT maps the sender's packets
+    /// to us at a port near it: probe those too (pointless from an open or symmetric NAT, which take any packet or
+    /// would burn a port per probe). Only around a public address: senders predict only for theirs.
+    fn guesses(&self, o: &Offer<A>) -> Vec<A> {
+        let loopback = self.loopback;
+        match (o.predict, o.addrs.first()) {
+            (Some(p), Some(base))
+                if self.nat != NatType::Open
+                    && !self.nat.symmetric()
+                    && is_public(base)
+                    && dialable(base, loopback) =>
+            {
+                p.window(base).into_iter().filter(|a| dialable(a, loopback) && !o.addrs.contains(a)).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether a dial to a peer (`r`) may go through `relay`, newly linked: with no policy, yes; with one, if the
+    /// relay's kind is on and its step of the dial has started (or every step has).
+    fn via_due(&self, r: &Remote<A>, relay: &PeerId) -> bool {
+        let Some(p) = &self.policy else { return true };
+        let bit = self.relay_kind(relay).bit();
+        let Some(step) = p.steps().iter().position(|s| s & bit != 0) else { return false };
+        r.ladder.as_ref().is_none_or(|l| step < l.next)
+    }
+
+    /// Moves the link to `peer` off a path the policy turned off (see [`set_policy`](Traversal::set_policy)), or
+    /// closes it if there is nowhere to go.
+    fn move_off(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: PeerId) {
+        let (Some(p), Some(path)) = (self.policy.clone(), ep.path(&peer).cloned()) else { return };
+        let r = self.remotes.entry(peer).or_default();
+        if r.moving.is_some() {
+            return;
+        }
+        let (addrs, named) = (r.addrs.clone(), r.relays.clone());
+        let mut tried = false;
+        if matches!(path, Path::Via(_)) && (p.allows(PathKind::Direct) || p.allows(PathKind::Birthday)) {
+            if p.allows(PathKind::Direct) {
+                ep.add_candidates(now, &peer, &addrs);
+            }
+            // Asks for an offer back: the peer punches to ours, and its offer may plan a punch here.
+            let room = self.room_role(&peer).is_some();
+            self.offer(now, ep, peer, true, room);
+            tried = true;
+        }
+        let current = match path {
+            Path::Via(r) => Some(r),
+            Path::Direct(_) => None,
+        };
+        let mut vias: Vec<PeerId> = Vec::new();
+        for v in named.iter().chain(&self.relay_peers) {
+            let usable = Some(*v) != current && *v != peer && ep.is_connected(v) && p.allows(self.relay_kind(v));
+            if usable && !vias.contains(v) {
+                vias.push(*v);
+            }
+        }
+        vias.sort_by_key(|v| p.rank(self.relay_kind(v))); // the preferred kind first
+        let targets: Vec<Path<A>> = vias.into_iter().take(VIA_PER_DIAL).map(Path::Via).collect();
+        let redialled = !targets.is_empty() && ep.redial(now, peer, &targets).is_ok();
+        match (tried || redialled, self.remotes.get_mut(&peer)) {
+            (true, Some(r)) => (r.moving, r.redial) = (Some(now + MOVE_WAIT), redialled),
+            _ => self.close(ep, peer),
+        }
+    }
+
+    /// Closes the link to `peer`, on a path the policy turned off, for [`poll_dropped`](Traversal::poll_dropped).
+    fn close(&mut self, ep: &mut Endpoint<A>, peer: PeerId) {
+        ep.disconnect(&peer);
+        if let Some(r) = self.remotes.get_mut(&peer) {
+            r.moving = None;
+        }
+        self.dropped.push_back(peer);
+    }
+
     /// Plans a punch with `from` after its offer, if its NAT and ours are a pair an
     /// ordinary punch can't link: a birthday punch for ours symmetric with random
     /// ports and its a cone, or the other way round; a lockstep sweep for two sequential
@@ -935,11 +1505,11 @@ impl<A: Address> Traversal<A> {
     /// it does its part), the same birthday punch with the `SymmetricIp` side's sockets,
     /// or both roles on each side for two `SymmetricIp` ones. Aimed at the offer's first
     /// address, which is public when the sender's STUN answered (and which its prediction
-    /// is for).
-    fn plan_punch(&mut self, now: Instant, ep: &Endpoint<A>, from: PeerId, o: &Offer<A>) {
+    /// is for): that address, if a punch is planned.
+    fn plan_punch(&mut self, now: Instant, ep: &Endpoint<A>, from: PeerId, o: &Offer<A>) -> Option<A> {
         let (loopback, relay_only) = (self.loopback, matches!(self.privacy, Privacy::RelayOnly { .. }));
         let v4 = |a: &A| a.to_socket_addr().is_some_and(|s| s.is_ipv4());
-        let Some(base) = o.addrs.first().filter(|a| is_public(*a) && v4(a) && dialable(*a, loopback)) else { return };
+        let base = o.addrs.first().filter(|a| is_public(*a) && v4(a) && dialable(*a, loopback))?;
         // To a peer whose offer doesn't say how its NAT maps (one that predates NB-083,
         // or isn't symmetric) this node is Symmetric, as that peer sees it.
         let mine = match self.nat {
@@ -964,17 +1534,20 @@ impl<A: Address> Traversal<A> {
                     (NatType::SymmetricIp, NatType::SymmetricIp) => Plan::Both(base.clone()),
                     (NatType::SymmetricIp, _) => Plan::Open(base.clone()),
                     (_, NatType::SymmetricIp) => Plan::Spray(base.clone()),
-                    _ => return,
+                    _ => return None,
                 },
             },
-            _ => return,
+            _ => return None,
         };
         if relay_only || matches!(ep.path(&from), Some(Path::Direct(_))) {
-            return;
+            return None;
         }
-        let Some(r) = self.remotes.get_mut(&from) else { return };
-        if r.plan.is_some() || r.plan_at.is_some_and(|t| now - t < BIRTHDAY_COOLDOWN) {
-            return;
+        let r = self.remotes.get_mut(&from)?;
+        if r.plan.is_some() {
+            return Some(base.clone());
+        }
+        if r.plan_at.is_some_and(|t| now - t < BIRTHDAY_COOLDOWN) {
+            return None;
         }
         let wait = match side {
             Plan::Open(_) | Plan::Both(_) => BIRTHDAY_OPEN_AFTER,
@@ -982,6 +1555,7 @@ impl<A: Address> Traversal<A> {
             Plan::Sweep(_) => LOCKSTEP_AFTER,
         };
         r.plan = Some((now + wait, side));
+        Some(base.clone())
     }
 
     /// The next STUN datagram to send from the endpoint's socket.
@@ -1101,28 +1675,16 @@ impl<A: Address> Traversal<A> {
         if room {
             r.member = Some(o.role);
         }
-        self.plan_punch(now, ep, from, &o);
-        let loopback = self.loopback;
-        // A sequential symmetric NAT maps the sender's packets to us at a port
-        // near its prediction: probe those too (pointless from an open or
-        // symmetric NAT, which take any packet or would burn a port per probe).
-        // Only around a public address: senders predict only for theirs.
-        let guesses: Vec<A> = match (o.predict, o.addrs.first()) {
-            (Some(p), Some(base))
-                if self.nat != NatType::Open
-                    && !self.nat.symmetric()
-                    && is_public(base)
-                    && dialable(base, loopback) =>
-            {
-                p.window(base).into_iter().filter(|a| dialable(a, loopback) && !o.addrs.contains(a)).collect()
-            }
-            _ => Vec::new(),
-        };
-        let addrs: Vec<A> = o
-            .addrs
-            .into_iter()
-            .filter(|a| dialable(a, loopback) && self.reaches(a) && !self.local.contains(a))
-            .collect();
+        let relay_only = matches!(self.privacy, Privacy::RelayOnly { .. });
+        let by_policy = self.policy.is_some() && !relay_only;
+        if !by_policy {
+            self.plan_punch(now, ep, from, &o);
+        }
+        let guesses = self.guesses(&o);
+        let addrs = self.dial_addrs(&o);
+        if let Some(r) = self.remotes.get_mut(&from) {
+            r.addrs.clone_from(&addrs);
+        }
         let mut relay = self.relay();
         let reachable = ep.is_connected(&from) || !addrs.is_empty();
         if relay.is_none()
@@ -1142,6 +1704,8 @@ impl<A: Address> Traversal<A> {
             if let Some(r) = relay.filter(|r| ep.is_connected(r) && !ep.is_connected(&from)) {
                 let _ = ep.connect_with(now, from, &[Path::Via(r)]);
             }
+        } else if by_policy {
+            self.dial_by_policy(now, ep, from, &o, &addrs, &guesses);
         } else {
             if ep.is_connected(&from) {
                 ep.add_candidates(now, &from, &addrs);
@@ -1399,7 +1963,7 @@ enum Proof {
 }
 
 /// Candidates for one peer. Sealed to it, so only it reads them.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Offer<A> {
     kind: Proof,
     /// The sender wants an offer back (it will dial when that arrives).
@@ -2320,6 +2884,79 @@ mod tests {
         t.handle_signal(now, &mut ep, Topic::peer(&me), &offer_from(&relay, &me, Some(&key), 4, Role::Peer, vec![]));
         let o = sent_offers(&mut t, &relay).remove(0);
         assert_eq!((o.relays, o.addrs.contains(&lan)), (vec![], true));
+    }
+
+    /// NB-097: a policy's steps (`Direct` and `Birthday` side by side are one), the relayed links it keeps (a relay
+    /// kind ranked before both direct ones), and the orders it takes.
+    #[test]
+    fn policy_steps_keeps_and_checks() {
+        use PathKind::*;
+        let bits = |ks: &[PathKind]| ks.iter().fold(0, |b, k| b | k.bit());
+        let steps = |order: &[PathKind]| Policy::new(order.iter().copied()).steps();
+        assert_eq!(Policy::default().steps(), vec![bits(&[Direct, Birthday]), bits(&[RelayPeers]), bits(&[Peers])]);
+        assert_eq!(steps(&[Birthday, Direct]), vec![bits(&[Direct, Birthday])]);
+        assert_eq!(steps(&[Direct, Peers, Birthday]), vec![bits(&[Direct]), bits(&[Peers]), bits(&[Birthday])]);
+        let keeps = |order: &[PathKind]| {
+            let p = Policy::new(order.iter().copied());
+            (p.keeps(RelayPeers), p.keeps(Peers))
+        };
+        assert_eq!(keeps(&[Direct, RelayPeers, Peers]), (false, false));
+        assert_eq!(keeps(&[Peers, Direct]), (false, true));
+        assert_eq!(keeps(&[RelayPeers, Birthday, Peers]), (true, false));
+        assert_eq!(keeps(&[RelayPeers, Peers]), (true, true));
+        assert!(Policy::default().is_valid() && Policy::new([Peers]).is_valid());
+        assert!(!Policy::new([]).is_valid() && !Policy::new([Direct, Peers, Direct]).is_valid());
+        assert_eq!((Policy::default().port_mapping, Policy::default().fallback), (false, Duration::from_secs(2)));
+    }
+
+    /// NB-097: under a policy an offer is dialled a step at a time, each `fallback` after the last: here through a
+    /// room member linked to both, through a relay peer and directly, in the policy's order. A kind left out is
+    /// never dialled.
+    #[test]
+    fn offers_are_dialled_in_the_steps_of_the_policy() {
+        use PathKind::*;
+        let me = id(1).peer_id();
+        let lan: SocketAddr = "10.0.0.1:7000".parse().unwrap();
+        let at = |i: u8| -> SocketAddr { format!("198.51.100.{i}:9").parse().unwrap() };
+        let (key, member, relay, joiner) = (room_key(ROOM.0, ROOM.1), id(30), id(31), id(4));
+        let o: Offer<SocketAddr> = Offer {
+            kind: Proof::Room,
+            reply: false,
+            role: Role::Peer,
+            nat: NatType::Cone,
+            says_mapping: false,
+            ts: 0,
+            nonce: 1,
+            addrs: vec![at(4)],
+            predict: None,
+            relays: vec![member.peer_id(), relay.peer_id()],
+        };
+        let mut body = o.encode();
+        body.extend(mac(&key, &[b"pw-offer", joiner.peer_id().as_bytes(), me.as_bytes(), &body]));
+        let sealed_offer = sealed::seal(&joiner, &me, [7; 32], &body).unwrap();
+        for (order, want) in [
+            (vec![Peers, RelayPeers, Direct], vec![vec![at(30)], vec![at(31)], vec![at(4)]]),
+            (vec![Direct, Birthday, Peers], vec![vec![at(4)], vec![at(30)], vec![]]),
+            (vec![RelayPeers], vec![vec![at(31)], vec![], vec![]]),
+        ] {
+            let (mut t, mut ep) = in_room(Role::Peer, None, lan);
+            let now = Instant::from_millis(10);
+            link(&mut ep, lan, &member, at(30), now);
+            link(&mut ep, lan, &relay, at(31), now);
+            t.set_relay_peers(vec![relay.peer_id()]);
+            t.set_policy(now, &mut ep, Some(Policy::new(order.clone())));
+            while ep.poll_transmit(now).is_some() {}
+            t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed_offer);
+            let mut got = vec![dials(&mut ep, now)];
+            for k in 1..3 {
+                let (before, later) = (now + Duration::from_millis(2000 * k - 1), now + Duration::from_secs(2 * k));
+                t.handle_timeout(before, &mut ep);
+                assert_eq!(dials(&mut ep, later), Vec::<SocketAddr>::new(), "{order:?}: not before `fallback`");
+                t.handle_timeout(later, &mut ep);
+                got.push(dials(&mut ep, later));
+            }
+            assert_eq!(got, want, "{order:?}");
+        }
     }
 
     /// NB-042: an offer's addresses are dialled only in the families the socket

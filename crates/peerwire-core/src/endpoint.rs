@@ -209,6 +209,9 @@ pub enum DisconnectReason {
     /// the old link is lost.
     Replaced,
     ProtocolViolation,
+    /// Closed by this end's host: the path the link took was turned off and no path still allowed took it over
+    /// (the connection policy of a `peerwire` node). The endpoint itself never raises it.
+    PathOff,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -835,6 +838,19 @@ fn on_slow<A: Address>(path: &Path<A>, slow: &Option<A>) -> bool {
     slow.is_some() && path.direct() == slow.as_ref()
 }
 
+/// Whether `sess` is a live link that stays on its relay ([`Endpoint::set_keep_relayed`]).
+fn kept<A: Address>(keep: &(Vec<PeerId>, bool, bool), sess: &Session<A>) -> bool {
+    matches!((&sess.state, &sess.path), (State::Live(_), Path::Via(r)) if keeps(keep, r))
+}
+
+/// Whether links through `relay` stay on it ([`Endpoint::set_keep_relayed`]).
+fn keeps(keep: &(Vec<PeerId>, bool, bool), relay: &PeerId) -> bool {
+    match keep.0.contains(relay) {
+        true => keep.1,
+        false => keep.2,
+    }
+}
+
 /// A sans-IO P2P endpoint: one identity, any number of encrypted links.
 pub struct Endpoint<A: Address> {
     me: PeerId,
@@ -858,6 +874,9 @@ pub struct Endpoint<A: Address> {
     events: VecDeque<Event<A>>,
     stats: Stats,
     relay_only: bool,
+    /// Relayed links that stay relayed ([`Endpoint::set_keep_relayed`]): through a relay listed here if `.1`,
+    /// through any other if `.2`.
+    keep_relayed: (Vec<PeerId>, bool, bool),
     /// Node-wide relay bucket (`Config::relay_total_rate`): tokens and last refill.
     relay_total: (u64, Option<Instant>),
 }
@@ -881,6 +900,7 @@ impl<A: Address> Endpoint<A> {
             events: VecDeque::new(),
             stats: Stats::default(),
             relay_only: false,
+            keep_relayed: (Vec::new(), false, false),
             relay_total: (0, None),
         }
     }
@@ -932,6 +952,27 @@ impl<A: Address> Endpoint<A> {
     /// Whether [`set_relay_only`](Endpoint::set_relay_only) is on.
     pub fn relay_only(&self) -> bool {
         self.relay_only
+    }
+
+    /// Keeps relayed links on their relay: a link through one of `relays` if `listed`, through any other relay if
+    /// `others`. Such a link takes no direct candidates (given, or learned from a relay's origin tag or the peer's
+    /// direct traffic), never punches, and doesn't answer a punch at this endpoint's address, so neither end moves
+    /// it to a direct path; guesses and sprays for it are ignored, and [`opener`](Endpoint::opener) gives `None`.
+    /// Unlike [`set_relay_only`](Endpoint::set_relay_only) it hides no address and leaves dials and direct links
+    /// alone, and the link may still follow the peer to another relay. A kept link stops punching at once. Replaces
+    /// the last call; by default no link is kept.
+    pub fn set_keep_relayed(&mut self, relays: &[PeerId], listed: bool, others: bool) {
+        self.keep_relayed = (relays.to_vec(), listed, others);
+        let keep = &self.keep_relayed;
+        for sess in self.sessions.values_mut() {
+            if kept(keep, sess) {
+                sess.punch = None;
+                sess.candidates.clear();
+                sess.guesses.clear();
+                sess.guess_probes = 0;
+                sess.spray = None;
+            }
+        }
     }
 
     fn shares_addresses(&self) -> bool {
@@ -1195,9 +1236,23 @@ impl<A: Address> Endpoint<A> {
         Ok(())
     }
 
+    /// [`connect_with`](Endpoint::connect_with), also for a peer already linked, to move its link to other paths:
+    /// the old link carries traffic until the new handshake completes and replaces it (at both ends, `Disconnected`
+    /// with [`DisconnectReason::Replaced`], then `Connected` on the new path). If the dial fails
+    /// (`ConnectFailed`), the old link stays.
+    pub fn redial(&mut self, now: Instant, peer: PeerId, targets: &[Path<A>]) -> Result<(), ConnectError> {
+        let live = self.peers.remove(&peer);
+        let dialled = self.connect_with(now, peer, targets);
+        if let Some(idx) = live {
+            self.peers.insert(peer, idx);
+        }
+        dialled
+    }
+
     /// Adds direct addresses (learned through signalling) for a dialling or
     /// relayed peer, and starts punching towards them. Ignored while relay-only
-    /// for a peer reached, or being dialled, through a relay.
+    /// for a peer reached, or being dialled, through a relay, and for a link
+    /// kept on its relay ([`set_keep_relayed`](Endpoint::set_keep_relayed)).
     pub fn add_candidates(&mut self, now: Instant, peer: &PeerId, addrs: &[A]) {
         if let Some(&idx) = self.peers.get(peer) {
             for a in addrs {
@@ -1211,10 +1266,11 @@ impl<A: Address> Endpoint<A> {
 
     fn add_candidate(&mut self, now: Instant, idx: u32, a: A) {
         let (max, relay_only, direct) = (self.config.max_candidates, self.relay_only, self.config.share_addresses);
+        let keep = &self.keep_relayed;
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         // The slow address isn't punched to: a relay beats it.
         let known = sess.path.direct() == Some(&a) || sess.slow.as_ref() == Some(&a);
-        if known || (relay_only && matches!(sess.path, Path::Via(_))) {
+        if known || (relay_only && matches!(sess.path, Path::Via(_))) || kept(keep, sess) {
             return;
         }
         if !sess.candidates.contains(&a) {
@@ -1237,9 +1293,10 @@ impl<A: Address> Endpoint<A> {
         }
         let until = now + self.config.punch_duration;
         let token = self.rng.next_u64();
+        let keep = &self.keep_relayed;
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         let nothing = sess.candidates.is_empty() && sess.guesses.is_empty() && sess.spray.is_none();
-        if !matches!(sess.path, Path::Via(_)) || nothing || !matches!(sess.state, State::Live(_)) {
+        if !matches!(sess.path, Path::Via(_)) || nothing || !matches!(sess.state, State::Live(_)) || kept(keep, sess) {
             return;
         }
         match &mut sess.punch {
@@ -1363,17 +1420,19 @@ impl<A: Address> Endpoint<A> {
     /// answers from it. Replaces the peer's earlier guesses; keeps at most
     /// 64 (`MAX_GUESSES`). The same guesses again change nothing, and new ones are
     /// sent to at once without repeating the old. Ignored for a peer a relay-only
-    /// endpoint reaches through a relay, or linked directly.
+    /// endpoint reaches through a relay, linked directly, or kept on its relay
+    /// ([`set_keep_relayed`](Endpoint::set_keep_relayed)).
     pub fn set_guesses(&mut self, now: Instant, peer: &PeerId, addrs: &[A]) {
         let Some(&idx) = self.peers.get(peer).or_else(|| self.dialing.get(peer)) else { return };
         let relay_only = self.relay_only;
+        let keep = &self.keep_relayed;
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         let relayed = match &sess.state {
             State::Dialing(d) => d.targets.iter().any(|t| matches!(t, Path::Via(_))),
             State::Live(_) => matches!(sess.path, Path::Via(_)),
         };
         let direct = matches!(sess.state, State::Live(_)) && !relayed;
-        if (relay_only && relayed) || direct {
+        if (relay_only && relayed) || direct || kept(keep, sess) {
             return;
         }
         let known = |a: &A| sess.candidates.contains(a) || sess.path.direct() == Some(a);
@@ -1404,8 +1463,10 @@ impl<A: Address> Endpoint<A> {
     /// mapping; one probe that lands on one of them lets that socket's answer
     /// through our NAT, and the link takes that path. While dialling, the probes
     /// are the handshake; on a relayed link, punches. Replaces an earlier spray
-    /// for the peer; ignored for a peer linked directly, or reached through a
-    /// relay by a relay-only endpoint, and for addresses without ports.
+    /// for the peer; ignored for a peer linked directly, reached through a relay
+    /// by a relay-only endpoint or kept on its relay
+    /// ([`set_keep_relayed`](Endpoint::set_keep_relayed)), and for addresses
+    /// without ports.
     pub fn spray(&mut self, now: Instant, peer: &PeerId, addr: &A, count: u16) {
         let Some(base_port) = addr.to_socket_addr().map(|s| s.port()) else { return };
         let start = self.rng.next_u32() % SPRAY_RANGE;
@@ -1430,12 +1491,13 @@ impl<A: Address> Endpoint<A> {
     fn start_spray(&mut self, now: Instant, peer: &PeerId, targets: Targets<A>, count: u16) {
         let Some(&idx) = self.peers.get(peer).or_else(|| self.dialing.get(peer)) else { return };
         let relay_only = self.relay_only;
+        let keep = &self.keep_relayed;
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         let relayed = match &sess.state {
             State::Dialing(d) => d.targets.iter().any(|t| matches!(t, Path::Via(_))),
             State::Live(_) => matches!(sess.path, Path::Via(_)),
         };
-        if (relay_only && relayed) || (matches!(sess.state, State::Live(_)) && !relayed) {
+        if (relay_only && relayed) || (matches!(sess.state, State::Live(_)) && !relayed) || kept(keep, sess) {
             return;
         }
         let count = count.min(MAX_SPRAY);
@@ -1452,17 +1514,19 @@ impl<A: Address> Endpoint<A> {
     /// The host then hands the endpoint what each socket receives and sends
     /// replies to that sender from the socket that heard it. The handshake while
     /// dialling, a punch on a relayed link (which starts punching); `None` once
-    /// linked directly, for a relay-only endpoint's relayed link, or with no link
-    /// or dial.
+    /// linked directly, for a relay-only endpoint's relayed link or a kept one
+    /// ([`set_keep_relayed`](Endpoint::set_keep_relayed)), or with no link or dial.
     pub fn opener(&mut self, now: Instant, peer: &PeerId) -> Option<Vec<u8>> {
         let &idx = self.peers.get(peer).or_else(|| self.dialing.get(peer))?;
         let token = self.rng.next_u64();
         let until = now + self.config.punch_duration;
         let relay_only = self.relay_only;
+        let keep = &self.keep_relayed;
         let sess = self.sessions.get_mut(&idx)?;
+        let kept = kept(keep, sess);
         match &mut sess.state {
             State::Dialing(d) => Some(d.hs1.clone()),
-            State::Live(link) if matches!(sess.path, Path::Via(_)) && !relay_only => {
+            State::Live(link) if matches!(sess.path, Path::Via(_)) && !relay_only && !kept => {
                 let p = sess.punch.get_or_insert(Punch { token, next_at: now, until, round: 0, relays: Vec::new() });
                 p.until = p.until.max(until);
                 seal_punch(link, false, p.token)
@@ -2061,9 +2125,11 @@ impl<A: Address> Endpoint<A> {
                         relayed.push((packet.to_vec(), A::decode(addr)));
                     }
                 }
-                // A relay-only endpoint never answers at its own address on a relayed link.
+                // A relay-only endpoint never answers at its own address on a relayed link, nor any on a kept one.
                 Ok(Frame::Punch(t)) => {
-                    if let (Some(a), false) = (&direct_from, self.relay_only && matches!(sess.path, Path::Via(_))) {
+                    let kept = matches!(&sess.path, Path::Via(r) if keeps(&self.keep_relayed, r));
+                    let stays = (self.relay_only && matches!(sess.path, Path::Via(_))) || kept;
+                    if let (Some(a), false) = (&direct_from, stays) {
                         punch_acks.push((a.clone(), t));
                     } else if let Path::Via(r) = &from {
                         // Through a relay: answered through it only if this end would
@@ -2934,6 +3000,79 @@ mod tests {
         assert_eq!(eps[0].path(&b), Some(&Path::Via(r)), "the dial completes through r");
         let to_c: Vec<u32> = sent.iter().filter(|&&(i, d)| i == 0 && to_c(&d)).map(|s| s.1).collect();
         assert!([21, 22, 23].into_iter().chain(500..600).all(|x| to_c.contains(&x)), "{to_c:?}");
+    }
+
+    /// NB-097: a link kept on its relay (`set_keep_relayed`, by its relay or as any other) takes no candidates and
+    /// answers none of the peer's punches, so neither end moves it to a direct path, though the peer learns a's
+    /// address from the relay's origin tag and punches to it. Let go, it moves to the first address that answers.
+    #[test]
+    fn kept_relayed_links_stay_on_their_relay() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b, r) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id());
+        for (listed, others) in [(true, false), (false, true)] {
+            let mut eps: Vec<Endpoint<u32>> =
+                ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+            let mut t = Instant::from_millis(1);
+            eps[0].connect(t, 3, r).unwrap();
+            eps[1].connect(t, 3, r).unwrap();
+            route(&mut eps, &mut t, 100, None);
+            let relays = if listed { vec![r] } else { vec![] };
+            eps[0].set_keep_relayed(&relays, listed, others);
+            eps[0].connect_via(t, r, b, &[]).unwrap();
+            route(&mut eps, &mut t, 200, None);
+            assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(r)), Some(&Path::Via(r))));
+            eps[0].add_candidates(t, &b, &[2]);
+            eps[0].set_guesses(t, &b, &[20, 21]);
+            eps[0].spray(t, &b, &2, 64);
+            assert_eq!(eps[0].opener(t, &b), None);
+            route(&mut eps, &mut t, 6000, None);
+            assert!(eps[1].stats().punches_sent > 0, "b punches to a's address, learned from r");
+            assert_eq!((eps[0].stats().punches_sent, eps[0].stats().spray_probes), (0, 0));
+            assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(r)), Some(&Path::Via(r))));
+
+            eps[0].set_keep_relayed(&[], false, false);
+            eps[0].add_candidates(t, &b, &[2]);
+            route(&mut eps, &mut t, 1000, None);
+            assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(2)), Some(&Path::Direct(1))));
+        }
+    }
+
+    /// NB-097: `redial` dials a linked peer anyway. The old link carries traffic until the new handshake replaces
+    /// it, at both ends (`Replaced`, then `Connected` on the new path); a redial that fails leaves it up.
+    #[test]
+    fn redial_replaces_a_live_link_and_a_failed_one_leaves_it() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b, r) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, 3, r).unwrap();
+        eps[1].connect(t, 3, r).unwrap();
+        eps[0].connect(t, 2, b).unwrap();
+        route(&mut eps, &mut t, 200, None);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)));
+        for ep in eps.iter_mut() {
+            events(ep);
+        }
+        // Kept there, as a node whose policy turned direct paths off keeps it.
+        eps[0].set_keep_relayed(&[r], true, false);
+        eps[0].redial(t, b, &[Path::Via(r)]).unwrap();
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)), "the old link until the new one is up");
+        route(&mut eps, &mut t, 300, None);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(r)), Some(&Path::Via(r))));
+        let replaced = |peer| Event::Disconnected { peer, reason: DisconnectReason::Replaced };
+        let connected = |peer, initiator| Event::Connected { peer, path: Path::Via(r), initiator };
+        assert_eq!(events(&mut eps[0]), vec![replaced(b), connected(b, true)]);
+        assert_eq!(events(&mut eps[1]), vec![replaced(a), connected(a, false)]);
+
+        eps[0].redial(t, b, &[Path::Direct(9)]).unwrap(); // nobody there
+        route(&mut eps, &mut t, 30_000, None);
+        assert_eq!(events(&mut eps[0]), vec![Event::ConnectFailed { peer: b }]);
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(r)));
+        eps[0].send(&b, Lane::Reliable, b"still up").unwrap();
+        route(&mut eps, &mut t, 200, None);
+        let got = events(&mut eps[1]);
+        assert!(got.iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"still up")), "{got:?}");
     }
 
     /// Relay-only, a direct dial also given a relay while pending keeps its

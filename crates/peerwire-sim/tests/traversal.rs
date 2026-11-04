@@ -4,10 +4,10 @@
 //! invite or address is exchanged out of band.
 
 use peerwire::traversal::{
-    Failure, NatType, Privacy, Role, Side, Signal, Traversal, BIRTHDAY_PROBES, BIRTHDAY_SOCKETS,
+    Failure, NatType, PathKind, Policy, Privacy, Role, Side, Signal, Traversal, BIRTHDAY_PROBES, BIRTHDAY_SOCKETS,
 };
 use peerwire::Topic;
-use peerwire_core::{Config, Event, Lane, Path, PeerId};
+use peerwire_core::{Config, DisconnectReason, Event, Lane, Path, PeerId};
 use peerwire_sim::{Dependence, NatConfig, NetConfig, PortAlloc, Sim, SimAddr};
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
@@ -73,6 +73,8 @@ struct Peer {
     trav: Traversal<SimAddr>,
     topics: BTreeSet<Topic>,
     events: Vec<Event<SimAddr>>,
+    /// Links its policy closed ([`Traversal::poll_dropped`]).
+    dropped: Vec<PeerId>,
 }
 
 /// A simulated internet with two STUN servers, the first asked on two ports as in
@@ -133,7 +135,7 @@ impl World {
         let seed = [node as u8 + 1; 32];
         let local = [Some(self.sim.addr(node)), self.sim.nodes[node].addr6].into_iter().flatten().collect();
         let trav = Traversal::new(&identity, seed, BASE_MS, local, self.stun.clone());
-        self.peers.push(Peer { node, trav, topics: BTreeSet::new(), events: Vec::new() });
+        self.peers.push(Peer { node, trav, topics: BTreeSet::new(), events: Vec::new(), dropped: Vec::new() });
         self.peers.len() - 1
     }
 
@@ -144,6 +146,11 @@ impl World {
     fn set_privacy(&mut self, p: usize, privacy: Privacy) {
         let ep = &mut self.sim.nodes[self.peers[p].node].endpoint;
         self.peers[p].trav.set_privacy(ep, privacy);
+    }
+
+    fn set_policy(&mut self, p: usize, policy: Option<Policy>) {
+        let (now, ep) = (self.sim.now, &mut self.sim.nodes[self.peers[p].node].endpoint);
+        self.peers[p].trav.set_policy(now, ep, policy);
     }
 
     fn join(&mut self, p: usize, room: &str, role: Role) {
@@ -175,6 +182,7 @@ impl World {
                 peer.trav.handle_event(now, &mut n.endpoint, &e);
                 peer.events.push(e);
             }
+            peer.dropped.extend(std::iter::from_fn(|| peer.trav.poll_dropped()));
             let stun: Vec<_> = std::iter::from_fn(|| peer.trav.poll_transmit()).collect();
             let signals: Vec<_> = std::iter::from_fn(|| peer.trav.poll_signal()).collect();
             let birthdays: Vec<_> = std::iter::from_fn(|| peer.trav.poll_birthday()).collect();
@@ -1092,4 +1100,144 @@ fn privacy_modes_matrix() {
     // On one LAN, Direct links over the LAN; PublicOnly gave the LAN address to no
     // one, and the NAT doesn't hairpin, so the pair goes through the host.
     assert_eq!(lan, vec![Link::Direct, Link::Relayed, Link::Relayed]);
+}
+
+/// NB-097: A and B, of kinds `a` and `b`, each linked directly to a public peer for each entry of `relays` (a relay
+/// peer of both where it is true), under `policy`, then in a room. Returns the world, A, B and the relays.
+fn pair_with_relays(
+    seed: u64,
+    a: &str,
+    b: &str,
+    relays: &[bool],
+    policy: Option<Policy>,
+) -> (World, usize, usize, Vec<usize>) {
+    let mut w = World::new(seed);
+    let (pa, pb) = (w.add(&kind(a)), w.add(&kind(b)));
+    let rs: Vec<usize> = relays.iter().map(|_| w.add(&Kind::Public)).collect();
+    w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+    let ours: Vec<PeerId> = rs.iter().zip(relays).filter(|(_, ours)| **ours).map(|(r, _)| w.id(*r)).collect();
+    for p in [pa, pb] {
+        for &r in &rs {
+            let (now, rid, at) = (w.sim.now, w.id(r), w.sim.addr(w.peers[r].node));
+            w.sim.nodes[w.peers[p].node].endpoint.connect_with(now, rid, &[Path::Direct(at)]).unwrap();
+        }
+        w.peers[p].trav.set_relay_peers(ours.clone());
+        w.set_policy(p, policy.clone());
+    }
+    assert!(w.run_until(Duration::from_secs(2), |w| rs.iter().all(|&r| w.connected(pa, r) && w.connected(pb, r))));
+    w.join(pa, "pair", Role::Peer);
+    w.join(pb, "pair", Role::Peer);
+    (w, pa, pb, rs)
+}
+
+/// NB-097: under `[Peers, Direct]` two port-restricted peers link through a peer linked to both and stay there:
+/// neither end punches, nor answers the other's punches. With no policy the same pair ends up direct.
+#[test]
+fn a_relay_first_policy_never_moves_a_link_to_direct() {
+    let relay_first = Policy::new([PathKind::Peers, PathKind::Direct]);
+    for seed in 0..3 {
+        for policy in [None, Some(relay_first.clone())] {
+            let (mut w, a, b, rs) = pair_with_relays(1900 + seed, "port-restr", "port-restr", &[false], policy.clone());
+            let via = Some(Path::Via(w.id(rs[0])));
+            assert!(w.run_until(Duration::from_secs(5), |w| w.connected(a, b)), "seed {seed}");
+            if policy.is_none() {
+                assert!(w.run_until(Duration::from_secs(10), |w| w.direct(a, b)), "seed {seed}: {:?}", w.path(a, b));
+                continue;
+            }
+            assert_eq!((w.path(a, b), w.path(b, a)), (via.clone(), via.clone()), "seed {seed}: through the peer");
+            w.run_until(Duration::from_secs(10), |_| false);
+            assert_eq!((w.path(a, b), w.path(b, a)), (via.clone(), via), "seed {seed}: and stays");
+            let stats = |p: usize| w.sim.nodes[w.peers[p].node].endpoint.stats();
+            let (sa, sb) = (stats(a), stats(b));
+            assert_eq!((sa.punches_sent, sb.punches_sent, sa.punch_succeeded, sb.punch_succeeded), (0, 0, 0, 0));
+        }
+    }
+}
+
+/// NB-097: a link through a room peer whose `Peers` kind is turned off moves, or goes. (1) With `Direct` still on
+/// and NATs a punch gets through, it moves to a direct path, as core moves a relayed link. (2) On symmetric NATs,
+/// with a relay peer linked to both still allowed, it is dialled again through that one, which replaces it at
+/// both ends. (3) With neither, it is closed after the 6 s a move gets, and reported dropped.
+#[test]
+fn turning_peers_off_moves_a_relayed_link_or_drops_it() {
+    use PathKind::*;
+    let replaced = |w: &World, p: usize, from: PeerId| {
+        let gone = Event::Disconnected { peer: from, reason: DisconnectReason::Replaced };
+        w.peers[p].events.contains(&gone)
+    };
+    // (1) Both ends turn it off: they punch, and the link goes direct.
+    let (mut w, a, b, rs) =
+        pair_with_relays(1950, "port-restr", "port-restr", &[false], Some(Policy::new([Peers, Direct])));
+    assert!(w.run_until(Duration::from_secs(5), |w| w.connected(a, b)));
+    assert_eq!(w.path(a, b), Some(Path::Via(w.id(rs[0]))));
+    for p in [a, b] {
+        w.set_policy(p, Some(Policy::new([Direct])));
+    }
+    assert!(w.run_until(Duration::from_secs(6), |w| w.direct(a, b)), "(1): {:?}", w.path(a, b));
+    assert!(w.peers[a].dropped.is_empty() && w.peers[b].dropped.is_empty());
+
+    // (2) A alone turns it off: A dials B again through the relay peer, and both move there.
+    let order = Policy::new([Peers, RelayPeers, Direct]);
+    let (mut w, a, b, rs) = pair_with_relays(1951, "sym-random", "sym-random", &[false, true], Some(order));
+    let (r, rp) = (Path::Via(w.id(rs[0])), Path::Via(w.id(rs[1])));
+    assert!(w.run_until(Duration::from_secs(5), |w| w.connected(a, b)));
+    assert_eq!((w.path(a, b), w.path(b, a)), (Some(r.clone()), Some(r)));
+    w.set_policy(a, Some(Policy::new([RelayPeers, Direct])));
+    let moved = |w: &World| w.path(a, b) == Some(rp.clone()) && w.path(b, a) == Some(rp.clone());
+    assert!(w.run_until(Duration::from_secs(6), moved), "(2): {:?} {:?}", w.path(a, b), w.path(b, a));
+    w.run_until(Duration::from_secs(8), |_| false);
+    assert!(replaced(&w, a, w.id(b)) && replaced(&w, b, w.id(a)), "(2): one new link at both ends");
+    assert!(moved(&w) && w.peers[a].dropped.is_empty(), "(2): it stays");
+
+    // (3) Through the relay peer, which A turns off with nothing else to take: the link goes.
+    let (mut w, a, b, rs) =
+        pair_with_relays(1952, "sym-random", "sym-random", &[true], Some(Policy::new([RelayPeers, Direct])));
+    assert!(w.run_until(Duration::from_secs(5), |w| w.connected(a, b)));
+    assert_eq!(w.path(a, b), Some(Path::Via(w.id(rs[0]))));
+    w.set_policy(a, Some(Policy::new([Direct, Birthday])));
+    w.run_until(Duration::from_secs(5), |_| false);
+    assert!(w.connected(a, b) && w.peers[a].dropped.is_empty(), "(3): up while it tries to punch");
+    assert!(w.run_until(Duration::from_secs(2), |w| !w.peers[a].dropped.is_empty()));
+    assert_eq!(w.peers[a].dropped, vec![w.id(b)]);
+    assert!(!w.sim.nodes[w.peers[a].node].endpoint.is_connected(&w.id(b)));
+    let closed = |w: &World| {
+        let aid = w.id(a);
+        w.peers[b].events.contains(&Event::Disconnected { peer: aid, reason: DisconnectReason::ClosedByPeer })
+    };
+    assert!(w.run_until(Duration::from_secs(1), closed));
+}
+
+/// NB-097: STUN servers swapped live are asked at once, and the link stays up; with none, the public address and
+/// NAT type are forgotten, and the link still stays up.
+#[test]
+fn stun_servers_swap_live_and_links_stay() {
+    let mut w = World::new(1960);
+    let (a, b) = (w.add(&kind("port-restr")), w.add(&kind("full-cone")));
+    w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+    w.join(a, "pair", Role::Peer);
+    w.join(b, "pair", Role::Peer);
+    assert!(w.run_until(Duration::from_secs(10), |w| w.direct(a, b)));
+    let public = *w.peers[a].trav.public_addr().unwrap();
+    let (s1, s2) = (w.sim.add_stun_server(), w.sim.add_stun_server());
+    let fresh = vec![s1, s2, SimAddr::new(s1.ip, s1.port + 1)];
+    w.peers[a].trav.set_stun_servers(fresh.clone());
+    let (now, node) = (w.sim.now, w.peers[a].node);
+    w.peers[a].trav.handle_timeout(now, &mut w.sim.nodes[node].endpoint);
+    let mut asked = Vec::new();
+    while let Some(t) = w.peers[a].trav.poll_transmit() {
+        asked.push(t.dst);
+        w.sim.send_raw(node, t.dst, t.payload);
+    }
+    assert_eq!(asked, fresh, "asked at once");
+    w.run_until(Duration::from_secs(2), |_| false);
+    assert!(w.direct(a, b));
+    assert_eq!((w.peers[a].trav.public_addr(), w.peers[a].trav.nat_type()), (Some(&public), NatType::Cone));
+
+    w.peers[a].trav.set_stun_servers(Vec::new());
+    assert_eq!((w.peers[a].trav.public_addr(), w.peers[a].trav.nat_type()), (None, NatType::Unknown));
+    w.run_until(Duration::from_secs(2), |_| false);
+    let (na, nb) = (w.peers[a].node, w.peers[b].node);
+    w.sim.send(na, nb, Lane::Reliable, b"still up").unwrap();
+    w.run_until(Duration::from_secs(1), |w| w.peers[b].events.iter().any(|e| matches!(e, Event::Message { .. })));
+    assert_eq!(w.messages(b), vec![b"still up".to_vec()]);
 }

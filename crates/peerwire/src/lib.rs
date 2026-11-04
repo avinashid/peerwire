@@ -75,7 +75,7 @@ pub use peerwire_core::{
 };
 pub use portmap::{MapProtocol, PortMapping};
 pub use signaling::{MemoryHub, MemorySignaling, MultiSignaling, Signaling, Topic};
-pub use traversal::{Failure, NatType, Privacy, Role, Side};
+pub use traversal::{Failure, NatType, PathKind, Policy, Privacy, Role, Side};
 
 /// An event from a [`Node`]: a peer connected or left, a message arrived, a link moved.
 pub type Event = peerwire_core::Event<std::net::SocketAddr>;

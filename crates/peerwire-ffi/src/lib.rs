@@ -400,6 +400,7 @@ fn encode_event(e: Event<u32>) -> Vec<u8> {
                 DisconnectReason::ClosedByPeer => 1,
                 DisconnectReason::Replaced => 2,
                 DisconnectReason::ProtocolViolation => 3,
+                DisconnectReason::PathOff => 4,
             });
         }
         Event::ConnectFailed { peer } => head(4, &peer),

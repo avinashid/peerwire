@@ -1,9 +1,10 @@
 use crate::portmap::{self, PortMapping, Worker};
 use crate::signaling::Signaling;
-use crate::traversal::{Birthday, Failure, NatType, Privacy, Role, Signal, Traversal};
+use crate::traversal::{Birthday, Failure, NatType, PathKind, Policy, Privacy, Role, Signal, Traversal};
 use crate::Event;
 use peerwire_core::{
-    Config, ConnectError, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError, Stats, Transmit,
+    Config, ConnectError, DisconnectReason, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError,
+    Stats, Transmit,
 };
 use rand_core::{OsRng, RngCore};
 use std::collections::{HashMap, VecDeque};
@@ -55,11 +56,13 @@ pub enum Status {
     Connected,
 }
 
-/// Why [`Node::connect`] or [`Node::set_relay_peers`] failed.
+/// Why [`Node::connect`], [`Node::set_relay_peers`] or [`Node::set_policy`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The string is not an `pw:` invite.
     InvalidInvite,
+    /// The policy's order is empty or lists a kind twice ([`Policy::is_valid`]).
+    InvalidPolicy,
     /// The dial didn't start: the invite names this node ([`ConnectError::SelfConnect`])
     /// or a key that isn't valid ([`ConnectError::InvalidPeerId`]), it lists no address
     /// in an IP family this socket reaches and no relay this node is linked to
@@ -72,6 +75,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::InvalidInvite => f.write_str("not a valid pw: invite"),
+            Error::InvalidPolicy => f.write_str("a policy lists each kind of path at most once, and at least one"),
             Error::Connect(e) => write!(f, "cannot dial: {e}"),
         }
     }
@@ -90,6 +94,7 @@ pub struct Builder {
     /// PCP/NAT-PMP server and SSDP target, instead of the default gateway's (tests).
     portmap_at: Option<(SocketAddr, SocketAddr)>,
     relay_peers: Vec<String>,
+    policy: Option<Policy>,
 }
 
 impl Builder {
@@ -138,6 +143,7 @@ impl Builder {
     /// its own, for IPv4 and dual-stack sockets not bound to loopback. It doesn't run while the
     /// node is under [`Privacy::RelayOnly`], which gives out no address (see
     /// [`PortMapping::RelayOnly`]). See [`Node::port_mapping`]. Default: off.
+    /// With a [`policy`](Builder::policy), the policy's `port_mapping` decides instead.
     pub fn port_mapping(mut self, on: bool) -> Self {
         self.port_mapping = on;
         self
@@ -160,9 +166,19 @@ impl Builder {
         self
     }
 
+    /// Which paths links may take, and in what order: see [`Policy`] and [`Node::set_policy`].
+    /// [`bind`](Builder::bind) fails with [`ErrorKind::InvalidInput`] if it is not valid. Default: none, every path.
+    pub fn policy(mut self, policy: Policy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
     /// Binds the UDP socket: `"[::]:0"` for any interface, IPv4 and IPv6, and a
     /// free port (see [`Node::bind`]).
     pub fn bind(self, addr: impl ToSocketAddrs) -> io::Result<Node> {
+        if self.policy.as_ref().is_some_and(|p| !p.is_valid()) {
+            return Err(io::Error::new(ErrorKind::InvalidInput, Error::InvalidPolicy));
+        }
         let sock = bind_socket(addr)?;
         sock.set_nonblocking(true)?;
         let local = sock.local_addr()?;
@@ -179,8 +195,7 @@ impl Builder {
         let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let mut trav = Traversal::new(&identity, seed, unix_ms, local_addresses(local), stun);
         trav.set_privacy(&mut ep, self.privacy);
-        // Starts paused: sync_port_mapping starts it unless relay-only.
-        let port_mapping = if self.port_mapping { PortMapping::RelayOnly } else { PortMapping::Off };
+        trav.set_policy(peerwire_core::Instant::ZERO, &mut ep, self.policy);
         let mut node = Node {
             sock,
             local,
@@ -193,7 +208,8 @@ impl Builder {
             pending: VecDeque::new(),
             buf: Box::new([0; 2048]),
             portmap: None,
-            port_mapping,
+            port_mapping: PortMapping::Off, // sync_port_mapping starts it, if asked for and not relay-only
+            map_asked: self.port_mapping,
             portmap_at: self.portmap_at,
             releasing: None,
             relay_peers: Vec::new(),
@@ -222,6 +238,8 @@ pub struct Node {
     buf: Box<[u8; 2048]>,
     portmap: Option<Worker>,
     port_mapping: PortMapping,
+    /// [`Builder::port_mapping`]: whether to map with no policy.
+    map_asked: bool,
     portmap_at: Option<(SocketAddr, SocketAddr)>,
     /// A worker stopped by a switch to relay-only, deleting its mapping.
     releasing: Option<Worker>,
@@ -287,7 +305,7 @@ impl Node {
     }
 
     /// Options: identity, config, STUN servers, signaling, privacy, router port
-    /// mapping and relay peers. See [`Builder`].
+    /// mapping, relay peers and the paths links take. See [`Builder`].
     pub fn builder() -> Builder {
         Builder {
             identity: None,
@@ -298,6 +316,7 @@ impl Node {
             port_mapping: false,
             portmap_at: None,
             relay_peers: Vec::new(),
+            policy: None,
         }
     }
 
@@ -351,24 +370,93 @@ impl Node {
         self.sync_port_mapping();
     }
 
-    /// Runs router port mapping, when asked for, only while not relay-only.
+    /// Runs router port mapping while it is asked for (by the policy, with `Direct` on, or with none by
+    /// [`Builder::port_mapping`]), and only while not relay-only.
     fn sync_port_mapping(&mut self) {
-        if self.port_mapping == PortMapping::Off {
+        let asked = match self.trav.policy() {
+            Some(p) => p.port_mapping && p.allows(PathKind::Direct),
+            None => self.map_asked,
+        };
+        if asked && !matches!(self.privacy(), Privacy::RelayOnly { .. }) {
+            if matches!(self.port_mapping, PortMapping::Off | PortMapping::RelayOnly) {
+                // The old mapping's delete goes out before the new request.
+                drop(self.releasing.take());
+                self.portmap = start_port_mapping(self.local, self.portmap_at);
+                self.port_mapping = if self.portmap.is_some() { PortMapping::Trying } else { PortMapping::Unavailable };
+            }
             return;
         }
-        if matches!(self.privacy(), Privacy::RelayOnly { .. }) {
-            if let Some(w) = self.portmap.take() {
-                w.stop();
-                self.releasing = Some(w);
-            }
-            self.port_mapping = PortMapping::RelayOnly;
-            self.trav.set_mapped(None);
-        } else if self.port_mapping == PortMapping::RelayOnly {
-            // The old mapping's delete goes out before the new request.
-            drop(self.releasing.take());
-            self.portmap = start_port_mapping(self.local, self.portmap_at);
-            self.port_mapping = if self.portmap.is_some() { PortMapping::Trying } else { PortMapping::Unavailable };
+        if let Some(w) = self.portmap.take() {
+            w.stop();
+            self.releasing = Some(w);
         }
+        self.port_mapping = if asked { PortMapping::RelayOnly } else { PortMapping::Off };
+        self.trav.set_mapped(None);
+    }
+
+    /// The paths this node's links may take, if a policy is set ([`set_policy`](Node::set_policy)).
+    pub fn policy(&self) -> Option<&Policy> {
+        self.trav.policy()
+    }
+
+    /// Sets which paths links may take, and in what order ([`Policy`]); `None` takes every path, as with no
+    /// policy. New dials follow it at once, and dials under way take their next steps by it.
+    ///
+    /// A link on a path it turns off moves to one still allowed. A link through a relay punches to a direct path
+    /// (with `Direct` on). One with an allowed relay linked to both is dialled again through it: the old link
+    /// carries traffic until the new one replaces it, which raises [`Event::Disconnected`] with
+    /// [`DisconnectReason::Replaced`] and then [`Event::Connected`], at both ends. A link that can't move, or
+    /// hasn't within 6 s, is closed: [`Event::Disconnected`] with [`DisconnectReason::PathOff`]. Leaving
+    /// [`PathKind::RelayPeers`] out closes the links to [relay peers](Node::set_relay_peers) (they are dialled again
+    /// once it is back in), and the policy's `port_mapping` starts or stops router port mapping, as
+    /// [`Builder::port_mapping`] does with no policy.
+    ///
+    /// Fails, changing nothing, with [`Error::InvalidPolicy`] for an empty order or one that lists a kind twice.
+    pub fn set_policy(&mut self, policy: impl Into<Option<Policy>>) -> Result<(), Error> {
+        let policy = policy.into();
+        if policy.as_ref().is_some_and(|p| !p.is_valid()) {
+            return Err(Error::InvalidPolicy);
+        }
+        let now = self.now();
+        self.trav.set_policy(now, &mut self.ep, policy);
+        if !self.relay_peers_on() {
+            let own = self.trav.relay();
+            let closed: Vec<PeerId> = self.relay_peers.iter().map(|r| r.peer).filter(|p| Some(*p) != own).collect();
+            for peer in closed {
+                self.ep.disconnect(&peer);
+                self.status.remove(&peer);
+            }
+        }
+        self.sync_port_mapping();
+        self.poll();
+        Ok(())
+    }
+
+    /// Whether relay peers may be linked: the policy, if any, has [`PathKind::RelayPeers`] in.
+    fn relay_peers_on(&self) -> bool {
+        self.trav.policy().is_none_or(|p| p.allows(PathKind::RelayPeers))
+    }
+
+    /// Replaces the STUN servers ([`Builder::stun_servers`]; empty turns STUN off) and asks the new ones at once.
+    /// Names are resolved now, on this thread, as [`bind`](Builder::bind) does. Links stay up: the servers only
+    /// tell this node its public address and NAT type, which its next offers and invites carry.
+    pub fn set_stun_servers<S: Into<String>>(&mut self, servers: impl IntoIterator<Item = S>) {
+        let names: Vec<String> = servers.into_iter().map(Into::into).collect();
+        let dual = self.local.is_ipv6() && self.local.ip().is_unspecified();
+        let stun =
+            if self.local.ip().is_loopback() { Vec::new() } else { resolve(&names, self.local.is_ipv6() && !dual) };
+        self.trav.set_stun_servers(stun);
+        self.poll();
+    }
+
+    /// Swaps the signaling carrier ([`Builder::signaling`]), to change relays, say: the old one is dropped, and on
+    /// the new one this node subscribes to its inbox and its room's topic and says hello in the room at once. Links
+    /// stay up. Peers meet over it from then on, so those in the room must move to it too, or share it.
+    pub fn set_signaling(&mut self, signaling: impl Signaling + 'static) {
+        self.signaling = Some(Box::new(signaling));
+        let now = self.now();
+        self.trav.resubscribe(now);
+        self.pump_signals();
     }
 
     /// Addresses a peer may reach this node at, as put in [`invite`](Node::invite),
@@ -407,6 +495,9 @@ impl Node {
     /// Under [`Privacy::RelayOnly`] it dials through the relay only (the relay
     /// itself directly), and fails with [`ConnectError::NoRelay`] while no relay
     /// is connected: it never falls back to a direct path.
+    ///
+    /// Under a [`Policy`] it dials the paths the policy allows, step by step, and
+    /// fails with [`ConnectError::NoPath`] if none has anything to dial.
     pub fn connect(&mut self, invite: &str) -> Result<PeerId, Error> {
         let inv: Invite<SocketAddr> = Invite::parse(invite).ok_or(Error::InvalidInvite)?;
         let reaches = |a: &&SocketAddr| self.trav.reaches(*a);
@@ -424,7 +515,19 @@ impl Node {
             targets = vec![Path::Via(r)];
         }
         let now = self.now();
-        self.ep.connect_with(now, inv.peer, &targets).map_err(Error::Connect)?;
+        let relay_only = matches!(self.privacy(), Privacy::RelayOnly { .. });
+        if self.trav.policy().is_some() && !relay_only && !self.is_relay_peer(&inv.peer) {
+            let (mut addrs, mut vias) = (Vec::new(), Vec::new());
+            for t in targets {
+                match t {
+                    Path::Direct(a) => addrs.push(a),
+                    Path::Via(r) => vias.push(r),
+                }
+            }
+            self.trav.dial_invite(now, &mut self.ep, inv.peer, addrs, vias).map_err(Error::Connect)?;
+        } else {
+            self.ep.connect_with(now, inv.peer, &targets).map_err(Error::Connect)?;
+        }
         if !self.ep.is_connected(&inv.peer) {
             self.status.insert(inv.peer, Status::Connecting);
             // Also marks the peer as welcome while in a room (the offer is dropped with no carrier).
@@ -483,7 +586,7 @@ impl Node {
 
     /// Dials the relay peers that are neither linked nor being dialled, once their wait is over.
     fn keep_relay_links(&mut self, now: Instant) {
-        if matches!(self.privacy(), Privacy::RelayOnly { .. }) {
+        if matches!(self.privacy(), Privacy::RelayOnly { .. }) || !self.relay_peers_on() {
             return;
         }
         for i in 0..self.relay_peers.len() {
@@ -671,14 +774,20 @@ impl Node {
                 Event::ConnectFailed { .. } => None,
             };
             if let Some(peer) = about.filter(|p| self.status(p) != Status::Connected && !self.admits(p, &e)) {
-                // In a room, a link from a peer that never proved the room key, or a
-                // relay-only node's new direct link to anyone but its relay: closed unseen.
+                // In a room, a link from a peer that never proved the room key, a relay-only
+                // node's new direct link to anyone but its relay, or a link on a path the
+                // policy has off: closed unseen.
                 if matches!(e, Event::Connected { .. }) {
                     self.ep.disconnect(&peer);
                 }
                 continue;
             }
+            // A dial that moved a link off a path the policy turned off failed: the node's own.
+            let own = matches!(&e, Event::ConnectFailed { peer } if self.trav.redialing(peer));
             self.trav.handle_event(now, &mut self.ep, &e);
+            if own {
+                continue;
+            }
             self.track(&e);
             let subject = match &e {
                 Event::AddrObserved { by, .. } => by,
@@ -696,10 +805,22 @@ impl Node {
             }
             self.events.push_back(e);
         }
+        self.report_dropped();
         self.keep_relay_links(wall);
         self.flush(now);
         self.pump_signals();
         drained
+    }
+
+    /// Reports the links the policy closed ([`Traversal::poll_dropped`]): [`Event::Disconnected`] with
+    /// [`DisconnectReason::PathOff`].
+    fn report_dropped(&mut self) {
+        while let Some(peer) = self.trav.poll_dropped() {
+            self.status.remove(&peer);
+            if !self.is_relay_peer(&peer) {
+                self.events.push_back(Event::Disconnected { peer, reason: DisconnectReason::PathOff });
+            }
+        }
     }
 
     /// The next event, if any is queued.
@@ -717,7 +838,7 @@ impl Node {
         let t = t.map(|t| t.saturating_duration_since(now));
         let redial = self.relay_peers.iter().filter(|r| self.status(&r.peer) == Status::Disconnected);
         let redial = redial.map(|r| r.retry_at.saturating_duration_since(wall)).min();
-        let redial = redial.filter(|_| !matches!(self.privacy(), Privacy::RelayOnly { .. }));
+        let redial = redial.filter(|_| !matches!(self.privacy(), Privacy::RelayOnly { .. }) && self.relay_peers_on());
         let extra = (!self.extra.is_empty()).then_some(EXTRA_POLL);
         let t = [t, redial, extra].into_iter().flatten().min();
         match self.signaling {
@@ -763,7 +884,11 @@ impl Node {
     fn admits(&self, peer: &PeerId, e: &Event) -> bool {
         let direct = matches!(e, Event::Connected { path: Path::Direct(_), .. });
         let relay_only = matches!(self.privacy(), Privacy::RelayOnly { .. });
-        self.trav.admits(peer) && !(relay_only && direct && self.trav.relay() != Some(*peer))
+        let allowed = match e {
+            Event::Connected { path, .. } => self.trav.allows(peer, path),
+            _ => true,
+        };
+        self.trav.admits(peer) && allowed && !(relay_only && direct && self.trav.relay() != Some(*peer))
     }
 
     /// Hands the traversal's signaling actions to the carrier (dropped without one).
@@ -1441,6 +1566,33 @@ mod tests {
         assert!(inv.addrs.contains(&mapped));
         drop(n);
         assert!(eventually(|| log.lock().unwrap().last().is_some_and(|r| lifetime_of(r) == 0)));
+    }
+
+    /// NB-097: with a policy, its `port_mapping`, and `Direct`, decide whether the router maps a port, live; with
+    /// none again, [`Builder::port_mapping`] does.
+    #[test]
+    fn port_mapping_follows_the_policy() {
+        use crate::portmap::tests::{eventually, lifetime_of, pcp_gateway};
+        let ext = Ipv4Addr::new(203, 0, 113, 7);
+        let (gw, log) = pcp_gateway(ext, 120);
+        let mapped = SocketAddr::from((ext, 41000));
+        let b = Node::builder().stun_servers(Vec::<String>::new()).port_mapping_at(gw, "127.0.0.1:9".parse().unwrap());
+        let mut n = b.policy(Policy::new([PathKind::Direct])).bind("127.0.0.1:0").unwrap();
+        assert_eq!(n.port_mapping(), PortMapping::Off, "the policy doesn't ask for it");
+        let map = |n: &mut Node| {
+            eventually(|| {
+                n.poll();
+                n.port_mapping().addr() == Some(mapped)
+            })
+        };
+        n.set_policy(Policy { port_mapping: true, ..Policy::new([PathKind::Direct]) }).unwrap();
+        assert!(map(&mut n));
+        n.set_policy(Policy { port_mapping: true, ..Policy::new([PathKind::Peers]) }).unwrap();
+        assert_eq!(n.port_mapping(), PortMapping::Off, "no direct path to map for");
+        assert!(eventually(|| log.lock().unwrap().last().is_some_and(|r| lifetime_of(r) == 0)), "deleted");
+        assert!(!n.addresses().contains(&mapped));
+        n.set_policy(None).unwrap();
+        assert!(map(&mut n), "Builder::port_mapping asked for it");
     }
 
     /// NPM-1: a relay-only node gives out no address, so it asks the router for
