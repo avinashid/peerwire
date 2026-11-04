@@ -44,6 +44,49 @@ export interface SignalingContext {
   room: string;
 }
 
+/** A path a room's link may take: WebRTC without TURN (host and STUN candidates, port prediction, birthday punches),
+ * WebRTC through a TURN server in `iceServers`, relayed by another member, or over the signalling relays. */
+export type RoomPath = 'direct' | 'turn' | 'peers' | 'signaling';
+
+/** A room's connection policy: `joinRoom`'s `policy`, and `room.setPolicy`, which takes only the keys that change. */
+export interface RoomPolicy {
+  /** The paths a link may take, in the order to try them; a path missing is off. Default (and `fallback: 'auto'`)
+   * `['direct', 'turn', 'peers', 'signaling']`; `fallback: 'peers'` leaves out `'signaling'`, and `'off'` both.
+   * - The side that dials (the smaller PeerId) tries the first path, and each later one when those before it fail. A
+   *   WebRTC attempt fails when its DataChannel isn't open `fallbackMs` after its offer, or its ICE fails; a dial
+   *   through members or signalling, when it has no answer in 10 s, or at once with nothing to dial (no member
+   *   linked to us directly).
+   * - `'direct'` and `'turn'` next to each other are one WebRTC attempt (ICE prefers the direct pairs); `'peers'` and
+   *   `'signaling'` next to each other are one fallback, the first dialled 1 s before the other. So `['direct',
+   *   'peers', 'signaling', 'turn']` uses TURN only once the fallback fails. With `'turn'` and no `'direct'`, WebRTC
+   *   takes relay candidates alone (`iceTransportPolicy: 'relay'`). A WebRTC attempt without `'turn'` asks the peer
+   *   to leave its TURN servers out too.
+   * - A link moves only to a path earlier than its own: WebRTC retries, a DataChannel that opens late and birthday
+   *   punches need a WebRTC path before its own, and a member takes over a link on signalling only with `'peers'`
+   *   before `'signaling'`. So `['peers', 'direct']` keeps a relayed link relayed.
+   * - It governs this end: a peer whose policy differs can still dial us over a path ours has off. Such a link
+   *   moves to a path ours allows (a member's link to signalling, a signalling link to a member, if the peer takes
+   *   it), or drops: `'peer-leave'` with reason `'policy'`.
+   * TypeError for an empty order, an unknown path, or one given twice. */
+  order?: RoomPath[];
+  /** STUN and TURN servers: urls of `stun:`, `stuns:`, `turn:` or `turns:`. Default: none for `'local'`, Google and
+   * Cloudflare STUN otherwise. TURN ones are used only with `'turn'` in the order and STUN ones only with
+   * `'direct'`, by the room's links, its calls and its birthday punches. TypeError for any other url, naming the
+   * entry by its index alone, never a url or a credential. */
+  iceServers?: RTCIceServer[];
+  /** Nostr relays, for `signaling: 'nostr'`: `ws://` or `wss://` urls. Members find each other, and link over
+   * signalling, only through a relay they share. TypeError for an empty list or another url. */
+  relays?: string[];
+  /** As `joinRoom`'s. */
+  fallbackMs?: number;
+  /** As `joinRoom`'s. */
+  sameNatFallbackMs?: number;
+  /** As `joinRoom`'s; it needs `'direct'` in the order too. */
+  birthday?: boolean;
+  /** As `joinRoom`'s; set when the room is joined, so `setPolicy` takes only the room's own. */
+  privacy?: 'direct' | 'public-only';
+}
+
 export interface JoinRoomOptions {
   /** Names your app; rooms of different apps never meet. */
   appId: string;
@@ -71,9 +114,15 @@ export interface JoinRoomOptions {
    * `?url` import are fetched from the page's origin), a file path or `file:` URL (Node) or the bytes. Default: next to
    * this package. */
   wasm?: string | URL | BufferSource;
+  /** The connection policy: which paths a link may take, in what order, and the servers they use. See
+   * {@link RoomPolicy}. The options below that it also holds (`relays`, `iceServers`, `privacy`, `fallbackMs`,
+   * `sameNatFallbackMs`, `birthday`, and `fallback` for its `order`) go either here or there: TypeError for one
+   * given both ways. Change it later with `room.setPolicy`. */
+  policy?: RoomPolicy;
   /** Nostr relays, for `signaling: 'nostr'`. */
   relays?: string[];
-  /** Default: none for `'local'`, Google and Cloudflare STUN otherwise. */
+  /** Default: none for `'local'`, Google and Cloudflare STUN otherwise. TURN servers are used as the policy's order
+   * allows. */
   iceServers?: RTCIceServer[];
   /** Which of your addresses peers see in ICE candidates. `'direct'` (default): all of them.
    * `'public-only'`: no LAN or loopback (`host`) candidates, only what STUN reports (and no local address in
@@ -94,7 +143,8 @@ export interface JoinRoomOptions {
    *   that reaches the relays.
    * - `'peers'`: through other members only.
    * - `'off'`: WebRTC only.
-   * Every path carries the same end-to-end encrypted session. See `room.route(peer)`. */
+   * Every path carries the same end-to-end encrypted session. See `room.route(peer)`. Shorthand for the policy's
+   * `order`: `'auto'` is every path, `'peers'` all but `'signaling'`, `'off'` `['direct', 'turn']`. */
   fallback?: 'auto' | 'peers' | 'off';
   /** How long a WebRTC link may take to open before the fallback starts. Default 8000 ms. */
   fallbackMs?: number;
@@ -141,8 +191,9 @@ export interface RoomEvents {
   /** A peer connected and shared its presence (the member's JSON, which can nest deeply: see `message`). */
   'peer-join': (peer: PeerId, presence: Presence) => void;
   /** A peer left, timed out or lost its connection. A peer that leaves (`leave()`, or its tab closing) shows
-   * as 'left' or 'closed' at once; one that crashes or loses its network shows as 'timeout' after the idle timeout (30 s). */
-  'peer-leave': (peer: PeerId, reason: 'left' | 'closed' | 'failed' | 'timeout' | 'replaced' | 'violation') => void;
+   * as 'left' or 'closed' at once; one that crashes or loses its network shows as 'timeout' after the idle timeout (30 s).
+   * 'policy': its link was on a path the policy has off and couldn't move (see `setPolicy`). */
+  'peer-leave': (peer: PeerId, reason: 'left' | 'closed' | 'failed' | 'timeout' | 'replaced' | 'violation' | 'policy') => void;
   /** A joined peer changed its presence. It is the member's JSON, which can nest deeply: see `message`. */
   presence: (peer: PeerId, presence: Presence) => void;
   /** What a joined peer sent: a string, a Uint8Array, or any other value as JSON. A member's JSON can nest about
@@ -191,8 +242,36 @@ export declare class Room {
    * the room retries WebRTC (see `retryDirect`), or a channel is adopted. A `'signaling'` route also moves to a
    * member linked directly to both of you once that member is seen to relay both ways, and back if it goes; a
    * `'peer'` route to another such member once it is clearly faster (20 % and 15 ms, in 3 of 5 probe rounds 2 s
-   * apart). `rttMs`: the round trip over this path, measured since the link moved there; null until then. */
-  route(peer: PeerId): ({ kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' }) & { rttMs: number | null } | null;
+   * apart). Each only as the policy allows: a link moves only to a path earlier in its `order`. `turn`: our end of
+   * the WebRTC link runs through a TURN server (its selected candidate pair's local candidate is a relay one);
+   * unset while this WebRTC can't say. `rttMs`: the round trip over this path, measured since the link moved there;
+   * null until then. */
+  route(peer: PeerId): ({ kind: 'direct'; adopted?: true; turn?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' }) & { rttMs: number | null } | null;
+  /** The policy as it stands, every key set: `relays` null without Nostr signalling, and `iceServers` as their
+   * urls alone, never a username or credential (an entry from here given back to `setPolicy` keeps its own). */
+  readonly policy: Readonly<{
+    order: RoomPath[];
+    iceServers: { urls: string | string[] }[];
+    relays: string[] | null;
+    fallbackMs: number;
+    sameNatFallbackMs: number;
+    birthday: boolean;
+    privacy: 'direct' | 'public-only';
+  }>;
+  /** Changes the policy: the keys given, the rest as they were. New dials follow it at once, and so do links:
+   * - one on a path now off moves where the room can move it, within 10 s: from a member to signalling, or from
+   *   signalling to a member, if the peer takes it. Else it drops (`'peer-leave'` reason `'policy'`), and the two
+   *   dial again under the new order. A WebRTC link on a path now off (over our TURN with `'turn'` off, or not with
+   *   `'direct'` off) drops at once the same way;
+   * - new `iceServers` go to every WebRTC connection for its next ICE restart, a link over our TURN restarts ICE
+   *   at once (from the side that dialled it), and peers on a fallback try WebRTC again;
+   * - new `relays`: the room dials those it hasn't, says hello there, and closes those dropped. Links stay; what
+   *   was on its way through a relay dropped is lost, and the session resends it;
+   * - `fallbackMs`, `sameNatFallbackMs` and `birthday` count for links and punches from then on. `privacy` is set
+   *   when the room is joined.
+   * Throws TypeError as `joinRoom` does, for `relays` without Nostr signalling, and for a `privacy` other than the
+   * room's; nothing changes when it throws. */
+  setPolicy(policy: RoomPolicy): void;
   /** Tries WebRTC again, now, with `peer` (or every peer) the room reaches only by fallback: a new connection,
    * so one made after a network change, or a microphone or camera grant (privacy `'direct'`), offers the new
    * addresses. If its DataChannel opens, the link moves onto it and `route(peer)` says `'direct'`; if not, it
@@ -719,6 +798,10 @@ export declare class WebRtcTransport implements Transport {
        * `joinRoom` turns it on for `fallback: 'auto'` and opens the pipes itself. Off, pipe batches that arrive are
        * refused (`badSignals`). */
       pipes?: boolean;
+      /** The WebRTC paths allowed: STUN servers go to a connection with `direct`, TURN ones with `turn`, and one
+       * without `direct` takes relay candidates alone. Ours follow what `dial` is given; one we answer, these, without
+       * TURN when the offer says `turn: false`; with neither, an offer goes unanswered. Default both. */
+      rtc?: { direct: boolean; turn: boolean };
       RTCPeerConnection?: typeof globalThis.RTCPeerConnection;
     },
   );
@@ -791,11 +874,25 @@ export declare class WebRtcTransport implements Transport {
    * the link's own connection, which never opened, is closed, and the offer says `retry`, so the other side
    * drops its own (only one that never opened). If the new DataChannel opens, the link moves onto it; if not,
    * it closes quietly (`'retry-failed'`, never `'failed'`). False if the link is open or a retry is under way.
+   * `use`: its WebRTC paths, the `rtc` option's by default.
    */
-  retry(peer: PeerId): boolean;
+  retry(peer: PeerId, use?: { direct: boolean; turn: boolean }): boolean;
   /** Asks `peer`, the dialling side, for a retry (it gets `onPeer(peer, 'retry')`). */
   askRetry(peer: PeerId): void;
-  dial(peer: PeerId, options?: { retry?: boolean }): Promise<void>;
+  /** Opens a DataChannel to `peer` over the WebRTC paths `use` (the `rtc` option's by default; an offer without
+   * `turn` says `turn: false`) and, once open, runs the handshake. `replace`: the offer says `retry`, so the peer
+   * drops a link of its own that never opened, but ours fails as `'failed'` (a later stage of a room's policy). */
+  dial(peer: PeerId, options?: { retry?: boolean; replace?: boolean; use?: { direct: boolean; turn: boolean } }): Promise<void>;
+  /** Whether our end of `peer`'s WebRTC link runs through a TURN server (its selected candidate pair's local
+   * candidate is a relay one): null while this WebRTC can't say, or with no link. */
+  relayed(peer: PeerId): boolean | null;
+  /** New iceServers, and the WebRTC paths allowed: connections made from now on use them, and every connection
+   * takes them (`setConfiguration`) for its next ICE restart, within the paths it was made for. */
+  configure(iceServers: RTCIceServer[], rtc: { direct: boolean; turn: boolean }): void;
+  /** Restarts ICE on `peer`'s open link, if we dialled it, within the restart budget (see `restarts`). */
+  restart(peer: PeerId): void;
+  /** Pipes on or off. Off: no new pipe, and only a peer whose pipe is open now may still send over it. */
+  setPipes(on: boolean): void;
   has(peer: PeerId): boolean;
   drop(peer: PeerId): void;
   close(): void;
@@ -838,9 +935,12 @@ export declare class NostrSignaling implements SignalingAdapter {
    * stayed open 30 s, so a relay that drops each connection as it opens fires this twice a minute at most (a `Room`
    * says hello through every relay each time); at once, starting over, on going online, a new connection type or the
    * page showing again (not on a `navigator.connection` 'change' of the same type: a new speed estimate); going online
-   * redials every relay.
+   * redials every relay. Also when a relay `setRelays` added opens.
    */
   onReconnect: (url: string) => void;
+  /** Moves to the relays at `urls`, keeping the sockets of those listed already: one no longer listed is closed (what
+   * waited for it is lost), one newly listed is dialled and subscribed as the others. */
+  setRelays(urls: string[]): void;
   hello(meta?: unknown): Promise<void>;
   /** `lossy`: through one relay, the relays taking turns (one that holds us for its rate, has banned us or isn't open
    * is skipped, and so is one slowed behind what waits for it and, while any relay that answers is left, one that has

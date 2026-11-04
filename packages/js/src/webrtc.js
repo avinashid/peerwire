@@ -21,6 +21,7 @@
 import { isPeerId, MAX_DATAGRAM } from './peerwire.js';
 import { b64, unb64 } from './nostr.js';
 import { isPublicV4 } from './birthday.js';
+import { serversFor, hasTurn } from './policy.js';
 
 // Above this many bytes queued on a DataChannel, new datagrams are dropped (PERF-1).
 export const MAX_BUFFERED = 1024 * 1024;
@@ -239,6 +240,29 @@ function iceUp(pc) {
   return pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
 }
 
+// Whether our end of `pc`'s selected candidate pair is a relay (TURN) candidate: true or false, or null where
+// this WebRTC can't say at once (no RTCIceTransport.getSelectedCandidatePair) or nothing is selected yet.
+function relayedNow(pc) {
+  try {
+    const t = pc.sctp?.transport?.iceTransport?.getSelectedCandidatePair?.()?.local?.type;
+    return t ? t === 'relay' : null;
+  } catch {
+    return null;
+  }
+}
+
+// The same from getStats(): the transport's selected pair (Chrome), or the pair marked selected (Firefox).
+async function relayedStats(pc) {
+  const stats = await pc.getStats();
+  const byId = new Map();
+  let pair = null;
+  stats.forEach((s) => byId.set(s.id, s));
+  for (const s of byId.values()) if (s.type === 'transport' && s.selectedCandidatePairId) pair = byId.get(s.selectedCandidatePairId);
+  for (const s of byId.values()) if (!pair && s.type === 'candidate-pair' && s.selected) pair = s;
+  const local = pair && byId.get(pair.localCandidateId);
+  return local?.candidateType ? local.candidateType === 'relay' : null;
+}
+
 export class WebRtcTransport {
   // A retry offer that makes a new connection is taken at most once per this many ms per
   // peer (a copy of the one taken is still answered again). A peer's own retries are a
@@ -276,12 +300,16 @@ export class WebRtcTransport {
   //   IPv4), or ICE failed. For a retry (see retry()): 'retry-failed' instead, and 'retry'
 //   when the other side asks us, the dialling side, for one.
   // `pipes`: carry datagrams over signalling for peers allowed with allowPipe().
+  // `rtc`: the WebRTC paths allowed, { direct, turn } (both by default). A connection gets the iceServers
+  //   its paths use (STUN with `direct`, TURN with `turn`), and relay candidates alone without `direct`
+  //   (see config()). Ours follow what dial() is given; one we answer, `rtc`, without TURN when the offer
+  //   says `turn: false` (a dial without TURN: the peer tries TURN later, or not at all).
   // `trace(peer, what, detail)`, settable later: diagnostics of each link's
   //   signalling ('offer-sent', 'offer-received', 'answer-sent', 'answer-received',
   //   'ice-batch-sent', 'ice-batch-received'; detail has candidateSummary counts),
   //   of ICE ('ice-state', 'candidate-error') and 'same-nat' ({ ip, ms }: the peer
   //   has our public IPv4, so the link falls back after `ms`).
-  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, pipes = false, fallbackMs = RTC_FALLBACK_MS, sameNatFallbackMs = RTC_SAME_NAT_FALLBACK_MS, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
+  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, pipes = false, rtc = { direct: true, turn: true }, fallbackMs = RTC_FALLBACK_MS, sameNatFallbackMs = RTC_SAME_NAT_FALLBACK_MS, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
     if (!['direct', 'public-only', 'relay-only'].includes(privacy)) throw new Error(`unknown privacy mode: ${privacy}`);
     if (privacy === 'relay-only' && !isPeerId(relay)) throw new TypeError("privacy 'relay-only' needs a relay peer id");
     this.ep = endpoint;
@@ -304,6 +332,7 @@ export class WebRtcTransport {
     this.trace = null;
     this.sig = signaling;
     this.iceServers = iceServers;
+    this.rtc = rtc;
     this.onPeer = onPeer;
     this.links = new Map(); // handle -> { pc, dc, peer }
     this.byPeer = new Map(); // peer hex -> handle
@@ -358,11 +387,24 @@ export class WebRtcTransport {
     }
   }
 
-  link(peer) {
+  // The configuration of a connection over the WebRTC paths `use` ({ direct, turn }): its iceServers, and
+  // relay candidates alone without `direct`.
+  config(use) {
+    const iceServers = serversFor(this.iceServers, use);
+    return use.direct ? { iceServers } : { iceServers, iceTransportPolicy: 'relay' };
+  }
+
+  // Whether a connection over `use` could find a path: TURN alone needs a TURN server.
+  canDial(use) {
+    return !!this.Pc && (use.direct || (use.turn && hasTurn(this.iceServers)));
+  }
+
+  // `peer`'s link, made over the WebRTC paths `use` if there is none.
+  link(peer, use = this.rtc) {
     let h = this.byPeer.get(peer);
     if (h !== undefined) return this.links.get(h);
     h = this.nextHandle++;
-    const pc = new this.Pc({ iceServers: this.iceServers });
+    const pc = new this.Pc(this.config(use));
     const dc = pc.createDataChannel('peerwire', { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 });
     dc.binaryType = 'arraybuffer';
     // Without trickle: `described` once the offer or answer is out, `late` holds the
@@ -370,14 +412,16 @@ export class WebRtcTransport {
     // `mine` and `theirs`: the public IPv4s each side's candidates name, each with its ports
     // (see sameNat and nat());
     // `heard` once the DataChannel has carried a datagram from the peer; `unsent` while
-    // our answer waits for budget (its candidates wait with it).
-    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, watchedAt: 0, failed: false, described: false, late: [], lateTimer: null,
+    // our answer waits for budget (its candidates wait with it). `use`: its WebRTC paths; `turn`:
+    // whether our end of its selected pair is a TURN relay, as getStats last said (see relayed()).
+    const l = { pc, dc, peer, use, turn: null, handle: h, dialer: false, timer: null, watchedAt: 0, failed: false, described: false, late: [], lateTimer: null,
       held: [], offerMsg: null, offerSdp: null, answerMsg: null, unsent: false, resends: [],
       lateSent: 0, opened: false, restartAt: [], restartTimer: null, guessed: null, guesses: 0,
       mine: new Map(), theirs: new Map(), sameNat: false, heard: false, retry: false };
     dc.onopen = () => {
       clearTimeout(l.timer);
       l.opened = true;
+      this.readTurn(l);
       // Opened after the room fell back (ICE went on checking, or a retry): a link relayed by a
       // member punches over it and moves there; a pipe's datagrams go over it (see
       // onTransmit). Else the dialler's handshake goes over it, joining a dial under way.
@@ -414,6 +458,7 @@ export class WebRtcTransport {
       pc.addEventListener('iceconnectionstatechange', () => {
         this.tr(peer, 'ice-state', { state: pc.iceConnectionState });
         this.iceChanged(l);
+        if (l.opened && iceUp(pc)) this.readTurn(l); // a restart may have moved it on or off TURN
       });
       pc.addEventListener('icecandidateerror', (e) => this.tr(peer, 'candidate-error', { url: e.url, code: e.errorCode, text: e.errorText, address: e.address }));
     }
@@ -649,20 +694,22 @@ export class WebRtcTransport {
     if (l.late.length) l.lateTimer = setTimeout(() => this.sendLate(l), 0);
   }
 
-  // Opens a DataChannel to `peer` and, once open, runs the Peerwire handshake.
-  async dial(peer, { retry = false } = {}) {
+  // Opens a DataChannel to `peer` over the WebRTC paths `use` and, once open, runs the Peerwire handshake.
+  // `replace`: the offer says `retry`, so the peer drops a link of its own that never opened (as for a retry, but
+  // the link fails with 'failed', not quietly: a later WebRTC stage of the room's policy, see room.js).
+  async dial(peer, { retry = false, replace = retry, use = this.rtc } = {}) {
     if (!isPeerId(peer)) throw new TypeError('dial: not a peer id (64 lowercase hex characters)');
     if (!this.allowed(peer)) throw new Error('relay-only: reach this peer with endpoint.connectVia(relay, peer)');
     if (this.byPeer.has(peer)) return;
-    const l = this.link(peer);
+    const l = this.link(peer, use);
     l.dialer = true;
     l.retry = retry;
     await l.pc.setLocalDescription(await l.pc.createOffer());
     await this.gathered(l.pc);
     const p = this.offerProof ? await this.offerProof.sign(peer) : undefined;
     if (this.links.get(l.handle) !== l) return; // dropped meanwhile
-    const again = retry ? { retry: true } : {};
-    l.offerMsg = { kind: 'offer', sdp: this.describe(l), p, ...this.prediction(l), ...again };
+    const again = replace ? { retry: true } : {};
+    l.offerMsg = { kind: 'offer', sdp: this.describe(l), p, ...this.prediction(l), ...again, ...(use.turn ? {} : { turn: false }) };
     if (this.publish(peer, l.offerMsg)) this.tr(peer, 'offer-sent', { ...candidateSummary(l.offerMsg.sdp.sdp), ...again });
     this.watch(l);
     this.resendOffer(l);
@@ -672,14 +719,14 @@ export class WebRtcTransport {
   // reaches it by fallback: the link's own, which never opened, is closed, and the offer
   // says `retry`, so the other side drops its own too. If the new DataChannel opens, the
   // link moves onto it (see dc.onopen); if not, it closes quietly ('retry-failed', never
-  // 'failed'). False if the link is open or a retry is under way.
-  retry(peer) {
+  // 'failed'). False if the link is open or a retry is under way. `use`: its WebRTC paths.
+  retry(peer, use = this.rtc) {
     const l = this.links.get(this.byPeer.get(peer));
     if (!isPeerId(peer) || !this.allowed(peer) || l?.opened || l?.dc.readyState === 'open' || (l?.retry && !l.failed)) return false;
     this.dropRtc(peer);
     this.retried++;
     this.tr(peer, 'retry', { dialer: true });
-    const dialing = this.dial(peer, { retry: true });
+    const dialing = this.dial(peer, { retry: true, use });
     const h = this.byPeer.get(peer); // dial() makes its link before its first await
     dialing.catch(() => {
       // A retry that can't start (createOffer threw) ends as one that didn't open: its link
@@ -745,6 +792,9 @@ export class WebRtcTransport {
       // One that makes a new connection, at most once per retryAnswerMs (a copy doesn't).
       if (msg.retry === true && old?.offerSdp !== sdp && !this.takeRetry(from)) return void this.badSignals++;
       if (old && old.offerSdp !== sdp) this.dropRtc(from);
+      // Over the WebRTC paths we allow, without TURN for an offer that leaves it out; none: no answer.
+      const use = { direct: this.rtc.direct, turn: this.rtc.turn && msg.turn !== false };
+      if (!this.byPeer.has(from) && !use.direct && !use.turn) return;
       const fresh = !this.byPeer.has(from);
       if (!fresh) {
         // The same offer again: our answer was lost (or is still being made). Send it again,
@@ -762,7 +812,7 @@ export class WebRtcTransport {
           return;
         }
       }
-      const l = this.link(from);
+      const l = this.link(from, use);
       l.offerSdp = sdp; // a copy that comes while this one is answered is ignored
       l.answerMsg = null;
       if (fresh) l.retry = msg.retry === true;
@@ -859,6 +909,62 @@ export class WebRtcTransport {
     return this.byPeer.has(peer);
   }
 
+  // Whether our end of `peer`'s WebRTC link runs through a TURN server (its selected candidate pair's local
+  // candidate is a relay one): true or false, null while unknown or with no link. A connection made without TURN
+  // never does, and one with relay candidates alone always does.
+  relayed(peer) {
+    const l = this.links.get(this.byPeer.get(peer));
+    if (!l) return null;
+    if (!l.use.turn || !l.use.direct) return !l.use.direct;
+    return relayedNow(l.pc) ?? l.turn;
+  }
+
+  // Notes in `l.turn` whether our end of its selected pair is a TURN relay, where this WebRTC can only say through
+  // getStats (asynchronous): when its DataChannel opens, and when its ICE connects again.
+  readTurn(l) {
+    if (relayedNow(l.pc) !== null || typeof l.pc.getStats !== 'function') return;
+    relayedStats(l.pc).then((t) => {
+      if (this.links.get(l.handle) === l) l.turn = t;
+    }, () => {});
+  }
+
+  // New iceServers, and the WebRTC paths allowed (`rtc`): connections made from now on use them, and every
+  // connection now takes them for its next ICE restart (setConfiguration), within the paths it was made for.
+  configure(iceServers, rtc) {
+    this.iceServers = iceServers;
+    this.rtc = rtc;
+    for (const l of this.links.values()) {
+      const use = { direct: l.use.direct && rtc.direct, turn: l.use.turn && rtc.turn };
+      if (!use.direct && !use.turn) continue; // the room drops its link
+      try {
+        l.pc.setConfiguration?.(this.config(use));
+      } catch {
+        // a configuration this connection can't take: it keeps its own until it closes
+      }
+    }
+  }
+
+  // Restarts ICE on `peer`'s open link, as the dialling side, so it gathers with the iceServers configure() gave
+  // (a TURN server swapped for another). The other side's ask would go unheeded while our ICE is up: only the
+  // dialling side does. Within the restart budget (MAX_RESTARTS).
+  restart(peer) {
+    const l = this.links.get(this.byPeer.get(peer));
+    if (l?.opened && l.dialer) this.restartIce(l, 'policy');
+  }
+
+  // Pipes on or off. Off: no new pipe is made, and only a peer whose pipe is open now may still send over it,
+  // until it goes (dropPipe).
+  setPipes(on) {
+    this.pipesOn = on;
+    if (!on) for (const p of this.pipeAllowed) if (!this.pipeByPeer.has(p)) this.pipeAllowed.delete(p);
+  }
+
+  // Sends what `peer`'s pipe holds now, as one batch past the rate budget (a closing link's sealed close).
+  flush(peer) {
+    const p = this.pipes.get(this.pipeByPeer.get(peer));
+    if (p) this.pipeFlush(p, true);
+  }
+
   // What the newest WebRTC link to `peer` that failed showed of the two NATs (before one
   // has, the link now, once it has the peer's description): { mine, theirs }, the
   // server-reflexive IPv4s each side's candidates named, each with its ports (natOfPorts
@@ -885,11 +991,11 @@ export class WebRtcTransport {
     return this.pipes.has(handle);
   }
 
-  // The endpoint address that reaches `peer` over signalling, or null if pipes are off.
+  // The endpoint address that reaches `peer` over signalling, or null if pipes are off (and it has none still).
   pipe(peer) {
-    if (!this.pipesOn || !isPeerId(peer)) return null;
     let h = this.pipeByPeer.get(peer);
     if (h !== undefined) return h;
+    if (!this.pipesOn || !isPeerId(peer)) return null;
     h = this.nextHandle++;
     this.pipes.set(h, { peer, handle: h, q: [], bytes: 0, timer: null, queued: 0 });
     this.pipeByPeer.set(peer, h);
@@ -981,6 +1087,7 @@ export class WebRtcTransport {
     const own = this.links.get(this.byPeer.get(from));
     if (own?.heard && own.dc.readyState === 'open') return void (this.piped.stale += d.length);
     const h = this.pipe(from);
+    if (h === null) return void this.badSignals++;
     for (const s of d) {
       if (typeof s !== 'string' || s.length > (MAX_DATAGRAM * 4) / 3 + 4) return void this.badSignals++;
       let bytes;
@@ -1110,6 +1217,7 @@ export class WebRtcTransport {
   }
 
   dropPipe(peer) {
+    if (!this.pipesOn) this.pipeAllowed.delete(peer); // see setPipes()
     const h = this.pipeByPeer.get(peer);
     if (h === undefined) return;
     unflush(this.pipes.get(h));

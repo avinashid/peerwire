@@ -50,10 +50,11 @@ Joins a room, and resolves once the signalling is ready and our first hello has 
 | `queue` | `boolean` | `false` | Queue events for `room.poll()`/`room.receive()` from the start. Otherwise the first call starts the queue. |
 | `secret` | `Uint8Array` (32 bytes) | a fresh identity | Restores an identity saved from `room.endpoint.secret()`, so the PeerId stays the same. |
 | `wasm` | `string` \| `URL` \| `BufferSource` | next to the package | Where to load `peerwire_ffi.wasm` from: a URL (in a browser, relative and root-relative ones too, such as a bundler's `?url` import), a file path or `file:` URL in Node, or the bytes. |
+| `policy` | `RoomPolicy` | every path | Which paths a link may take, in what order, and the servers they use: see [policy and setPolicy](#policy-and-setpolicy). The options below that it also holds (`relays`, `iceServers`, `privacy`, `fallback` as its `order`, `fallbackMs`, `sameNatFallbackMs`, `birthday`) go either there or here, not both. |
 | `relays` | `string[]` | [`DEFAULT_RELAYS`](#constants) | Nostr relays, for `signaling: 'nostr'`. |
-| `iceServers` | `RTCIceServer[]` | none for `'local'`; else [`DEFAULT_ICE_SERVERS`](#constants) | STUN and TURN servers for WebRTC. |
+| `iceServers` | `RTCIceServer[]` | none for `'local'`; else [`DEFAULT_ICE_SERVERS`](#constants) | STUN and TURN servers for WebRTC, used as the policy's `order` allows. |
 | `privacy` | `'direct'` \| `'public-only'` | `'direct'` | Which of your addresses peers see: see [Privacy](#privacy). |
-| `fallback` | `'auto'` \| `'peers'` \| `'off'` | `'auto'` | What to do for a peer WebRTC can't link: see [Through any NAT](#through-any-nat). |
+| `fallback` | `'auto'` \| `'peers'` \| `'off'` | `'auto'` | What to do for a peer WebRTC can't link: see [Through any NAT](#through-any-nat). Shorthand for the policy's `order`: `'auto'` is every path, `'peers'` all but `'signaling'`, `'off'` `['direct', 'turn']`. |
 | `fallbackMs` | `number` | 8000 | How long a WebRTC link may take to open before the fallback starts (`RTC_FALLBACK_MS` in `webrtc.js`). |
 | `sameNatFallbackMs` | `number` | 3000, at most `fallbackMs` | The same, for a peer behind your own public IPv4 (`RTC_SAME_NAT_FALLBACK_MS`). |
 | `retryOnGrant` | `boolean` | `true` | With privacy `'direct'`, try WebRTC again with peers on a fallback when the page is granted the microphone or camera. No effect with `'public-only'`. |
@@ -62,7 +63,9 @@ Joins a room, and resolves once the signalling is ready and our first hello has 
 
 **Throws** (the promise rejects):
 
-- `TypeError` with no `appId` or `roomId`, a `privacy` or `fallback` not listed, or an unknown `signaling`.
+- `TypeError` with no `appId` or `roomId`, a `privacy` or `fallback` not listed, or an unknown `signaling`; for a
+  policy as [setPolicy](#policy-and-setpolicy) refuses one, `policy.relays` without `signaling: 'nostr'`, or a setting
+  given both on its own and in `policy`.
 - `RangeError` for a `presence` over 1 MiB as JSON; `TypeError` for one JSON can't encode (a function, a BigInt).
 - `Error` when the runtime has no WebRTC and `signaling` isn't `'local'` (pass `RTCPeerConnection`).
 - The wasm load's error, such as an HTTP error status for its URL.
@@ -108,6 +111,7 @@ What `joinRoom` resolves to. One per join; `leave()` ends it.
 | `peers` | `PeerId[]` | Joined peers, not counting us. |
 | `endpoint` | [`Endpoint`](#endpoint) | The Peerwire endpoint underneath, for stats, sealing and identity. |
 | `signaling` | [`SignalingAdapter`](#signalingadapter) | The signalling in use. |
+| `policy` | `RoomPolicy` | The connection policy as it stands, every key set: see [policy and setPolicy](#policy-and-setpolicy). |
 
 ### Events
 
@@ -119,7 +123,7 @@ room.off(event, fn): void
 | Event | Arguments | When |
 |---|---|---|
 | `'peer-join'` | `(peer, presence)` | A peer linked, proved the room key and shared its presence. A peer counts as joined once its presence has arrived, so `presence` is always there. |
-| `'peer-leave'` | `(peer, reason)` | A joined peer is gone. `reason` is `'left'` or `'closed'` at once when it leaves (`leave()`, or its tab closing); `'timeout'` after the idle timeout (30 s) when it crashes or loses its network; `'failed'` when its link failed with nothing else to try; `'replaced'` or `'violation'` as the core reports them. |
+| `'peer-leave'` | `(peer, reason)` | A joined peer is gone. `reason` is `'left'` or `'closed'` at once when it leaves (`leave()`, or its tab closing); `'timeout'` after the idle timeout (30 s) when it crashes or loses its network; `'failed'` when its link failed with nothing else to try; `'policy'` when its link was on a path the policy has off and couldn't move ([setPolicy](#policy-and-setpolicy)); `'replaced'` or `'violation'` as the core reports them. |
 | `'presence'` | `(peer, presence)` | A joined peer called `setPresence`. |
 | `'message'` | `(data, peer, { lane, kind })` | A joined peer sent something. `lane` is `'reliable'` or `'unreliable'` (urgent arrives as reliable); `kind` is `'text'`, `'bytes'` or `'json'`. |
 
@@ -198,19 +202,98 @@ old one.
 
 ```ts ignore
 room.route(peer: PeerId):
-  | (({ kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' })
+  | (({ kind: 'direct'; adopted?: true; turn?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' })
       & { rttMs: number | null })
   | null
 ```
 
 How `peer` is reached: its own WebRTC link (`'direct'`), a channel handed to [`adoptChannel`](#adoptchannel)
 (`adopted`), relayed by member `via` (`'peer'`), or over the signalling relays (`'signaling'`); null while it isn't
-linked. `rttMs` is the round trip over this path, measured since the link moved there; null until then.
+linked. `turn: true`: our end of the WebRTC link runs through a TURN server from `iceServers` (the selected candidate
+pair's local candidate is a relay one; read from `RTCIceTransport.getSelectedCandidatePair()`, or `getStats()` where
+there is none, so it may be unset for a moment after the link opens). `rttMs` is the round trip over this path,
+measured since the link moved there; null until then.
 
 A `'peer'` or `'signaling'` route can become `'direct'` later, with the same session (no `'peer-leave'` or
 `'peer-join'`). A `'signaling'` route moves to a member linked directly to both of you once that member is seen to
 relay both ways, and back if it goes. A `'peer'` route moves to another such member once it is clearly faster (20 %
-and 15 ms, in 3 of 5 probe rounds 2 s apart). See [Through any NAT](#through-any-nat).
+and 15 ms, in 3 of 5 probe rounds 2 s apart). Each only as the [policy](#policy-and-setpolicy) allows: a link moves
+only to a path earlier in its `order`. See [Through any NAT](#through-any-nat).
+
+### policy and setPolicy
+
+```ts ignore
+room.policy: RoomPolicy               // as it stands, every key set
+room.setPolicy(policy: RoomPolicy): void  // the keys given; the rest stay
+```
+
+```js
+// TURN costs money: use it only when members and the signalling relays can't carry a link.
+const room = await joinRoom({
+  appId: 'my-app', roomId, signaling: 'nostr',
+  policy: { order: ['direct', 'peers', 'signaling', 'turn'], iceServers: [stun, myTurn] },
+});
+room.setPolicy({ order: ['direct', 'turn'] }); // later: no relaying through members or signalling
+```
+
+The policy says which paths a link may take and in what order. A path missing from `order` is off.
+
+| Key | Type | Default | |
+|---|---|---|---|
+| `order` | `('direct' \| 'turn' \| 'peers' \| 'signaling')[]` | all four, in this order | `'direct'`: WebRTC over host and STUN candidates, with port prediction and birthday punches. `'turn'`: WebRTC through a TURN server in `iceServers`. `'peers'`: relayed by another member. `'signaling'`: over the signalling relays. |
+| `iceServers` | `RTCIceServer[]` | as `joinRoom`'s | `stun:`, `stuns:`, `turn:` and `turns:` urls. TURN ones are used only with `'turn'`, STUN ones only with `'direct'`, by links, calls and birthday punches alike. |
+| `relays` | `string[]` | as `joinRoom`'s | `ws://` or `wss://` urls, for `signaling: 'nostr'`. |
+| `fallbackMs`, `sameNatFallbackMs`, `birthday`, `privacy` | | as `joinRoom`'s | `birthday` needs `'direct'` too. `privacy` is set when the room is joined. |
+
+**Order.** The side that dials (the smaller PeerId) tries the first path, and each later one when those before it
+fail:
+
+- A WebRTC attempt fails when its DataChannel isn't open `fallbackMs` after its offer, or its ICE fails. A dial
+  through members or signalling fails when it has no answer in 10 s (the core's handshake timeout), or at once with
+  nothing to dial: no member linked to us directly, for `'peers'`.
+- `'direct'` and `'turn'` next to each other are one WebRTC attempt, in which ICE prefers the direct pairs. `'peers'`
+  and `'signaling'` next to each other are one fallback, the first dialled 1 s before the other, as without a policy.
+  So `['direct', 'peers', 'signaling', 'turn']` makes a WebRTC attempt without TURN first, and one through TURN only
+  once the fallback has failed; its offer says `retry`, so the peer drops its first connection.
+- With `'turn'` and no `'direct'`, WebRTC takes relay candidates alone (`iceTransportPolicy: 'relay'`), and none of
+  your addresses reach the peer. An attempt without `'turn'` says `turn: false` in its offer, and the peer leaves its
+  own TURN servers out of it too. `'turn'` with no TURN server in `iceServers` is skipped.
+- A link moves only to a path earlier than its own. WebRTC retries, a DataChannel that opens late and birthday
+  punches need a WebRTC path before the link's; a member takes over a link on signalling only with `'peers'` before
+  `'signaling'`. So `['peers', 'direct']` keeps a relayed link relayed, and `['signaling', 'peers']` keeps a link on
+  signalling there.
+
+`fallback` is shorthand: `'auto'` is the default order, `'peers'` leaves out `'signaling'`, `'off'` both fallbacks.
+`room.policy` lists `iceServers` as their urls alone, never a username or credential; an entry from it given back to
+`setPolicy` keeps its own.
+
+**Live changes.** `setPolicy` takes the keys given. New dials follow it at once, and so do links:
+
+- A link on a path now off moves where the room can move it, within 10 s (`Room.moveMs`): from a member to the
+  signalling relays (a punch over them, which the peer answers if its policy has `'signaling'`), or from signalling to
+  a member (the relay probe, which the peer joins if its policy puts `'peers'` before `'signaling'` too). Otherwise it
+  drops, with `'peer-leave'` reason `'policy'` (the peer, told the link closed, sees `'closed'`), and the two dial
+  again under the new order. A WebRTC
+  link on a path now off (over our TURN with `'turn'` off, or not with `'direct'` off) drops at once the same way.
+- New `iceServers` go to every WebRTC connection (`setConfiguration`) for its next ICE restart. A link over our TURN
+  restarts ICE at once if we dialled it (the other side's restart ask is heeded only while ICE is down), and peers on
+  a fallback try WebRTC again.
+- New `relays`: the room dials those it hasn't, subscribes and says hello there, and closes those dropped. Links
+  stay; what was on its way through a dropped relay is lost, and the session sends it again. Members find each other,
+  and link over signalling, only through a relay they share.
+- `fallbackMs`, `sameNatFallbackMs` and `birthday` count for links and punches from then on.
+
+A dial under way when `order` changes starts over under the new one.
+
+**Each end has its own.** A policy governs what this end dials, moves to and keeps. A peer whose policy differs can
+still dial us over a path ours has off: that link moves to a path ours allows, or drops as above. What a peer sends
+through a member that relays for it, after we have moved off that member, isn't ours to refuse: the core takes
+relayed packets from any member that forwards them.
+
+**Throws** `TypeError` for an empty `order`, an unknown path or one given twice, an unknown key, an `iceServers` entry
+whose urls aren't STUN or TURN (the message names it by index, never a url or a credential), `relays` that aren't
+`ws://` or `wss://` urls or without Nostr signalling, a negative `fallbackMs`, and a `privacy` other than the room's.
+Nothing changes when it throws; `Error` after `leave()`.
 
 ### retryDirect
 
@@ -525,7 +608,8 @@ A [`DocStore`](#docstore) in this process's memory, for Node and tests. Its copi
 WebRTC can't link two peers that are both behind symmetric NAT (common on mobile hotspots and carrier NAT) unless a
 TURN server is configured. Rather than requiring one, `joinRoom` falls back per peer, on its own, with no setup on
 either side. Every path carries the same end-to-end encrypted session. `fallback: 'peers'` skips step 3; `'off'`
-keeps WebRTC only. TURN in `iceServers` still works, and is faster than step 3 when you have a server. The core keeps
+keeps WebRTC only; a [policy](#policy-and-setpolicy) picks any of the paths and their order. TURN in `iceServers` still
+works, and is faster than step 3 when you have a server. The core keeps
 the first path that completes the handshake, and the room's proofs, presence and messages run unchanged on it. See
 also [NAT traversal](../concepts/nat-traversal.md).
 

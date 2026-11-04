@@ -91,6 +91,7 @@ NODE=(
   "node room adopt|node packages/js/test/room_adopt.mjs"
   "node room birthday|node packages/js/test/room_birthday.mjs"
   "node room same nat|node packages/js/test/room_same_nat.mjs"
+  "node room policy|node packages/js/test/room_policy.mjs"
   "node room retry|node packages/js/test/room_retry.mjs"
   "node retry backoff|node packages/js/test/retry_backoff.mjs"
   "node nat prediction|node packages/js/test/nat_predict.mjs"

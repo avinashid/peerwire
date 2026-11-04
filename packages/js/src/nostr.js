@@ -16,7 +16,8 @@
 //   room members without changing who can join.
 //
 // Same interface as BroadcastSignaling: id, hello(meta), onHello, send(to, body, { lossy }),
-// onMessage(fn), close(). A doc's copy on the relays (relays.js) and an inbox (inbox.js) also
+// onMessage(fn), close(); and setRelays(urls), to move to other relays while open (a room's policy). A doc's copy on
+// the relays (relays.js) and an inbox (inbox.js) also
 // read stored events with query(filter) and write them with store(ev, urls), behind signalling.
 // An inbox's own signalling (`listen: false`) subscribes to nothing, so no relay sees our peer tag.
 
@@ -175,8 +176,9 @@ export class NostrSignaling {
   }
 
   // Opens (or reopens) the socket to `url`; `opened` runs once it opens or fails. One dialled for a `deaf` one (see
-  // deaf()) is silent from the start: it takes no pipe batch until its relay answers.
-  dial(url, opened = () => {}, deaf = false) {
+  // deaf()) is silent from the start: it takes no pipe batch until its relay answers. One `added` by setRelays() says
+  // it opened as a reopened one does (onReconnect), so the room says hello on it.
+  dial(url, opened = () => {}, deaf = false, added = false) {
     if (this.closed) return;
     const again = this.sockets.some((s) => s.relayUrl === url);
     for (const s of this.sockets) if (s.relayUrl === url) this.forget(s);
@@ -193,10 +195,8 @@ export class NostrSignaling {
       const filter = { kinds: [KIND], '#p': [this.myTag, this.roomTag], since: Math.floor(Date.now() / 1000) - 30 };
       if (this.listen) ws.send(JSON.stringify(['REQ', this.sub, filter]));
       opened();
-      if (again) {
-        this.stats.reconnects++;
-        this.onReconnect(url);
-      }
+      if (again) this.stats.reconnects++;
+      if (again || added) this.onReconnect(url);
     };
     ws.onerror = () => opened();
     ws.onclose = () => this.lostSocket(ws);
@@ -261,6 +261,30 @@ export class NostrSignaling {
       ws.close();
     } catch {}
     this.dial(ws.relayUrl, undefined, deaf);
+  }
+
+  // Moves to the relays at `urls` (well-formed: the caller checks them) and keeps the sockets of those in it already.
+  // A relay no longer listed is closed for good: what waited for it, or was on its way, is lost as on a dead path,
+  // and lossy events go through the others from now on. One newly listed is dialled, subscribed as the others, and
+  // says it opened (onReconnect). What we know of each relay (holds, bans, rates) stays, should it be listed again.
+  setRelays(urls) {
+    if (this.closed) return;
+    const next = new Set(urls);
+    for (const ws of this.sockets.filter((s) => !next.has(s.relayUrl))) {
+      clearTimeout(this.retry.get(ws.relayUrl)?.timer);
+      this.retry.delete(ws.relayUrl);
+      this.redialled.delete(ws.relayUrl);
+      this.sockets = this.sockets.filter((s) => s !== ws); // first: lostSocket() redials only a socket listed
+      if (ws.counted) this.stats.relaysOpen--;
+      ws.counted = false;
+      ws.onopen = ws.onerror = ws.onclose = ws.onmessage = null; // one still connecting stays shut
+      this.forget(ws);
+      try {
+        ws.close();
+      } catch {}
+    }
+    for (const url of next) if (!this.sockets.some((s) => s.relayUrl === url)) this.dial(url, undefined, false, true);
+    this.release(); // a relay held may be the one free now
   }
 
   // `lossy`: through one relay, the relays taking turns (stripe), not each.

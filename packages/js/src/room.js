@@ -36,6 +36,14 @@
 // microphone or camera grant (retry.js); a retry whose DataChannel opens takes the link
 // over the same way.
 //
+// The policy (joinRoom's `policy`, room.setPolicy(), policy.js) says which of these paths a link
+// may take and in what order: 'direct' and 'turn' (WebRTC without and through TURN), 'peers' (a
+// member relays) and 'signaling' (the pipe). `fallback` is shorthand for its order. The side that
+// dials runs the order's stages (dialStage), and a link moves only to a path earlier than its own:
+// retries, a late DataChannel and birthday punches need a WebRTC path before it, a member relay
+// takes over a pipe link only with 'peers' before 'signaling' (the core's slow address, setRoute).
+// A policy set later moves links off paths it turns off, or drops them (evict).
+//
 // Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
 // room.poll() / room.receive() return queued events as plain objects (strings,
 // numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
@@ -49,8 +57,8 @@
 // with a tag of their own.
 
 import { loadPeerwire, Lane, toHex, fromHex, isPeerId } from './peerwire.js';
-import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
-import { NostrSignaling } from './nostr.js';
+import { WebRtcTransport, BroadcastSignaling, RTC_FALLBACK_MS, RTC_SAME_NAT_FALLBACK_MS } from './webrtc.js';
+import { NostrSignaling, DEFAULT_RELAYS } from './nostr.js';
 import { LocalTransport } from './local.js';
 import { RoomProof } from './proof.js';
 import { DirectRetries } from './retry.js';
@@ -60,6 +68,7 @@ import { deflate, inflate, deflates } from './zip.js';
 import { RelayCopy } from './relays.js';
 import { Calls } from './call.js';
 import { Punches } from './punch.js';
+import { PATHS, FALLBACK_ORDERS, makePolicy, serversFor, showServers, rankOf } from './policy.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
@@ -166,18 +175,23 @@ export async function joinRoom({
   wasm,
   relays,
   iceServers,
-  privacy = 'direct',
-  fallback = 'auto',
+  privacy,
+  fallback,
   fallbackMs,
   sameNatFallbackMs,
   retryOnGrant = true,
-  birthday = true,
+  birthday,
+  policy,
   RTCPeerConnection = globalThis.RTCPeerConnection,
 } = {}) {
   if (!appId || !roomId) throw new TypeError('joinRoom needs an appId and a roomId');
   // A room dials every member, so relay-only (one WebRTC link, to the relay) can't apply.
-  if (privacy !== 'direct' && privacy !== 'public-only') throw new TypeError(`joinRoom privacy must be 'direct' or 'public-only', not ${privacy}`);
-  if (!['auto', 'peers', 'off'].includes(fallback)) throw new TypeError(`joinRoom fallback must be 'auto', 'peers' or 'off', not ${fallback}`);
+  if (privacy !== undefined && privacy !== 'direct' && privacy !== 'public-only') throw new TypeError(`joinRoom privacy must be 'direct' or 'public-only', not ${privacy}`);
+  if (fallback !== undefined && !['auto', 'peers', 'off'].includes(fallback)) throw new TypeError(`joinRoom fallback must be 'auto', 'peers' or 'off', not ${fallback}`);
+  const own = { order: fallback && FALLBACK_ORDERS[fallback], iceServers, fallbackMs, sameNatFallbackMs, birthday, privacy };
+  // Relays count only for Nostr signalling, as they always have.
+  if (signaling === 'nostr') own.relays = relays;
+  const plan = joinPolicy(policy, own, signaling);
   presenceFrame(presence);
   const pw = await peerwireModule(wasm);
   const endpoint = pw.endpoint({ secret });
@@ -185,20 +199,19 @@ export async function joinRoom({
   const proof = await RoomProof.create(name);
   let sig;
   if (signaling === 'local') sig = new BroadcastSignaling(endpoint.id, `peerwire/${name}`);
-  else if (signaling === 'nostr') sig = new NostrSignaling(pw, endpoint, { room: name, relays });
+  else if (signaling === 'nostr') sig = new NostrSignaling(pw, endpoint, { room: name, relays: plan.relays });
   else if (typeof signaling === 'function') sig = signaling({ endpoint, peerwire: pw, room: name });
   else throw new TypeError(`unknown signaling ${signaling}: use 'local', 'nostr' or a factory`);
   let transport;
-  // Remote peers need STUN to find a path; tabs of one browser don't.
-  const ice = iceServers ?? (signaling === 'local' ? [] : DEFAULT_ICE_SERVERS);
   if (RTCPeerConnection) {
     // Relays charge per event: one offer and one answer, each with every candidate.
     const offerProof = {
       sign: (to) => proof.pair('pw-rtc-offer', endpoint.id, to),
       check: (from, p) => proof.checkPair('pw-rtc-offer', from, endpoint.id, p),
     };
-    const pipes = fallback === 'auto';
-    transport = (onPeer) => new WebRtcTransport(endpoint, sig, { iceServers: ice, trickle: signaling === 'local', onPeer, privacy, offerProof, pipes, fallbackMs, sameNatFallbackMs, RTCPeerConnection });
+    const { iceServers: ice, privacy: priv, fallbackMs: ms, sameNatFallbackMs: sameNatMs } = plan;
+    transport = (onPeer) => new WebRtcTransport(endpoint, sig, { iceServers: ice, trickle: signaling === 'local', onPeer, privacy: priv, offerProof, pipes: plan.rank.has('signaling'),
+      rtc: rtcOf(plan), fallbackMs: ms, sameNatFallbackMs: sameNatMs, RTCPeerConnection });
   } else if (signaling === 'local') {
     transport = () => new LocalTransport(endpoint, sig);
   } else {
@@ -207,21 +220,48 @@ export async function joinRoom({
     throw new Error('no WebRTC in this runtime: pass RTCPeerConnection (e.g. from node-datachannel) or use signaling: \'local\'');
   }
   // A grant shows local addresses only to new connections, and only 'direct' offers them. Calls use the room's
-  // iceServers and privacy for their media connections too.
-  const media = RTCPeerConnection ? { RTCPeerConnection, MediaStream: globalThis.MediaStream, iceServers: ice, privacy } : null;
+  // privacy for their media connections too, and its iceServers as the policy allows (see Room).
+  const media = RTCPeerConnection ? { RTCPeerConnection, MediaStream: globalThis.MediaStream, privacy: plan.privacy } : null;
   // Birthday punches need STUN, to learn the public address the far side's fleet aims at.
-  const punch = RTCPeerConnection ? { RTCPeerConnection, iceServers: ice, on: birthday } : null;
-  const room = new Room(endpoint, sig, transport, presence, proof, { fallback, grants: privacy === 'direct' && retryOnGrant, roomId, pw, media, punch });
+  const punch = RTCPeerConnection ? { RTCPeerConnection } : null;
+  const room = new Room(endpoint, sig, transport, presence, proof, { plan, grants: plan.privacy === 'direct' && retryOnGrant, roomId, pw, media, punch });
   if (queue) room.queue = [];
   await sig.ready;
   await room.hello();
   return room;
 }
 
+// The policy joinRoom starts with: `policy`, and the same settings given on their own (`own`; the order as
+// `fallback`), never one setting both ways. Unset, each is as it was before policies: every path, STUN for
+// remote peers (tabs of one browser need none), the default relays for Nostr.
+function joinPolicy(policy = {}, own, signaling) {
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) throw new TypeError('a policy is an object');
+  for (const [k, v] of Object.entries(own)) {
+    if (v !== undefined && policy[k] !== undefined) throw new TypeError(`pass ${k === 'order' ? 'fallback' : k} or policy.${k}, not both`);
+  }
+  if (policy.relays !== undefined && signaling !== 'nostr') throw new TypeError("policy.relays needs signaling: 'nostr'");
+  const base = {
+    order: PATHS,
+    iceServers: signaling === 'local' ? [] : DEFAULT_ICE_SERVERS,
+    relays: signaling === 'nostr' ? DEFAULT_RELAYS : null,
+    fallbackMs: RTC_FALLBACK_MS,
+    sameNatFallbackMs: RTC_SAME_NAT_FALLBACK_MS,
+    birthday: true,
+    privacy: 'direct',
+  };
+  const given = Object.fromEntries(Object.entries(own).filter(([, v]) => v !== undefined));
+  return makePolicy({ ...given, ...policy }, base);
+}
+
+// The WebRTC paths `policy` allows.
+const rtcOf = (policy) => ({ direct: policy.rank.has('direct'), turn: policy.rank.has('turn') });
+
 export class Room {
   static proofMs = PROOF_MS; // tests shorten it
   static peerFirstMs = PEER_FIRST_MS;
-  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off', grants = false, roomId = null, pw = null, media = null, punch = null } = {}) {
+  // A link on a path a new policy turns off that hasn't moved to one it allows this long after drops.
+  static moveMs = 10000;
+  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off', plan = null, grants = false, roomId = null, pw = null, media = null, punch = null } = {}) {
     this.endpoint = endpoint;
     this.signaling = signaling;
     this.roomId = roomId; // for room.doc(name, { relays })
@@ -240,7 +280,11 @@ export class Room {
     this.proving = new Map(); // peer -> frames held while its proof is checked
     this.proofSent = new Map(); // linked peer -> resolves once our link proof is written
     this.deadlines = new Map(); // peer -> timer that drops it unless it proves the key
-    this.fallback = fallback;
+    // The policy (policy.js), whole and checked: room.policy shows it.
+    this.plan = plan ?? makePolicy({ order: FALLBACK_ORDERS[fallback] }, { iceServers: [], relays: null, fallbackMs: RTC_FALLBACK_MS, sameNatFallbackMs: RTC_SAME_NAT_FALLBACK_MS, birthday: false, privacy: 'direct' });
+    this.stageOf = new Map(); // peer we dial -> the stage of the policy its dial is at (see dialStage)
+    this.viaOk = new Set(); // peers being dialled by fallback whose dial may go through members now
+    this.moving = new Map(); // linked peer -> timer: its link is on a path the policy has off (see evict)
     this.routes = new Map(); // linked peer -> { kind: 'direct' | 'peer' | 'signaling', via?, adopted? }
     this.paths = new Map(); // linked peer -> the endpoint's path to it
     this.fallingBack = new Set(); // peers we dial by fallback since WebRTC failed
@@ -248,8 +292,19 @@ export class Room {
     this.docOut = new Map(); // peer -> the doc frames to it, in order, while one waits to be deflated
     this.docIn = new Map(); // peer -> the doc frames from it, in order, while one waits to be inflated
     this.deflated = new WeakMap(); // doc frame -> its deflated bytes, made once for all the members it goes to
-    // The room's call: who is in it, and ours while we are (see call()).
-    this.calls = new Calls({ self: this.self, send: (peer, m) => this.writeCall(peer, m), members: () => this.peers, media });
+    // The room's call: who is in it, and ours while we are (see call()). Its connections get the iceServers the
+    // policy allows WebRTC now (rtcConfig).
+    const room = this;
+    const callMedia = media && {
+      ...media,
+      get iceServers() {
+        return room.rtcConfig().iceServers;
+      },
+      get iceTransportPolicy() {
+        return room.rtcConfig().iceTransportPolicy;
+      },
+    };
+    this.calls = new Calls({ self: this.self, send: (peer, m) => this.writeCall(peer, m), members: () => this.peers, media: callMedia });
     this.transport = makeTransport((peer, state, handle) => {
       if (state === 'closed') this.rtcClosed(peer, handle);
       else if (state === 'failed') this.rtcFailed(peer);
@@ -265,12 +320,14 @@ export class Room {
     });
     // Peers on a fallback: WebRTC is tried again now and then (see retryDirect).
     this.retries = new DirectRetries((peer) => this.retryNow(peer), { holdMs: (this.transport.fallbackMs ?? 8000) + 10000 });
-    // And a birthday punch once, with a peer whose NATs call for one (punch.js).
+    // And a birthday punch once, with a peer whose NATs call for one (punch.js), and only while it would move the
+    // link to an earlier path: to the punches, a peer it wouldn't is one with no route yet.
     this.punches = punch && new Punches({
       ...punch,
+      ...this.punchPolicy(),
       room: {
         send: (peer, m) => this.writePunch(peer, m),
-        route: (peer) => this.routes.get(peer)?.kind ?? null,
+        route: (peer) => (this.before('direct', this.pathOf(peer)) ? this.routes.get(peer)?.kind ?? null : null),
         member: (peer) => this.members.has(peer),
         nat: (peer) => this.transport.nat?.(peer) ?? null,
         adopt: (peer, pc, dc) => this.adoptChannel(peer, pc, dc),
@@ -387,13 +444,115 @@ export class Room {
     for (const p of this.proven) this.write(p, f, Lane.Reliable);
   }
 
-  // How `peer` is reached: { kind: 'direct' } (its own WebRTC link), { kind: 'direct',
-  // adopted: true } (a channel handed to adoptChannel), { kind: 'peer', via } (relayed
-  // by member `via`), { kind: 'signaling' } (over the signalling relays), or null while
-  // not linked; with `rttMs`, the round trip over that path (null until measured).
+  // How `peer` is reached: { kind: 'direct' } (its own WebRTC link; with `turn: true` when our
+  // end of it runs through a TURN server), { kind: 'direct', adopted: true } (a channel handed to
+  // adoptChannel), { kind: 'peer', via } (relayed by member `via`), { kind: 'signaling' } (over the
+  // signalling relays), or null while not linked; with `rttMs`, the round trip over that path (null
+  // until measured).
   route(peer) {
     const r = this.routes.get(peer);
-    return r ? { ...r, rttMs: this.endpoint.pathRttMs(peer) } : null;
+    if (!r) return null;
+    const turn = r.kind === 'direct' && !r.adopted && this.transport.relayed?.(peer) === true;
+    return { ...r, ...(turn && { turn }), rttMs: this.endpoint.pathRttMs(peer) };
+  }
+
+  // The policy: the order of the paths a link may take, and the settings that go with it (see joinRoom). Its
+  // iceServers come as their urls alone, never a username or credential; one given back to setPolicy keeps its
+  // own.
+  get policy() {
+    const p = this.plan;
+    const relays = p.relays && [...p.relays];
+    return { order: [...p.order], iceServers: showServers(p.iceServers), relays, fallbackMs: p.fallbackMs, sameNatFallbackMs: p.sameNatFallbackMs, birthday: p.birthday, privacy: p.privacy };
+  }
+
+  // Changes the policy: the keys given, the rest as they were. New dials follow it at once, and links follow it
+  // here: one on a path now off moves to one it allows or drops (evict, recheck); new iceServers go to every
+  // WebRTC connection (an ICE restart for those over our TURN, a retry for peers on a fallback); new relays move
+  // the signalling to them (NostrSignaling.setRelays), links kept. fallbackMs, sameNatFallbackMs and birthday
+  // count from the next link or punch. TypeError as joinRoom's, for relays without Nostr signalling, and for a
+  // privacy other than the room's (set at joinRoom). Nothing changes when it throws.
+  setPolicy(policy) {
+    if (this.left) throw new Error('left the room');
+    const was = this.plan;
+    const p = makePolicy(policy, was);
+    if (p.privacy !== was.privacy) throw new TypeError('privacy is set when the room is joined: leave and join again to change it');
+    if (policy.relays !== undefined && typeof this.signaling.setRelays !== 'function') throw new TypeError("relays need signaling: 'nostr'");
+    this.plan = p;
+    if (policy.relays !== undefined) this.signaling.setRelays(p.relays);
+    const servers = p.iceServers !== was.iceServers;
+    const order = p.order.join() !== was.order.join();
+    if (servers || order) this.transport.configure?.(p.iceServers, rtcOf(p));
+    this.transport.setPipes?.(p.rank.has('signaling'));
+    if (typeof this.transport.fallbackMs === 'number') {
+      this.transport.fallbackMs = p.fallbackMs;
+      this.transport.sameNatMs = Math.min(p.sameNatFallbackMs, p.fallbackMs);
+    }
+    if (this.punches) {
+      // As Punches takes `on`: only with a WebRTC that can make a certificate (a browser's).
+      const { on, iceServers } = this.punchPolicy();
+      Object.assign(this.punches, { on: on && typeof this.punches.Pc?.generateCertificate === 'function', iceServers });
+    }
+    if (order) {
+      // Dials under way start over under the new order, at the hello below.
+      for (const peer of new Set([...this.fallingBack, ...this.stageOf.keys()])) if (!this.linked.has(peer)) this.lost(peer, 'policy');
+      this.helloSoon();
+    }
+    for (const peer of [...this.linked]) this.recheck(peer, servers);
+    this.offerRelays();
+    if (servers || order) this.retries.soon();
+  }
+
+  // WebRTC's configuration under the policy, for a connection made now outside the transport (a call's).
+  rtcConfig() {
+    const use = rtcOf(this.plan);
+    const iceServers = serversFor(this.plan.iceServers, use);
+    return use.direct ? { iceServers } : { iceServers, iceTransportPolicy: 'relay' };
+  }
+
+  // The birthday punches' settings under the policy: on with `birthday` and 'direct', STUN to learn our address,
+  // and TURN as the policy allows.
+  punchPolicy() {
+    return { on: this.plan.birthday && this.allows('direct'), iceServers: serversFor(this.plan.iceServers, { direct: true, turn: this.allows('turn') }) };
+  }
+
+  // Whether the policy allows `path`.
+  allows(path) {
+    return this.plan.rank.has(path);
+  }
+
+  // Whether the policy allows `a` and puts it before `b` (one it has off comes after all).
+  before(a, b) {
+    return this.allows(a) && rankOf(this.plan, a) < rankOf(this.plan, b);
+  }
+
+  // The path `peer`'s link is on: 'direct', 'turn', 'peers' or 'signaling'; null for one not linked, or a WebRTC
+  // link that may be on either WebRTC path while this WebRTC can't say which yet.
+  pathOf(peer) {
+    const r = this.routes.get(peer);
+    if (!r) return null;
+    if (r.kind === 'peer') return 'peers';
+    if (r.kind === 'signaling') return 'signaling';
+    if (r.adopted) return 'direct';
+    const t = this.transport.relayed?.(peer);
+    return t === undefined ? 'direct' : t === null ? null : t ? 'turn' : 'direct';
+  }
+
+  // The WebRTC paths a retry with `peer` may use: those the policy puts before the path its link is on, or null if
+  // none (a link moves only to an earlier path) or they can't find one (TURN alone, with no TURN server).
+  retryUse(peer) {
+    const at = rankOf(this.plan, this.pathOf(peer));
+    const use = { direct: rankOf(this.plan, 'direct') < at, turn: rankOf(this.plan, 'turn') < at };
+    return (use.direct || use.turn) && this.transport.canDial?.(use) !== false ? use : null;
+  }
+
+  // Announces us after this task, once however many asked: peers dropped for the policy then dial afresh.
+  helloSoon() {
+    if (this.helloDue) return;
+    this.helloDue = true;
+    queueMicrotask(() => {
+      this.helloDue = false;
+      this.hello();
+    });
   }
 
   // Tries WebRTC again, now, with `peer` (or every peer) that the room reaches only by
@@ -409,7 +568,9 @@ export class Room {
   // Begins a retry with `peer`: the dialling side dials it afresh, the other asks it to.
   retryNow(peer) {
     if (this.left || !this.linked.has(peer)) return false;
-    if (this.self < peer) return !!this.transport.retry?.(peer);
+    const use = this.retryUse(peer);
+    if (!use) return false;
+    if (this.self < peer) return !!this.transport.retry?.(peer, use);
     this.transport.askRetry?.(peer);
     return false;
   }
@@ -434,11 +595,12 @@ export class Room {
   // Resolves true once the channel carries the link: a link over signalling moves at
   // once; a relayed one once the endpoint's punch over the channel is answered. route()
   // then says { kind: 'direct', adopted: true }. Resolves false, leaving the channel to
-  // the caller, if the link is direct already or the peer didn't adopt in time. When
-  // the channel closes, the link goes back to its fallback route.
+  // the caller, if the link is direct already, the policy doesn't put 'direct' before its
+  // path, or the peer didn't adopt in time. When the channel closes, the link goes back to
+  // its fallback route.
   async adoptChannel(peer, pc, dc) {
     const r = this.routes.get(peer);
-    if (this.left || !r || r.kind === 'direct' || !this.transport.adopt) return false;
+    if (this.left || !r || r.kind === 'direct' || !this.transport.adopt || !this.before('direct', this.pathOf(peer))) return false;
     const pipe = r.kind === 'signaling';
     const h = await this.transport.adopt(peer, pc, dc, { pipe });
     if (h < 0) return false;
@@ -621,12 +783,19 @@ export class Room {
     this.routes.clear();
     this.paths.clear();
     this.fallingBack.clear();
+    this.stageOf.clear();
+    this.viaOk.clear();
+    for (const t of this.moving.values()) clearTimeout(t);
+    this.moving.clear();
     await Promise.all(saved);
   }
 
-  // Announces us on the room topic, with a proof of the room key.
+  // Announces us on the room topic, with a proof of the room key. Not once the room has left,
+  // which may happen while the proof is made: its signalling is closed then.
   async hello() {
-    if (!this.left) this.signaling.hello(await this.proof.hello(this.self));
+    if (this.left) return;
+    const meta = await this.proof.hello(this.self);
+    if (!this.left) this.signaling.hello(meta);
   }
 
   async onHello(peer, meta) {
@@ -645,7 +814,25 @@ export class Room {
       this.hello();
     }
     // One side dials: the smaller id.
-    if (this.self < peer) this.transport.dial(peer);
+    if (this.self < peer) this.dialStage(peer, 0);
+  }
+
+  // Dials `peer` (we dial it: the smaller id) by stage `k` of the policy's order, or the first after it with
+  // something to try: a WebRTC attempt over that stage's paths (one that comes after another failed replaces it:
+  // its offer says `retry`, so the peer drops its own), or a fallback (fallBack). False if none has.
+  dialStage(peer, k) {
+    const stages = this.plan.stages;
+    for (; k < stages.length; k++) {
+      const s = stages[k];
+      if (s.rtc ? this.transport.canDial?.(s.rtc) === false : !this.fallBack(peer, s.fallback)) continue;
+      this.stageOf.set(peer, k);
+      if (!s.rtc) return true;
+      const replace = this.transport.has(peer);
+      if (replace) this.transport.dropRtc?.(peer);
+      this.transport.dial(peer, { use: s.rtc, replace });
+      return true;
+    }
+    return false;
   }
 
   onEvent(e) {
@@ -656,6 +843,8 @@ export class Room {
       this.paths.set(peer, e.path);
       this.reroute(peer);
       this.fallingBack.delete(peer);
+      this.viaOk.delete(peer);
+      this.stageOf.delete(peer);
       // Prove the room key first; presence follows once the peer has proved it too.
       this.proofSent.set(peer, this.proof.pair('pw-link', this.self, peer).then((p) => {
         if (this.linked.has(peer)) this.write(peer, frame(T.Proof, fromHex(p)), Lane.Reliable);
@@ -674,6 +863,13 @@ export class Room {
     } else if (e.type === 'disconnected') {
       this.lost(e.peer, e.reason);
     } else if (e.type === 'connectFailed') {
+      // A fallback dial that failed goes on to the policy's next stage, if it has one.
+      const k = this.stageOf.get(e.peer);
+      if (this.fallingBack.has(e.peer) && k !== undefined && this.self < e.peer) {
+        this.fallingBack.delete(e.peer);
+        this.viaOk.delete(e.peer);
+        if (this.dialStage(e.peer, k + 1)) return;
+      }
       this.lost(e.peer, 'failed');
     }
   }
@@ -762,12 +958,19 @@ export class Room {
   }
 
   // The route to `peer` on `path`. The core learns whether a direct path is the slow
-  // signalling pipe, which a member relay beats (offerRelays).
+  // signalling pipe, which a member relay beats (offerRelays): only with 'peers' before
+  // 'signaling' in the policy, so with neither a relay takes over a pipe link. A link on a
+  // fallback is retried while the policy has a WebRTC path before its own (retryUse). With
+  // 'signaling' off, a link on a member forgets its pipe, so it never falls back there.
   setRoute(peer, path) {
     const r = this.routeOf(path);
     this.routes.set(peer, r);
-    this.retries.track(peer, r.kind !== 'direct', this.self < peer); // the dialling side keeps the backoff
-    if (path.direct !== undefined) this.endpoint.setSlow(peer, r.kind === 'signaling' ? path.direct : null);
+    this.retries.track(peer, r.kind !== 'direct' && !!this.retryUse(peer), this.self < peer); // the dialling side keeps the backoff
+    if (path.direct !== undefined) this.endpoint.setSlow(peer, r.kind === 'signaling' && this.before('peers', 'signaling') ? path.direct : null);
+    else if (!this.allows('signaling')) {
+      this.endpoint.setSlow(peer, null);
+      this.transport.dropPipe?.(peer);
+    }
   }
 
   // The route to a linked `peer` again: its path changed, or an adopted channel took
@@ -778,18 +981,80 @@ export class Room {
     this.setRoute(peer, path);
     this.offerRelays();
     for (const d of this.docs.values()) d.rerouted();
+    this.checkPath(peer);
+  }
+
+  // A link that came up or moved: on a fallback path the policy has off (the peer dialled it that way, under a
+  // policy of its own), it moves or drops (evict); on one it allows, any move under way is done. WebRTC paths are
+  // the policy's by their configuration; a policy set later checks them (recheck).
+  checkPath(peer) {
+    const on = this.pathOf(peer);
+    if ((on === 'peers' || on === 'signaling') && !this.allows(on)) return this.evict(peer, on, false);
+    clearTimeout(this.moving.get(peer));
+    this.moving.delete(peer);
+  }
+
+  // `peer`'s link against a policy just set: its route again, so its upgrades are as the policy now allows; on a
+  // path now off (or a WebRTC link that can't say which of its paths it is on, one of them now off), moved or
+  // dropped (evict). With new iceServers (`servers`), one over our TURN (or that can't say) restarts ICE on them. A
+  // fallback link's WebRTC attempt it can no longer move to (no WebRTC path before its own) is closed.
+  recheck(peer, servers) {
+    const path = this.paths.get(peer);
+    if (!path) return;
+    this.setRoute(peer, path);
+    const r = this.routes.get(peer);
+    const on = this.pathOf(peer);
+    if (!(on === null ? this.allows('direct') && this.allows('turn') : this.allows(on))) return this.evict(peer, on, true);
+    if (r.kind !== 'direct' && !this.retryUse(peer)) this.transport.dropRtc?.(peer);
+    else if (servers && r.kind === 'direct' && !r.adopted && on !== 'direct') this.transport.restart?.(peer);
+  }
+
+  // `peer`'s link is on `on`, a path the policy has off. It moves where the room can move it: from a member to the
+  // pipe (a punch over it: the core moves there once the peer answers), or from the pipe to a member (the member
+  // relay's probe, offered as setRoute and offerRelays now allow); else, and if it hasn't moved to a path the
+  // policy allows Room.moveMs on, it drops (unlink; `redial` as there).
+  evict(peer, on, redial) {
+    if (this.moving.has(peer)) return;
+    const pipe = on === 'peers' && this.allows('signaling') ? this.transport.pipe?.(peer) ?? null : null;
+    const relay = on === 'signaling' && this.allows('peers') && this.proven.has(peer) && this.membersFor(peer).length > 0;
+    if (pipe !== null) {
+      this.endpoint.setSlow(peer, null); // a punch never goes to the slow address
+      this.endpoint.addCandidate(pipe, peer);
+    } else if (!relay) return this.unlink(peer, redial);
+    this.moving.set(peer, setTimeout(() => {
+      this.moving.delete(peer);
+      const now = this.pathOf(peer);
+      if (this.linked.has(peer) && (now === 'peers' || now === 'signaling') && !this.allows(now)) this.unlink(peer, redial);
+    }, Room.moveMs));
+  }
+
+  // Ends the link to `peer`, on a path the policy has off, telling it so (its sealed close goes at once, over the
+  // pipe too): 'peer-leave' with reason 'policy'. With `redial` (the policy changed here), announces us again, so the
+  // two dial afresh under it, the smaller id dialling; a peer that dialled a path we have off isn't asked back.
+  unlink(peer, redial) {
+    this.endpoint.disconnect(peer);
+    this.transport.flush?.(peer);
+    this.lost(peer, 'policy');
+    if (redial) this.helloSoon();
   }
 
   // Every proven member linked to us directly is offered as a relay for every proven
   // peer we reach over signalling or through another member: the core probes through it
   // and moves the link there once the peer answers (from signalling), or once it is
   // clearly faster than the member relaying now; the peer answers only if it would use
-  // that member too.
+  // that member too. As the policy allows: 'peers' at all, and before 'signaling' for a
+  // link on the pipe.
   offerRelays() {
-    const members = [...this.routes].filter(([p, r]) => r.kind === 'direct' && this.proven.has(p)).map(([p]) => p);
+    const members = this.membersFor(null);
     for (const [p, r] of this.routes) {
-      if (r.kind !== 'direct' && this.proven.has(p)) for (const m of members) this.endpoint.addRelay(m, p);
+      const ok = r.kind === 'peer' ? this.allows('peers') : r.kind === 'signaling' && this.before('peers', 'signaling');
+      if (ok && this.proven.has(p)) for (const m of members) this.endpoint.addRelay(m, p);
     }
+  }
+
+  // The proven members linked to us directly, other than `peer`: those that can relay a link to it.
+  membersFor(peer) {
+    return [...this.routes].filter(([p, r]) => p !== peer && r.kind === 'direct' && this.proven.has(p)).map(([p]) => p);
   }
 
   // A DataChannel closed: the peer is lost if that was its path, or if no fallback
@@ -803,32 +1068,58 @@ export class Room {
     this.lost(peer, 'closed');
   }
 
-  // WebRTC couldn't link `peer`. The side that dials (the smaller id) dials it again
-  // through every member linked to us directly (and any that links later) and, unless
-  // one answers within PEER_FIRST_MS, over signalling too; the core keeps the first
-  // path to answer. With no other member that could (two in the room, say: a laptop on
-  // a phone's hotspot), signalling is dialled at once. The other side just answers.
+  // WebRTC couldn't link `peer`. The side that dials (the smaller id) goes on to the
+  // policy's next stage (dialStage): by default, the fallback (fallBack). With nothing
+  // left to try, it drops the dead link, so a later hello dials it again from the first
+  // stage; with no fallback in the order at all (`fallback: 'off'`), the dead link stays,
+  // and hellos don't dial it again. The other side just answers.
   rtcFailed(peer) {
-    if (this.left || this.fallback === 'off' || this.self > peer || this.endpoint.isConnected(peer)) return;
-    const vias = [...this.routes].filter(([p, r]) => p !== peer && r.kind === 'direct' && this.proven.has(p)).map(([p]) => p);
-    const pipe = this.transport.pipe?.(peer);
-    // Nothing else to try: drop the dead link, so a later hello dials WebRTC again.
-    if (!vias.length && pipe == null) return this.lost(peer, 'failed');
+    if (this.left || this.self > peer || this.endpoint.isConnected(peer)) return;
+    if (this.dialStage(peer, (this.stageOf.get(peer) ?? 0) + 1)) return;
+    if (this.plan.stages.some((s) => s.fallback)) this.lost(peer, 'failed');
+  }
+
+  // Dials `peer` through the fallback paths `paths` ('peers', 'signaling' or both, in the
+  // policy's order): through every member linked to us directly (and any that links later),
+  // and over signalling; the core keeps the first path to answer. The first gets
+  // PEER_FIRST_MS to itself. With members first and no other member that could relay (two
+  // in the room, say: a laptop on a phone's hotspot), signalling is dialled at once. False
+  // with nothing to dial.
+  fallBack(peer, paths) {
+    const relay = paths.includes('peers');
+    const vias = relay ? this.membersFor(peer) : [];
+    const pipe = paths.includes('signaling') ? this.transport.pipe?.(peer) ?? null : null;
+    if (!vias.length && pipe === null) return false;
     this.fallingBack.add(peer);
-    for (const v of vias) this.endpoint.connectVia(v, peer);
-    if (pipe == null) return;
-    // Another peer we heard but haven't linked yet may still link and prove the key, and
-    // relayPending dial through it: only with no such peer either is signalling at once.
-    const others = [...this.greeted, ...this.linked].some((p) => p !== peer && (!this.linked.has(p) || this.routes.get(p)?.kind === 'direct'));
-    if (!others) return this.endpoint.connect(pipe, peer);
-    setTimeout(() => !this.left && this.fallingBack.has(peer) && this.endpoint.connect(pipe, peer), Room.peerFirstMs);
+    if (pipe === null || paths[0] === 'peers') {
+      this.viaOk.add(peer);
+      for (const v of vias) this.endpoint.connectVia(v, peer);
+      if (pipe === null) return true;
+      // Another peer we heard but haven't linked yet may still link and prove the key, and
+      // relayPending dial through it: only with no such peer either is signalling at once.
+      const others = [...this.greeted, ...this.linked].some((p) => p !== peer && (!this.linked.has(p) || this.routes.get(p)?.kind === 'direct'));
+      if (!others) this.endpoint.connect(pipe, peer);
+      else setTimeout(() => !this.left && this.fallingBack.has(peer) && this.endpoint.connect(pipe, peer), Room.peerFirstMs);
+      return true;
+    }
+    // Signalling first: members join the dial Room.peerFirstMs on, unless it has linked.
+    this.endpoint.connect(pipe, peer);
+    if (relay) {
+      setTimeout(() => {
+        if (this.left || !this.fallingBack.has(peer)) return;
+        this.viaOk.add(peer);
+        for (const v of this.membersFor(peer)) this.endpoint.connectVia(v, peer);
+      }, Room.peerFirstMs);
+    }
+    return true;
   }
 
   // A member just linked directly and proved the key: it can relay the peers we are
-  // still dialling by fallback (the core adds a path to a dial under way).
+  // still dialling by fallback whose dial may go through members now (the core adds a
+  // path to a dial under way).
   relayPending(member) {
     if (this.routes.get(member)?.kind !== 'direct') return;
-    for (const p of this.fallingBack) if (p !== member && !this.endpoint.isConnected(p)) this.endpoint.connectVia(member, p);
+    for (const p of this.fallingBack) if (this.viaOk.has(p) && p !== member && !this.endpoint.isConnected(p)) this.endpoint.connectVia(member, p);
   }
 
   lost(peer, reason) {
@@ -844,6 +1135,10 @@ export class Room {
     this.routes.delete(peer);
     this.paths.delete(peer);
     this.fallingBack.delete(peer);
+    this.viaOk.delete(peer);
+    this.stageOf.delete(peer);
+    clearTimeout(this.moving.get(peer));
+    this.moving.delete(peer);
     this.retries.forget(peer);
     this.punches?.gone(peer);
     this.docOut.delete(peer);

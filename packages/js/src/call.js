@@ -102,7 +102,8 @@ function checkStream(stream) {
 // A room's calls: the roster, kept whether or not we are in the call, and our call while we are.
 // `self` our PeerId; `send(peer, msg)` writes a call frame to a room member; `members()` the room's members;
 // `now()` a monotonic clock in ms; `after(ms, fn)` a timer, returning its cancel; `media` { RTCPeerConnection,
-// MediaStream, iceServers, privacy } from joinRoom, or null without WebRTC.
+// MediaStream, iceServers, iceTransportPolicy?, privacy } from the room (the servers as its policy allows now), or
+// null without WebRTC.
 export class Calls {
   constructor({ self, send, members, now = () => performance.now(), after = timer, media = null }) {
     Object.assign(this, { self, send, members, now, after, media });
@@ -331,8 +332,8 @@ export class Call {
   }
 
   link(peer) {
-    const { RTCPeerConnection: Pc, MediaStream: Ms, iceServers = [], privacy = 'direct' } = this.calls.media;
-    const pc = new Pc({ iceServers });
+    const { RTCPeerConnection: Pc, MediaStream: Ms, iceServers = [], iceTransportPolicy, privacy = 'direct' } = this.calls.media;
+    const pc = new Pc(iceTransportPolicy ? { iceServers, iceTransportPolicy } : { iceServers });
     const l = { peer, pc, polite: this.calls.self > peer, remote: new Ms(), tx: null, state: null, shown: false, closed: false,
       makingOffer: false, chain: Promise.resolve(), timer: null, connected: false, restarts: [] };
     this.links.set(peer, l);
