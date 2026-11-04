@@ -1,7 +1,10 @@
 use crate::portmap::{self, PortMapping, Worker};
 use crate::signaling::Signaling;
-use crate::traversal::{Birthday, Failure, NatType, PathKind, Policy, Privacy, Role, Signal, Traversal};
+use crate::traversal::{Birthday, Failure, Hop, NatType, PathKind, Policy, Privacy, Role, Signal, Traversal};
+#[cfg(feature = "turn")]
+use crate::turn::TurnServer;
 use crate::Event;
+use peerwire_core::Event as Ev;
 use peerwire_core::{
     Config, ConnectError, DisconnectReason, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError,
     Stats, Transmit,
@@ -12,6 +15,9 @@ use std::fmt;
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// What the node's endpoint and traversal take as addresses ([`Hop`]): TURN hops besides network addresses.
+type Addr = Hop<SocketAddr>;
 
 /// Most datagrams read in one [`Node::poll`], so a flood can't stall the caller's frame.
 const MAX_READS_PER_POLL: usize = 4096;
@@ -95,6 +101,8 @@ pub struct Builder {
     portmap_at: Option<(SocketAddr, SocketAddr)>,
     relay_peers: Vec<String>,
     policy: Option<Policy>,
+    #[cfg(feature = "turn")]
+    turn: Vec<TurnServer>,
 }
 
 impl Builder {
@@ -173,6 +181,14 @@ impl Builder {
         self
     }
 
+    /// This node's own TURN servers, with their credentials ([`TurnServer`]): see [`Node::set_turn_servers`].
+    /// Names are resolved in [`bind`](Builder::bind). Default: none.
+    #[cfg(feature = "turn")]
+    pub fn turn_servers(mut self, servers: impl IntoIterator<Item = TurnServer>) -> Self {
+        self.turn = servers.into_iter().collect();
+        self
+    }
+
     /// Binds the UDP socket: `"[::]:0"` for any interface, IPv4 and IPv6, and a
     /// free port (see [`Node::bind`]).
     pub fn bind(self, addr: impl ToSocketAddrs) -> io::Result<Node> {
@@ -193,9 +209,12 @@ impl Builder {
         let stun = if local.ip().is_loopback() { Vec::new() } else { resolve(&self.stun, local.is_ipv6() && !dual) };
         OsRng.fill_bytes(&mut seed);
         let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-        let mut trav = Traversal::new(&identity, seed, unix_ms, local_addresses(local), stun);
+        let (local_addrs, stun) = (local_addresses(local).into_iter().map(Hop::Net).collect(), net(stun));
+        let mut trav = Traversal::new(&identity, seed, unix_ms, local_addrs, stun);
         trav.set_privacy(&mut ep, self.privacy);
         trav.set_policy(peerwire_core::Instant::ZERO, &mut ep, self.policy);
+        #[cfg(feature = "turn")]
+        trav.set_turn_servers(peerwire_core::Instant::ZERO, &mut ep, resolve_turn(&self.turn, local));
         let mut node = Node {
             sock,
             local,
@@ -228,13 +247,13 @@ impl Builder {
 pub struct Node {
     sock: UdpSocket,
     local: SocketAddr,
-    ep: Endpoint<SocketAddr>,
-    trav: Traversal<SocketAddr>,
+    ep: Endpoint<Addr>,
+    trav: Traversal<Addr>,
     signaling: Option<Box<dyn Signaling>>,
     epoch: Instant,
     status: HashMap<PeerId, Status>,
     events: VecDeque<Event>,
-    pending: VecDeque<Transmit<SocketAddr>>,
+    pending: VecDeque<Transmit<Addr>>,
     buf: Box<[u8; 2048]>,
     portmap: Option<Worker>,
     port_mapping: PortMapping,
@@ -317,6 +336,8 @@ impl Node {
             portmap_at: None,
             relay_peers: Vec::new(),
             policy: None,
+            #[cfg(feature = "turn")]
+            turn: Vec::new(),
         }
     }
 
@@ -336,7 +357,7 @@ impl Node {
     /// signaling, to dial back. Share it with those you want to link with.
     pub fn invite(&self) -> String {
         let relays = match self.trav.relay() {
-            Some(r) => self.ep.path(&r).and_then(|p| p.direct()).map(|a| (r, *a)).into_iter().collect(),
+            Some(r) => self.ep.path(&r).and_then(|p| p.direct()).map(|a| (r, *a.addr())).into_iter().collect(),
             None => Vec::new(),
         };
         Invite { peer: self.peer_id(), key: Some(self.trav.invite_key()), addrs: self.addresses(), relays }.to_link()
@@ -447,8 +468,32 @@ impl Node {
         let dual = self.local.is_ipv6() && self.local.ip().is_unspecified();
         let stun =
             if self.local.ip().is_loopback() { Vec::new() } else { resolve(&names, self.local.is_ipv6() && !dual) };
-        self.trav.set_stun_servers(stun);
+        self.trav.set_stun_servers(net(stun));
         self.poll();
+    }
+
+    /// Replaces this node's own TURN servers ([`Builder::turn_servers`]; empty: none); names are resolved now.
+    ///
+    /// TURN runs only with [`PathKind::Turn`] in the [policy](Node::set_policy), and not under
+    /// [`Privacy::RelayOnly`]. Then this node keeps an allocation on each server, offers its relayed address to
+    /// peers (in an entry nodes without TURN skip), and a dial's `Turn` step goes through it. A link on TURN moves
+    /// to a `Direct` or `Birthday` path the policy ranks earlier once one answers, never to a relay peer.
+    ///
+    /// An allocation stays on a server kept with the same credentials; the others are released, and links through
+    /// them move to a path the policy allows, or close with [`DisconnectReason::PathOff`]. New credentials for a
+    /// server (renewing short-lived ones before they expire) make a new allocation, at a new relayed address.
+    #[cfg(feature = "turn")]
+    pub fn set_turn_servers(&mut self, servers: impl IntoIterator<Item = TurnServer>) {
+        let servers: Vec<TurnServer> = servers.into_iter().collect();
+        let now = self.now();
+        self.trav.set_turn_servers(now, &mut self.ep, resolve_turn(&servers, self.local));
+        self.poll();
+    }
+
+    /// Each of this node's TURN servers, as resolved, and the relayed address of its allocation there once made.
+    #[cfg(feature = "turn")]
+    pub fn turn_status(&self) -> Vec<(SocketAddr, Option<SocketAddr>)> {
+        self.trav.turn_status().into_iter().map(|(a, r)| (*a.addr(), r)).collect()
     }
 
     /// Swaps the signaling carrier ([`Builder::signaling`]), to change relays, say: the old one is dropped, and on
@@ -468,12 +513,12 @@ impl Node {
     /// interface, the LAN and loopback addresses). At most 8, and only those the
     /// [`Privacy`] mode allows.
     pub fn addresses(&self) -> Vec<SocketAddr> {
-        self.trav.candidates()
+        self.trav.candidates().iter().map(|a| *a.addr()).collect()
     }
 
     /// The public address STUN reported for this socket, once a server has answered.
     pub fn public_addr(&self) -> Option<SocketAddr> {
-        self.trav.public_addr().copied()
+        self.trav.public_addr().map(|a| *a.addr())
     }
 
     /// What STUN says about this node's NAT.
@@ -502,12 +547,13 @@ impl Node {
     /// fails with [`ConnectError::NoPath`] if none has anything to dial.
     pub fn connect(&mut self, invite: &str) -> Result<PeerId, Error> {
         let inv: Invite<SocketAddr> = Invite::parse(invite).ok_or(Error::InvalidInvite)?;
-        let reaches = |a: &&SocketAddr| self.trav.reaches(*a);
-        let mut targets: Vec<Path<SocketAddr>> = inv.addrs.iter().filter(reaches).copied().map(Path::Direct).collect();
+        let reaches = |a: &&SocketAddr| self.trav.reaches(&Hop::Net(**a));
+        let direct = |a: &SocketAddr| Path::Direct(Hop::Net(*a));
+        let mut targets: Vec<Path<Addr>> = inv.addrs.iter().filter(reaches).map(direct).collect();
         for (relay, addr) in &inv.relays {
             if self.ep.is_connected(relay) {
                 targets.push(Path::Via(*relay));
-                targets.extend(Some(addr).filter(reaches).copied().map(Path::Direct));
+                targets.extend(Some(addr).filter(reaches).map(direct));
             }
         }
         let relay = self.trav.relay();
@@ -683,9 +729,24 @@ impl Node {
         self.ep.peer_stats(peer)
     }
 
-    /// The route a connected peer's link takes.
-    pub fn path(&self, peer: &PeerId) -> Option<&crate::Path> {
-        self.ep.path(peer)
+    /// The route a connected peer's link takes: through a relaying peer, or straight to an address, which is where
+    /// its packets go. A link through TURN shows the peer's address as the TURN server relays to it (its own, or
+    /// the peer's relayed address); [`path_kind`](Node::path_kind) says `Turn`.
+    pub fn path(&self, peer: &PeerId) -> Option<crate::Path> {
+        self.ep.path(peer).map(plain)
+    }
+
+    /// The kind of route a connected peer's link takes ([`PathKind`]): `Direct`, `Birthday` (out of one of this
+    /// node's birthday punch sockets, [`via_birthday`](Node::via_birthday)), `Peers` or `RelayPeers` (through
+    /// another peer), or `Turn` (through a TURN server: this node's own, or the peer's relayed address).
+    pub fn path_kind(&self, peer: &PeerId) -> Option<PathKind> {
+        Some(match self.ep.path(peer)? {
+            Path::Via(r) if self.is_relay_peer(r) => PathKind::RelayPeers,
+            Path::Via(_) => PathKind::Peers,
+            Path::Direct(Hop::Net(_)) if self.via_birthday(peer) => PathKind::Birthday,
+            Path::Direct(Hop::Net(_)) => PathKind::Direct,
+            Path::Direct(_) => PathKind::Turn,
+        })
     }
 
     /// Whether the direct link to `peer` goes out of one of this node's birthday
@@ -693,8 +754,8 @@ impl Node {
     /// punch made the link. On the peer's side, which probed for it from its main
     /// socket, this is false.
     pub fn via_birthday(&self, peer: &PeerId) -> bool {
-        match self.path(peer) {
-            Some(crate::Path::Direct(a)) => self.routes.get(a).is_some_and(|id| self.extra.contains_key(id)),
+        match self.ep.path(peer) {
+            Some(Path::Direct(Hop::Net(a))) => self.routes.get(a).is_some_and(|id| self.extra.contains_key(id)),
             _ => false,
         }
     }
@@ -729,16 +790,20 @@ impl Node {
         let now = self.at(now);
         if let Some(s) = self.portmap.as_ref().and_then(|w| w.poll()) {
             self.port_mapping = s;
-            self.trav.set_mapped(s.addr());
+            self.trav.set_mapped(s.addr().map(Hop::Net));
         }
         let mut drained = false;
         for _ in 0..MAX_READS_PER_POLL {
             match self.sock.recv_from(&mut self.buf[..]) {
                 Ok((n, from)) => {
                     // A dual-stack socket sees IPv4 peers as ::ffff:a.b.c.d.
-                    let from = SocketAddr::new(from.ip().to_canonical(), from.port());
-                    if !self.trav.handle_stun(&from, &self.buf[..n]) {
-                        self.ep.handle_datagram(now, from, &self.buf[..n]);
+                    let from = Hop::Net(SocketAddr::new(from.ip().to_canonical(), from.port()));
+                    // From a TURN server of ours: what a peer sent through it, or its own answers.
+                    match self.trav.handle_turn(now, &from, &self.buf[..n]) {
+                        Some(Some((hop, data))) => self.ep.handle_datagram(now, hop, &data),
+                        Some(None) => {}
+                        None if self.trav.handle_stun(&from, &self.buf[..n]) => {}
+                        None => self.ep.handle_datagram(now, self.trav.hop(from), &self.buf[..n]),
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -771,20 +836,18 @@ impl Node {
         let mut refused: Vec<PeerId> = Vec::new();
         // A new link's first packet raises its `AddrObserved`, and the `Replaced` of a link it replaces, before its
         // `Connected`: they wait for the next event, which says whether that link is admitted.
-        let mut held: Vec<Event> = Vec::new();
+        let mut held: Vec<Ev<Addr>> = Vec::new();
         while let Some(e) = self.ep.poll_event() {
             match e {
-                Event::AddrObserved { .. } | Event::Disconnected { reason: DisconnectReason::Replaced, .. } => {
-                    held.push(e)
-                }
+                Ev::AddrObserved { .. } | Ev::Disconnected { reason: DisconnectReason::Replaced, .. } => held.push(e),
                 // In a room, a link from a peer that never proved the room key, a relay-only node's new direct link
                 // to anyone but its relay, or a link on a path the policy has off: closed unseen, with what came in
                 // with it. A link it replaced was closed for its path (NB97-I1).
-                Event::Connected { peer, .. } if !self.admits(&peer, &e) => {
+                Ev::Connected { peer, .. } if !self.admits(&peer, &e) => {
                     for h in std::mem::take(&mut held) {
                         match h {
-                            Event::Disconnected { peer: p, .. } if p == peer => {
-                                let off = Event::Disconnected { peer, reason: DisconnectReason::PathOff };
+                            Ev::Disconnected { peer: p, .. } if p == peer => {
+                                let off = Ev::Disconnected { peer, reason: DisconnectReason::PathOff };
                                 self.take_event(now, wall, off, &refused);
                             }
                             h if about(&h) == Some(peer) => {}
@@ -794,10 +857,10 @@ impl Node {
                     refused.push(peer);
                 }
                 e => {
-                    if let Event::Connected { peer, .. } = e {
+                    if let Ev::Connected { peer, .. } = e {
                         if refused.contains(&peer) {
                             // It replaced the refused link, which the app never saw (NB97-I4).
-                            held.retain(|h| !matches!(h, Event::Disconnected { peer: p, .. } if *p == peer));
+                            held.retain(|h| !matches!(h, Ev::Disconnected { peer: p, .. } if *p == peer));
                         }
                         refused.retain(|p| *p != peer);
                     }
@@ -826,33 +889,33 @@ impl Node {
     /// Hands on an event of the core's: to the traversal and the node, then to the app unless it is the node's own
     /// business. Dropped if it is about a peer in `refused` (see `poll_drained`), or one whose link isn't up and
     /// isn't admitted (see `admits`).
-    fn take_event(&mut self, now: peerwire_core::Instant, wall: Instant, e: Event, refused: &[PeerId]) {
+    fn take_event(&mut self, now: peerwire_core::Instant, wall: Instant, e: Ev<Addr>, refused: &[PeerId]) {
         let unseen = |p: &PeerId| refused.contains(p) || (self.status(p) != Status::Connected && !self.admits(p, &e));
         if about(&e).is_some_and(|p| unseen(&p)) {
             return;
         }
         // A dial that moved a link off a path the policy turned off failed: the node's own.
-        let own = matches!(&e, Event::ConnectFailed { peer } if self.trav.redialing(peer));
+        let own = matches!(&e, Ev::ConnectFailed { peer } if self.trav.redialing(peer));
         self.trav.handle_event(now, &mut self.ep, &e);
         if own {
             return;
         }
         self.track(&e);
         let subject = match &e {
-            Event::AddrObserved { by, .. } => by,
-            Event::Connected { peer, .. }
-            | Event::Message { peer, .. }
-            | Event::Disconnected { peer, .. }
-            | Event::PathChanged { peer, .. }
-            | Event::ConnectFailed { peer } => peer,
+            Ev::AddrObserved { by, .. } => by,
+            Ev::Connected { peer, .. }
+            | Ev::Message { peer, .. }
+            | Ev::Disconnected { peer, .. }
+            | Ev::PathChanged { peer, .. }
+            | Ev::ConnectFailed { peer } => peer,
         };
         if let Some(r) = self.relay_peers.iter_mut().find(|r| r.peer == *subject) {
-            if matches!(e, Event::Connected { .. }) {
+            if matches!(e, Ev::Connected { .. }) {
                 r.linked_at = Some(wall);
             }
             return; // a relay link is the node's own business, not the app's
         }
-        self.events.push_back(e);
+        self.events.push_back(plain_event(e));
     }
 
     /// Reports the links the policy closed ([`Traversal::poll_dropped`]): [`Event::Disconnected`] with
@@ -861,7 +924,7 @@ impl Node {
         while let Some(peer) = self.trav.poll_dropped() {
             self.status.remove(&peer);
             if !self.is_relay_peer(&peer) {
-                self.events.push_back(Event::Disconnected { peer, reason: DisconnectReason::PathOff });
+                self.events.push_back(Ev::Disconnected { peer, reason: DisconnectReason::PathOff });
             }
         }
     }
@@ -914,6 +977,10 @@ impl Node {
             }
         }
         while let Some(t) = self.ep.poll_transmit(now).or_else(|| self.trav.poll_transmit()) {
+            if let Hop::Turn { .. } = t.dst {
+                self.trav.send_turn(now, &t.dst, &t.payload); // through the allocation: to its server, next
+                continue;
+            }
             if !self.try_send(&t) {
                 if self.pending.len() >= MAX_PENDING_SENDS {
                     self.pending.pop_front();
@@ -924,11 +991,11 @@ impl Node {
     }
 
     /// Whether an event about a not yet connected `peer` belongs (see `poll_drained`).
-    fn admits(&self, peer: &PeerId, e: &Event) -> bool {
-        let direct = matches!(e, Event::Connected { path: Path::Direct(_), .. });
+    fn admits(&self, peer: &PeerId, e: &Ev<Addr>) -> bool {
+        let direct = matches!(e, Ev::Connected { path: Path::Direct(_), .. });
         let relay_only = matches!(self.privacy(), Privacy::RelayOnly { .. });
         let allowed = match e {
-            Event::Connected { path, .. } => self.trav.allows(peer, path),
+            Ev::Connected { path, .. } => self.trav.allows(peer, path),
             _ => true,
         };
         self.trav.admits(peer) && allowed && !(relay_only && direct && self.trav.relay() != Some(*peer))
@@ -948,9 +1015,13 @@ impl Node {
 
     /// `false` only when the socket's send buffer is full. Goes out of the extra
     /// socket that is `t.dst`'s route, if any, else the main one.
-    fn try_send(&self, t: &Transmit<SocketAddr>) -> bool {
-        let sock = self.routes.get(&t.dst).and_then(|id| self.extra.get(id)).map_or(&self.sock, |x| &x.sock);
-        match sock.send_to(&t.payload, self.wire_addr(t.dst)) {
+    fn try_send(&self, t: &Transmit<Addr>) -> bool {
+        let route = match &t.dst {
+            Hop::Net(a) => self.routes.get(a),
+            _ => None,
+        };
+        let sock = route.and_then(|id| self.extra.get(id)).map_or(&self.sock, |x| &x.sock);
+        match sock.send_to(&t.payload, self.wire_addr(*t.dst.addr())) {
             Ok(_) => true,
             Err(e) => e.kind() != ErrorKind::WouldBlock, // unreachable addresses etc.: drop it
         }
@@ -966,7 +1037,7 @@ impl Node {
 
     /// Opens a birthday punch's sockets, on the main socket's address but any
     /// port, and sends its payload from each (see [`Traversal::poll_birthday`]).
-    fn open_extra(&mut self, b: &Birthday<SocketAddr>) {
+    fn open_extra(&mut self, b: &Birthday<Addr>) {
         let any = SocketAddr::new(self.local.ip(), 0);
         let n = (b.sockets as usize).min(MAX_EXTRA_SOCKETS.saturating_sub(self.extra.len()));
         let mut opened: Vec<u64> = Vec::new();
@@ -987,7 +1058,7 @@ impl Node {
             if sock.set_nonblocking(true).is_err() {
                 continue;
             }
-            let _ = sock.send_to(&b.payload, self.wire_addr(b.dst));
+            let _ = sock.send_to(&b.payload, self.wire_addr(*b.dst.addr()));
             self.next_extra += 1;
             self.extra.insert(self.next_extra, Extra { sock, peer: b.peer, until: b.until, last_recv: None });
             opened.push(self.next_extra);
@@ -1018,7 +1089,9 @@ impl Node {
                 // packet sent again, or another peer otherwise made itself a route,
                 // redirecting our egress and holding the socket open; now the
                 // endpoint just has the datagram.
-                let Some((who, fresh)) = self.ep.handle_datagram_direct(now, from, &self.buf[..n]) else { continue };
+                let Some((who, fresh)) = self.ep.handle_datagram_direct(now, Hop::Net(from), &self.buf[..n]) else {
+                    continue;
+                };
                 if who != peer {
                     continue;
                 }
@@ -1076,33 +1149,66 @@ impl Node {
         self.routes.len()
     }
 
-    fn track(&mut self, e: &Event) {
+    fn track(&mut self, e: &Ev<Addr>) {
         match e {
-            Event::Connected { peer, .. } => {
+            Ev::Connected { peer, .. } => {
                 self.status.insert(*peer, Status::Connected);
             }
-            Event::Disconnected { peer, .. } | Event::ConnectFailed { peer } => {
+            Ev::Disconnected { peer, .. } | Ev::ConnectFailed { peer } => {
                 self.status.remove(peer);
             }
-            Event::Message { .. } | Event::PathChanged { .. } | Event::AddrObserved { .. } => {}
+            Ev::Message { .. } | Ev::PathChanged { .. } | Ev::AddrObserved { .. } => {}
         }
     }
 }
 
 /// The peer `e` is about; none for a failed dial.
-fn about(e: &Event) -> Option<PeerId> {
+fn about<A>(e: &Ev<A>) -> Option<PeerId> {
     match e {
-        Event::Connected { peer, .. }
-        | Event::Message { peer, .. }
-        | Event::Disconnected { peer, .. }
-        | Event::PathChanged { peer, .. } => Some(*peer),
-        Event::AddrObserved { by, .. } => Some(*by),
-        Event::ConnectFailed { .. } => None,
+        Ev::Connected { peer, .. }
+        | Ev::Message { peer, .. }
+        | Ev::Disconnected { peer, .. }
+        | Ev::PathChanged { peer, .. } => Some(*peer),
+        Ev::AddrObserved { by, .. } => Some(*by),
+        Ev::ConnectFailed { .. } => None,
     }
 }
 
 /// Binds `addr`, the first of its addresses that binds. `[::]` binds a dual-stack
 /// socket, or `0.0.0.0` on the same port where the host has no IPv6.
+fn net(addrs: Vec<SocketAddr>) -> Vec<Addr> {
+    addrs.into_iter().map(Hop::Net).collect()
+}
+
+/// What the app sees of a path: where its packets go ([`Hop::addr`]).
+fn plain(p: &Path<Addr>) -> crate::Path {
+    match p {
+        Path::Direct(h) => Path::Direct(*h.addr()),
+        Path::Via(r) => Path::Via(*r),
+    }
+}
+
+/// An event of the endpoint's as the app sees it, its paths and addresses as [`plain`] shows them.
+fn plain_event(e: Ev<Addr>) -> Event {
+    match e {
+        Ev::Connected { peer, path, initiator } => Ev::Connected { peer, path: plain(&path), initiator },
+        Ev::PathChanged { peer, path } => Ev::PathChanged { peer, path: plain(&path) },
+        Ev::AddrObserved { by, addr } => Ev::AddrObserved { by, addr: *addr.addr() },
+        Ev::Message { peer, lane, data } => Ev::Message { peer, lane, data },
+        Ev::Disconnected { peer, reason } => Ev::Disconnected { peer, reason },
+        Ev::ConnectFailed { peer } => Ev::ConnectFailed { peer },
+    }
+}
+
+/// TURN servers' addresses, resolved as STUN servers' are (a dual-stack socket's over IPv4), but on loopback too;
+/// one that doesn't resolve is skipped.
+#[cfg(feature = "turn")]
+fn resolve_turn(servers: &[TurnServer], local: SocketAddr) -> Vec<(Addr, TurnServer)> {
+    let v6 = local.is_ipv6() && !local.ip().is_unspecified();
+    let one = |t: &TurnServer| Some((Hop::Net(*resolve(std::slice::from_ref(&t.addr), v6).first()?), t.clone()));
+    servers.iter().filter_map(one).collect()
+}
+
 fn bind_socket(addr: impl ToSocketAddrs) -> io::Result<UdpSocket> {
     let mut last = io::Error::new(ErrorKind::InvalidInput, "no address to bind");
     for a in addr.to_socket_addrs()? {
@@ -1314,14 +1420,15 @@ mod tests {
     fn birthday_sockets_carry_the_link_they_hear() {
         let (mut a, mut b) = (quiet("127.0.0.1:0"), quiet("127.0.0.1:0"));
         let until = a.now() + Duration::from_millis(300);
-        let opened = Birthday { peer: b.peer_id(), dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until };
+        let opened =
+            Birthday { peer: b.peer_id(), dst: Hop::Net(b.local_addr()), sockets: 4, payload: b"x".to_vec(), until };
         a.open_extra(&opened);
         let (socks, _) = a.extra_sockets();
         assert_eq!(socks.len(), 4);
         assert!(socks.iter().all(|s| s.port() != a.local_addr().port()));
         let hit = socks[2];
         let now = b.now();
-        b.ep.connect(now, hit, a.peer_id()).unwrap();
+        b.ep.connect(now, Hop::Net(hit), a.peer_id()).unwrap();
         let t0 = Instant::now();
         while !(a.status(&b.peer_id()) == Status::Connected && b.status(&a.peer_id()) == Status::Connected) {
             assert!(t0.elapsed() < Duration::from_secs(5), "no link");
@@ -1329,7 +1436,7 @@ mod tests {
             a.poll();
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(b.path(&a.peer_id()), Some(&Path::Direct(hit)));
+        assert_eq!(b.path(&a.peer_id()), Some(Path::Direct(hit)));
         assert!(a.via_birthday(&b.peer_id()), "the opener sees the link on its extra socket");
         assert!(!b.via_birthday(&a.peer_id()), "the prober's link is on its main socket");
         assert_eq!((a.birthday_sockets_opened(), b.birthday_sockets_opened()), (4, 0));
@@ -1339,14 +1446,14 @@ mod tests {
             a.poll();
             b.poll();
             while let Some(e) = b.try_recv_event() {
-                if let Event::Message { data, .. } = e {
+                if let Ev::Message { data, .. } = e {
                     got.push(data);
                 }
             }
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(got, vec![b"from the extra socket".to_vec()]);
-        assert_eq!(b.path(&a.peer_id()), Some(&Path::Direct(hit)), "A's replies came from the extra socket");
+        assert_eq!(b.path(&a.peer_id()), Some(Path::Direct(hit)), "A's replies came from the extra socket");
         assert!(a.next_timeout().is_some_and(|t| t <= EXTRA_POLL), "wakes to read the extra sockets");
         while t0.elapsed() < Duration::from_millis(400) {
             a.poll();
@@ -1364,7 +1471,7 @@ mod tests {
         let mut a = quiet("127.0.0.1:0");
         let peer = quiet("127.0.0.1:0").peer_id(); // a peer we never dial
         let until = a.now() + Duration::from_millis(200);
-        let dst = "127.0.0.1:9".parse().unwrap();
+        let dst = Hop::Net("127.0.0.1:9".parse().unwrap());
         let opened = Birthday { peer, dst, sockets: 4, payload: b"x".to_vec(), until };
         a.open_extra(&opened);
         let (socks, _) = a.extra_sockets();
@@ -1410,7 +1517,7 @@ mod tests {
         let (mut a, mut b, mut c) = (quiet("127.0.0.1:0"), quiet("127.0.0.1:0"), quiet("127.0.0.1:0"));
         let (pa, pb, pc) = (a.peer_id(), b.peer_id(), c.peer_id());
         let linked = |x: &Node, y: &Node| x.status(&y.peer_id()) == Status::Connected;
-        a.ep.connect(a.now(), b.local_addr(), pb).unwrap();
+        a.ep.connect(a.now(), Hop::Net(b.local_addr()), pb).unwrap();
         poll_until(&mut [&mut a, &mut b], |n| linked(n[0], n[1]) && linked(n[1], n[0]));
         // A Data packet of b's to a: its receiver index is a's for the link.
         b.ep.send(&pa, Lane::Unreliable, b"x").unwrap();
@@ -1419,15 +1526,15 @@ mod tests {
         let junk = [&[(data.payload[0] & 0xf0) | 2, 7, 0, 0, 0][..], &data.payload[1..5], &[0x55; 48]].concat();
         let t0 = Instant::now();
         let until = a.now() + Duration::from_millis(1000);
-        a.open_extra(&Birthday { peer: pb, dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until });
+        a.open_extra(&Birthday { peer: pb, dst: Hop::Net(b.local_addr()), sockets: 4, payload: b"x".to_vec(), until });
         let (socks, _) = a.extra_sockets();
         for _ in 0..3 {
             b.socket().send_to(&junk, socks[0]).unwrap();
         }
-        c.ep.connect(c.now(), socks[1], pa).unwrap();
+        c.ep.connect(c.now(), Hop::Net(socks[1]), pa).unwrap();
         poll_until(&mut [&mut a, &mut b, &mut c], |n| linked(n[0], n[2]) && linked(n[2], n[0]));
         assert!(t0.elapsed() < Duration::from_millis(900), "the test ran past until");
-        assert_eq!(c.path(&pa), Some(&Path::Direct(a.local_addr())), "c's link is on a's main socket");
+        assert_eq!(c.path(&pa), Some(Path::Direct(a.local_addr())), "c's link is on a's main socket");
         assert_eq!((a.route_count(), a.extra_sockets().1), (0, 0), "no route");
         assert!(!a.via_birthday(&pb) && !a.via_birthday(&pc));
         poll_until(&mut [&mut a, &mut b, &mut c], |_| t0.elapsed() > Duration::from_millis(1100));
@@ -1445,8 +1552,8 @@ mod tests {
         let (mut a, mut b, mut c) = (quiet("127.0.0.1:0"), quiet("127.0.0.1:0"), quiet("127.0.0.1:0"));
         let (pa, pb, pc) = (a.peer_id(), b.peer_id(), c.peer_id());
         let linked = |x: &Node, y: &Node| x.status(&y.peer_id()) == Status::Connected;
-        a.ep.connect(a.now(), b.local_addr(), pb).unwrap();
-        a.ep.connect(a.now(), c.local_addr(), pc).unwrap();
+        a.ep.connect(a.now(), Hop::Net(b.local_addr()), pb).unwrap();
+        a.ep.connect(a.now(), Hop::Net(c.local_addr()), pc).unwrap();
         poll_until(&mut [&mut a, &mut b, &mut c], |n| (1..3).all(|i| linked(n[0], n[i]) && linked(n[i], n[0])));
         // The newest packet `n` sealed for a, sent from a port of its own to `hit`; a reads it.
         let mut froms = Vec::new();
@@ -1458,13 +1565,13 @@ mod tests {
             s.send_to(&data.unwrap().payload, hit).unwrap();
             let from = s.local_addr().unwrap();
             froms.push(s);
-            poll_until(&mut [a], |x| x[0].path(&n.peer_id()) == Some(&Path::Direct(from)));
+            poll_until(&mut [a], |x| x[0].path(&n.peer_id()) == Some(Path::Direct(from)));
         };
         let t0 = Instant::now();
         let until = a.now() + Duration::from_millis(1000);
-        a.open_extra(&Birthday { peer: pb, dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until });
+        a.open_extra(&Birthday { peer: pb, dst: Hop::Net(b.local_addr()), sockets: 4, payload: b"x".to_vec(), until });
         let (socks, _) = a.extra_sockets();
-        a.open_extra(&Birthday { peer: pc, dst: c.local_addr(), sockets: 1, payload: b"x".to_vec(), until });
+        a.open_extra(&Birthday { peer: pc, dst: Hop::Net(c.local_addr()), sockets: 1, payload: b"x".to_vec(), until });
         let to_c = a.extra_sockets().0.into_iter().find(|s| !socks.contains(s)).unwrap();
         hop(&mut a, &mut c, to_c);
         assert!(a.via_birthday(&pc));
@@ -1492,14 +1599,14 @@ mod tests {
         let (mut a, mut b) = (quiet("127.0.0.1:0"), quiet("127.0.0.1:0"));
         let (pa, pb) = (a.peer_id(), b.peer_id());
         let linked = |x: &Node, y: &Node| x.status(&y.peer_id()) == Status::Connected;
-        b.ep.connect(b.now(), a.local_addr(), pa).unwrap();
+        b.ep.connect(b.now(), Hop::Net(a.local_addr()), pa).unwrap();
         let now = b.now();
         let hs1 = std::iter::from_fn(|| b.ep.poll_transmit(now)).find(|t| t.payload[0] & 0x0f == 1).unwrap().payload;
         b.socket().send_to(&hs1, a.local_addr()).unwrap();
         poll_until(&mut [&mut a, &mut b], |n| linked(n[0], n[1]) && linked(n[1], n[0]));
         let t0 = Instant::now();
         let until = a.now() + Duration::from_millis(1000);
-        a.open_extra(&Birthday { peer: pb, dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until });
+        a.open_extra(&Birthday { peer: pb, dst: Hop::Net(b.local_addr()), sockets: 4, payload: b"x".to_vec(), until });
         let (socks, _) = a.extra_sockets();
         // b's link moves to a new port of b's, heard on socks[0]: b's route.
         b.ep.send(&pa, Lane::Unreliable, b"x").unwrap();
@@ -1508,7 +1615,7 @@ mod tests {
         let moved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         moved.send_to(&data.payload, socks[0]).unwrap();
         let b_at = moved.local_addr().unwrap();
-        poll_until(&mut [&mut a], |x| x[0].path(&pb) == Some(&Path::Direct(b_at)));
+        poll_until(&mut [&mut a], |x| x[0].path(&pb) == Some(Path::Direct(b_at)));
         assert!(a.via_birthday(&pb));
         let m = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let src = if spoofed { &moved } else { &m };
@@ -1527,7 +1634,7 @@ mod tests {
         let (by, routes) = if spoofed { (socks[0], 1) } else { (socks[1], 2) };
         assert_eq!(answer, Some((57, by)), "the HS2, and the socket it left");
         assert!(t0.elapsed() < Duration::from_millis(900), "the test ran past until");
-        assert_eq!(a.path(&pb), Some(&Path::Direct(b_at)), "b's link stays");
+        assert_eq!(a.path(&pb), Some(Path::Direct(b_at)), "b's link stays");
         assert!(a.via_birthday(&pb), "on its route");
         assert_eq!((a.route_count(), a.extra_sockets().1), (routes, 1), "a copy holds no socket");
         poll_until(&mut [&mut a], |_| t0.elapsed() > Duration::from_millis(1100));

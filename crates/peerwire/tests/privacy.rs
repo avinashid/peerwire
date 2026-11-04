@@ -134,7 +134,7 @@ fn relay_only_room_peers_link_through_the_host() {
     a.join_room_as("pw-test", "quiet", Role::Peer);
     b.join_room_as("pw-test", "quiet", Role::Peer);
     let mut ev = [vec![], vec![], vec![]];
-    let via_h = |n: &Node, p: &PeerId| n.path(p) == Some(&Path::Via(hid));
+    let via_h = |n: &Node, p: &PeerId| n.path(p) == Some(Path::Via(hid));
     assert!(pump(&mut [&mut h, &mut a, &mut b], &mut ev, 10, |n| via_h(n[1], &bid) && via_h(n[2], &aid)));
     a.send(&bid, peerwire::Lane::Reliable, b"psst").unwrap();
     pump(&mut [&mut h, &mut a, &mut b], &mut ev, 2, |_| false);
@@ -198,7 +198,7 @@ fn relay_only_invites_go_through_the_relay() {
     assert_eq!(inv.addrs, vec![]);
     assert_eq!(inv.relays, vec![(rid, r.local_addr())]);
     b.connect(&a.invite()).unwrap();
-    let via = |n: &Node, p: &PeerId| n.path(p) == Some(&Path::Via(rid));
+    let via = |n: &Node, p: &PeerId| n.path(p) == Some(Path::Via(rid));
     assert!(pump(&mut [&mut r, &mut a, &mut b], &mut ev, 5, |n| via(n[1], &bid) && via(n[2], &aid)));
     pump(&mut [&mut r, &mut a, &mut b], &mut ev, 1, |_| false);
     assert!(via(&a, &bid) && via(&b, &aid));
