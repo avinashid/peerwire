@@ -183,19 +183,23 @@ anywhere can join with `room_chat ROOM`. Without one it stays on the LAN, in roo
   the C3 and `-mlongcalls` on the ESP32. ring draws its random numbers from
   `esp_fill_random` (feature `less-safe-getrandom-espidf`), after Wi-Fi is up.
 - **SNTP.** One boot got no answer from its one SNTP server in 20 s; as the Node reads
-  the clock when it is bound, it linked with no one. The firmware now asks four servers
-  and waits up to 60 s. The relay's TLS needs the clock too.
+  the clock when it is bound, it linked with no one. Asking four through lwIP's SNTP
+  still took 15 s on one boot and over 50 s, silent, on two others, as lwIP gives each
+  server 15 s. The firmware now asks the four itself, 2 s each, for up to 60 s, logs why
+  each ask failed, then leaves lwIP's SNTP to keep the clock in step. The relay's TLS
+  needs the clock too.
 - **Restarts.** A boot that joined Wi-Fi but got no DHCP address stopped there; the
   firmware now restarts 5 s after any setup error.
-- **Security review (NB95-1 to NB95-5).** One relay message of a few KB, parsed whole,
+- **Security review (NB95-1 to NB95-6).** One relay message of a few KB, parsed whole,
   could take more heap than the board had free (4.5 KB of empty tags took 192 KB). On
   ESP-IDF the carrier now takes messages of up to 4 KiB and holds 16 KiB of waiting
-  events; on every target it drops a message of more than 64 JSON values unparsed, and
-  keeps its back-off when a frame over the cap closes the connection. A relay that
+  events; on every target it drops a message of more than 64 JSON values, 2 objects or
+  8 arrays unparsed (738 B of nested objects took 65.6 KB), and keeps its back-off when
+  a frame over the cap closes the connection. A relay that
   stopped reading held every later publish; writes now time out after 5 s. The relay
   thread runs at the main task's priority, 1, not ESP-IDF's 5, which on the C3's one
-  core could hold off the node's loop. The room is no longer fixed and public, and the
-  log escapes what members send.
+  core could hold off the node's loop. The room is no longer fixed and public, the log
+  escapes what members send, and the board forgets the address of a peer that left.
 
 ## What it would take to go further
 

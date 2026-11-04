@@ -18,7 +18,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -56,6 +57,9 @@ const QEMU_ROOM: (&str, &str) = ("peerwire-esp32", "lab");
 /// On Wi-Fi: one of `NostrSignaling`'s default relays, so PCs on the defaults share it.
 /// One relay, as each costs the chip a thread and a TLS session.
 const NOSTR_RELAY: &str = "wss://nostr.mom";
+/// Asked in turn for the time, each for up to `NTP_WAIT`.
+const NTP_SERVERS: [&str; 4] = ["0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.org", "3.pool.ntp.org"];
+const NTP_WAIT: Duration = Duration::from_secs(2);
 
 /// What the last flash sector says.
 struct NodeConfig {
@@ -210,7 +214,13 @@ fn run() -> anyhow::Result<()> {
                         );
                     }
                 }
-                Event::Disconnected { peer, reason } => warn!("node {n}: {} left: {reason:?}", name(&names, &peer)),
+                Event::Disconnected { peer, reason } => {
+                    warn!("node {n}: {} left: {reason:?}", name(&names, &peer));
+                    // Unless a new link replaced this one.
+                    if !node.peers().any(|q| *q == peer) {
+                        names.remove(&peer);
+                    }
+                }
                 Event::ConnectFailed { peer } => warn!("node {n}: dial to {} failed", name(&names, &peer)),
                 _ => {}
             }
@@ -231,6 +241,9 @@ fn run() -> anyhow::Result<()> {
         }
         if now >= next_report {
             next_report = now + Duration::from_secs(10);
+            // Linked peers only: one that relinks under fresh keys adds an entry each time,
+            // and a map past a few hundred grows in one block the heap can't spare (NB95-6).
+            names.retain(|p, _| node.peers().any(|q| q == p));
             report(n, &node, heap_node, &names, [&lan, &nostr], wifi.is_some(), on_relay);
         }
         std::thread::sleep(node.next_timeout().unwrap_or(Duration::from_millis(10)).min(Duration::from_millis(10)));
@@ -396,22 +409,80 @@ fn lan_signaling(n: u8, ip: Ipv4Addr, prefix: u8) -> std::io::Result<LanSignalin
 /// has no battery-backed clock: at 1970 it and a PC on the LAN dropped each other's hellos
 /// and never linked (NB-091). The Node reads the clock when it is bound, so this comes
 /// first. In QEMU every chip's clock starts at 1970, so they agree without it.
+///
+/// It asks the pool itself, 2 s a server, and logs why each ask failed: lwIP's SNTP gives a
+/// server 15 s and can't be told less, and on a board it took 15 s on one boot and over
+/// 50 s, silent, on two others (NB-095 run E). lwIP's SNTP then keeps the clock in step.
 fn set_clock(n: u8) -> Option<EspSntp<'static>> {
-    let unix_s = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let sntp = EspSntp::new_default().map_err(|e| warn!("node {n}: SNTP: {e}")).ok()?;
     let start = Instant::now();
-    // 2023-11-14: any clock before it was never set.
-    // lwIP gives a server 15 s to answer, then asks the next (sdkconfig.defaults): one
-    // that never answered left a board with no links (NB-095), as the Node reads the clock
-    // once, when it is bound.
-    while unix_s() < 1_700_000_000 && start.elapsed() < Duration::from_secs(60) {
-        std::thread::sleep(Duration::from_millis(100));
+    for server in NTP_SERVERS.iter().cycle() {
+        if clock_set() || start.elapsed() >= Duration::from_secs(60) {
+            break;
+        }
+        let next = Instant::now() + NTP_WAIT;
+        match ask_ntp(server) {
+            Ok((from, now)) => {
+                let tv = sys::timeval { tv_sec: now.as_secs() as _, tv_usec: now.subsec_micros() as _ };
+                if unsafe { sys::settimeofday(&tv, std::ptr::null()) } == 0 {
+                    let ms = start.elapsed().as_millis();
+                    info!("node {n}: clock set by {server} ({from}) in {ms} ms: {} s", now.as_secs());
+                } else {
+                    warn!("node {n}: settimeofday failed");
+                }
+            }
+            Err(e) => warn!("node {n}: SNTP {server}: {e}"),
+        }
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
     }
-    match unix_s() {
-        s if s >= 1_700_000_000 => info!("node {n}: clock set by SNTP in {} ms: {s} s", start.elapsed().as_millis()),
-        s => warn!("node {n}: no SNTP answer in 60 s, clock at {s} s: LAN peers with a set clock drop our hellos"),
+    if !clock_set() {
+        warn!("node {n}: no SNTP answer in 60 s, clock at 1970: LAN peers with a set clock drop our hellos");
     }
-    Some(sntp)
+    EspSntp::new_default().map_err(|e| warn!("node {n}: SNTP: {e}")).ok()
+}
+
+/// 2023-11-14: any clock before it was never set.
+fn clock_set() -> bool {
+    SystemTime::now().duration_since(UNIX_EPOCH).is_ok_and(|d| d.as_secs() >= 1_700_000_000)
+}
+
+/// Asks `server` the time once, waiting up to 2 s: its address and the time since 1970,
+/// with no allowance for the trip (the replay guard allows a minute).
+fn ask_ntp(server: &str) -> io::Result<(SocketAddr, Duration)> {
+    let to = (server, 123)
+        .to_socket_addrs()
+        .map_err(|e| io::Error::new(e.kind(), format!("DNS: {e}")))?
+        .find(SocketAddr::is_ipv4)
+        .ok_or_else(|| io::Error::other("DNS: no IPv4 address"))?;
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    // No leap second, version 4, a client; and a random transmit time, which the answer must
+    // echo: a sender off the path can't guess it.
+    let mut ask = [0u8; 48];
+    ask[0] = 0x23;
+    unsafe { sys::esp_fill_random(ask[40..].as_mut_ptr().cast(), 8) };
+    sock.send_to(&ask, to)?;
+    let end = Instant::now() + NTP_WAIT;
+    let mut buf = [0u8; 64];
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("no answer from {to} in 2 s")));
+        }
+        sock.set_read_timeout(Some(left))?;
+        let (len, from) = match sock.recv_from(&mut buf) {
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => continue,
+            r => r?,
+        };
+        // The server's answer (mode 4) to this ask, and not a kiss-o'-death (stratum 0).
+        if from != to || len < 48 || buf[0] & 7 != 4 || buf[1] == 0 || buf[24..32] != ask[40..48] {
+            continue;
+        }
+        let word = |i: usize| u64::from(u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
+        // NTP counts from 1900.
+        let Some(unix) = word(40).checked_sub(2_208_988_800).filter(|&s| s >= 1_700_000_000) else {
+            return Err(io::Error::other(format!("{to} answered {} s since 1900", word(40))));
+        };
+        return Ok((to, Duration::from_secs(unix) + Duration::from_micros(word(44) * 1_000_000 >> 32)));
+    }
 }
 
 fn free_heap() -> u32 {
