@@ -232,8 +232,10 @@ pub enum Privacy {
     RelayOnly { via: Option<PeerId> },
 }
 
-/// A way a link can reach its peer, as a [`Policy`] orders them.
+/// A way a link can reach its peer, as a [`Policy`] orders them. More kinds may come, so a `match` on one outside
+/// this crate needs a `_` arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PathKind {
     /// Straight to the peer's addresses: those its offers and invites carry (LAN, public from STUN, mapped by its
     /// router, seen by its peers), the ports around one its NAT will likely pick, and the punches that move a link
