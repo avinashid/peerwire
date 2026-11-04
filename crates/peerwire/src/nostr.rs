@@ -40,6 +40,11 @@ const RELAY_STACK: Option<usize> = if SMALL { Some(32 << 10) } else { None };
 /// JSON value costs several times its text, most of all as many small values (4.5 KB of
 /// empty tags took 192 KB, NB95-1). A Peerwire event has 13.
 const MAX_SHAPE: usize = 64;
+/// Nor more `{` or `[` than these: an object costs about 630 B parsed even with one key,
+/// and nesting costs stack too (738 B of 50 nested objects took +65.6 KB of heap and 33 KB
+/// of stack, NB95-1a). A Peerwire event has 1 and 3.
+const MAX_OBJECTS: usize = 2;
+const MAX_ARRAYS: usize = 8;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A connection that stayed up this long resets the back-off. One that drops sooner, as
 /// one a frame over the cap closes does, keeps it, so a sender can't make the carrier
@@ -399,7 +404,16 @@ fn req_sub(req: Option<&str>) -> String {
 }
 
 fn on_relay_message(text: &str, out: &SyncSender<Incoming>, shared: &Shared, max_bytes: usize) {
-    if text.bytes().filter(|b| matches!(b, b'[' | b'{' | b',')).count() > MAX_SHAPE {
+    let (mut arrays, mut objects, mut commas) = (0, 0, 0);
+    for b in text.bytes() {
+        match b {
+            b'[' => arrays += 1,
+            b'{' => objects += 1,
+            b',' => commas += 1,
+            _ => {}
+        }
+    }
+    if arrays + objects + commas > MAX_SHAPE || objects > MAX_OBJECTS || arrays > MAX_ARRAYS {
         return;
     }
     let Ok(Value::Array(m)) = serde_json::from_str::<Value>(text) else { return };
@@ -657,10 +671,11 @@ mod tests {
     fn relay_messages_are_bounded_before_they_are_parsed_and_queued() {
         let (tx, rx) = sync_channel(64);
         let shared = Shared::default();
-        // 13 + 2 × 20 = 53 values: passed on. 13 + 2 × 60: dropped, though its id is right.
-        on(&relay_event(1, "t", "QQ==", 20), &tx, &shared);
+        // 3 + 5 = 8 arrays: passed on. 9, or 13 + 2 × 60 values: dropped, though the id is right.
+        on(&relay_event(1, "t", "QQ==", 5), &tx, &shared);
         assert_eq!(rx.try_iter().count(), 1);
-        on(&relay_event(2, "t", "QQ==", 60), &tx, &shared);
+        on(&relay_event(2, "t", "QQ==", 6), &tx, &shared);
+        on(&relay_event(3, "t", "QQ==", 60), &tx, &shared);
         assert_eq!(rx.try_iter().count(), 0);
         // An ESP32's inbox: 16 KiB, so 5 events of 3,129 B and not the 6th.
         let shared = Shared::default();

@@ -2,7 +2,7 @@
 //! relay that stops reading (NB95-2), against relays of our own on loopback. One test, as
 //! the counting allocator counts the whole process.
 use peerwire::{NostrSignaling, Signaling, Topic};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Socket, Type};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -56,13 +56,13 @@ fn wait(secs: u64, mut done: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// `["EVENT", "s", event]` on `topic` with a valid id and `extra` empty tags beside the
-/// `p` one. The carrier checks no signature, so none is made.
-fn event(topic: Topic, content: &str, extra: usize) -> String {
+/// `["EVENT", "s", event]` on `topic` with a valid id and `extra` beside the `p` tag. The
+/// carrier checks no signature, so none is made.
+fn event(topic: Topic, content: &str, extra: impl IntoIterator<Item = Value>) -> String {
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let pubkey = "11".repeat(32);
     let mut tags = vec![json!(["p", topic.to_hex()])];
-    tags.extend((0..extra).map(|_| json!([""])));
+    tags.extend(extra);
     let id = hex(&Sha256::digest(json!([0, pubkey, 1_700_000_000, 25059, tags, content]).to_string()));
     let ev = json!({"id": id, "pubkey": pubkey, "created_at": 1_700_000_000, "kind": 25059, "tags": tags,
                     "content": content, "sig": "22".repeat(64)});
@@ -120,10 +120,15 @@ fn relays_cant_make_a_carrier_hold_much_heap() {
     // empty tags; an ESP32 has about 80 KB free.
     let (url, to_carrier) = relay(true);
     let mut carrier = subscribed(&url, topic);
+    // NB95-1a: the nested shapes, under 64 values, took up to +65.6 KB and 33 KB of stack.
+    let nested = |n, inner: Value, wrap: fn(Value) -> Value| (0..n).fold(inner, |v, _| wrap(v));
     let signal = "A".repeat(1808); // the base64 of 1,356 B, the largest LAN signal
     for (what, msg, delivered, max_peak) in [
-        ("an event the size of a signal", event(topic, &signal, 0), true, 64 << 10),
-        ("4.5 KB of empty tags", event(topic, "QQ==", 900), false, 32 << 10),
+        ("an event the size of a signal", event(topic, &signal, []), true, 64 << 10),
+        ("4.5 KB of empty tags", event(topic, "QQ==", vec![json!([""]); 900]), false, 32 << 10),
+        ("50 nested objects", event(topic, "QQ==", [nested(50, json!(0), |v| json!({ "a": v }))]), false, 32 << 10),
+        ("25 objects side by side", event(topic, "QQ==", vec![json!({"a": 0}); 25]), false, 32 << 10),
+        ("50 nested arrays", event(topic, "QQ==", [nested(50, json!(0), |v| json!([v]))]), false, 32 << 10),
     ] {
         std::thread::sleep(Duration::from_millis(50));
         let base = NOW.load(Relaxed);
