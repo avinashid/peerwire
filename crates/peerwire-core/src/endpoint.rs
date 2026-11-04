@@ -955,19 +955,19 @@ impl<A: Address> Endpoint<A> {
     }
 
     /// Keeps relayed links on their relay: a link through one of `relays` if `listed`, through any other relay if
-    /// `others`. Such a link takes no direct candidates (given, or learned from a relay's origin tag or the peer's
-    /// direct traffic), never punches, and doesn't answer a punch at this endpoint's address, so neither end moves
-    /// it to a direct path; guesses and sprays for it are ignored, and [`opener`](Endpoint::opener) gives `None`.
-    /// Unlike [`set_relay_only`](Endpoint::set_relay_only) it hides no address and leaves dials and direct links
-    /// alone, and the link may still follow the peer to another relay. A kept link stops punching at once. Replaces
-    /// the last call; by default no link is kept.
+    /// `others`. Such a link never punches, to the direct candidates it has (given, from its dial, or learned from
+    /// a relay's origin tag or the peer's direct traffic) or any other address, and doesn't answer a punch at this
+    /// endpoint's address, so neither end moves it to a direct path; guesses and sprays for it are ignored, and
+    /// [`opener`](Endpoint::opener) gives `None`. Unlike [`set_relay_only`](Endpoint::set_relay_only) it hides no
+    /// address and leaves dials and direct links alone, and the link may still follow the peer to another relay. A
+    /// kept link stops punching at once; let go, it punches to its candidates once given one more. Replaces the last
+    /// call; by default no link is kept.
     pub fn set_keep_relayed(&mut self, relays: &[PeerId], listed: bool, others: bool) {
         self.keep_relayed = (relays.to_vec(), listed, others);
         let keep = &self.keep_relayed;
         for sess in self.sessions.values_mut() {
             if kept(keep, sess) {
                 sess.punch = None;
-                sess.candidates.clear();
                 sess.guesses.clear();
                 sess.guess_probes = 0;
                 sess.spray = None;
@@ -1251,8 +1251,9 @@ impl<A: Address> Endpoint<A> {
 
     /// Adds direct addresses (learned through signalling) for a dialling or
     /// relayed peer, and starts punching towards them. Ignored while relay-only
-    /// for a peer reached, or being dialled, through a relay, and for a link
-    /// kept on its relay ([`set_keep_relayed`](Endpoint::set_keep_relayed)).
+    /// for a peer reached, or being dialled, through a relay. A link kept on its
+    /// relay ([`set_keep_relayed`](Endpoint::set_keep_relayed)) keeps them but
+    /// punches to none until let go.
     pub fn add_candidates(&mut self, now: Instant, peer: &PeerId, addrs: &[A]) {
         if let Some(&idx) = self.peers.get(peer) {
             for a in addrs {
@@ -1266,11 +1267,10 @@ impl<A: Address> Endpoint<A> {
 
     fn add_candidate(&mut self, now: Instant, idx: u32, a: A) {
         let (max, relay_only, direct) = (self.config.max_candidates, self.relay_only, self.config.share_addresses);
-        let keep = &self.keep_relayed;
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         // The slow address isn't punched to: a relay beats it.
         let known = sess.path.direct() == Some(&a) || sess.slow.as_ref() == Some(&a);
-        if known || (relay_only && matches!(sess.path, Path::Via(_))) || kept(keep, sess) {
+        if known || (relay_only && matches!(sess.path, Path::Via(_))) {
             return;
         }
         if !sess.candidates.contains(&a) {
@@ -3002,9 +3002,10 @@ mod tests {
         assert!([21, 22, 23].into_iter().chain(500..600).all(|x| to_c.contains(&x)), "{to_c:?}");
     }
 
-    /// NB-097: a link kept on its relay (`set_keep_relayed`, by its relay or as any other) takes no candidates and
-    /// answers none of the peer's punches, so neither end moves it to a direct path, though the peer learns a's
-    /// address from the relay's origin tag and punches to it. Let go, it moves to the first address that answers.
+    /// NB-097: a link kept on its relay (`set_keep_relayed`, by its relay or as any other) punches to none of its
+    /// candidates, from its dial or given later, and answers none of the peer's punches, so neither end moves it to a
+    /// direct path, though the peer learns a's address from the relay's origin tag and punches to it. Let go, it
+    /// moves to the first address that answers.
     #[test]
     fn kept_relayed_links_stay_on_their_relay() {
         let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
@@ -3018,8 +3019,10 @@ mod tests {
             route(&mut eps, &mut t, 100, None);
             let relays = if listed { vec![r] } else { vec![] };
             eps[0].set_keep_relayed(&relays, listed, others);
-            eps[0].connect_via(t, r, b, &[]).unwrap();
-            route(&mut eps, &mut t, 200, None);
+            // Dialled through r and at b's address, which loses a's packets for now: the link comes up through r,
+            // with b's address a candidate from the dial.
+            eps[0].connect_with(t, b, &[Path::Via(r), Path::Direct(2)]).unwrap();
+            route_with(&mut eps, &mut t, 200, |i, dst| i == 0 && dst == 2);
             assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(r)), Some(&Path::Via(r))));
             eps[0].add_candidates(t, &b, &[2]);
             eps[0].set_guesses(t, &b, &[20, 21]);

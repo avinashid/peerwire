@@ -2959,6 +2959,20 @@ mod tests {
         }
     }
 
+    /// NB-097: for a new carrier, `resubscribe` subscribes the inbox and the room's topic again and says hello in
+    /// the room at once; hellos then repeat from 2 s again.
+    #[test]
+    fn resubscribe_subscribes_again_and_says_hello() {
+        let me = id(1).peer_id();
+        let (mut t, _) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        let (now, topic) = (Instant::from_millis(90_000), Topic::room(ROOM.0, ROOM.1));
+        t.resubscribe(now);
+        let signals: Vec<Signal> = std::iter::from_fn(|| t.poll_signal()).collect();
+        assert_eq!(signals[..2], [Signal::Subscribe(Topic::peer(&me)), Signal::Subscribe(topic)]);
+        assert!(matches!(&signals[2..], [Signal::Publish(to, _)] if *to == topic), "{signals:?}");
+        assert_eq!(t.poll_timeout(), Some(now + HELLO_FIRST));
+    }
+
     /// NB-042: an offer's addresses are dialled only in the families the socket
     /// can send to (both on a dual-stack one), all at once.
     #[test]
