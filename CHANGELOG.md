@@ -8,23 +8,6 @@ and the commit that fixed it.
 
 ## Unreleased
 
-### `@peerwire/js`
-
-**Added**
-
-- **Connection policy:** `joinRoom({ policy })` and `room.setPolicy()` choose which paths a link may take
-  (`'direct'`, `'turn'`, `'peers'`, `'signaling'`) and in what order, with your own STUN and TURN servers
-  (`iceServers`) and Nostr relays (`relays`). Each can change live: links on a path turned off move or drop with
-  `'peer-leave'` reason `'policy'`, new servers reach open connections, and a relay swap keeps links. With
-  `order: ['turn']`, WebRTC offers relay candidates alone, so members never see your addresses. `room.policy` shows
-  the policy, with `iceServers` as urls only. `fallback` still works, as shorthand for the order. See
-  [choosing paths](docs/guides/connection-paths.md).
-- `room.route(peer)` says `turn: true` for a link whose end runs through a TURN server.
-
-**Fixed**
-
-- A room that left while its hello was being signed no longer posts it on the closed channel (Node 22 threw).
-
 ### Rust crates and Godot
 
 - **Connection policy:** `Policy` orders the paths links take (`PathKind::Direct`, `Birthday`, `Peers`,
@@ -64,6 +47,23 @@ and the commit that fixed it.
   saying the packet was fresh.
 - **Godot:** a hub catches up a stalled member afresh instead of disconnecting it; getters for each link's route and
   address.
+
+## `@peerwire/js` 0.3.0 (2026-11-04)
+
+**Added**
+
+- **Connection policy:** `joinRoom({ policy })` and `room.setPolicy()` choose which paths a link may take
+  (`'direct'`, `'turn'`, `'peers'`, `'signaling'`) and in what order, with your own STUN and TURN servers
+  (`iceServers`) and Nostr relays (`relays`). Each can change live: links on a path turned off move or drop with
+  `'peer-leave'` reason `'policy'`, new servers reach open connections, and a relay swap keeps links. With
+  `order: ['turn']`, WebRTC offers relay candidates alone, so members never see your addresses. `room.policy` shows
+  the policy, with `iceServers` as urls only. `fallback` still works, as shorthand for the order. See
+  [choosing paths](docs/guides/connection-paths.md).
+- `room.route(peer)` says `turn: true` for a link whose end runs through a TURN server.
+
+**Fixed**
+
+- A room that left while its hello was being signed no longer posts it on the closed channel (Node 22 threw).
 
 ## `@peerwire/js` 0.2.2 (2026-11-03)
 

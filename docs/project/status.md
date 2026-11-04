@@ -8,7 +8,7 @@ what's next. It's updated as parts land; the [changelog](../../CHANGELOG.md) has
 
 | Package | Released | On `main` |
 |---|---|---|
-| `@peerwire/js` | 0.2.2 on npm (3 Nov 2026) | 0.2.2 |
+| `@peerwire/js` | 0.3.0 on npm (4 Nov 2026) | 0.3.0 |
 | `@peerwire/react` | 0.1.1 on npm (1 Nov 2026) | 0.1.1 |
 | Rust crates | not on crates.io; use them from git | 0.1.0 |
 | Godot extension | built from source | |
