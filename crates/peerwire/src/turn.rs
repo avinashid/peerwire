@@ -318,6 +318,20 @@ impl<A: Address> TurnClient<A> {
         }
     }
 
+    /// Whether a datagram from the server is this client's: anything but a STUN message that is neither a Data
+    /// indication nor the answer to one of its requests. Those, such as the answer to a Binding request when the
+    /// server is one of the node's STUN servers too, are for the node's STUN client.
+    pub fn takes(&self, b: &[u8]) -> bool {
+        if !stun::is_stun(b) {
+            return true;
+        }
+        Message::parse(b).is_some_and(|m| match m.class {
+            Class::Indication => m.method == method::DATA,
+            Class::Success | Class::Error => self.reqs.contains_key(&m.tx),
+            Class::Request => false,
+        })
+    }
+
     fn on_response(&mut self, now: Instant, m: &Message) {
         let Some(req) = self.reqs.get(&m.tx) else { return };
         if m.class == Class::Success {
@@ -619,10 +633,11 @@ impl<A: Address> TurnSet<A> {
         }
     }
 
-    /// A datagram from `from`: `None` if it isn't one of the servers; else what it carried for the endpoint, as from
-    /// the peer through that server ([`Address::turn_hop`]), if anything.
+    /// A datagram from `from`: `None` if it isn't one of the servers, or is a STUN message that server's client
+    /// doesn't [take](TurnClient::takes); else what it carried for the endpoint, as from the peer through that server
+    /// ([`Address::turn_hop`]), if anything.
     pub fn handle(&mut self, now: Instant, from: &A, data: &[u8]) -> Option<Option<(A, Vec<u8>)>> {
-        let c = self.clients.iter_mut().find(|c| c.server() == from)?;
+        let c = self.clients.iter_mut().find(|c| c.server() == from && c.takes(data))?;
         Some(c.handle(now, data).and_then(|(peer, payload)| Some((A::turn_hop(from, peer)?, payload))))
     }
 
@@ -835,6 +850,39 @@ mod tests {
         assert_eq!(n.c.handle(n.t, &ind), None);
         n.c.permit(n.t, [addr(P).ip()]);
         assert_eq!(n.c.handle(n.t, &ind), Some((addr(P), b"x".to_vec())));
+    }
+
+    /// The client takes ChannelData, Data indications, the answers to its requests and whatever isn't STUN; it
+    /// leaves other STUN messages, such as a Binding answer from a server that is a STUN server too, for STUN.
+    #[test]
+    fn it_takes_its_own_and_leaves_the_rest_of_stun() {
+        let mut n = Net::new(&TurnServer::new(S, "app", "secret"), server());
+        let ind = |m| MessageBuilder::new(m, Class::Indication, &[1; 12]).attr(attr::DATA, b"x").finish();
+        assert!(n.c.takes(&ind(method::DATA)) && n.c.takes(&stun::channel_data(0x4000, b"x")) && n.c.takes(&[16; 40]));
+        assert!(!n.c.takes(&ind(method::SEND)) && !n.c.takes(&stun::binding_request(&[9; 12])));
+        let asked = n.c.poll_transmit().unwrap();
+        let tx: TxId = asked.payload[8..20].try_into().unwrap();
+        for class in [Class::Success, Class::Error] {
+            let answer = |tx: &TxId| MessageBuilder::new(method::ALLOCATE, class, tx).finish();
+            assert!(n.c.takes(&answer(&tx)) && !n.c.takes(&answer(&[9; 12])), "{class:?}");
+        }
+        let mut torn = stun::binding_response(&[9; 12], addr(C));
+        torn.truncate(torn.len() - 1);
+        assert!(stun::is_stun(&torn) && Message::parse(&torn).is_none());
+        assert!(!n.c.takes(&stun::binding_response(&[9; 12], addr(C))) && !n.c.takes(&torn));
+    }
+
+    /// From a server: a STUN message its client leaves goes back (`None`), for STUN; what isn't STUN is dropped
+    /// (`Some(None)`), never handed on. From elsewhere: `None` either way.
+    #[test]
+    fn the_set_hands_on_stun_its_clients_leave() {
+        let (t, mut set) = (Instant::from_millis(1), TurnSet::<SocketAddr>::new(UNIX_MS, [3; 32]));
+        set.set_servers(t, vec![(addr(S), TurnServer::new(S, "app", "secret"))]);
+        set.set_on(t, true);
+        let binding = stun::binding_response(&[9; 12], addr(C));
+        assert_eq!(set.handle(t, &addr(S), &binding), None);
+        assert_eq!(set.handle(t, &addr(S), &[16; 40]), Some(None));
+        assert_eq!((set.handle(t, &addr(P), &binding), set.handle(t, &addr(P), &[16; 40])), (None, None));
     }
 
     #[test]

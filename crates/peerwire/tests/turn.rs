@@ -4,11 +4,11 @@
 //! `src/turn.rs`; across NATs, in `peerwire-sim/tests/turn.rs`.
 use peerwire::{DisconnectReason, Event, Lane, MemoryHub, Node, PathKind, PeerId, Policy, Privacy, Status, TurnServer};
 use peerwire_sim::turn::{Out, ServerStats, TurnServer as Server};
-use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// A TURN server on loopback.
+/// A TURN server on loopback (or at another of this host's addresses).
 struct MockTurn {
     server: Server,
     sock: UdpSocket,
@@ -18,12 +18,17 @@ struct MockTurn {
 
 impl MockTurn {
     fn new() -> MockTurn {
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        MockTurn::on(Ipv4Addr::LOCALHOST.into())
+    }
+
+    /// The server and its relayed addresses at `ip`.
+    fn on(ip: IpAddr) -> MockTurn {
+        let sock = UdpSocket::bind((ip, 0)).unwrap();
         sock.set_nonblocking(true).unwrap();
         let relays: Arc<Mutex<Vec<UdpSocket>>> = Arc::default();
         let held = relays.clone();
         let next = move || {
-            let s = UdpSocket::bind("127.0.0.1:0").ok()?;
+            let s = UdpSocket::bind((ip, 0)).ok()?;
             s.set_nonblocking(true).ok()?;
             let at = s.local_addr().ok()?;
             held.lock().unwrap().push(s);
@@ -111,6 +116,14 @@ fn node(hub: &MemoryHub, turn: Option<&MockTurn>, policy: Option<Policy>) -> Nod
     n
 }
 
+/// This host's address on its default route, which a node bound to any interface offers first (as `Node` finds
+/// it: a UDP socket connected to a documentation address sends nothing); `None` with loopback only.
+fn host_ip() -> Option<IpAddr> {
+    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?;
+    Some(s.local_addr().ok()?.ip()).filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+}
+
 fn linked(a: &Node, b: &Node) -> bool {
     a.status(&b.peer_id()) == Status::Connected && b.status(&a.peer_id()) == Status::Connected
 }
@@ -150,6 +163,30 @@ fn a_link_through_turn_alone() {
     let st = turn.stats();
     assert_eq!((st.allocations, st.auth_failures), (1, 0));
     assert!(st.channel_data_in + st.sends > 0 && st.channel_data_out + st.data_indications > 0, "{st:?}");
+}
+
+/// One server as both STUN and TURN, as a self-hosted coturn usually is: its Binding answers reach STUN, so a learns
+/// its address from it (the one the server sees), and a links through it. On this host's own address, as a node
+/// bound to loopback asks no STUN server; b asks none.
+#[test]
+fn one_server_for_stun_and_turn() {
+    let Some(ip) = host_ip() else { return eprintln!("skipped: no address but loopback on this host") };
+    let (hub, mut turn) = (MemoryHub::new(), MockTurn::on(ip));
+    let a = Node::builder().signaling(hub.connect()).stun_servers([turn.addr()]).turn_servers([turn.creds()]);
+    let mut a = a.policy(Policy::new([PathKind::Turn])).bind("0.0.0.0:0").unwrap();
+    let mut b = Node::builder().signaling(hub.connect()).stun_servers(Vec::<String>::new()).bind("0.0.0.0:0").unwrap();
+    for n in [&mut a, &mut b] {
+        n.join_room("pw-turn", "room");
+    }
+    let mut ev = Vec::new();
+    let done = |_: &MockTurn, n: &[&mut Node]| n[0].public_addr().is_some() && linked(n[0], n[1]);
+    let up = pump(&mut turn, &mut [&mut a, &mut b], &mut ev, 10.0, done);
+    assert!(up, "public {:?}, {:?} {ev:?}", a.public_addr(), turn.stats());
+    assert_eq!(a.public_addr(), Some(SocketAddr::new(ip, a.local_addr().port())), "as the server saw it");
+    assert_eq!((a.path_kind(&b.peer_id()), b.path_kind(&a.peer_id())), (Some(PathKind::Turn), Some(PathKind::Turn)));
+    let st = turn.stats();
+    assert!(st.bindings > 0 && st.allocations == 1 && st.auth_failures == 0, "{st:?}");
+    talk(&mut turn, &mut a, &mut b);
 }
 
 /// `[Turn, Direct]` at both ends keeps the link on TURN: neither punches off it.

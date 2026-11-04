@@ -1,7 +1,8 @@
 //! A TURN server (RFC 8656 over UDP) for tests and the simulator, sans-IO: long-term credentials (static users, or
 //! a shared REST secret), allocations with a lifetime, permissions (5 minutes) and channels (10 minutes) that
 //! expire, Send and Data indications, ChannelData both ways, a nonce that can go stale and a restart that forgets
-//! everything. Not a production server: one allocation per client address, at most `MAX_ALLOCATIONS`, UDP only.
+//! everything. It answers STUN Binding requests too, as TURN servers do. Not a production server: one allocation per
+//! client address, at most `MAX_ALLOCATIONS`, UDP only.
 
 use peerwire_core::stun::{self, attr, method, Class, Message, MessageBuilder};
 use peerwire_core::Instant;
@@ -40,6 +41,8 @@ pub struct ServerStats {
     pub channel_data_out: u64,
     /// Packets to or from a peer with no permission, or on no allocation.
     pub dropped: u64,
+    /// STUN Binding requests answered.
+    pub bindings: u64,
 }
 
 struct Alloc {
@@ -185,6 +188,11 @@ impl TurnServer {
         }
         if m.class != Class::Request {
             return Vec::new();
+        }
+        // A STUN Binding request, which needs no credentials: where the server sees the client.
+        if m.method == method::BINDING {
+            self.stats.bindings += 1;
+            return vec![Out::ToClient { to: from, data: stun::binding_response(&m.tx, from) }];
         }
         let reply = |b: MessageBuilder| vec![Out::ToClient { to: from, data: b.fingerprint().finish() }];
         let error = |code: u16| MessageBuilder::new(m.method, Class::Error, &m.tx).error(code);

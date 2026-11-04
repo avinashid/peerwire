@@ -482,6 +482,9 @@ impl Node {
     /// An allocation stays on a server kept with the same credentials; the others are released, and links through
     /// them move to a path the policy allows, or close with [`DisconnectReason::PathOff`]. New credentials for a
     /// server (renewing short-lived ones before they expire) make a new allocation, at a new relayed address.
+    ///
+    /// One server can be both STUN and TURN, as coturn is: list it in [`stun_servers`](Builder::stun_servers) too, and
+    /// its Binding answers reach STUN as any STUN server's do.
     #[cfg(feature = "turn")]
     pub fn set_turn_servers(&mut self, servers: impl IntoIterator<Item = TurnServer>) {
         let servers: Vec<TurnServer> = servers.into_iter().collect();
@@ -798,7 +801,8 @@ impl Node {
                 Ok((n, from)) => {
                     // A dual-stack socket sees IPv4 peers as ::ffff:a.b.c.d.
                     let from = Hop::Net(SocketAddr::new(from.ip().to_canonical(), from.port()));
-                    // From a TURN server of ours: what a peer sent through it, or its own answers.
+                    // From a TURN server of ours: what a peer sent through it, or its answers to TURN requests (its
+                    // Binding answers, as a STUN server of ours too, go on to STUN).
                     match self.trav.handle_turn(now, &from, &self.buf[..n]) {
                         Some(Some((hop, data))) => self.ep.handle_datagram(now, hop, &data),
                         Some(None) => {}

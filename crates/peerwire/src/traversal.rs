@@ -1200,8 +1200,9 @@ impl<A: Address> Traversal<A> {
             }
             Event::AddrObserved { addr, .. } => {
                 let addr = &canonical(addr.clone());
-                let real = dialable(addr, false); // a peer that sees us on loopback is on this host
-                                                  // Where our TURN server relays from isn't our NAT's mapping (NB-099).
+                // A peer that sees us on loopback is on this host, and where our TURN server relays from isn't our
+                // NAT's mapping (NB-099).
+                let real = dialable(addr, false);
                 let ours = self.turn.relayed().contains(addr);
                 if real && !ours && !self.observed.contains(addr) && !self.local.contains(addr) {
                     if self.observed.len() >= MAX_OBSERVED {
@@ -1769,9 +1770,10 @@ impl<A: Address> Traversal<A> {
         }
     }
 
-    /// A datagram from `from`, if from one of this node's TURN servers: `None` if not; else what it carried for the
-    /// endpoint (a peer's packet, as from its [TURN hop](Address::turn_hop)), if anything. Call it before
-    /// [`handle_stun`](Traversal::handle_stun): TURN's answers are STUN messages too.
+    /// A datagram from `from`, if from one of this node's TURN servers: `None` if not, or if it is a STUN message the
+    /// TURN client didn't ask for (a Binding answer, from a server that is a STUN server too); else what it carried
+    /// for the endpoint (a peer's packet, as from its [TURN hop](Address::turn_hop)), if anything. Call it before
+    /// [`handle_stun`](Traversal::handle_stun), and give that what it leaves: TURN's answers are STUN messages too.
     pub fn handle_turn(&mut self, now: Instant, from: &A, data: &[u8]) -> Option<Option<(A, Vec<u8>)>> {
         self.turn.handle(now, from, data)
     }

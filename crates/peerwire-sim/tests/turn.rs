@@ -199,6 +199,24 @@ fn two_symmetric_nats_link_only_through_turn() {
     assert_eq!((st.allocations, st.auth_failures), (1, 0));
 }
 
+/// A TURN server that is the peers' only STUN server too: its Binding answers reach STUN, so a learns its NAT's
+/// mapping from it (the client address its allocation is for), and a links through it.
+#[test]
+fn one_server_for_stun_and_turn() {
+    let mut w = World::new();
+    w.stun = vec![w.turn];
+    let a = w.add(NatConfig::symmetric_random(), true, policy());
+    let b = w.add(NatConfig::symmetric_random(), false, policy());
+    let up = |w: &World| w.linked(a, b) && w.peers[a].trav.public_addr().is_some();
+    assert!(w.run_until(Duration::from_secs(20), up), "{:?}", w.peers[a].trav.public_addr());
+    assert!(w.relayed(a, b, true), "{:?} {:?}", w.path(a, b), w.path(b, a));
+    let (turn, relayed) = (w.turn, w.peers[a].trav.turn_status()[0].1.unwrap());
+    let server = w.sim.turn_server(turn).unwrap();
+    let seen = SimAddr::from_socket_addr(server.client_of(relayed).unwrap()).unwrap();
+    assert!(server.stats.bindings > 0);
+    assert_eq!(w.peers[a].trav.public_addr(), Some(&Hop::Net(seen)));
+}
+
 /// Two NATs that punch through each other (full cone and port-restricted), linked on TURN first (`[Turn]`): with
 /// `Direct` ranked first, live, both ends move to the direct path (`PathChanged`), and stay linked.
 #[test]
