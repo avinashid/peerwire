@@ -29,6 +29,16 @@ pub trait Address: Clone + Eq + Hash + Debug {
     fn from_socket_addr(_addr: SocketAddr) -> Option<Self> {
         None
     }
+    /// Whether packets to and from this address go through a relay server (a TURN
+    /// server's relayed address, or the peer seen through ours). A link on one is
+    /// relayed, as through a peer ([`Path::Via`]): it punches to the peer's other
+    /// direct addresses and moves to the first that answers (`PathChanged`), and no
+    /// race, punch answer or straggler moves a link onto one. It isn't raced, punched
+    /// to, relayed across or told where it is seen from. `false` unless the host's
+    /// address type says otherwise.
+    fn relayed(&self) -> bool {
+        false
+    }
 }
 
 pub const MAX_ADDR_LEN: usize = 19;

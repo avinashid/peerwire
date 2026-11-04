@@ -797,9 +797,10 @@ impl<A: Address> Session<A> {
     fn race(&mut self, direct: bool, max: usize) -> &mut Race<A> {
         let (path, slow) = (&self.path, &self.slow);
         let max = if matches!(path, Path::Via(_)) { MAX_RELAYS } else { max };
+        // A relayed address, as the slow address, has nothing to race: the link punches off it.
         let kind = |p: &Path<A>| match p {
             Path::Via(_) => 2,
-            Path::Direct(_) if on_slow(p, slow) => 0,
+            Path::Direct(a) if on_slow(p, slow) || a.relayed() => 0,
             Path::Direct(_) => 1,
         };
         let rc = match self.race.take() {
@@ -830,7 +831,7 @@ impl<A: Address> Session<A> {
                 }
                 if rc.alts.is_empty() && kind(path) == 1 && direct {
                     for c in &self.candidates {
-                        if Some(c) != slow.as_ref() {
+                        if Some(c) != slow.as_ref() && !c.relayed() {
                             rc.add(Path::Direct(c.clone()), max);
                         }
                     }
@@ -847,13 +848,34 @@ fn on_slow<A: Address>(path: &Path<A>, slow: &Option<A>) -> bool {
     slow.is_some() && path.direct() == slow.as_ref()
 }
 
-/// Whether `sess` is a live link that stays on its relay ([`Endpoint::set_keep_relayed`]).
-fn kept<A: Address>(keep: &(Vec<PeerId>, bool, bool), sess: &Session<A>) -> bool {
-    matches!((&sess.state, &sess.path), (State::Live(_), Path::Via(r)) if keeps(keep, r))
+/// Whether a link on `path` is relayed: through a peer, or at an address that is a relay server's
+/// ([`Address::relayed`]). A relayed link punches to the peer's direct addresses.
+fn relayed<A: Address>(path: &Path<A>) -> bool {
+    match path {
+        Path::Via(_) => true,
+        Path::Direct(a) => a.relayed(),
+    }
+}
+
+/// The relayed links that stay relayed: through a relay listed in `.0` if `.1`, through any other if `.2`
+/// ([`Endpoint::set_keep_relayed`]), and on a relayed address if `.3` ([`Endpoint::set_keep_turn`]).
+type Keep = (Vec<PeerId>, bool, bool, bool);
+
+/// Whether a link on `path` stays there ([`Keep`]).
+fn keeps_path<A: Address>(keep: &Keep, path: &Path<A>) -> bool {
+    match path {
+        Path::Via(r) => keeps(keep, r),
+        Path::Direct(a) => keep.3 && a.relayed(),
+    }
+}
+
+/// Whether `sess` is a live link that stays on its relay ([`Keep`]).
+fn kept<A: Address>(keep: &Keep, sess: &Session<A>) -> bool {
+    matches!(sess.state, State::Live(_)) && keeps_path(keep, &sess.path)
 }
 
 /// Whether links through `relay` stay on it ([`Endpoint::set_keep_relayed`]).
-fn keeps(keep: &(Vec<PeerId>, bool, bool), relay: &PeerId) -> bool {
+fn keeps(keep: &Keep, relay: &PeerId) -> bool {
     match keep.0.contains(relay) {
         true => keep.1,
         false => keep.2,
@@ -883,9 +905,8 @@ pub struct Endpoint<A: Address> {
     events: VecDeque<Event<A>>,
     stats: Stats,
     relay_only: bool,
-    /// Relayed links that stay relayed ([`Endpoint::set_keep_relayed`]): through a relay listed here if `.1`,
-    /// through any other if `.2`.
-    keep_relayed: (Vec<PeerId>, bool, bool),
+    /// Relayed links that stay relayed ([`Keep`]).
+    keep_relayed: Keep,
     /// Node-wide relay bucket (`Config::relay_total_rate`): tokens and last refill.
     relay_total: (u64, Option<Instant>),
 }
@@ -909,7 +930,7 @@ impl<A: Address> Endpoint<A> {
             events: VecDeque::new(),
             stats: Stats::default(),
             relay_only: false,
-            keep_relayed: (Vec::new(), false, false),
+            keep_relayed: (Vec::new(), false, false, false),
             relay_total: (0, None),
         }
     }
@@ -973,7 +994,19 @@ impl<A: Address> Endpoint<A> {
     /// next timer; an answer to that punch moves it nowhere); let go, it punches to its candidates once given one
     /// more. Replaces the last call; by default no link is kept.
     pub fn set_keep_relayed(&mut self, relays: &[PeerId], listed: bool, others: bool) {
-        self.keep_relayed = (relays.to_vec(), listed, others);
+        self.keep_relayed = (relays.to_vec(), listed, others, self.keep_relayed.3);
+        self.stop_kept();
+    }
+
+    /// Keeps links on relayed addresses ([`Address::relayed`]) there, as
+    /// [`set_keep_relayed`](Endpoint::set_keep_relayed) keeps them on a relay peer: they punch to nothing, answer
+    /// no punch and stop punching at once. Off by default.
+    pub fn set_keep_turn(&mut self, on: bool) {
+        self.keep_relayed.3 = on;
+        self.stop_kept();
+    }
+
+    fn stop_kept(&mut self) {
         let keep = &self.keep_relayed;
         for sess in self.sessions.values_mut() {
             if kept(keep, sess) {
@@ -1286,9 +1319,10 @@ impl<A: Address> Endpoint<A> {
             }
             sess.candidates.push(a.clone());
         }
-        // On a direct path: raced against it.
+        // On a direct path: raced against it. Not a relayed one, nor from one (it punches).
         let live = matches!(sess.state, State::Live(_));
-        if live && direct && !relay_only && matches!(sess.path, Path::Direct(_)) && !sess.on_slow() {
+        let on_direct = matches!(sess.path, Path::Direct(_)) && !sess.on_slow() && !relayed(&sess.path);
+        if live && direct && !relay_only && on_direct && !a.relayed() {
             sess.race(direct, max).add(Path::Direct(a), max);
         }
         self.start_punch(now, idx);
@@ -1303,7 +1337,7 @@ impl<A: Address> Endpoint<A> {
         let keep = &self.keep_relayed;
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         let nothing = sess.candidates.is_empty() && sess.guesses.is_empty() && sess.spray.is_none();
-        if !matches!(sess.path, Path::Via(_)) || nothing || !matches!(sess.state, State::Live(_)) || kept(keep, sess) {
+        if !relayed(&sess.path) || nothing || !matches!(sess.state, State::Live(_)) || kept(keep, sess) {
             return;
         }
         match &mut sess.punch {
@@ -1405,10 +1439,9 @@ impl<A: Address> Endpoint<A> {
     /// Whether `peer` is linked over a direct path that isn't its slow address:
     /// a relay worth moving a link onto.
     fn fast_link(&self, peer: &PeerId) -> bool {
-        self.peers
-            .get(peer)
-            .and_then(|i| self.sessions.get(i))
-            .is_some_and(|s| matches!(s.path, Path::Direct(_)) && !s.on_slow() && matches!(s.state, State::Live(_)))
+        self.peers.get(peer).and_then(|i| self.sessions.get(i)).is_some_and(|s| {
+            matches!(s.path, Path::Direct(_)) && !s.on_slow() && !relayed(&s.path) && matches!(s.state, State::Live(_))
+        })
     }
 
     /// Whether a packet for session `idx` came over the channel of `owner`, a
@@ -1436,7 +1469,7 @@ impl<A: Address> Endpoint<A> {
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         let relayed = match &sess.state {
             State::Dialing(d) => d.targets.iter().any(|t| matches!(t, Path::Via(_))),
-            State::Live(_) => matches!(sess.path, Path::Via(_)),
+            State::Live(_) => relayed(&sess.path),
         };
         let direct = matches!(sess.state, State::Live(_)) && !relayed;
         if (relay_only && relayed) || direct || kept(keep, sess) {
@@ -1502,7 +1535,7 @@ impl<A: Address> Endpoint<A> {
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         let relayed = match &sess.state {
             State::Dialing(d) => d.targets.iter().any(|t| matches!(t, Path::Via(_))),
-            State::Live(_) => matches!(sess.path, Path::Via(_)),
+            State::Live(_) => relayed(&sess.path),
         };
         if (relay_only && relayed) || (matches!(sess.state, State::Live(_)) && !relayed) || kept(keep, sess) {
             return;
@@ -1533,7 +1566,7 @@ impl<A: Address> Endpoint<A> {
         let kept = kept(keep, sess);
         match &mut sess.state {
             State::Dialing(d) => Some(d.hs1.clone()),
-            State::Live(link) if matches!(sess.path, Path::Via(_)) && !relay_only && !kept => {
+            State::Live(link) if relayed(&sess.path) && !relay_only && !kept => {
                 let p = sess.punch.get_or_insert(Punch { token, next_at: now, until, round: 0, relays: Vec::new() });
                 p.until = p.until.max(until);
                 seal_punch(link, false, p.token)
@@ -1979,6 +2012,8 @@ impl<A: Address> Endpoint<A> {
             Path::Via(r) => {
                 sess.relay.get_or_insert(*r);
             }
+            // At a relayed address, the guesses and spray punch on.
+            Path::Direct(a) if a.relayed() => {}
             Path::Direct(_) => {
                 sess.guesses.clear();
                 sess.spray = None;
@@ -2048,6 +2083,13 @@ impl<A: Address> Endpoint<A> {
         let leads = self.me < sess.peer;
         match (&from, &sess.path) {
             (Path::Direct(x), Path::Direct(y)) if x == y => sess.last_path = now,
+            // A relayed address is left as a relay is: direct traffic makes a candidate, and PUNCH_ACK decides;
+            // stragglers through one don't move a direct link back.
+            (Path::Direct(x), Path::Direct(y)) if x.relayed() != y.relayed() => {
+                if y.relayed() {
+                    reflexive = Some(x.clone());
+                }
+            }
             (Path::Direct(_), Path::Direct(_)) => {
                 if newer && !(leads && settling) {
                     sess.path = from.clone();
@@ -2099,7 +2141,7 @@ impl<A: Address> Endpoint<A> {
         let mut violation = false;
         let mut closed = false;
         // Kept on its relay ([`set_keep_relayed`](Endpoint::set_keep_relayed)): no punch moves it.
-        let kept = matches!(&sess.path, Path::Via(r) if keeps(&self.keep_relayed, r));
+        let kept = keeps_path(&self.keep_relayed, &sess.path);
         for f in wire::frames(&pt[..n]) {
             match f {
                 // Answered with an ACK, so a silent-side probe gets a reply.
@@ -2118,14 +2160,15 @@ impl<A: Address> Endpoint<A> {
                 }
                 Ok(Frame::Unreliable(d)) => unreliable.push(d.to_vec()),
                 Ok(Frame::Close) => closed = true,
+                // Not through a relay server: where it sees us from isn't where our NAT maps us.
                 Ok(Frame::Observed(a)) => {
-                    if direct_from.is_some() {
+                    if direct_from.as_ref().is_some_and(|f| !f.relayed()) {
                         observed = A::decode(a);
                     }
                 }
-                // Relaying happens only between directly connected peers.
+                // Relaying happens only between directly connected peers, not across a relay server.
                 Ok(Frame::Fwd { to, packet, tag }) => {
-                    if let Some(a) = &direct_from {
+                    if let Some(a) = direct_from.as_ref().filter(|a| !a.relayed()) {
                         forwards.push((to, packet.to_vec(), tag.then(|| a.clone())));
                     }
                 }
@@ -2154,7 +2197,10 @@ impl<A: Address> Endpoint<A> {
                 Ok(Frame::PunchAck(t)) => {
                     match (&from, &sess.punch) {
                         // Not on a kept link: the answer to a punch sent before it moved onto its relay (NB97-I2).
-                        (Path::Direct(a), Some(p)) if p.token == t && sess.slow.as_ref() != Some(a) && !kept => {
+                        // Nor onto a relayed address.
+                        (Path::Direct(a), Some(p))
+                            if p.token == t && sess.slow.as_ref() != Some(a) && !kept && !a.relayed() =>
+                        {
                             upgraded = Some(a.clone())
                         }
                         // A relay probe answered through the relay: it carries both ways.
@@ -2465,10 +2511,10 @@ impl<A: Address> Endpoint<A> {
                             let guessed = if probe { &sess.guesses[..] } else { &[] };
                             sess.guess_probes -= probe as u32;
                             p.round += 1;
-                            // Direct candidates are punched only while relayed.
-                            let relayed = matches!(sess.path, Path::Via(_));
+                            // Direct candidates are punched only while relayed; relayed ones never.
+                            let relayed = relayed(&sess.path);
                             let candidates = if relayed { &sess.candidates[..] } else { &[] };
-                            let sprayed = candidates.iter().flat_map(|c| {
+                            let sprayed = candidates.iter().filter(|c| !c.relayed()).flat_map(|c| {
                                 std::iter::once(Some(c.clone())).chain((1..=spray).map(|k| c.port_offset(k))).flatten()
                             });
                             for dst in sprayed.chain(guessed.iter().cloned()) {
@@ -2746,8 +2792,9 @@ impl<A: Address> Endpoint<A> {
             if link.ping_pending {
                 wire::put_ping(&mut pt);
                 link.ping_pending = false;
-                // Tell the peer where we see it from (its reflexive address).
-                if let (Path::Direct(a), true) = (&sess.path, self.config.share_addresses && !self.relay_only) {
+                // Tell the peer where we see it from (its reflexive address), unless through a relay server.
+                let share = self.config.share_addresses && !self.relay_only && !relayed(&sess.path);
+                if let (Path::Direct(a), true) = (&sess.path, share) {
                     let mut b = Vec::new();
                     a.encode(&mut b);
                     if b.len() <= crate::addr::MAX_ADDR_LEN {
@@ -4866,5 +4913,253 @@ mod tests {
         assert_eq!(eps[0].sessions[&ab].candidates, [&before[..], &[41]].concat());
         let ad: Vec<_> = eps[0].sessions.values().filter(|s| s.peer == pd).map(|s| s.candidates.clone()).collect();
         assert_eq!(ad, vec![vec![42]]);
+    }
+
+    /// An address that may go through a relay server (bit `TR`), which forwards both ways as a TURN server does:
+    /// what endpoint `i` sends to `j | TR` reaches `j` from `i | TR`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    struct Tr(u32);
+    const TR: u32 = 0x100;
+
+    impl Address for Tr {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.0.encode(out)
+        }
+        fn decode(b: &[u8]) -> Option<Self> {
+            u32::decode(b).map(Tr)
+        }
+        fn relayed(&self) -> bool {
+            self.0 & TR != 0
+        }
+    }
+
+    /// Where what endpoint `i` sends to `dst` goes: to the endpoint at `dst`, from `i`'s address, through the relay
+    /// server if `dst` is; `None` if no endpoint is there.
+    fn to(i: usize, dst: Tr) -> Option<(usize, Tr)> {
+        let j = ((dst.0 & !TR) as usize).checked_sub(1)?;
+        Some((j, Tr((i as u32 + 1) | (dst.0 & TR))))
+    }
+
+    /// Through the relay server only: the direct path loses everything.
+    fn relay_server_only(i: usize, dst: Tr) -> Option<(usize, Tr)> {
+        to(i, dst).filter(|_| dst.relayed())
+    }
+
+    /// As `route`, endpoint `i` at `Tr(i + 1)`: `deliver(sender index, destination)` is the endpoint a datagram
+    /// reaches and the address it comes from there (`to`), or `None` if it is lost.
+    fn route_tr(
+        eps: &mut [Endpoint<Tr>],
+        t: &mut Instant,
+        ms: u64,
+        deliver: impl Fn(usize, Tr) -> Option<(usize, Tr)>,
+    ) -> Vec<(usize, Tr)> {
+        let mut sent = Vec::new();
+        for _ in 0..ms / 10 {
+            for _ in 0..100 {
+                let mut quiet = true;
+                for i in 0..eps.len() {
+                    let out: Vec<_> = std::iter::from_fn(|| eps[i].poll_transmit(*t)).collect();
+                    for tx in out {
+                        quiet = false;
+                        sent.push((i, tx.dst));
+                        if let Some((j, src)) = deliver(i, tx.dst) {
+                            if let Some(ep) = eps.get_mut(j) {
+                                ep.handle_datagram(*t, src, &tx.payload);
+                            }
+                        }
+                    }
+                }
+                if quiet {
+                    break;
+                }
+            }
+            *t = *t + Duration::from_millis(10);
+            for ep in eps.iter_mut() {
+                ep.handle_timeout(*t);
+            }
+        }
+        sent
+    }
+
+    fn tr_endpoints(n: u8) -> (Vec<Endpoint<Tr>>, Vec<PeerId>) {
+        let ids: Vec<Identity> = (1..=n).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let eps = ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        (eps, ids.iter().map(Identity::peer_id).collect())
+    }
+
+    fn tr_events(ep: &mut Endpoint<Tr>) -> Vec<Event<Tr>> {
+        std::iter::from_fn(|| ep.poll_event()).collect()
+    }
+
+    /// NB-099: a link at a relayed address (a dialled b through the relay server and directly, and only the relay
+    /// server got through) carries data, races nothing and tells neither end where it is seen from; both ends punch
+    /// to the other's direct addresses, its guesses (also from the dial) and sprays, never to a relayed address,
+    /// and once the direct path works the link moves there (`PathChanged`). A race after that leaves out relayed
+    /// addresses.
+    #[test]
+    fn a_link_at_a_relayed_address_punches_off_it() {
+        let (mut eps, ids) = tr_endpoints(2);
+        let (a, b) = (ids[0], ids[1]);
+        let mut t = Instant::from_millis(1);
+        eps[0].connect_with(t, b, &[Path::Direct(Tr(2 | TR)), Path::Direct(Tr(2))]).unwrap();
+        eps[0].set_guesses(t, &b, &[Tr(7)]);
+        route_tr(&mut eps, &mut t, 300, relay_server_only);
+        let relayed = (Some(&Path::Direct(Tr(2 | TR))), Some(&Path::Direct(Tr(1 | TR))));
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), relayed);
+        eps[1].add_candidates(t, &a, &[Tr(1)]);
+        eps[0].add_candidates(t, &b, &[Tr(3 | TR)]); // another relayed address of b's
+        eps[0].send(&b, Lane::Reliable, b"through the relay server").unwrap();
+        let sent = route_tr(&mut eps, &mut t, 2000, relay_server_only);
+        let direct = |i: usize| sent.iter().filter(|(s, d)| *s == i && !d.relayed()).count();
+        assert!(direct(0) > 10 && direct(1) > 10, "both ends punch: {} {}", direct(0), direct(1));
+        assert!(sent.contains(&(0, Tr(7))) && !sent.contains(&(0, Tr(3 | TR))));
+        eps[0].set_guesses(t, &b, &[Tr(8)]);
+        eps[0].sweep(t, &b, &[Tr(10), Tr(11)]);
+        assert!(eps[0].opener(t, &b).is_some());
+        let sent = route_tr(&mut eps, &mut t, 500, relay_server_only);
+        assert!(sent.contains(&(0, Tr(8))) && sent.contains(&(0, Tr(10))) && eps[0].stats().spray_probes == 2);
+        assert_eq!((eps[0].stats().path_probes, eps[1].stats().path_probes), (0, 0), "nothing raced");
+        let (ea, eb) = (tr_events(&mut eps[0]), tr_events(&mut eps[1]));
+        assert!(eb.iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"through the relay server")));
+        assert!(!ea.iter().chain(&eb).any(|e| matches!(e, Event::AddrObserved { .. })), "{ea:?} {eb:?}");
+        route_tr(&mut eps, &mut t, 1000, to);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(Tr(2))), Some(&Path::Direct(Tr(1)))));
+        let (ea, eb) = (tr_events(&mut eps[0]), tr_events(&mut eps[1]));
+        assert!(ea.iter().any(|e| matches!(e, Event::PathChanged { path: Path::Direct(Tr(2)), .. })), "{ea:?}");
+        assert!(eb.iter().any(|e| matches!(e, Event::PathChanged { path: Path::Direct(Tr(1)), .. })), "{eb:?}");
+        eps[0].add_candidates(t, &b, &[Tr(5)]);
+        let sent = route_tr(&mut eps, &mut t, 3000, to);
+        assert!(eps[0].stats().path_probes > 0 && !sent.iter().any(|(i, d)| *i == 0 && d.relayed()));
+    }
+
+    /// NB-099: only a knows a direct address of b's (from its dial): its punch moves it there, and b, learning a's
+    /// address from a's direct traffic, punches and follows.
+    #[test]
+    fn a_link_at_a_relayed_address_follows_its_peer_to_a_direct_one() {
+        let (mut eps, ids) = tr_endpoints(2);
+        let (a, b) = (ids[0], ids[1]);
+        let mut t = Instant::from_millis(1);
+        eps[0].connect_with(t, b, &[Path::Direct(Tr(2 | TR)), Path::Direct(Tr(2))]).unwrap();
+        route_tr(&mut eps, &mut t, 300, relay_server_only);
+        assert_eq!(eps[1].path(&a), Some(&Path::Direct(Tr(1 | TR))));
+        route_tr(&mut eps, &mut t, 2000, to);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(Tr(2))), Some(&Path::Direct(Tr(1)))));
+    }
+
+    /// NB-099: a direct link stays direct: b's packets coming through the relay server instead, newer than any
+    /// direct one, don't roam it, a relayed candidate isn't raced or punched to, and where b says it sees a (here
+    /// Tr(9)) isn't taken from packets through the relay server.
+    #[test]
+    fn a_direct_link_never_moves_onto_a_relayed_address() {
+        let (mut eps, ids) = tr_endpoints(2);
+        let (a, b) = (ids[0], ids[1]);
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, Tr(2), b).unwrap();
+        route_tr(&mut eps, &mut t, 300, to);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(Tr(2))), Some(&Path::Direct(Tr(1)))));
+        tr_events(&mut eps[0]);
+        // Tr(3) is direct and answers nothing.
+        eps[0].add_candidates(t, &b, &[Tr(2 | TR), Tr(3)]);
+        eps[1].send(&a, Lane::Reliable, b"through the relay server").unwrap();
+        let through = |i: usize, dst: Tr| match i {
+            1 => Some((0, Tr(2 | TR))),
+            _ => to(i, dst).map(|(j, _)| (j, Tr(9))),
+        };
+        let sent = route_tr(&mut eps, &mut t, 12_000, through);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(Tr(2))), Some(&Path::Direct(Tr(9)))));
+        assert!(eps[0].stats().path_probes > 0, "Tr(3) is raced");
+        assert!(sent.iter().all(|(i, d)| *i != 0 || !d.relayed()), "nothing goes to a relayed address");
+        let got = tr_events(&mut eps[0]);
+        assert!(got.iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"through the relay server")));
+        assert!(!got.iter().any(|e| matches!(e, Event::PathChanged { .. } | Event::AddrObserved { .. })), "{got:?}");
+    }
+
+    /// NB-099: a link at a relayed address doesn't say where it sees its peer: here a's packets through the relay
+    /// server reach b as if direct, so b would take what they said.
+    #[test]
+    fn a_link_at_a_relayed_address_says_nothing_of_where_it_sees_its_peer() {
+        let (mut eps, ids) = tr_endpoints(2);
+        let (a, b) = (ids[0], ids[1]);
+        let mut t = Instant::from_millis(1);
+        eps[0].connect_with(t, b, &[Path::Direct(Tr(2 | TR))]).unwrap();
+        let unmarked = |i: usize, dst: Tr| match i {
+            0 => to(i, dst).map(|(j, _)| (j, Tr(1))),
+            _ => to(i, dst).map(|(j, _)| (j, Tr(2 | TR))),
+        };
+        route_tr(&mut eps, &mut t, 12_000, unmarked);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(Tr(2 | TR))), Some(&Path::Direct(Tr(1)))));
+        let got = tr_events(&mut eps[1]);
+        assert!(got.iter().any(|e| matches!(e, Event::Connected { .. })));
+        assert!(!got.iter().any(|e| matches!(e, Event::AddrObserved { .. })), "{got:?}");
+    }
+
+    /// NB-099: a link kept at its relayed address (`set_keep_turn`, which `set_keep_relayed` leaves as it is)
+    /// punches to nothing and answers none of the peer's punches; let go, it moves to the direct path.
+    #[test]
+    fn kept_turn_links_stay_at_their_relayed_address() {
+        let (mut eps, ids) = tr_endpoints(2);
+        let (a, b) = (ids[0], ids[1]);
+        let mut t = Instant::from_millis(1);
+        eps[0].set_keep_turn(true);
+        eps[0].set_keep_relayed(&[], false, false);
+        eps[0].connect_with(t, b, &[Path::Direct(Tr(2 | TR)), Path::Direct(Tr(2))]).unwrap();
+        route_tr(&mut eps, &mut t, 300, relay_server_only);
+        eps[1].add_candidates(t, &a, &[Tr(1)]);
+        eps[0].add_candidates(t, &b, &[Tr(2)]);
+        assert_eq!(eps[0].opener(t, &b), None);
+        route_tr(&mut eps, &mut t, 3000, to);
+        assert!(eps[1].stats().punches_sent > 0);
+        assert_eq!(eps[0].stats().punches_sent, 0);
+        let relayed = (Some(&Path::Direct(Tr(2 | TR))), Some(&Path::Direct(Tr(1 | TR))));
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), relayed);
+        eps[0].set_keep_turn(false);
+        eps[0].add_candidates(t, &b, &[Tr(2)]);
+        route_tr(&mut eps, &mut t, 1000, to);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(Tr(2))), Some(&Path::Direct(Tr(1)))));
+    }
+
+    /// NB-099: a peer linked only through a relay server neither relays nor is relayed for: r forwards nothing from
+    /// a (at a relayed address) to b, nor from b to a, so neither dial through r links.
+    #[test]
+    fn a_peer_reached_through_a_relay_server_is_not_relayed_for() {
+        let (_, ids) = tr_endpoints(3);
+        let (a, b, r) = (ids[0], ids[1], ids[2]);
+        let quick = Config { handshake_attempts: 2, ..Config::default() };
+        let mut eps: Vec<Endpoint<Tr>> =
+            (1..=3u8).map(|i| Endpoint::new(&Identity::from_secret_bytes(&[i; 32]), quick.clone(), [i; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, Tr(3 | TR), r).unwrap();
+        eps[1].connect(t, Tr(3), r).unwrap();
+        // a and b reach each other only through r.
+        let apart = |i: usize, dst: Tr| to(i, dst).filter(|&(j, _)| !matches!((i, j), (0, 1) | (1, 0)));
+        route_tr(&mut eps, &mut t, 300, apart);
+        let at_r = (Some(&Path::Direct(Tr(1 | TR))), Some(&Path::Direct(Tr(2))));
+        assert_eq!((eps[2].path(&a), eps[2].path(&b)), at_r);
+        eps[0].connect_via(t, r, b, &[]).unwrap();
+        eps[1].connect_via(t, r, a, &[]).unwrap();
+        route_tr(&mut eps, &mut t, 10_000, apart);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a), eps[2].stats().relayed), (None, None, 0));
+    }
+
+    /// NB-099: a link through a relay peer punches to a guess that is a relayed address (as a punch may), and the
+    /// answer from there doesn't move it: a link moves onto a relayed address only by a dial.
+    #[test]
+    fn a_punch_answered_at_a_relayed_address_moves_no_link() {
+        let (mut eps, ids) = tr_endpoints(3);
+        let (a, b, r) = (ids[0], ids[1], ids[2]);
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, Tr(3), r).unwrap();
+        eps[1].connect(t, Tr(3), r).unwrap();
+        // a and b reach each other directly only through the relay server.
+        let apart =
+            |i: usize, dst: Tr| to(i, dst).filter(|&(j, _)| dst.relayed() || !matches!((i, j), (0, 1) | (1, 0)));
+        route_tr(&mut eps, &mut t, 300, apart);
+        eps[0].connect_via(t, r, b, &[]).unwrap();
+        route_tr(&mut eps, &mut t, 300, apart);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(r)), Some(&Path::Via(r))));
+        eps[0].set_guesses(t, &b, &[Tr(2 | TR)]);
+        let sent = route_tr(&mut eps, &mut t, 2000, apart);
+        assert!(sent.contains(&(0, Tr(2 | TR))), "the guess is punched to");
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(r)));
     }
 }
