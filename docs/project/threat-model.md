@@ -159,8 +159,8 @@ release of each.
 | NB95-I2 (Info) | Open (NB-095): the firmware's own SNTP ask checks its answer, but lwIP's SNTP, which keeps the clock in step after boot, takes a time from any device on the LAN; the Node reads the clock only at `bind`, so this reaches the relay carrier's TLS and timestamps, not the replay guard, same section |
 | NB98-1, NB98-2 (Low) | **Fixed** by `3e055f1` before NB-098 merged, so never on main (a call's connections take a policy set live, restart ICE on our side when it turns `'direct'` or `'turn'` off or brings new servers, and fail `'no-path'` if still on a path now off 20 s later; relay urls are parsed with `new URL()`, and every check in `setPolicy` comes before the policy is set), reviewed 2026-11-04; residuals accepted, [Connection policy](#connection-policy-nb-098--nb98-1-nb98-2) |
 | NB98-I1, NB98-I2, NB98-I3, NB98-I4 (Info) | NB98-I1, NB98-I3 **fixed** by `3e055f1` (a link dropped as it came up leaves no proof deadline; without `'direct'` links and calls send relay candidates alone, with no related address and no port prediction, whatever WebRTC gathers); NB98-I4 fixed by it on the dialling side, while the answering side's kept link keeps its old session until the dialler restarts; NB98-I2 documented (an order binds the dialling side only), same section |
-| NB97-1 (Low) | Open (NB-097, `d6b42fd`): a link the node refuses for a path its policy has off is closed at its `Connected`, but the messages that came in with it reach the app, [Connection policy in Rust](#connection-policy-in-rust-nb-097--nb97-1) |
-| NB97-I1, NB97-I2, NB97-I3 (Info) | Open (NB-097): a refused replacement ends a link with `Replaced` and no `Connected`; a punch under way follows a link onto a kept relay; a Rust policy hides no address (accepted, the guide says so), same section |
+| NB97-1 (Low) | **Fixed** by `a00fff5` before NB-097 merged, so never on main (the node drops what came in with a link it refuses, and holds a new link's `AddrObserved`, and the `Replaced` of the link it replaces, until its `Connected` says whether it is admitted), reviewed 2026-11-04, [Connection policy in Rust](#connection-policy-in-rust-nb-097--nb97-1) |
+| NB97-I1, NB97-I2, NB97-I3, NB97-I4 (Info) | NB97-I1, NB97-I2 **fixed** by `a00fff5` (a refused replacement ends the old link with `PathOff`; a link that moves onto a kept relay stops punching, and the answer to an earlier punch moves it nowhere); NB97-I3 accepted (a Rust policy hides no address, the guide says so); NB97-I4 open: a refused link that an admitted one replaced in the same read closes the admitted one, and the app holds the peer `Connected` with no link, same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
@@ -3773,8 +3773,9 @@ node refuses a new link on a path that is off. `set_stun_servers` and `set_signa
 swap servers live and keep the links.
 
 Reviewed 2026-11-04 by reading `d6b42fd` (on `90de9f2`) against the core's path rules
-(`endpoint.rs`), with probes on loopback sockets in a copy of the tree; the probes
-aren't in it.
+(`endpoint.rs`), with probes on loopback sockets in a copy of the tree. The fixes,
+`a00fff5`, were re-checked the same day by reading and with the same probes and one
+more, the unfixed code run beside them. The probes aren't in the tree.
 
 **What holds.**
 - A kept link takes no direct path in the core: it starts no punch (`start_punch`,
@@ -3823,6 +3824,20 @@ neither probe delivers the message, and `tests/policy.rs` passes. Test: in
 `direct_off_closes_direct_links_and_refuses_new_ones` the peer sends as it links, and
 nothing reaches the node that refuses it.
 
+**Status: fixed** by `a00fff5`, reviewed 2026-11-04. `poll_drained` keeps the peers
+whose new link it refused in that pass and drops their later events until a link to the
+peer is admitted. The core raises a new link's `AddrObserved`, and the `Replaced` of the
+link it replaces, before its `Connected`, all from the packet that announces it, so the
+node holds those two until the next event: they go out before an admitted `Connected`,
+in the core's order, and are dropped with a refused one. By reading, no other event
+comes between a held one and its link's `Connected`, and the check the node makes again
+as it hands an event on (`take_event`) agrees with the first, since `Disconnected` and
+`AddrObserved` change neither the policy's paths nor room membership. Measured with both
+probes, the unfixed code beside them: the refusing node's app got nothing about the peer
+from the direct dial, and exactly `Disconnected { reason: PathOff }` from the
+replacement (NB97-I1). With no policy the events come in the same order as before
+(`observed_addresses_reach_the_app_as_before`). Residual: NB97-I4.
+
 **NB97-I1 — A refused replacement ends a link with `Replaced` (Info).** In the second
 probe the link the node had, on a path it allows, ended with
 `Disconnected { reason: Replaced }`, and no `Connected` followed, though
@@ -3830,6 +3845,11 @@ probe the link the node had, on a path it allows, ended with
 the link anyway. Fix: the core raises `Replaced` right before the new link's `Connected`
 (`announce`), so the node can hold it until then and report `PathOff` when it refuses
 the link; or the docs say so.
+
+**Status: fixed** by `a00fff5`, reviewed 2026-11-04: the `Replaced` held for a link the
+node refuses becomes `Disconnected { reason: PathOff }`, which goes through the
+traversal and the node's status as before; `docs/reference/rust.md` says so. Measured
+with the second probe above.
 
 **NB97-I2 — A punch under way follows a link onto a kept relay (Info).** The endpoint
 clears the punches of kept links when the policy or the relay peers change, and checks
@@ -3841,6 +3861,14 @@ path the order ranks after its relay. Read, not measured. Every such order has a
 kind on, so no path that is off is taken. Fix: skip kept links in the punch timer and in
 the PUNCH_ACK that upgrades, as the PUNCH answer does.
 
+**Status: fixed** by `a00fff5`, reviewed 2026-11-04 by reading. The timer stops the
+punch, guesses and spray of a link that is now kept before it sends or races anything
+(`Session::stop_punching`, shared with `set_keep_relayed`), and the PUNCH_ACK that
+upgrades skips a kept link, judged from the link's path after its packet has roamed and
+before its frames are read; a packet that comes direct can't move a link onto a relay.
+The author's core test has a link follow its peer onto a kept relay mid-punch and then
+get the answer to a punch sent before the move: the link stays and punches no more.
+
 **NB97-I3 — A Rust policy hides no address (Info, accepted).** Under an order without
 `Direct` and `Birthday` the node still gives out its addresses: in offers and invites,
 in the origin tag a relay adds to the packets it relays for the node (`relay_out` asks
@@ -3850,6 +3878,32 @@ before the node refuses the link. `Privacy::RelayOnly` keeps them back, and the
 keep back none of the rest, so it isn't done. In JavaScript, `['turn']` without
 `'direct'` sends members no address of ours
 ([Connection policy](#connection-policy-nb-098--nb98-1-nb98-2)).
+
+**NB97-I4 — A refused link can close the admitted one that replaced it (Info).** The
+node closes a refused link with `Endpoint::disconnect(peer)`, which closes the peer's
+link as the core has it when the node handles the event, not the one the event
+announced. Two links of one peer can both be announced in one read, the second replacing
+the first: two dials with the same key, from two instances or from a restart while an
+old dial is under way. When the first is on a path that is off and the second isn't, the
+node closes the second. The peer gets `ClosedByPeer`, while the node's app gets
+`Replaced` for a link it never saw, then `Connected` and the second link's messages, and
+then holds the peer `Connected` with no link (`Node::path` gives none, `send` gives
+`NotConnected`) and no `Disconnected` to follow, until the peer links again. Measured on
+loopback: a node with `[Direct]` was linked to a third node; a peer dialled it through
+that node and, with the same key from a second socket, directly, and both first data
+packets reached it in one poll. `d6b42fd` does the same, so it doesn't come from the
+fixes. Only the holder of the peer's key can do it, and it ends only its own link.
+Main's refusal of a relay-only node's direct link has the same shape, but there the core
+answers a direct HS1 only from a peer it dials or links directly; under a policy it
+answers any.
+
+Fix: close refused links after the pass, only for the peers still refused at its end (a
+later admitted link replaced the refused one otherwise), and drop a held `Replaced`
+whose link was refused. Tried: the probe then got `Connected` and the message with the
+link up at both ends, in 3 runs of 3, and the node's tests pass. The probe also tests
+what the fixes leave untested, that an admitted link takes its peer out of the refused
+list: its check that the admitted link's `Connected` and message reach the app fails
+with that removed, with or without the fix.
 
 ### Connection policy (NB-098) — NB98-1, NB98-2
 
