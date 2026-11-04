@@ -24,7 +24,7 @@ and the commit that fixed it.
 - **Changed:** `Node::path` returns an owned `Option<Path>` (it was `Option<&Path>`): a link through TURN shows the
   peer's address as relayed, and `Node::path_kind` says `Turn`. Drop a `.cloned()`, or compare with `Some(path)`.
   `peerwire_core::Address` has more provided methods (`relayed`, `turn_hop`, `turn_parts`, `relayed_hop`), and
-  `Endpoint` has `set_keep_turn` and `retag`.
+  `Endpoint` has `set_keep_turn`, `retag` and `peer_of`.
 - **LAN discovery:** `LanSignaling` runs rooms over UDP multicast and broadcast on the local network, with no
   internet. Broadcast, to the LAN's broadcast address only, reaches devices that a router never gives multicast to,
   such as an ESP32 on Wi-Fi.
