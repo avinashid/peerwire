@@ -161,7 +161,7 @@ release of each.
 | NB98-1, NB98-2 (Low) | **Fixed** by `3e055f1` before NB-098 merged, so never on main (a call's connections take a policy set live, restart ICE on our side when it turns `'direct'` or `'turn'` off or brings new servers, and fail `'no-path'` if still on a path now off 20 s later; relay urls are parsed with `new URL()`, and every check in `setPolicy` comes before the policy is set), reviewed 2026-11-04; residuals accepted, [Connection policy](#connection-policy-nb-098--nb98-1-nb98-2) |
 | NB98-I1, NB98-I2, NB98-I3, NB98-I4 (Info) | NB98-I1, NB98-I3 **fixed** by `3e055f1` (a link dropped as it came up leaves no proof deadline; without `'direct'` links and calls send relay candidates alone, with no related address and no port prediction, whatever WebRTC gathers); NB98-I4 fixed by it on the dialling side, while the answering side's kept link keeps its old session until the dialler restarts; NB98-I2 documented (an order binds the dialling side only), same section |
 | NB97-1 (Low) | **Fixed** by `a00fff5` before NB-097 merged, so never on main (the node drops what came in with a link it refuses, and holds a new link's `AddrObserved`, and the `Replaced` of the link it replaces, until its `Connected` says whether it is admitted), reviewed 2026-11-04, [Connection policy in Rust](#connection-policy-in-rust-nb-097--nb97-1) |
-| NB97-I1, NB97-I2, NB97-I3, NB97-I4 (Info) | NB97-I1, NB97-I2 **fixed** by `a00fff5` (a refused replacement ends the old link with `PathOff`; a link that moves onto a kept relay stops punching, and the answer to an earlier punch moves it nowhere); NB97-I3 accepted (a Rust policy hides no address, the guide says so); NB97-I4 open: a refused link that an admitted one replaced in the same read closes the admitted one, and the app holds the peer `Connected` with no link, same section |
+| NB97-I1, NB97-I2, NB97-I3, NB97-I4 (Info) | NB97-I1, NB97-I2 **fixed** by `a00fff5` (a refused replacement ends the old link with `PathOff`; a link that moves onto a kept relay stops punching, and the answer to an earlier punch moves it nowhere); NB97-I3 accepted (a Rust policy hides no address, the guide says so); NB97-I4 **fixed** by `9131188` (a refused link is closed at the end of the pass, so an admitted link of the same peer that replaced it in the same read is kept), reviewed 2026-11-04, same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
@@ -3776,7 +3776,10 @@ swap servers live and keep the links.
 Reviewed 2026-11-04 by reading `d6b42fd` (on `90de9f2`) against the core's path rules
 (`endpoint.rs`), with probes on loopback sockets in a copy of the tree. The fixes,
 `a00fff5`, were re-checked the same day by reading and with the same probes and one
-more, the unfixed code run beside them. The probes aren't in the tree.
+more, the unfixed code run beside them; that one found NB97-I4, whose fix, `9131188`,
+was re-checked the same way. The last probe is in the tree
+(`refused_link_replaced_by_an_admitted_one_in_one_batch` in `tests/policy.rs`), and the
+first two have tests like them there.
 
 **What holds.**
 - A kept link takes no direct path in the core: it starts no punch (`start_punch`,
@@ -3837,7 +3840,7 @@ as it hands an event on (`take_event`) agrees with the first, since `Disconnecte
 probes, the unfixed code beside them: the refusing node's app got nothing about the peer
 from the direct dial, and exactly `Disconnected { reason: PathOff }` from the
 replacement (NB97-I1). With no policy the events come in the same order as before
-(`observed_addresses_reach_the_app_as_before`). Residual: NB97-I4.
+(`observed_addresses_reach_the_app_as_before`). Residual: NB97-I4, since fixed.
 
 **NB97-I1 — A refused replacement ends a link with `Replaced` (Info).** In the second
 probe the link the node had, on a path it allows, ended with
@@ -3905,6 +3908,24 @@ link up at both ends, in 3 runs of 3, and the node's tests pass. The probe also 
 what the fixes leave untested, that an admitted link takes its peer out of the refused
 list: its check that the admitted link's `Connected` and message reach the app fails
 with that removed, with or without the fix.
+
+**Status: fixed** by `9131188`, reviewed 2026-11-04. The fix above, as written: the
+refusal closes nothing at once; after the pass, and after the held events have gone out,
+the node closes the link of each peer still refused, and an admitted `Connected` for a
+refused peer first drops the held `Replaced` of the refused link. `Endpoint::disconnect`
+raises no event for the peer (only the links it relayed go back to their slow addresses,
+and a node sets none), so the later close tells the app nothing. Measured on loopback
+with the unfixed code beside it: `tests/policy.rs` passes, 10 of 10 in 3 runs, and with
+main's `node.rs` the probe fails at its `send` to the admitted peer.
+`a_replaced_link_reaches_the_app_as_before` pins that a restarted peer's `Replaced`
+still reaches the app.
+
+Residual, read: a refused link now stays in the core until the end of the pass, not
+until its `Connected` is handled, so an offer the traversal sends a room member on
+another peer's admitted `Connected` in the same read can name the refused peer among our
+links, and a dial through it fails once it is closed. Main already kept a refused link
+in the core from the read to its `Connected`, and offers went out in between
+(`handle_signal`, `handle_timeout`).
 
 ### Connection policy (NB-098) — NB98-1, NB98-2
 
