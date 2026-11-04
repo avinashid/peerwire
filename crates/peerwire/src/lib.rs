@@ -62,6 +62,8 @@ pub mod nostr;
 mod portmap;
 mod signaling;
 pub mod traversal;
+#[cfg(feature = "turn")]
+mod turn;
 
 #[cfg(feature = "tokio")]
 pub use async_node::AsyncNode;
@@ -76,6 +78,8 @@ pub use peerwire_core::{
 pub use portmap::{MapProtocol, PortMapping};
 pub use signaling::{MemoryHub, MemorySignaling, MultiSignaling, Signaling, Topic};
 pub use traversal::{Failure, NatType, PathKind, Policy, Privacy, Role, Side};
+#[cfg(feature = "turn")]
+pub use turn::TurnServer;
 
 /// An event from a [`Node`]: a peer connected or left, a message arrived, a link moved.
 pub type Event = peerwire_core::Event<std::net::SocketAddr>;

@@ -114,6 +114,11 @@ impl<'a> Message<'a> {
         decode_addr(self.attr(t)?, Some(&self.tx))
     }
 
+    /// Every XOR-…-ADDRESS attribute of type `t`, in order (CreatePermission may carry several).
+    pub fn xor_addresses(&self, t: u16) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.attrs.iter().filter(move |a| a.0 == t).filter_map(|a| decode_addr(a.1, Some(&self.tx)))
+    }
+
     /// ERROR-CODE as a number: 401, 438, …
     pub fn error_code(&self) -> Option<u16> {
         let v = self.attr(attr::ERROR_CODE)?;
@@ -253,6 +258,29 @@ pub fn long_term_key(username: &str, realm: &str, password: &str) -> [u8; 16] {
         h.update(part.as_bytes());
     }
     h.finalize().into()
+}
+
+/// The password of time-limited credentials (the "TURN REST API" style coturn's `static-auth-secret` and others
+/// take): base64 of HMAC-SHA1 under the shared `secret` of the username, which is `expiry:user` with `expiry` in
+/// Unix seconds.
+pub fn rest_password(secret: &[u8], username: &str) -> String {
+    let mut h = Hmac::<Sha1>::new_from_slice(secret).expect("HMAC takes keys of any length");
+    h.update(username.as_bytes());
+    base64(&h.finalize().into_bytes())
+}
+
+/// Standard base64 with padding.
+fn base64(b: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = c.iter().enumerate().fold(0u32, |n, (i, &x)| n | u32::from(x) << (16 - 8 * i));
+        for i in 0..4 {
+            let ch = if i <= c.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] } else { b'=' };
+            s.push(char::from(ch));
+        }
+    }
+    s
 }
 
 /// Whether `ch` is a channel number TURN allows.
@@ -414,6 +442,16 @@ mod tests {
         // A channel number TURN doesn't allow, and error codes out of range.
         let p = MessageBuilder::new(CHANNEL_BIND, Class::Request, &tx).channel(0x3FFF).error(299).finish();
         assert_eq!((Message::parse(&p).unwrap().channel(), Message::parse(&p).unwrap().error_code()), (None, None));
+    }
+
+    /// Checked with Python's hmac, hashlib and base64.
+    #[test]
+    fn rest_passwords() {
+        assert_eq!(rest_password(b"north-star", "1700000000:alice"), "rchw+7XvnG7mN0BXm8xDnHNSHX0=");
+        assert_eq!(
+            (base64(&[0, 0xff, 0x10]), base64(b"ab"), base64(b"a"), base64(b"")),
+            ("AP8Q".into(), "YWI=".into(), "YQ==".into(), String::new())
+        );
     }
 
     #[test]

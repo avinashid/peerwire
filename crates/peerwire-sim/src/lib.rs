@@ -17,6 +17,7 @@
 
 pub mod fuzz;
 mod nat;
+pub mod turn;
 
 use nat::Nat;
 pub use nat::{Dependence, NatConfig, NatStats, PortAlloc};

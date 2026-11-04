@@ -11,7 +11,8 @@ keywords = ["p2p", "simulator", "networking", "deterministic", "testing"]
 categories = ["simulation", "network-programming", "development-tools::testing"]
 
 [dependencies]
-peerwire-core = { path = "../peerwire-core" }
+# The TURN codec, for the TURN server (src/turn.rs).
+peerwire-core = { path = "../peerwire-core", features = ["turn"] }
 rand_core = "0.6"
 rand_chacha = "0.3"
 
