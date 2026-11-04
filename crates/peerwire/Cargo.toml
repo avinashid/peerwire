@@ -43,6 +43,9 @@ if-addrs = "0.15"
 socket2 = { version = "0.6", features = ["all"] }
 
 [features]
+# The TURN client (RFC 8656 over UDP; Builder::turn_servers). On by default; the ESP32 port turns it off.
+default = ["turn"]
+turn = ["peerwire-core/turn"]
 tokio = ["dep:tokio"]
 nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:serde_json"]
 # Test hooks for bindings (Builder::port_mapping_at, a fake gateway's address). Not for apps.

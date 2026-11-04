@@ -333,6 +333,7 @@ fn fuzz_stun() {
 /// TURN's messages and ChannelData (stun.rs): what a client and server exchange, with and without
 /// MESSAGE-INTEGRITY and FINGERPRINT, mutated. Whatever parses rebuilds from its attributes to a message that
 /// parses the same, and verifies under one key only.
+#[cfg(feature = "turn")]
 #[test]
 fn fuzz_turn() {
     use stun::{attr, method, Class, Message, MessageBuilder};

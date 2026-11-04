@@ -15,13 +15,16 @@ snow = { version = "0.10", default-features = false, features = ["use-curve25519
 ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "zeroize", "rand_core"] }
 rand_core = "0.6"
 rand_chacha = "0.3"
-# TURN's long-term credentials (RFC 8656, stun.rs): MESSAGE-INTEGRITY is HMAC-SHA1 under MD5(user:realm:pass), which
-# TURN servers (coturn, Cloudflare) require. RustCrypto, as sha2 and hmac in peerwire; sha1 and hmac are already in
-# the tree (tungstenite, room proofs). Unused by the FFI; without their default `std` (digest's), the wasm is as
-# large as without them.
-hmac = "0.12"
-sha1 = { version = "0.10", default-features = false }
-md-5 = { version = "0.10", default-features = false }
+# TURN's long-term credentials (feature `turn`, stun/turn.rs): MESSAGE-INTEGRITY is HMAC-SHA1 under
+# MD5(user:realm:pass), which TURN servers (coturn, Cloudflare) require. RustCrypto, as sha2 and hmac in peerwire;
+# sha1 and hmac are already in the tree (tungstenite, room proofs). Without their default `std`, which nothing needs.
+hmac = { version = "0.12", optional = true }
+sha1 = { version = "0.10", default-features = false, optional = true }
+md-5 = { version = "0.10", default-features = false, optional = true }
+
+[features]
+# The TURN codec (stun/turn.rs), for the `peerwire` crate's TURN client. Off for the FFI (the wasm) and the ESP32 port.
+turn = ["dep:hmac", "dep:sha1", "dep:md-5"]
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
