@@ -37,6 +37,7 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 | The LAN, for `LanSignaling` | No | Every device on the link, and every program on the machine, hears each frame and can send its own, with no relay to pace it. The same limits as a relay: cannot open or forge a sealed payload. See [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6). |
 | Peer relay (`FWD`/`RELAYED`) | No | Sees only ciphertext; rate-limited; forwards only to already-connected peers. |
 | NAT / on-path network | No | Noise authenticates the endpoints; cannot MITM. Can drop/delay. |
+| A TURN server the app lists (`iceServers`; in Rust `turn_servers`, NB-099) | Partially | The app's choice, not ours. Sees our address, the peers' addresses, sizes and timing, never a payload; can drop or delay; picks the relayed address we offer. See [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2). |
 | Remote peer | Partially | Authenticated, but may be malicious: send malformed frames, flood, probe. Parsers and resource caps are the defence. |
 | Host application / C caller | Yes | The C ABI trusts its caller to pass valid pointers and lengths; since NB-085 it refuses null ones (see SEC-8). |
 
@@ -164,6 +165,8 @@ release of each.
 | NB97-I1, NB97-I2, NB97-I3, NB97-I4 (Info) | NB97-I1, NB97-I2 **fixed** by `a00fff5` (a refused replacement ends the old link with `PathOff`; a link that moves onto a kept relay stops punching, and the answer to an earlier punch moves it nowhere); NB97-I3 accepted (a Rust policy hides no address, the guide says so); NB97-I4 open: a refused link that an admitted one replaced in the same read closes the admitted one, and the app holds the peer `Connected` with no link, same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
+| NB99-1 (Medium), NB99-2 (Low), NB99-I1 (Info) | **Fixed** by `b2b2919` and `41471eb` before NB-099 merged, so never on main (a relayed address an offer names relabels only the packets that name its claimant's link, and the policy takes it as TURN's for that peer alone; full TURN tables make room for a later peer, a peer holds one offer's IPs, channel numbers are bound again once quiet), reviewed 2026-11-05; residuals accepted, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
+| NB99-I2 (Info) | Open (NB-099): a member that offers another peer's relayed address as its own takes the claim from it until that peer's next offer, so that peer's packets from there come in as from a network address; measured, its link stayed on TURN, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -4088,6 +4091,167 @@ the dialling side restarts (a policy change of its own, new servers, a failure);
 room checks a WebRTC link's path only when a policy is set, so a later move onto one of
 that session's host pairs goes unchecked. A call restarts on whichever side changed
 (NB98-1).
+
+### TURN client in Rust (NB-099) — NB99-1, NB99-2
+
+Feature `turn` (`crates/peerwire/src/turn.rs`, on by default) gives a Rust node TURN
+servers of its own (`Builder::turn_servers`, `Node::set_turn_servers`; RFC 8656 over
+UDP), with a username and password, or credentials minted for each allocation from a
+REST secret (`TurnServer::rest`: the username `expiry:user`, the password
+base64(HMAC-SHA1(secret, username))). TURN runs only with `PathKind::Turn` in the policy
+and not under `Privacy::RelayOnly`. The node keeps an allocation on each server, offers
+its relayed address in a tagged `fe 03` entry, and a dial's `Turn` step goes through the
+allocation (a channel for each peer address, Send indications until it is bound) to the
+peer's addresses, or from the node's socket to the peer's relayed address. A link at a
+relayed address counts as `Turn`, for the policy and in `path_kind`, and leaves it as a
+link leaves a relay: by a punch to a direct address, answered there. The codec is
+`peerwire-core/src/stun/turn.rs`.
+
+Reviewed 2026-11-05 by reading `4c61f49` (on `9131188`) against the core's path rules
+(`endpoint.rs`) and RFC 8656, with probes on loopback sockets, and a loopback TURN
+server (the simulator's, `peerwire_sim::turn`), in a copy of the tree. The fixes,
+`c3585f9` to `6b1b3a4`, were re-checked the same day by reading and with the same probes
+and one more, the unfixed code run beside them, and two mutants of the NB99-I1 fix. The
+probes aren't in the tree; the author's tests like them are.
+
+**What the TURN server sees.** The server is the app's (coturn, Cloudflare TURN, …),
+trusted with metadata only. It sees our address as it reaches it, the IPs we let in
+(each peer's last offer's addresses and relayed ones) and the addresses we send to, when
+and how much goes each way, how long the allocation lives, and the username: with REST
+credentials, `expiry:user`, so the app's name for the user and when they were minted.
+What it carries are Noise packets, sealed end to end: it can drop, delay, reorder or
+replay them (the link's replay window drops a replay), not read or forge one. It also
+picks the relayed address we offer, so a server that lies points the peers' TURN dials
+at an address of its choosing, which gets their handshakes, as an offer of any address
+can; since NB99-1's fix, naming an address as relayed changes nothing about other peers'
+packets from it.
+
+**What holds.**
+- The codec reads every attribute within bounds. MESSAGE-INTEGRITY is checked with
+  `verify_slice`, which takes only the full 20-byte tag and compares in constant time;
+  FINGERPRINT must come last, and a message has at most 24 attributes. `fuzz_turn` runs
+  on it.
+- Transaction ids are 96 bits from ChaCha20. A success response counts only from the
+  server's address and under our key; a request takes at most 2 challenges, and a 401 to
+  one already sent under our key (wrong credentials) ends it. A failed allocation is
+  tried again after 5 s, doubling to 300 s. ChannelData is taken only on a bound channel
+  of a live allocation, a Data indication only from a permitted IP. No credential, key
+  or MESSAGE-INTEGRITY is in a `Debug` output or an error.
+- From a server's address (`c3585f9`, for one server as both STUN and TURN),
+  ChannelData, Data indications and the answers to the TURN client's requests go to it,
+  other STUN to the STUN client, which takes a Binding answer only for its pending
+  transaction, and anything else is dropped. Nothing from a server's address reaches the
+  endpoint as from a network address, so no link is taken to be at the server.
+- OBSERVED is neither sent nor taken on a relayed path, and our relayed address is never
+  taken as our NAT's mapping.
+- Decoders from before NB-099 skip the `fe 03` entry: `SocketAddr::decode` needs a first
+  byte of 4 or 6, and the u32 and u64 fields need their exact length.
+- Under `Privacy::RelayOnly` nothing is allocated, and the node never dials a peer's
+  relayed address.
+
+**NB99-1 — An offer's relayed address relabels everyone's packets from it (Medium).** At
+`4c61f49`, `on_offer` put each address in a peer's `fe 03` entry in `relayed_of`, and
+`Traversal::hop`, which every datagram on the node's socket goes through, took anything
+from such an address as from a relayed one, whoever sent it. So a room member M that
+names another member V's address as its relayed one makes our node take V's packets as
+relayed: V's link is a TURN link, with its observed addresses ignored, which the policy
+may have off, and it can move through M. This needs no TURN server, and works with
+feature `turn` off (`turn_off.rs` kept `relayed_of` and `hop`). Reproduction: on
+loopback, a room of A, M and V on `MemoryHub`, with M changed only to add V's socket
+address to its offers' relayed entry, and the same run without the claim beside it. With
+no policy, A's link to V was `Turn`; under `Policy::default()` it went through M; under
+`[Direct]` there was none. Without the claim, each was direct to V's socket. Fix:
+relabel a datagram only if it names the claimant's link, by its receiver index; a
+handshake's first message names none, so its link is retagged when it comes up.
+
+**Status: fixed** by `b2b2919`, reviewed 2026-11-05. `Endpoint::peer_of` reads the
+receiver index of an HS2, Data or Cookie packet from its header, and `hop` relabels a
+datagram only when that names the address's claimant; the retags, on `Connected` and in
+`on_offer`, are the claimant's only. Measured with the same probe, the unfixed code
+beside it: with the claim, A's link to V was direct to V's socket under all three
+policies, as without it; unfixed, `Turn`, through M, and none. The index isn't
+authenticated, so it is a hint: a forged one fails that link's keys, and a claimant that
+sends from the address it claimed moves only its own link. Residual: NB99-I2.
+
+**NB99-2 — Full TURN tables lock out later peers (Low).** At `4c61f49`,
+`TurnClient::permit` refused a new IP once 64 were held (`MAX_PERMISSIONS`), `send`
+bound no channel past 64 (`MAX_CHANNELS`), and channel numbers were never used again;
+`on_offer` let in the IPs of every offer it took, up to 10 each, and an entry stays
+while wanted (permitted or sent to in the last 10 minutes). So the members' offers fill
+the tables, and a peer met later gets nothing through our allocation, either way.
+Reproduction, a unit test against the simulator's server: with 64 IPs permitted and sent
+to, a later peer got 0 datagrams out and 0 back; with 63, or none, 3 out and 1 back.
+Fix: a quota for each peer; when full, the entry wanted longest ago gives way; channel
+numbers used again.
+
+**Status: fixed** by `41471eb`, reviewed 2026-11-05. With 64 held, a new permission or
+channel takes the place of the one wanted longest ago. A channel number let go (evicted,
+no longer wanted, or unanswered) is bound again only 15 minutes later, the server's 10
+and the 5 that RFC 8656 §12 asks, and a new allocation starts afresh. A peer's IPs are
+its last offer's (`TurnSet::permit`): those no other peer holds are let go, and peers
+the traversal forgets hold none. Measured with the same probe, the unfixed code beside
+it: with 64 held, the later peer got 3 out and 1 back; unfixed, 0 and 0. Residual: the
+tables are still bounded, and a member with many identities (anyone with the room key
+can make them) can push entries out. A peer still sent to keeps its permission at the
+server, as each ChannelBind renews it; one not sent to gets in again with its next
+offer; while all 4,096 channel numbers are bound or quiet, new peers get Send
+indications.
+
+**NB99-I1 — The policy read a link's path before its retag (Info).** A link that a
+peer's dial through its allocation makes comes up at its relayed address as from a
+network address, and is retagged on `Connected`, or by the offer. At `4c61f49`,
+`handle_event` retagged, then gave `follow_policy` the event's path, direct to a network
+address, and the node's admission check used the same; `on_offer`'s retag checked
+nothing. So a TURN link was judged as a direct one: kept under `[Direct]`, refused under
+`[Turn]`. Fix: read the path after the retag.
+
+**Status: fixed** by `b2b2919`, another way, reviewed 2026-11-05. Reading
+`ep.path(peer)` again would read the peer's current link, which can be a later one than
+the event's (NB97-I4). Instead `allows` takes an address a peer offered as relayed as
+TURN's for that peer only, so the node and the traversal agree whichever came first, the
+link or the offer, and `on_offer` runs `follow_policy` after its retag. Read against
+both orders. The author's test
+(`a_link_at_a_relayed_address_follows_the_policy_in_either_order`) moves the link off
+under `[Direct]` in each, and fails with either half of the fix taken out: tried, both
+mutants caught.
+
+**NB99-I2 — A later claim of a relayed address takes it from the first (Info).**
+`on_offer` keeps one claimant for each relayed address (`relayed_of.insert`), so a
+member that offers another peer's relayed address as its own takes it over, until that
+peer's next offer. NB99-1's fix relabels only the claimant's packets, so the first
+peer's packets from its own relayed address then come in as from a network address.
+Measured on loopback: T linked to B through T's allocation, both under `[Turn]`, and M,
+a member under the default policy, offering T's relayed address. M held the claim at B
+in 3,682 of 3,683 polls over 8 s, and the link stayed on TURN at both ends, as packets
+from a network address move nothing on a link at a relayed one. After B closed the link,
+T's offer came before its dial and took the claim back, and the link came up on TURN
+again. By reading, a handshake from that address that lands while M holds the claim
+comes up as from a network address and isn't retagged, so the policy reads it as direct
+(refused under `[Turn]`, kept under `[Direct]`) until T's next offer retags it. Fix:
+keep every claimant of an address (key `relayed_of` by address and peer), so a claim
+relabels only its claimant's packets and takes nothing from another's.
+
+**Status: open** (Info), reported on NB-099 at `6b1b3a4`.
+
+**Residuals, accepted.**
+- UDP to the server only: no TURN over TCP or TLS, so a network that blocks UDP gets no
+  TURN path.
+- A link on TURN moves to a direct path ranked earlier once a punch answers, but not to
+  a relay peer, even one ranked earlier (the guide says so).
+- In Rust, `[Turn]` hides no address: offers still carry the node's addresses, a peer
+  can name its own address as relayed, and a link to a peer's relayed address goes from
+  our socket, so the peer's TURN server sees our address. `Privacy::RelayOnly` hides
+  them, and TURN is off under it (`connection-paths.md` says so).
+- Off path, a sender that spoofs the server's address injects only what a direct sender
+  could: ChannelData on a bound channel (numbered from 0x4000, so easy to guess) or a
+  Data indication from a permitted IP becomes a datagram from that peer's TURN hop,
+  which must pass that link's keys.
+- Error responses aren't checked for integrity, so on path an attacker can fail an
+  allocation or a refresh, as it could drop them; the next try backs off, to 300 s.
+- The password, or the REST secret, stays in the node's memory for its life, to make new
+  allocations. The secret mints credentials for anyone who holds it, and the rustdoc
+  says to use it only in apps the developer runs.
+- NB99-2's bounds, above, and NB99-I2.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
