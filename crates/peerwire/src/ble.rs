@@ -258,7 +258,9 @@ struct Conn {
     made: u32,
     /// This end is the central.
     central: bool,
-    /// The `n` of the advert this end connected to, as the central.
+    /// The device this end connected to, as the central.
+    to: Option<DeviceId>,
+    /// The `n` of the advert it connected to.
     n: Option<u32>,
     mtu: u16,
     chunker: Chunker,
@@ -337,8 +339,9 @@ pub(crate) struct Ble {
     next_hop: u32,
     /// Connects under way: the device and the advert's `n`.
     pending: HashMap<DeviceId, (u32, Instant)>,
-    /// Adverts not to connect to again until then.
-    held: HashMap<u32, Instant>,
+    /// Adverts not to connect to again until then, by device and `n`: one device's copy of another's advert holds
+    /// only its own (NB110-10).
+    held: HashMap<(DeviceId, u32), Instant>,
     /// Adverts lately looked at, and whether each was this room's: another room's is skipped, this room's is
     /// judged again without its tag checked again.
     seen: VecDeque<(DeviceId, [u8; ADVERT_LEN], Instant, bool)>,
@@ -441,7 +444,7 @@ impl Ble {
             RadioEvent::Connected { conn, device, mtu } => self.on_connected(now, conn, device, mtu),
             RadioEvent::ConnectFailed { device } => {
                 if let Some((n, _)) = self.pending.remove(&device) {
-                    self.held.insert(n, now + RECONNECT_HOLD);
+                    self.held.insert((device, n), now + RECONNECT_HOLD);
                 }
             }
             RadioEvent::Mtu { conn, mtu } => {
@@ -451,8 +454,8 @@ impl Ble {
             }
             RadioEvent::Value { conn, value } => self.on_value(now, ep, conn, &value),
             RadioEvent::Disconnected { conn } => {
-                if let Some((n, until)) = self.conns.get(&conn).and_then(|c| Some((c.n?, now + hold(c)))) {
-                    let t = self.held.entry(n).or_insert(until);
+                if let Some((at, until)) = self.conns.get(&conn).and_then(|c| Some((c.to.zip(c.n)?, now + hold(c)))) {
+                    let t = self.held.entry(at).or_insert(until);
                     *t = (*t).max(until);
                 }
                 self.forget(conn);
@@ -489,10 +492,11 @@ impl Ble {
         if n == self.n || theirs_full || !(self.n < n || self.full()) {
             return;
         }
-        // Nor one this end is connected or connecting to, or holds. Only adverts it connected to itself count, as
-        // nothing a central says of its own is taken (NB110-6): two connections to one peer may happen, and one closes.
+        // Nor one this end is connected or connecting to, or holds from this device (NB110-10). Only adverts it
+        // connected to itself count, as nothing a central says of its own is taken (NB110-6): two connections to one
+        // peer may happen, and one closes.
         let known = self.conns.values().any(|c| c.n == Some(n)) || self.pending.values().any(|(m, _)| *m == n);
-        if known || self.held.get(&n).is_some_and(|t| now < *t) || !self.room_out() {
+        if known || self.held.get(&(device, n)).is_some_and(|t| now < *t) || !self.room_out() {
             return;
         }
         self.pending.insert(device, (n, now));
@@ -513,7 +517,8 @@ impl Ble {
     /// centrals, it can. A central's connection whose peer hasn't proven who it is doesn't count, as it soon has, or
     /// closes, or makes way for a newcomer after `GRACE` (NB110-7); nor does a second one to a peer, which its central
     /// closes or which makes way at once (NB110-9). These are what `make_way` closes for a newcomer, so an advert
-    /// that says it takes a central refuses one only within another's `GRACE`.
+    /// that says it takes a central refuses one only within another's `GRACE`, or while a connect of this end's own
+    /// is under way: it counts, and only an open connection makes way (I10).
     fn full(&self) -> bool {
         let weak = |(i, c): &(&ConnId, &Conn)| !c.central && (c.known().is_none() || self.second(**i, c));
         let weak = self.conns.iter().filter(weak).count();
@@ -586,6 +591,7 @@ impl Ble {
             hop: Hop::Ble(at),
             made: self.next_hop,
             central,
+            to: device,
             n,
             mtu,
             chunker: Chunker::new(),
@@ -966,9 +972,9 @@ impl Ble {
     /// `hold`.
     fn close_for(&mut self, conn: ConnId, hold: Duration) {
         let Some(c) = self.conns.get(&conn) else { return };
-        if let Some(n) = c.n.filter(|_| !hold.is_zero()) {
+        if let Some(at) = c.to.zip(c.n).filter(|_| !hold.is_zero()) {
             let until = self.now + hold;
-            let t = self.held.entry(n).or_insert(until);
+            let t = self.held.entry(at).or_insert(until);
             *t = (*t).max(until);
         }
         self.radio.disconnect(conn);
@@ -1954,6 +1960,47 @@ mod tests {
             };
             assert!(gaps_ms.len() >= 3 && gaps_ms.iter().all(|g| gaps.contains(g)), "{what}: {gaps_ms:?}");
             assert!(gaps_ms.iter().any(|g| *g != gaps_ms[0]), "{what}: at random, {gaps_ms:?}");
+        }
+    }
+
+    /// NB110-10 (security's case f): an outsider with no room key copies Alice's advert, which anyone in range
+    /// hears, and Bob, whose `n` is the smaller, connects to the copy before Alice's. The outsider sends a challenge
+    /// and nothing more, or sends one and leaves, or the connect fails. Bob holds that device's copy of the advert,
+    /// not Alice's: they link within seconds (before, after about 63 s).
+    #[test]
+    fn a_replayed_advert_doesnt_hold_a_central_off_the_real_one() {
+        for what in ["challenges", "challenges and leaves", "connect fails"] {
+            let mut w = Air::new(&[Limits::DESKTOP; 2]);
+            w.set_n(0, 2_000); // Alice
+            w.set_n(1, 1_000); // Bob
+            let copy = w.air.advert(0).expect("Alice's advert");
+            let mut rp = w.air.radio(Limits::DESKTOP);
+            let (start, from) = (w.now, if what == "connect fails" { DeviceId(9) } else { DeviceId(2) });
+            if what == "connect fails" {
+                w.b[1].on_seen(start, from, &copy); // no such radio
+            } else {
+                w.air.set_off(0, true); // so Bob hears the copy first
+                rp.advertise(Some(&copy));
+            }
+            while !w.linked(0, 1) && w.now - start < Duration::from_secs(10) {
+                w.run(10);
+                for e in std::iter::from_fn(|| rp.poll()).collect::<Vec<_>>() {
+                    let RadioEvent::Connected { conn, .. } = e else { continue };
+                    Chunker::new().split(&[KIND_CHALLENGE; 1 + CHALLENGE], 23, |v| rp.send(conn, v));
+                    rp.advertise(None);
+                    if what == "challenges and leaves" {
+                        rp.disconnect(conn);
+                    }
+                    w.air.set_off(0, false);
+                }
+            }
+            let took = w.now - start;
+            eprintln!("{what}: linked {} in {took:?}", w.linked(0, 1));
+            assert!(w.linked(0, 1) && took < Duration::from_secs(5), "{what}: linked in {took:?}");
+            assert!(w.b[1].held.contains_key(&(from, 2_000)), "{what}: the copy is held");
+            let now = w.now;
+            w.b[1].on_seen(now, from, &advert(&ble_key("app", "room"), 3_000, false));
+            assert!(w.b[1].pending.contains_key(&from), "{what}: a new advert from that device isn't");
         }
     }
 
