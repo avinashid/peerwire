@@ -122,8 +122,13 @@ impl Board {
         let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
         let (ip, prefix) = (ip_info.ip, ip_info.subnet.mask.0);
         info!("on Wi-Fi at {ip}/{prefix}, free heap {} B", free_heap());
-        if let Err(e) = clock::sync(CLOCK_WAIT) {
-            warn!("{e}: the clock is at 1970, so peers with a set clock drop our hellos; we restart once it is set");
+        match clock::sync(CLOCK_WAIT) {
+            // The time a server gave before a restart is kept in RTC memory.
+            Err(e) if clock::is_set() => warn!("{e}: keeping the time set before the restart"),
+            Err(e) => {
+                warn!("{e}: the clock is at 1970, so peers with a set clock drop our hellos; we restart once it is set")
+            }
+            Ok(()) => {}
         }
         clock::keep_in_step()?;
         Ok(Board { wifi, ip, prefix })
