@@ -63,7 +63,9 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 | `turn` (default) | A TURN client: [`TurnServer`](#turnserver), `Builder::turn_servers`, `Node::set_turn_servers`, `Node::turn_status`. Without it `PathKind::Turn` is still a kind, but no node has TURN servers | `peerwire-core`'s `turn`: `hmac` 0.12, `sha1` 0.10, `md-5` 0.10 |
 | `tokio` | [`AsyncNode`](#asyncnode) | `tokio` 1 with `net`, `time`, `macros`, `rt` |
 | `nostr` | [`NostrSignaling`](#nostrsignaling) and the `peerwire::nostr` module | `tungstenite` 0.24, `rustls` 0.23 (`ring`), `webpki-roots` 1, `k256` 0.13, `serde_json` 1 |
-| `testing` | `Builder::port_mapping_at`, port mapping through a fake gateway (hidden from rustdoc). For the bindings' tests only, not for apps | nothing |
+| `ble` | Bluetooth LE ([Bluetooth](../concepts/bluetooth.md)): the `peerwire::ble` module (the `Radio` driver trait, `RadioEvent`, `Limits`), `Builder::bluetooth`. The node's side only: a driver comes from `ble-bluez`, or from the app (the ESP32 port's NimBLE one) | nothing |
+| `ble-bluez` | `ble`, and the Linux driver `ble::BlueZ` (BlueZ over D-Bus) | `bluer` 0.17 (`bluetoothd`), `dbus` 0.9 (`vendored`: `libdbus` built from source, so no system package is needed), `futures` 0.3, `tokio` 1 (`rt`, `sync`, `macros`) |
+| `testing` | `Builder::port_mapping_at`, port mapping through a fake gateway; `Node::set_udp_off`; with `ble`, `ble::FakeAir`, radios in one process, and `Node::ble_counts` (all hidden from rustdoc). For tests only, not for apps | nothing |
 
 `peerwire-ffi` has one feature, `sync`: the shared-document functions (`pw_docs_*`, `pw_doc_*`) on `peerwire-sync`.
 It is off by default, and the wasm build leaves it out. `peerwire-core` has one, `turn`, off by default: TURN's
@@ -106,7 +108,8 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `LanSignaling` | A carrier over UDP multicast and broadcast on one LAN | `src/lan.rs` |
 | `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND` and `NostrStats` | `src/nostr.rs` |
 | `Privacy`, `Role`, `NatType`, `Failure`, `Side` | Which addresses a node gives out, room roles, the NAT type, why a dial failed | `src/traversal.rs` |
-| `PathKind`, `Policy`, `Hop` | The kinds of path, a connection policy, and the addresses a host with TURN gives its endpoint (a network address, a peer through this node's TURN allocation, or a peer's relayed address) | `src/traversal.rs` |
+| `PathKind`, `Policy`, `Hop` | The kinds of path, a connection policy, and the addresses a host with TURN or a radio gives its endpoint (a network address, a peer through this node's TURN allocation, a peer's relayed address, or a Bluetooth connection) | `src/traversal.rs` |
+| `ble` (feature `ble`) | Bluetooth LE: the `Radio` driver trait, `RadioEvent`, `DeviceId`, `ConnId`, `Limits`, the service's UUIDs, and `BlueZ` with `ble-bluez` | `src/ble.rs`, `src/bluez.rs` |
 | `TurnServer` (feature `turn`) | A TURN server and the credentials for it | `src/turn.rs` |
 | `PortMapping`, `MapProtocol` | Where router port mapping stands | `src/portmap.rs` |
 | `Config`, `ConnectError`, `DisconnectReason`, `Identity`, `Invite`, `Lane`, `PeerId`, `PeerStats`, `SendError`, `Stats`, `MAX_UNRELIABLE`, `MAX_URGENT` | Re-exported from `peerwire-core` | `crates/peerwire-core/src` |
@@ -263,7 +266,7 @@ Messages and links:
 | `peers(&self) -> impl Iterator<Item = &PeerId>` | Peers with a live link, relay peers left out |
 | `peer_stats(&self, peer: &PeerId) -> Option<PeerStats>` | A link's RTT, path RTT, congestion window, fragments sent and retransmitted; `PeerStats::loss()` estimates loss |
 | `path(&self, peer: &PeerId) -> Option<Path>` | The route the link takes: `Path::Direct(addr)` or `Path::Via(relay)`. The address is where its packets go: a link through TURN shows the peer's address as this node's TURN server relays to it, or the peer's relayed address; `path_kind` says which |
-| `path_kind(&self, peer: &PeerId) -> Option<PathKind>` | The kind of route: `Direct`, `Birthday` (out of a birthday-punch socket, as `via_birthday`), `Peers` or `RelayPeers` (through a peer), or `Turn` (through a TURN server, this node's or the peer's) |
+| `path_kind(&self, peer: &PeerId) -> Option<PathKind>` | The kind of route: `Direct`, `Birthday` (out of a birthday-punch socket, as `via_birthday`), `Peers` or `RelayPeers` (through a peer), `Turn` (through a TURN server, this node's or the peer's), or `Bluetooth` (over a radio connection; its `path` is `Path::Direct` at an address in `0.0.0.0/8`, port 0) |
 | `via_birthday(&self, peer: &PeerId) -> bool` | Whether the direct link leaves from one of this node's birthday-punch sockets |
 | `birthday_sockets_opened(&self) -> u64` | How many sockets this node has opened for birthday punching |
 | `stats(&self) -> Stats` | Node-wide counters: packets, drops, relaying, hole punching |
@@ -297,6 +300,7 @@ Options for a `Node`, from `Node::builder()`. Each takes `self` and returns the 
 | `relay_peers` | `impl IntoIterator<Item = S>`, `S: Into<String>` | None | Invites of always-on peers to keep linked as relays (see `Node::set_relay_peers`) |
 | `policy` | `Policy` | None: every path, as before policies | Which paths links may take, and in what order (see [Policy](#policy) and `Node::set_policy`) |
 | `turn_servers` | `impl IntoIterator<Item = TurnServer>` | none | Feature `turn`. This node's own TURN servers, as `Node::set_turn_servers` takes them, resolved in `bind`; used only with `PathKind::Turn` in the policy |
+| `bluetooth` | `impl ble::Radio + 'static` | None | Feature `ble`. A Bluetooth LE radio (`ble::BlueZ` on Linux): in a room, the node advertises, links with the members it hears over it, with no network, and ranks it below every UDP path (`PathKind::Bluetooth`). Off under `Privacy::RelayOnly`. See [Bluetooth](../concepts/bluetooth.md) |
 
 `bind(self, addr: impl ToSocketAddrs) -> io::Result<Node>` binds the socket as `Node::bind` describes. It fails with
 `ErrorKind::InvalidInput` if a relay peer is not an invite, or if the policy is not valid (`Policy::is_valid`).
@@ -428,6 +432,7 @@ works.
 | `Peers` | Through another peer linked to both (`Path::Via`), such as a room member. A peer relays only over its direct links, so with `Direct` and `Birthday` off only relay peers can relay |
 | `RelayPeers` | Through this node's own always-on relay peers (`Node::set_relay_peers`), as you would run your own TURN server. Left out, they aren't linked at all |
 | `Turn` | Through a TURN server: this node's own (`Node::set_turn_servers`, allocated only with this kind in the order), or the peer's, at the relayed address its offers carry |
+| `Bluetooth` | Over a Bluetooth LE connection (feature `ble`), to a peer whose room hellos or offers came over it. Last wherever it is listed: a dial takes it in its last step, and a link on it punches to the peer's addresses and moves off it. Not in the default order, and off under `Privacy::RelayOnly` |
 
 How the order is read:
 

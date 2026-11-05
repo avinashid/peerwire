@@ -6,6 +6,19 @@ versioning](https://semver.org); before 1.0, a minor version may break the API.
 Every security finding behind a fix below is in the [threat model](docs/project/threat-model.md), with its severity
 and the commit that fixed it.
 
+## Unreleased: Rust crates
+
+- **Bluetooth LE** (NB-110, [Bluetooth](docs/concepts/bluetooth.md)): `peerwire` feature `ble` (no dependencies)
+  gives a node a radio, `Builder::bluetooth`: in a room it advertises, links with the members it hears with no
+  network, and ranks the radio below every UDP path (`PathKind::Bluetooth`, not in `Policy::default()`, off under
+  `Privacy::RelayOnly`); a link that loses UDP comes back over the radio, and moves to UDP again once it works.
+  Feature `ble-bluez` adds the Linux driver, `ble::BlueZ`. Drivers implement `ble::Radio`; the ESP32's comes in
+  `peerwire-esp`. Not yet run on a radio.
+- `peerwire-core`: `ble`, the framing codec every host shares (`Chunker`, `Reassembler`, the service's UUIDs);
+  `Endpoint::handle_datagram_unbound`, for a channel no peer is bound to yet; `Address::radio`.
+- **Breaking:** `peerwire::Hop` has a new variant, `Ble`, so a `match` on it needs an arm for it (the next release of
+  `peerwire` is 0.2). `Traversal::handle_signal_via`, `Traversal::forget_radio` and `Traversal::hello_soon` are new.
+
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 
 - **The doctor:** `npx @peerwire/js doctor` (a `bin` in `@peerwire/js`) and the Rust example `doctor`, which

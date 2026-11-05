@@ -69,11 +69,12 @@ That is 30 of the 31 bytes a legacy advert holds. Where the stack allows a scan 
   peer not in a room doesn't advertise or scan. Nothing in the advert lasts longer: no `PeerId`, name, topic or
   address. A listener with the room's name can tell a member of that room, as it could from a Nostr relay.
 
-**Who connects.** Native peers both advertise and scan. Of two peers that see each other's adverts, the one whose `n`
-is the smaller connects, as the central; the other one does if the smaller one's advert says it is full, and with
-equal values neither does until one changes. A peer with no advert of its own (a browser) connects to the device the
-user picks. So a native peer accepts a central that never advertises. A peer doesn't connect twice to one `n`, nor
-again within 60 s to an `n` whose connection closed.
+**Who connects.** Native peers both advertise and scan. A peer connects, as the central, to an advert that isn't
+full when its own `n` is the smaller, or when its own advert is full; with equal values neither does until one
+changes. A peer with no advert of its own (a browser) connects to the device the user picks. So a native peer accepts
+a central that never advertises. A peer doesn't connect to an `n` it is connected to (the central names its own in its
+answer, below), nor while a central's connection to it hasn't proven the room yet, nor within 60 s to an `n` whose
+connection closed.
 
 ## Framing
 
@@ -103,7 +104,7 @@ A message's first byte is its kind:
 | Kind | Rest of the message | When |
 |---|---|---|
 | `3` challenge | `c_p`, 16 random bytes | the peripheral's first message |
-| `4` answer | `c_c`, 16 random bytes, then `HMAC-SHA256(ble key, "pw-ble-c" ‖ c_p ‖ c_c)` | the central's reply |
+| `4` answer | `c_c`, 16 random bytes; `n`, its advert's (u32 LE, 0 for none); `HMAC-SHA256(ble key, "pw-ble-c" ‖ c_p ‖ c_c ‖ n)` | the central's reply |
 | `5` proof | `HMAC-SHA256(ble key, "pw-ble-p" ‖ c_c ‖ c_p)` | the peripheral's reply to a good answer |
 | `1` signal | `seq` u64 LE, then AES-256-GCM(link key, nonce, `inner kind ‖ payload`) | once proven |
 | `0` datagram | one Peerwire packet ([Protocol](protocol.md#packets)), 1 to 1,232 B | once proven |
@@ -138,6 +139,11 @@ a new connection, even to the same device, starts unbound. A peer has at most on
 bound to it, the older closes. The core does this for every host: `Endpoint::handle_datagram_unbound` for an unbound
 connection, `handle_datagram_from` for a bound one.
 
+A peer keeps one connection to each other peer: the one bound to it, or else the oldest whose signals proved it a
+member. Another that carries its signals closes, and so do the unbound ones that did when a connection binds to it.
+A proven connection bound to no one, such as one between peers linked over UDP, stays open while a signal proving a
+member comes over it at least every 60 s (hellos come every 30 s at most): it is ready for the day UDP goes.
+
 ## Paths: UDP first
 
 A Bluetooth hop is ranked as a relayed address is (`Address::relayed`): a last resort, which only a handshake on it
@@ -150,9 +156,14 @@ puts a link on.
 - **Up on Bluetooth.** A link on Bluetooth punches to the peer's UDP candidates and moves to the first that answers,
   on an authenticated answer (`PathChanged`). No race, punch answer or late packet moves a link onto Bluetooth, and
   no peer relays across it.
-- **UDP gone.** A link on UDP that goes silent closes when it times out (30 s). Its peer's hellos over the radio then
-  dial it again, over Bluetooth. A move costs the link a reconnect, and a link moves to Bluetooth only when the UDP
-  one is gone and off it only on an authenticated answer over UDP: it never flaps faster than its timeout.
+- **UDP gone.** A link on UDP that goes silent closes when it times out (30 s). A member a radio connection reaches is
+  then offered to again at once, over it, and the dial goes over Bluetooth. A move costs the link a reconnect.
+- **UDP back.** A link on Bluetooth punches to the peer's UDP addresses when it comes up, and again every 15 s, and
+  moves to the first that answers.
+- **No flapping.** A link moves to Bluetooth only when its UDP link is gone, and off it only on an authenticated
+  answer over UDP: at most one reconnect for each time the network goes, and one move back for each time it returns.
+  Tested on simulated time: with UDP off 5 s at a time for 2 minutes, nothing moves; off 40 s and on 40 s for 4
+  minutes, each side loses its link once and moves back to UDP once each time.
 - **Policy.** Bluetooth is `PathKind::Bluetooth`, not in `Policy::default()`: with a policy, the radio carries links
   only if its order lists it, and it ranks last wherever it is listed. Under `Privacy::RelayOnly` no link goes over
   Bluetooth, which would announce the device within radio range; `PublicOnly` allows it, as no IP address goes over
@@ -166,8 +177,9 @@ puts a link on.
 |---|---|---|
 | Connections | 8, one of them as the peripheral | 3 |
 | Unproven or unbound connections | 4; more are closed at once | 2 |
-| Time to prove the room, and to bind | 10 s each, then the connection closes | same |
-| Distinct HS1s on an unbound connection | 1 per 24 s; its resends pass | same |
+| Time to prove the room | 10 s, then the connection closes | same |
+| A proven connection bound to no peer | open while a signal proves a member at least every 60 s | same |
+| Distinct HS1s on an unbound connection | 1 per 10 s (a half-open handshake's life); its resends pass | same |
 | HS1s on a bound connection | a burst of 4, then one per 5 s | same |
 | Signals taken per connection | a burst of 16, then one per 500 ms; the rest dropped before any cryptography | same |
 | Messages dropped or refused before the connection closes | 32 | same |
@@ -202,13 +214,16 @@ pub trait Radio: Send {
     /// Connects to `device` (from `Seen`) as a central, subscribes to `tx`, and asks for the largest ATT MTU.
     fn connect(&mut self, device: DeviceId);
     /// Sends one value of at most ATT_MTU - 3 bytes on `conn`: a write without response to `rx` as the central, a
-    /// notification on `tx` to that one central as the peripheral. `false` if it can't now (a full buffer): the
-    /// value is dropped.
+    /// notification on `tx` to that one central as the peripheral. `false` if it can't take it now (a full buffer):
+    /// the node keeps it and tries again later.
     fn send(&mut self, conn: ConnId, value: &[u8]) -> bool;
     /// Closes `conn`.
     fn disconnect(&mut self, conn: ConnId);
     /// The next event, without blocking.
     fn poll(&mut self) -> Option<RadioEvent>;
+    /// What it holds at once (connections, unbound ones, centrals, values queued): `Limits::DESKTOP` unless the
+    /// driver says otherwise; an ESP32's says `Limits::SMALL`.
+    fn limits(&self) -> Limits { Limits::DESKTOP }
 }
 
 pub enum RadioEvent {
@@ -227,13 +242,18 @@ tests use an in-process pair of fake radios.
 
 ## Platforms
 
-- **Linux:** BlueZ over D-Bus (`bluer`, with `libdbus` built from source), on one adapter. The driver can't choose
-  BlueZ's addresses or its GAP name: with `Privacy=device` in `/etc/bluetooth/main.conf` it advertises from a
-  resolvable private address that changes every 15 minutes, and without it from the adapter's own, which tracks the
-  machine; the GAP name is the adapter's alias, the host name unless set (`bluetoothctl system-alias Peerwire`). The
-  driver warns at start when either shows. It can't add a scan response either, so Web Bluetooth's picker must
-  filter on the service data (to be checked on a phone). Ordinary users need access to `bluetoothd` over D-Bus,
-  which most desktop distributions give the logged-in user.
+- **Linux:** BlueZ over D-Bus (`bluer`, with `libdbus` built from source), on one adapter, on a thread of its own.
+  The driver can't choose BlueZ's addresses, its GAP name or how it scans:
+  - with `Privacy=device` in `/etc/bluetooth/main.conf` BlueZ advertises from a resolvable private address that
+    changes every 15 minutes, and without it from the adapter's own, which tracks the machine (the driver can't
+    tell which);
+  - the GAP name is the adapter's alias, the host name unless set (`bluetoothctl system-alias Peerwire`), which
+    `BlueZ::alias` reports for the app to check;
+  - its discovery scans actively, so the radio sends scan requests from its address;
+  - it can't add a scan response, so Web Bluetooth's picker must filter on the service data (to be checked on a
+    phone).
+
+  Ordinary users need access to `bluetoothd` over D-Bus, which most desktop distributions give the logged-in user.
 - **ESP32 (NB-110c):** NimBLE, three connections, an ATT MTU of 256, a random non-resolvable address, no security
   manager and no stored bonds, and a small prepared-write pool. With Wi-Fi off, every random draw comes after the
   Bluetooth controller starts (`nimble_port_init`), as NB-063 has it for Wi-Fi. A board with no Wi-Fi has no SNTP:
