@@ -47,8 +47,9 @@ its trust boundaries, and the standing findings.
   in range sees that a Peerwire peer is near and the sizes and timing of its
   connections, and can jam or cut them; a link over Bluetooth proves nothing about
   distance. On BlueZ 5.87 without upstream commit `82af2beaf`, `bluetoothd` crashes on a
-  UUID discovery filter, which the Linux driver sets until NB-112 lands
-  ([threat model](docs/project/threat-model.md), NB-110).
+  UUID discovery filter, which the Linux driver sets before NB-112 and any local program
+  can set: use a BlueZ with that commit ([threat model](docs/project/threat-model.md),
+  NB-110).
 - **Connection-setup DoS resistance** against an attacker with many real
   addresses: 256 IPv4 addresses or IPv6 /64s (one IPv6 /56, which many ISPs and
   hosts give a single customer), at 4 half-open handshakes each, fill the quarter
