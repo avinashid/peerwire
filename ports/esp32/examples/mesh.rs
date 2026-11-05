@@ -1,4 +1,4 @@
-//! Peerwire on an ESP32-C3 or ESP32: a feasibility prototype (NB-062, NB-064, NB-091), not a product.
+//! The port's mesh test on an ESP32-C3 or ESP32 (NB-062, NB-064, NB-091, NB-095), on `peerwire-esp`.
 //!
 //! In QEMU, each node reads its number from the last flash sector (run.sh patches it in)
 //! and takes the address 10.62.0.<10+n> on QEMU's emulated Ethernet. On a board, wifi.sh
@@ -17,31 +17,23 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::ffi::CStr;
-use std::io;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
 use esp_idf_svc::eth::{BlockingEth, EspEth, EthDriver};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 use esp_idf_svc::ipv4::{ClientConfiguration, ClientSettings, Configuration, Mask, Subnet};
 use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sntp::EspSntp;
 use esp_idf_svc::sys;
-use esp_idf_svc::wifi::{self, AuthMethod, BlockingWifi, EspWifi, WifiEvent};
-use log::{error, info, warn};
+use log::{info, warn};
 use peerwire::{
-    Config, Event, Identity, LanSignaling, Lane, MultiSignaling, Node, NostrSignaling, Path, PeerId, Signaling, Topic,
+    Event, Identity, LanSignaling, Lane, MultiSignaling, Node, NostrSignaling, Path, PeerId, Signaling, Topic,
 };
+use peerwire_esp::{config, free_heap, Board, NOSTR_RELAY, PORT};
 
-const PORT: u16 = 4040;
 const MAX_NODES: u8 = 16;
 /// Where run.sh writes b"PWN", the node number, the message size in KiB and a 32-byte
 /// identity seed, wifi.sh the Wi-Fi record (at +0x40) and room.sh the room's (at +0xC0):
@@ -54,12 +46,6 @@ const ROOM_CFG_OFFSET: usize = 0xC0;
 const WIFI_APP: &str = "peerwire-lan-chat";
 const LAN_ROOM: &str = "esp32";
 const QEMU_ROOM: (&str, &str) = ("peerwire-esp32", "lab");
-/// On Wi-Fi: one of `NostrSignaling`'s default relays, so PCs on the defaults share it.
-/// One relay, as each costs the chip a thread and a TLS session.
-const NOSTR_RELAY: &str = "wss://nostr.mom";
-/// Asked in turn for the time, each for up to `NTP_WAIT`.
-const NTP_SERVERS: [&str; 4] = ["0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.org", "3.pool.ntp.org"];
-const NTP_WAIT: Duration = Duration::from_secs(2);
 
 /// What the last flash sector says.
 struct NodeConfig {
@@ -73,15 +59,7 @@ struct NodeConfig {
 }
 
 fn main() {
-    sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
-    // Restart and try again rather than sit idle: a board that joined Wi-Fi but got no
-    // address by DHCP stayed down until it was power-cycled (NB-095).
-    if let Err(e) = run() {
-        error!("{e:#}; restarting in 5 s");
-        std::thread::sleep(Duration::from_secs(5));
-        unsafe { sys::esp_restart() };
-    }
+    peerwire_esp::run(run)
 }
 
 fn run() -> anyhow::Result<()> {
@@ -92,10 +70,10 @@ fn run() -> anyhow::Result<()> {
     let sysloop = EspSystemEventLoop::take()?;
     // The driver lives as long as the node: dropping it takes the network down.
     let (ip, prefix, _net): (Ipv4Addr, u8, Box<dyn Any>) = match &wifi {
+        // Wi-Fi, and the clock set by SNTP before the Node is bound and kept in step.
         Some((ssid, password)) => {
-            let w = join_wifi(n, peripherals.modem, sysloop, ssid, password)?;
-            let info = w.wifi().sta_netif().get_ip_info()?;
-            (info.ip, info.subnet.mask.0, Box::new(w))
+            let board = Board::connect_with(peripherals.modem, sysloop, ssid, password)?;
+            (board.ip(), board.prefix(), Box::new(board))
         }
         None => {
             let netif = EspNetif::new_with_conf(&NetifConfiguration {
@@ -119,9 +97,6 @@ fn run() -> anyhow::Result<()> {
     };
     let heap_net = free_heap();
     info!("node {n}: network up at {ip}, free heap {heap_net} B");
-    // Kept, so SNTP keeps the clock in step.
-    let _sntp = if wifi.is_some() { set_clock(n) } else { None };
-
     // Its own address, not 0.0.0.0: ESP-IDF can't list interfaces, so a node bound to
     // any interface would offer only loopback.
     let mut builder = Node::builder();
@@ -137,7 +112,7 @@ fn run() -> anyhow::Result<()> {
         None => warn!("node {n}: no identity seed in flash; generating one from the chip's RNG"),
     }
     let (lan, nostr) = (Arc::new(Counts::default()), Arc::new(Counts::default()));
-    let on_lan = Counted { n, what: "LAN", inner: lan_signaling(n, ip, prefix)?, counts: lan.clone() };
+    let on_lan = Counted { n, what: "LAN", inner: peerwire_esp::lan_signaling(ip, prefix)?, counts: lan.clone() };
     // The relay only for a room the flash names: anyone who knows the name links with the
     // board from anywhere and learns its home's public address, so the firmware names no
     // room of its own (NB95-4).
@@ -148,7 +123,8 @@ fn run() -> anyhow::Result<()> {
         // router's public address in our offers, for peers beyond the LAN.
         Some(room) => {
             info!("node {n}: room {room:?} on the LAN and over {NOSTR_RELAY}");
-            let on_nostr = Counted { n, what: "Nostr", inner: nostr_signaling()?, counts: nostr.clone() };
+            let on_nostr =
+                Counted { n, what: "Nostr", inner: peerwire_esp::nostr_signaling(NOSTR_RELAY)?, counts: nostr.clone() };
             builder.signaling(MultiSignaling::new(vec![Box::new(on_lan), Box::new(on_nostr)]))
         }
         None => {
@@ -207,11 +183,7 @@ fn run() -> anyhow::Result<()> {
                             .trim_end_matches('.')
                             .escape_debug()
                             .to_string();
-                        info!(
-                            "node {n}: from {}: {text}, {} B ({received} received)",
-                            name(&names, &peer),
-                            data.len()
-                        );
+                        info!("node {n}: from {}: {text}, {} B ({received} received)", name(&names, &peer), data.len());
                     }
                 }
                 Event::Disconnected { peer, reason } => {
@@ -266,7 +238,7 @@ fn report(
     let min = unsafe { sys::esp_get_minimum_free_heap_size() };
     let stack_left = unsafe { sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
     let relay = if on_relay {
-        let thread = nostr_thread().map_or(String::new(), |(unused, priority)| {
+        let thread = peerwire_esp::nostr_thread().map_or(String::new(), |(unused, priority)| {
             format!(", relay stack unused {unused} B, priority {priority}")
         });
         format!(
@@ -288,11 +260,7 @@ fn report(
         })
         .collect();
     let signal = if on_wifi {
-        let mut ap: sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
-        match unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) } {
-            sys::ESP_OK => format!(", Wi-Fi {} dBm", ap.rssi),
-            _ => ", Wi-Fi not connected".into(),
-        }
+        peerwire_esp::wifi::rssi().map_or(", Wi-Fi not connected".into(), |dbm| format!(", Wi-Fi {dbm} dBm"))
     } else {
         String::new()
     };
@@ -367,212 +335,6 @@ impl<S: Signaling + Health> Signaling for Counted<S> {
     }
 }
 
-/// The relay's thread, named so the report can find it. `NostrSignaling` sizes its stack
-/// (std's own setting wins over this one's); the report shows how much went unused.
-const NOSTR_THREAD: &CStr = c"nostr";
-
-/// The relay thread runs at the main task's priority, 1. ESP-IDF's default for a thread
-/// is 5, and on the C3's one core a relay streaming events at it would hold off the Node's
-/// loop: keepalives, retransmits and polls (NB95-3). ESP-IDF takes the priority from this
-/// config even where std sets the stack.
-fn nostr_signaling() -> anyhow::Result<NostrSignaling> {
-    ThreadSpawnConfiguration { name: Some(NOSTR_THREAD), priority: 1, ..Default::default() }.set()?;
-    let nostr = NostrSignaling::new([NOSTR_RELAY]);
-    ThreadSpawnConfiguration::default().set()?;
-    Ok(nostr)
-}
-
-/// The relay thread's stack that has never been used, and its priority, if it is running.
-fn nostr_thread() -> Option<(u32, u32)> {
-    let task = unsafe { sys::xTaskGetHandle(NOSTR_THREAD.as_ptr()) };
-    (!task.is_null()).then(|| unsafe { (sys::uxTaskGetStackHighWaterMark(task), sys::uxTaskPriorityGet(task)) })
-}
-
-/// The LAN carrier on this node's address, and on its subnet's broadcast address too
-/// (NB-092): a home router in NB-091 never delivered multicast to the board, but passed
-/// broadcast both ways. ESP-IDF can't list interfaces, so `LanSignaling` can't find it.
-fn lan_signaling(n: u8, ip: Ipv4Addr, prefix: u8) -> std::io::Result<LanSignaling> {
-    let lan = LanSignaling::on(LanSignaling::GROUP, ip)?;
-    // A /31 or /32 has no broadcast address: below, it would give a host's address, the
-    // chip's own on a /32, which `broadcast` refuses (NB92-1).
-    if prefix >= 31 {
-        info!("node {n}: LAN signals to {} only, on a /{prefix}", LanSignaling::GROUP.ip());
-        return Ok(lan);
-    }
-    let broadcast = Ipv4Addr::from(u32::from(ip) | u32::MAX >> prefix);
-    info!("node {n}: LAN signals to {} and {broadcast}", LanSignaling::GROUP.ip());
-    lan.broadcast(broadcast)
-}
-
-/// Sets the clock by SNTP, waiting up to 60 s. Room hellos and offers carry the sender's
-/// clock, and a node drops those more than a minute off its own (a replay guard). A board
-/// has no battery-backed clock: at 1970 it and a PC on the LAN dropped each other's hellos
-/// and never linked (NB-091). The Node reads the clock when it is bound, so this comes
-/// first. In QEMU every chip's clock starts at 1970, so they agree without it.
-///
-/// It asks the pool itself, 2 s a server, and logs why each ask failed: lwIP's SNTP gives a
-/// server 15 s and can't be told less, and on a board it took 15 s on one boot and over
-/// 50 s, silent, on two others (NB-095 run E). lwIP's SNTP then keeps the clock in step.
-fn set_clock(n: u8) -> Option<EspSntp<'static>> {
-    let start = Instant::now();
-    for server in NTP_SERVERS.iter().cycle() {
-        if clock_set() || start.elapsed() >= Duration::from_secs(60) {
-            break;
-        }
-        let next = Instant::now() + NTP_WAIT;
-        match ask_ntp(server) {
-            Ok((from, now)) => {
-                let tv = sys::timeval { tv_sec: now.as_secs() as _, tv_usec: now.subsec_micros() as _ };
-                if unsafe { sys::settimeofday(&tv, std::ptr::null()) } == 0 {
-                    let ms = start.elapsed().as_millis();
-                    info!("node {n}: clock set by {server} ({from}) in {ms} ms: {} s", now.as_secs());
-                } else {
-                    warn!("node {n}: settimeofday failed");
-                }
-            }
-            Err(e) => warn!("node {n}: SNTP {server}: {e}"),
-        }
-        // A failed ask waits out its 2 s, so a DNS error doesn't spin; a set clock goes on.
-        if !clock_set() {
-            std::thread::sleep(next.saturating_duration_since(Instant::now()));
-        }
-    }
-    if !clock_set() {
-        warn!("node {n}: no SNTP answer in 60 s, clock at 1970: LAN peers with a set clock drop our hellos");
-    }
-    EspSntp::new_default().map_err(|e| warn!("node {n}: SNTP: {e}")).ok()
-}
-
-/// 2023-11-14: any clock before it was never set.
-fn clock_set() -> bool {
-    SystemTime::now().duration_since(UNIX_EPOCH).is_ok_and(|d| d.as_secs() >= 1_700_000_000)
-}
-
-/// Asks `server` the time once, waiting up to 2 s: its address and the time since 1970,
-/// with no allowance for the trip (the replay guard allows a minute).
-fn ask_ntp(server: &str) -> io::Result<(SocketAddr, Duration)> {
-    let to = (server, 123)
-        .to_socket_addrs()
-        .map_err(|e| io::Error::new(e.kind(), format!("DNS: {e}")))?
-        .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| io::Error::other("DNS: no IPv4 address"))?;
-    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    // No leap second, version 4, a client; and a random transmit time, which the answer must
-    // echo: a sender off the path can't guess it.
-    let mut ask = [0u8; 48];
-    ask[0] = 0x23;
-    unsafe { sys::esp_fill_random(ask[40..].as_mut_ptr().cast(), 8) };
-    sock.send_to(&ask, to)?;
-    let end = Instant::now() + NTP_WAIT;
-    let mut buf = [0u8; 64];
-    loop {
-        let left = end.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("no answer from {to} in 2 s")));
-        }
-        sock.set_read_timeout(Some(left))?;
-        let (len, from) = match sock.recv_from(&mut buf) {
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => continue,
-            r => r?,
-        };
-        // The server's answer (mode 4) to this ask, and not a kiss-o'-death (stratum 0).
-        if from != to || len < 48 || buf[0] & 7 != 4 || buf[1] == 0 || buf[24..32] != ask[40..48] {
-            continue;
-        }
-        let word = |i: usize| u64::from(u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
-        // NTP counts from 1900.
-        let Some(unix) = word(40).checked_sub(2_208_988_800).filter(|&s| s >= 1_700_000_000) else {
-            return Err(io::Error::other(format!("{to} answered {} s since 1900", word(40))));
-        };
-        return Ok((to, Duration::from_secs(unix) + Duration::from_micros(word(44) * 1_000_000 >> 32)));
-    }
-}
-
-fn free_heap() -> u32 {
-    unsafe { sys::esp_get_free_heap_size() }
-}
-
-/// Joins the Wi-Fi network and waits for a DHCP address, retrying until it does. Each
-/// attempt steps the TX power down (ESP-IDF's quarter-dBm, 20 to 8.5 dBm): small C3
-/// boards with a chip antenna often can't take full power, so the AP hears their short
-/// auth frame but never their association request.
-fn join_wifi(
-    n: u8,
-    modem: Modem<'static>,
-    sysloop: EspSystemEventLoop,
-    ssid: &str,
-    password: &str,
-) -> anyhow::Result<BlockingWifi<EspWifi<'static>>> {
-    const TX_POWER: [i8; 4] = [80, 60, 44, 34];
-    let nvs = EspDefaultNvsPartition::take()?;
-    let mut w = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop.clone())?;
-    w.set_configuration(&wifi::Configuration::Client(wifi::ClientConfiguration {
-        ssid: ssid.try_into().map_err(|_| anyhow!("SSID over 32 bytes"))?,
-        password: password.try_into().map_err(|_| anyhow!("password over 64 bytes"))?,
-        auth_method: if password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal },
-        ..Default::default()
-    }))?;
-    w.start()?;
-    // Modem sleep holds our frames until the next beacon, ~100 ms on every RTT.
-    sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
-    let aps = w.scan()?;
-    let seen: Vec<_> = aps.iter().filter(|ap| ap.ssid == ssid).collect();
-    if seen.is_empty() {
-        warn!("node {n}: {ssid:?} not among the {} networks in range", aps.len());
-    }
-    for ap in seen {
-        let bssid: Vec<_> = ap.bssid.iter().map(|b| format!("{b:02x}")).collect();
-        info!(
-            "node {n}: hears {ssid:?} at {} on channel {}, {} dBm, {:?}",
-            bssid.join(":"),
-            ap.channel,
-            ap.signal_strength,
-            ap.auth_method
-        );
-    }
-    // The last disconnect's reason (ESP-IDF's wifi_err_reason_t); 0 while there is none.
-    let reason = Arc::new(AtomicU16::new(0));
-    let _sub = sysloop.subscribe::<WifiEvent, _>({
-        let reason = reason.clone();
-        move |event| {
-            if let WifiEvent::StaDisconnected(d) = event {
-                reason.store(d.reason(), Ordering::Relaxed);
-            }
-        }
-    })?;
-    for attempt in 1.. {
-        let power = TX_POWER[(attempt - 1) % TX_POWER.len()];
-        sys::esp!(unsafe { sys::esp_wifi_set_max_tx_power(power) })?;
-        info!("node {n}: joining Wi-Fi {ssid:?}, attempt {attempt} at {} dBm", f32::from(power) / 4.0);
-        reason.store(0, Ordering::Relaxed);
-        w.wifi_mut().connect()?;
-        let start = Instant::now();
-        while !w.is_connected()? && reason.load(Ordering::Relaxed) == 0 && start.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        if w.is_connected()? {
-            info!("node {n}: joined on attempt {attempt} at {} dBm", f32::from(power) / 4.0);
-            break;
-        }
-        let r = reason.load(Ordering::Relaxed);
-        let why = match r {
-            0 => "no answer in 10 s",
-            2 => "auth expired",
-            4 => "the AP never answered the association request",
-            15 | 204 => "4-way handshake timed out: wrong password?",
-            201 => "AP not found",
-            202 => "auth failed",
-            203 => "association refused",
-            _ => "see ESP-IDF's wifi_err_reason_t",
-        };
-        warn!("node {n}: attempt {attempt} failed, reason {r}: {why}");
-        let _ = w.wifi_mut().disconnect();
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    w.wait_netif_up()?;
-    Ok(w)
-}
-
 /// This node's number, the size of its messages in KiB (0: a short line), its identity
 /// seed, Wi-Fi credentials and room from flash; node 1 with short lines, no seed, QEMU's
 /// Ethernet and no room for whatever wasn't written.
@@ -630,15 +392,4 @@ fn name_of(path: &Path) -> Option<String> {
 /// `peer`'s name, or "node 0" if it hasn't linked directly yet.
 fn name(names: &HashMap<PeerId, String>, peer: &PeerId) -> String {
     names.get(peer).cloned().unwrap_or_else(|| "node 0".into())
-}
-
-/// Caps sized for a chip with ~300 KB of heap; the defaults allow 1 MiB messages and buffers.
-fn config() -> Config {
-    Config {
-        max_message: 16 * 1024,
-        max_send_buffer: 32 * 1024,
-        max_links: 8,
-        max_pending_handshakes: 8,
-        ..Config::default()
-    }
 }

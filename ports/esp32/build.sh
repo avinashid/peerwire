@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds the firmware and writes out/flash.bin, a full 4 MB flash image for
-# Espressif's QEMU or a real board. Needs the toolchain in README.md.
+# Builds the mesh example's firmware and writes out/flash.bin, a full 4 MB flash
+# image for Espressif's QEMU or a real board. Needs the toolchain in README.md.
 # CHIP=esp32c3 (default, RISC-V, upstream nightly) or CHIP=esp32 (the original
 # ESP32, as on an ESP32-WROOM-32: Xtensa, Espressif's `esp` toolchain from espup).
 # Usage: [CHIP=chip] ./build.sh [cargo args]
@@ -33,9 +33,10 @@ gcc_dir=$(dirname "$(ls ~/.espressif/tools/$gcc/*/$gcc/bin/$cc 2>/dev/null | tai
 export "CC_$(echo "$target" | tr - _)=$cc"
 export "CFLAGS_$(echo "$target" | tr - _)=$cflags"
 
-cargo "${toolchain[@]}" build --release --target "$target" -Z build-std=std,panic_abort "${@}"
+cargo "${toolchain[@]}" build --release --target "$target" -Z build-std=std,panic_abort \
+  --example mesh --features nostr "${@}"
 
 mkdir -p out
-elf=target/$target/release/peerwire-esp32
+elf=target/$target/release/examples/mesh
 espflash save-image --chip "$CHIP" --flash-size 4mb --merge "$elf" out/flash.bin
 ls -l "$elf" out/flash.bin

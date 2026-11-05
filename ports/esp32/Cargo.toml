@@ -1,23 +1,30 @@
 [package]
-name = "peerwire-esp32"
+name = "peerwire-esp"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/avinashid/peerwire"
 homepage = "https://avinashid.github.io/peerwire/"
-description = "A Peerwire prototype on the ESP32-C3 and ESP32 under ESP-IDF: chips find each other over LanSignaling and link peer to peer"
+documentation = "https://avinashid.github.io/peerwire/docs/guides/esp32"
+description = "Peerwire on the ESP32-C3 and ESP32 under ESP-IDF: Wi-Fi, a clock set by SNTP before the node binds, caps sized for the chip, and LAN and Nostr signaling"
 readme = "README.md"
 keywords = ["esp32", "esp-idf", "embedded", "p2p", "iot"]
 categories = ["embedded", "network-programming"]
-publish = false
 rust-version = "1.82"
+include = ["/src", "/examples", "/build.rs", "/README.md", "/sdkconfig.defaults"]
 
 # Not a member of the repo's workspace: it builds for the ESP32-C3 and ESP32 only, with their own toolchains (see README.md).
 [workspace]
 
-[[bin]]
-name = "peerwire-esp32"
-harness = false
+[features]
+# Rooms across the internet over a Nostr relay (Board::node_with_nostr). Its TLS (rustls on ring) compiles C with the
+# chip's GCC: see README.md.
+nostr = ["peerwire/nostr", "dep:ring"]
+
+# The port's mesh test: QEMU's emulated chips, or a board on Wi-Fi (run.sh, wifi.sh, room.sh).
+[[example]]
+name = "mesh"
+required-features = ["nostr"]
 
 [profile.release]
 opt-level = "s"
@@ -28,13 +35,13 @@ opt-level = "z"
 
 [dependencies]
 # Without the default TURN client (NB-099): a follow-up, as is its code size here.
-peerwire = { path = "../../crates/peerwire", default-features = false, features = ["nostr"] }
+peerwire = { version = "0.1.0", path = "../../crates/peerwire", default-features = false }
 esp-idf-svc = "0.53"
 log = "0.4"
 anyhow = "1"
 # Nostr signaling's TLS (rustls on ring): ring draws from esp_fill_random only with this
 # feature, and the firmware starts Wi-Fi before any draw (NB62-2).
-ring = { version = "0.17", features = ["less-safe-getrandom-espidf"] }
+ring = { version = "0.17", features = ["less-safe-getrandom-espidf"], optional = true }
 
 [build-dependencies]
 embuild = "0.33.5"
