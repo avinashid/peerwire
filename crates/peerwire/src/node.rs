@@ -388,7 +388,10 @@ impl Node {
     ///
     /// Under [`Privacy::RelayOnly`] with TURN on ([`set_turn_servers`](Node::set_turn_servers) and [`PathKind::Turn`]
     /// in the policy), links to peers but the relay that show this node's address move onto its allocations or the
-    /// relay at once, or close with [`DisconnectReason::PathOff`]: from then on nothing to them leaves its socket.
+    /// relay at once, or close with [`DisconnectReason::PathOff`] (and are dialled afresh through the relay, with
+    /// no allocation to go through). Those closes, and relay peers', send the peer nothing from the socket: it times
+    /// the link out. From then on nothing to them leaves the socket, but from a dial already under way that neither
+    /// an allocation nor the relay can take, which runs on to its end.
     ///
     /// With [`Builder::port_mapping`] on, switching to [`Privacy::RelayOnly`]
     /// removes the router mapping (in the background), and switching out of it
@@ -400,7 +403,8 @@ impl Node {
         if matches!(privacy, Privacy::RelayOnly { .. }) {
             let own = self.trav.relay();
             for r in self.relay_peers.iter().filter(|r| Some(r.peer) != own) {
-                self.ep.disconnect(&r.peer);
+                // Unannounced if a Close would show this node's address (NB101-I1).
+                self.trav.hang_up(&mut self.ep, &r.peer);
                 self.status.remove(&r.peer);
             }
         }
@@ -590,9 +594,10 @@ impl Node {
             targets = vec![Path::Via(r)];
         }
         let now = self.now();
-        // With TURN under relay-only, step by step through the relay and this node's allocations (NB-101).
+        // With TURN under relay-only, step by step through the relay and this node's allocations (NB-101), a relay
+        // peer too: dialled directly, it would see this node's address (NB101-1).
         let stepped = !relay_only || (hidden && self.trav.turn_private());
-        if self.trav.policy().is_some() && stepped && !self.is_relay_peer(&inv.peer) {
+        if self.trav.policy().is_some() && stepped && (hidden || !self.is_relay_peer(&inv.peer)) {
             let (mut addrs, mut vias) = (Vec::new(), Vec::new());
             for t in targets {
                 match t {

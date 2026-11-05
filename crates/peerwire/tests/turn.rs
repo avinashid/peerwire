@@ -456,10 +456,35 @@ fn switching_to_relay_only_takes_a_direct_link_onto_turn() {
     assert!(!heard(&b, &a), "{:?}", b.sources());
 }
 
+/// NB101-I1: a starts with `Privacy::Direct` and `[Direct, Turn, RelayPeers]` (its allocation up), linked directly to
+/// p, a relay peer. a turns `RelayOnly` on, which keeps no relay peer but its relay: the link to p closes unannounced,
+/// and p's socket hears nothing more from a's (unfixed, a Close).
+#[test]
+fn switching_to_relay_only_drops_a_relay_peer_unannounced() {
+    let (hub, mut turn) = (MemoryHub::new(), MockTurn::new());
+    let mut a = node(&hub, Some(&turn), Some(Policy::new([PathKind::Direct, PathKind::Turn, PathKind::RelayPeers])));
+    let mut p = Node::builder().bind("127.0.0.1:0").unwrap();
+    a.set_relay_peers(&[p.invite()]).unwrap();
+    let pid = p.peer_id();
+    let up = |_: &MockTurn, n: &[&mut Node]| {
+        n[0].relay_peers() == [(n[1].peer_id(), Status::Connected)] && n[0].turn_status()[0].1.is_some()
+    };
+    let mut ev = Vec::new();
+    assert!(pump(&mut turn, &mut [&mut a, &mut p], &mut ev, 10.0, up), "{ev:?}");
+    assert_eq!(a.path(&pid), Some(Path::Direct(p.local_addr())));
+    a.poll();
+    p.poll();
+    p.note_sources();
+    a.set_privacy(Privacy::RelayOnly { via: None });
+    assert_eq!(a.path(&pid), None);
+    pump(&mut turn, &mut [&mut a, &mut p], &mut ev, 1.0, |_, _| false);
+    assert!(!heard(&p, &a) && p.status(&a.peer_id()) == Status::Connected, "{:?}", p.sources());
+}
+
 /// NB-101: a `RelayOnly` node with TURN and no relay connects to b's invite through its allocation (`Turn`), and b's
-/// socket hears nothing from a's; with no TURN server it fails with `NoRelay`, as before. a's own invite carries its
-/// relayed address alone, and d, which holds it, links with a through a's allocation, without a datagram from a's
-/// socket.
+/// socket hears nothing from a's; with no TURN server it fails with `NoRelay`, as before. So it does to a relay peer's
+/// invite (NB101-1; unfixed, dialled from a's socket). a's own invite carries its relayed address alone, and d, which
+/// holds it, links with a through a's allocation, without a datagram from a's socket.
 #[test]
 fn relay_only_connects_to_an_invite_through_its_allocation() {
     let (hub, mut turn) = (MemoryHub::new(), MockTurn::new());
@@ -476,6 +501,13 @@ fn relay_only_connects_to_an_invite_through_its_allocation() {
     assert!(!heard(&b, &a), "{:?}", b.sources());
     let mut c = Node::builder().privacy(Privacy::RelayOnly { via: None }).bind("127.0.0.1:0").unwrap();
     assert!(matches!(c.connect(&b.invite()), Err(Error::Connect(ConnectError::NoRelay))));
+    let mut p = Node::builder().bind("127.0.0.1:0").unwrap();
+    p.note_sources();
+    a.set_relay_peers(&[p.invite()]).unwrap();
+    let pid = a.connect(&p.invite()).unwrap();
+    let up = |_: &MockTurn, n: &[&mut Node]| n[1].status(&n[0].peer_id()) == Status::Connected;
+    assert!(pump(&mut turn, &mut [&mut a, &mut p], &mut ev, 10.0, up), "{ev:?}");
+    assert!(a.path_kind(&pid) == Some(PathKind::Turn) && !heard(&p, &a), "{:?}", p.sources());
     let invite = peerwire::Invite::<SocketAddr>::parse(&a.invite()).unwrap();
     assert_eq!(invite.addrs, [a.turn_status()[0].1.unwrap()]);
     let mut d = Node::builder().signaling(hub.connect()).bind("127.0.0.1:0").unwrap();

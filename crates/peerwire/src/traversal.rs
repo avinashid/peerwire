@@ -246,10 +246,12 @@ pub enum Privacy {
     /// With TURN servers of its own and [`PathKind::Turn`] in the [`Policy`] (feature `turn`), links also go through
     /// its allocations there, which show peers the TURN server's address, not its own: offers to peers but the
     /// relay carry the relayed address alone, and dials take `Turn` and `RelayPeers` (the relay) in the policy's
-    /// order, `RelayPeers` last if left out. Nothing to a peer but the relay leaves its socket, and it takes a
-    /// peer's packets only through its allocations and the relay. A link moves between the two only when its
-    /// allocation is gone (or closes, with nowhere to go), and links that show its address when TURN comes on under
-    /// it move onto an allocation or the relay, or close.
+    /// order, `RelayPeers` last if left out. It takes a peer's packets only through its allocations and the relay. A
+    /// link moves between the two only when its allocation is gone (or closes, with nowhere to go), and links that
+    /// show its address when TURN comes on under it move onto an allocation or the relay, or close unannounced.
+    /// Nothing to a peer but the relay leaves its socket then, except from a dial already under way that neither an
+    /// allocation nor the relay can take: it runs on to its end, at addresses the peer had from earlier offers, and
+    /// a link it makes is refused.
     RelayOnly { via: Option<PeerId> },
 }
 
@@ -1723,11 +1725,12 @@ impl<A: Address> Traversal<A> {
 
     /// Moves the link to `peer`, under [`Privacy::RelayOnly`], onto its relay or this node's own allocations (NB-101):
     /// off a path that shows this node's address (TURN came on under it, or it came on with TURN), or off an
-    /// allocation that is gone. A link at an address of the peer's goes on at once through an allocation, to that
-    /// address ([`Endpoint::retag`]), so nothing more of it leaves the socket, and is dialled again there and through
-    /// the relay ([`Endpoint::redial`]), as the peer still sends to the socket. A link with nowhere to go, or whose
-    /// move fails or hasn't happened in 6 s, is closed ([`poll_dropped`](Traversal::poll_dropped)): never moved to
-    /// a path that shows this node's address.
+    /// allocation that is gone. A link from the socket goes on at once through an allocation ([`Endpoint::retag`]),
+    /// to the address it is at if one relays there, else to another of the peer's (NB101-I1), so nothing more of it
+    /// leaves the socket, and is dialled again through the allocations and the relay ([`Endpoint::redial`]), as the
+    /// peer still sends to the socket. With no allocation to go through, it is closed unannounced and dialled afresh
+    /// through the relay, if one is linked. A link with nowhere to go, or whose move fails or hasn't happened in 6 s,
+    /// is closed ([`poll_dropped`](Traversal::poll_dropped)): never moved to a path that shows this node's address.
     fn hide(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: PeerId) {
         let Some(path) = ep.path(&peer).cloned() else { return };
         let r = self.remotes.entry(peer).or_default();
@@ -1741,14 +1744,21 @@ impl<A: Address> Traversal<A> {
             addrs.insert(0, at);
         }
         let turn = if self.turn_private() { self.turn_targets(now, peer, &addrs, &relayed) } else { Vec::new() };
-        if let Path::Direct(old) = &path {
+        let relay = self.relay().filter(|v| *v != peer && ep.is_connected(v)).map(Path::Via);
+        if let Some(old) = path.direct().filter(|a| !a.own_turn()) {
             let there = |t: &&Path<A>| t.direct().is_some_and(|h| h.to_socket_addr() == old.to_socket_addr());
-            if let (false, Some(Path::Direct(hop))) = (old.own_turn(), turn.iter().find(there)) {
-                ep.retag(now, &peer, old, hop.clone());
+            match turn.iter().find(there).or(turn.first()) {
+                Some(Path::Direct(hop)) => ep.retag(now, &peer, old, hop.clone()),
+                _ => {
+                    self.close(ep, peer);
+                    if let Some(v) = relay {
+                        let _ = ep.connect_with(now, peer, &[v]);
+                    }
+                    return;
+                }
             }
         }
-        let mut targets: Vec<Path<A>> =
-            self.relay().filter(|v| *v != peer && ep.is_connected(v)).map(Path::Via).into_iter().collect();
+        let mut targets: Vec<Path<A>> = relay.into_iter().collect();
         targets.extend(turn);
         let redialled = !targets.is_empty() && ep.redial(now, peer, &targets).is_ok();
         match (redialled, self.remotes.get_mut(&peer)) {
@@ -1770,6 +1780,17 @@ impl<A: Address> Traversal<A> {
         }
     }
 
+    /// Closes the link to `peer` ([`Endpoint::disconnect`]); unannounced ([`Endpoint::abandon`]) if its Close would
+    /// show this node's address: under [`Privacy::RelayOnly`] with TURN on, to a peer but the relay, from the
+    /// socket (NB101-I1).
+    pub(crate) fn hang_up(&self, ep: &mut Endpoint<A>, peer: &PeerId) {
+        let shows = |p: &Path<A>| p.direct().is_some_and(|a| !a.own_turn());
+        match ep.path(peer) {
+            Some(p) if self.turn_private() && self.relay() != Some(*peer) && shows(p) => ep.abandon(peer),
+            _ => ep.disconnect(peer),
+        }
+    }
+
     /// The relayed addresses of this node's allocations.
     pub(crate) fn relayed_addrs(&self) -> Vec<A> {
         self.turn.relayed()
@@ -1784,7 +1805,7 @@ impl<A: Address> Traversal<A> {
 
     /// Closes the link to `peer`, on a path the policy turned off, for [`poll_dropped`](Traversal::poll_dropped).
     fn close(&mut self, ep: &mut Endpoint<A>, peer: PeerId) {
-        ep.disconnect(&peer);
+        self.hang_up(ep, &peer);
         if let Some(r) = self.remotes.get_mut(&peer) {
             (r.moving, r.hide) = (None, false);
         }
@@ -4989,6 +5010,116 @@ mod tests {
         t.set_turn_servers(now, &mut ea, vec![]);
         assert_eq!((t.poll_dropped(), ea.is_connected(&b)), (Some(b), false));
         assert!(std::iter::from_fn(|| ea.poll_transmit(now)).all(|tx| tx.dst.own_turn()));
+    }
+
+    /// Links `ea` (`id(1)`, seen at `a_at`) with a new endpoint of `id(i)` at `b_at`, from `now` on; what `ea` sends
+    /// elsewhere meanwhile is dropped.
+    #[cfg(feature = "turn")]
+    fn hop_link_another(
+        ea: &mut Endpoint<Hop<SocketAddr>>,
+        now: &mut Instant,
+        i: u8,
+        a_at: Hop<SocketAddr>,
+        b_at: Hop<SocketAddr>,
+    ) -> Endpoint<Hop<SocketAddr>> {
+        let mut eb = Endpoint::new(&id(i), Config::default(), [i + 2; 32]);
+        ea.connect(*now, b_at, id(i).peer_id()).unwrap();
+        for _ in 0..30 {
+            for t in std::iter::from_fn(|| ea.poll_transmit(*now)).filter(|t| t.dst == b_at).collect::<Vec<_>>() {
+                eb.handle_datagram(*now, a_at, &t.payload);
+            }
+            while let Some(t) = eb.poll_transmit(*now) {
+                ea.handle_datagram(*now, b_at, &t.payload);
+            }
+            *now = *now + Duration::from_millis(10);
+            ea.handle_timeout(*now);
+            eb.handle_timeout(*now);
+        }
+        assert!(ea.is_connected(&id(i).peer_id()) && eb.is_connected(&id(1).peer_id()));
+        eb
+    }
+
+    /// NB101-I1: `RelayOnly` turned on with TURN on, for a link at an address no allocation relays to (b's IPv6
+    /// address, the allocation IPv4): it goes on at once through the allocation to another of b's addresses, and
+    /// nothing more of it leaves this node's socket, the app's data and the link's close included (unfixed: it stayed
+    /// there, 10 datagrams in 6 s). With no address of b's an allocation relays to, the link closes unannounced, and is
+    /// dialled afresh through the relay if one is linked.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn relay_only_takes_a_link_no_allocation_relays_to_off_its_socket() {
+        let (me, b6, b4, s, r_at): (SocketAddr, SocketAddr, SocketAddr, SocketAddr, SocketAddr) = (
+            "192.0.2.10:7000".parse().unwrap(),
+            "[2001:db8::2]:7000".parse().unwrap(),
+            "203.0.113.2:7000".parse().unwrap(),
+            "198.51.100.1:3478".parse().unwrap(),
+            "198.51.100.40:7000".parse().unwrap(),
+        );
+        let (b, through) = (id(2).peer_id(), Hop::Turn { server: s, peer: b4 });
+        let (mut t, _, _) = with_allocation();
+        let [mut ea, _] = hop_link(Hop::Net(me), Hop::Net(b6));
+        t.remotes.entry(b).or_default().addrs = vec![Hop::Net(b4)];
+        let mut now = Instant::from_millis(500);
+        std::iter::from_fn(|| ea.poll_event()).for_each(drop);
+        t.set_privacy(now, &mut ea, Privacy::RelayOnly { via: None });
+        assert_eq!(ea.path(&b), Some(&Path::Direct(through)), "at once");
+        ea.send(&b, peerwire_core::Lane::Reliable, b"after the switch").unwrap();
+        let mut sent = Vec::new();
+        for _ in 0..65 {
+            sent.extend(std::iter::from_fn(|| ea.poll_transmit(now)).map(|tx| tx.dst));
+            now = now + Duration::from_millis(100);
+            ea.handle_timeout(now);
+            for e in std::iter::from_fn(|| ea.poll_event()).collect::<Vec<_>>() {
+                t.handle_event(now, &mut ea, &e);
+            }
+            t.handle_timeout(now, &mut ea);
+        }
+        sent.extend(std::iter::from_fn(|| ea.poll_transmit(now)).map(|tx| tx.dst));
+        assert!(sent.contains(&through) && sent.iter().all(|d| d.own_turn()), "{sent:?}");
+        assert_eq!((t.poll_dropped(), ea.is_connected(&b)), (Some(b), false), "unanswered, closed");
+
+        for relay in [None, Some(id(3).peer_id())] {
+            let (mut t, _, _) = with_allocation();
+            let [mut ea, _] = hop_link(Hop::Net(me), Hop::Net(b6));
+            let mut now = Instant::from_millis(500);
+            let mut er = relay.map(|_| hop_link_another(&mut ea, &mut now, 3, Hop::Net(me), Hop::Net(r_at)));
+            std::iter::from_fn(|| ea.poll_transmit(now)).for_each(drop);
+            t.set_privacy(now, &mut ea, Privacy::RelayOnly { via: relay });
+            assert_eq!((t.poll_dropped(), ea.is_connected(&b)), (Some(b), false), "{relay:?}");
+            let sent: Vec<Transmit<Hop<SocketAddr>>> = std::iter::from_fn(|| ea.poll_transmit(now)).collect();
+            assert!(sent.iter().all(|tx| tx.dst == Hop::Net(r_at)), "{relay:?}: {sent:?}");
+            match &mut er {
+                Some(er) => {
+                    sent.iter().for_each(|tx| er.handle_datagram(now, Hop::Net(me), &tx.payload));
+                    assert!(er.stats().relay_dropped > 0, "dialled afresh through the relay");
+                }
+                None => assert!(sent.is_empty()),
+            }
+        }
+    }
+
+    /// NB101-I1: under `RelayOnly` with TURN on, `hang_up` closes a link through an allocation, and the relay's link
+    /// from the socket, with a Close, as `disconnect` does: only a link to a peer but the relay from the socket goes
+    /// unannounced.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn relay_only_hangs_up_with_a_close_but_from_its_socket() {
+        let (me, b_at, s): (SocketAddr, SocketAddr, SocketAddr) = (
+            "192.0.2.10:7000".parse().unwrap(),
+            "203.0.113.2:7000".parse().unwrap(),
+            "198.51.100.1:3478".parse().unwrap(),
+        );
+        let (b, through) = (id(2).peer_id(), Hop::Turn { server: s, peer: b_at });
+        for (at, via) in [(through, None), (Hop::Net(b_at), Some(b))] {
+            let (mut t, _, _) = with_allocation();
+            let [mut ea, _] = hop_link(Hop::Net(me), at);
+            let now = Instant::from_millis(500);
+            t.set_privacy(now, &mut ea, Privacy::RelayOnly { via });
+            assert_eq!(ea.path(&b), Some(&Path::Direct(at)), "{via:?}");
+            std::iter::from_fn(|| ea.poll_transmit(now)).for_each(drop);
+            t.hang_up(&mut ea, &b);
+            let sent: Vec<Hop<SocketAddr>> = std::iter::from_fn(|| ea.poll_transmit(now)).map(|tx| tx.dst).collect();
+            assert_eq!((sent, ea.is_connected(&b)), (vec![at], false), "{via:?}");
+        }
     }
 
     /// NB-101: a relay-only node's relay that links after a peer's offer, once the dial's steps have all started, is
