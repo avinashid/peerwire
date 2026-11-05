@@ -35,7 +35,7 @@ service with two characteristics:
 Neither needs pairing or bonding, and neither may ask for it: Noise IK already authenticates both ends, and pairing
 would add operating-system prompts and a lasting bond that identifies the device. The central subscribes to `tx`,
 then each side writes [chunks](#framing) to its own characteristic. A central asks for the largest ATT MTU its stack
-allows (517); each value carries at most ATT_MTU − 3 bytes, at least 20.
+allows (517); each value carries at most ATT_MTU − 3 bytes and 512 (GATT's longest value), at least 20.
 
 ## Advertising
 
@@ -63,7 +63,7 @@ advertises. A peer doesn't connect twice to one token, nor again within 60 s to 
 ## Framing
 
 A datagram is up to 1,232 bytes, a GATT value as little as 20, so each message is split into chunks, one per GATT
-value. Each chunk is a one-byte header and up to ATT_MTU − 4 bytes of the message:
+value. Each chunk is a one-byte header and up to ATT_MTU − 4 bytes of the message (511 at most):
 
 ```text
 header u8   bit 7: the message's first chunk   bit 6: its last   bits 0-5: chunk counter, mod 64
@@ -74,7 +74,9 @@ the order but may drop a value when a buffer is full, so the receiver checks the
 first one with no message open, a first one while a message is open, or a message longer than 1,233 bytes drops the
 message it was assembling (and the chunk, unless it is a first one, which starts the next). Lost messages are lost
 as UDP datagrams are; the lanes resend what needs it. Each connection holds at most one partial message per
-direction. A chunk with no payload is invalid and dropped.
+direction. A chunk with no payload is invalid: it and the open message are dropped. Only a run of exactly 64 lost
+chunks (or a multiple) between two that arrive goes unseen and joins two messages' parts, and Peerwire packets are
+authenticated, so such a message fails its checks. `peerwire_core::ble` has the codec (`Chunker`, `Reassembler`).
 
 ## Messages
 
