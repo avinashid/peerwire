@@ -33,6 +33,10 @@ use tokio::task::JoinHandle;
 const QUEUE: usize = 32;
 /// How long [`BlueZ::new`] waits for the adapter.
 const START: Duration = Duration::from_secs(10);
+/// A connect not set up by then (the link, the service found, both sockets) fails, and its link drops: so a device
+/// that stalls it can't hold one of the node's connects for bluer's 120 s a step, and the node, which gives one up
+/// after 12 s, hears why first (NB110-11).
+const SETUP: Duration = Duration::from_secs(10);
 
 /// The Linux driver: the default BlueZ adapter, powered on, serving the Peerwire GATT service.
 ///
@@ -408,14 +412,17 @@ impl Driver {
     }
 
     /// Connects to `device` as a central, in a task of its own: the service's `tx` notifications as a socket to read,
-    /// its `rx` as one to write without response.
+    /// its `rx` as one to write without response. One that isn't set up within `SETUP`, or fails, is disconnected,
+    /// which also stops a connect BlueZ still has under way.
     fn connect(&mut self, device: DeviceId) {
         let (adapter, events, shared, centrals) =
             (self.adapter.clone(), self.events.clone(), self.shared.clone(), self.centrals.clone());
         tokio::spawn(async move {
             let addr = address(device);
+            let Ok(dev) = adapter.device(addr) else {
+                return events.send(RadioEvent::ConnectFailed { device });
+            };
             let setup = async {
-                let dev = adapter.device(addr)?;
                 dev.connect().await?;
                 let mut rx = None;
                 let mut tx = None;
@@ -432,21 +439,17 @@ impl Driver {
                     }
                 }
                 let (Some(rx), Some(tx)) = (rx, tx) else {
-                    let _ = dev.disconnect().await;
                     return Err(bluer::Error { kind: bluer::ErrorKind::ServicesUnresolved, message: String::new() });
                 };
                 let reader = tx.notify_io().await?;
                 let writer = rx.write_io().await?;
-                Ok::<_, bluer::Error>((dev, reader, writer))
+                Ok::<_, bluer::Error>((reader, writer))
             };
-            let Ok((dev, reader, writer)) = setup.await else {
-                events.send(RadioEvent::ConnectFailed { device });
-                return;
-            };
-            let Some(mtu) = att_mtu(writer.mtu().min(reader.mtu())) else {
+            let set_up = tokio::time::timeout(SETUP, setup).await.ok().and_then(Result::ok);
+            let mtu = set_up.as_ref().and_then(|(r, w)| att_mtu(w.mtu().min(r.mtu())));
+            let (Some((reader, writer)), Some(mtu)) = (set_up, mtu) else {
                 let _ = dev.disconnect().await;
-                events.send(RadioEvent::ConnectFailed { device });
-                return;
+                return events.send(RadioEvent::ConnectFailed { device });
             };
             let conn = shared.next.fetch_add(1, Ordering::Relaxed);
             let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
