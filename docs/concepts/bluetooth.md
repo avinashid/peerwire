@@ -262,11 +262,17 @@ tests use an in-process pair of fake radios.
     phone).
 
   Ordinary users need access to `bluetoothd` over D-Bus, which most desktop distributions give the logged-in user.
-- **ESP32 (NB-110c):** NimBLE, three connections, an ATT MTU of 256, a random non-resolvable address, no security
-  manager and no stored bonds, and a small prepared-write pool. With Wi-Fi off, every random draw comes after the
-  Bluetooth controller starts (`nimble_port_init`), as NB-063 has it for Wi-Fi. A board with no Wi-Fi has no SNTP:
-  room hellos must be within a minute of the receiver's clock, so a board joins a room over Bluetooth only with a
-  clock set since power-on (its RTC keeps it across restarts, not power cuts; NB-093).
+- **ESP32 (NB-110c):** NimBLE, three connections, an ATT MTU of 256 and a random non-resolvable address.
+  - The security manager is compiled in, as esp32-nimble 0.13 calls `ble_sm_inject_io`. The driver turns bonding
+    off, asks for neither MITM protection nor Secure Connections, and refuses a central's pairing request, so no
+    bonds are stored.
+  - The prepared-write pool is empty (`BT_NIMBLE_ATT_MAX_PREP_ENTRIES=0`), so NimBLE itself refuses a long write
+    before the driver sees it: on an ESP32-C3, a 300 B write fails with `rc=6`.
+  - With Wi-Fi off, every random draw comes after the Bluetooth controller starts (`nimble_port_init`), as NB-063 has
+    it for Wi-Fi.
+  - A board with no Wi-Fi has no SNTP, and room hellos must be within a minute of the receiver's clock. So a board
+    joins a room over Bluetooth only with a clock set since power-on (its RTC keeps it across restarts, not power
+    cuts; NB-093).
 - **Browsers (NB-110d):** a central only. Each connection starts from a user gesture and the device picker, filtered
   on the service UUID; never `acceptAllDevices`. The permission belongs to the page's origin. Nothing from the picker
   (`device.name`, `device.id`) goes into signaling or is trusted: identity comes from Noise alone. The page runs the

@@ -14,8 +14,9 @@ categories = ["network-programming", "game-development", "asynchronous"]
 include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [package.metadata.docs.rs]
-# The async host and Nostr signaling as well as the default TURN client; not `testing`, which is for bindings.
-features = ["tokio", "nostr"]
+# The async host, Nostr signaling and the Bluetooth transport as well as the default TURN client; not `testing`,
+# which is for bindings, nor `ble-bluez`, which would build libdbus there.
+features = ["tokio", "nostr", "ble"]
 
 [dependencies]
 peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
