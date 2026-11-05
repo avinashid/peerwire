@@ -3,7 +3,11 @@
 //! Room hellos and offers carry the sender's clock, and a node drops those more than a minute off its own (a replay
 //! guard). A board has no battery-backed clock and starts at 1970, so a board and a PC on the same LAN drop each
 //! other's hellos and never link (NB-091). [`sync`] sets the clock before the node is bound, and [`keep_in_step`]
-//! asks again every [`RESYNC`]: a board drifts about a second a day.
+//! asks again every [`RESYNC`].
+//!
+//! A bound node reads the clock once and counts on from it, so the re-asks keep the relay carrier's event times and
+//! TLS right, not the node's, and can't move its replay guard. If no server answered before the node was bound, it
+//! keeps 1970: so when a later ask sets the clock, [`keep_in_step`] restarts the chip, to bind again (NB103-I2).
 //!
 //! The asks are this module's own, not lwIP's SNTP client, which takes any answer that reaches its port, so a device
 //! on the LAN could step the clock (NB95-I2). Each ask carries 8 random bytes that the answer must echo, and an
@@ -23,8 +27,8 @@ use crate::ntp::{self, Refused};
 /// The servers asked, in turn.
 pub const SERVERS: [&str; 4] = ["0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.org", "3.pool.ntp.org"];
 
-/// How often [`keep_in_step`] asks again once the clock is set. The replay guard allows a minute, and a board drifts
-/// about a second a day.
+/// How often [`keep_in_step`] asks again once the clock is set: a board drifts about a second a day, and the relay
+/// carrier reads the clock for its event times and TLS. A bound node doesn't: it read the clock once, when bound.
 pub const RESYNC: Duration = Duration::from_secs(6 * 3600);
 
 /// How often [`keep_in_step`] asks again while the clock isn't set.
@@ -76,19 +80,29 @@ pub fn sync(timeout: Duration) -> io::Result<()> {
 
 /// Starts a thread that keeps the clock in step: it asks again every [`RESYNC`], or every minute while the clock
 /// isn't set. It runs at the main task's priority, 1. A second call does nothing.
+///
+/// If the clock isn't set when it starts, the first answer sets it and restarts the chip 5 s later, as a node bound
+/// meanwhile keeps 1970 and peers with a set clock drop its hellos (NB103-I2). The next boot asks before binding.
 pub fn keep_in_step() -> io::Result<()> {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::Relaxed) {
         return Ok(());
     }
+    let set_late = !is_set();
     // ESP-IDF takes the task's name and priority from this config; std sets the stack.
     ThreadSpawnConfiguration { name: Some(c"sntp"), priority: 1, ..Default::default() }
         .set()
         .map_err(io::Error::other)?;
-    let spawned = std::thread::Builder::new().stack_size(STACK).spawn(|| loop {
+    let spawned = std::thread::Builder::new().stack_size(STACK).spawn(move || loop {
         std::thread::sleep(if is_set() { RESYNC } else { RETRY });
-        if let Err(e) = sync(Duration::from_secs(30)) {
-            warn!("clock: {e}");
+        match sync(Duration::from_secs(30)) {
+            Ok(()) if set_late => {
+                warn!("clock: set late; restarting in 5 s, so the node binds with the time and not 1970");
+                std::thread::sleep(Duration::from_secs(5));
+                unsafe { sys::esp_restart() }
+            }
+            Ok(()) => {}
+            Err(e) => warn!("clock: {e}"),
         }
         let unused = unsafe { sys::uxTaskGetStackHighWaterMark(std::ptr::null_mut()) };
         info!("clock: SNTP thread stack unused {unused} B");

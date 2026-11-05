@@ -86,7 +86,10 @@ itself, and asks again every 6 hours to keep the clock in step; since NB-103 it 
 longer leaves that to lwIP's SNTP, which took any answer that reached its port, so a
 device on the LAN could step the clock (NB95-I2). An answer must echo the ask's 8
 random bytes, and one from an unsynchronised server (leap indicator 3, stratum 0 or
-16 and up) is refused.
+16 and up) is refused. The `Node` reads the clock once, when bound, so the re-asks keep
+the relay carrier's event times and TLS right, not the node's. If no server answered in
+the 60 s before binding, the node keeps 1970 and a PC drops its hellos; the board asks
+every minute and restarts once one answers, to bind again with the time (NB103-I2).
 
 `l2hub.mjs` carries Ethernet frames between the QEMU instances (`-netdev dgram`
 on 127.0.0.1), as a hub on one LAN segment would. Nothing leaves the host.
@@ -239,9 +242,9 @@ anywhere can join with `room_chat ROOM`. Without one it stays on the LAN, in roo
 - **SNTP.** One boot got no answer from its one SNTP server in 20 s; as the Node reads
   the clock when it is bound, it linked with no one. Asking four through lwIP's SNTP
   still took 15 s on one boot and over 50 s, silent, on two others, as lwIP gives each
-  server 15 s. The firmware now asks the four itself, 2 s each, for up to 60 s, logs why
-  each ask failed, then leaves lwIP's SNTP to keep the clock in step. The relay's TLS
-  needs the clock too.
+  server 15 s. The firmware now asks the four itself, 2 s each, for up to 60 s, and logs
+  why each ask failed. It then left lwIP's SNTP to keep the clock in step; since NB-103
+  its own asks do (NB95-I2). The relay's TLS needs the clock too.
 - **Restarts.** A boot that joined Wi-Fi but got no DHCP address stopped there; the
   firmware now restarts 5 s after any setup error.
 - **Security review (NB95-1 to NB95-6).** One relay message of a few KB, parsed whole,

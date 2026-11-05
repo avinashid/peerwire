@@ -52,7 +52,7 @@ relay, so `room_chat` on a PC anywhere links with it. The project's README says 
 | `peerwire-esp` | |
 |---|---|
 | `peerwire_esp::run(app)` | Starts ESP-IDF's logger and runs `app`; restarts the chip if it fails |
-| `Board::connect(ssid, password)` | Joins Wi-Fi, sets the clock by SNTP (waiting up to 60 s) and keeps it in step |
+| `Board::connect(ssid, password)` | Joins Wi-Fi, sets the clock by SNTP (waiting up to 60 s) and keeps it in step; if it was set late, restarts the board so the node binds with it |
 | `board.node()` | A node on the board's address, sized for the chip, with LAN signaling |
 | `board.node_with_nostr(relay)` | The same, with a Nostr relay too (feature `nostr`) |
 | `board.builder()` | The node's builder, to change before binding: an identity of your own, say |

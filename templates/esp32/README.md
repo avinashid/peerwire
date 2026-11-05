@@ -59,7 +59,8 @@ board's LAN address, so name the room something others can't guess.
 
 - **Clock.** Peers drop hellos more than a minute off their own clock, and a board
   starts at 1970. If the log says `no SNTP answer`, the board can't reach
-  `pool.ntp.org` and a PC ignores it; it asks again every minute.
+  `pool.ntp.org` and a PC ignores it. It asks again every minute, and restarts once one
+  is answered (`clock: set late`), as the node keeps the clock it was bound with.
 - **Network.** 2.4 GHz only, and the PC must be on the same network, not a guest one
   that keeps devices apart. The board also broadcasts, for routers that drop multicast.
 - **Wi-Fi join.** `the AP never answered the association request`: the firmware retries

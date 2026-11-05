@@ -103,8 +103,9 @@ impl Board {
     /// keeps it in step ([`clock::keep_in_step`]). It takes the chip's peripherals and system event loop: firmware
     /// that needs others of them passes the modem and the loop to [`connect_with`](Board::connect_with) instead.
     ///
-    /// A clock no server set is a warning, not an error, and the clock is asked for again every minute. Until it is
-    /// set, peers with a set clock (any PC) drop this board's hellos, and a Nostr relay's certificate can't be checked.
+    /// A clock no server set is a warning, not an error: the clock is asked for again every minute, and until it is
+    /// set a Nostr relay's certificate can't be checked. A node bound meanwhile keeps 1970, so peers with a set clock
+    /// (any PC) drop its hellos: once an ask is answered, the board restarts to bind again ([`clock::keep_in_step`]).
     pub fn connect(ssid: &str, password: &str) -> anyhow::Result<Board> {
         let peripherals = Peripherals::take()?;
         Board::connect_with(peripherals.modem, EspSystemEventLoop::take()?, ssid, password)
@@ -122,7 +123,7 @@ impl Board {
         let (ip, prefix) = (ip_info.ip, ip_info.subnet.mask.0);
         info!("on Wi-Fi at {ip}/{prefix}, free heap {} B", free_heap());
         if let Err(e) = clock::sync(CLOCK_WAIT) {
-            warn!("{e}: the clock is at 1970, so peers with a set clock drop our hellos");
+            warn!("{e}: the clock is at 1970, so peers with a set clock drop our hellos; we restart once it is set");
         }
         clock::keep_in_step()?;
         Ok(Board { wifi, ip, prefix })
