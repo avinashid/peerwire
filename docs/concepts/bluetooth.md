@@ -71,18 +71,19 @@ That is 30 of the 31 bytes a legacy advert holds. Where the stack allows a scan 
 
 **Who connects.** Native peers both advertise and scan. A peer connects, as the central, to an advert that isn't full
 when its own `n` is the smaller, or when its own advert is full; with equal values neither does until one changes. A
-peer with no advert of its own (a browser) connects to the device the user picks. So a native peer accepts a central
-that never advertises. A peer doesn't connect to an `n` it is connected or connecting to, nor within 60 s to an `n`
-from a device whose connection closed or failed. A connect not up within 12 s counts as failed (a driver fails its own
-within 10 s and drops the link), and one that comes up after that is closed: so a device that takes the link and
+peer with no advert of its own (a browser) connects to the device the user picks, and a native peer whose advert isn't
+on the air (its stack refused it, or its adapter went, and its driver says so) to any advert of the room that isn't
+full, whatever its `n`: else two peers could each wait for the other's advert (NB-112). So a native peer accepts a
+central that never advertises. A peer doesn't connect to an `n` it is connected or connecting to, nor within 60 s to an
+`n` from a device whose connection closed or failed. A connect not up within 12 s counts as failed (a driver fails its
+own within 10 s and drops the link), and one that comes up after that is closed: so a device that takes the link and
 stalls its setup holds a connect 12 s at most, and then not again for 60 s. The hold is that device's alone, so a copy
 of a member's advert, which anyone in range can replay, holds only the copy, not the member's own. But one whose
 connection closed before it sent a challenge (it refused the central, or never challenged) is tried again after 1 to
 4 s, at random, so a device that connects on a cycle of its own can't keep a newcomer landing in its grace (see the
-limits). Nothing a peer says of its
-own advert is taken, as a member could name another's to keep two members apart: so two peers may make two connections
-(a full desktop connects back to the peer that filled it, say), and the
-[second one closes](#binding-a-connection-to-its-peer).
+limits). Nothing a peer says of its own advert is taken, as a member could name another's to keep two members apart: so
+two peers may make two connections (a full desktop connects back to the peer that filled it, say), and the [second one
+closes](#binding-a-connection-to-its-peer).
 
 ## Framing
 
@@ -245,7 +246,9 @@ driver for the radio, so each platform writes only the driver. In `peerwire` (fe
 pub trait Radio: Send {
     /// Advertises with `data` as the service data, replacing the last; `None` stops. Serves the GATT service, and
     /// accepts centrals, while advertising. Each call with data comes from a new random address, and lists the
-    /// service UUID (AD 0x07) in the scan response where the stack can set one.
+    /// service UUID (AD 0x07) in the scan response where the stack can set one. An advert that isn't on the air (the
+    /// stack refused it, or the adapter went) is reported (`Advertising(false)`) and tried again until it is
+    /// (`Advertising(true)`).
     fn advertise(&mut self, data: Option<&[u8]>);
     /// Starts or stops scanning, passively, for the service's adverts.
     fn scan(&mut self, on: bool);
@@ -276,10 +279,12 @@ pub enum RadioEvent {
     Mtu { conn: ConnId, mtu: u16 },                                  // the ATT MTU changed
     Value { conn: ConnId, value: Vec<u8> },                          // a write to `rx`, or a notification on `tx`
     Disconnected { conn: ConnId },
+    Advertising(bool),                                               // whether the advert asked for is on the air
 }
 ```
 
-`DeviceId(u64)` and `ConnId(u32)` are the driver's own numbers. `Builder::bluetooth(radio)` gives a node its radio;
+`DeviceId(u64)` and `ConnId(u32)` are the driver's own numbers. A driver that never sends `Advertising` is taken to
+advertise as asked. `Builder::bluetooth(radio)` gives a node its radio;
 `Node::poll` drains its events, and `Node::set_waker` (which `AsyncNode` calls itself) hands it a waker.
 Feature `ble-bluez` adds the Linux driver, `BlueZ`; the ESP32's NimBLE driver lives in `peerwire-esp` (NB-110c), and
 tests use an in-process pair of fake radios.
@@ -295,6 +300,8 @@ tests use an in-process pair of fake radios.
     `BlueZ::alias` reports it, and `BlueZ::names_this_host` says when it is the host name, for the app to tell its
     user;
   - its discovery scans actively, so the radio sends scan requests from its address;
+  - the driver scans for every LE advert, as a discovery filter on the service UUID crashes bluetoothd 5.87 (NB-112),
+    and follows at most 256 devices at once: past that, only ones advertising the service, in place of others;
   - it can't add a scan response, so Web Bluetooth's picker must filter on the service data (to be checked on a
     phone);
   - pairing is the system's: BlueZ answers a central's pairing request through the desktop's agent, so a device
@@ -307,6 +314,15 @@ tests use an in-process pair of fake radios.
   bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone
   browser that doesn't raise it, say; to be checked with NB-110d) can't carry the codec's 20-byte values and isn't
   used.
+
+  The driver keeps the radio up (NB-112). A part that fails (finding the adapter, the GATT service, the advert, the
+  scan) is logged through the `log` crate and tried again 1, 2, 4, 8, 16, then every 30 s, until it works, which is
+  logged once; an advert that isn't on the air is reported (`Advertising`). When the adapter in use goes (a USB reset
+  brings it back as `hci1`, say), stops answering (it is asked every 10 s, as a bluetoothd that crashed says nothing)
+  or comes again (bluetoothd restarted, and forgot what was set up on it), or another becomes the default, its links
+  are reported closed, connects under way fail, and the driver sets up on the default adapter: powered on, serving,
+  advertising and scanning. One powered off has its links reported closed too, and is set up again once powered on:
+  the driver doesn't power on an adapter its user turned off.
 
   Ordinary users need access to `bluetoothd` over D-Bus, which most desktop distributions give the logged-in user.
 - **ESP32 (NB-110c):** NimBLE, three connections, an ATT MTU of 256 and a random non-resolvable address.

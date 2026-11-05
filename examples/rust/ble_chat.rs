@@ -10,7 +10,8 @@
 //! It joins `lan_chat`'s and `room_chat`'s rooms, so `room_chat kitchen` on the LAN is in the room too, and so is
 //! the ESP32 port in the room its flash names. `--no-udp` drops the LAN carrier and allows Bluetooth links alone
 //! (`Policy::new([PathKind::Bluetooth])`), so every link goes over the radio. Type a line to send it to everyone in
-//! the room. It needs `bluetoothd` and a powered adapter; centrals nearby read the adapter's alias as its name.
+//! the room. It needs `bluetoothd` and a powered adapter; centrals nearby read the adapter's alias as its name. The
+//! driver's log goes to stderr: a part of the radio that failed and is tried again, the adapter going or changing.
 
 use peerwire::ble::BlueZ;
 use peerwire::{Event, LanSignaling, Lane, Node, PathKind, PeerId, Policy};
@@ -24,6 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let room = words.next().unwrap_or_else(|| "lobby".into());
     let bind = words.next().unwrap_or_else(|| "0.0.0.0:0".into());
 
+    log::set_logger(&Stderr).map_err(|e| e.to_string())?;
+    log::set_max_level(log::LevelFilter::Info);
     let radio = BlueZ::new()?;
     println!("Bluetooth name (the adapter's alias): {:?}", radio.alias());
     if radio.names_this_host() {
@@ -71,6 +74,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::thread::sleep(node.next_timeout().unwrap_or(Duration::MAX).min(Duration::from_millis(5)));
     }
+}
+
+/// Prints Peerwire's log lines, such as the Bluetooth driver's, to stderr.
+struct Stderr;
+
+impl log::Log for Stderr {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Info && m.target().starts_with("peerwire")
+    }
+
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            eprintln!("{} {}", r.level(), r.args());
+        }
+    }
+
+    fn flush(&self) {}
 }
 
 /// The kind of path the link to `peer` takes: `Direct` over UDP, `Bluetooth` over the radio.

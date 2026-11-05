@@ -77,7 +77,9 @@ impl Default for Limits {
 /// [`TX_UUID`]), advertises, scans, connects and moves GATT values, and never blocks. Nothing is paired or bonded.
 pub trait Radio: Send {
     /// Advertises with `data` as the service data, replacing the last; `None` stops. Serves the GATT service, and
-    /// accepts centrals, while advertising. Each call with data should come from a new random address.
+    /// accepts centrals, while advertising. Each call with data should come from a new random address. An advert that
+    /// isn't on the air (the stack refused it, or the adapter went) is reported ([`RadioEvent::Advertising`]) and
+    /// tried again until it is.
     fn advertise(&mut self, data: Option<&[u8]>);
     /// Starts or stops scanning, passively, for the service's adverts.
     fn scan(&mut self, on: bool);
@@ -121,6 +123,11 @@ pub enum RadioEvent {
     Value { conn: ConnId, value: Vec<u8> },
     /// `conn` closed.
     Disconnected { conn: ConnId },
+    /// Whether the advert asked for is on the air: `false` when it isn't (the stack refused it, or the adapter went),
+    /// `true` once it is again. A radio that never says is taken to advertise as asked. While it doesn't, the node
+    /// connects to any advert of its room that isn't full, as a peer with no advert does, so that two peers can't
+    /// each wait for the other's advert (NB-112).
+    Advertising(bool),
 }
 
 /// Adverts change this often, with a new `n`, tag and address. An advert whose connection this end closed as a second
@@ -336,6 +343,8 @@ pub(crate) struct Ble {
     n: u32,
     /// What it advertises now: `n` and whether full.
     advertised: Option<(u32, bool)>,
+    /// The radio hasn't said its advert is off the air ([`RadioEvent::Advertising`]).
+    on_air: bool,
     rotate_at: Instant,
     conns: HashMap<ConnId, Conn>,
     by_hop: HashMap<SocketAddr, ConnId>,
@@ -370,6 +379,7 @@ impl Ble {
             on: false,
             n: OsRng.next_u32(),
             advertised: None,
+            on_air: true,
             rotate_at: now + ROTATE,
             conns: HashMap::new(),
             by_hop: HashMap::new(),
@@ -452,6 +462,7 @@ impl Ble {
                 }
             }
             RadioEvent::Value { conn, value } => self.on_value(now, ep, conn, &value),
+            RadioEvent::Advertising(up) => self.on_air = up,
             RadioEvent::Disconnected { conn } => {
                 if let Some((at, until)) = self.conns.get(&conn).and_then(|c| Some((c.to.zip(c.n)?, now + hold(c)))) {
                     let t = self.held.entry(at).or_insert(until);
@@ -486,9 +497,10 @@ impl Ble {
                 }
             }
         }
-        // Not our own. The smaller `n` connects to an advert that isn't full; the larger one does if its own is.
+        // Not our own. The smaller `n` connects to an advert that isn't full; the larger one does if its own is full,
+        // or isn't on the air, as a peer with no advert does (NB-112).
         let theirs_full = data[0] & FULL != 0;
-        if n == self.n || theirs_full || !(self.n < n || self.full()) {
+        if n == self.n || theirs_full || !(self.n < n || self.full() || !self.on_air) {
             return;
         }
         // Nor one this end is connected or connecting to, or holds from this device (NB110-10). Only adverts it
@@ -1452,6 +1464,64 @@ mod tests {
         }
     }
 
+    /// A radio whose advert stays off the air while `down` is set, as when the stack refuses it and the driver tries
+    /// again: it says so ([`RadioEvent::Advertising`]) if it `tells`, and puts the last advert asked for on the air
+    /// once `down` is cleared.
+    struct OffAir {
+        radio: FakeRadio,
+        down: Arc<AtomicBool>,
+        tells: bool,
+        /// The last advert asked for.
+        data: Option<Vec<u8>>,
+        /// What it last said.
+        up: bool,
+        said: VecDeque<RadioEvent>,
+    }
+
+    impl OffAir {
+        fn new(radio: FakeRadio, down: Arc<AtomicBool>, tells: bool) -> OffAir {
+            OffAir { radio, down, tells, data: None, up: true, said: VecDeque::new() }
+        }
+
+        /// Puts the advert on the air or not, as `down` has it, and says when that changed.
+        fn sync(&mut self) {
+            let up = !self.down.load(Ordering::Relaxed);
+            self.radio.advertise(self.data.as_deref().filter(|_| up));
+            if self.tells && self.data.is_some() && up != self.up {
+                self.up = up;
+                self.said.push_back(RadioEvent::Advertising(up));
+            }
+        }
+    }
+
+    impl Radio for OffAir {
+        fn advertise(&mut self, data: Option<&[u8]>) {
+            self.data = data.map(<[u8]>::to_vec);
+            self.sync();
+        }
+
+        fn scan(&mut self, on: bool) {
+            self.radio.scan(on);
+        }
+
+        fn connect(&mut self, device: DeviceId) {
+            self.radio.connect(device);
+        }
+
+        fn send(&mut self, conn: ConnId, value: &[u8]) -> bool {
+            self.radio.send(conn, value)
+        }
+
+        fn disconnect(&mut self, conn: ConnId) {
+            self.radio.disconnect(conn);
+        }
+
+        fn poll(&mut self) -> Option<RadioEvent> {
+            self.sync();
+            self.said.pop_front().or_else(|| self.radio.poll())
+        }
+    }
+
     /// A central of the test's, by hand over a radio of its own: it knows the room's key, and does as it is told.
     struct Rogue {
         radio: FakeRadio,
@@ -2237,6 +2307,64 @@ mod tests {
         assert!(closed, "the connection came, and closed: {seen:?}");
         assert_eq!((node.counts().0, air.links()), (0, 0), "not taken");
         assert!(node.held.contains_key(&(DeviceId(0), u32::MAX)), "still held");
+    }
+
+    /// NB-112: a node whose `n` is the larger connects to an advert of its room that isn't full only while its radio
+    /// says its own advert is off the air.
+    #[test]
+    fn a_node_whose_advert_is_off_the_air_connects_whatever_the_n() {
+        use RadioEvent::Advertising;
+        let key = ble_key("app", "room");
+        let air = FakeAir::new(23);
+        let t = Instant::from_millis(1);
+        let cases: [(&[RadioEvent], bool, bool); 4] = [
+            (&[], false, false),
+            (&[Advertising(false)], false, true),
+            (&[Advertising(false)], true, false),
+            (&[Advertising(false), Advertising(true)], false, false),
+        ];
+        for (said, full, connects) in cases {
+            let (mut node, mut ep) = lone(&air, Limits::DESKTOP, 1, t);
+            node.n = 2_000;
+            for e in said {
+                node.on_event(t, &mut ep, e.clone());
+            }
+            node.on_seen(t, DeviceId(100), &advert(&key, 1_000, full));
+            let what = format!("after {said:?}, to an advert full {full}");
+            assert_eq!(node.pending.contains_key(&DeviceId(100)), connects, "{what}");
+        }
+    }
+
+    /// NB-112 (the v3 laptop run): Alice's stack refuses her advert, and Bob, whose `n` is the smaller, waits for it.
+    /// Her radio says so, and she connects to Bob's as a peer with no advert does: they link within a second, and
+    /// keep one link once her advert is up. A radio that doesn't say leaves them apart, each waiting for the other's
+    /// advert (in the run, until Alice's next `n`, 15 minutes later).
+    #[test]
+    fn a_node_whose_advert_is_refused_still_links() {
+        for tells in [true, false] {
+            let down = Arc::new(AtomicBool::new(true));
+            let wrap = |i: usize, r: FakeRadio| -> Box<dyn Radio> {
+                match i {
+                    0 => Box::new(OffAir::new(r, down.clone(), tells)),
+                    _ => Box::new(r),
+                }
+            };
+            let (mut w, _) = Air::with(&[Limits::DESKTOP; 2], 0, wrap);
+            w.set_n(0, 2_000); // Alice
+            w.set_n(1, 1_000); // Bob
+            let took = link_time(&mut w, 0, 1, Duration::from_secs(30));
+            eprintln!("tells {tells}: linked in {took:?}");
+            if !tells {
+                assert_eq!(took, None, "apart");
+                continue;
+            }
+            assert!(took.is_some_and(|t| t < Duration::from_secs(1)), "linked in {took:?}");
+            assert_eq!(w.air.advert(0), None, "with no advert of Alice's");
+            down.store(false, Ordering::Relaxed);
+            w.run(10_000);
+            assert!(w.air.advert(0).is_some() && w.linked(0, 1), "still linked once her advert is up");
+            assert_eq!(w.air.links(), 1, "on one connection");
+        }
     }
 
     /// NB110-2: Mallory's four members, with adverts above everyone's, take all of Bob's unbound connections, and

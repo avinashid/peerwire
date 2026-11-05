@@ -64,7 +64,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 | `tokio` | [`AsyncNode`](#asyncnode) | `tokio` 1 with `net`, `time`, `macros`, `rt` |
 | `nostr` | [`NostrSignaling`](#nostrsignaling) and the `peerwire::nostr` module | `tungstenite` 0.24, `rustls` 0.23 (`ring`), `webpki-roots` 1, `k256` 0.13, `serde_json` 1 |
 | `ble` | Bluetooth LE ([Bluetooth](../concepts/bluetooth.md)): the `peerwire::ble` module (the `Radio` driver trait, `RadioEvent`, `Limits`), `Builder::bluetooth`. The node's side only: a driver comes from `ble-bluez`, or from the app (the ESP32 port's NimBLE one) | nothing |
-| `ble-bluez` | `ble`, and the Linux driver `ble::BlueZ` (BlueZ over D-Bus) | `bluer` 0.17 (`bluetoothd`), `dbus` 0.9 (`vendored`: `libdbus` built from source, so no system package is needed), `futures` 0.3, `tokio` 1 (`rt`, `sync`, `macros`) |
+| `ble-bluez` | `ble`, and the Linux driver `ble::BlueZ` (BlueZ over D-Bus), which logs what fails and is tried again through `log` | `bluer` 0.17 (`bluetoothd`), `dbus` 0.9 (`vendored`: `libdbus` built from source, so no system package is needed), `futures` 0.3, `log` 0.4, `tokio` 1 (`rt`, `sync`, `macros`) |
 | `testing` | `Builder::port_mapping_at`, port mapping through a fake gateway; `Node::set_udp_off`; with `ble`, `ble::FakeAir`, radios in one process, and `Node::ble_counts` (all hidden from rustdoc). For tests only, not for apps | nothing |
 
 `peerwire-ffi` has one feature, `sync`: the shared-document functions (`pw_docs_*`, `pw_doc_*`) on `peerwire-sync`.
