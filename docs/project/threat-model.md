@@ -37,7 +37,7 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 | The LAN, for `LanSignaling` | No | Every device on the link, and every program on the machine, hears each frame and can send its own, with no relay to pace it. The same limits as a relay: cannot open or forge a sealed payload. See [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6). |
 | Peer relay (`FWD`/`RELAYED`) | No | Sees only ciphertext; rate-limited; forwards only to already-connected peers. |
 | NAT / on-path network | No | Noise authenticates the endpoints; cannot MITM. Can drop/delay. |
-| A TURN server the app lists (`iceServers`; in Rust `turn_servers`, NB-099) | Partially | The app's choice, not ours. Sees our address, the peers' addresses, sizes and timing, never a payload; can drop or delay; picks the relayed address we offer. See [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2). |
+| A TURN server the app lists (`iceServers`; in Rust `turn_servers`, NB-099) | Partially | The app's choice, not ours. Sees our address, the peers' addresses, sizes and timing, never a payload; can drop or delay; picks the relayed address we offer. Under `Privacy::RelayOnly` with `Turn` in the policy (NB-101) the peers see its relayed address instead of ours. See [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) and [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1). |
 | Remote peer | Partially | Authenticated, but may be malicious: send malformed frames, flood, probe. Parsers and resource caps are the defence. |
 | Host application / C caller | Yes | The C ABI trusts its caller to pass valid pointers and lengths; since NB-085 it refuses null ones (see SEC-8). |
 
@@ -166,7 +166,9 @@ release of each.
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB99-1 (Medium), NB99-2 (Low), NB99-I1 (Info) | **Fixed** by `b2b2919` and `41471eb` before NB-099 merged, so never on main (a relayed address an offer names relabels only the packets that name its claimant's link, and the policy takes it as TURN's for that peer alone; full TURN tables make room for a later peer, a peer holds one offer's IPs, channel numbers are bound again once quiet), reviewed 2026-11-05; residuals accepted, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
-| NB99-I2 (Info) | Open (NB-099): a member that offers another peer's relayed address as its own takes the claim from it until that peer's next offer, so that peer's packets from there come in as from a network address; measured, its link stayed on TURN, same section |
+| NB99-I2 (Info) | **Fixed** by `1551da7` (NB-100, merged with NB-101), reviewed 2026-11-05: every claimant of a relayed address is kept, and a claim relabels its claimant's packets alone; the 256-claim cap stays, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
+| NB101-1 (Low), NB101-I1 (Info) | **Fixed** by `ee3ef67` and `016c77f` before NB-101 merged, so never on main (under relay-only with TURN, a relay peer's invite is dialled through the allocation; a link that shows the node's address goes onto an allocation at any of the peer's addresses, or closes without a Close and is dialled afresh through the relay), reviewed 2026-11-05; residuals accepted, [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1) |
+| NB101-I2 (Info) | Open (NB-101): a link that a policy change is moving when relay-only comes on with TURN stays on the node's socket until the move lands or 6 s pass, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -4119,14 +4121,15 @@ Feature `turn` (`crates/peerwire/src/turn.rs`, on by default) gives a Rust node 
 servers of its own (`Builder::turn_servers`, `Node::set_turn_servers`; RFC 8656 over
 UDP), with a username and password, or credentials minted for each allocation from a
 REST secret (`TurnServer::rest`: the username `expiry:user`, the password
-base64(HMAC-SHA1(secret, username))). TURN runs only with `PathKind::Turn` in the policy
-and not under `Privacy::RelayOnly`. The node keeps an allocation on each server, offers
-its relayed address in a tagged `fe 03` entry, and a dial's `Turn` step goes through the
-allocation (a channel for each peer address, Send indications until it is bound) to the
-peer's addresses, or from the node's socket to the peer's relayed address. A link at a
-relayed address counts as `Turn`, for the policy and in `path_kind`, and leaves it as a
-link leaves a relay: by a punch to a direct address, answered there. The codec is
-`peerwire-core/src/stun/turn.rs`.
+base64(HMAC-SHA1(secret, username))). TURN runs only with `PathKind::Turn` in the
+policy, and until NB-101 not under `Privacy::RelayOnly` (see
+[TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1)). The
+node keeps an allocation on each server, offers its relayed address in a tagged `fe 03`
+entry, and a dial's `Turn` step goes through the allocation (a channel for each peer
+address, Send indications until it is bound) to the peer's addresses, or from the node's
+socket to the peer's relayed address. A link at a relayed address counts as `Turn`, for
+the policy and in `path_kind`, and leaves it as a link leaves a relay: by a punch to a
+direct address, answered there. The codec is `peerwire-core/src/stun/turn.rs`.
 
 Reviewed 2026-11-05 by reading `4c61f49` (on `9131188`) against the core's path rules
 (`endpoint.rs`) and RFC 8656, with probes on loopback sockets, and a loopback TURN
@@ -4167,8 +4170,8 @@ packets from it.
   taken as our NAT's mapping.
 - Decoders from before NB-099 skip the `fe 03` entry: `SocketAddr::decode` needs a first
   byte of 4 or 6, and the u32 and u64 fields need their exact length.
-- Under `Privacy::RelayOnly` nothing is allocated, and the node never dials a peer's
-  relayed address.
+- Under `Privacy::RelayOnly` the node never dials a peer's relayed address from its
+  socket, and allocates nothing unless the policy lists `Turn` (NB-101).
 
 **NB99-1 — An offer's relayed address relabels everyone's packets from it (Medium).** At
 `4c61f49`, `on_offer` put each address in a peer's `fe 03` entry in `relayed_of`, and
@@ -4192,7 +4195,7 @@ datagram only when that names the address's claimant; the retags, on `Connected`
 beside it: with the claim, A's link to V was direct to V's socket under all three
 policies, as without it; unfixed, `Turn`, through M, and none. The index isn't
 authenticated, so it is a hint: a forged one fails that link's keys, and a claimant that
-sends from the address it claimed moves only its own link. Residual: NB99-I2.
+sends from the address it claimed moves only its own link. Residual: NB99-I2 (fixed).
 
 **NB99-2 — Full TURN tables lock out later peers (Low).** At `4c61f49`,
 `TurnClient::permit` refused a new IP once 64 were held (`MAX_PERMISSIONS`), `send`
@@ -4252,7 +4255,16 @@ comes up as from a network address and isn't retagged, so the policy reads it as
 keep every claimant of an address (key `relayed_of` by address and peer), so a claim
 relabels only its claimant's packets and takes nothing from another's.
 
-**Status: open** (Info), reported on NB-099 at `6b1b3a4`.
+**Status: fixed** by `1551da7` (NB-100, merged with NB-101), reviewed 2026-11-05.
+`relayed_of` keeps each address's claimants, and `hop`, `retag` and `allows` take an
+address as relayed only for a peer that claims it; a peer's offer replaces its own
+earlier claims and no one else's. Read against every use of the map; the author's test
+(`a_later_claim_leaves_the_first_claimants_address`) keeps the first claimant's packets
+relayed after a second claim. Residual: the map holds at most 256 claims, 2 for each
+peer, so a member with 128 identities fills it, and a later peer's claim is refused
+until those are forgotten (10 minutes after the node last heard of them, unless linked);
+that peer's packets from its relayed address then come in as from a network address, as
+before the fix.
 
 **Residuals, accepted.**
 - UDP to the server only: no TURN over TCP or TLS, so a network that blocks UDP gets no
@@ -4262,7 +4274,11 @@ relabels only its claimant's packets and takes nothing from another's.
 - In Rust, `[Turn]` hides no address: offers still carry the node's addresses, a peer
   can name its own address as relayed, and a link to a peer's relayed address goes from
   our socket, so the peer's TURN server sees our address. `Privacy::RelayOnly` hides
-  them, and TURN is off under it (`connection-paths.md` says so).
+  them; since NB-101, with `Turn` in the policy, TURN runs under it through the node's
+  own allocations alone, so peers see the TURN server's relayed address. The TURN server
+  still sees ours, and the relayed address hides it only if the server isn't on the
+  node's own host or behind its NAT
+  ([TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1)).
 - Off path, a sender that spoofs the server's address injects only what a direct sender
   could: ChannelData on a bound channel (numbered from 0x4000, so easy to guess) or a
   Data indication from a permitted IP becomes a datagram from that peer's TURN hop,
@@ -4272,7 +4288,131 @@ relabels only its claimant's packets and takes nothing from another's.
 - The password, or the REST secret, stays in the node's memory for its life, to make new
   allocations. The secret mints credentials for anyone who holds it, and the rustdoc
   says to use it only in apps the developer runs.
-- NB99-2's bounds, above, and NB99-I2.
+- NB99-2's and NB99-I2's bounds, above.
+
+### TURN under relay-only in Rust (NB-101) — NB101-1
+
+Since NB-101, a `Privacy::RelayOnly` node with TURN servers of its own and
+`PathKind::Turn` in the policy (`Traversal::turn_private`) runs TURN, and links to peers
+but its relay through its own allocations as well as through the relay. Offers to those
+peers carry the relayed address alone, with no port prediction, and its invites carry it
+too; offers to the relay carry the node's addresses and no relayed one, as it links
+directly. Dials and `Node::connect` take `Turn` and `RelayPeers` (the relay) in the
+policy's order, `RelayPeers` last if left out, through hops of the node's own
+allocations only (`Hop::Turn`), never from its socket. In the core, `Address::own_turn`
+marks such a hop, and relay-only takes a path through one as hidden, as it does a relay:
+a dial given one goes through those and its relays alone, a handshake through one is
+answered, and a link on one takes no candidates and drops, before its replay window and
+decryption, what the peer sends from anywhere else. Turning relay-only on, or TURN on
+under it, moves a link that shows the node's address onto an allocation at once
+(`Endpoint::retag`) and dials it again there and through the relay; a link whose
+allocation goes moves to the relay or closes with `PathOff`. Without `Turn` in the
+policy, relay-only is as before. NB-100, on the same branch, fixed NB99-I2
+([TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2)).
+
+Reviewed 2026-11-05 by reading `2448dc5` (NB-100 `1551da7`, the core `308f462`,
+traversal and node `9b1f91e`, on `d919967`) against the card's rule that nothing to a
+peer but the relay leaves the node's socket, at every place that sends, with probes on
+loopback sockets and a loopback TURN server and unit probes in the traversal's tests, in
+a copy of the tree, `d919967` run beside them. The fixes, `016c77f` and `ee3ef67` (docs
+`bed6f86`), were re-checked the same day with the same probes and one more, `2448dc5`
+run beside them, and a trial of NB101-I2's fix. The probes aren't in the tree; the
+author's tests like them are, and check each datagram's source at the peer's socket
+(`Node::note_sources`, feature `testing`).
+
+**What holds.**
+- The core's relay-only checks take an own-allocation hop as hidden and nothing else:
+  `Net` addresses and a peer's relayed ones (`Hop::Relayed`) stay blocked. No spray or
+  guess goes out on an own-allocation link or dial, an HS1 is answered directly only
+  through the allocation or the relay, a quiet link falls back only to `Via(relay)`, and
+  no OBSERVED frame is sent.
+- `Hop::Turn` never reaches the socket: the node hands it to the TURN client, which
+  drops it with no allocation, so a lost allocation pushes nothing onto the socket.
+- Offers are sealed for each peer, so the node's addresses reach the relay alone.
+- Switching to relay-only closes the links to relay peers but the relay (with TURN on,
+  without a Close); `keep_relay_links` doesn't dial them again under relay-only, and
+  router port mapping stays off.
+- `Endpoint::abandon` (`disconnect` with no Close) is called only from
+  `Traversal::hang_up`, and only under relay-only with TURN, for a peer but the relay on
+  a direct path that isn't an own allocation; every other close still sends its Close.
+- NB-100: `relayed_of` maps an address to its claimants; `hop`, `retag` and `allows`
+  check the pair, an offer drops only its sender's earlier claims, and the 256 cap
+  counts claims.
+
+**NB101-1 — `connect` to a relay peer's invite dialled from the socket (Low).** At
+`2448dc5`, `Node::connect` under relay-only with TURN took the step-by-step dial through
+the allocations and the relay for any invite but a relay peer's
+(`Node::set_relay_peers`), and with TURN on skipped the old `Via(relay)` substitution,
+so a relay peer that isn't the node's relay was dialled at its invite's addresses from
+the node's socket. The node refused the link, but its HS1s had gone out, so that peer
+learnt the node's address, which relay-only promises it won't. Reproduction: on
+loopback, A relay-only with no relay and `[Turn]`, its allocation up on a loopback TURN
+server, and P's invite pointing at a sniffer socket; `A.set_relay_peers([P])`, then
+`A.connect(P)`. 3 HS1s reached the sniffer from A's socket; an ordinary peer's invite
+gave 0 (its 3 came from the relayed address), and `d919967` failed with `NoRelay` and
+sent nothing. Fix: a relay peer's invite takes the stepped dial too.
+
+**Status: fixed** by `ee3ef67` before NB-101 merged, so never on main; reviewed
+2026-11-05. Measured with the same probe, `2448dc5` beside it: 0 datagrams from A's
+socket, the 3 HS1s from the relayed address; unfixed, 3 from the socket. The author's
+loopback test (`relay_only_connects_to_an_invite_through_its_allocation`) links to a
+relay peer's invite on `Turn`, with nothing at the peer's socket from A's.
+
+**NB101-I1 — A link no allocation relays to stayed on the socket (Info).** At `2448dc5`,
+`hide()`, which takes a link that shows the node's address off it when relay-only comes
+on with TURN, retagged it onto an own-allocation hop only at the same address, then
+dialled it again through the allocations and the relay, the link kept meanwhile. With no
+hop at that address (an IPv6 link and IPv4 allocations, or no allocation up while a
+relay is linked), the link stayed on the socket until the new dial landed or 6 s passed
+(`MOVE_WAIT`), and its close sent a Close from there. Reproduction, a traversal unit
+test: a link at `[2001:db8::2]:7000`, an IPv4 allocation, the peer's `203.0.113.2:7000`
+known; `set_privacy(RelayOnly)`, then an app send. The path stayed `Net`, and 10
+datagrams left the socket over 6 s (the data, its retransmits, the Close at 6,000 ms),
+then `PathOff`. The peer knew the address already, and on main such a link stays where
+it is, hence Info. Fix: retag onto any own-allocation hop, else close the link and dial
+afresh through the relay.
+
+**Status: fixed** by `016c77f` and `ee3ef67` before NB-101 merged, so never on main;
+reviewed 2026-11-05. `hide()` retags onto the hop at the link's address, else onto the
+first own-allocation hop, at another of the peer's addresses; with none, it closes the
+link and dials afresh through the relay, if one is linked. Such closes, and relay peers'
+at the switch, send no Close (`Endpoint::abandon`). Measured with the same probe,
+`2448dc5` beside it: retagged onto the allocation's hop to `203.0.113.2:7000` at once,
+and 0 datagrams from the socket; unfixed, 10. Residual: NB101-I2.
+
+**NB101-I2 — A link mid-move when relay-only comes on stays on the socket (Info).**
+`hide()` returns early for a link whose move is under way (`moving`), before its retag.
+So a link at a peer's address that a policy change is moving when relay-only comes on
+with TURN (`set_policy` with its path off, such as `[Turn]`: the link is dialled again
+through the allocation) stays on the socket until the move lands or 6 s pass, and the
+app's data on it, with its retransmits, goes from there. Measured at `bed6f86` with a
+traversal unit probe, the move unanswered: the path stayed `Net`, and 9 datagrams left
+the socket over 4.2 s, then `PathOff` at 6 s; at `2448dc5`, 10, its Close included. With
+the peer answering, the window is the move's round trip through TURN. An app that turns
+on TURN-only privacy with `set_policy([Turn])` and then `set_privacy(RelayOnly)` meets
+it; the other order doesn't. The peer knew the address already, hence Info. Fix: retag
+(or close) before the `moving` guard, and for a move under way mark the link to close if
+the move fails, with no second dial. Tried in a copy: 0 datagrams from the socket, the
+link still closed at 6 s, and the crate's unit tests and its TURN, policy, privacy and
+relay-peer tests pass.
+
+**Status: open** (Info), reported on NB-101 at `bed6f86`.
+
+**Residuals, accepted.**
+- A dial under way when relay-only comes on, that neither an allocation nor the relay
+  can take, runs on to its end at addresses the peer had from earlier offers, and a link
+  it makes is refused, with a Close from the socket. The guides name this exception.
+- A link closed without a Close: the peer keeps its end until its idle timeout, and its
+  packets to our socket count as an unknown session and get no answer. With a relay, the
+  fresh dial through it replaces that end.
+- Under handshake load, an HS1 at the node's socket gets a cookie before any relay-only
+  check (`on_hs1`, as before NB-101). Only a sender that has the address reaches the
+  socket, but it can spoof the source the cookie goes to, and so show the address to a
+  third party, as it could by telling it.
+- The TURN server sees our address and every peer's, as for NB-099, and the relayed
+  address hides ours only if the server isn't on the node's own host or behind its NAT:
+  there it carries our public IP.
+- NB101-I2, above.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
