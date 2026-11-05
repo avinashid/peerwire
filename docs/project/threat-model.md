@@ -169,7 +169,7 @@ release of each.
 | NB99-1 (Medium), NB99-2 (Low), NB99-I1 (Info) | **Fixed** by `b2b2919` and `41471eb` before NB-099 merged, so never on main (a relayed address an offer names relabels only the packets that name its claimant's link, and the policy takes it as TURN's for that peer alone; full TURN tables make room for a later peer, a peer holds one offer's IPs, channel numbers are bound again once quiet), reviewed 2026-11-05; residuals accepted, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
 | NB99-I2 (Info) | **Fixed** by `1551da7` (NB-100, merged with NB-101), reviewed 2026-11-05: every claimant of a relayed address is kept, and a claim relabels its claimant's packets alone; the 256-claim cap stays, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
 | NB101-1 (Low), NB101-I1 (Info) | **Fixed** by `ee3ef67` and `016c77f` before NB-101 merged, so never on main (under relay-only with TURN, a relay peer's invite is dialled through the allocation; a link that shows the node's address goes onto an allocation at any of the peer's addresses, or closes without a Close and is dialled afresh through the relay), reviewed 2026-11-05; residuals accepted, [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1) |
-| NB101-I2 (Info) | Open (NB-101): a link that a policy change is moving when relay-only comes on with TURN stays on the node's socket until the move lands or 6 s pass, same section |
+| NB101-I2 (Info) | **Fixed** by `807d66a` (NB-108), reviewed 2026-11-05: `hide()` retags a link a policy change is moving onto an allocation, or closes it, before its `moving` guard, then leaves it to that move, which closes it if it fails or is late, so nothing more of the link leaves the socket, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -4474,7 +4474,7 @@ first own-allocation hop, at another of the peer's addresses; with none, it clos
 link and dials afresh through the relay, if one is linked. Such closes, and relay peers'
 at the switch, send no Close (`Endpoint::abandon`). Measured with the same probe,
 `2448dc5` beside it: retagged onto the allocation's hop to `203.0.113.2:7000` at once,
-and 0 datagrams from the socket; unfixed, 10. Residual: NB101-I2.
+and 0 datagrams from the socket; unfixed, 10. Residual: NB101-I2 (fixed).
 
 **NB101-I2 — A link mid-move when relay-only comes on stays on the socket (Info).**
 `hide()` returns early for a link whose move is under way (`moving`), before its retag.
@@ -4492,12 +4492,29 @@ the move fails, with no second dial. Tried in a copy: 0 datagrams from the socke
 link still closed at 6 s, and the crate's unit tests and its TURN, policy, privacy and
 relay-peer tests pass.
 
-**Status: open** (Info), reported on NB-101 at `bed6f86`.
+**Status: fixed** by `807d66a` (NB-108), reviewed 2026-11-05: the fix tried above.
+`hide()` retags the link onto an own-allocation hop, or closes it, before the `moving`
+guard; a link whose move is under way is then marked to close if that move fails or is
+late, and isn't dialled again. Measured with the same probe, `272c7b0` beside it: the
+path went to `Turn` at once, 0 datagrams left the socket after the switch (14 went
+through the allocation), and the link closed at 6 s; unfixed, 9 from the socket. The
+author's test (`relay_only_takes_a_link_mid_move_off_its_socket`), with the switch 1 s
+into the move, asserts the same and fails on `272c7b0`. A moving link with no allocation
+up is now closed at the switch, with no Close, and the relay, if one is linked, is added
+to its move's dial. A second probe, with no relay, a relay the move's dial didn't name
+and one it did, gave 0 datagrams of the link from the socket after the switch; unfixed,
+9 each. That dial runs on: the first residual below.
 
 **Residuals, accepted.**
 - A dial under way when relay-only comes on, that neither an allocation nor the relay
   can take, runs on to its end at addresses the peer had from earlier offers, and a link
-  it makes is refused, with a Close from the socket. The guides name this exception.
+  it makes is refused, with a Close from the socket. The guides name this exception. A
+  policy change's move with no allocation up, whose dial named no relay, is one, even
+  with a relay linked: `hide()` closes the link and adds the relay to the move's dial,
+  which keeps its other targets, as a direct dial given a relay does under relay-only.
+  Measured (NB-108): the move's HS1s to the peer's relayed address went on from the
+  socket, 4 after the switch (at 1.5, 3.5, 7.5 and 15.5 s of the dial's 23.5 s), as on
+  `272c7b0`; the dial had sent it 2 before.
 - A link closed without a Close: the peer keeps its end until its idle timeout, and its
   packets to our socket count as an unknown session and get no answer. With a relay, the
   fresh dial through it replaces that end.
@@ -4508,7 +4525,6 @@ relay-peer tests pass.
 - The TURN server sees our address and every peer's, as for NB-099, and the relayed
   address hides ours only if the server isn't on the node's own host or behind its NAT:
   there it carries our public IP.
-- NB101-I2, above.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
