@@ -59,8 +59,8 @@ fn run() -> anyhow::Result<()> {
         warn!("ble: the clock isn't set, so peers drop this board's hellos: wifi.sh names a network to set it from");
     }
     let radio = Nimble::new()?;
-    let both = free_heap();
-    if board.is_some() {
+    let both = board.as_ref().map(|_| free_heap());
+    if let Some(both) = both {
         info!("ble: Wi-Fi and NimBLE up, free heap {both} B, lowest {} B", lowest());
     }
     drop(board); // Wi-Fi off: links have the radio alone
@@ -75,7 +75,10 @@ fn run() -> anyhow::Result<()> {
     node.join_room(APP, &room);
     let joined = Instant::now();
     info!("ble: node {} joined {APP}/{room} over Bluetooth, free heap {} B", node.peer_id(), free_heap());
-    let startup = format!("boot {boot} B, Wi-Fi and NimBLE {both} B, NimBLE alone {alone} B, room {room:?}");
+    let both = both.map_or("no Wi-Fi".into(), |b| format!("Wi-Fi and NimBLE {b} B"));
+    let clock = if clock::is_set() { "set" } else { "unset" };
+    let startup =
+        format!("boot {boot} B, {both}, NimBLE alone {alone} B, joined {APP}/{room} over Bluetooth, clock {clock}");
 
     let (mut next_send, mut next_report, mut sent, mut reports) = (joined + SEND_EVERY, joined, 0u32, 0u32);
     loop {

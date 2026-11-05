@@ -31,6 +31,8 @@ use peerwire::ble::{ConnId, DeviceId, Limits, Radio, RadioEvent, RX_UUID, SERVIC
 const MTU: u16 = 256;
 /// As sdkconfig.ble's `BT_NIMBLE_MAX_CONNECTIONS`, and [`Limits::SMALL`].
 const MAX_CONNECTIONS: usize = 3;
+/// The GAP device name, the same on every peer and never the host's (the spec's Names).
+const GAP_NAME: &str = "Peerwire";
 /// Passive scanning, 30 ms in every 100 (0.625 ms units).
 const SCAN_INTERVAL: u16 = 160;
 const SCAN_WINDOW: u16 = 48;
@@ -126,6 +128,8 @@ impl Nimble {
     pub fn new() -> anyhow::Result<Nimble> {
         let ble = BLEDevice::take();
         ble.set_preferred_mtu(MTU)?;
+        // What a connected central reads as the GAP name: the spec's, not esp32-nimble's `nimble`.
+        BLEDevice::set_device_name(GAP_NAME)?;
         // Every address this radio uses is a fresh non-resolvable random one, never the efuse MAC (BLE-R3).
         // esp32-nimble does that only on the original ESP32: ask NimBLE here, for each advert.
         new_address()?;
@@ -406,6 +410,8 @@ impl Worker {
         }
     }
 
+    /// The same advert from the same address: the address changes with `n`, when the node gives a new advert (the
+    /// spec's Rotation), not when a connection opens or closes.
     fn readvertise(&self) {
         let advertising = BLEDevice::take().get_advertising();
         let state = self.shared.lock();
