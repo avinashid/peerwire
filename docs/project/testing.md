@@ -225,18 +225,30 @@ both profiles first, about 5 minutes. With no Rust change since `origin/main`, t
   (guesses, sprays, openers too) and moves at both ends; follows the peer that moved; a direct link stays direct
   (stragglers, races, observed addresses); nothing observed from a relayed address; `set_keep_turn`; no relaying
   across one; a punch answered at one moves nothing; `retag`; `peer_of` reads an HS2's and a Data packet's receiver
-  index, not an HS1's.
+  index, not an HS1's. NB-101 (bit `OWN`: through the endpoint's own allocation): relay-only takes such a path as a
+  relay; a dial given one goes through it alone, ignoring guesses and sprays; answers, punches, data and a crossing
+  dial at the endpoint's socket are dropped; nothing leaves the socket.
 - Traversal: an observed address that is our relayed one isn't taken, and offers carry it only in their relayed
   entry; a link at an address offered as relayed is retagged, before or after it comes up; a peer's relayed address
   is dialled; `[Turn, Direct]` keeps a TURN link, `[Direct, Turn]` lets it punch; an allocation made is offered to
   peers offered to before. NB99-1: a peer that names another's address as its relayed one moves none of that peer's
   packets, under no policy, the default and `[Direct]`; NB99-I1: under `[Direct]` a link at a peer's relayed address
-  moves off it whichever came first, the link or the offer.
+  moves off it whichever came first, the link or the offer. NB-100: a later claim to a relayed address leaves the
+  first claimant's packets relayed and its new links there retagged; claims stay within `MAX_RELAYED_OF`. NB-101,
+  under `RelayOnly` with TURN: offers carry the relayed address alone and the relay's none; dials take `Turn` and the
+  relay in the policy's order and nothing from the socket, with the policy gone too; a link at a peer's address goes
+  onto the allocation at once, is dialled again there and closes unanswered; one whose allocation goes, with no
+  relay, closes.
 - Loopback (a TURN server on UDP sockets of its own): a link through TURN alone (`path_kind` `Turn` at both ends);
   `Turn` first keeping it there; `Direct` first moving it off TURN with `PathChanged` at both ends; `Turn` taken out
   moving it; a dropped server closing it with `PathOff`; new credentials making a new allocation; no policy or no
-  servers changing nothing; nothing allocated under `Privacy::RelayOnly`; one server as both STUN and TURN (on this
-  host's own address, skipped with loopback only): the node's address learnt from it, and a link through it.
+  servers changing nothing; one server as both STUN and TURN (on this host's own address, skipped with loopback
+  only): the node's address learnt from it, and a link through it. NB-101, each checked on the datagrams the sockets
+  read (`Node::sources`, feature `testing`) and those the server's relayed addresses got: under `RelayOnly`, TURN only
+  with `Turn` in the policy; a relay-only node links through its allocation alone, and neither its socket nor the
+  peer's hears from the other's; two relay-only nodes link through both allocations, each socket hearing only the
+  server; a lost allocation moves a relay-only node's link to its relay; switching to relay-only takes a direct link
+  onto TURN at once, after which the peer hears nothing from the node's socket; `connect` through the allocation.
 - Simulator (`Sim::add_turn_server`, external nodes): two symmetric NATs with random ports link only through TURN;
   two that can punch move from TURN to the direct path once `Direct` ranks first; a TURN server that is the only STUN
   server too gives the NAT's mapping, and a link.
