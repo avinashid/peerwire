@@ -54,5 +54,9 @@ anyhow = "1"
 ring = { version = "0.17", features = ["less-safe-getrandom-espidf"], optional = true }
 esp32-nimble = { version = "0.13", optional = true }
 
+[dev-dependencies]
+# ble_probe times a handshake between two endpoints in memory.
+peerwire-core = { version = "0.1.0", path = "../../crates/peerwire-core" }
+
 [build-dependencies]
 embuild = "0.33.5"
