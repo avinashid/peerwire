@@ -31,7 +31,7 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 # Dual-stack sockets: IPV6_V6ONLY off before bind, which std can't set (already in the tree through tokio).
 socket2 = "0.6"
 # Optional async host; the sync Node needs no runtime.
-tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "macros", "rt"] }
+tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "macros", "rt", "sync"] }
 # Nostr signaling (feature `nostr`): websocket client, TLS, BIP-340 signatures, relay JSON.
 tungstenite = { version = "0.24", optional = true, default-features = false, features = ["handshake"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
@@ -63,7 +63,7 @@ nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:s
 # Bluetooth LE (docs/concepts/bluetooth.md): the radio driver trait and the node's side of it (Builder::bluetooth),
 # with no dependencies. Off by default; `ble-bluez` adds the Linux driver.
 ble = []
-ble-bluez = ["ble", "dep:bluer", "dep:dbus", "dep:futures", "tokio/rt", "tokio/sync", "tokio/macros"]
+ble-bluez = ["ble", "dep:bluer", "dep:dbus", "dep:futures", "dep:tokio"]
 # Test hooks (Builder::port_mapping_at, a fake gateway's address; Node::note_sources, where the socket's datagrams
 # came from; ble::FakeAir, radios in one process). Not for apps.
 testing = []

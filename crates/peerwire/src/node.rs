@@ -1073,6 +1073,16 @@ impl Node {
         }
     }
 
+    /// Gives the node's radio ([`Builder::bluetooth`]) a waker to wake when something comes over it, for a host that
+    /// sleeps until [`next_timeout`](Node::next_timeout) or the socket: then it polls at once rather than within
+    /// 50 ms. [`AsyncNode`](crate::AsyncNode) sets one itself. Feature `ble`; nothing without a radio.
+    #[cfg(feature = "ble")]
+    pub fn set_waker(&mut self, waker: std::task::Waker) {
+        if let Some(b) = self.ble.as_mut() {
+            b.set_waker(waker);
+        }
+    }
+
     /// Drops the socket's datagrams both ways while `off`, as with the Wi-Fi gone: a test's (feature `testing`). Not
     /// for apps.
     #[cfg(any(test, feature = "testing"))]
@@ -1181,14 +1191,17 @@ impl Node {
     }
 
     /// `false` only when the socket's send buffer is full. Goes out of the extra
-    /// socket that is `t.dst`'s route, if any, else the main one.
+    /// socket that is `t.dst`'s route, if any, else the main one. Only a network address or a peer's relayed one
+    /// goes to a socket: a hop through a TURN allocation goes through it (`flush`), and a Bluetooth connection's
+    /// datagrams go over the radio, never to the address that names it, so this drops them.
     fn try_send(&self, t: &Transmit<Addr>) -> bool {
-        let route = match &t.dst {
-            Hop::Net(a) => self.routes.get(a),
-            _ => None,
+        let (dst, route) = match &t.dst {
+            Hop::Net(a) => (a, self.routes.get(a)),
+            Hop::Relayed(a) => (a, None),
+            Hop::Turn { .. } | Hop::Ble(_) => return true,
         };
         let sock = route.and_then(|id| self.extra.get(id)).map_or(&self.sock, |x| &x.sock);
-        match sock.send_to(&t.payload, self.wire_addr(*t.dst.addr())) {
+        match sock.send_to(&t.payload, self.wire_addr(*dst)) {
             Ok(_) => true,
             Err(e) => e.kind() != ErrorKind::WouldBlock, // unreachable addresses etc.: drop it
         }
@@ -1539,6 +1552,23 @@ mod tests {
 
     fn quiet(addr: &str) -> Node {
         Node::builder().stun_servers(Vec::<String>::new()).bind(addr).unwrap()
+    }
+
+    /// NB-110: a datagram for a Bluetooth connection never leaves by the socket, even if the address that names the
+    /// connection were one a socket listens on; a network address's does.
+    #[test]
+    fn a_bluetooth_hop_never_reaches_the_socket() {
+        let n = quiet("127.0.0.1:0");
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let there = listener.local_addr().unwrap();
+        let mut buf = [0u8; 64];
+        for dst in [Hop::Ble(there), Hop::Turn { server: there, peer: there }] {
+            assert!(n.try_send(&Transmit { dst, payload: b"radio".to_vec() }), "{dst:?}: dropped, not kept");
+            assert!(listener.recv_from(&mut buf).is_err(), "{dst:?}: nothing on the socket");
+        }
+        assert!(n.try_send(&Transmit { dst: Hop::Net(there), payload: b"udp".to_vec() }));
+        assert_eq!(listener.recv_from(&mut buf).unwrap().0, 3);
     }
 
     #[test]

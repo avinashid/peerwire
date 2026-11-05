@@ -433,8 +433,10 @@ impl std::fmt::Display for Failure {
 /// this node's allocation on one of its TURN servers, a peer's relayed address (on the peer's TURN server), sent to
 /// from this node's own socket, or a Bluetooth connection. All but the first are [`relayed`](Address::relayed): a
 /// link on one punches to the peer's network addresses and moves to the first that answers. On the wire each is its
-/// network address, but a Bluetooth connection's, which goes nowhere.
+/// network address, but a Bluetooth connection's, which goes nowhere. More kinds may come, so a `match` on one outside
+/// this crate needs a `_` arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Hop<A> {
     Net(A),
     Turn {

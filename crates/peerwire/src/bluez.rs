@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::task::Waker;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -60,6 +61,25 @@ struct Shared {
     /// Where each connection's values go out.
     senders: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
     next: AtomicU32,
+    /// The node's, woken with each event ([`Radio::set_waker`]).
+    waker: Mutex<Option<Waker>>,
+}
+
+/// Where the driver's thread reports to the node: each event queued, and the node woken.
+#[derive(Clone)]
+struct Events {
+    tx: std_mpsc::Sender<RadioEvent>,
+    shared: Arc<Shared>,
+}
+
+impl Events {
+    fn send(&self, e: RadioEvent) {
+        if self.tx.send(e).is_ok() {
+            if let Some(w) = self.shared.waker.lock().unwrap().as_ref() {
+                w.wake_by_ref();
+            }
+        }
+    }
 }
 
 impl BlueZ {
@@ -68,7 +88,8 @@ impl BlueZ {
     pub fn new() -> io::Result<BlueZ> {
         let (cmds, rx) = mpsc::unbounded_channel();
         let (events_tx, events) = std_mpsc::channel();
-        let shared = Arc::new(Shared { senders: Mutex::new(HashMap::new()), next: AtomicU32::new(1) });
+        let shared =
+            Arc::new(Shared { senders: Mutex::new(HashMap::new()), next: AtomicU32::new(1), waker: Mutex::new(None) });
         let (ready_tx, ready) = std_mpsc::channel();
         let s = shared.clone();
         std::thread::Builder::new().name("peerwire-bluez".into()).spawn(move || {
@@ -76,7 +97,8 @@ impl BlueZ {
                 Ok(rt) => rt,
                 Err(e) => return drop(ready_tx.send(Err(e))),
             };
-            rt.block_on(Driver::run(rx, events_tx, s, ready_tx));
+            let events = Events { tx: events_tx, shared: s.clone() };
+            rt.block_on(Driver::run(rx, events, s, ready_tx));
         })?;
         let alias = ready.recv_timeout(START).map_err(|_| io::Error::other("BlueZ didn't answer in time"))??;
         Ok(BlueZ { cmds, events, shared, alias })
@@ -88,6 +110,19 @@ impl BlueZ {
     pub fn alias(&self) -> &str {
         &self.alias
     }
+
+    /// Whether the [`alias`](BlueZ::alias) is this machine's host name, which any central nearby can then read: an app
+    /// should tell its user how to set another (NB110-5).
+    pub fn names_this_host(&self) -> bool {
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+        same_name(&self.alias, &host)
+    }
+}
+
+/// Whether an adapter alias is a host name, ignoring case and the white space around it.
+fn same_name(alias: &str, host: &str) -> bool {
+    let host = host.trim();
+    !host.is_empty() && alias.trim().eq_ignore_ascii_case(host)
 }
 
 impl Radio for BlueZ {
@@ -123,6 +158,10 @@ impl Radio for BlueZ {
     fn limits(&self) -> Limits {
         Limits::DESKTOP
     }
+
+    fn set_waker(&mut self, waker: Waker) {
+        *self.shared.waker.lock().unwrap() = Some(waker);
+    }
 }
 
 fn uuid(u: u128) -> Uuid {
@@ -153,7 +192,7 @@ struct Peripheral {
 
 struct Driver {
     adapter: Adapter,
-    events: std_mpsc::Sender<RadioEvent>,
+    events: Events,
     shared: Arc<Shared>,
     peripheral: Arc<Mutex<Peripheral>>,
     advert: Option<AdvertisementHandle>,
@@ -165,7 +204,7 @@ struct Driver {
 impl Driver {
     async fn run(
         mut cmds: mpsc::UnboundedReceiver<Cmd>,
-        events: std_mpsc::Sender<RadioEvent>,
+        events: Events,
         shared: Arc<Shared>,
         ready: std_mpsc::Sender<io::Result<String>>,
     ) {
@@ -216,9 +255,9 @@ impl Driver {
                     (true, Some(conn)) if p.from.is_none_or(|f| f == req.device_address) => {
                         if p.from.is_none() {
                             p.from = Some(req.device_address);
-                            let _ = events.send(RadioEvent::Mtu { conn: ConnId(conn), mtu: req.mtu });
+                            events.send(RadioEvent::Mtu { conn: ConnId(conn), mtu: req.mtu });
                         }
-                        let _ = events.send(RadioEvent::Value { conn: ConnId(conn), value });
+                        events.send(RadioEvent::Value { conn: ConnId(conn), value });
                         true
                     }
                     _ => false,
@@ -358,14 +397,14 @@ impl Driver {
                 Ok::<_, bluer::Error>((dev, reader, writer))
             };
             let Ok((dev, reader, writer)) = setup.await else {
-                let _ = events.send(RadioEvent::ConnectFailed { device });
+                events.send(RadioEvent::ConnectFailed { device });
                 return;
             };
             let conn = shared.next.fetch_add(1, Ordering::Relaxed);
             let mtu = u16::try_from(writer.mtu().min(reader.mtu())).unwrap_or(u16::MAX);
             let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
             shared.senders.lock().unwrap().insert(conn, out);
-            let _ = events.send(RadioEvent::Connected { conn: ConnId(conn), device: Some(device), mtu });
+            events.send(RadioEvent::Connected { conn: ConnId(conn), device: Some(device), mtu });
             let write = tokio::spawn(async move {
                 while let Some(v) = queue.recv().await {
                     if writer.send(&v).await.is_err() {
@@ -376,14 +415,14 @@ impl Driver {
             let (ev, sh, ce) = (events.clone(), shared.clone(), centrals.clone());
             let read = tokio::spawn(async move {
                 while let Ok(value) = reader.recv().await {
-                    let _ = ev.send(RadioEvent::Value { conn: ConnId(conn), value });
+                    ev.send(RadioEvent::Value { conn: ConnId(conn), value });
                 }
                 sh.senders.lock().unwrap().remove(&conn);
                 if let Some((tasks, _)) = ce.lock().unwrap().remove(&conn) {
                     tasks.iter().for_each(JoinHandle::abort);
                 }
                 let _ = dev.disconnect().await;
-                let _ = ev.send(RadioEvent::Disconnected { conn: ConnId(conn) });
+                ev.send(RadioEvent::Disconnected { conn: ConnId(conn) });
             });
             centrals.lock().unwrap().insert(conn, (vec![write, read], addr));
         });
@@ -413,9 +452,9 @@ impl Driver {
 }
 
 /// Reports an advert's service data, if it has the service's.
-fn seen(events: &std_mpsc::Sender<RadioEvent>, addr: Address, data: &HashMap<Uuid, Vec<u8>>) {
+fn seen(events: &Events, addr: Address, data: &HashMap<Uuid, Vec<u8>>) {
     if let Some(d) = data.get(&uuid(SERVICE_UUID)) {
-        let _ = events.send(RadioEvent::Seen { device: device_id(addr), data: d.clone() });
+        events.send(RadioEvent::Seen { device: device_id(addr), data: d.clone() });
     }
 }
 
@@ -423,7 +462,7 @@ fn seen(events: &std_mpsc::Sender<RadioEvent>, addr: Address, data: &HashMap<Uui
 /// stops the session or the node closes it.
 async fn serve_central(
     mut notifier: CharacteristicNotifier,
-    events: std_mpsc::Sender<RadioEvent>,
+    events: Events,
     peripheral: Arc<Mutex<Peripheral>>,
     shared: Arc<Shared>,
 ) {
@@ -438,7 +477,7 @@ async fn serve_central(
     };
     let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
     shared.senders.lock().unwrap().insert(conn, out);
-    let _ = events.send(RadioEvent::Connected { conn: ConnId(conn), device: None, mtu: crate::ble::MIN_ATT_MTU });
+    events.send(RadioEvent::Connected { conn: ConnId(conn), device: None, mtu: crate::ble::MIN_ATT_MTU });
     loop {
         tokio::select! {
             v = queue.recv() => {
@@ -454,7 +493,7 @@ async fn serve_central(
     let mut p = peripheral.lock().unwrap();
     if p.conn == Some(conn) {
         *p = Peripheral::default();
-        let _ = events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
+        events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
     }
 }
 
@@ -470,5 +509,13 @@ mod tests {
         assert_eq!(uuid(SERVICE_UUID).to_string(), "1c3eea41-c2be-493c-ab0b-7707ad2dbed6");
         assert_eq!(uuid(RX_UUID).to_string(), "1c3eea42-c2be-493c-ab0b-7707ad2dbed6");
         assert_eq!(uuid(TX_UUID).to_string(), "1c3eea43-c2be-493c-ab0b-7707ad2dbed6");
+    }
+
+    #[test]
+    fn an_alias_names_the_host_whatever_its_case() {
+        assert!(same_name("laptop", "laptop\n"));
+        assert!(same_name("Laptop", "laptop"));
+        assert!(!same_name("Peerwire", "laptop"));
+        assert!(!same_name("", ""), "no host name to name");
     }
 }

@@ -23,6 +23,7 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::task::Waker;
 use std::time::Duration;
 
 #[cfg(feature = "ble-bluez")]
@@ -86,6 +87,12 @@ pub trait Radio: Send {
     /// What it holds at once. [`Limits::DESKTOP`] unless the driver says otherwise.
     fn limits(&self) -> Limits {
         Limits::DESKTOP
+    }
+    /// Takes a waker to wake whenever it queues an event, so a node asleep until its next timer
+    /// ([`Node::set_waker`](crate::Node::set_waker), [`AsyncNode`](crate::AsyncNode)) polls at once. A driver that
+    /// never wakes it still works: a node with a radio polls at least every 50 ms.
+    fn set_waker(&mut self, waker: Waker) {
+        let _ = waker;
     }
 }
 
@@ -208,6 +215,8 @@ enum Proof {
 
 struct Conn {
     hop: Hop<SocketAddr>,
+    /// Counts the connections made: the newer, the larger.
+    made: u32,
     /// This end is the central.
     central: bool,
     /// The `n` of the other end's advert: the one this end connected to, or the one the central named in its answer.
@@ -335,6 +344,11 @@ impl Ble {
         self.refresh(now);
     }
 
+    /// Hands the radio a waker ([`Radio::set_waker`]).
+    pub(crate) fn set_waker(&mut self, waker: Waker) {
+        self.radio.set_waker(waker);
+    }
+
     /// The next thing for the node to handle.
     pub(crate) fn take(&mut self) -> Option<Inbound> {
         self.out.pop_front()
@@ -343,9 +357,9 @@ impl Ble {
     /// A signal on `conn` proved `peer` a room member: it stays open while unbound. A peer keeps one connection, the
     /// one bound to it if any, else the oldest it was heard on: this one closes if it is another.
     pub(crate) fn heard(&mut self, conn: ConnId, now: Instant, peer: PeerId) {
-        let Some(opened) = self.conns.get(&conn).map(|c| c.opened) else { return };
+        let Some(age) = self.conns.get(&conn).map(|c| (c.opened, c.made)) else { return };
         let other = |(i, c): (&ConnId, &Conn)| {
-            let first = c.bound.is_none() && c.heard_from == Some(peer) && c.opened <= opened;
+            let first = c.bound.is_none() && c.heard_from == Some(peer) && (c.opened, c.made) < age;
             *i != conn && (c.bound == Some(peer) || first)
         };
         if self.conns.iter().any(other) {
@@ -428,25 +442,35 @@ impl Ble {
             return;
         }
         let known = self.conns.values().any(|c| c.n == Some(n)) || self.pending.values().any(|(m, _)| *m == n);
-        if known || self.held.get(&n).is_some_and(|t| now < *t) || !self.room_for(true) {
+        if known || self.held.get(&n).is_some_and(|t| now < *t) || !self.room_out() {
             return;
         }
         self.pending.insert(device, (n, now));
         self.radio.connect(device);
     }
 
-    /// Whether another connection fits: one this end makes (`out`), or a central's.
-    fn room_for(&self, out: bool) -> bool {
+    /// Whether a connection this end makes fits: one more connection, and one more unbound.
+    fn room_out(&self) -> bool {
         let unbound = self.conns.values().filter(|c| c.bound.is_none()).count() + self.pending.len();
-        let centrals = self.conns.values().filter(|c| !c.central).count();
-        self.conns.len() + self.pending.len() < self.limits.connections
-            && unbound < self.limits.unbound
-            && (out || centrals < self.limits.centrals)
+        self.conns.len() + self.pending.len() < self.limits.connections && unbound < self.limits.unbound
     }
 
-    /// Whether this radio takes no central now: its advert says so.
+    /// Whether this radio takes no central now (its advert says so): it holds all the connections it can, or all the
+    /// centrals. A central over the unbound limit is taken, and the oldest unbound connection closes for it (NB110-2).
     fn full(&self) -> bool {
-        !self.room_for(false)
+        let centrals = self.conns.values().filter(|c| !c.central).count();
+        self.conns.len() + self.pending.len() >= self.limits.connections || centrals >= self.limits.centrals
+    }
+
+    /// Closes the oldest connection bound to no peer, if this radio holds as many as it may.
+    fn evict_unbound(&mut self) {
+        let unbound = self.conns.values().filter(|c| c.bound.is_none()).count() + self.pending.len();
+        if unbound >= self.limits.unbound {
+            let oldest = self.conns.iter().filter(|(_, c)| c.bound.is_none()).min_by_key(|(_, c)| (c.opened, c.made));
+            if let Some(&conn) = oldest.map(|(i, _)| i) {
+                self.close(conn);
+            }
+        }
     }
 
     fn on_connected(&mut self, now: Instant, conn: ConnId, device: Option<DeviceId>, mtu: u16) {
@@ -455,8 +479,11 @@ impl Ble {
                 Some((n, _)) => Some(n),
                 None => return self.radio.disconnect(conn), // not one we asked for
             },
-            None if !self.on || !self.room_for(false) => return self.radio.disconnect(conn),
-            None => None,
+            None if !self.on || self.full() => return self.radio.disconnect(conn),
+            None => {
+                self.evict_unbound();
+                None
+            }
         };
         if self.room.is_none() {
             return self.radio.disconnect(conn);
@@ -469,6 +496,7 @@ impl Ble {
         let central = device.is_some();
         let c = Conn {
             hop: Hop::Ble(at),
+            made: self.next_hop,
             central,
             n,
             mtu,
@@ -803,6 +831,7 @@ mod fake {
     use super::{ConnId, DeviceId, Limits, Radio, RadioEvent};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
+    use std::task::Waker;
 
     /// Radios in one process that hear each other's adverts and connect: [`FakeAir::radio`] makes one. Every value
     /// sent arrives, in order, unless the test cuts a radio off.
@@ -825,6 +854,18 @@ mod fake {
         events: VecDeque<RadioEvent>,
         limits: Limits,
         polls: u64,
+        waker: Option<Waker>,
+    }
+
+    impl Air {
+        /// Queues `e` for radio `i`, and wakes it.
+        fn push(&mut self, i: usize, e: RadioEvent) {
+            let s = &mut self.stations[i];
+            s.events.push_back(e);
+            if let Some(w) = &s.waker {
+                w.wake_by_ref();
+            }
+        }
     }
 
     /// One radio on a [`FakeAir`].
@@ -843,7 +884,15 @@ mod fake {
         /// A new radio on it, with these limits.
         pub fn radio(&self, limits: Limits) -> FakeRadio {
             let mut air = self.0.lock().unwrap();
-            let s = Station { advert: None, scanning: false, off: false, events: VecDeque::new(), limits, polls: 0 };
+            let s = Station {
+                advert: None,
+                scanning: false,
+                off: false,
+                events: VecDeque::new(),
+                limits,
+                polls: 0,
+                waker: None,
+            };
             air.stations.push(s);
             FakeRadio { air: self.clone(), me: air.stations.len() - 1 }
         }
@@ -858,8 +907,8 @@ mod fake {
                 for (a, b) in ends {
                     air.links.remove(&a);
                     air.links.remove(&b);
-                    air.stations[a.0].events.push_back(RadioEvent::Disconnected { conn: ConnId(a.1) });
-                    air.stations[b.0].events.push_back(RadioEvent::Disconnected { conn: ConnId(b.1) });
+                    air.push(a.0, RadioEvent::Disconnected { conn: ConnId(a.1) });
+                    air.push(b.0, RadioEvent::Disconnected { conn: ConnId(b.1) });
                 }
             }
         }
@@ -867,6 +916,11 @@ mod fake {
         /// Connections open (each counted once).
         pub fn links(&self) -> usize {
             self.0.lock().unwrap().links.len() / 2
+        }
+
+        /// The radio at the other end of radio `i`'s connection `conn`.
+        pub fn peer_of(&self, i: usize, conn: ConnId) -> Option<usize> {
+            self.0.lock().unwrap().links.get(&(i, conn.0)).map(|l| l.0)
         }
 
         /// What radio `i` advertises.
@@ -898,7 +952,7 @@ mod fake {
                 && !air.stations[self.me].off
                 && air.stations.get(to).is_some_and(|s| s.advert.is_some() && !s.off);
             if !reachable {
-                air.stations[self.me].events.push_back(RadioEvent::ConnectFailed { device });
+                air.push(self.me, RadioEvent::ConnectFailed { device });
                 return;
             }
             let (a, b) = (air.next, air.next + 1);
@@ -906,16 +960,14 @@ mod fake {
             air.links.insert((self.me, a), (to, b));
             air.links.insert((to, b), (self.me, a));
             let mtu = air.mtu;
-            let ours = RadioEvent::Connected { conn: ConnId(a), device: Some(device), mtu };
-            air.stations[self.me].events.push_back(ours);
-            air.stations[to].events.push_back(RadioEvent::Connected { conn: ConnId(b), device: None, mtu });
+            air.push(self.me, RadioEvent::Connected { conn: ConnId(a), device: Some(device), mtu });
+            air.push(to, RadioEvent::Connected { conn: ConnId(b), device: None, mtu });
         }
 
         fn send(&mut self, conn: ConnId, value: &[u8]) -> bool {
             let mut air = self.air.0.lock().unwrap();
             if let Some(&(to, theirs)) = air.links.get(&(self.me, conn.0)) {
-                let value = value.to_vec();
-                air.stations[to].events.push_back(RadioEvent::Value { conn: ConnId(theirs), value });
+                air.push(to, RadioEvent::Value { conn: ConnId(theirs), value: value.to_vec() });
             }
             true
         }
@@ -924,7 +976,7 @@ mod fake {
             let mut air = self.air.0.lock().unwrap();
             if let Some(other) = air.links.remove(&(self.me, conn.0)) {
                 air.links.remove(&other);
-                air.stations[other.0].events.push_back(RadioEvent::Disconnected { conn: ConnId(other.1) });
+                air.push(other.0, RadioEvent::Disconnected { conn: ConnId(other.1) });
             }
         }
 
@@ -953,13 +1005,17 @@ mod fake {
         fn limits(&self) -> Limits {
             self.air.0.lock().unwrap().stations[self.me].limits
         }
+
+        fn set_waker(&mut self, waker: Waker) {
+            self.air.0.lock().unwrap().stations[self.me].waker = Some(waker);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use peerwire_core::{Config, Identity, Lane};
+    use peerwire_core::{Config, Identity, Lane, Path};
 
     fn id(n: u8) -> Identity {
         Identity::from_secret_bytes(&[n; 32])
@@ -988,6 +1044,106 @@ mod tests {
         assert_eq!(open(&key, 1, 1, &s), None, "the other direction's nonce");
         assert_eq!(open(&key, 0, 2, &s), None, "another seq");
         assert_eq!(open(&[8u8; 32], 0, 1, &s), None, "another connection's key");
+    }
+
+    #[test]
+    fn a_radio_wakes_its_node_when_something_comes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let air = FakeAir::new(23);
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let (mut a, mut b) = (air.radio(Limits::DESKTOP), air.radio(Limits::DESKTOP));
+        a.advertise(Some(&[0; ADVERT_LEN]));
+        a.set_waker(count.clone().into());
+        b.connect(DeviceId(0));
+        assert_eq!(count.0.load(Ordering::Relaxed), 1, "a central connected");
+        let Some(RadioEvent::Connected { conn, .. }) = b.poll() else { panic!() };
+        b.send(conn, b"x");
+        assert_eq!(count.0.load(Ordering::Relaxed), 2, "a value came");
+    }
+
+    /// NB110-1: Alice and Bob linked over their connection, and Mallory, a member, connected to Bob too. Mallory
+    /// takes Alice's next packet before Bob has it and sends it over her own connection: Bob drops it unread, his
+    /// link to Alice stays where it is, Mallory's connection isn't bound to Alice and Alice's isn't closed; the real
+    /// packet, when it comes, still reads.
+    #[test]
+    fn a_member_cannot_move_another_link_onto_its_connection() {
+        let air = FakeAir::new(185);
+        let mut now = Instant::from_millis(1);
+        let limits = Limits { centrals: 3, ..Limits::DESKTOP };
+        let room = Some((ble_key("app", "room"), Topic::room("app", "room")));
+        let mut b: Vec<Ble> = (1..=3)
+            .map(|i| {
+                let mut b = Ble::new(Box::new(air.radio(limits)), id(i).peer_id(), now);
+                b.set_room(now, room);
+                b
+            })
+            .collect();
+        let mut eps: Vec<Endpoint<Hop<SocketAddr>>> =
+            (1..=3).map(|i| Endpoint::new(&id(i), Config::default(), [i; 32])).collect();
+        let step = |b: &mut [Ble], eps: &mut [Endpoint<Hop<SocketAddr>>], now: Instant, hold: bool| {
+            let mut held = Vec::new();
+            for i in 0..b.len() {
+                while let Some(t) = eps[i].poll_transmit(now) {
+                    if let Hop::Ble(at) = t.dst {
+                        match hold && i == 0 {
+                            true => held.push((at, t.payload)),
+                            false => b[i].send_datagram(&at, &t.payload),
+                        }
+                    }
+                }
+                b[i].poll(now, &mut eps[i]);
+                while b[i].take().is_some() {}
+                eps[i].handle_timeout(now);
+            }
+            held
+        };
+        for _ in 0..200 {
+            step(&mut b, &mut eps, now, false);
+            now = now + Duration::from_millis(10);
+        }
+        assert!(b.iter().all(|b| b.counts() == (2, 2, 0)), "each linked to the other two by the radio");
+        // Alice dials Bob over both her connections; the one to Bob binds.
+        let (alice, bob) = (id(1).peer_id(), id(2).peer_id());
+        let hops: Vec<Hop<SocketAddr>> = b[0].conns.values().map(|c| c.hop).collect();
+        eps[0].connect_with(now, bob, &hops.iter().map(|h| Path::Direct(*h)).collect::<Vec<_>>()).unwrap();
+        for _ in 0..200 {
+            step(&mut b, &mut eps, now, false);
+            now = now + Duration::from_millis(10);
+        }
+        assert!(eps[0].is_connected(&bob) && eps[1].is_connected(&alice));
+        assert_eq!((b[0].counts().2, b[1].counts().2), (1, 1), "bound at both ends");
+        let path = eps[1].path(&alice).cloned();
+        // Mallory's connection to Bob.
+        let to_bob = b[2].conns.iter().find(|(i, _)| air.peer_of(2, **i) == Some(1)).map(|(_, c)| c.hop);
+        let Some(Hop::Ble(to_bob)) = to_bob else { panic!("Mallory is connected to Bob") };
+        eps[0].send(&bob, Lane::Reliable, b"for bob").unwrap();
+        let held = step(&mut b, &mut eps, now, true);
+        assert_eq!(held.len(), 1, "Alice's packet, taken");
+        let wrong = eps[1].stats().rx_wrong_peer;
+        b[2].send_datagram(&to_bob, &held[0].1);
+        for _ in 0..5 {
+            step(&mut b, &mut eps, now, false);
+            now = now + Duration::from_millis(10);
+        }
+        assert_eq!(eps[1].stats().rx_wrong_peer, wrong + 1, "dropped unread");
+        assert_eq!(eps[1].path(&alice).cloned(), path, "the link stays where it was");
+        assert_eq!(b[1].counts(), (2, 2, 1), "Mallory's isn't bound to Alice, and Alice's is still open");
+        assert!(std::iter::from_fn(|| eps[1].poll_event()).all(|e| !matches!(e, peerwire_core::Event::Message { .. })));
+        b[0].send_datagram(&held[0].0, &held[0].1);
+        for _ in 0..5 {
+            step(&mut b, &mut eps, now, false);
+            now = now + Duration::from_millis(10);
+        }
+        let got = std::iter::from_fn(|| eps[1].poll_event())
+            .any(|e| matches!(e, peerwire_core::Event::Message { data, .. } if data == b"for bob"));
+        assert!(got, "the real packet still reads");
     }
 
     #[test]
@@ -1042,9 +1198,14 @@ mod tests {
 
     #[test]
     fn members_connect_once_prove_the_room_and_carry_sealed_signals() {
+        // Who connects turns on random values: many pairs, never two connections.
+        for _ in 0..20 {
+            let mut p = Pair::new(["room", "room"]);
+            p.run(500);
+            assert_eq!(p.air.links(), 1, "one connection, made by the smaller n");
+        }
         let mut p = Pair::new(["room", "room"]);
         p.run(500);
-        assert_eq!(p.air.links(), 1, "one connection, made by the smaller n");
         assert!(p.b.iter().all(|b| b.counts() == (1, 1, 0)), "proven, bound to no one");
         let room = Topic::room("app", "room");
         p.b[0].publish(room, b"hello from 1");
@@ -1113,8 +1274,10 @@ mod tests {
         assert_eq!(node.counts(), (0, 0, 0));
     }
 
+    /// NB110-2: a central over the unbound limit is taken, and the oldest unbound connection closes for it, so held
+    /// slots can't lock newcomers out; over the limit of centrals it is refused, and the advert says so.
     #[test]
-    fn unbound_connections_beyond_the_limit_are_refused() {
+    fn a_central_over_the_unbound_limit_evicts_the_oldest() {
         let air = FakeAir::new(23);
         let now = Instant::from_millis(1);
         let limits = Limits { connections: 8, unbound: 2, centrals: 8, queue: 64 };
@@ -1128,10 +1291,26 @@ mod tests {
             node.poll(now, &mut ep);
         }
         assert_eq!(node.counts().0, 2);
-        assert_eq!(air.advert(0).map(|a| a[0] & FULL), Some(FULL), "the advert says it is full");
-        let last = rogues[2].poll();
-        assert!(matches!(last, Some(RadioEvent::Connected { .. })));
-        assert!(matches!(rogues[2].poll(), Some(RadioEvent::Disconnected { .. })));
+        let events = |r: &mut FakeRadio| std::iter::from_fn(|| r.poll()).collect::<Vec<_>>();
+        let gone = |e: &Vec<RadioEvent>| e.iter().any(|e| matches!(e, RadioEvent::Disconnected { .. }));
+        let seen: Vec<Vec<RadioEvent>> = rogues.iter_mut().map(events).collect();
+        assert_eq!(seen.iter().map(gone).collect::<Vec<_>>(), [true, false, false], "the first one went");
+        assert_eq!(air.advert(0).map(|a| a[0] & FULL), Some(0), "not full: it takes centrals");
+
+        let one = Limits { centrals: 2, ..limits };
+        let mut node = Ble::new(Box::new(air.radio(one)), id(1).peer_id(), now);
+        node.set_room(now, Some((ble_key("app", "room"), Topic::room("app", "room"))));
+        node.poll(now, &mut ep);
+        let at = DeviceId(4); // the fifth radio on the air
+        let mut more: Vec<FakeRadio> = (0..3).map(|_| air.radio(one)).collect();
+        for r in &mut more {
+            r.connect(at);
+            node.poll(now, &mut ep);
+        }
+        assert_eq!(node.counts().0, 2, "two centrals at most");
+        assert_eq!(air.advert(4).map(|a| a[0] & FULL), Some(FULL), "the advert says it is full");
+        let seen: Vec<Vec<RadioEvent>> = more.iter_mut().map(events).collect();
+        assert_eq!(seen.iter().map(gone).collect::<Vec<_>>(), [false, false, true], "the third is refused");
     }
 
     #[test]

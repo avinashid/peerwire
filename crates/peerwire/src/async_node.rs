@@ -3,8 +3,10 @@ use peerwire_core::{Lane, PeerId, SendError};
 use std::io::{self, ErrorKind};
 use std::net::ToSocketAddrs;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::Interest;
+use tokio::sync::Notify;
 
 /// Longest sleep when no timer is armed; readiness wakes the node before that.
 const IDLE: Duration = Duration::from_secs(3600);
@@ -34,6 +36,19 @@ pub struct AsyncNode {
     node: Node,
     /// A clone of the node's socket, registered with tokio only to learn when it is readable.
     io: tokio::net::UdpSocket,
+    /// What the node's radio wakes (feature `ble`, [`Node::set_waker`]).
+    wake: Arc<Notify>,
+}
+
+/// Wakes an [`AsyncNode`] from its radio's driver.
+#[cfg(feature = "ble")]
+struct Wake(Arc<Notify>);
+
+#[cfg(feature = "ble")]
+impl std::task::Wake for Wake {
+    fn wake(self: Arc<Self>) {
+        self.0.notify_one();
+    }
 }
 
 impl AsyncNode {
@@ -44,13 +59,16 @@ impl AsyncNode {
 
     /// Drives an existing node (one made with [`Node::bind_with`], say) from tokio.
     /// Call it inside a tokio runtime.
-    pub fn from_node(node: Node) -> io::Result<AsyncNode> {
+    pub fn from_node(#[allow(unused_mut)] mut node: Node) -> io::Result<AsyncNode> {
         let io = tokio::net::UdpSocket::from_std(node.socket().try_clone()?)?;
-        Ok(AsyncNode { node, io })
+        let wake = Arc::new(Notify::new());
+        #[cfg(feature = "ble")]
+        node.set_waker(Arc::new(Wake(wake.clone())).into());
+        Ok(AsyncNode { node, io, wake })
     }
 
-    /// Waits for the next event: reads the socket when it is readable and fires the
-    /// node's timers when they are due. Cancel-safe, so it can sit in a `select!`
+    /// Waits for the next event: reads the socket when it is readable, takes what its radio has (feature `ble`) when
+    /// the radio wakes it, and fires the node's timers when they are due. Cancel-safe, so it can sit in a `select!`
     /// next to other work; no event is lost when it is dropped.
     pub async fn next_event(&mut self) -> Event {
         loop {
@@ -70,6 +88,7 @@ impl AsyncNode {
                         tokio::task::yield_now().await;
                     }
                 }
+                _ = self.wake.notified() => self.node.poll(),
                 _ = tokio::time::sleep(wait) => self.node.poll(),
             }
         }
