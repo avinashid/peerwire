@@ -1728,15 +1728,14 @@ impl<A: Address> Traversal<A> {
     /// allocation that is gone. A link from the socket goes on at once through an allocation ([`Endpoint::retag`]),
     /// to the address it is at if one relays there, else to another of the peer's (NB101-I1), so nothing more of it
     /// leaves the socket, and is dialled again through the allocations and the relay ([`Endpoint::redial`]), as the
-    /// peer still sends to the socket. With no allocation to go through, it is closed unannounced and dialled afresh
-    /// through the relay, if one is linked. A link with nowhere to go, or whose move fails or hasn't happened in 6 s,
-    /// is closed ([`poll_dropped`](Traversal::poll_dropped)): never moved to a path that shows this node's address.
+    /// peer still sends to the socket; one a policy change is moving already keeps that dial (NB101-I2). With no
+    /// allocation to go through, it is closed unannounced and dialled afresh through the relay, if one is linked. A
+    /// link with nowhere to go, or whose move fails or hasn't happened in 6 s, is closed
+    /// ([`poll_dropped`](Traversal::poll_dropped)): never moved to a path that shows this node's address.
     fn hide(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: PeerId) {
         let Some(path) = ep.path(&peer).cloned() else { return };
         let r = self.remotes.entry(peer).or_default();
-        if r.moving.is_some() {
-            return;
-        }
+        let moving = r.moving.is_some();
         let (mut addrs, relayed) = (r.addrs.clone(), r.relayed.clone());
         // The address it is at, first.
         let at = path.direct().and_then(|a| A::from_socket_addr(a.to_socket_addr()?));
@@ -1757,6 +1756,12 @@ impl<A: Address> Traversal<A> {
                     return;
                 }
             }
+        }
+        if moving {
+            if let Some(r) = self.remotes.get_mut(&peer) {
+                r.hide = true;
+            }
+            return;
         }
         let mut targets: Vec<Path<A>> = relay.into_iter().collect();
         targets.extend(turn);
@@ -5095,6 +5100,62 @@ mod tests {
                 None => assert!(sent.is_empty()),
             }
         }
+    }
+
+    /// NB101-I2: `RelayOnly` turned on with TURN on, for a link a policy change is moving: `[Turn]` alone dials a link
+    /// at b's address again, through the allocation and from the socket to b's relayed address, and a second later,
+    /// that dial unanswered, `RelayOnly` comes on. The link goes on through the allocation at once, as one not moving
+    /// does, and nothing more of it or the dial leaves this node's socket, the app's data included (unfixed: the link
+    /// stayed there, 9 datagrams before the close). The move isn't dialled again: still unanswered, it closes the
+    /// link at `MOVE_WAIT` after the policy change, not later.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn relay_only_takes_a_link_mid_move_off_its_socket() {
+        let (me, b_at, b_relayed, s): (SocketAddr, SocketAddr, SocketAddr, SocketAddr) = (
+            "192.0.2.10:7000".parse().unwrap(),
+            "203.0.113.2:7000".parse().unwrap(),
+            "198.51.100.30:52000".parse().unwrap(),
+            "198.51.100.1:3478".parse().unwrap(),
+        );
+        let (b, through) = (id(2).peer_id(), Hop::Turn { server: s, peer: b_at });
+        let (mut t, _, _) = with_allocation();
+        let [mut ea, _] = hop_link(Hop::Net(me), Hop::Net(b_at));
+        let r = t.remotes.entry(b).or_default();
+        (r.addrs, r.relayed) = (vec![Hop::Net(b_at)], vec![Hop::Net(b_relayed)]);
+        let (moved, mut now) = (Instant::from_millis(500), Instant::from_millis(500));
+        std::iter::from_fn(|| ea.poll_event()).for_each(drop);
+        t.set_policy(now, &mut ea, Some(Policy::new([PathKind::Turn])));
+        let moving = t.remotes.get(&b).and_then(|r| r.moving);
+        assert_eq!((moving, ea.path(&b)), (Some(moved + MOVE_WAIT), Some(&Path::Direct(Hop::Net(b_at)))));
+        let step = |t: &mut Traversal<Hop<SocketAddr>>, ea: &mut Endpoint<Hop<SocketAddr>>, now: &mut Instant| {
+            let sent: Vec<Hop<SocketAddr>> = std::iter::from_fn(|| ea.poll_transmit(*now)).map(|tx| tx.dst).collect();
+            *now = *now + Duration::from_millis(100);
+            ea.handle_timeout(*now);
+            for e in std::iter::from_fn(|| ea.poll_event()).collect::<Vec<_>>() {
+                t.handle_event(*now, ea, &e);
+            }
+            t.handle_timeout(*now, ea);
+            (sent, t.poll_dropped())
+        };
+        let mut before = Vec::new();
+        for _ in 0..10 {
+            let (out, dropped) = step(&mut t, &mut ea, &mut now);
+            assert_eq!(dropped, None, "a link from the socket, moving");
+            before.extend(out);
+        }
+        assert!(before.contains(&through) && before.contains(&Hop::Relayed(b_relayed)), "{before:?}");
+        t.set_privacy(now, &mut ea, Privacy::RelayOnly { via: None });
+        assert_eq!(ea.path(&b), Some(&Path::Direct(through)), "at once");
+        ea.send(&b, peerwire_core::Lane::Reliable, b"after the switch").unwrap();
+        let (mut sent, mut closed) = (Vec::new(), None);
+        for _ in 0..65 {
+            let (out, dropped) = step(&mut t, &mut ea, &mut now);
+            sent.extend(out);
+            closed = closed.or(dropped.map(|p| (p, now)));
+        }
+        sent.extend(std::iter::from_fn(|| ea.poll_transmit(now)).map(|tx| tx.dst));
+        assert!(sent.contains(&through) && sent.iter().all(|d| d.own_turn()), "{sent:?}");
+        assert_eq!((closed, ea.is_connected(&b)), (Some((b, moved + MOVE_WAIT)), false), "unanswered, closed");
     }
 
     /// NB101-I1: under `RelayOnly` with TURN on, `hang_up` closes a link through an allocation, and the relay's link
