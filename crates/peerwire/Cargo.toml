@@ -48,7 +48,8 @@ default = ["turn"]
 turn = ["peerwire-core/turn"]
 tokio = ["dep:tokio"]
 nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:serde_json"]
-# Test hooks for bindings (Builder::port_mapping_at, a fake gateway's address). Not for apps.
+# Test hooks (Builder::port_mapping_at, a fake gateway's address; Node::note_sources, where the socket's datagrams
+# came from). Not for apps.
 testing = []
 
 [lints.rust]
@@ -57,8 +58,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docs_samples)"] }
 
 [dev-dependencies]
 peerwire-core = { path = "../peerwire-core" }
-# Tests and examples cover the async host and Nostr signaling too.
-peerwire = { path = ".", features = ["tokio", "nostr"] }
+# Tests and examples cover the async host and Nostr signaling too, and tests use the test hooks (Node::sources).
+peerwire = { path = ".", features = ["tokio", "nostr", "testing"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
 # The fuzz harness (peerwire_sim::fuzz); a dev-only cycle, the harness deals in bytes.
 peerwire-sim = { path = "../peerwire-sim" }
