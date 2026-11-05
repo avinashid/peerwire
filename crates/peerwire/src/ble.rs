@@ -43,20 +43,26 @@ pub struct ConnId(pub u32);
 pub struct Limits {
     /// Connections, in either role.
     pub connections: usize,
-    /// Of those, ones not yet proven or bound to a peer: more are closed at once.
+    /// Of those, ones not yet proven or bound to a peer: a central beyond this closes the oldest of them.
     pub unbound: usize,
     /// Of those, ones a central made to this radio.
     pub centrals: usize,
     /// GATT values queued to send on one connection: more are dropped, never waited for.
     pub queue: usize,
+    /// New handshakes (distinct HS1s) taken on unbound connections, across the radio: `unbound` at once, then one per
+    /// this. Each costs the node a Diffie-Hellman before it can tell who sent it (BLE-R9).
+    pub hs1_gap: Duration,
 }
 
 impl Limits {
     /// A desktop's: 8 connections, 4 unbound, one central (BlueZ sends a notification to every subscribed central),
-    /// 64 values queued.
-    pub const DESKTOP: Limits = Limits { connections: 8, unbound: 4, centrals: 1, queue: 64 };
-    /// A small board's, such as an ESP32's: 3 connections, 2 unbound, 16 values queued.
-    pub const SMALL: Limits = Limits { connections: 3, unbound: 2, centrals: 3, queue: 16 };
+    /// 64 values queued, a new handshake per 250 ms.
+    pub const DESKTOP: Limits =
+        Limits { connections: 8, unbound: 4, centrals: 1, queue: 64, hs1_gap: Duration::from_millis(250) };
+    /// A small board's, such as an ESP32's: 3 connections, 2 unbound, 16 values queued, a new handshake per 2 s (an
+    /// ESP32-C3 answers one in 156 ms, so about 8% of it).
+    pub const SMALL: Limits =
+        Limits { connections: 3, unbound: 2, centrals: 3, queue: 16, hs1_gap: Duration::from_secs(2) };
 }
 
 impl Default for Limits {
@@ -291,6 +297,8 @@ pub(crate) struct Ble {
     /// judged again without its tag checked again.
     seen: VecDeque<(DeviceId, [u8; ADVERT_LEN], Instant, bool)>,
     adverts: Bucket,
+    /// New handshakes on unbound connections, across the radio ([`Limits::hs1_gap`]).
+    hs1s: Bucket,
     out: VecDeque<Inbound>,
 }
 
@@ -315,6 +323,7 @@ impl Ble {
             held: HashMap::new(),
             seen: VecDeque::new(),
             adverts: Bucket::default(),
+            hs1s: Bucket::default(),
             out: VecDeque::new(),
         }
     }
@@ -642,7 +651,13 @@ impl Ble {
                             return self.dropped(conn, 1);
                         }
                         Some((first, _)) if first == id => {}
-                        _ => c.hs1 = Some((id, now)),
+                        _ => {
+                            let burst = u32::try_from(self.limits.unbound).unwrap_or(u32::MAX);
+                            if !self.hs1s.take(now, burst, self.limits.hs1_gap) {
+                                return self.dropped(conn, 1);
+                            }
+                            c.hs1 = Some((id, now));
+                        }
                     }
                 }
                 if let Some(peer) = ep.handle_datagram_unbound(now, c.hop, d) {
@@ -1146,6 +1161,67 @@ mod tests {
         assert!(got, "the real packet still reads");
     }
 
+    /// A central of the test's that knows the room's key: connects to radio `to`, proves the room, and sends `datagram`
+    /// once proven. Returns its connection.
+    fn member_sends(
+        rogue: &mut FakeRadio,
+        to: DeviceId,
+        node: &mut Ble,
+        ep: &mut Endpoint<Hop<SocketAddr>>,
+        t: Instant,
+        datagram: &[u8],
+    ) -> ConnId {
+        let key = ble_key("app", "room");
+        rogue.connect(to);
+        let Some(RadioEvent::Connected { conn, .. }) = rogue.poll() else { panic!() };
+        let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
+        let mut read = |rogue: &mut FakeRadio, node: &mut Ble, ep: &mut Endpoint<Hop<SocketAddr>>| {
+            node.poll(t, ep);
+            std::iter::from_fn(|| rogue.poll())
+                .filter_map(|e| match e {
+                    RadioEvent::Value { value, .. } => rx.push(t, &value).map(<[u8]>::to_vec),
+                    _ => None,
+                })
+                .last()
+        };
+        let challenge = read(rogue, node, ep).expect("a challenge");
+        assert_eq!(challenge[0], KIND_CHALLENGE);
+        let (c_p, c_c, n) = (&challenge[1..], [9u8; CHALLENGE], 0u32.to_le_bytes());
+        let mac = hmac(&key, &[b"pw-ble-c", c_p, &c_c, &n]);
+        tx.split(&[&[KIND_ANSWER][..], &c_c, &n, &mac].concat(), 23, |v| rogue.send(conn, v));
+        assert_eq!(read(rogue, node, ep).map(|m| m[0]), Some(KIND_PROOF), "proven");
+        tx.split(&[&[KIND_DATAGRAM], datagram].concat(), 23, |v| rogue.send(conn, v));
+        node.poll(t, ep);
+        conn
+    }
+
+    /// The lead's R9 case (156 ms per HS1 on an ESP32-C3): a member that reconnects after each new handshake gets a
+    /// fresh connection each time, so the radio budgets new handshakes on unbound connections across all of them.
+    #[test]
+    fn new_handshakes_are_budgeted_across_unbound_connections() {
+        let air = FakeAir::new(23);
+        let now = Instant::from_millis(1);
+        let limits = Limits { unbound: 2, centrals: 3, hs1_gap: Duration::from_secs(2), ..Limits::SMALL };
+        let mut node = Ble::new(Box::new(air.radio(limits)), id(1).peer_id(), now);
+        node.set_room(now, Some((ble_key("app", "room"), Topic::room("app", "room"))));
+        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
+        node.poll(now, &mut ep);
+        let mut rogue = air.radio(Limits::DESKTOP);
+        let mut sessions = Vec::new();
+        for (i, t) in [0u64, 0, 0, 0, 2_000].into_iter().enumerate() {
+            let t = now + Duration::from_millis(t);
+            let seed = [20 + i as u8; 32]; // each its own ephemeral key: a new handshake, not a resend
+            let mut dialler = Endpoint::<Hop<SocketAddr>>::new(&id(10 + i as u8), Config::default(), seed);
+            dialler.connect(t, Hop::Ble("0.0.0.9:0".parse().unwrap()), id(1).peer_id()).unwrap();
+            let hs1 = dialler.poll_transmit(t).unwrap().payload;
+            let conn = member_sends(&mut rogue, DeviceId(0), &mut node, &mut ep, t, &hs1);
+            sessions.push(ep.session_count());
+            rogue.disconnect(conn);
+            node.poll(t, &mut ep);
+        }
+        assert_eq!(sessions, [1, 2, 2, 2, 3], "two at once, then one per 2 s");
+    }
+
     #[test]
     fn a_bucket_gives_its_burst_then_refills() {
         let mut b = Bucket::default();
@@ -1280,7 +1356,7 @@ mod tests {
     fn a_central_over_the_unbound_limit_evicts_the_oldest() {
         let air = FakeAir::new(23);
         let now = Instant::from_millis(1);
-        let limits = Limits { connections: 8, unbound: 2, centrals: 8, queue: 64 };
+        let limits = Limits { unbound: 2, centrals: 8, ..Limits::DESKTOP };
         let mut node = Ble::new(Box::new(air.radio(limits)), id(1).peer_id(), now);
         node.set_room(now, Some((ble_key("app", "room"), Topic::room("app", "room"))));
         let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);

@@ -180,6 +180,7 @@ puts a link on.
 | Time to prove the room | 10 s, then the connection closes | same |
 | A proven connection bound to no peer | open while a signal proves a member at least every 60 s | same |
 | Distinct HS1s on an unbound connection | 1 per 10 s (a half-open handshake's life); its resends pass | same |
+| Distinct HS1s on unbound connections, across the radio | 4 at once, then one per 250 ms | 2, then one per 2 s (a C3 answers one in 156 ms: about 8% of it) |
 | HS1s on a bound connection | a burst of 4, then one per 5 s | same |
 | Signals taken per connection | a burst of 16, then one per 500 ms; the rest dropped before any cryptography | same |
 | Messages dropped or refused before the connection closes | 32 | same |
