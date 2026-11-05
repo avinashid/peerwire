@@ -102,6 +102,11 @@ path = "../../examples/rust/room_chat.rs"
 required-features = ["nostr"]
 
 [[example]]
+name = "ble_chat"
+path = "../../examples/rust/ble_chat.rs"
+required-features = ["ble-bluez"]
+
+[[example]]
 name = "doctor"
 path = "../../examples/rust/doctor.rs"
 required-features = ["nostr"]

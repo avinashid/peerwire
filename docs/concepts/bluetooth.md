@@ -281,6 +281,22 @@ tests use an in-process pair of fake radios.
   (`device.name`, `device.id`) goes into signaling or is trusted: identity comes from Noise alone. The page runs the
   room proof, the codec (from the wasm) and the binding rules as above.
 
+## Try it
+
+`ble_chat` (`examples/rust/ble_chat.rs`) joins a room over the radio and the LAN on Linux, and prints the path each
+link takes (`Direct` over UDP, `Bluetooth` over the radio), again each time it moves. Run it on two machines nearby,
+or beside an ESP32 in the same room (`room_chat`'s rooms, app `peerwire-lan-chat`):
+
+```sh
+cargo run -p peerwire --features ble-bluez --example ble_chat -- kitchen            # UDP first, the radio as well
+cargo run -p peerwire --features ble-bluez --example ble_chat -- kitchen --no-udp   # Bluetooth only
+```
+
+`--no-udp` gives the node no LAN carrier and the policy `[PathKind::Bluetooth]`, so its links stay on the radio even
+where UDP works: the node leaves its UDP socket unused, and answers none of the peer's dials or punches there.
+At start it prints the adapter's alias, which centrals read as its name, and warns when that is the host name.
+Building it needs a C compiler for `libdbus` (built from source); running it, `bluetoothd` and a powered adapter.
+
 ## Not yet
 
 - L2CAP connection-oriented channels, which are faster but missing from Web Bluetooth.
