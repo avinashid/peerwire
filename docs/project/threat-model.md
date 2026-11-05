@@ -158,7 +158,8 @@ release of each.
 | NB62-2 (Info in the emulator, High on a board) | **Fixed** on a board by `c5e13b7` (NB-091), merged `4697a77`: the firmware starts Wi-Fi, with modem sleep off, before any random draw, reviewed 2026-11-03; in QEMU the draws still repeat on every chip (accepted), and the order is the firmware's, not the library's; NB-095's relay carrier draws after Wi-Fi too, reviewed 2026-11-04, same section |
 | NB95-1 (Medium on a board), NB95-2, NB95-3, NB95-4 (Low), NB95-5, NB95-I1 (Info) | **Fixed** by `0b909e3` and `d5c2cfb` before NB-095 merged: on ESP-IDF a relay message is at most 4 KiB and the inbox 16 KiB, and on every target a message of more than 64 `[`, `{` and `,` is dropped unparsed; relay writes time out after 5 s; the relay thread runs at the main task's priority; the firmware goes on the relay only in a room its flash names, random by default; the log escapes members' bytes; NB95-I1 is documented (its fix is SEC-5's), reviewed 2026-11-04, [Several carriers](#several-carriers-and-the-esp32-on-nostr-nb-095--nb95-1nb95-6) |
 | NB95-1a, NB95-6 (Low) | **Fixed** by `51d3ba9` and `a777178` before NB-095 merged: a relay message with more than 2 `{` or 8 `[` is dropped unparsed too; the firmware forgets the address of a peer that left, reviewed 2026-11-04, same section |
-| NB95-I2 (Info) | Open (NB-095): the firmware's own SNTP ask checks its answer, but lwIP's SNTP, which keeps the clock in step after boot, takes a time from any device on the LAN; the Node reads the clock only at `bind`, so this reaches the relay carrier's TLS and timestamps, not the replay guard, same section |
+| NB95-I2 (Info) | **Fixed** by `4c71c67` (NB-103, merged `9b3959b`): the firmware never starts lwIP's SNTP; its own ask, at boot and every 6 hours, takes only an answer from the address and port asked that echoes its 8 random bytes, refuses leap indicator 3 and stratum 0 or 16 and up, and reads era 1, reviewed 2026-11-05; one answer still sets the clock, so the server asked or anyone on the path can, same section |
+| NB103-I1, NB103-I2 (Info) | Open (NB-103): an answer whose seconds fall in 1968–1969 wraps `ntp::time`'s subtraction, which panics in a debug build and passes the 2023-11-14 floor in a release one, though only the server asked or the path can send it; a Node bound when no server answered at boot keeps 1970 until the board reboots, as the re-asks don't reach it, same section |
 | NB98-1, NB98-2 (Low) | **Fixed** by `3e055f1` before NB-098 merged, so never on main (a call's connections take a policy set live, restart ICE on our side when it turns `'direct'` or `'turn'` off or brings new servers, and fail `'no-path'` if still on a path now off 20 s later; relay urls are parsed with `new URL()`, and every check in `setPolicy` comes before the policy is set), reviewed 2026-11-04; residuals accepted, [Connection policy](#connection-policy-nb-098--nb98-1-nb98-2) |
 | NB98-I1, NB98-I2, NB98-I3, NB98-I4 (Info) | NB98-I1, NB98-I3 **fixed** by `3e055f1` (a link dropped as it came up leaves no proof deadline; without `'direct'` links and calls send relay candidates alone, with no related address and no port prediction, whatever WebRTC gathers); NB98-I4 fixed by it on the dialling side, while the answering side's kept link keeps its old session until the dialler restarts; NB98-I2 documented (an order binds the dialling side only), same section |
 | NB97-1 (Low) | **Fixed** by `a00fff5` before NB-097 merged, so never on main (the node drops what came in with a link it refuses, and holds a new link's `AddrObserved`, and the `Replaced` of the link it replaces, until its `Connected` says whether it is admitted), reviewed 2026-11-04, [Connection policy in Rust](#connection-policy-in-rust-nb-097--nb97-1) |
@@ -3473,9 +3474,10 @@ Residuals:
 - The two-chip nonce test needs a second board. By reading, the nonces come from the
   traversal seed, drawn after Wi-Fi.
 - The relay's TLS checks certificates against the clock, which SNTP sets without
-  authentication: at boot anyone on the path, and after it any device on the LAN, can
-  set the board's clock (NB95-I2). TLS then fails closed or, with the clock set back,
-  accepts a certificate expired since (Info, accepted for the prototype).
+  authentication: anyone on the path at an ask, at boot or at a re-ask every 6 hours,
+  can set the board's clock (NB95-I2; since `4c71c67` a device on the LAN off the path
+  can't). TLS then fails closed or, with the clock set back, accepts a certificate
+  expired since (Info, accepted for the prototype).
 
 ### Several carriers, and the ESP32 on Nostr (NB-095) — NB95-1…NB95-6
 
@@ -3752,6 +3754,70 @@ relay carrier's uses bear a drift of about a second a day, or re-ask with `ask_n
 every few hours; skip leap indicator 3 and stratum 16 or more; read a seconds field
 under `1 << 31` as era 1 (RFC 4330 §3); and, for the Node, take the time only when two
 servers agree within a few seconds.
+
+**Status: fixed** by `4c71c67` (NB-103, merged `9b3959b`), reviewed 2026-11-05 by
+reading `272c7b0` and ESP-IDF v5.5.5, with the host tests of `src/ntp.rs` run. The
+firmware is now the `peerwire-esp` crate (`ports/esp32`), and it never starts lwIP's
+SNTP: nothing in the crate, its `mesh` example or `templates/esp32` calls
+`esp_sntp_init`, `esp_netif_sntp_init` or `EspSntp`, ESP-IDF starts lwIP's client only
+on such a call, and `CONFIG_LWIP_SNTP_MAX_SERVERS` left the sdkconfig. `clock::sync`
+asks at boot, as `ask_ntp` did, and `clock::keep_in_step` asks again every 6 hours, or
+every minute while the clock is before 2023-11-14, on a thread at priority 1. Each ask
+has its own socket and 8 new random bytes, drawn after Wi-Fi is up, and takes an answer
+only from the address and port asked, in mode 4, that echoes them. It now also refuses
+leap indicator 3, stratum 0 or 16 and up, and a zero transmit time, and reads seconds
+under `1 << 31` as era 1, so it takes a time from 2023-11-14 to 2104-02-26. A device on
+the LAN can no longer set the clock by sending to the board: it must see an ask to
+answer it, so it must be on the path. Nor can it forge the pool's address blind, as
+lwIP's DNS keeps a random query id and source port. Of the fix above, all is done but
+the two servers that must agree.
+
+NB95-I2's residuals (accepted):
+- One answer sets the clock. The pool server asked, or anyone on the path, can set any
+  time from 2023-11-14 to 2104-02-26, at boot as before and now at each re-ask. A device
+  on the LAN can still put itself on the path, by spoofing the router's address or
+  answering DHCP first, and on WPA2-Personal one that has the network's password and
+  heard the board join is on it. At boot the Node keeps that time until the board
+  reboots, with the effects above. Two servers that must agree within a few seconds
+  would stop one pool server, not the path.
+- A re-ask steps the clock by any amount, with no limit once the clock is set. It
+  reaches the relay carrier (each event's `created_at`, a new connection's `since` and
+  TLS's certificate check, as above), not a running Node; the next re-ask a real server
+  answers, 6 hours on, sets it back.
+- The Node's drift is as above: the re-asks don't reach it (NB103-I2).
+- Firmware that starts lwIP's SNTP itself (`EspSntp`, `esp_sntp_init`) opens the LAN
+  path again.
+
+**NB103-I1 — `ntp::time` wraps on a time before 1970 (Info).** `ntp::time`
+(`ports/esp32/src/ntp.rs`) subtracts the seconds from 1900 to 1970 from the answer's
+seconds unchecked. Seconds from `1 << 31` to 2,208,988,799 (era 0, 1968-01-20 to
+1969-12-31) wrap. In a debug build that panics ("attempt to subtract with overflow"),
+which on the chip aborts and reboots it. In a release build the 2023-11-14 floor passes
+and the clock is set to 18,446,744,073,648,046,464 s, which ESP-IDF's unsigned
+microseconds turn into about the year 586,500. Only the server asked, or the path, can
+send such an answer, as it must echo the ask's 8 bytes, and either can already set any
+time to 2104, so the gain is a debug build's reboot. The host tests miss it: their time
+before 2023-11-14 is in 2020. Reproduced 2026-11-05 with a host test,
+`answer(1 << 31, 0)`, in both builds. Fix:
+`ntp.checked_sub(NTP_TO_UNIX).filter(|&unix| unix >= SET_AFTER)`, refusing the answer
+otherwise, and that test. Tried in a copy: the 4 tests and the new one pass in both
+builds.
+
+**Status: open** (Info), reported on NB-103 at `272c7b0`.
+
+**NB103-I2 — The clock's re-asks don't reach a running Node (Info).** `Board::connect`
+waits up to 60 s for the clock and then goes on with a warning; the Node, bound next,
+reads the clock once. When no server answers in those 60 s, the Node keeps the clock it
+had, 1970 after a power-on, until the board reboots: the re-asks every minute set the
+chip's clock, not the Node's, so peers with a set clock drop the board's hellos for as
+long as it runs, where `Board::connect`'s docs say they do so only until the clock is
+set. `RESYNC`'s docs give the replay guard as its reason, which it doesn't reach, and
+`ports/esp32/README.md` still says lwIP's SNTP keeps the clock in step. That the Node's
+clock stays put is also why a re-ask can't move the replay guard. Fix: say so in the
+docs, and to recover, rebuild the Node once the clock is first set, or let the Node move
+its clock once from before 2023-11-14 to after it, never again.
+
+**Status: open** (Info), reported on NB-103 at `272c7b0`.
 
 Residuals (accepted):
 - With one relay, the relay, or anyone who publishes on the board's topics, can deny the
