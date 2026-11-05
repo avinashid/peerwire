@@ -1,0 +1,4 @@
+[toolchain]
+# Espressif's Rust, which espup installs: it builds for the ESP32-C3 and the ESP32 alike.
+channel = "esp"
+components = ["rust-src"]

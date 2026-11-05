@@ -1,0 +1,24 @@
+[template]
+cargo_generate_version = ">=0.21"
+description = "A Peerwire node on an ESP32-C3 or ESP32: it joins your Wi-Fi, sets its clock and links with the peers in a room"
+ignore = ["target", ".embuild"]
+
+[placeholders.chip]
+type = "string"
+prompt = "Chip (esp32c3: the ESP32-C3, RISC-V; esp32: the original ESP32, as on an ESP32-WROOM-32, Xtensa)"
+choices = ["esp32c3", "esp32"]
+default = "esp32c3"
+
+[placeholders.wifi_ssid]
+type = "string"
+prompt = "Wi-Fi network (2.4 GHz) the board joins; cfg.toml keeps it, and git ignores that file"
+
+[placeholders.wifi_password]
+type = "string"
+prompt = "Its password (empty for an open network)"
+default = ""
+
+[placeholders.room]
+type = "string"
+prompt = "Room to join (`lan_chat ROOM` on a PC on the same Wi-Fi joins it too)"
+default = "esp32"

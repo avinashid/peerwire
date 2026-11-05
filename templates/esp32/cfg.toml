@@ -1,0 +1,5 @@
+# The board's settings, built into its firmware. Git ignores this file: it holds your Wi-Fi password.
+wifi_ssid = '''{{wifi_ssid}}'''
+wifi_password = '''{{wifi_password}}'''
+# Anyone on the LAN who knows the room's name can join it.
+room = '''{{room}}'''
