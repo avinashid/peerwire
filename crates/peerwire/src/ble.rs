@@ -1,8 +1,8 @@
 //! Bluetooth LE (feature `ble`): links with peers nearby over a radio, with no network (`docs/concepts/bluetooth.md`).
 //!
 //! A node given a [`Radio`] ([`Builder::bluetooth`](crate::Builder::bluetooth)) advertises while it is in a room,
-//! connects to the members it hears, proves the room on each connection, and then carries room hellos, offers and
-//! datagrams over it: a Bluetooth connection is one more path for a link, ranked below every UDP one
+//! connects to the members it hears, proves the room and who it is on each connection, and then carries room hellos,
+//! offers and datagrams over it: a Bluetooth connection is one more path for a link, ranked below every UDP one
 //! ([`PathKind::Bluetooth`](crate::PathKind::Bluetooth)). The node does all of that itself; a driver only advertises,
 //! scans, connects and moves GATT values. Feature `ble-bluez` has the Linux driver, `BlueZ` (`ble::BlueZ`).
 //!
@@ -18,7 +18,7 @@ use peerwire_core::ble::{
     hs1_id, value_len, Chunker, Reassembler, KIND_ANSWER, KIND_CHALLENGE, KIND_DATAGRAM, KIND_PROOF, KIND_SIGNAL,
     MAX_MESSAGE,
 };
-use peerwire_core::{Endpoint, Instant, PeerId};
+use peerwire_core::{Endpoint, Identity, Instant, PeerId};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -43,14 +43,16 @@ pub struct ConnId(pub u32);
 pub struct Limits {
     /// Connections, in either role.
     pub connections: usize,
-    /// Of those, ones not yet proven or bound to a peer: a central beyond this closes the oldest of them.
+    /// Of those, ones not bound to a peer. Proven ones (standbys) leave one of these free for a newcomer: a connection
+    /// that proves the room into the last closes the weakest other (NB110-2).
     pub unbound: usize,
     /// Of those, ones a central made to this radio.
     pub centrals: usize,
     /// GATT values queued to send on one connection: more are dropped, never waited for.
     pub queue: usize,
     /// New handshakes (distinct HS1s) taken on unbound connections, across the radio: `unbound` at once, then one per
-    /// this. Each costs the node a Diffie-Hellman before it can tell who sent it (BLE-R9).
+    /// this. Each costs the node a Diffie-Hellman before it can tell who sent it (BLE-R9). Identity proofs are checked
+    /// at four times that rate, as a check costs about a quarter of what answering a handshake does.
     pub hs1_gap: Duration,
 }
 
@@ -59,10 +61,10 @@ impl Limits {
     /// 64 values queued, a new handshake per 250 ms.
     pub const DESKTOP: Limits =
         Limits { connections: 8, unbound: 4, centrals: 1, queue: 64, hs1_gap: Duration::from_millis(250) };
-    /// A small board's, such as an ESP32's: 3 connections, 2 unbound, 16 values queued, a new handshake per 2 s (an
-    /// ESP32-C3 answers one in 156 ms, so about 8% of it).
+    /// A small board's, such as an ESP32's: 3 connections, 2 unbound, 16 values queued, a new handshake per 5 s (an
+    /// ESP32-C3 answers one in 156 ms, so about 3% of it).
     pub const SMALL: Limits =
-        Limits { connections: 3, unbound: 2, centrals: 3, queue: 16, hs1_gap: Duration::from_secs(2) };
+        Limits { connections: 3, unbound: 2, centrals: 3, queue: 16, hs1_gap: Duration::from_secs(5) };
 }
 
 impl Default for Limits {
@@ -119,10 +121,14 @@ pub enum RadioEvent {
     Disconnected { conn: ConnId },
 }
 
-/// Adverts change this often, with a new `n`, tag and address.
+/// Adverts change this often, with a new `n`, tag and address. An advert whose connection this end closed as a second
+/// one to the same peer isn't connected to again for as long, so until it changes.
 const ROTATE: Duration = Duration::from_secs(15 * 60);
-/// A connection that hasn't proven the room by then closes.
-const PROVE_WITHIN: Duration = Duration::from_secs(10);
+/// A connection that hasn't proven the room, and brought the other end's identity proof, by then closes.
+const PROVE_WITHIN: Duration = Duration::from_secs(3);
+/// A central's connection that hasn't proven the room makes way for a new central once it has had this long (an
+/// honest one needs a round trip), so one that never answers can't keep others out.
+const GRACE: Duration = Duration::from_secs(1);
 /// A proven connection bound to no peer stays open while a signal that proves a room member comes over it this often.
 const UNBOUND_FOR: Duration = Duration::from_secs(60);
 /// No connect again to an advert whose last connection closed or failed for this long.
@@ -142,6 +148,8 @@ const HS1_WINDOW: Duration = Duration::from_secs(10);
 /// HS1s on a bound connection: a burst, then one per `BOUND_HS1_REFILL`.
 const BOUND_HS1_BURST: u32 = 4;
 const BOUND_HS1_REFILL: Duration = Duration::from_secs(5);
+/// Identity proofs checked across the radio for each new handshake it takes ([`Limits::hs1_gap`]).
+const CHECKS_PER_HS1: u32 = 4;
 /// Signals taken per connection: a burst, then one per `SIGNAL_REFILL`; the rest dropped before any cryptography.
 const SIGNAL_BURST: u32 = 16;
 const SIGNAL_REFILL: Duration = Duration::from_millis(500);
@@ -149,12 +157,15 @@ const SIGNAL_REFILL: Duration = Duration::from_millis(500);
 const MAX_DROPS: u64 = 32;
 const CHALLENGE: usize = 16;
 const MAC: usize = 32;
+/// An identity proof: the sender's `PeerId` and its signature over the connection's challenges.
+const ID_LEN: usize = 32 + 64;
 /// The advert's service data: flags, `n`, tag.
 const ADVERT_LEN: usize = 9;
 const FULL: u8 = 1;
-/// A signal's inner kinds: a room hello, or a message sealed to the receiver.
+/// A signal's inner kinds: a room hello, a message sealed to the receiver, or the sender's identity proof.
 const INNER_ROOM: u8 = 1;
 const INNER_PEER: u8 = 2;
+const INNER_ID: u8 = 3;
 
 /// The room's ble key: the room's name hashed under a label of its own, never the topic's.
 pub(crate) fn ble_key(app_id: &str, room: &str) -> [u8; 32] {
@@ -176,6 +187,11 @@ pub(crate) fn advert(key: &[u8; 32], n: u32, full: bool) -> [u8; ADVERT_LEN] {
     a[1..5].copy_from_slice(&n.to_le_bytes());
     a[5..].copy_from_slice(&hmac(key, &[b"pw-ble-adv", &n.to_le_bytes()])[..4]);
     a
+}
+
+/// What an identity proof signs: the connection's challenges, `c_p ‖ c_c`, under a label of its own.
+fn id_message(transcript: &[u8; 2 * CHALLENGE]) -> Vec<u8> {
+    [&b"pw-ble-id"[..], transcript].concat()
 }
 
 /// A token bucket.
@@ -215,8 +231,19 @@ enum Proof {
     Awaiting,
     /// The central answered `c_p` with `c_c`, and waits for the proof.
     Answered([u8; CHALLENGE], [u8; CHALLENGE]),
-    /// Both ends hold the room's ble key: signals are sealed under `key`.
-    Proven { key: [u8; 32], tx: u64, rx: u64 },
+    /// Both ends hold the room's ble key: signals are sealed under `key`. `transcript` is `c_p ‖ c_c`.
+    Proven { key: [u8; 32], tx: u64, rx: u64, transcript: [u8; 2 * CHALLENGE] },
+}
+
+/// Who is at a connection's other end, as far as it is proven on the connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Id {
+    /// No identity proof yet.
+    Unknown,
+    /// Its identity proof came, and waits for the radio's budget to be checked.
+    Pending(PeerId, [u8; 64]),
+    /// Proven on this connection: by its identity proof, or a session bound to it.
+    Known(PeerId),
 }
 
 struct Conn {
@@ -225,7 +252,7 @@ struct Conn {
     made: u32,
     /// This end is the central.
     central: bool,
-    /// The `n` of the other end's advert: the one this end connected to, or the one the central named in its answer.
+    /// The `n` of the advert this end connected to, as the central.
     n: Option<u32>,
     mtu: u16,
     chunker: Chunker,
@@ -234,12 +261,13 @@ struct Conn {
     proof: Proof,
     /// The room it was proven in ([`Ble::gen`]): it carries signals only for that one.
     gen: u32,
+    id: Id,
     bound: Option<PeerId>,
-    /// The bound peer's inbox, where its signals go.
+    /// The inbox of the peer at the other end, once known: signals for it go here.
     inbox: Option<Topic>,
-    /// The peer whose signals on it last proved a room member: the other end, unless it lies.
-    heard_from: Option<PeerId>,
     opened: Instant,
+    /// When its peer was proven ([`Id::Known`]).
+    known_at: Instant,
     /// When the last signal on it proved a room member (or it was proven).
     heard: Instant,
     signals: Bucket,
@@ -257,14 +285,24 @@ impl Conn {
     fn proven(&self) -> bool {
         matches!(self.proof, Proof::Proven { .. })
     }
+
+    /// The peer proven to be at the other end.
+    fn known(&self) -> Option<PeerId> {
+        match self.id {
+            Id::Known(p) => Some(p),
+            _ => None,
+        }
+    }
 }
 
 /// What the node does with what came over the radio.
 pub(crate) enum Inbound {
-    /// A signal, as from this carrier's `topic`, that came over `via`.
-    Signal { topic: Topic, payload: Vec<u8>, via: Hop<SocketAddr>, conn: ConnId },
-    /// A connection proved the room: a hello should go out soon.
-    Proven,
+    /// A signal, as from this carrier's `topic`, that came over `conn`.
+    Signal { topic: Topic, payload: Vec<u8>, conn: ConnId },
+    /// `conn` proved the room: a room hello should go over it ([`Ble::send_room`]).
+    Proven(ConnId),
+    /// `peer` proved, on the connection itself, that it is at the other end of `via`: it may be dialled over it.
+    Identified { peer: PeerId, via: Hop<SocketAddr> },
     /// A connection closed: no dial goes over it any more.
     Closed(Hop<SocketAddr>),
 }
@@ -273,7 +311,9 @@ pub(crate) enum Inbound {
 pub(crate) struct Ble {
     radio: Box<dyn Radio>,
     limits: Limits,
-    me: PeerId,
+    me: Identity,
+    /// The time of the last call that brought one.
+    now: Instant,
     /// The room's ble key and topic, while in one.
     room: Option<([u8; 32], Topic)>,
     /// Counts rooms joined: a connection proven in another carries no signals.
@@ -299,16 +339,19 @@ pub(crate) struct Ble {
     adverts: Bucket,
     /// New handshakes on unbound connections, across the radio ([`Limits::hs1_gap`]).
     hs1s: Bucket,
+    /// Identity proofs checked, across the radio.
+    checks: Bucket,
     out: VecDeque<Inbound>,
 }
 
 impl Ble {
-    pub(crate) fn new(radio: Box<dyn Radio>, me: PeerId, now: Instant) -> Ble {
+    pub(crate) fn new(radio: Box<dyn Radio>, me: &Identity, now: Instant) -> Ble {
         let limits = radio.limits();
         Ble {
             radio,
             limits,
-            me,
+            me: me.clone(),
+            now,
             room: None,
             gen: 0,
             enabled: true,
@@ -324,30 +367,33 @@ impl Ble {
             seen: VecDeque::new(),
             adverts: Bucket::default(),
             hs1s: Bucket::default(),
+            checks: Bucket::default(),
             out: VecDeque::new(),
         }
     }
 
     /// Joins `room` (its ble key and topic), or leaves (`None`): a new `n`, and connections not bound to a peer close.
     pub(crate) fn set_room(&mut self, now: Instant, room: Option<([u8; 32], Topic)>) {
+        self.now = now;
         self.room = room;
         self.gen = self.gen.wrapping_add(1);
         self.n = OsRng.next_u32();
         self.rotate_at = now + ROTATE;
         let unbound: Vec<ConnId> = self.conns.iter().filter(|(_, c)| c.bound.is_none()).map(|(i, _)| *i).collect();
         for c in unbound {
-            self.close(c);
+            self.close_for(c, Duration::ZERO);
         }
         self.refresh(now);
     }
 
     /// Turns the radio off (relay-only) or back on.
     pub(crate) fn set_enabled(&mut self, now: Instant, on: bool) {
+        self.now = now;
         self.enabled = on;
         if !on {
             let all: Vec<ConnId> = self.conns.keys().copied().collect();
             for c in all {
-                self.close(c);
+                self.close_for(c, Duration::ZERO);
             }
         }
         self.refresh(now);
@@ -363,24 +409,17 @@ impl Ble {
         self.out.pop_front()
     }
 
-    /// A signal on `conn` proved `peer` a room member: it stays open while unbound. A peer keeps one connection, the
-    /// one bound to it if any, else the oldest it was heard on: this one closes if it is another.
-    pub(crate) fn heard(&mut self, conn: ConnId, now: Instant, peer: PeerId) {
-        let Some(age) = self.conns.get(&conn).map(|c| (c.opened, c.made)) else { return };
-        let other = |(i, c): (&ConnId, &Conn)| {
-            let first = c.bound.is_none() && c.heard_from == Some(peer) && (c.opened, c.made) < age;
-            *i != conn && (c.bound == Some(peer) || first)
-        };
-        if self.conns.iter().any(other) {
-            return self.close(conn);
-        }
+    /// A signal on `conn` proved a room member: while unbound, it stays open. Who sent it is only a claim: nothing
+    /// here acts on it (NB110-6).
+    pub(crate) fn heard(&mut self, conn: ConnId, now: Instant) {
         if let Some(c) = self.conns.get_mut(&conn) {
-            (c.heard, c.heard_from) = (now, Some(peer));
+            c.heard = now;
         }
     }
 
     /// Handles what the radio reported, and the timers, handing datagrams to `ep`; then sends what is queued.
     pub(crate) fn poll(&mut self, now: Instant, ep: &mut Endpoint<Hop<SocketAddr>>) {
+        self.now = now;
         // A radio that floods can't hold the node: what is left waits for the next poll.
         for _ in 0..1024 {
             let Some(e) = self.radio.poll() else { break };
@@ -406,10 +445,10 @@ impl Ble {
             }
             RadioEvent::Value { conn, value } => self.on_value(now, ep, conn, &value),
             RadioEvent::Disconnected { conn } => {
-                if let Some(c) = self.conns.get(&conn) {
-                    if let Some(n) = c.n {
-                        self.held.insert(n, now + RECONNECT_HOLD);
-                    }
+                if let Some(n) = self.conns.get(&conn).and_then(|c| c.n) {
+                    let until = now + RECONNECT_HOLD;
+                    let t = self.held.entry(n).or_insert(until);
+                    *t = (*t).max(until);
                 }
                 self.forget(conn);
                 self.refresh(now);
@@ -440,16 +479,13 @@ impl Ble {
                 }
             }
         }
-        // Not our own, and not while a central's connection says nothing yet of the advert it is behind.
-        let unsure = self.conns.values().any(|c| !c.central && !c.proven());
-        if n == self.n || unsure {
-            return;
-        }
-        // The smaller `n` connects to an advert that isn't full; the larger one does if its own is.
+        // Not our own. The smaller `n` connects to an advert that isn't full; the larger one does if its own is.
         let theirs_full = data[0] & FULL != 0;
-        if theirs_full || !(self.n < n || self.full()) {
+        if n == self.n || theirs_full || !(self.n < n || self.full()) {
             return;
         }
+        // Nor one this end is connected or connecting to, or holds. Only adverts it connected to itself count, as
+        // nothing a central says of its own is taken (NB110-6): two connections to one peer may happen, and one closes.
         let known = self.conns.values().any(|c| c.n == Some(n)) || self.pending.values().any(|(m, _)| *m == n);
         if known || self.held.get(&n).is_some_and(|t| now < *t) || !self.room_out() {
             return;
@@ -458,28 +494,57 @@ impl Ble {
         self.radio.connect(device);
     }
 
+    /// Connections bound to no peer, with the connects under way.
+    fn unbound(&self) -> usize {
+        self.conns.values().filter(|c| c.bound.is_none()).count() + self.pending.len()
+    }
+
     /// Whether a connection this end makes fits: one more connection, and one more unbound.
     fn room_out(&self) -> bool {
-        let unbound = self.conns.values().filter(|c| c.bound.is_none()).count() + self.pending.len();
-        self.conns.len() + self.pending.len() < self.limits.connections && unbound < self.limits.unbound
+        self.conns.len() + self.pending.len() < self.limits.connections && self.unbound() < self.limits.unbound
     }
 
-    /// Whether this radio takes no central now (its advert says so): it holds all the connections it can, or all the
-    /// centrals. A central over the unbound limit is taken, and the oldest unbound connection closes for it (NB110-2).
+    /// Whether this radio takes no central now (its advert says so): it holds all the connections, or all the
+    /// centrals, it can. A central's connection whose peer hasn't proven who it is doesn't count, as it soon has, or
+    /// closes, or makes way for a newcomer (NB110-7); nor does a second one to a peer, which the central closes.
     fn full(&self) -> bool {
-        let centrals = self.conns.values().filter(|c| !c.central).count();
-        self.conns.len() + self.pending.len() >= self.limits.connections || centrals >= self.limits.centrals
+        let weak = |(i, c): &(&ConnId, &Conn)| !c.central && c.known().is_none_or(|p| self.twin(**i, p));
+        let weak = self.conns.iter().filter(weak).count();
+        let centrals = self.conns.values().filter(|c| !c.central).count() - weak;
+        self.conns.len() + self.pending.len() - weak >= self.limits.connections || centrals >= self.limits.centrals
     }
 
-    /// Closes the oldest connection bound to no peer, if this radio holds as many as it may.
-    fn evict_unbound(&mut self) {
-        let unbound = self.conns.values().filter(|c| c.bound.is_none()).count() + self.pending.len();
-        if unbound >= self.limits.unbound {
-            let oldest = self.conns.iter().filter(|(_, c)| c.bound.is_none()).min_by_key(|(_, c)| (c.opened, c.made));
-            if let Some(&conn) = oldest.map(|(i, _)| i) {
-                self.close(conn);
+    /// Whether another connection than `conn` is proven to reach `peer`.
+    fn twin(&self, conn: ConnId, peer: PeerId) -> bool {
+        self.conns.iter().any(|(i, c)| *i != conn && c.known() == Some(peer))
+    }
+
+    /// The connection bound to no peer, among those `which` takes, that makes way for a newcomer: one that hasn't
+    /// proven the room before one that has, one whose peer hasn't proven who it is before one whose has, then the
+    /// oldest.
+    fn weakest(&self, which: impl Fn(ConnId, &Conn) -> bool) -> Option<ConnId> {
+        let open = self.conns.iter().filter(|(i, c)| c.bound.is_none() && which(**i, c));
+        open.min_by_key(|(_, c)| (c.proven(), c.known().is_some(), c.opened, c.made)).map(|(i, _)| *i)
+    }
+
+    /// Makes room for a new central if it can: over a limit, a connection that hasn't proven the room within `GRACE`
+    /// closes, a central's for the limits of connections and centrals (NB110-7). Whether the central is taken.
+    fn make_way(&mut self, now: Instant) -> bool {
+        let stale = |c: &Conn| !c.proven() && now.saturating_duration_since(c.opened) >= GRACE;
+        let centrals = self.conns.values().filter(|c| !c.central).count();
+        if self.conns.len() + self.pending.len() >= self.limits.connections || centrals >= self.limits.centrals {
+            match self.weakest(|_, c| !c.central && stale(c)) {
+                Some(w) => self.close(w),
+                None => return false,
             }
         }
+        if self.unbound() >= self.limits.unbound {
+            match self.weakest(|_, c| stale(c)) {
+                Some(w) => self.close(w),
+                None => return false,
+            }
+        }
+        true
     }
 
     fn on_connected(&mut self, now: Instant, conn: ConnId, device: Option<DeviceId>, mtu: u16) {
@@ -488,11 +553,8 @@ impl Ble {
                 Some((n, _)) => Some(n),
                 None => return self.radio.disconnect(conn), // not one we asked for
             },
-            None if !self.on || self.full() => return self.radio.disconnect(conn),
-            None => {
-                self.evict_unbound();
-                None
-            }
+            None if !self.on || !self.make_way(now) => return self.radio.disconnect(conn),
+            None => None,
         };
         if self.room.is_none() {
             return self.radio.disconnect(conn);
@@ -514,10 +576,11 @@ impl Ble {
             queue: VecDeque::new(),
             proof: if central { Proof::Awaiting } else { Proof::Challenged(challenge) },
             gen: self.gen,
+            id: Id::Unknown,
             bound: None,
             inbox: None,
-            heard_from: None,
             opened: now,
+            known_at: now,
             heard: now,
             signals: Bucket::default(),
             hs1: None,
@@ -567,44 +630,54 @@ impl Ble {
         let Some(((key, topic), c)) = self.room.zip(self.conns.get_mut(&conn)) else { return };
         let (kind, body) = (m[0], &m[1..]);
         match (&c.proof, kind) {
-            (Proof::Challenged(c_p), KIND_ANSWER) if body.len() == CHALLENGE + 4 + MAC => {
-                let c_p = *c_p;
-                let (c_c, n) = (&body[..CHALLENGE], &body[CHALLENGE..CHALLENGE + 4]);
-                if !same(&hmac(&key, &[b"pw-ble-c", &c_p, c_c, n]), &body[CHALLENGE + 4..]) {
+            (Proof::Challenged(c_p), KIND_ANSWER) if body.len() == CHALLENGE + MAC => {
+                let (c_p, c_c) = (*c_p, <[u8; CHALLENGE]>::try_from(&body[..CHALLENGE]).expect("16 bytes"));
+                if !same(&hmac(&key, &[b"pw-ble-c", &c_p, &c_c]), &body[CHALLENGE..]) {
                     return self.close(conn);
                 }
-                // The central's advert, which this end then won't connect to: 0 if it has none.
-                let n = u32::from_le_bytes(n.try_into().expect("4 bytes"));
-                c.n = (n != 0).then_some(n);
-                let link = hmac(&key, &[b"pw-ble-k", &c_p, c_c]);
-                let proof = hmac(&key, &[b"pw-ble-p", c_c, &c_p]);
-                (c.proof, c.heard) = (Proof::Proven { key: link, tx: 0, rx: 0 }, now);
+                let proof = hmac(&key, &[b"pw-ble-p", &c_c, &c_p]);
                 self.send(conn, &[&[KIND_PROOF], &proof]);
-                self.out.push_back(Inbound::Proven);
+                self.proven(now, conn, c_p, c_c);
             }
             (Proof::Awaiting, KIND_CHALLENGE) if body.len() == CHALLENGE => {
-                let mut c_p = [0u8; CHALLENGE];
-                c_p.copy_from_slice(body);
+                let c_p = <[u8; CHALLENGE]>::try_from(body).expect("16 bytes");
                 let mut c_c = [0u8; CHALLENGE];
                 OsRng.fill_bytes(&mut c_c);
-                let n = self.n.to_le_bytes();
-                let mac = hmac(&key, &[b"pw-ble-c", &c_p, &c_c, &n]);
+                let mac = hmac(&key, &[b"pw-ble-c", &c_p, &c_c]);
                 c.proof = Proof::Answered(c_p, c_c);
-                self.send(conn, &[&[KIND_ANSWER], &c_c, &n, &mac]);
+                self.send(conn, &[&[KIND_ANSWER], &c_c, &mac]);
             }
             (Proof::Answered(c_p, c_c), KIND_PROOF) if body.len() == MAC => {
-                if !same(&hmac(&key, &[b"pw-ble-p", c_c, c_p]), body) {
+                let (c_p, c_c) = (*c_p, *c_c);
+                if !same(&hmac(&key, &[b"pw-ble-p", &c_c, &c_p]), body) {
                     return self.close(conn);
                 }
-                let link = hmac(&key, &[b"pw-ble-k", c_p, c_c]);
-                (c.proof, c.heard) = (Proof::Proven { key: link, tx: 0, rx: 0 }, now);
-                self.out.push_back(Inbound::Proven);
+                self.proven(now, conn, c_p, c_c);
             }
             // Before the proof, nothing else: a connection that tries closes.
             (Proof::Challenged(_) | Proof::Awaiting | Proof::Answered(..), _) => self.close(conn),
             (Proof::Proven { .. }, KIND_SIGNAL) => self.on_signal(now, conn, topic, body),
             (Proof::Proven { .. }, KIND_DATAGRAM) if !body.is_empty() => self.on_datagram(now, ep, conn, body),
             (Proof::Proven { .. }, _) => self.dropped(conn, 1),
+        }
+    }
+
+    /// `conn` proved the room with challenges `c_p` and `c_c`: signals go under its link key, and this end sends its
+    /// identity proof over it. A standby that fills the last unbound slot closes the weakest other (NB110-2).
+    fn proven(&mut self, now: Instant, conn: ConnId, c_p: [u8; CHALLENGE], c_c: [u8; CHALLENGE]) {
+        let Some(((key, _), c)) = self.room.zip(self.conns.get_mut(&conn)) else { return };
+        let mut transcript = [0u8; 2 * CHALLENGE];
+        transcript[..CHALLENGE].copy_from_slice(&c_p);
+        transcript[CHALLENGE..].copy_from_slice(&c_c);
+        let link = hmac(&key, &[b"pw-ble-k", &transcript]);
+        (c.proof, c.heard) = (Proof::Proven { key: link, tx: 0, rx: 0, transcript }, now);
+        let sig = self.me.sign(&id_message(&transcript));
+        self.signal(conn, INNER_ID, &[&self.me.peer_id().as_bytes()[..], &sig].concat());
+        self.out.push_back(Inbound::Proven(conn));
+        if self.unbound() >= self.limits.unbound {
+            if let Some(w) = self.weakest(|i, _| i != conn) {
+                self.close(w);
+            }
         }
     }
 
@@ -623,11 +696,68 @@ impl Ble {
         *rx = seq;
         let topic = match plain[0] {
             INNER_ROOM => room,
-            INNER_PEER => Topic::peer(&self.me),
+            INNER_PEER => Topic::peer(&self.me.peer_id()),
+            INNER_ID => return self.on_id(conn, &plain[1..]),
             _ => return self.dropped(conn, 1),
         };
-        let via = c.hop;
-        self.out.push_back(Inbound::Signal { topic, payload: plain[1..].to_vec(), via, conn });
+        self.out.push_back(Inbound::Signal { topic, payload: plain[1..].to_vec(), conn });
+    }
+
+    /// The other end's identity proof, the one a connection takes: checked as the radio's budget allows.
+    fn on_id(&mut self, conn: ConnId, body: &[u8]) {
+        let Some(c) = self.conns.get_mut(&conn) else { return };
+        if body.len() != ID_LEN || c.id != Id::Unknown {
+            return self.dropped(conn, 1);
+        }
+        let peer = PeerId(body[..32].try_into().expect("32 bytes"));
+        c.id = Id::Pending(peer, body[32..].try_into().expect("64 bytes"));
+        self.check_ids();
+    }
+
+    /// Checks the identity proofs that came, the oldest connection's first, as far as the radio's budget goes
+    /// (BLE-R9): a proof signed by its `PeerId` over this connection's challenges proves that peer is at the other
+    /// end; any other closes the connection.
+    fn check_ids(&mut self) {
+        let burst = u32::try_from(self.limits.unbound).unwrap_or(u32::MAX).saturating_mul(CHECKS_PER_HS1);
+        let gap = self.limits.hs1_gap / CHECKS_PER_HS1;
+        loop {
+            let waiting = self.conns.iter().filter(|(_, c)| matches!(c.id, Id::Pending(..)));
+            let Some((&conn, c)) = waiting.min_by_key(|(_, c)| (c.opened, c.made)) else { return };
+            let (Id::Pending(peer, sig), Proof::Proven { transcript, .. }) = (c.id, &c.proof) else { return };
+            let message = id_message(transcript);
+            if !self.checks.take(self.now, burst, gap) {
+                return;
+            }
+            match peer != self.me.peer_id() && peer.verify(&message, &sig) {
+                true => self.reaches(conn, peer, false),
+                false => self.close(conn),
+            }
+        }
+    }
+
+    /// `peer` is proven to be at the other end of `conn`: by its identity proof, or by a session that `binds` it. A
+    /// peer keeps one connection (NB110-6). A session's is the one, and others to that peer close. Otherwise the first
+    /// proven stays: both ends proved it before a second was made, so a second one closes, at the end that made it,
+    /// which doesn't connect to that advert again until it changes; the other end leaves it to that one.
+    fn reaches(&mut self, conn: ConnId, peer: PeerId, binds: bool) {
+        let twins: Vec<ConnId> =
+            self.conns.iter().filter(|(i, c)| **i != conn && c.known() == Some(peer)).map(|(i, _)| *i).collect();
+        let Some(c) = self.conns.get_mut(&conn) else { return };
+        (c.id, c.inbox, c.known_at) = (Id::Known(peer), Some(Topic::peer(&peer)), self.now);
+        let (central, via) = (c.central, c.hop);
+        if binds {
+            c.bound = Some(peer);
+            for t in twins {
+                self.close_for(t, ROTATE);
+            }
+        } else if !twins.is_empty() {
+            if central {
+                self.close_for(conn, ROTATE);
+            }
+            return self.refresh(self.now);
+        }
+        self.out.push_back(Inbound::Identified { peer, via });
+        self.refresh(self.now);
     }
 
     fn on_datagram(&mut self, now: Instant, ep: &mut Endpoint<Hop<SocketAddr>>, conn: ConnId, d: &[u8]) {
@@ -661,26 +791,12 @@ impl Ble {
                     }
                 }
                 if let Some(peer) = ep.handle_datagram_unbound(now, c.hop, d) {
-                    self.bind(conn, peer);
+                    self.reaches(conn, peer, true);
                 }
             }
         }
         let wrong = ep.stats().rx_wrong_peer - before;
         self.dropped(conn, wrong);
-    }
-
-    /// Binds `conn` to `peer` for as long as it lasts; another connection bound to `peer`, or bound to no one and
-    /// heard from it, closes.
-    fn bind(&mut self, conn: ConnId, peer: PeerId) {
-        let theirs = |c: &Conn| c.bound == Some(peer) || c.bound.is_none() && c.heard_from == Some(peer);
-        let older = self.conns.iter().filter(|(i, c)| **i != conn && theirs(c)).map(|(i, _)| *i);
-        let older: Vec<ConnId> = older.collect();
-        for o in older {
-            self.close(o);
-        }
-        if let Some(c) = self.conns.get_mut(&conn) {
-            (c.bound, c.inbox) = (Some(peer), Some(Topic::peer(&peer)));
-        }
     }
 
     /// Sends a datagram the endpoint addressed to `hop`; dropped if no proven connection is there.
@@ -691,7 +807,8 @@ impl Ble {
     }
 
     /// Sends a signal the traversal published on `topic`: a room hello on every connection proven in this room, a
-    /// message for a peer's inbox on the connection bound to that peer, or else on every one bound to no other.
+    /// message for a peer's inbox on the connection proven to reach that peer, or else on every one whose peer isn't
+    /// known yet.
     pub(crate) fn publish(&mut self, topic: Topic, payload: &[u8]) {
         let Some((_, room)) = self.room else { return };
         let inner = if topic == room { INNER_ROOM } else { INNER_PEER };
@@ -701,21 +818,34 @@ impl Ble {
             to = self.conns.iter().filter(|(_, c)| live(c) && c.inbox == Some(topic)).map(|(i, _)| *i).collect();
         }
         if to.is_empty() {
-            let open = |c: &Conn| inner == INNER_ROOM || c.bound.is_none();
+            let open = |c: &Conn| inner == INNER_ROOM || c.known().is_none();
             to = self.conns.iter().filter(|(_, c)| live(c) && open(c)).map(|(i, _)| *i).collect();
         }
         for conn in to {
-            let Some(c) = self.conns.get_mut(&conn) else { continue };
-            let Proof::Proven { key, tx, .. } = &mut c.proof else { continue };
-            *tx += 1;
-            let dir = if c.central { 0u32 } else { 1 };
-            let mut plain = Vec::with_capacity(1 + payload.len());
-            plain.push(inner);
-            plain.extend_from_slice(payload);
-            let Some(sealed) = seal(key, dir, *tx, &plain) else { continue };
-            let seq = tx.to_le_bytes();
-            self.send(conn, &[&[KIND_SIGNAL], &seq, &sealed]);
+            self.signal(conn, inner, payload);
         }
+    }
+
+    /// Sends a room hello on `conn` alone, which has just proven the room ([`Inbound::Proven`]): the members it
+    /// reaches hear of this node at once, and no other carrier's hellos come sooner for it.
+    pub(crate) fn send_room(&mut self, conn: ConnId, payload: &[u8]) {
+        if self.conns.get(&conn).is_some_and(|c| c.proven() && c.gen == self.gen) {
+            self.signal(conn, INNER_ROOM, payload);
+        }
+    }
+
+    /// Seals `inner ‖ payload` under `conn`'s link key, as its next signal, and queues it.
+    fn signal(&mut self, conn: ConnId, inner: u8, payload: &[u8]) {
+        let Some(c) = self.conns.get_mut(&conn) else { return };
+        let Proof::Proven { key, tx, .. } = &mut c.proof else { return };
+        *tx += 1;
+        let dir = if c.central { 0u32 } else { 1 };
+        let mut plain = Vec::with_capacity(1 + payload.len());
+        plain.push(inner);
+        plain.extend_from_slice(payload);
+        let Some(sealed) = seal(key, dir, *tx, &plain) else { return };
+        let seq = tx.to_le_bytes();
+        self.send(conn, &[&[KIND_SIGNAL], &seq, &sealed]);
     }
 
     /// Queues a message, in its chunks, on `conn`: the whole of it, or none if the queue lacks room.
@@ -749,7 +879,7 @@ impl Ble {
         let late: Vec<ConnId> = self
             .conns
             .iter()
-            .filter(|(_, c)| match c.proven() {
+            .filter(|(_, c)| match c.proven() && c.id != Id::Unknown {
                 false => now.saturating_duration_since(c.opened) > PROVE_WITHIN,
                 true => c.bound.is_none() && now.saturating_duration_since(c.heard) > UNBOUND_FOR,
             })
@@ -758,6 +888,24 @@ impl Ble {
         for c in late {
             self.close(c);
         }
+        // Two connections to one peer, each made by one end, which each took as its first (they were made at once):
+        // once the other end's has been proven that long, the one whose central has the larger `PeerId` closes, at the
+        // end that made it.
+        let me = self.me.peer_id();
+        let theirs = |p: PeerId| {
+            let late = |o: &Conn| now.saturating_duration_since(o.known_at) >= PROVE_WITHIN;
+            self.conns.values().any(|o| !o.central && o.known() == Some(p) && late(o))
+        };
+        let lose: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.central && c.bound.is_none() && c.known().is_some_and(|p| me > p && theirs(p)))
+            .map(|(i, _)| *i)
+            .collect();
+        for c in lose {
+            self.close_for(c, ROTATE);
+        }
+        self.check_ids();
         self.pending.retain(|_, (_, at)| now.saturating_duration_since(*at) < CONNECT_WAIT);
         self.held.retain(|_, t| now < *t);
         self.seen.retain(|(_, _, at, _)| now.saturating_duration_since(*at) < SEEN_FOR);
@@ -794,10 +942,20 @@ impl Ble {
 
     /// Closes `conn` and forgets it.
     fn close(&mut self, conn: ConnId) {
-        if self.conns.contains_key(&conn) {
-            self.radio.disconnect(conn);
-            self.forget(conn);
+        self.close_for(conn, RECONNECT_HOLD);
+    }
+
+    /// Closes `conn` and forgets it; if this end connected to an advert for it, that isn't connected to again for
+    /// `hold`.
+    fn close_for(&mut self, conn: ConnId, hold: Duration) {
+        let Some(c) = self.conns.get(&conn) else { return };
+        if let Some(n) = c.n.filter(|_| !hold.is_zero()) {
+            let until = self.now + hold;
+            let t = self.held.entry(n).or_insert(until);
+            *t = (*t).max(until);
         }
+        self.radio.disconnect(conn);
+        self.forget(conn);
     }
 
     fn forget(&mut self, conn: ConnId) {
@@ -942,6 +1100,11 @@ mod fake {
         pub fn advert(&self, i: usize) -> Option<Vec<u8>> {
             self.0.lock().unwrap().stations[i].advert.clone()
         }
+
+        /// Connections made on it so far.
+        pub fn connects(&self) -> u32 {
+            (self.0.lock().unwrap().next - 1) / 2
+        }
     }
 
     impl FakeRadio {
@@ -1036,6 +1199,10 @@ mod tests {
         Identity::from_secret_bytes(&[n; 32])
     }
 
+    fn room() -> Option<([u8; 32], Topic)> {
+        Some((ble_key("app", "room"), Topic::room("app", "room")))
+    }
+
     #[test]
     fn the_advert_carries_no_lasting_value_and_a_tag_only_members_can_check() {
         let (key, other) = (ble_key("app", "room"), ble_key("app", "other"));
@@ -1083,116 +1250,235 @@ mod tests {
         assert_eq!(count.0.load(Ordering::Relaxed), 2, "a value came");
     }
 
+    /// Node sides on one air, in the same room, each with an endpoint: `run` polls them all, hands each signal to
+    /// `heard` as the node does, publishes a room hello from each every 10 s, and keeps what came.
+    struct Air {
+        air: FakeAir,
+        b: Vec<Ble>,
+        eps: Vec<Endpoint<Hop<SocketAddr>>>,
+        now: Instant,
+        /// Each one's signals: topic and payload.
+        got: Vec<Vec<(Topic, Vec<u8>)>>,
+        /// Each one's `Identified`: the peer, and the connection.
+        ids: Vec<Vec<(PeerId, Hop<SocketAddr>)>>,
+        /// Datagrams cross between endpoints.
+        datagrams: bool,
+    }
+
+    impl Air {
+        /// Nodes `1..=limits.len()` (identities `id(i)`), the `i`th with `limits[i - 1]`, in room "room".
+        fn new(limits: &[Limits]) -> Air {
+            let air = FakeAir::new(23);
+            let now = Instant::from_millis(1);
+            let b = (1..=limits.len() as u8)
+                .map(|i| {
+                    let mut b = Ble::new(Box::new(air.radio(limits[usize::from(i) - 1])), &id(i), now);
+                    b.set_room(now, room());
+                    b
+                })
+                .collect();
+            let eps = (1..=limits.len() as u8).map(|i| Endpoint::new(&id(i), Config::default(), [i; 32])).collect();
+            let n = limits.len();
+            Air { air, b, eps, now, got: vec![Vec::new(); n], ids: vec![Vec::new(); n], datagrams: false }
+        }
+
+        /// Gives node `i` (from 0) the advert value `n`.
+        fn set_n(&mut self, i: usize, n: u32) {
+            let b = &mut self.b[i];
+            (b.n, b.advertised) = (n, None);
+            b.refresh(self.now);
+        }
+
+        fn run(&mut self, ms: u64) {
+            for _ in 0..ms / 10 {
+                for i in 0..self.b.len() {
+                    while let Some(t) = self.eps[i].poll_transmit(self.now) {
+                        if let (Hop::Ble(at), true) = (t.dst, self.datagrams) {
+                            self.b[i].send_datagram(&at, &t.payload);
+                        }
+                    }
+                    self.b[i].poll(self.now, &mut self.eps[i]);
+                    while let Some(e) = self.b[i].take() {
+                        match e {
+                            Inbound::Signal { topic, payload, conn } => {
+                                self.b[i].heard(conn, self.now);
+                                self.got[i].push((topic, payload));
+                            }
+                            Inbound::Identified { peer, via } => self.ids[i].push((peer, via)),
+                            Inbound::Proven(_) | Inbound::Closed(_) => {}
+                        }
+                    }
+                    if (self.now - Instant::from_millis(1)).as_millis().is_multiple_of(10_000) {
+                        self.b[i].publish(Topic::room("app", "room"), b"hello");
+                    }
+                    self.eps[i].handle_timeout(self.now);
+                }
+                self.now = self.now + Duration::from_millis(10);
+            }
+        }
+
+        /// Whether nodes `i` and `j` (from 0) hold a connection to each other, each proven to reach the other.
+        fn linked(&self, i: usize, j: usize) -> bool {
+            let (pi, pj) = (id(i as u8 + 1).peer_id(), id(j as u8 + 1).peer_id());
+            let to = |a: usize, b: usize, p: PeerId| {
+                self.b[a].conns.iter().any(|(c, x)| self.air.peer_of(a, *c) == Some(b) && x.known() == Some(p))
+            };
+            to(i, j, pj) && to(j, i, pi)
+        }
+    }
+
+    /// A central of the test's, by hand over a radio of its own: it knows the room's key, and does as it is told.
+    struct Rogue {
+        radio: FakeRadio,
+        conn: ConnId,
+        tx: Chunker,
+        rx: Reassembler,
+        /// `c_p ‖ c_c`, and the link key, once proven.
+        transcript: [u8; 2 * CHALLENGE],
+        link: [u8; 32],
+        seq: u64,
+        /// The node closed it.
+        gone: bool,
+    }
+
+    impl Rogue {
+        /// Connects to radio `to`, which `node` runs, and proves the room. The node's identity proof is in `read`.
+        fn prove(air: &FakeAir, to: DeviceId, node: &mut Ble, ep: &mut Endpoint<Hop<SocketAddr>>, t: Instant) -> Rogue {
+            let mut radio = air.radio(Limits::DESKTOP);
+            radio.connect(to);
+            let Some(RadioEvent::Connected { conn, .. }) = radio.poll() else { panic!() };
+            let (tx, rx) = (Chunker::new(), Reassembler::new());
+            let (transcript, link) = ([0; 2 * CHALLENGE], [0; 32]);
+            let mut r = Rogue { radio, conn, tx, rx, transcript, link, seq: 0, gone: false };
+            let challenge = r.read(node, ep, t);
+            assert_eq!(challenge.len(), 1, "a challenge");
+            let (c_p, c_c) = (&challenge[0][1..], [9u8; CHALLENGE]);
+            assert_eq!((challenge[0][0], c_p.len()), (KIND_CHALLENGE, CHALLENGE));
+            let key = ble_key("app", "room");
+            r.send(&[&[KIND_ANSWER][..], &c_c, &hmac(&key, &[b"pw-ble-c", c_p, &c_c])].concat());
+            r.transcript[..CHALLENGE].copy_from_slice(c_p);
+            r.transcript[CHALLENGE..].copy_from_slice(&c_c);
+            r.link = hmac(&key, &[b"pw-ble-k", &r.transcript]);
+            r
+        }
+
+        fn send(&mut self, m: &[u8]) {
+            let (radio, conn) = (&mut self.radio, self.conn);
+            self.tx.split(m, 23, |v| radio.send(conn, v));
+        }
+
+        /// Polls `node`, and returns the messages that came.
+        fn read(&mut self, node: &mut Ble, ep: &mut Endpoint<Hop<SocketAddr>>, t: Instant) -> Vec<Vec<u8>> {
+            node.poll(t, ep);
+            let mut out = Vec::new();
+            while let Some(e) = self.radio.poll() {
+                match e {
+                    RadioEvent::Value { value, .. } => out.extend(self.rx.push(t, &value).map(<[u8]>::to_vec)),
+                    RadioEvent::Disconnected { .. } => self.gone = true,
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        /// The plaintext of a signal from the node (the peripheral), whose seq is `seq`.
+        fn open(&self, m: &[u8]) -> Vec<u8> {
+            assert_eq!(m[0], KIND_SIGNAL);
+            let seq = u64::from_le_bytes(m[1..9].try_into().unwrap());
+            open(&self.link, 1, seq, &m[9..]).expect("a signal under the link key")
+        }
+
+        /// Sends `inner ‖ payload` as its next signal.
+        fn signal(&mut self, inner: u8, payload: &[u8]) {
+            self.seq += 1;
+            let sealed = seal(&self.link, 0, self.seq, &[&[inner][..], payload].concat()).unwrap();
+            self.send(&[&[KIND_SIGNAL][..], &self.seq.to_le_bytes(), &sealed].concat());
+        }
+
+        /// Sends an identity proof: `who`, signed over `transcript`.
+        fn prove_id(&mut self, who: &Identity, transcript: &[u8; 2 * CHALLENGE]) {
+            let sig = who.sign(&id_message(transcript));
+            self.signal(INNER_ID, &[&who.peer_id().as_bytes()[..], &sig].concat());
+        }
+
+        fn closed(&mut self) -> bool {
+            while let Some(e) = self.radio.poll() {
+                self.gone |= matches!(e, RadioEvent::Disconnected { .. });
+            }
+            self.gone
+        }
+    }
+
+    fn lone(air: &FakeAir, limits: Limits, n: u8, now: Instant) -> (Ble, Endpoint<Hop<SocketAddr>>) {
+        let mut b = Ble::new(Box::new(air.radio(limits)), &id(n), now);
+        b.set_room(now, room());
+        let mut ep = Endpoint::new(&id(n), Config::default(), [n; 32]);
+        b.poll(now, &mut ep);
+        (b, ep)
+    }
+
     /// NB110-1: Alice and Bob linked over their connection, and Mallory, a member, connected to Bob too. Mallory
     /// takes Alice's next packet before Bob has it and sends it over her own connection: Bob drops it unread, his
     /// link to Alice stays where it is, Mallory's connection isn't bound to Alice and Alice's isn't closed; the real
     /// packet, when it comes, still reads.
     #[test]
     fn a_member_cannot_move_another_link_onto_its_connection() {
-        let air = FakeAir::new(185);
-        let mut now = Instant::from_millis(1);
         let limits = Limits { centrals: 3, ..Limits::DESKTOP };
-        let room = Some((ble_key("app", "room"), Topic::room("app", "room")));
-        let mut b: Vec<Ble> = (1..=3)
-            .map(|i| {
-                let mut b = Ble::new(Box::new(air.radio(limits)), id(i).peer_id(), now);
-                b.set_room(now, room);
-                b
-            })
-            .collect();
-        let mut eps: Vec<Endpoint<Hop<SocketAddr>>> =
-            (1..=3).map(|i| Endpoint::new(&id(i), Config::default(), [i; 32])).collect();
-        let step = |b: &mut [Ble], eps: &mut [Endpoint<Hop<SocketAddr>>], now: Instant, hold: bool| {
+        let mut w = Air::new(&[limits; 3]);
+        w.run(2_000);
+        assert!(w.b.iter().all(|b| b.counts() == (2, 2, 0)), "each linked to the other two by the radio");
+        let step = |w: &mut Air, hold: bool| {
             let mut held = Vec::new();
-            for i in 0..b.len() {
-                while let Some(t) = eps[i].poll_transmit(now) {
+            for i in 0..3 {
+                while let Some(t) = w.eps[i].poll_transmit(w.now) {
                     if let Hop::Ble(at) = t.dst {
                         match hold && i == 0 {
                             true => held.push((at, t.payload)),
-                            false => b[i].send_datagram(&at, &t.payload),
+                            false => w.b[i].send_datagram(&at, &t.payload),
                         }
                     }
                 }
-                b[i].poll(now, &mut eps[i]);
-                while b[i].take().is_some() {}
-                eps[i].handle_timeout(now);
+                w.b[i].poll(w.now, &mut w.eps[i]);
+                while w.b[i].take().is_some() {}
+                w.eps[i].handle_timeout(w.now);
             }
+            w.now = w.now + Duration::from_millis(10);
             held
         };
-        for _ in 0..200 {
-            step(&mut b, &mut eps, now, false);
-            now = now + Duration::from_millis(10);
-        }
-        assert!(b.iter().all(|b| b.counts() == (2, 2, 0)), "each linked to the other two by the radio");
         // Alice dials Bob over both her connections; the one to Bob binds.
         let (alice, bob) = (id(1).peer_id(), id(2).peer_id());
-        let hops: Vec<Hop<SocketAddr>> = b[0].conns.values().map(|c| c.hop).collect();
-        eps[0].connect_with(now, bob, &hops.iter().map(|h| Path::Direct(*h)).collect::<Vec<_>>()).unwrap();
+        let hops: Vec<Path<Hop<SocketAddr>>> = w.b[0].conns.values().map(|c| Path::Direct(c.hop)).collect();
+        let now = w.now;
+        w.eps[0].connect_with(now, bob, &hops).unwrap();
         for _ in 0..200 {
-            step(&mut b, &mut eps, now, false);
-            now = now + Duration::from_millis(10);
+            step(&mut w, false);
         }
-        assert!(eps[0].is_connected(&bob) && eps[1].is_connected(&alice));
-        assert_eq!((b[0].counts().2, b[1].counts().2), (1, 1), "bound at both ends");
-        let path = eps[1].path(&alice).cloned();
+        assert!(w.eps[0].is_connected(&bob) && w.eps[1].is_connected(&alice));
+        assert_eq!((w.b[0].counts().2, w.b[1].counts().2), (1, 1), "bound at both ends");
+        let path = w.eps[1].path(&alice).cloned();
         // Mallory's connection to Bob.
-        let to_bob = b[2].conns.iter().find(|(i, _)| air.peer_of(2, **i) == Some(1)).map(|(_, c)| c.hop);
+        let to_bob = w.b[2].conns.iter().find(|(i, _)| w.air.peer_of(2, **i) == Some(1)).map(|(_, c)| c.hop);
         let Some(Hop::Ble(to_bob)) = to_bob else { panic!("Mallory is connected to Bob") };
-        eps[0].send(&bob, Lane::Reliable, b"for bob").unwrap();
-        let held = step(&mut b, &mut eps, now, true);
+        w.eps[0].send(&bob, Lane::Reliable, b"for bob").unwrap();
+        let held = step(&mut w, true);
         assert_eq!(held.len(), 1, "Alice's packet, taken");
-        let wrong = eps[1].stats().rx_wrong_peer;
-        b[2].send_datagram(&to_bob, &held[0].1);
+        let wrong = w.eps[1].stats().rx_wrong_peer;
+        w.b[2].send_datagram(&to_bob, &held[0].1);
         for _ in 0..5 {
-            step(&mut b, &mut eps, now, false);
-            now = now + Duration::from_millis(10);
+            step(&mut w, false);
         }
-        assert_eq!(eps[1].stats().rx_wrong_peer, wrong + 1, "dropped unread");
-        assert_eq!(eps[1].path(&alice).cloned(), path, "the link stays where it was");
-        assert_eq!(b[1].counts(), (2, 2, 1), "Mallory's isn't bound to Alice, and Alice's is still open");
-        assert!(std::iter::from_fn(|| eps[1].poll_event()).all(|e| !matches!(e, peerwire_core::Event::Message { .. })));
-        b[0].send_datagram(&held[0].0, &held[0].1);
+        assert_eq!(w.eps[1].stats().rx_wrong_peer, wrong + 1, "dropped unread");
+        assert_eq!(w.eps[1].path(&alice).cloned(), path, "the link stays where it was");
+        assert_eq!(w.b[1].counts(), (2, 2, 1), "Mallory's isn't bound to Alice, and Alice's is still open");
+        let mut events = std::iter::from_fn(|| w.eps[1].poll_event());
+        assert!(events.all(|e| !matches!(e, peerwire_core::Event::Message { .. })));
+        w.b[0].send_datagram(&held[0].0, &held[0].1);
         for _ in 0..5 {
-            step(&mut b, &mut eps, now, false);
-            now = now + Duration::from_millis(10);
+            step(&mut w, false);
         }
-        let got = std::iter::from_fn(|| eps[1].poll_event())
+        let got = std::iter::from_fn(|| w.eps[1].poll_event())
             .any(|e| matches!(e, peerwire_core::Event::Message { data, .. } if data == b"for bob"));
         assert!(got, "the real packet still reads");
-    }
-
-    /// A central of the test's that knows the room's key: connects to radio `to`, proves the room, and sends `datagram`
-    /// once proven. Returns its connection.
-    fn member_sends(
-        rogue: &mut FakeRadio,
-        to: DeviceId,
-        node: &mut Ble,
-        ep: &mut Endpoint<Hop<SocketAddr>>,
-        t: Instant,
-        datagram: &[u8],
-    ) -> ConnId {
-        let key = ble_key("app", "room");
-        rogue.connect(to);
-        let Some(RadioEvent::Connected { conn, .. }) = rogue.poll() else { panic!() };
-        let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
-        let mut read = |rogue: &mut FakeRadio, node: &mut Ble, ep: &mut Endpoint<Hop<SocketAddr>>| {
-            node.poll(t, ep);
-            std::iter::from_fn(|| rogue.poll())
-                .filter_map(|e| match e {
-                    RadioEvent::Value { value, .. } => rx.push(t, &value).map(<[u8]>::to_vec),
-                    _ => None,
-                })
-                .last()
-        };
-        let challenge = read(rogue, node, ep).expect("a challenge");
-        assert_eq!(challenge[0], KIND_CHALLENGE);
-        let (c_p, c_c, n) = (&challenge[1..], [9u8; CHALLENGE], 0u32.to_le_bytes());
-        let mac = hmac(&key, &[b"pw-ble-c", c_p, &c_c, &n]);
-        tx.split(&[&[KIND_ANSWER][..], &c_c, &n, &mac].concat(), 23, |v| rogue.send(conn, v));
-        assert_eq!(read(rogue, node, ep).map(|m| m[0]), Some(KIND_PROOF), "proven");
-        tx.split(&[&[KIND_DATAGRAM], datagram].concat(), 23, |v| rogue.send(conn, v));
-        node.poll(t, ep);
-        conn
     }
 
     /// The lead's R9 case (156 ms per HS1 on an ESP32-C3): a member that reconnects after each new handshake gets a
@@ -1202,11 +1488,7 @@ mod tests {
         let air = FakeAir::new(23);
         let now = Instant::from_millis(1);
         let limits = Limits { unbound: 2, centrals: 3, hs1_gap: Duration::from_secs(2), ..Limits::SMALL };
-        let mut node = Ble::new(Box::new(air.radio(limits)), id(1).peer_id(), now);
-        node.set_room(now, Some((ble_key("app", "room"), Topic::room("app", "room"))));
-        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
-        node.poll(now, &mut ep);
-        let mut rogue = air.radio(Limits::DESKTOP);
+        let (mut node, mut ep) = lone(&air, limits, 1, now);
         let mut sessions = Vec::new();
         for (i, t) in [0u64, 0, 0, 0, 2_000].into_iter().enumerate() {
             let t = now + Duration::from_millis(t);
@@ -1214,9 +1496,11 @@ mod tests {
             let mut dialler = Endpoint::<Hop<SocketAddr>>::new(&id(10 + i as u8), Config::default(), seed);
             dialler.connect(t, Hop::Ble("0.0.0.9:0".parse().unwrap()), id(1).peer_id()).unwrap();
             let hs1 = dialler.poll_transmit(t).unwrap().payload;
-            let conn = member_sends(&mut rogue, DeviceId(0), &mut node, &mut ep, t, &hs1);
+            let mut rogue = Rogue::prove(&air, DeviceId(0), &mut node, &mut ep, t);
+            rogue.send(&[&[KIND_DATAGRAM][..], &hs1].concat());
+            node.poll(t, &mut ep);
             sessions.push(ep.session_count());
-            rogue.disconnect(conn);
+            rogue.radio.disconnect(rogue.conn);
             node.poll(t, &mut ep);
         }
         assert_eq!(sessions, [1, 2, 2, 2, 3], "two at once, then one per 2 s");
@@ -1233,83 +1517,54 @@ mod tests {
         assert!(!b.take(t + Duration::from_secs(5), 4, Duration::from_secs(5)));
     }
 
-    /// Two node sides on one air, in the same room: who connects, the room proof, signals both ways.
-    struct Pair {
-        air: FakeAir,
-        b: [Ble; 2],
-        eps: [Endpoint<Hop<SocketAddr>>; 2],
-        now: Instant,
-        got: [Vec<(Topic, Vec<u8>)>; 2],
-    }
-
-    impl Pair {
-        fn new(rooms: [&str; 2]) -> Pair {
-            let air = FakeAir::new(23);
-            let now = Instant::from_millis(1);
-            let mk = |i: u8, room: &str| {
-                let mut b = Ble::new(Box::new(air.radio(Limits::DESKTOP)), id(i).peer_id(), now);
-                b.set_room(now, Some((ble_key("app", room), Topic::room("app", room))));
-                b
-            };
-            let b = [mk(1, rooms[0]), mk(2, rooms[1])];
-            let eps = [1, 2].map(|i| Endpoint::new(&id(i), Config::default(), [i; 32]));
-            Pair { air, b, eps, now, got: [Vec::new(), Vec::new()] }
-        }
-
-        fn run(&mut self, ms: u64) {
-            for _ in 0..ms / 10 {
-                for i in 0..2 {
-                    self.b[i].poll(self.now, &mut self.eps[i]);
-                    while let Some(e) = self.b[i].take() {
-                        if let Inbound::Signal { topic, payload, conn, .. } = e {
-                            self.b[i].heard(conn, self.now, id(2 - i as u8).peer_id());
-                            self.got[i].push((topic, payload));
-                        }
-                    }
-                }
-                self.now = self.now + Duration::from_millis(10);
-            }
-        }
-    }
-
+    /// Who connects turns on random values. Desktops take one central each, so once one has connected to the other,
+    /// the other is full and connects back: a second connection, which its maker closes once both ends have proven
+    /// who they are, and doesn't make again while that advert lasts (NB110-6). A pair ends with one connection, made
+    /// at most twice.
     #[test]
-    fn members_connect_once_prove_the_room_and_carry_sealed_signals() {
-        // Who connects turns on random values: many pairs, never two connections.
-        for _ in 0..20 {
-            let mut p = Pair::new(["room", "room"]);
-            p.run(500);
-            assert_eq!(p.air.links(), 1, "one connection, made by the smaller n");
+    fn members_connect_once_prove_the_room_and_who_they_are_and_carry_sealed_signals() {
+        for _ in 0..10 {
+            let mut w = Air::new(&[Limits::DESKTOP; 2]);
+            w.run(3_000);
+            assert_eq!(w.air.links(), 1, "one connection");
+            assert!(w.linked(0, 1), "each proven to reach the other");
+            w.run(70_000);
+            assert!(w.air.links() == 1 && w.linked(0, 1), "still the one");
+            assert!(w.air.connects() <= 2, "{} connections made", w.air.connects());
+            let (a, b) = (id(1).peer_id(), id(2).peer_id());
+            assert_eq!(w.ids.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1], "each told once");
+            assert!(w.ids[0][0].0 == b && w.ids[1][0].0 == a);
+            assert!(w.b.iter().all(|b| b.counts() == (1, 1, 0)), "proven, bound to no one");
         }
-        let mut p = Pair::new(["room", "room"]);
-        p.run(500);
-        assert!(p.b.iter().all(|b| b.counts() == (1, 1, 0)), "proven, bound to no one");
+        let mut w = Air::new(&[Limits::DESKTOP; 2]);
+        w.run(3_000);
         let room = Topic::room("app", "room");
-        p.b[0].publish(room, b"hello from 1");
-        p.b[1].publish(Topic::peer(&id(1).peer_id()), b"offer for 1");
-        p.run(100);
-        assert_eq!(p.got[1], vec![(room, b"hello from 1".to_vec())]);
-        assert_eq!(p.got[0], vec![(Topic::peer(&id(1).peer_id()), b"offer for 1".to_vec())]);
+        let got = w.got.iter().map(Vec::len).collect::<Vec<_>>();
+        w.b[0].publish(room, b"hello from 1");
+        w.b[1].publish(Topic::peer(&id(1).peer_id()), b"offer for 1");
+        w.b[1].publish(Topic::peer(&id(3).peer_id()), b"offer for 3");
+        w.run(100);
+        assert_eq!(w.got[1][got[1]..], [(room, b"hello from 1".to_vec())]);
+        assert_eq!(w.got[0][got[0]..], [(Topic::peer(&id(1).peer_id()), b"offer for 1".to_vec())], "not 3's");
     }
 
     #[test]
     fn other_rooms_never_connect() {
-        let mut p = Pair::new(["room", "other"]);
-        p.run(2000);
-        assert_eq!(p.air.links(), 0);
+        let mut w = Air::new(&[Limits::DESKTOP; 2]);
+        w.b[1].set_room(w.now, Some((ble_key("app", "other"), Topic::room("app", "other"))));
+        w.run(2000);
+        assert_eq!(w.air.links(), 0);
     }
 
     #[test]
     fn a_central_without_the_room_key_is_closed() {
         let air = FakeAir::new(23);
         let now = Instant::from_millis(1);
-        let mut node = Ble::new(Box::new(air.radio(Limits::DESKTOP)), id(1).peer_id(), now);
-        node.set_room(now, Some((ble_key("app", "room"), Topic::room("app", "room"))));
-        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
-        node.poll(now, &mut ep);
+        let (mut node, mut ep) = lone(&air, Limits::DESKTOP, 1, now);
         let mut rogue = air.radio(Limits::DESKTOP);
         let mut t = now;
         // A wrong answer closes it at once; one that says nothing, at the deadline.
-        for (answer, after) in [(true, 20u64), (false, 10_100)] {
+        for (answer, after) in [(true, 20u64), (false, 3_100)] {
             rogue.connect(DeviceId(0));
             let Some(RadioEvent::Connected { conn, .. }) = rogue.poll() else { panic!() };
             node.poll(t, &mut ep);
@@ -1318,7 +1573,7 @@ mod tests {
             if answer {
                 let mut chunker = Chunker::new();
                 let mut m = vec![KIND_ANSWER];
-                m.extend([0u8; CHALLENGE + 4 + MAC]);
+                m.extend([0u8; CHALLENGE + MAC]);
                 chunker.split(&m, 23, |v| rogue.send(conn, v));
             }
             t = t + Duration::from_millis(after);
@@ -1332,10 +1587,7 @@ mod tests {
     fn nothing_but_the_proof_passes_before_it() {
         let air = FakeAir::new(23);
         let now = Instant::from_millis(1);
-        let mut node = Ble::new(Box::new(air.radio(Limits::DESKTOP)), id(1).peer_id(), now);
-        node.set_room(now, Some((ble_key("app", "room"), Topic::room("app", "room"))));
-        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
-        node.poll(now, &mut ep);
+        let (mut node, mut ep) = lone(&air, Limits::DESKTOP, 1, now);
         let mut rogue = air.radio(Limits::DESKTOP);
         rogue.connect(DeviceId(0));
         let Some(RadioEvent::Connected { conn, .. }) = rogue.poll() else { panic!() };
@@ -1350,79 +1602,245 @@ mod tests {
         assert_eq!(node.counts(), (0, 0, 0));
     }
 
-    /// NB110-2: a central over the unbound limit is taken, and the oldest unbound connection closes for it, so held
-    /// slots can't lock newcomers out; over the limit of centrals it is refused, and the advert says so.
+    /// NB110-6: once the room is proven, each end proves who it is on the connection: its `PeerId`, signed over this
+    /// connection's challenges. Only that identity reaches anything. A proof made for another connection (a member
+    /// passing on one it was sent), one in this node's own name, or none at all, closes the connection.
     #[test]
-    fn a_central_over_the_unbound_limit_evicts_the_oldest() {
+    fn a_peer_proves_who_it_is_on_the_connection() {
         let air = FakeAir::new(23);
-        let now = Instant::from_millis(1);
-        let limits = Limits { unbound: 2, centrals: 8, ..Limits::DESKTOP };
-        let mut node = Ble::new(Box::new(air.radio(limits)), id(1).peer_id(), now);
-        node.set_room(now, Some((ble_key("app", "room"), Topic::room("app", "room"))));
-        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
-        node.poll(now, &mut ep);
-        let mut rogues: Vec<FakeRadio> = (0..3).map(|_| air.radio(limits)).collect();
-        for r in &mut rogues {
-            r.connect(DeviceId(0));
-            node.poll(now, &mut ep);
-        }
-        assert_eq!(node.counts().0, 2);
-        let events = |r: &mut FakeRadio| std::iter::from_fn(|| r.poll()).collect::<Vec<_>>();
-        let gone = |e: &Vec<RadioEvent>| e.iter().any(|e| matches!(e, RadioEvent::Disconnected { .. }));
-        let seen: Vec<Vec<RadioEvent>> = rogues.iter_mut().map(events).collect();
-        assert_eq!(seen.iter().map(gone).collect::<Vec<_>>(), [true, false, false], "the first one went");
-        assert_eq!(air.advert(0).map(|a| a[0] & FULL), Some(0), "not full: it takes centrals");
+        let mut t = Instant::from_millis(1);
+        let (mut node, mut ep) = lone(&air, Limits { centrals: 4, ..Limits::DESKTOP }, 1, t);
+        let ids = |node: &mut Ble| {
+            std::iter::from_fn(|| node.take())
+                .filter_map(|e| match e {
+                    Inbound::Identified { peer, .. } => Some(peer),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // The node's own proof comes right after its proof of the room, and checks out.
+        let mut first = Rogue::prove(&air, DeviceId(0), &mut node, &mut ep, t);
+        let came = first.read(&mut node, &mut ep, t);
+        assert_eq!(came[0][0], KIND_PROOF);
+        let proof = first.open(&came[1]);
+        assert_eq!((proof[0], proof.len()), (INNER_ID, 1 + ID_LEN));
+        let (who, sig) = (PeerId(proof[1..33].try_into().unwrap()), proof[33..].try_into().unwrap());
+        assert!(who == id(1).peer_id() && who.verify(&id_message(&first.transcript), &sig));
+        first.prove_id(&id(5), &first.transcript.clone());
+        first.read(&mut node, &mut ep, t);
+        assert_eq!(ids(&mut node), [id(5).peer_id()], "proven on the connection");
 
-        let one = Limits { centrals: 2, ..limits };
-        let mut node = Ble::new(Box::new(air.radio(one)), id(1).peer_id(), now);
-        node.set_room(now, Some((ble_key("app", "room"), Topic::room("app", "room"))));
-        node.poll(now, &mut ep);
-        let at = DeviceId(4); // the fifth radio on the air
-        let mut more: Vec<FakeRadio> = (0..3).map(|_| air.radio(one)).collect();
-        for r in &mut more {
-            r.connect(at);
-            node.poll(now, &mut ep);
+        let mut other = Rogue::prove(&air, DeviceId(0), &mut node, &mut ep, t);
+        other.prove_id(&id(6), &first.transcript);
+        other.read(&mut node, &mut ep, t);
+        assert!(other.closed(), "a proof for another connection");
+        let mut mine = Rogue::prove(&air, DeviceId(0), &mut node, &mut ep, t);
+        mine.prove_id(&id(1), &mine.transcript.clone());
+        mine.read(&mut node, &mut ep, t);
+        assert!(mine.closed(), "the node's own name");
+        let mut silent = Rogue::prove(&air, DeviceId(0), &mut node, &mut ep, t);
+        t = t + PROVE_WITHIN + Duration::from_millis(10);
+        silent.read(&mut node, &mut ep, t);
+        assert!(silent.closed(), "no proof by the deadline");
+        assert!(ids(&mut node).is_empty() && node.counts().0 == 1);
+    }
+
+    /// NB110-6 (security's case c): Mallory, a member, connects to Alice and takes Alice's identity proof off that
+    /// connection, then connects to Bob before Alice does and passes it on. Bob closes Mallory's connection, and
+    /// Alice and Bob still link over theirs.
+    #[test]
+    fn a_member_cannot_pass_on_anothers_identity() {
+        let limits = Limits { centrals: 3, ..Limits::DESKTOP };
+        let mut w = Air::new(&[limits; 2]);
+        w.set_n(0, 2_000);
+        w.set_n(1, 1_000);
+        let t = w.now;
+        let (alice, bob) = w.b.split_at_mut(1);
+        let (ea, eb) = w.eps.split_at_mut(1);
+        let mut m = Rogue::prove(&w.air, DeviceId(0), &mut alice[0], &mut ea[0], t);
+        let came = m.read(&mut alice[0], &mut ea[0], t);
+        let proof = m.open(&came[1]);
+        let mut to_bob = Rogue::prove(&w.air, DeviceId(1), &mut bob[0], &mut eb[0], t);
+        to_bob.signal(INNER_ID, &proof[1..]);
+        to_bob.read(&mut bob[0], &mut eb[0], t);
+        assert!(to_bob.closed(), "Alice's proof doesn't hold on Mallory's connection");
+        w.run(2_000);
+        assert!(w.linked(0, 1), "Alice and Bob link");
+        let via = |i: usize| w.ids[i].iter().filter(|(p, _)| *p == id(2 - i as u8).peer_id()).count();
+        assert_eq!((via(0), via(1)), (1, 1));
+    }
+
+    /// NB110-6: two connections to one peer, one made by each end, each of which took its own as the first (made at
+    /// once, over a slow radio). Here the node made one to Y's advert and proved Y on it first; then Y's own
+    /// connection to the node proved Y too. The node leaves that one to Y, which made it, and it doesn't fill the
+    /// advert; once it has been proven `PROVE_WITHIN`, the one whose central has the larger `PeerId` closes, at the
+    /// end that made it: the node's own if the node's `PeerId` is the larger, else none here.
+    #[test]
+    fn twins_made_at_once_settle_on_one() {
+        let key = ble_key("app", "room");
+        for (me, y) in [(1u8, 2u8), (2, 1)] {
+            let air = FakeAir::new(23);
+            let t = Instant::from_millis(1);
+            let (mut node, mut ep) = lone(&air, Limits::DESKTOP, me, t);
+            let (yp, x) = (&mut air.radio(Limits::DESKTOP), DeviceId(0));
+            yp.advertise(Some(&advert(&key, u32::MAX, false)));
+            let conn = (0..64)
+                .find_map(|_| {
+                    node.poll(t, &mut ep);
+                    std::iter::from_fn(|| yp.poll()).find_map(|e| match e {
+                        RadioEvent::Connected { conn, .. } => Some(conn),
+                        _ => None,
+                    })
+                })
+                .expect("the node connects to Y's advert");
+            // Y's side of the room proof, as the peripheral, then its identity proof.
+            let (c_p, mut tx, mut rx) = ([3u8; CHALLENGE], Chunker::new(), Reassembler::new());
+            tx.split(&[&[KIND_CHALLENGE][..], &c_p].concat(), 23, |v| yp.send(conn, v));
+            node.poll(t, &mut ep);
+            let answer = std::iter::from_fn(|| yp.poll())
+                .find_map(|e| match e {
+                    RadioEvent::Value { value, .. } => rx.push(t, &value).map(<[u8]>::to_vec),
+                    _ => None,
+                })
+                .expect("an answer");
+            let c_c: [u8; CHALLENGE] = answer[1..1 + CHALLENGE].try_into().unwrap();
+            tx.split(&[&[KIND_PROOF][..], &hmac(&key, &[b"pw-ble-p", &c_c, &c_p])].concat(), 23, |v| yp.send(conn, v));
+            let transcript: [u8; 2 * CHALLENGE] = [c_p, c_c].concat().try_into().unwrap();
+            let link = hmac(&key, &[b"pw-ble-k", &transcript]);
+            let sig = id(y).sign(&id_message(&transcript));
+            let proof = [&[INNER_ID][..], id(y).peer_id().as_bytes(), &sig].concat();
+            let sealed = seal(&link, 1, 1, &proof).unwrap();
+            tx.split(&[&[KIND_SIGNAL][..], &1u64.to_le_bytes(), &sealed].concat(), 23, |v| yp.send(conn, v));
+            node.poll(t, &mut ep);
+            // Y's own connection to the node, which proves Y as well.
+            let mut yc = Rogue::prove(&air, x, &mut node, &mut ep, t);
+            yc.prove_id(&id(y), &yc.transcript.clone());
+            yc.read(&mut node, &mut ep, t);
+            let told: Vec<PeerId> = std::iter::from_fn(|| node.take())
+                .filter_map(|e| match e {
+                    Inbound::Identified { peer, .. } => Some(peer),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(told, [id(y).peer_id()], "told of the first only");
+            assert_eq!(node.counts().0, 2, "Y's left to Y");
+            assert_eq!(air.advert(0).map(|a| a[0] & FULL), Some(0), "nor does it fill the advert");
+            node.poll(t + PROVE_WITHIN, &mut ep);
+            let mine_closes = id(me).peer_id() > id(y).peer_id();
+            let gone = std::iter::from_fn(|| yp.poll()).any(|e| matches!(e, RadioEvent::Disconnected { .. }));
+            assert_eq!((gone, yc.closed()), (mine_closes, false), "me {me}, Y {y}");
+            assert_eq!(node.counts().0, if mine_closes { 1 } else { 2 });
         }
-        assert_eq!(node.counts().0, 2, "two centrals at most");
-        assert_eq!(air.advert(4).map(|a| a[0] & FULL), Some(FULL), "the advert says it is full");
-        let seen: Vec<Vec<RadioEvent>> = more.iter_mut().map(events).collect();
-        assert_eq!(seen.iter().map(gone).collect::<Vec<_>>(), [false, false, true], "the third is refused");
+    }
+
+    /// NB110-7 (security's case a): a device with no room key connects to both desktops, which take one central
+    /// each, never answers, and connects again each time it is closed. A new central takes the place of one that
+    /// hasn't proven the room within `GRACE`, so the two still link; the advert counts no such central.
+    #[test]
+    fn a_central_that_never_answers_keeps_no_one_apart() {
+        let mut w = Air::new(&[Limits::DESKTOP; 2]);
+        let mut rogue = w.air.radio(Limits::DESKTOP);
+        let mut on: HashMap<ConnId, usize> = HashMap::new();
+        let mut tries = 0;
+        for _ in 0..12_000 {
+            for e in std::iter::from_fn(|| rogue.poll()).collect::<Vec<_>>() {
+                match e {
+                    RadioEvent::Connected { conn, device: Some(d), .. } => drop(on.insert(conn, d.0 as usize)),
+                    RadioEvent::Disconnected { conn } => drop(on.remove(&conn)),
+                    _ => {}
+                }
+            }
+            for to in 0..2 {
+                if !on.values().any(|t| *t == to) {
+                    rogue.connect(DeviceId(to as u64));
+                    tries += 1;
+                }
+            }
+            w.run(10);
+            if w.linked(0, 1) {
+                break;
+            }
+        }
+        assert!(w.linked(0, 1) && tries >= 2, "linked, after {tries} connects of the rogue's");
+        let full = |i: usize| w.air.advert(i).is_some_and(|a| a[0] & FULL != 0);
+        assert!(full(0) || full(1), "the honest central counts");
+    }
+
+    /// NB110-7: a new central over the limits takes the place of the oldest that hasn't proven the room, once it
+    /// has had `GRACE`; until then, and in place of one that has, it is refused. The advert counts only centrals
+    /// whose peer has proven who it is.
+    #[test]
+    fn a_new_central_takes_the_place_of_one_that_never_proves_the_room() {
+        let air = FakeAir::new(23);
+        let t = Instant::from_millis(1);
+        let (mut node, mut ep) = lone(&air, Limits::DESKTOP, 1, t);
+        let silent = |air: &FakeAir, node: &mut Ble, ep: &mut Endpoint<Hop<SocketAddr>>, t: Instant| {
+            let mut r = air.radio(Limits::DESKTOP);
+            r.connect(DeviceId(0));
+            node.poll(t, ep);
+            r
+        };
+        let gone =
+            |r: &mut FakeRadio| std::iter::from_fn(|| r.poll()).any(|e| matches!(e, RadioEvent::Disconnected { .. }));
+        let mut first = silent(&air, &mut node, &mut ep, t);
+        assert_eq!(air.advert(0).map(|a| a[0] & FULL), Some(0), "an unproven central doesn't fill it");
+        let mut early = silent(&air, &mut node, &mut ep, t + GRACE / 2);
+        assert!(gone(&mut early) && !gone(&mut first), "refused within the first one's grace");
+        let mut later = silent(&air, &mut node, &mut ep, t + GRACE);
+        assert!(gone(&mut first) && !gone(&mut later), "takes its place after");
+        let at = t + GRACE * 2;
+        let mut member = Rogue::prove(&air, DeviceId(0), &mut node, &mut ep, at);
+        assert!(gone(&mut later), "so does a member");
+        member.prove_id(&id(5), &member.transcript.clone());
+        member.read(&mut node, &mut ep, at);
+        assert_eq!(air.advert(0).map(|a| a[0] & FULL), Some(FULL), "a proven member's fills it");
+        let mut after = silent(&air, &mut node, &mut ep, at + GRACE * 2);
+        assert!(gone(&mut after) && !member.closed(), "and isn't displaced");
+
+        // Over the unbound limit, the same: the oldest unproven connection makes way.
+        let air = FakeAir::new(23);
+        let limits = Limits { unbound: 2, centrals: 8, ..Limits::DESKTOP };
+        let (mut node, mut ep) = lone(&air, limits, 2, t);
+        let mut rs: Vec<FakeRadio> = (0..2).map(|_| silent(&air, &mut node, &mut ep, t)).collect();
+        let mut third = silent(&air, &mut node, &mut ep, t + GRACE);
+        assert!(gone(&mut rs[0]) && !gone(&mut rs[1]) && !gone(&mut third), "the oldest went");
+    }
+
+    /// NB110-2: Mallory's four members, with adverts above everyone's, take all of Bob's unbound connections, and
+    /// keep them alive with hellos. A connection that proves the room into the last unbound slot closes the weakest
+    /// other, so Bob keeps one free and still connects to Alice, whose advert is above his.
+    #[test]
+    fn standbys_leave_a_slot_for_a_newcomer() {
+        let roomy = Limits { centrals: 8, unbound: 8, ..Limits::DESKTOP }; // Mallory's never close Bob's
+        let mut w = Air::new(&[roomy, roomy, roomy, roomy, Limits::DESKTOP, Limits::DESKTOP]);
+        for i in 0..4 {
+            w.set_n(i, u32::MAX - i as u32);
+        }
+        w.set_n(4, 2_000); // Alice
+        w.set_n(5, 1_000); // Bob
+        w.run(5_000);
+        assert!(w.linked(4, 5), "Bob connected to Alice");
+        let unbound = w.b[5].conns.values().filter(|c| c.bound.is_none()).count();
+        assert!(unbound < Limits::DESKTOP.unbound, "one slot free: {unbound}");
     }
 
     #[test]
     fn a_link_binds_its_connection_and_datagrams_cross() {
-        let mut p = Pair::new(["room", "room"]);
-        p.run(500);
+        let mut w = Air::new(&[Limits::DESKTOP; 2]);
+        w.run(3_000);
+        w.datagrams = true;
         // Each side learns the other's connection from the radio, and dials over it.
-        let hops: Vec<Hop<SocketAddr>> = p.b.iter().map(|b| b.conns.values().next().unwrap().hop).collect();
+        let hops: Vec<Hop<SocketAddr>> = w.ids.iter().map(|ids| ids[0].1).collect();
         let (x, y) = (id(1).peer_id(), id(2).peer_id());
-        p.eps[0].connect(p.now, hops[0], y).unwrap();
-        for _ in 0..150 {
-            for i in 0..2 {
-                while let Some(t) = p.eps[i].poll_transmit(p.now) {
-                    if let Hop::Ble(at) = t.dst {
-                        p.b[i].send_datagram(&at, &t.payload);
-                    }
-                }
-            }
-            p.run(10);
-            p.eps.iter_mut().for_each(|e| e.handle_timeout(p.now));
-        }
-        assert!(p.eps[0].is_connected(&y) && p.eps[1].is_connected(&x));
-        let counts: Vec<_> = p.b.iter().map(Ble::counts).collect();
+        let now = w.now;
+        w.eps[0].connect(now, hops[0], y).unwrap();
+        w.run(1_500);
+        assert!(w.eps[0].is_connected(&y) && w.eps[1].is_connected(&x));
+        let counts: Vec<_> = w.b.iter().map(Ble::counts).collect();
         assert_eq!(counts, vec![(1, 1, 1); 2], "bound both ends");
-        p.eps[0].send(&y, Lane::Reliable, &[5u8; 900]).unwrap();
-        for _ in 0..20 {
-            for i in 0..2 {
-                while let Some(t) = p.eps[i].poll_transmit(p.now) {
-                    if let Hop::Ble(at) = t.dst {
-                        p.b[i].send_datagram(&at, &t.payload);
-                    }
-                }
-            }
-            p.run(10);
-        }
-        let got = std::iter::from_fn(|| p.eps[1].poll_event())
+        w.eps[0].send(&y, Lane::Reliable, &[5u8; 900]).unwrap();
+        w.run(200);
+        let got = std::iter::from_fn(|| w.eps[1].poll_event())
             .any(|e| matches!(e, peerwire_core::Event::Message { data, .. } if data == vec![5u8; 900]));
         assert!(got, "900 bytes in 45 chunks of 20");
     }

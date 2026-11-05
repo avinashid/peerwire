@@ -65,8 +65,6 @@ const STUN_TRIES: u32 = 3;
 /// Room hellos repeat at 2 s, 4 s, ... up to every 30 s, for peers that missed one.
 const HELLO_FIRST: Duration = Duration::from_secs(2);
 const HELLO_MAX: Duration = Duration::from_secs(30);
-/// How soon [`Traversal::hello_soon`] brings the next hello.
-const HELLO_SOON: Duration = Duration::from_millis(100);
 /// Least time between two offers to one peer.
 const OFFER_GAP: Duration = Duration::from_secs(2);
 /// Offers older or newer than this (by the sender's clock) are dropped.
@@ -92,7 +90,7 @@ const _: () = assert!(INBOX_BURST > BURST, "a burst of real offers is opened bef
 /// Most offer nonces remembered (they are only kept for offers acted on).
 const MAX_NONCES: usize = 1024;
 const MAX_CANDIDATES: usize = 8;
-/// Radio connections remembered per peer ([`Traversal::handle_signal_via`]).
+/// Radio connections remembered per peer ([`Traversal::radio_reaches`]).
 const MAX_RADIO: usize = 2;
 /// A link on a radio connection punches to its peer's addresses again this often: the network may be back.
 const RADIO_PUNCH: Duration = Duration::from_secs(15);
@@ -635,8 +633,8 @@ struct Remote<A> {
     redial: bool,
     /// Its link is moving under [`Privacy::RelayOnly`] ([`Traversal::hide`]): closed if the move fails or is late.
     hide: bool,
-    /// The radio connections its proven hellos and acted-on offers came over, newest first, at most `MAX_RADIO`: a
-    /// dial to it goes over them too ([`PathKind::Bluetooth`]). Never offered.
+    /// The radio connections proven to reach it, newest first, at most `MAX_RADIO`: a dial to it goes over them too
+    /// ([`PathKind::Bluetooth`]). Never offered.
     radio: Vec<A>,
 }
 
@@ -1076,14 +1074,15 @@ impl<A: Address> Traversal<A> {
         self.announce(now);
     }
 
-    /// Brings this node's next room hello forward to within `HELLO_SOON`, but no sooner than 2 s after the last
-    /// one, and starts its back-off again: for a carrier that has just reached new members (a Bluetooth connection
-    /// proved the room). It only moves the timer, so however often it is called, hellos go out at most every 2 s.
-    pub fn hello_soon(&mut self, now: Instant) {
-        if let Some(r) = self.room.as_mut() {
-            let next = r.next_hello.min(now + HELLO_SOON).max(r.said + HELLO_FIRST);
-            (r.interval, r.next_hello) = (HELLO_FIRST, next);
-        }
+    /// A room hello of this node's, sealed for the room, to send on one carrier that has just reached new members (a
+    /// Bluetooth connection that proved the room) and nowhere else: the hellos on the room topic keep their schedule.
+    /// `None` outside a room.
+    pub fn room_hello(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let wall = self.wall_ms(now);
+        let r = self.room.as_ref()?;
+        let mut nonce = [0; NONCE_LEN];
+        self.rng.fill_bytes(&mut nonce);
+        Some(seal_room(&r.enc, nonce, &hello(&r.key, &self.id, r.role, wall)))
     }
 
     /// The key this node's invites carry: an offer proved with it is from a peer
@@ -1170,24 +1169,16 @@ impl<A: Address> Traversal<A> {
         true
     }
 
-    /// Handles a message from the signaling carrier.
-    pub fn handle_signal(&mut self, now: Instant, ep: &mut Endpoint<A>, topic: Topic, payload: &[u8]) {
-        self.handle_signal_via(now, ep, topic, payload, None);
-    }
-
-    /// [`handle_signal`](Traversal::handle_signal) for a message that came over `via`, a radio connection
-    /// ([`Address::radio`]) that carries signals and datagrams alike, such as a Bluetooth one. A hello whose proof
-    /// checked out, or an offer acted on, makes `via` a path its sender is dialled on ([`PathKind::Bluetooth`]),
-    /// beside its addresses; no offer of this node's ever names it. The peer the message proved, if any.
-    pub fn handle_signal_via(
+    /// Handles a message from the signaling carrier. The member a room hello whose proof checked out, or an offer
+    /// acted on, came from, if any. That is all it proves: not that the carrier it came over reaches that member,
+    /// as a member may pass on another's signals (see [`radio_reaches`](Traversal::radio_reaches)).
+    pub fn handle_signal(
         &mut self,
         now: Instant,
         ep: &mut Endpoint<A>,
         topic: Topic,
         payload: &[u8],
-        via: Option<A>,
     ) -> Option<PeerId> {
-        let via = via.filter(Address::radio);
         self.sync_keep(ep);
         if let Some(room) = self.room.as_ref().filter(|r| r.topic == topic) {
             // A hello that doesn't open under the room's key (plaintext, another room's, altered) is dropped.
@@ -1197,9 +1188,6 @@ impl<A: Address> Traversal<A> {
             if fresh && mac_ok(&room.key, &[b"pw-hello", from.as_bytes(), &[role as u8], &ts.to_le_bytes()], &proof) {
                 if from == self.id {
                     return None;
-                }
-                if let Some(v) = via {
-                    self.note_radio(from, v);
                 }
                 self.on_hello(now, ep, from, role);
                 return Some(from);
@@ -1231,7 +1219,7 @@ impl<A: Address> Traversal<A> {
                 _ => false,
             };
             if let Some(offer) = Offer::decode(body).filter(|_| welcome) {
-                return self.on_offer(now, ep, from, offer, via).then_some(from);
+                return self.on_offer(now, ep, from, offer).then_some(from);
             }
         }
         None
@@ -1251,12 +1239,21 @@ impl<A: Address> Traversal<A> {
         }
     }
 
-    /// Notes that `peer`'s signals came over radio connection `via` (see `handle_signal_via`).
-    fn note_radio(&mut self, peer: PeerId, via: A) {
+    /// Radio connection `via` ([`Address::radio`]), such as a Bluetooth one, which carries signals and datagrams
+    /// alike, proved on the connection itself that `peer` is at its other end (Bluetooth's identity proof): a dial to
+    /// `peer` goes over it from now on, beside its addresses ([`PathKind::Bluetooth`]), and a member with no link is
+    /// offered to again at once, over it too. No offer of this node's ever names it.
+    pub fn radio_reaches(&mut self, now: Instant, ep: &Endpoint<A>, peer: PeerId, via: A) {
+        if !via.radio() || peer == self.id {
+            return;
+        }
         let r = self.remotes.entry(peer).or_default();
         r.radio.retain(|a| *a != via);
         r.radio.insert(0, via);
         r.radio.truncate(MAX_RADIO);
+        if r.member.is_some() && !ep.is_connected(&peer) {
+            self.offer(now, ep, peer, true, true);
+        }
     }
 
     /// Forgets radio connection `via`, which closed: no dial goes over it any more.
@@ -2226,9 +2223,9 @@ impl<A: Address> Traversal<A> {
         }
     }
 
-    /// An offer that opened, and whose room proof (in a room) checked out; `via`, the radio connection it came over.
-    /// Whether it was acted on: not stale, a replay or over a budget.
-    fn on_offer(&mut self, now: Instant, ep: &mut Endpoint<A>, from: PeerId, mut o: Offer<A>, via: Option<A>) -> bool {
+    /// An offer that opened, and whose room proof (in a room) checked out. Whether it was acted on: not stale, a
+    /// replay or over a budget.
+    fn on_offer(&mut self, now: Instant, ep: &mut Endpoint<A>, from: PeerId, mut o: Offer<A>) -> bool {
         o.addrs = o.addrs.into_iter().map(canonical).collect(); // `::ffff:` copies compare as the IPv4 address
         o.relayed = o.relayed.into_iter().map(canonical).filter(|a| dialable(a, self.loopback)).collect();
         let room = o.kind == Proof::Room;
@@ -2248,9 +2245,6 @@ impl<A: Address> Traversal<A> {
             return false;
         }
         self.nonces.insert((from, o.nonce), now);
-        if let Some(v) = via {
-            self.note_radio(from, v);
-        }
         let r = self.remotes.entry(from).or_default();
         (r.heard, r.nat, r.seen_at, r.offers) = (true, o.nat, now, mine);
         r.relays = o.relays.iter().filter(|p| **p != from && **p != self.id).take(MAX_RELAYS).copied().collect();
@@ -3057,12 +3051,13 @@ mod tests {
         assert!(!t.allows(&peer, &ble), "relay-only, with no policy too");
     }
 
-    /// NB-110: a hello that proves the room, or an offer acted on, that came over a Bluetooth connection makes the
-    /// connection a path its sender is dialled on, beside its addresses; this node's offers never name it. Nothing is
-    /// noted for a hello that doesn't prove the room, or for a `via` that is no radio's; a closed connection, or a
-    /// policy that has `Bluetooth` off, takes it out; under a policy it is the dial's last step.
+    /// NB-110 (NB110-6): only a radio connection proven to reach a peer (`radio_reaches`) is a path it is dialled on,
+    /// beside its addresses: a hello or an offer proves who sent it, not who is at the other end of what carried it.
+    /// A `via` that is no radio's is ignored; a member with no link is offered to again at once; this node's offers
+    /// never name a radio; a closed connection, or a policy that has `Bluetooth` off, takes it out; under a policy it
+    /// is the dial's last step.
     #[test]
-    fn signals_over_a_radio_make_it_a_dial_target() {
+    fn a_radio_proven_to_reach_a_peer_is_a_dial_target() {
         let ia = id(1);
         let me = ia.peer_id();
         let local: SocketAddr = "10.0.0.1:7000".parse().unwrap();
@@ -3078,43 +3073,48 @@ mod tests {
             while t.poll_signal().is_some() {}
             (t, ep)
         };
+        let published = |t: &mut Traversal<Hop<SocketAddr>>| -> Vec<Vec<u8>> {
+            std::iter::from_fn(|| t.poll_signal())
+                .filter_map(|s| match s {
+                    Signal::Publish(_, p) => Some(p),
+                    _ => None,
+                })
+                .collect()
+        };
         let (b, c) = (id(2), id(3));
         let (pb, pc) = (b.peer_id(), c.peer_id());
         let (mut t, mut ep) = new(None);
         let forged = room_hello(&topic.0, &pb, Role::Peer, 0);
-        assert_eq!(t.handle_signal_via(now, &mut ep, topic, &forged, Some(ble)), None);
-        let (hello_c, not_radio) = (room_hello(&key, &pc, Role::Peer, 0), Some(Hop::Net(there)));
-        assert_eq!(t.handle_signal_via(now, &mut ep, topic, &hello_c, not_radio), Some(pc));
-        assert!(t.radio_targets(&pb).is_empty() && t.radio_targets(&pc).is_empty());
-        while t.poll_signal().is_some() {}
+        assert_eq!(t.handle_signal(now, &mut ep, topic, &forged), None);
         let hello_b = room_hello(&key, &pb, Role::Peer, 0);
-        assert_eq!(t.handle_signal_via(now, &mut ep, topic, &hello_b, Some(ble)), Some(pb));
-        assert_eq!(t.radio_targets(&pb), vec![Path::Direct(ble)]);
-        let offers: Vec<Vec<u8>> = std::iter::from_fn(|| t.poll_signal())
-            .filter_map(|s| match s {
-                Signal::Publish(_, p) => Some(p),
-                _ => None,
-            })
-            .collect();
+        assert_eq!(t.handle_signal(now, &mut ep, topic, &hello_b), Some(pb));
+        assert!(t.radio_targets(&pb).is_empty(), "a hello proves its sender, not what carried it");
+        let offers = published(&mut t);
         assert_eq!(offers.len(), 1, "the hello is answered");
         let (_, body) = sealed::open(&b, &offers[0]).unwrap();
         let o = Offer::<Hop<SocketAddr>>::decode(&body[..body.len() - PROOF_LEN]).unwrap();
         assert_eq!(o.addrs, vec![Hop::Net(local)], "the offer names no radio");
+        t.radio_reaches(now, &ep, pc, Hop::Net(there));
+        assert!(t.radio_targets(&pc).is_empty(), "not a radio");
+        t.radio_reaches(now, &ep, pb, ble);
+        assert_eq!(t.radio_targets(&pb), vec![Path::Direct(ble)]);
+        assert_eq!(published(&mut t).len(), 1, "a member with no link is offered to again");
         let offer = offer_from(&b, &me, Some(&key), 1, Role::Peer, vec![there]);
-        assert_eq!(t.handle_signal_via(now, &mut ep, inbox, &offer, None), Some(pb));
+        assert_eq!(t.handle_signal(now, &mut ep, inbox, &offer), Some(pb));
         let sent: Vec<_> = std::iter::from_fn(|| ep.poll_transmit(now)).map(|x| x.dst).collect();
         assert!(sent.contains(&Hop::Net(there)) && sent.contains(&ble), "{sent:?}");
-        assert_eq!(t.handle_signal_via(now, &mut ep, inbox, &offer, Some(ble)), None, "a replay is not acted on");
+        assert_eq!(t.handle_signal(now, &mut ep, inbox, &offer), None, "a replay is not acted on");
         t.forget_radio(&ble);
         assert!(t.radio_targets(&pb).is_empty());
 
-        // Under a policy, the offer that came over the radio is dialled there last, after `fallback`; with
-        // `Bluetooth` off, never.
+        // Under a policy, a peer the radio reaches is dialled there last, after `fallback`; with `Bluetooth` off,
+        // never.
         let orders = [(vec![PathKind::Direct, PathKind::Bluetooth], true), (vec![PathKind::Direct], false)];
         for (order, over_radio) in orders {
             let (mut t, mut ep) = new(Some(Policy::new(order)));
+            t.radio_reaches(now, &ep, pb, ble);
             let offer = offer_from(&b, &me, Some(&key), 2, Role::Peer, vec![there]);
-            assert_eq!(t.handle_signal_via(now, &mut ep, inbox, &offer, Some(ble)), Some(pb));
+            assert_eq!(t.handle_signal(now, &mut ep, inbox, &offer), Some(pb));
             let sent: Vec<_> = std::iter::from_fn(|| ep.poll_transmit(now)).map(|x| x.dst).collect();
             assert!(sent.contains(&Hop::Net(there)) && !sent.contains(&ble), "{sent:?}");
             let later = now + Policy::FALLBACK;
@@ -3124,8 +3124,8 @@ mod tests {
         }
     }
 
-    /// Two nodes in `ROOM` on simulated time, each with a UDP address and a radio connection to the other: signals go
-    /// over the radio; datagrams over UDP while `udp` says it is up, and over the radio.
+    /// Two nodes in `ROOM` on simulated time, each with a UDP address and a radio connection to the other, proven to
+    /// reach it: signals go over the radio; datagrams over UDP while `udp` says it is up, and over the radio.
     struct OnAir {
         t: [Traversal<Hop<SocketAddr>>; 2],
         e: [Endpoint<Hop<SocketAddr>>; 2],
@@ -3145,8 +3145,9 @@ mod tests {
                 Traversal::new(&id(i + 1), [i + 3; 32], 1_700_000_000_000, vec![Hop::Net(udp[usize::from(i)])], vec![])
             });
             let e = [0, 1].map(|i| Endpoint::new(&id(i + 1), config.clone(), [i + 1; 32]));
-            for t in &mut t {
+            for (i, t) in t.iter_mut().enumerate() {
                 t.join_room(now, ROOM.0, ROOM.1, Role::Peer, None);
+                t.radio_reaches(now, &e[i], id(2 - i as u8).peer_id(), radio[i]);
             }
             OnAir { t, e, now, udp, radio, events: [Vec::new(), Vec::new()] }
         }
@@ -3160,7 +3161,7 @@ mod tests {
                         if let Signal::Publish(topic, payload) = s {
                             let [ta, tb] = &mut self.t;
                             let tj = if j == 0 { ta } else { tb };
-                            tj.handle_signal_via(now, &mut self.e[j], topic, &payload, Some(self.radio[j]));
+                            tj.handle_signal(now, &mut self.e[j], topic, &payload);
                         }
                     }
                     let out: Vec<_> = std::iter::from_fn(|| self.e[i].poll_transmit(now)).collect();
@@ -5126,13 +5127,13 @@ mod tests {
         let [_, mut eb] = hop_link(Hop::Net(r), Hop::Net(b));
         let mut tb = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
         let o = hop_offer(&tb, now, &[], &[R]);
-        tb.on_offer(now, &mut eb, a, o, None);
+        tb.on_offer(now, &mut eb, a, o);
         assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Relayed(r))), "retagged by the offer");
 
         let mut tb = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
         let mut dialler = Endpoint::new(&id(2), Config::default(), [9; 32]);
         let o = hop_offer(&tb, now, &[], &[R]);
-        tb.on_offer(now, &mut dialler, a, o, None);
+        tb.on_offer(now, &mut dialler, a, o);
         assert!(std::iter::from_fn(|| dialler.poll_transmit(now)).any(|t| t.dst == Hop::Relayed(r)), "dialled there");
         let [_, mut eb] = hop_link(Hop::Net(r), Hop::Net(b));
         let up = std::iter::from_fn(|| eb.poll_event()).find(|e| matches!(e, Event::Connected { .. })).unwrap();
@@ -5159,14 +5160,14 @@ mod tests {
             tb.handle_event(now, &mut eb, &e);
         }
         assert!(eb.is_connected(&a) && !moving(&tb), "a direct link, as far as b knows");
-        tb.on_offer(now, &mut eb, a, hop_offer(&tb, now, &["203.0.113.9:7000"], &[R]), None);
+        tb.on_offer(now, &mut eb, a, hop_offer(&tb, now, &["203.0.113.9:7000"], &[R]));
         assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Relayed(r))));
         assert!(moving(&tb), "the link first, then the offer");
 
         let mut tb = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
         let mut dialler = Endpoint::new(&id(2), Config::default(), [9; 32]);
         tb.set_policy(now, &mut dialler, direct());
-        tb.on_offer(now, &mut dialler, a, hop_offer(&tb, now, &["203.0.113.9:7000"], &[R]), None);
+        tb.on_offer(now, &mut dialler, a, hop_offer(&tb, now, &["203.0.113.9:7000"], &[R]));
         let at_r = Path::Direct(Hop::Net(r));
         assert!(!tb.allows(&a, &at_r) && tb.allows(&id(3).peer_id(), &at_r));
         let [_, mut eb] = hop_link(Hop::Net(r), Hop::Net(b));
@@ -5193,7 +5194,7 @@ mod tests {
             let mut ea = Endpoint::new(&id(1), Config::default(), [3; 32]);
             let mut ev = Endpoint::new(&id(2), Config::default(), [4; 32]);
             ta.set_policy(now, &mut ea, policy.clone());
-            ta.on_offer(now, &mut ea, m, hop_offer(&ta, now, &[], &[&v_at.to_string()]), None);
+            ta.on_offer(now, &mut ea, m, hop_offer(&ta, now, &[], &[&v_at.to_string()]));
             ev.connect(now, Hop::Net(a_at), a).unwrap();
             for _ in 0..50 {
                 while let Some(t) = ev.poll_transmit(now) {
@@ -5220,7 +5221,7 @@ mod tests {
         let now = Instant::from_millis(500);
         let [mut ea, mut eb] = hop_link(Hop::Net(r), Hop::Relayed(r));
         let mut ta = Traversal::new(&id(1), [6; 32], 1_700_000_000_000, vec![Hop::Net(a_at)], vec![]);
-        ta.on_offer(now, &mut ea, id(2).peer_id(), hop_offer(&ta, now, &[], &[R]), None);
+        ta.on_offer(now, &mut ea, id(2).peer_id(), hop_offer(&ta, now, &[], &[R]));
         eb.send(&a, peerwire_core::Lane::Reliable, b"from r").unwrap();
         let data = eb.poll_transmit(now).unwrap().payload;
         assert_eq!(ta.hop(&ea, Hop::Net(r), &data), Hop::Relayed(r), "the claimant's own");
@@ -5241,8 +5242,8 @@ mod tests {
         let (a, m, now) = (id(1).peer_id(), id(3).peer_id(), Instant::from_millis(500));
         let [mut ea, mut eb] = hop_link(Hop::Net(r), Hop::Net(b));
         let mut tb = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
-        tb.on_offer(now, &mut eb, a, hop_offer(&tb, now, &[], &[R]), None);
-        tb.on_offer(now, &mut eb, m, hop_offer(&tb, now + Duration::from_millis(1), &[], &[R]), None);
+        tb.on_offer(now, &mut eb, a, hop_offer(&tb, now, &[], &[R]));
+        tb.on_offer(now, &mut eb, m, hop_offer(&tb, now + Duration::from_millis(1), &[], &[R]));
         assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Relayed(r))));
         ea.send(&id(2).peer_id(), peerwire_core::Lane::Reliable, b"from r").unwrap();
         let data = ea.poll_transmit(now).unwrap().payload;
@@ -5251,7 +5252,7 @@ mod tests {
         let up = std::iter::from_fn(|| fresh.poll_event()).find(|e| matches!(e, Event::Connected { .. })).unwrap();
         tb.handle_event(now, &mut fresh, &up);
         assert_eq!(fresh.path(&a), Some(&Path::Direct(Hop::Relayed(r))), "a new link from there, retagged");
-        tb.on_offer(now, &mut eb, a, hop_offer(&tb, now + Duration::from_millis(2), &[], &[]), None);
+        tb.on_offer(now, &mut eb, a, hop_offer(&tb, now + Duration::from_millis(2), &[], &[]));
         assert_eq!(tb.hop(&eb, Hop::Net(r), &data), Hop::Net(r), "taken back by its next offer");
         assert!(tb.claimed(&Hop::Net(r), &m) && !tb.claimed(&Hop::Net(r), &a));
 
@@ -5262,7 +5263,7 @@ mod tests {
             let p = id(10 + i).peer_id();
             t.remotes.entry(p).or_default().invited = true; // past the node's offer budget
             let own: Vec<String> = (1..=n).map(|port| format!("198.51.100.{i}:{port}")).collect();
-            t.on_offer(at, e, p, hop_offer(t, at, &[], &own.iter().map(String::as_str).collect::<Vec<_>>()), None);
+            t.on_offer(at, e, p, hop_offer(t, at, &[], &own.iter().map(String::as_str).collect::<Vec<_>>()));
             own.iter().filter(|a| t.claimed(&Hop::Net(a.parse().unwrap()), &p)).count()
         };
         let ms = |i: u8| now + Duration::from_millis(u64::from(i));
@@ -5274,7 +5275,7 @@ mod tests {
         assert_eq!(claim(&mut t, &mut e, full, 2, ms(full)), 1, "the last one left");
         assert_eq!(claim(&mut t, &mut e, full + 1, 2, ms(full + 1)), 0, "past MAX_RELAYED_OF");
         let later = now + Duration::from_secs(2);
-        t.on_offer(later, &mut e, id(11).peer_id(), hop_offer(&t, later, &[], &[]), None);
+        t.on_offer(later, &mut e, id(11).peer_id(), hop_offer(&t, later, &[], &[]));
         assert_eq!(claim(&mut t, &mut e, full + 1, 2, later), 2, "once a peer's claims are taken back");
     }
 
@@ -5346,7 +5347,7 @@ mod tests {
             t.set_policy(now, &mut ea, Some(Policy::new(order.clone())));
             assert!(ea.is_connected(&id(2).peer_id()), "the relay's link, as it was");
             let o = hop_offer(&t, now, &["203.0.113.2:7000"], &["198.51.100.30:50002"]);
-            t.on_offer(now, &mut ea, id(3).peer_id(), o, None);
+            t.on_offer(now, &mut ea, id(3).peer_id(), o);
             // What a sends: through its allocation, counted, or to the relay, which drops what it can't forward.
             let mut sent = |ea: &mut Endpoint<Hop<SocketAddr>>, now| {
                 let mut turn = 0;
@@ -5367,7 +5368,7 @@ mod tests {
             let next = if turn_first { dropped > first.1 } else { turn > 0 };
             assert!(next, "{order:?}: the other a step later, {first:?} then {:?}", (turn, dropped));
             // A dial under way, with the policy gone: every step at once, as with none, and still no other.
-            t.on_offer(now, &mut ea, id(4).peer_id(), hop_offer(&t, now, &["203.0.113.4:7000"], &[]), None);
+            t.on_offer(now, &mut ea, id(4).peer_id(), hop_offer(&t, now, &["203.0.113.4:7000"], &[]));
             t.set_policy(now, &mut ea, None);
             sent(&mut ea, now);
         }
@@ -5410,7 +5411,7 @@ mod tests {
         // A dial under way at the switch, at c's address, goes through the allocation alone from then on.
         let (mut t, mut ea, _) = with_allocation();
         let c_at: SocketAddr = "203.0.113.3:7000".parse().unwrap();
-        t.on_offer(now, &mut ea, id(3).peer_id(), hop_offer(&t, now, &["203.0.113.3:7000"], &[]), None);
+        t.on_offer(now, &mut ea, id(3).peer_id(), hop_offer(&t, now, &["203.0.113.3:7000"], &[]));
         assert!(std::iter::from_fn(|| ea.poll_transmit(now)).any(|tx| tx.dst == Hop::Net(c_at)), "dialled directly");
         t.set_privacy(now, &mut ea, Privacy::RelayOnly { via: None });
         let mut sent = Vec::new();
@@ -5622,7 +5623,7 @@ mod tests {
             };
             t.set_privacy(now, &mut lone, Privacy::RelayOnly { via: Some(id(2).peer_id()) });
             // Nothing for the allocation to dial: the offer has no address.
-            t.on_offer(now, &mut lone, id(3).peer_id(), hop_offer(&t, now, &[], &[]), None);
+            t.on_offer(now, &mut lone, id(3).peer_id(), hop_offer(&t, now, &[], &[]));
             now = now + Policy::FALLBACK;
             t.handle_timeout(now, &mut lone);
             let [mut ea, mut er] = hop_link(Hop::Net(me), Hop::Net(r_at));
@@ -5650,7 +5651,7 @@ mod tests {
         let mut now = Instant::from_millis(500);
         ta.set_policy(now, &mut ea, Some(Policy::new([PathKind::Turn, PathKind::Direct])));
         let o = hop_offer(&ta, now, &["203.0.113.2:7000"], &[]);
-        ta.on_offer(now, &mut ea, b, o, None);
+        ta.on_offer(now, &mut ea, b, o);
         ea.add_candidates(now, &b, &[Hop::Net("203.0.113.3:7000".parse().unwrap())]);
         for _ in 0..50 {
             now = now + Duration::from_millis(20);
@@ -5684,7 +5685,6 @@ mod tests {
                 &mut ep,
                 *p,
                 hop_offer(&t, now + Duration::from_millis(i as u64), &["203.0.113.2:7000"], &[]),
-                None,
             );
         }
         assert!(peers.iter().all(|p| t.turn.holds(p)));

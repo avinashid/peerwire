@@ -231,7 +231,7 @@ impl Builder {
         trav.set_turn_servers(peerwire_core::Instant::ZERO, &mut ep, resolve_turn(&self.turn, local));
         #[cfg(feature = "ble")]
         let ble = self.radio.map(|r| {
-            let mut b = Ble::new(r, identity.peer_id(), peerwire_core::Instant::ZERO);
+            let mut b = Ble::new(r, &identity, peerwire_core::Instant::ZERO);
             b.set_enabled(peerwire_core::Instant::ZERO, !matches!(self.privacy, Privacy::RelayOnly { .. }));
             b
         });
@@ -984,21 +984,26 @@ impl Node {
         drained
     }
 
-    /// Takes what the radio reported: datagrams go to the endpoint as it comes, signals to the traversal, which
-    /// may dial their sender over the connection they came on.
+    /// Takes what the radio reported: datagrams go to the endpoint as it comes, signals to the traversal, and each
+    /// connection proven to reach a peer to the traversal too, which may dial the peer over it.
     #[cfg(feature = "ble")]
     fn poll_ble(&mut self, now: peerwire_core::Instant) {
         let Some(b) = self.ble.as_mut() else { return };
         b.poll(now, &mut self.ep);
         while let Some(i) = self.ble.as_mut().and_then(Ble::take) {
             match i {
-                Inbound::Signal { topic, payload, via, conn } => {
-                    let proved = self.trav.handle_signal_via(now, &mut self.ep, topic, &payload, Some(via));
-                    if let (Some(peer), Some(b)) = (proved, self.ble.as_mut()) {
-                        b.heard(conn, now, peer);
+                Inbound::Signal { topic, payload, conn } => {
+                    let proved = self.trav.handle_signal(now, &mut self.ep, topic, &payload);
+                    if let (Some(_), Some(b)) = (proved, self.ble.as_mut()) {
+                        b.heard(conn, now);
                     }
                 }
-                Inbound::Proven => self.trav.hello_soon(now),
+                Inbound::Proven(conn) => {
+                    if let (Some(hello), Some(b)) = (self.trav.room_hello(now), self.ble.as_mut()) {
+                        b.send_room(conn, &hello);
+                    }
+                }
+                Inbound::Identified { peer, via } => self.trav.radio_reaches(now, &self.ep, peer, via),
                 Inbound::Closed(hop) => self.trav.forget_radio(&hop),
             }
         }

@@ -72,9 +72,10 @@ That is 30 of the 31 bytes a legacy advert holds. Where the stack allows a scan 
 **Who connects.** Native peers both advertise and scan. A peer connects, as the central, to an advert that isn't
 full when its own `n` is the smaller, or when its own advert is full; with equal values neither does until one
 changes. A peer with no advert of its own (a browser) connects to the device the user picks. So a native peer accepts
-a central that never advertises. A peer doesn't connect to an `n` it is connected to (the central names its own in its
-answer, below), nor while a central's connection to it hasn't proven the room yet, nor within 60 s to an `n` whose
-connection closed.
+a central that never advertises. A peer doesn't connect to an `n` it is connected or connecting to, nor within 60 s
+to one whose connection closed or failed. Nothing a peer says of its own advert is taken, as a member could name
+another's to keep two members apart: so two peers may make two connections (a full desktop connects back to the
+peer that filled it, say), and the [second one closes](#binding-a-connection-to-its-peer).
 
 ## Framing
 
@@ -104,7 +105,7 @@ A message's first byte is its kind:
 | Kind | Rest of the message | When |
 |---|---|---|
 | `3` challenge | `c_p`, 16 random bytes | the peripheral's first message |
-| `4` answer | `c_c`, 16 random bytes; `n`, its advert's (u32 LE, 0 for none); `HMAC-SHA256(ble key, "pw-ble-c" ‖ c_p ‖ c_c ‖ n)` | the central's reply |
+| `4` answer | `c_c`, 16 random bytes; `HMAC-SHA256(ble key, "pw-ble-c" ‖ c_p ‖ c_c)` | the central's reply |
 | `5` proof | `HMAC-SHA256(ble key, "pw-ble-p" ‖ c_c ‖ c_p)` | the peripheral's reply to a good answer |
 | `1` signal | `seq` u64 LE, then AES-256-GCM(link key, nonce, `inner kind ‖ payload`) | once proven |
 | `0` datagram | one Peerwire packet ([Protocol](protocol.md#packets)), 1 to 1,232 B | once proven |
@@ -115,15 +116,27 @@ other holds the room's ble key, freshly, with no clock, and a peripheral sends n
 then a connection carries only these three messages; anything else closes it. The link key is
 `HMAC-SHA256(ble key, "pw-ble-k" ‖ c_p ‖ c_c)`.
 
+**The identity proof.** Then each end proves who it is, on this connection: its first signal is of inner kind 3, its
+`PeerId` (32 bytes) and its Ed25519 signature over `"pw-ble-id" ‖ c_p ‖ c_c` (64 bytes). The receiver checks it, as
+the radio's budget allows ([Limits](#limits)), and from then on knows the peer at the other end. A proof that fails
+(made for another connection, say), one in the receiver's own name, or none within 3 s of the connection, closes the
+connection; a second one is dropped and counted. Only an identity proven this way, or by a session bound to the
+connection (below), counts for anything: who a connection is dialled for, the one connection kept per peer, and where a
+peer signal goes. A hello or an offer proves who sent it, as on any carrier, never who is at the other end of the
+connection it came over: a member could pass on another's. A relay that passes every byte between two connections,
+and so gives them the same challenges, still joins them, as it could over any carrier: a link over Bluetooth proves
+nothing about distance.
+
 **Signals.** Hellos and offers travel sealed under the link key: the GCM nonce is 4 bytes of direction (0 from the
-central, 1 from the peripheral) and the 8 bytes of `seq`, which goes up with each signal sent, and a receiver takes
-only a `seq` above the last it took. The inner kind is 1 for a room hello, as on the room topic, or 2 for a message
-sealed to the receiver, such as an offer, as on its peer topic. No topic goes over the air: the receiver knows its
-room and its own inbox, so a listener never sees the hash of a `PeerId`, and only a member can tell a hello from an
-offer. A room signal goes on every proven connection, a peer signal on the connection bound to the peer it is for if
-there is one, and otherwise on every proven connection not bound to another peer. A peer never passes a signal from
-one connection on to another. Inside, every check stands as it does on any carrier: the hello key, room proofs,
-freshness and the hello and offer budgets.
+central, 1 from the peripheral) and the 8 bytes of `seq`, which goes up with each signal sent, and a receiver takes only
+a `seq` above the last it took. The inner kind is 1 for a room hello, as on the room topic, or 2 for a message sealed to
+the receiver, such as an offer, as on its peer topic; 3 is the identity proof. No topic goes over the air: the receiver
+knows its room and its own inbox, so a listener never sees the hash of a `PeerId`, and only a member can tell a hello
+from an offer. A room signal goes on every proven connection, a peer signal on the connection proven to reach the peer
+it is for if there is one, and otherwise on every proven connection whose peer isn't known yet. A peer never passes a
+signal from one connection on to another. When a connection proves the room, a room hello goes over it alone, so the
+members it reaches hear of the peer at once, and the hellos on other carriers keep their schedule. Inside, every check
+stands as it does on any carrier: the hello key, room proofs, freshness and the hello and offer budgets.
 
 A message of another kind, or one that fails its checks, is dropped and counted against the connection.
 
@@ -135,24 +148,27 @@ counted. It is **bound** to a peer by the first packet on it that authenticates 
 it: an HS2 that finishes a dial over it, or a data packet with a new nonce. An HS1 never binds one, as Noise IK's
 first message can be replayed. From then on, until it closes, only that peer's packets are taken from it, as a WebRTC
 channel's are: a packet for another peer's link, or a handshake from anyone else, is dropped. A connection binds once;
-a new connection, even to the same device, starts unbound. A peer has at most one bound connection: when a second is
-bound to it, the older closes. The core does this for every host: `Endpoint::handle_datagram_unbound` for an unbound
-connection, `handle_datagram_from` for a bound one.
+a new connection, even to the same device, starts unbound. The core does this for every host:
+`Endpoint::handle_datagram_unbound` for an unbound connection, `handle_datagram_from` for a bound one.
 
-A peer keeps one connection to each other peer: the one bound to it, or else the oldest whose signals proved it a
-member. Another that carries its signals closes, and so do the unbound ones that did when a connection binds to it.
-A proven connection bound to no one, such as one between peers linked over UDP, stays open while a signal proving a
-member comes over it at least every 60 s (hellos come every 30 s at most): it is ready for the day UDP goes.
+A peer keeps one connection to each other peer. When one binds to a peer, it is the one, and every other proven to
+reach that peer closes. Otherwise it is the first proven to reach it: both ends prove that one before a second is
+made, so the second closes, at the end that made it, which doesn't connect to that advert again until it changes;
+the other end leaves it to that one, and doesn't count it as a central. Two made at once may each be the first at the
+end that made it: then, once the other end's has been proven for 3 s, the one whose central has the larger `PeerId`
+closes, at the end that made it. A proven connection bound to no one, such as one between peers linked over UDP, stays
+open while a signal proving a member comes over it at least every 60 s (hellos come every 30 s at most): it is ready
+for the day UDP goes.
 
 ## Paths: UDP first
 
 A Bluetooth hop is ranked as a relayed address is (`Address::relayed`): a last resort, which only a handshake on it
 puts a link on.
 
-- **Dialling.** A dial to a peer with no link also dials over the connections it is bound to or that its proven
-  hellos and offers came over, beside its UDP candidates. A connection is never offered, sent in an `OBSERVED` or
-  relay frame, or decoded from one: its encoding is unique per connection, for the handshake cookie, and decodes to
-  nothing.
+- **Dialling.** A dial to a peer with no link also dials over the connection proven to reach it, beside its UDP
+  candidates, and a member proven on a new connection while it has no link is offered to again at once. A
+  connection is never offered, sent in an `OBSERVED` or relay frame, or decoded from one: its encoding is unique per
+  connection, for the handshake cookie, and decodes to nothing.
 - **Up on Bluetooth.** A link on Bluetooth punches to the peer's UDP candidates and moves to the first that answers,
   on an authenticated answer (`PathChanged`). No race, punch answer or late packet moves a link onto Bluetooth, and
   no peer relays across it.
@@ -179,20 +195,23 @@ puts a link on.
 | | Linux | ESP32 |
 |---|---|---|
 | Connections | 8, one of them as the peripheral | 3 |
-| Unproven or unbound connections | 4; a central over that closes the oldest of them, so held ones can't lock newcomers out | 2 |
-| Time to prove the room | 10 s, then the connection closes | same |
+| Connections bound to no peer | 4; proven ones (standbys) leave one free: one that proves the room into the last closes the weakest other (unproven, then with no proven peer, then the oldest), so standbys can't lock newcomers out | 2 |
+| Time to prove the room and the peer's identity | 3 s, then the connection closes | same |
+| A central's connection that hasn't proven the room | makes way, after 1 s, for a new central over the limits | same |
 | A proven connection bound to no peer | open while a signal proves a member at least every 60 s | same |
 | Distinct HS1s on an unbound connection | 1 per 10 s (a half-open handshake's life); its resends pass | same |
-| Distinct HS1s on unbound connections, across the radio | 4 at once, then one per 250 ms | 2, then one per 2 s (a C3 answers one in 156 ms: about 8% of it) |
+| Distinct HS1s on unbound connections, across the radio | 4 at once, then one per 250 ms | 2, then one per 5 s (a C3 answers one in 156 ms: about 3% of it) |
+| Identity proofs checked, across the radio | 16 at once, then one per 62.5 ms | 8, then one per 1.25 s (four times the HS1s': a check costs about a quarter of what answering an HS1 does, **theoretical**) |
 | HS1s on a bound connection | a burst of 4, then one per 5 s | same |
 | Signals taken per connection | a burst of 16, then one per 500 ms; the rest dropped before any cryptography | same |
 | Messages dropped or refused before the connection closes | 32 | same |
 | Partial messages per connection | one per direction, at most 1,233 B | same |
 | Values queued to send per connection | 64; more are dropped, never waited for | 16 |
 
-A peer that holds all the connections or all the centrals it can marks its advert full and refuses another central.
-Linux takes one central at a time because BlueZ sends a notification to every subscribed central (BLE-R8). The
-addresses naming connections (`Hop::Ble`) are never reused within a process, nor handed to another connection.
+A peer that holds all the connections or all the centrals it can marks its advert full and refuses another central,
+counting no central whose peer hasn't proven who it is, nor a second one to a peer. Linux takes one central at a time
+because BlueZ sends a notification to every subscribed central (BLE-R8). The addresses naming connections (`Hop::Ble`)
+aren't reused within a process before 2^24 (16.7 million) more connections have been made.
 
 ## What a listener on the radio sees
 
@@ -262,7 +281,15 @@ tests use an in-process pair of fake radios.
     user;
   - its discovery scans actively, so the radio sends scan requests from its address;
   - it can't add a scan response, so Web Bluetooth's picker must filter on the service data (to be checked on a
-    phone).
+    phone);
+  - pairing is the system's: BlueZ answers a central's pairing request through the desktop's agent, so a device
+    nearby may raise a pairing prompt. Nothing in Peerwire pairs or needs it: refuse such a prompt.
+
+  As the peripheral the driver serves the central whose subscription to `tx` BlueZ hands over, as a socket with its
+  address (`AcquireNotify`), and takes writes from that device alone; another that writes meanwhile is disconnected.
+  bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone
+  browser that doesn't raise it, say; to be checked with NB-110d) can't carry the codec's 20-byte values and isn't
+  used.
 
   Ordinary users need access to `bluetoothd` over D-Bus, which most desktop distributions give the logged-in user.
 - **ESP32 (NB-110c):** NimBLE, three connections, an ATT MTU of 256 and a random non-resolvable address.

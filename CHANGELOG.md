@@ -18,8 +18,9 @@ and the commit that fixed it.
   `Endpoint::handle_datagram_unbound`, for a channel no peer is bound to yet; `Address::radio`.
 - **Breaking:** `peerwire::Hop` has a new variant, `Ble`, and is `#[non_exhaustive]` from now on, so a `match` on it
   outside the crate needs a `_` arm (the next release of `peerwire` is 0.2; `peerwire-peer` and `peerwire-esp` move
-  with it). `Traversal::handle_signal_via`, `Traversal::forget_radio` and `Traversal::hello_soon` are new, and so
-  are `Node::set_waker` (feature `ble`) and `AsyncNode` waking on its radio.
+  with it). `Traversal::handle_signal` returns the member a hello or an offer proved (it returned nothing), and
+  `Traversal::radio_reaches`, `Traversal::forget_radio` and `Traversal::room_hello` are new, and so are
+  `Node::set_waker` (feature `ble`) and `AsyncNode` waking on its radio.
 
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 
