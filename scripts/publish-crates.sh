@@ -111,7 +111,15 @@ if [ $EXECUTE = 0 ]; then
   printf '\n%-15s %5s %10s  %s\n' crate files package crates.io
   for ((i = 0; i < ${#CRATES[@]}; i++)); do
     c=${CRATES[i]}
-    tenths=$((($(wc -c <"$TARGET/package/$c-$VERSION.crate") * 10 + 512) / 1024)) # KiB, rounded as cargo does
+    # cargo publish --dry-run of several crates leaves them in tmp-crate; cargo package, in package itself.
+    size="?"
+    for f in "$TARGET/package/tmp-crate/$c-$VERSION.crate" "$TARGET/package/$c-$VERSION.crate"; do
+      if [ -f "$f" ]; then
+        tenths=$((($(wc -c <"$f") * 10 + 512) / 1024)) # KiB, rounded as cargo does
+        size="$((tenths / 10)).$((tenths % 10)) KiB"
+        break
+      fi
+    done
     rc=0
     on_index "$c" || rc=$?
     case $rc in
@@ -119,13 +127,16 @@ if [ $EXECUTE = 0 ]; then
       1) state="not there: --execute publishes it" ;;
       *) state="index unreachable" ;;
     esac
-    printf '%-15s %5s %10s  %s\n' "$c" "${FILES[i]}" "$((tenths / 10)).$((tenths % 10)) KiB" "$state"
+    printf '%-15s %5s %10s  %s\n' "$c" "${FILES[i]}" "$size" "$state"
   done
   say "dry run passed; nothing was uploaded. scripts/publish-crates.sh --execute publishes"
   exit 0
 fi
 
 # --- publish ------------------------------------------------------------------------------------------------------
+# An expansion error (a bad $((…)), say) makes bash drop the rest of the dry run's block, its exit 0 too, and go on
+# here: set -e doesn't see it. So a dry run stops here, whatever went wrong above.
+[ $EXECUTE = 1 ] || die "the dry run stopped early (see above); nothing was uploaded"
 WAIT=${PUBLISH_WAIT:-600}
 for c in "${CRATES[@]}"; do
   rc=0
