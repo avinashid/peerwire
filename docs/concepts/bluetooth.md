@@ -69,13 +69,15 @@ That is 30 of the 31 bytes a legacy advert holds. Where the stack allows a scan 
   peer not in a room doesn't advertise or scan. Nothing in the advert lasts longer: no `PeerId`, name, topic or
   address. A listener with the room's name can tell a member of that room, as it could from a Nostr relay.
 
-**Who connects.** Native peers both advertise and scan. A peer connects, as the central, to an advert that isn't
-full when its own `n` is the smaller, or when its own advert is full; with equal values neither does until one
-changes. A peer with no advert of its own (a browser) connects to the device the user picks. So a native peer accepts
-a central that never advertises. A peer doesn't connect to an `n` it is connected or connecting to, nor within 60 s
-to one whose connection closed or failed. Nothing a peer says of its own advert is taken, as a member could name
-another's to keep two members apart: so two peers may make two connections (a full desktop connects back to the
-peer that filled it, say), and the [second one closes](#binding-a-connection-to-its-peer).
+**Who connects.** Native peers both advertise and scan. A peer connects, as the central, to an advert that isn't full
+when its own `n` is the smaller, or when its own advert is full; with equal values neither does until one changes. A
+peer with no advert of its own (a browser) connects to the device the user picks. So a native peer accepts a central
+that never advertises. A peer doesn't connect to an `n` it is connected or connecting to, nor within 60 s to one whose
+connection closed or failed; but one whose connection closed before it sent a challenge (it refused the central, or
+never challenged) is tried again after 1 to 4 s, at random, so a device that connects on a cycle of its own can't keep a
+newcomer landing in its grace (see the limits). Nothing a peer says of its own advert is taken, as a member could name
+another's to keep two members apart: so two peers may make two connections (a full desktop connects back to the peer
+that filled it, say), and the [second one closes](#binding-a-connection-to-its-peer).
 
 ## Framing
 
@@ -154,7 +156,8 @@ a new connection, even to the same device, starts unbound. The core does this fo
 A peer keeps one connection to each other peer. When one binds to a peer, it is the one, and every other proven to
 reach that peer closes. Otherwise it is the first proven to reach it: both ends prove that one before a second is
 made, so the second closes, at the end that made it, which doesn't connect to that advert again until it changes;
-the other end leaves it to that one, and doesn't count it as a central. Two made at once may each be the first at the
+the other end leaves it to that one, doesn't count it as a central, and closes it for a new central that needs its
+place. Two made at once may each be the first at the
 end that made it: then, once the other end's has been proven for 3 s, the one whose central has the larger `PeerId`
 closes, at the end that made it. A proven connection bound to no one, such as one between peers linked over UDP, stays
 open while a signal proving a member comes over it at least every 60 s (hellos come every 30 s at most): it is ready
@@ -197,7 +200,7 @@ puts a link on.
 | Connections | 8, one of them as the peripheral | 3 |
 | Connections bound to no peer | 4; proven ones (standbys) leave one free: one that proves the room into the last closes the weakest other (unproven, then with no proven peer, then the oldest), so standbys can't lock newcomers out | 2 |
 | Time to prove the room and the peer's identity | 3 s, then the connection closes | same |
-| A central's connection that hasn't proven the room | makes way, after 1 s, for a new central over the limits | same |
+| A central's connection whose peer hasn't proven who it is | makes way, after 1 s, for a new central over the limits; a second one to a peer, at once | same |
 | A proven connection bound to no peer | open while a signal proves a member at least every 60 s | same |
 | Distinct HS1s on an unbound connection | 1 per 10 s (a half-open handshake's life); its resends pass | same |
 | Distinct HS1s on unbound connections, across the radio | 4 at once, then one per 250 ms | 2, then one per 5 s (a C3 answers one in 156 ms: about 3% of it) |
@@ -209,7 +212,9 @@ puts a link on.
 | Values queued to send per connection | 64; more are dropped, never waited for | 16 |
 
 A peer that holds all the connections or all the centrals it can marks its advert full and refuses another central,
-counting no central whose peer hasn't proven who it is, nor a second one to a peer. Linux takes one central at a time
+counting no central whose peer hasn't proven who it is, nor a second one to a peer: those make way for a new central
+(one whose peer hasn't proven who it is, once it has had 1 s), so an advert that says it takes a central refuses one
+only within another's first second. Linux takes one central at a time
 because BlueZ sends a notification to every subscribed central (BLE-R8). The addresses naming connections (`Hop::Ble`)
 aren't reused within a process before 2^24 (16.7 million) more connections have been made.
 
