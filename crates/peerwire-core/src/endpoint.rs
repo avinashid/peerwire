@@ -867,14 +867,14 @@ fn hidden<A: Address>(path: &Path<A>) -> bool {
 }
 
 /// The relayed links that stay relayed: through a relay listed in `.0` if `.1`, through any other if `.2`
-/// ([`Endpoint::set_keep_relayed`]), and on a relayed address if `.3` ([`Endpoint::set_keep_turn`]).
+/// ([`Endpoint::set_keep_relayed`]), and on a relayed address but a radio's if `.3` ([`Endpoint::set_keep_turn`]).
 type Keep = (Vec<PeerId>, bool, bool, bool);
 
 /// Whether a link on `path` stays there ([`Keep`]).
 fn keeps_path<A: Address>(keep: &Keep, path: &Path<A>) -> bool {
     match path {
         Path::Via(r) => keeps(keep, r),
-        Path::Direct(a) => keep.3 && a.relayed(),
+        Path::Direct(a) => keep.3 && a.relayed() && !a.radio(),
     }
 }
 
@@ -1777,6 +1777,36 @@ impl<A: Address> Endpoint<A> {
             return None;
         }
         self.sessions.get(&idx).filter(|s| s.path.direct() == Some(&from)).map(|s| (s.peer, auth == Auth::Fresh))
+    }
+
+    /// Like [`Endpoint::handle_datagram_direct`], for a channel no peer is bound to yet, such as a new Bluetooth
+    /// connection (`docs/concepts/bluetooth.md`, BLE-R10). It takes only an HS1, which opens a session on `from`; an
+    /// HS2 or a cookie answering a dial that targets `from`; and a data packet for a session whose path is `from`.
+    /// Anything else is dropped unread ([`Stats::rx_wrong_peer`]), so a packet sniffed from another path can't move a
+    /// link onto the channel. Returns the peer to bind the channel to: the one whose session on `from` the packet
+    /// authenticated as fresh (an HS2 that finished a dial over it, or data with a new nonce). An HS1 never binds one,
+    /// as a copy of one reads again (NB85-1). Once bound, the host hands the channel's datagrams to
+    /// [`handle_datagram_from`](Endpoint::handle_datagram_from).
+    pub fn handle_datagram_unbound(&mut self, now: Instant, from: A, data: &[u8]) -> Option<PeerId> {
+        let takes = match wire::parse(data) {
+            // Malformed: counted as such by `on_packet`.
+            None | Some(Packet::Hs1 { .. }) => true,
+            Some(Packet::Hs2 { receiver, .. } | Packet::Cookie { receiver, .. }) => {
+                let target = Path::Direct(from.clone());
+                let dials = |s: &Session<A>| matches!(&s.state, State::Dialing(d) if d.targets.contains(&target));
+                self.sessions.get(&receiver).is_some_and(dials)
+            }
+            Some(Packet::Data { receiver, .. }) => {
+                self.sessions.get(&receiver).is_some_and(|s| s.path.direct() == Some(&from))
+            }
+        };
+        if !takes {
+            self.stats.rx_packets += 1;
+            self.stats.rx_wrong_peer += 1;
+            return None;
+        }
+        let (peer, fresh) = self.handle_datagram_direct(now, from, data)?;
+        fresh.then_some(peer)
     }
 
     /// Returns the session the packet belonged to, and whether it authenticated
@@ -3743,6 +3773,61 @@ mod tests {
         assert!(!ex.is_connected(&y));
         ex.handle_datagram_from(t, 2, &y, &hs2);
         assert!(ex.is_connected(&y));
+    }
+
+    /// BLE-R10: on a channel no peer is bound to, an HS1 opens a session but binds nothing; the initiator's first fresh
+    /// data packet on it binds the channel to the initiator. On the initiator's side the HS2 that finishes its dial
+    /// over the channel binds it at once.
+    #[test]
+    fn an_unbound_channel_binds_on_a_fresh_packet_not_an_hs1() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (x, y) = (ids[0].peer_id(), ids[1].peer_id());
+        let mut ex = Endpoint::<u32>::new(&ids[0], Config::default(), [1; 32]);
+        let mut ey = Endpoint::<u32>::new(&ids[1], Config::default(), [2; 32]);
+        let t = Instant::from_millis(1);
+        ex.connect(t, 20, y).unwrap();
+        let hs1 = ex.poll_transmit(t).unwrap().payload;
+        assert_eq!(ey.handle_datagram_unbound(t, 10, &hs1), None, "an HS1 binds nothing");
+        let hs2 = ey.poll_transmit(t).unwrap().payload;
+        assert_eq!(ey.handle_datagram_unbound(t, 10, &hs1), None, "nor its copy");
+        assert_eq!(ex.handle_datagram_unbound(t, 20, &hs2), Some(y), "the HS2 that finishes the dial over it");
+        assert!(ex.is_connected(&y));
+        ex.send(&y, Lane::Reliable, b"hi").unwrap();
+        let data = ex.poll_transmit(t).unwrap().payload;
+        assert_eq!(ey.handle_datagram_unbound(t, 10, &data), Some(x), "fresh data on the session there");
+        assert_eq!(ey.handle_datagram_unbound(t, 10, &data), None, "a copy isn't fresh");
+        assert_eq!((ex.stats().rx_wrong_peer, ey.stats().rx_wrong_peer), (0, 0));
+    }
+
+    /// BLE-R10: an unbound channel takes no HS2 or cookie for a dial elsewhere, and no data of a link on another
+    /// path, even a fresh packet of it: dropped unread and counted, so a sniffed packet can't move a link onto it.
+    #[test]
+    fn an_unbound_channel_takes_nothing_of_a_link_elsewhere() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let y = ids[1].peer_id();
+        let mut ex = Endpoint::<u32>::new(&ids[0], Config::default(), [1; 32]);
+        let mut ey = Endpoint::<u32>::new(&ids[1], Config::default(), [2; 32]);
+        let t = Instant::from_millis(1);
+        ex.connect(t, 2, y).unwrap();
+        let hs1 = ex.poll_transmit(t).unwrap().payload;
+        ey.handle_datagram(t, 1, &hs1);
+        let hs2 = ey.poll_transmit(t).unwrap().payload;
+        assert_eq!(ex.handle_datagram_unbound(t, 9, &hs2), None, "the dial targets 2, not 9");
+        assert_eq!((ex.stats().rx_wrong_peer, ex.is_connected(&y)), (1, false));
+        ex.handle_datagram(t, 2, &hs2);
+        assert!(ex.is_connected(&y));
+        ex.send(&y, Lane::Reliable, b"one").unwrap();
+        let data = ex.poll_transmit(t).unwrap().payload;
+        ey.handle_datagram(t, 1, &data);
+        events(&mut ey);
+        ex.send(&y, Lane::Reliable, b"two").unwrap();
+        let data = ex.poll_transmit(t).unwrap().payload;
+        assert_eq!(ey.handle_datagram_unbound(t, 9, &data), None);
+        assert_eq!(ey.stats().rx_wrong_peer, 1);
+        assert_eq!(ey.path(&ids[0].peer_id()), Some(&Path::Direct(1)), "the link stays where it was");
+        assert_eq!(events(&mut ey).iter().filter(|e| matches!(e, Event::Message { .. })).count(), 0);
+        ey.handle_datagram(t, 1, &data);
+        assert_eq!(events(&mut ey).iter().filter(|e| matches!(e, Event::Message { .. })).count(), 1, "still fresh");
     }
 
     /// NB99-1: `peer_of` names a peer by the receiver index of an HS2 (to its dial) or a Data packet, read from the

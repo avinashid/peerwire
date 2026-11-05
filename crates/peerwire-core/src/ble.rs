@@ -59,6 +59,15 @@ const FIRST: u8 = 0x80;
 const LAST: u8 = 0x40;
 const COUNTER: u8 = 0x3f;
 
+/// The sender index and ephemeral key of an HS1 (one with a cookie too), which tell its resends from a new handshake:
+/// a host takes one new HS1 at a time on a connection no peer is bound to (BLE-R9). `None` for any other datagram.
+pub fn hs1_id(datagram: &[u8]) -> Option<(u32, [u8; 32])> {
+    match crate::wire::parse(datagram)? {
+        crate::wire::Packet::Hs1 { sender, noise, .. } => Some((sender, noise.get(..32)?.try_into().ok()?)),
+        _ => None,
+    }
+}
+
 /// The longest GATT value a link with ATT MTU `mtu` carries: `mtu - 3`, at least 20 and at most 512.
 pub fn value_len(mtu: u16) -> usize {
     (usize::from(mtu.max(MIN_ATT_MTU)) - 3).min(MAX_VALUE)
@@ -225,6 +234,30 @@ mod tests {
     /// The messages `rx` gives for `values`, all at `now`.
     fn feed(rx: &mut Reassembler, values: &[Vec<u8>]) -> Vec<Vec<u8>> {
         values.iter().filter_map(|v| rx.push(T0, v).map(<[u8]>::to_vec)).collect()
+    }
+
+    #[test]
+    fn hs1_id_names_a_handshake_and_its_resends_only() {
+        use crate::{Config, Endpoint, Identity, Lane};
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let mut ex = Endpoint::<u32>::new(&ids[0], Config::default(), [1; 32]);
+        let mut ey = Endpoint::<u32>::new(&ids[1], Config::default(), [2; 32]);
+        ex.connect(T0, 2, ids[1].peer_id()).unwrap();
+        let hs1 = ex.poll_transmit(T0).unwrap().payload;
+        let id = hs1_id(&hs1).expect("an HS1");
+        ex.handle_timeout(Instant::from_millis(600));
+        let again = ex.poll_transmit(Instant::from_millis(600)).unwrap().payload;
+        assert_eq!(hs1_id(&again), Some(id), "a resend has the same id");
+        ey.handle_datagram(T0, 1, &hs1);
+        let hs2 = ey.poll_transmit(T0).unwrap().payload;
+        assert_eq!(hs1_id(&hs2), None);
+        ex.handle_datagram(T0, 2, &hs2);
+        ex.send(&ids[1].peer_id(), Lane::Reliable, b"x").unwrap();
+        assert_eq!(hs1_id(&ex.poll_transmit(T0).unwrap().payload), None);
+        assert_eq!(hs1_id(&hs1[..20]), None);
+        let mut other = Endpoint::<u32>::new(&ids[0], Config::default(), [3; 32]);
+        other.connect(T0, 2, ids[1].peer_id()).unwrap();
+        assert_ne!(hs1_id(&other.poll_transmit(T0).unwrap().payload), Some(id), "another dial");
     }
 
     #[test]

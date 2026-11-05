@@ -39,6 +39,13 @@ pub trait Address: Clone + Eq + Hash + Debug {
     fn relayed(&self) -> bool {
         false
     }
+    /// Whether this is a connection over a short-range radio, such as a Bluetooth LE connection
+    /// (`docs/concepts/bluetooth.md`). It is [`relayed`](Address::relayed) too, so only a handshake on it puts a link
+    /// there and a link on it punches off it, but it is no TURN server's: a policy that keeps links on TURN doesn't
+    /// keep them on it. `false` unless the host's address type says otherwise.
+    fn radio(&self) -> bool {
+        false
+    }
     /// For a host with TURN: `peer` (as the TURN server reports it) reached through this host's allocation on
     /// the server at `server` (where the host sends to it); [`relayed`](Address::relayed). `None`, the default,
     /// for a host without.
