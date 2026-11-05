@@ -62,6 +62,8 @@ enum Rfc5780 {
     SameIpOnly,
     /// Drops every changed answer, as an address-and-port-dependent filter does.
     NoChanges,
+    /// Answers test II from its other IP a second late, during test III: not test III's answer.
+    Late,
     /// Answers a change from its own address, as a server without RFC 5780 does.
     Ignores,
     /// Answers a change with a Binding error (420, unknown attribute).
@@ -88,6 +90,14 @@ fn stun5780(mode: Rfc5780) -> Option<String> {
                 (0, _) | (_, Rfc5780::Ignores) => (&main, &ok),
                 (_, Rfc5780::Refuses) => (&main, &error),
                 (0x06, Rfc5780::Full) => (&other_ip, &ok),
+                (0x06, Rfc5780::Late) => {
+                    let late = other_ip.try_clone().unwrap();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(1));
+                        let _ = late.send_to(&ok, from);
+                    });
+                    continue;
+                }
                 (0x02, Rfc5780::Full | Rfc5780::SameIpOnly) => (&other_port, &ok),
                 _ => continue,
             };
@@ -234,6 +244,7 @@ fn filtering_and_servers_without_rfc_5780() {
         (Full, "endpoint-independent"),
         (SameIpOnly, "address-dependent"),
         (NoChanges, "address-and-port-dependent"),
+        (Late, "address-and-port-dependent"),
         (Ignores, "unsupported"),
         (Refuses, "unsupported"),
     ] {
