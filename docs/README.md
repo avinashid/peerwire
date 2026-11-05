@@ -50,6 +50,8 @@ New here? Start with the [introduction](getting-started/introduction.md), then t
 
 - [Status and roadmap](project/status.md): what works, what's tested, and what's next.
 - [Performance](project/performance.md): measured and theoretical numbers, and how to reproduce each.
+- [Connectivity in the field](project/field-connectivity.md): the doctor, and results from real networks with their
+  dates.
 - [Comparison](project/comparison.md): Peerwire next to other peer-to-peer libraries.
 - [Testing](project/testing.md): how Peerwire is tested, and the gate every change passes.
 - [Threat model](project/threat-model.md): what Peerwire defends against, and every review finding with its status.

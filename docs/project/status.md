@@ -44,6 +44,7 @@ what's next. It's updated as parts land; the [changelog](../../CHANGELOG.md) has
   (116 of all 144 pairings connect directly).
 - **Real networks:** public Nostr relays and STUN, from one host; and field tests that linked an Android phone on
   mobile data with a laptop on its hotspot, and two Android phones on mobile data directly over IPv6.
+  [Connectivity in the field](field-connectivity.md) collects the doctor's results from real networks, with dates.
 - **Not tested yet:** real mobile carrier-grade NATs at scale, real ESP32 boards, and Godot on Android, iOS or the
   web.
 

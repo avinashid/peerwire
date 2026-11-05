@@ -58,7 +58,7 @@ Runnable versions live in [`examples/rust`](../../examples/rust):
 cargo run -p peerwire --example echo                                  # prints an pw: invite and echoes
 cargo run -p peerwire --example echo -- pw:…                          # joins, sends "hello"
 cargo run -p peerwire --features tokio --example echo_async           # the same on tokio
-cargo run -p peerwire --features nostr --example natcheck             # what does this network's NAT do?
+cargo run -p peerwire --features nostr --example doctor               # what does this network do to P2P traffic?
 cargo run -p peerwire --features nostr --example nostr_relay -- 127.0.0.1:7447   # LAN/test Nostr relay
 ```
 
