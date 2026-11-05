@@ -2,19 +2,22 @@
 //! one-thread tokio runtime, behind the non-blocking [`Radio`] the node polls.
 //!
 //! As the peripheral it takes one central at a time (BlueZ sends a characteristic's notifications to every subscribed
-//! central, BLE-R8): a central counts as connected once it subscribes to `tx`, and only its plain writes without
-//! response at offset 0 reach the node (BLE-R7). As the central it connects, finds the service and takes the `rx`
-//! writer and `tx` notifications as sockets. Nothing is paired. BlueZ picks the addresses it advertises and connects
-//! from, and its GAP name is the adapter's alias: see [`BlueZ::alias`] and `docs/concepts/bluetooth.md`.
+//! central, BLE-R8): a central counts as connected once it subscribes to `tx`, which BlueZ hands over as a socket with
+//! the subscriber's address (`AcquireNotify`), and only that device's plain writes without response at offset 0 reach
+//! the node (BLE-R7, NB110-8). As the central it connects, finds the service and takes the `rx` writer and `tx`
+//! notifications as sockets. bluer's sockets take values of up to 5 bytes under the ATT MTU, so the node is told an
+//! MTU that keeps its values to that, and a connection whose socket takes fewer than 20 bytes (an ATT MTU of 23 or 24)
+//! isn't used. Nothing is paired. BlueZ picks the addresses it advertises and connects from, and its GAP name is the
+//! adapter's alias: see [`BlueZ::alias`] and `docs/concepts/bluetooth.md`.
 
 use crate::ble::{ConnId, DeviceId, Limits, Radio, RadioEvent, RX_UUID, SERVICE_UUID, TX_UUID};
 use bluer::adv::{Advertisement, AdvertisementHandle, Type};
 use bluer::gatt::local::{
-    Application, ApplicationHandle, Characteristic, CharacteristicNotifier, CharacteristicNotify,
-    CharacteristicNotifyMethod, CharacteristicWrite, CharacteristicWriteMethod, CharacteristicWriteRequest, ReqError,
-    Service,
+    characteristic_control, Application, ApplicationHandle, Characteristic, CharacteristicControl,
+    CharacteristicControlEvent, CharacteristicNotify, CharacteristicNotifyMethod, CharacteristicWrite,
+    CharacteristicWriteMethod, CharacteristicWriteRequest, ReqError, Service,
 };
-use bluer::gatt::WriteOp;
+use bluer::gatt::{CharacteristicWriter, WriteOp};
 use bluer::{Adapter, AdapterEvent, Address, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport, Uuid};
 use futures::{FutureExt, StreamExt};
 use std::collections::HashMap;
@@ -168,6 +171,22 @@ fn uuid(u: u128) -> Uuid {
     Uuid::from_u128(u)
 }
 
+/// The ATT MTU to tell the node for a socket that takes values of up to `len` bytes (bluer keeps them 5 under the
+/// real one), so that its values fit: `len + 3`. `None` under the codec's least value, 20 bytes.
+fn att_mtu(len: usize) -> Option<u16> {
+    (len >= usize::from(crate::ble::MIN_ATT_MTU) - 3).then(|| u16::try_from(len + 3).unwrap_or(u16::MAX))
+}
+
+/// Closes the link to `addr`, unless this radio connected to it as a central.
+async fn drop_link(adapter: &Adapter, centrals: &Centrals, addr: Address) {
+    if centrals.lock().unwrap().values().any(|(_, a)| *a == addr) {
+        return;
+    }
+    if let Ok(dev) = adapter.device(addr) {
+        let _ = dev.disconnect().await;
+    }
+}
+
 fn device_id(a: Address) -> DeviceId {
     let mut b = [0u8; 8];
     b[2..].copy_from_slice(&a.0);
@@ -186,7 +205,7 @@ type Centrals = Arc<Mutex<HashMap<u32, (Vec<JoinHandle<()>>, Address)>>>;
 #[derive(Default)]
 struct Peripheral {
     conn: Option<u32>,
-    /// Its address, from its first write.
+    /// Its address, from its subscription to `tx`.
     from: Option<Address>,
 }
 
@@ -229,10 +248,12 @@ impl Driver {
             centrals: Arc::new(Mutex::new(HashMap::new())),
             _app: None,
         };
-        match d.adapter.serve_gatt_application(d.application()).await {
+        let (control, handle) = characteristic_control();
+        match d.adapter.serve_gatt_application(d.application(handle)).await {
             Ok(app) => d._app = Some(app),
             Err(e) => return drop(ready.send(Err(io::Error::other(e)))),
         }
+        tokio::spawn(d.subscriptions(control));
         let _ = ready.send(Ok(alias));
         while let Some(cmd) = cmds.recv().await {
             match cmd {
@@ -244,25 +265,32 @@ impl Driver {
         }
     }
 
-    /// The service: `rx` takes plain writes without response at offset 0 from the one central, `tx` notifies it.
-    fn application(&self) -> Application {
+    /// The service: `rx` takes plain writes without response at offset 0 from the one central, and `tx` notifies it
+    /// over the socket its subscription hands over (`control`'s, see [`Driver::subscriptions`]). Another device that
+    /// writes while one is served is refused, as the node refuses a central over its limit: its link closes.
+    fn application(&self, control: bluer::gatt::local::CharacteristicControlHandle) -> Application {
         let (events, peripheral) = (self.events.clone(), self.peripheral.clone());
+        let (adapter, centrals) = (self.adapter.clone(), self.centrals.clone());
         let write: Box<dyn Fn(Vec<u8>, CharacteristicWriteRequest) -> _ + Send + Sync> =
             Box::new(move |value: Vec<u8>, req: CharacteristicWriteRequest| {
                 let ok = req.op_type == WriteOp::Command && req.offset == 0;
-                let mut p = peripheral.lock().unwrap();
-                let taken = match (ok, p.conn) {
-                    (true, Some(conn)) if p.from.is_none_or(|f| f == req.device_address) => {
-                        if p.from.is_none() {
-                            p.from = Some(req.device_address);
-                            events.send(RadioEvent::Mtu { conn: ConnId(conn), mtu: req.mtu });
+                let p = peripheral.lock().unwrap();
+                let (taken, stranger) = match (p.conn, p.from) {
+                    (Some(conn), Some(from)) if from == req.device_address => {
+                        if ok {
+                            events.send(RadioEvent::Value { conn: ConnId(conn), value });
                         }
-                        events.send(RadioEvent::Value { conn: ConnId(conn), value });
-                        true
+                        (ok, false)
                     }
-                    _ => false,
+                    (Some(_), _) => (false, true),
+                    _ => (false, false),
                 };
+                drop(p);
+                let (adapter, centrals, addr) = (adapter.clone(), centrals.clone(), req.device_address);
                 async move {
+                    if stranger {
+                        tokio::spawn(async move { drop_link(&adapter, &centrals, addr).await });
+                    }
                     if taken {
                         Ok(())
                     } else {
@@ -270,12 +298,6 @@ impl Driver {
                     }
                 }
                 .boxed()
-            });
-        let (events, peripheral, shared) = (self.events.clone(), self.peripheral.clone(), self.shared.clone());
-        let notify: Box<dyn Fn(CharacteristicNotifier) -> _ + Send + Sync> =
-            Box::new(move |notifier: CharacteristicNotifier| {
-                let (events, peripheral, shared) = (events.clone(), peripheral.clone(), shared.clone());
-                async move { serve_central(notifier, events, peripheral, shared).await }.boxed()
             });
         let rx = Characteristic {
             uuid: uuid(RX_UUID),
@@ -290,14 +312,35 @@ impl Driver {
             uuid: uuid(TX_UUID),
             notify: Some(CharacteristicNotify {
                 notify: true,
-                method: CharacteristicNotifyMethod::Fun(notify),
+                method: CharacteristicNotifyMethod::Io,
                 ..Default::default()
             }),
+            control_handle: control,
             ..Default::default()
         };
         let service =
             Service { uuid: uuid(SERVICE_UUID), primary: true, characteristics: vec![rx, tx], ..Default::default() };
         Application { services: vec![service], ..Default::default() }
+    }
+
+    /// Serves each subscription to `tx`, as BlueZ hands it over with its socket and the subscriber's address.
+    fn subscriptions(&self, mut control: CharacteristicControl) -> impl std::future::Future<Output = ()> + 'static {
+        let (adapter, events, peripheral) = (self.adapter.clone(), self.events.clone(), self.peripheral.clone());
+        let (shared, centrals) = (self.shared.clone(), self.centrals.clone());
+        async move {
+            while let Some(e) = control.next().await {
+                if let CharacteristicControlEvent::Notify(writer) = e {
+                    let central = Central {
+                        adapter: adapter.clone(),
+                        centrals: centrals.clone(),
+                        events: events.clone(),
+                        peripheral: peripheral.clone(),
+                        shared: shared.clone(),
+                    };
+                    tokio::spawn(central.serve(writer));
+                }
+            }
+        }
     }
 
     async fn advertise(&mut self, data: Option<Vec<u8>>) {
@@ -400,8 +443,12 @@ impl Driver {
                 events.send(RadioEvent::ConnectFailed { device });
                 return;
             };
+            let Some(mtu) = att_mtu(writer.mtu().min(reader.mtu())) else {
+                let _ = dev.disconnect().await;
+                events.send(RadioEvent::ConnectFailed { device });
+                return;
+            };
             let conn = shared.next.fetch_add(1, Ordering::Relaxed);
-            let mtu = u16::try_from(writer.mtu().min(reader.mtu())).unwrap_or(u16::MAX);
             let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
             shared.senders.lock().unwrap().insert(conn, out);
             events.send(RadioEvent::Connected { conn: ConnId(conn), device: Some(device), mtu });
@@ -458,42 +505,70 @@ fn seen(events: &Events, addr: Address, data: &HashMap<Uuid, Vec<u8>>) {
     }
 }
 
-/// Serves a central that subscribed to `tx`, the only one at a time: its values go out as notifications until it
-/// stops the session or the node closes it.
-async fn serve_central(
-    mut notifier: CharacteristicNotifier,
+/// What serving a central that subscribed to `tx` takes.
+struct Central {
+    adapter: Adapter,
+    centrals: Centrals,
     events: Events,
     peripheral: Arc<Mutex<Peripheral>>,
     shared: Arc<Shared>,
-) {
-    let conn = {
-        let mut p = peripheral.lock().unwrap();
-        if p.conn.is_some() {
-            return; // another central's: one at a time (BLE-R8)
-        }
-        let conn = shared.next.fetch_add(1, Ordering::Relaxed);
-        *p = Peripheral { conn: Some(conn), from: None };
-        conn
-    };
-    let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
-    shared.senders.lock().unwrap().insert(conn, out);
-    events.send(RadioEvent::Connected { conn: ConnId(conn), device: None, mtu: crate::ble::MIN_ATT_MTU });
-    loop {
-        tokio::select! {
-            v = queue.recv() => {
-                let Some(v) = v else { break };
-                if notifier.notify(v).await.is_err() {
-                    break;
+}
+
+impl Central {
+    /// Serves the central behind `writer`, the only one at a time: its values go out as notifications until it stops
+    /// the session or leaves, or the node closes it. Another one, or one whose socket takes too little, is refused
+    /// and its link closed.
+    async fn serve(self, writer: CharacteristicWriter) {
+        let addr = writer.device_address();
+        let conn = {
+            let mut p = self.peripheral.lock().unwrap();
+            match att_mtu(writer.mtu()).filter(|_| p.conn.is_none()) {
+                Some(mtu) => {
+                    let conn = self.shared.next.fetch_add(1, Ordering::Relaxed);
+                    *p = Peripheral { conn: Some(conn), from: Some(addr) };
+                    Some((conn, mtu))
+                }
+                None => None,
+            }
+        };
+        let Some((conn, mtu)) = conn else {
+            drop(writer);
+            return drop_link(&self.adapter, &self.centrals, addr).await;
+        };
+        let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
+        self.shared.senders.lock().unwrap().insert(conn, out);
+        self.events.send(RadioEvent::Connected { conn: ConnId(conn), device: None, mtu });
+        // Its link going down ends the session too, as BlueZ keeps the socket while another device subscribes.
+        let adapter = self.adapter.clone();
+        let left = async move {
+            if let Ok(mut changes) = async { adapter.device(addr)?.events().await }.await {
+                while let Some(DeviceEvent::PropertyChanged(p)) = changes.next().await {
+                    if matches!(p, DeviceProperty::Connected(false)) {
+                        return;
+                    }
                 }
             }
-            _ = notifier.stopped() => break,
+            std::future::pending::<()>().await
+        };
+        tokio::pin!(left);
+        loop {
+            tokio::select! {
+                v = queue.recv() => {
+                    let Some(v) = v else { break };
+                    if writer.send(&v).await.is_err() {
+                        break;
+                    }
+                }
+                _ = writer.closed() => break,
+                _ = &mut left => break,
+            }
         }
-    }
-    shared.senders.lock().unwrap().remove(&conn);
-    let mut p = peripheral.lock().unwrap();
-    if p.conn == Some(conn) {
-        *p = Peripheral::default();
-        events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
+        self.shared.senders.lock().unwrap().remove(&conn);
+        let mut p = self.peripheral.lock().unwrap();
+        if p.conn == Some(conn) {
+            *p = Peripheral::default();
+            self.events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
+        }
     }
 }
 
@@ -509,6 +584,19 @@ mod tests {
         assert_eq!(uuid(SERVICE_UUID).to_string(), "1c3eea41-c2be-493c-ab0b-7707ad2dbed6");
         assert_eq!(uuid(RX_UUID).to_string(), "1c3eea42-c2be-493c-ab0b-7707ad2dbed6");
         assert_eq!(uuid(TX_UUID).to_string(), "1c3eea43-c2be-493c-ab0b-7707ad2dbed6");
+    }
+
+    /// bluer's sockets take values of up to 5 bytes under the ATT MTU: the node is told 3 over what they take, so its
+    /// values fit, and nothing under the codec's least value, 20 bytes.
+    #[test]
+    fn the_node_is_told_an_mtu_its_values_fit() {
+        assert_eq!(att_mtu(18), None, "an ATT MTU of 23");
+        assert_eq!(att_mtu(19), None);
+        assert_eq!(att_mtu(20), Some(23));
+        assert_eq!(crate::ble::MIN_ATT_MTU, 23);
+        assert_eq!(peerwire_core::ble::value_len(att_mtu(251).unwrap()), 251, "an ESP32's 256");
+        assert_eq!(att_mtu(512), Some(515));
+        assert_eq!(peerwire_core::ble::value_len(att_mtu(512).unwrap()), 512, "517");
     }
 
     #[test]
