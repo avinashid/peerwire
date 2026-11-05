@@ -5,13 +5,20 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+rust-version.workspace = true
 description = "Peer-to-peer nodes over UDP with no server: STUN, rooms, signaling and NAT traversal on peerwire-core"
 readme = "README.md"
 keywords = ["p2p", "nat-traversal", "udp", "multiplayer", "hole-punching"]
 categories = ["network-programming", "game-development", "asynchronous"]
+# A package ships its sources, README and licences; tests, examples and fixtures stay in the repo.
+include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+[package.metadata.docs.rs]
+# The async host and Nostr signaling as well as the default TURN client; not `testing`, which is for bindings.
+features = ["tokio", "nostr"]
 
 [dependencies]
-peerwire-core = { path = "../peerwire-core" }
+peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # Deterministic randomness in the sans-IO traversal (already used by peerwire-sim and peerwire-ffi).
 rand_chacha = "0.3"

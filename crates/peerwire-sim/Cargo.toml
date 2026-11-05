@@ -5,14 +5,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+rust-version.workspace = true
 description = "Deterministic network simulator for Peerwire: real endpoints over simulated latency, loss, uplinks and NATs, in virtual time"
 readme = "README.md"
 keywords = ["p2p", "simulator", "networking", "deterministic", "testing"]
 categories = ["simulation", "network-programming", "development-tools::testing"]
+# A package ships its sources, README and licences; tests, examples and fixtures stay in the repo.
+include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [dependencies]
 # The TURN codec, for the TURN server (src/turn.rs).
-peerwire-core = { path = "../peerwire-core", features = ["turn"] }
+peerwire-core = { version = "0.1.0", path = "../peerwire-core", features = ["turn"] }
 rand_core = "0.6"
 rand_chacha = "0.3"
 

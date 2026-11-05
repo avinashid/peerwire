@@ -5,13 +5,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+rust-version.workspace = true
 description = "An optional always-on Peerwire peer: keeps one identity across restarts and relays for the peers linked to it"
 readme = "README.md"
 keywords = ["p2p", "relay", "nat-traversal", "udp", "server"]
 categories = ["network-programming", "command-line-utilities"]
-publish = false
+# A package ships its sources, README and licences; tests, examples and fixtures stay in the repo.
+include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [dependencies]
-peerwire = { path = "../peerwire" }
+peerwire = { version = "0.1.0", path = "../peerwire" }
 # A fresh identity on first start (already in the tree through peerwire).
 rand_core = { version = "0.6", features = ["getrandom"] }

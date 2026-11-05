@@ -1,7 +1,8 @@
 name: CI
 
 # Runs every step of scripts/gate.sh --strict except the browser tests and the public-relay Nostr tests.
-# Linux only, three jobs (rust, wasm + node, docker build without push), cached builds, superseded runs cancelled.
+# Linux only, four jobs (rust, wasm + node, msrv, docker build without push), cached builds, superseded runs
+# cancelled.
 on:
   push:
     branches: [main]
@@ -100,6 +101,21 @@ jobs:
       # The docs' JS samples parse with the TypeScript installed above, and import what src/ and the build export.
       - run: node packages/js/test/docs_samples.mjs
       - run: node packages/js/test/docs_links.mjs
+
+  msrv:
+    name: rust-version (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.88'  # the workspace's rust-version in Cargo.toml
+      - uses: Swatinem/rust-cache@v2
+      # The crates scripts/publish-crates.sh publishes, every feature on, as cargo add and docs.rs build them.
+      - run: >-
+          cargo check --locked --all-features -p peerwire-core -p peerwire-game -p peerwire-sync -p peerwire
+          -p peerwire-ffi -p peerwire-sim -p peerwire-peer
 
   docker:
     name: docker build
