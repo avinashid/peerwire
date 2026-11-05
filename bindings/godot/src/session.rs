@@ -531,7 +531,7 @@ impl Session {
     /// through another peer or isn't linked.
     pub fn direct_address(&self, id: i32) -> Option<SocketAddr> {
         match self.node.path(&self.ids.peer(id)?)? {
-            peerwire::Path::Direct(a) => Some(*a),
+            peerwire::Path::Direct(a) => Some(a),
             peerwire::Path::Via(_) => None,
         }
     }

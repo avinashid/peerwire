@@ -27,7 +27,8 @@ debug = true
 opt-level = "z"
 
 [dependencies]
-peerwire = { path = "../../crates/peerwire", features = ["nostr"] }
+# Without the default TURN client (NB-099): a follow-up, as is its code size here.
+peerwire = { path = "../../crates/peerwire", default-features = false, features = ["nostr"] }
 esp-idf-svc = "0.53"
 log = "0.4"
 anyhow = "1"

@@ -1,11 +1,18 @@
 //! Minimal STUN (RFC 5389) Binding client codec, for learning our public
-//! address from any STUN server before we have peers to ask.
+//! address from any STUN server before we have peers to ask. With feature `turn`,
+//! also the STUN messages a TURN client and server exchange (RFC 8489, RFC 8656):
+//! `Message`, `MessageBuilder`, long-term credentials and ChannelData.
 //!
 //! STUN shares the socket with Peerwire packets. Following RFC 7983, STUN messages
-//! start with a byte in 0..=3 and Peerwire packets with 16..=31 (version nibble 1),
-//! so [`is_stun`] demultiplexes.
+//! start with a byte in 0..=3, TURN ChannelData with 64..=79 and Peerwire packets
+//! with 16..=31 (version nibble 1), so [`is_stun`] and `is_channel_data` demultiplex.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+#[cfg(feature = "turn")]
+mod turn;
+#[cfg(feature = "turn")]
+pub use turn::*;
 
 const MAGIC: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
@@ -32,23 +39,7 @@ pub fn binding_request(tx: &TxId) -> Vec<u8> {
 /// A Binding success response telling the requester it was seen at `addr`
 /// (XOR-MAPPED-ADDRESS): what a STUN server sends, for tests and simulators.
 pub fn binding_response(tx: &TxId, addr: SocketAddr) -> Vec<u8> {
-    let mut key = [0u8; 16];
-    key[..4].copy_from_slice(&MAGIC.to_be_bytes());
-    key[4..].copy_from_slice(tx);
-    let mut attr = vec![0, 0];
-    let port = addr.port().to_be_bytes();
-    attr.extend_from_slice(&[port[0] ^ key[0], port[1] ^ key[1]]);
-    let ip = match addr.ip() {
-        IpAddr::V4(ip) => {
-            attr[1] = 1;
-            ip.octets().to_vec()
-        }
-        IpAddr::V6(ip) => {
-            attr[1] = 2;
-            ip.octets().to_vec()
-        }
-    };
-    attr.extend(ip.iter().zip(key).map(|(b, k)| b ^ k));
+    let attr = encode_xor_addr(addr, tx);
     let mut v = Vec::with_capacity(24 + attr.len());
     v.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
     v.extend_from_slice(&(4 + attr.len() as u16).to_be_bytes());
@@ -112,6 +103,21 @@ fn decode_addr(v: &[u8], xor: Option<&TxId>) -> Option<SocketAddr> {
         _ => return None,
     };
     Some(SocketAddr::new(ip, port))
+}
+
+/// An XOR-…-ADDRESS value: `addr` XORed with the magic cookie and transaction `tx`.
+fn encode_xor_addr(addr: SocketAddr, tx: &TxId) -> Vec<u8> {
+    let mut key = [0u8; 16];
+    key[..4].copy_from_slice(&MAGIC.to_be_bytes());
+    key[4..].copy_from_slice(tx);
+    let port = addr.port().to_be_bytes();
+    let (family, ip) = match addr.ip() {
+        IpAddr::V4(ip) => (1, ip.octets().to_vec()),
+        IpAddr::V6(ip) => (2, ip.octets().to_vec()),
+    };
+    let mut v = vec![0, family, port[0] ^ key[0], port[1] ^ key[1]];
+    v.extend(ip.iter().zip(key).map(|(b, k)| b ^ k));
+    v
 }
 
 #[cfg(test)]

@@ -10,14 +10,14 @@ change both while the app runs.
 | Path | JavaScript | Rust | Who carries the packets | Cost |
 |---|---|---|---|---|
 | Direct | `'direct'` | `Direct` and `Birthday` | nobody: straight between the peers, through their NATs | none; each peer sees the other's address |
-| TURN | `'turn'` | none yet | your TURN server (coturn, Cloudflare TURN, …), named in `iceServers` | the server's bandwidth; it sees both addresses |
+| TURN | `'turn'` | `Turn` | your TURN server (coturn, Cloudflare TURN, …): in `iceServers`, or `Node::set_turn_servers` | the server's bandwidth; it sees both addresses |
 | Another peer | `'peers'` | `Peers` | a member linked directly to both | that member's upload, and a detour |
 | Your relay peer | none | `RelayPeers` | your own always-on `peerwire-peer` ([always-on peer](always-on-peer.md)) | its upload, and a detour |
 | Signalling | `'signaling'` | none | the Nostr relays the room meets on, as sealed events | slow and rate-limited: a last resort |
 
 In Rust, `Birthday` is the extra punching for symmetric NATs (see [NAT traversal](../concepts/nat-traversal.md));
-in JavaScript it comes with `'direct'` (`birthday: false` turns it off). A relay peer is Rust's equivalent of your own
-TURN server. Rust has no TURN client yet.
+in JavaScript it comes with `'direct'` (`birthday: false` turns it off). Rust's TURN client is in the `peerwire`
+crate's `turn` feature, on by default; a relay peer is another way to run your own relay.
 
 Every path is end-to-end encrypted: a TURN server, a relaying peer or a signalling relay sees sizes and timing, never
 the content.
@@ -35,6 +35,9 @@ The same rules hold in both languages:
   `'peer-leave'` with reason `'policy'` in JavaScript, `Disconnected` with `DisconnectReason::PathOff` in Rust.
 - **Each end has its own.** A policy governs what this end dials, moves to and keeps. A peer whose policy differs
   may still dial this end over a path it has off; that link moves to an allowed path or closes.
+- **TURN is used only when listed.** With no policy, or without `'turn'` / `Turn` in it, nothing is allocated. A
+  link counts as TURN when either end's relay carries it. In Rust, a link on TURN moves to a direct path ranked
+  earlier once a punch answers, but not to a relay peer, even one ranked earlier (a limit of this version).
 
 Two details differ:
 
@@ -49,7 +52,7 @@ Two details differ:
 |---|---|---|
 | Every path, fastest first | no policy (or `fallback: 'auto'`) | no policy |
 | No other member carries your packets | `['direct', 'turn']` (`fallback: 'off'`) | `[Direct, Birthday, RelayPeers]` |
-| TURN only when nothing free works | `['direct', 'peers', 'signaling', 'turn']` | not available |
+| TURN only when nothing free works | `['direct', 'peers', 'signaling', 'turn']` | `[Direct, Birthday, Peers, Turn]` |
 | Peers never see your IP address | `['turn']`, with your TURN server | `Privacy::RelayOnly`, not a policy |
 | Your own relay first, direct only if it fails | not available | `[RelayPeers, Direct, Birthday]` |
 | Only direct links, nothing relayed | `['direct']` | `[Direct, Birthday]` |
@@ -84,25 +87,34 @@ room.route(peer); // { kind: 'direct', turn: true, rttMs: 41 }
 `room.policy` shows `iceServers` as their urls only, never a username or credential, and errors name a server by its
 index. Use short-lived TURN credentials where your server supports them, as anyone with the page can read them.
 
-In Rust, set your STUN servers, relay peers and policy on the builder, and change them on the node:
+In Rust, set your STUN and TURN servers, relay peers and policy on the builder, and change them on the node:
 
 ```rust
-use peerwire::{Node, PathKind, Policy};
+use peerwire::{Node, PathKind, Policy, TurnServer};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relay = "pw:…"; // your always-on peer's invite
+    let turn_password = "…"; // short-lived, from your backend
     let mut node = Node::builder()
         .stun_servers(["stun.example.com:3478"])
+        .turn_servers([TurnServer::new("turn.example.com:3478", "app", turn_password)])
         .relay_peers([relay])
-        .policy(Policy::new([PathKind::Direct, PathKind::Birthday, PathKind::RelayPeers]))
+        .policy(Policy::new([PathKind::Direct, PathKind::Birthday, PathKind::RelayPeers, PathKind::Turn]))
         .bind("0.0.0.0:0")?;
 
     // Later, live: through the relay peer only. Direct links move to it, or close with PathOff.
     node.set_policy(Policy::new([PathKind::RelayPeers]))?;
     node.set_stun_servers(["stun2.example.com:3478"]);
+    // New TURN credentials before the old ones expire: a new allocation, at a new relayed address.
+    node.set_turn_servers([TurnServer::new("turn.example.com:3478", "app", "…")]);
     Ok(())
 }
 ```
+
+`node.path_kind(&peer)` says which kind of path a link takes (`Turn` through a TURN server), as `room.route(peer)`
+does in JavaScript; `node.turn_status()` shows each TURN server and the relayed address of the node's allocation
+there. A `TurnServer`'s `Debug` output shows its address only. `TurnServer::rest` mints time-limited credentials from
+the server's shared secret: only in apps you run yourself, as the secret mints credentials for anyone who holds it.
 
 `Node::set_signaling` swaps the signalling carrier (`NostrSignaling::new([...])` with other relays, say) the same
 way: links stay up, and the node says hello on the new one. `set_policy(None)` goes back to every path.
@@ -118,7 +130,9 @@ way: links stay up, and the node says hello on the new one. `set_policy(None)` g
 
 ## Limits
 
-- TURN is WebRTC's, so only JavaScript has it. A Rust node relays through peers and relay peers.
+- Rust's TURN client speaks UDP only (no `turns:` over TCP or TLS), is off under `Privacy::RelayOnly`, and doesn't
+  move a TURN link to a relay peer. New credentials for a server make a new allocation, at a new relayed address,
+  so its links move or close as when a server is dropped.
 - The `'signaling'` path is JavaScript's; a Rust node uses signalling to meet peers, not to carry a link.
 - After a link moves off a member, the peer can still send through that member for a while: the core takes relayed
   packets from any member that forwards them.

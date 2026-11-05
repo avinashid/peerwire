@@ -44,16 +44,19 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 
 ## Features
 
-`peerwire` turns no feature on by default (its `[features]` has no `default`).
+`peerwire` turns one feature on by default, `turn`; `default-features = false` leaves it out (as the ESP32 port does).
 
 | Feature | Adds | Pulls in |
 |---|---|---|
+| `turn` (default) | A TURN client: [`TurnServer`](#turnserver), `Builder::turn_servers`, `Node::set_turn_servers`, `Node::turn_status`. Without it `PathKind::Turn` is still a kind, but no node has TURN servers | `peerwire-core`'s `turn`: `hmac` 0.12, `sha1` 0.10, `md-5` 0.10 |
 | `tokio` | [`AsyncNode`](#asyncnode) | `tokio` 1 with `net`, `time`, `macros`, `rt` |
 | `nostr` | [`NostrSignaling`](#nostrsignaling) and the `peerwire::nostr` module | `tungstenite` 0.24, `rustls` 0.23 (`ring`), `webpki-roots` 1, `k256` 0.13, `serde_json` 1 |
 | `testing` | `Builder::port_mapping_at`, port mapping through a fake gateway (hidden from rustdoc). For the bindings' tests only, not for apps | nothing |
 
 `peerwire-ffi` has one feature, `sync`: the shared-document functions (`pw_docs_*`, `pw_doc_*`) on `peerwire-sync`.
-It is off by default, and the wasm build leaves it out. The other crates have no features.
+It is off by default, and the wasm build leaves it out. `peerwire-core` has one, `turn`, off by default: TURN's
+STUN messages in `stun` (`Message`, `MessageBuilder`, `long_term_key`, `rest_password`, ChannelData), which
+`peerwire`'s `turn` turns on and the FFI, so the wasm, never does. The other crates have no features.
 
 ## API docs
 
@@ -91,6 +94,8 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `LanSignaling` | A carrier over UDP multicast and broadcast on one LAN | `src/lan.rs` |
 | `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND` and `NostrStats` | `src/nostr.rs` |
 | `Privacy`, `Role`, `NatType`, `Failure`, `Side` | Which addresses a node gives out, room roles, the NAT type, why a dial failed | `src/traversal.rs` |
+| `PathKind`, `Policy`, `Hop` | The kinds of path, a connection policy, and the addresses a host with TURN gives its endpoint (a network address, a peer through this node's TURN allocation, or a peer's relayed address) | `src/traversal.rs` |
+| `TurnServer` (feature `turn`) | A TURN server and the credentials for it | `src/turn.rs` |
 | `PortMapping`, `MapProtocol` | Where router port mapping stands | `src/portmap.rs` |
 | `Config`, `ConnectError`, `DisconnectReason`, `Identity`, `Invite`, `Lane`, `PeerId`, `PeerStats`, `SendError`, `Stats`, `MAX_UNRELIABLE`, `MAX_URGENT` | Re-exported from `peerwire-core` | `crates/peerwire-core/src` |
 | `traversal` (module) | The sans-IO NAT traversal layer (`Traversal`) that `Node` drives; the simulator drives it too | `src/traversal.rs` |
@@ -218,6 +223,8 @@ Paths and servers, live:
 | `policy(&self) -> Option<&Policy>` | The paths links may take, if a policy is set |
 | `set_policy(&mut self, policy: impl Into<Option<Policy>>) -> Result<(), Error>` | Sets which paths links may take, and in what order (see [Policy](#policy)); `None` takes every path, as with no policy. New dials follow it at once, and dials under way take their next steps by it. A link on a path it turns off moves to one still allowed: through a relay, it punches to a direct path (with `Direct` on); with an allowed relay linked to both, it is dialled again through that one, which replaces it at both ends (`Disconnected` with `Replaced`, then `Connected`). One that can't move, or hasn't within 6 s (`MOVE_WAIT` in `traversal.rs`), is closed: `Disconnected` with `DisconnectReason::PathOff`. A new link on a path the policy has off is closed unseen, with whatever came in with it; if it replaced a link (the peer restarted, say), that link's `Disconnected` says `PathOff`, not `Replaced`. Leaving `RelayPeers` out closes the relay peers' links; the policy's `port_mapping` starts or stops router port mapping. Fails, changing nothing, with `Error::InvalidPolicy` |
 | `set_stun_servers<S: Into<String>>(&mut self, servers: impl IntoIterator<Item = S>)` | Replaces the STUN servers (as `Builder::stun_servers`; empty turns STUN off) and asks the new ones at once. Names are resolved now, on the calling thread. Links stay up: the servers only give the public address and NAT type that the next offers and invites carry |
+| `set_turn_servers(&mut self, servers: impl IntoIterator<Item = TurnServer>)` | Feature `turn`. Replaces this node's own TURN servers (empty: none); names are resolved now, as STUN servers' are, on loopback too. TURN runs only with `PathKind::Turn` in the policy and not under `Privacy::RelayOnly`: the node keeps an allocation on each server, offers its relayed address, and a dial's `Turn` step goes through it. An allocation stays on a server kept with the same credentials; the others are released, and their links move to a path the policy allows or close with `PathOff`. New credentials for a server (renewing short-lived ones) make a new allocation, at a new relayed address. One server can be both STUN and TURN, as coturn is: list it in `stun_servers` too, and its Binding answers reach STUN as any STUN server's do |
+| `turn_status(&self) -> Vec<(SocketAddr, Option<SocketAddr>)>` | Feature `turn`. Each TURN server as resolved, and the relayed address of this node's allocation there, once made |
 | `set_signaling(&mut self, signaling: impl Signaling + 'static)` | Swaps the carrier, to change relays, say: the old one is dropped, and on the new one the node subscribes to its inbox and its room's topic and says hello at once. Links stay up. Peers meet over it from then on, so those in the room move to it too, or share it |
 
 Peers and rooms:
@@ -243,7 +250,8 @@ Messages and links:
 | `status(&self, peer: &PeerId) -> Status` | `Disconnected`, `Connecting` or `Connected` |
 | `peers(&self) -> impl Iterator<Item = &PeerId>` | Peers with a live link, relay peers left out |
 | `peer_stats(&self, peer: &PeerId) -> Option<PeerStats>` | A link's RTT, path RTT, congestion window, fragments sent and retransmitted; `PeerStats::loss()` estimates loss |
-| `path(&self, peer: &PeerId) -> Option<&Path>` | The route the link takes: `Path::Direct(addr)` or `Path::Via(relay)` |
+| `path(&self, peer: &PeerId) -> Option<Path>` | The route the link takes: `Path::Direct(addr)` or `Path::Via(relay)`. The address is where its packets go: a link through TURN shows the peer's address as this node's TURN server relays to it, or the peer's relayed address; `path_kind` says which |
+| `path_kind(&self, peer: &PeerId) -> Option<PathKind>` | The kind of route: `Direct`, `Birthday` (out of a birthday-punch socket, as `via_birthday`), `Peers` or `RelayPeers` (through a peer), or `Turn` (through a TURN server, this node's or the peer's) |
 | `via_birthday(&self, peer: &PeerId) -> bool` | Whether the direct link leaves from one of this node's birthday-punch sockets |
 | `birthday_sockets_opened(&self) -> u64` | How many sockets this node has opened for birthday punching |
 | `stats(&self) -> Stats` | Node-wide counters: packets, drops, relaying, hole punching |
@@ -276,6 +284,7 @@ Options for a `Node`, from `Node::builder()`. Each takes `self` and returns the 
 | `port_mapping` | `bool` | `false` | Asks the router to forward a public UDP port to this node, by PCP, NAT-PMP or UPnP-IGD (tried in that order), and offers the mapped address like a public one. Runs on a thread of its own, for IPv4 and dual-stack sockets not bound to loopback; renewed while the node lives and removed when it is dropped. Paused under `Privacy::RelayOnly`. With a `policy`, the policy's `port_mapping` decides instead |
 | `relay_peers` | `impl IntoIterator<Item = S>`, `S: Into<String>` | None | Invites of always-on peers to keep linked as relays (see `Node::set_relay_peers`) |
 | `policy` | `Policy` | None: every path, as before policies | Which paths links may take, and in what order (see [Policy](#policy) and `Node::set_policy`) |
+| `turn_servers` | `impl IntoIterator<Item = TurnServer>` | none | Feature `turn`. This node's own TURN servers, as `Node::set_turn_servers` takes them, resolved in `bind`; used only with `PathKind::Turn` in the policy |
 
 `bind(self, addr: impl ToSocketAddrs) -> io::Result<Node>` binds the socket as `Node::bind` describes. It fails with
 `ErrorKind::InvalidInput` if a relay peer is not an invite, or if the policy is not valid (`Policy::is_valid`).
@@ -348,11 +357,11 @@ moves it into `tokio::spawn`. Carriers are polled, not awaited: with one, `next_
 
 | Variant | When |
 |---|---|
-| `Connected { peer: PeerId, path: Path, initiator: bool }` | A link is up. `initiator`: this side sent the handshake that made it |
+| `Connected { peer: PeerId, path: Path, initiator: bool }` | A link is up. `initiator`: this side sent the handshake that made it. The path's address is where packets go, as `Node::path` shows it; `Node::path_kind` tells a link through TURN apart |
 | `Message { peer: PeerId, lane: Lane, data: Vec<u8> }` | A message arrived. `lane` is `Reliable` or `Unreliable`: urgent messages arrive as `Lane::Reliable` |
 | `Disconnected { peer: PeerId, reason: DisconnectReason }` | A link went. `reason` is `Timeout`, `ClosedByPeer`, `Replaced` (the peer completed a new handshake, after a restart or a re-dial: a `Connected` for the new link follows, and reliable data in flight on the old one is lost), `ProtocolViolation` or `PathOff` (this node closed it: its policy turned the link's path off and no path still allowed took it over, or the peer replaced the link with one on a path the policy has off, see `Node::set_policy`) |
 | `ConnectFailed { peer: PeerId }` | A dial ran out of handshake attempts (`Config::handshake_attempts`). `Node::failure` says why |
-| `PathChanged { peer: PeerId, path: Path }` | A link moved: relayed to direct after a hole punch, direct to relayed after the direct path went silent, or to a new address (roaming) |
+| `PathChanged { peer: PeerId, path: Path }` | A link moved: relayed to direct after a hole punch (off a peer or off TURN: a move between TURN and a direct path raises it too, though both show `Direct(addr)`), direct to relayed after the direct path went silent, or to a new address (roaming) |
 | `AddrObserved { by: PeerId, addr: SocketAddr }` | A directly linked peer reports the address it sees this node at (its public address, behind a NAT) |
 
 A `Node` doesn't pass on everything the core raises. Events about relay peers stay inside it. In a room, a link from
@@ -394,7 +403,7 @@ works.
 
 | Field | Default | |
 |---|---|---|
-| `order: Vec<PathKind>` | `[Direct, Birthday, RelayPeers, Peers]` | The kinds of path allowed, most preferred first. A kind left out is off. Not empty, and each kind at most once (`Policy::is_valid`; else `Error::InvalidPolicy`) |
+| `order: Vec<PathKind>` | `[Direct, Birthday, RelayPeers, Peers]`, without `Turn`, as with no policy | The kinds of path allowed, most preferred first. A kind left out is off. Not empty, and each kind at most once (`Policy::is_valid`; else `Error::InvalidPolicy`) |
 | `port_mapping: bool` | `false` | Router port mapping (as `Builder::port_mapping`), which runs only with `Direct` in `order` |
 | `fallback: Duration` | 2 s (`Policy::FALLBACK`) | How long each step of a dial has to link before the next starts too |
 
@@ -406,6 +415,7 @@ works.
 | `Birthday` | The punches planned for symmetric NATs, which an ordinary one can't link: a birthday punch or a lockstep sweep (see [NAT traversal](../concepts/nat-traversal.md)). Each costs NAT ports, and they are rate-limited |
 | `Peers` | Through another peer linked to both (`Path::Via`), such as a room member. A peer relays only over its direct links, so with `Direct` and `Birthday` off only relay peers can relay |
 | `RelayPeers` | Through this node's own always-on relay peers (`Node::set_relay_peers`), as you would run your own TURN server. Left out, they aren't linked at all |
+| `Turn` | Through a TURN server: this node's own (`Node::set_turn_servers`, allocated only with this kind in the order), or the peer's, at the relayed address its offers carry |
 
 How the order is read:
 
@@ -418,7 +428,11 @@ How the order is read:
 - **Answering.** The node answers a dial on any path it allows: a peer with another policy may dial it directly
   first. It refuses a new link on a path it has off, with what came in with it, and a link such a one replaced
   ends with `PathOff`.
-- **Privacy.** Under `Privacy::RelayOnly` links go through its relay whatever the policy says.
+- **Privacy.** Under `Privacy::RelayOnly` links go through its relay whatever the policy says, and TURN is off.
+- **TURN.** A dial's `Turn` step goes through this node's allocations to the peer's addresses, and to the peer's
+  relayed addresses from this node's socket. A link on TURN moves only to `Direct` or `Birthday`, ranked earlier,
+  once a punch answers; never to a relay peer, even one ranked earlier (a limit of this version). `[Turn, Direct]`
+  keeps a TURN link on TURN. Without `Turn` in the order, no allocation is made, as with no policy.
 
 ```rust
 use peerwire::{Node, PathKind, Policy};
@@ -431,6 +445,23 @@ let mut node = Node::builder().policy(Policy::new(order)).bind("0.0.0.0:0")?;
 node.set_policy(Policy { port_mapping: true, ..Policy::default() })?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+### TurnServer
+
+Feature `turn` (`crates/peerwire/src/turn.rs`). A TURN server (RFC 8656, over UDP) and the credentials for it, for
+`Builder::turn_servers` and `Node::set_turn_servers`. Its `Debug` output shows the address only.
+
+| Constructor | Credentials |
+|---|---|
+| `TurnServer::new(addr, username, password)` | Long-term credentials, as coturn's users and services such as Cloudflare's hand out. Mint short-lived ones where the secret is (your backend), and pass new ones with `Node::set_turn_servers` before they expire |
+| `TurnServer::rest(addr, secret, user, ttl: Duration)` | Time-limited ones minted here, per allocation, from the server's shared secret (coturn's `static-auth-secret`): username `expiry:user`, password base64(HMAC-SHA1(secret, username)). An allocation lasts until they expire, then another is made. **The secret mints credentials for anyone who holds it**: use this only in apps you run yourself, such as an always-on peer |
+
+`addr` is `host:port` (a `turn:` prefix is dropped). The client allocates with the 401 challenge and
+MESSAGE-INTEGRITY, takes a stale nonce's new one, refreshes at half the lifetime, makes a new allocation when one is
+lost, asks for permissions for the peers' IPs and a channel for each peer address it sends to (both refreshed every
+4 minutes while wanted, at most 64 of each: a new one takes the place of the one wanted longest ago, a peer holds
+only its last offer's IPs, and a channel number let go is bound again only 15 minutes on), and counts only what comes
+from the server's address, a success response only under its key. TCP and TLS (`turns:`) are not supported.
 
 ### Role
 
@@ -463,7 +494,7 @@ tells `SymmetricIp` from `Symmetric` with one of them on a second port too. More
 | Variant | |
 |---|---|
 | `Failure::Unreachable` | No handshake answer on any address: the peer is gone, or a firewall drops UDP |
-| `Failure::Symmetric(Side)` | The NAT on that side (`Side::Ours`, `Side::Theirs` or `Side::Both`) is symmetric and the other side's router lets in only packets from ports it has sent to, so punching can't work, and no peer linked to both could relay. Peerwire has no TURN server; a third peer that both can reach fixes it |
+| `Failure::Symmetric(Side)` | The NAT on that side (`Side::Ours`, `Side::Theirs` or `Side::Both`) is symmetric and the other side's router lets in only packets from ports it has sent to, so punching can't work, and no peer linked to both could relay. Peerwire runs no TURN server; a third peer that both can reach fixes it, and so does a TURN server of your own (`PathKind::Turn`) |
 
 `Status` (`Node::status`): `Disconnected` (not linked, not dialling), `Connecting` (the handshake is under way) or
 `Connected`.

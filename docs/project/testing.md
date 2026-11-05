@@ -207,6 +207,40 @@ both profiles first, about 5 minutes. With no Rust change since `origin/main`, t
   upgrades the link, redials it through a relay peer (`Replaced` at both ends) or closes it after 6 s; a STUN swap
   keeps the link. No policy leaves the 12x12 NAT matrix as it was, to the byte.
 
+### TURN (`crates/peerwire/tests/turn.rs`, `src/turn.rs`, `src/traversal.rs`, `peerwire-sim/tests/turn.rs`)
+
+- NB-099, client (against `peerwire_sim::turn`, a sans-IO TURN server): allocation after the 401 challenge; wrong
+  credentials refused and asked again after 5 s, then 10 s; refreshed at half its lifetime over 700 s; permissions
+  and channels carrying both ways (a Data indication, then ChannelData) and refreshed while wanted, gone 5 minutes
+  after; ChannelData on a channel not bound and Data from a peer not permitted dropped; a stale nonce taken; a
+  restarted server's allocation made again at a new address; requests retransmitted, then given up; a forged success
+  response ignored; REST credentials lasting their TTL; close releasing the allocation; no credentials in `Debug`;
+  STUN messages that aren't the client's (a Binding answer) left for STUN, what isn't STUN still dropped. NB99-2:
+  with 64 permissions and 64 channels held, a peer met later still gets through both ways; a channel number let go
+  bound again only 15 minutes on, freed once whether evicted, no longer wanted or unanswered; a peer's IPs its last
+  offer's.
+- Codec (`peerwire-core/src/stun/turn.rs`, feature `turn`): RFC 5769's request, response and long-term-credential
+  vectors; round trips of every method and class; ChannelData bounds; `fuzz_turn`.
+- Core (an address type whose bit `TR` goes through a relay server): a link at a relayed address punches off it
+  (guesses, sprays, openers too) and moves at both ends; follows the peer that moved; a direct link stays direct
+  (stragglers, races, observed addresses); nothing observed from a relayed address; `set_keep_turn`; no relaying
+  across one; a punch answered at one moves nothing; `retag`; `peer_of` reads an HS2's and a Data packet's receiver
+  index, not an HS1's.
+- Traversal: an observed address that is our relayed one isn't taken, and offers carry it only in their relayed
+  entry; a link at an address offered as relayed is retagged, before or after it comes up; a peer's relayed address
+  is dialled; `[Turn, Direct]` keeps a TURN link, `[Direct, Turn]` lets it punch; an allocation made is offered to
+  peers offered to before. NB99-1: a peer that names another's address as its relayed one moves none of that peer's
+  packets, under no policy, the default and `[Direct]`; NB99-I1: under `[Direct]` a link at a peer's relayed address
+  moves off it whichever came first, the link or the offer.
+- Loopback (a TURN server on UDP sockets of its own): a link through TURN alone (`path_kind` `Turn` at both ends);
+  `Turn` first keeping it there; `Direct` first moving it off TURN with `PathChanged` at both ends; `Turn` taken out
+  moving it; a dropped server closing it with `PathOff`; new credentials making a new allocation; no policy or no
+  servers changing nothing; nothing allocated under `Privacy::RelayOnly`; one server as both STUN and TURN (on this
+  host's own address, skipped with loopback only): the node's address learnt from it, and a link through it.
+- Simulator (`Sim::add_turn_server`, external nodes): two symmetric NATs with random ports link only through TURN;
+  two that can punch move from TURN to the direct path once `Direct` ranks first; a TURN server that is the only STUN
+  server too gives the NAT's mapping, and a link.
+
 ### peerwire-core over the simulator (`crates/peerwire-sim/tests/endpoint.rs`, `nat.rs`)
 
 - Handshake in one RTT; wrong identity fails; simultaneous open converges to one link; replayed handshake does

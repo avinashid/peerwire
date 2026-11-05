@@ -10,7 +10,7 @@ Peerwire is ahead only on the roadmap, the table says *planned*.
 | Runs natively / mobile | yes (Rust, C ABI, Godot; ESP32 prototype) | Node | Node | no | yes | no | Node, Bare |
 | Needs a server you run | **no** (uses public Nostr relays and STUN, which you can swap) | relay peers in practice | signaling server | PeerServer | bootstrap nodes | **no** | no (public DHT) |
 | Signaling | invite/QR, BroadcastChannel, Nostr, LAN multicast; DHT planned | relay peers | WebSocket server | PeerServer | DHT, rendezvous | Nostr, BitTorrent, MQTT, IPFS | DHT |
-| Hard NAT (symmetric/CGNAT) | hole punch + **peer relay**, no TURN | through relay peers | TURN needed | TURN needed | circuit relay v2 + DCUtR | TURN needed | hole punch + relay |
+| Hard NAT (symmetric/CGNAT) | hole punch + **peer relay**; your own TURN server optional | through relay peers | TURN needed | TURN needed | circuit relay v2 + DCUtR | TURN needed | hole punch + relay |
 | E2E encryption, authenticated peer IDs | yes (Noise IK, ID = public key) | opt-in (SEA) | transport only | transport only | yes (Noise/TLS) | transport only | yes (Noise) |
 | Unreliable / real-time lane | **yes** (unreliable, reliable, urgent) | no | no | via DataChannel options | stream-based | no | stream-based |
 | Game netcode (lockstep, islands, failover) | **yes** | no | no | no | no | no | no |

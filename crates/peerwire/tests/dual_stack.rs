@@ -66,10 +66,10 @@ fn one_dual_stack_socket_links_ipv4_and_ipv6_peers() {
     assert!(pump(&mut [&mut dual, &mut v4, &mut v6], &mut ev, all_up));
 
     // Each side sees the other at its plain address: IPv4 peers are not ::ffff:a.b.c.d.
-    assert_eq!(v4.path(&d), Some(&Path::Direct(at(&format!("127.0.0.1:{port}")))));
-    assert_eq!(v6.path(&d), Some(&Path::Direct(at(&format!("[::1]:{port}")))));
-    assert_eq!(dual.path(&i4), Some(&Path::Direct(v4.local_addr())));
-    assert_eq!(dual.path(&i6), Some(&Path::Direct(v6.local_addr())));
+    assert_eq!(v4.path(&d), Some(Path::Direct(at(&format!("127.0.0.1:{port}")))));
+    assert_eq!(v6.path(&d), Some(Path::Direct(at(&format!("[::1]:{port}")))));
+    assert_eq!(dual.path(&i4), Some(Path::Direct(v4.local_addr())));
+    assert_eq!(dual.path(&i6), Some(Path::Direct(v6.local_addr())));
 
     dual.send(&i4, Lane::Reliable, b"to v4").unwrap();
     dual.send(&i6, Lane::Reliable, b"to v6").unwrap();
@@ -114,7 +114,7 @@ fn two_dual_stack_nodes_link_on_whichever_family_answers_first() {
     let mut ev = Vec::new();
     assert!(pump(&mut [&mut a, &mut b], &mut ev, |ev| connected(&ev[0], ib) && connected(&ev[1], ia)));
     let offered = a.addresses();
-    assert!(matches!(b.path(&ia), Some(Path::Direct(p)) if offered.contains(p)), "{:?}", b.path(&ia));
+    assert!(matches!(b.path(&ia), Some(Path::Direct(p)) if offered.contains(&p)), "{:?}", b.path(&ia));
     a.send(&ib, Lane::Reliable, b"hi").unwrap();
     assert!(pump(&mut [&mut a, &mut b], &mut ev, |ev| got(&ev[1], ia, b"hi")));
 }

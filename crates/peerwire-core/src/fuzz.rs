@@ -330,6 +330,107 @@ fn fuzz_stun() {
     assert!(found > 0);
 }
 
+/// TURN's messages and ChannelData (stun.rs): what a client and server exchange, with and without
+/// MESSAGE-INTEGRITY and FINGERPRINT, mutated. Whatever parses rebuilds from its attributes to a message that
+/// parses the same, and verifies under one key only.
+#[cfg(feature = "turn")]
+#[test]
+fn fuzz_turn() {
+    use stun::{attr, method, Class, Message, MessageBuilder};
+    let key = stun::long_term_key("fuzz", "peerwire.test", "pass");
+    let methods = [
+        method::ALLOCATE,
+        method::REFRESH,
+        method::SEND,
+        method::DATA,
+        method::CREATE_PERMISSION,
+        method::CHANNEL_BIND,
+    ];
+    let classes = [Class::Request, Class::Indication, Class::Success, Class::Error];
+    let addrs = [attr::XOR_PEER_ADDRESS, attr::XOR_RELAYED_ADDRESS, attr::XOR_MAPPED_ADDRESS];
+    let (mut parsed, mut verified, mut channels) = (0, 0, 0);
+    run(
+        "turn",
+        cases(30_000),
+        |rng| {
+            if rng.one_in(4) {
+                let n = rng.below(40);
+                let mut b = stun::channel_data(0x4000 + rng.below(0x1000) as u16, &rng.bytes(n));
+                if rng.below(3) != 0 {
+                    mutate(rng, &mut b, 200);
+                }
+                return b;
+            }
+            let tx: stun::TxId = rng.bytes(12).try_into().unwrap();
+            let mut m = MessageBuilder::new(*rng.pick(&methods), *rng.pick(&classes), &tx);
+            for _ in 0..rng.below(6) {
+                m = match rng.below(8) {
+                    0 => m.xor_address(*rng.pick(&addrs), random_socket_addr(rng)),
+                    1 => m.u32(attr::LIFETIME, rng.edgy_u32()),
+                    2 => m.channel(rng.u32() as u16),
+                    3 => m.error(300 + rng.below(400) as u16),
+                    4 => {
+                        let n = rng.below(64);
+                        m.attr(attr::DATA, &rng.bytes(n))
+                    }
+                    5 => {
+                        let n = rng.below(40);
+                        m.attr(*rng.pick(&[attr::USERNAME, attr::REALM, attr::NONCE]), &rng.bytes(n))
+                    }
+                    6 => m.attr(attr::REQUESTED_TRANSPORT, &stun::TRANSPORT_UDP),
+                    _ => {
+                        let n = rng.below(12);
+                        m.attr(rng.u32() as u16, &rng.bytes(n))
+                    }
+                };
+            }
+            if rng.below(3) != 0 {
+                m = m.integrity(&key);
+            }
+            if rng.one_in(2) {
+                m = m.fingerprint();
+            }
+            let mut b = m.finish();
+            if rng.below(3) != 0 {
+                mutate(rng, &mut b, 600);
+            }
+            b
+        },
+        |b| {
+            if stun::is_stun(b) || stun::is_channel_data(b) {
+                assert!(wire::parse(b).is_none(), "TURN and Peerwire packets must not overlap");
+                assert!(!(stun::is_stun(b) && stun::is_channel_data(b)));
+            }
+            if let Some((ch, payload)) = stun::parse_channel_data(b) {
+                channels += 1;
+                assert!(stun::is_channel(ch) && payload.len() + 4 <= b.len() && b.len() < payload.len() + 8);
+                assert_eq!(stun::parse_channel_data(&stun::channel_data(ch, payload)), Some((ch, payload)));
+            }
+            let Some(m) = Message::parse(b) else { return };
+            parsed += 1;
+            let _ = (m.error_code(), m.lifetime(), m.channel(), m.unknown_required());
+            for t in addrs {
+                let _ = m.xor_address(t);
+            }
+            if m.verify(&key) {
+                verified += 1;
+                assert!(!m.verify(&stun::long_term_key("fuzz", "peerwire.test", "pasS")));
+            }
+            let kept: Vec<(u16, &[u8])> = m.attrs().filter(|a| a.0 != attr::MESSAGE_INTEGRITY).collect();
+            let mut again = MessageBuilder::new(m.method, m.class, &m.tx);
+            for (t, v) in &kept {
+                again = again.attr(*t, v);
+            }
+            let again = again.finish();
+            let p = Message::parse(&again).expect("a rebuilt message parses");
+            assert_eq!((p.method, p.class, p.tx), (m.method, m.class, m.tx));
+            assert_eq!(p.attrs().collect::<Vec<_>>(), kept);
+        },
+    );
+    println!("fuzz turn: {parsed} messages parsed, {verified} verified, {channels} ChannelData");
+    assert!(parsed > 0 && verified > 0 && channels > 0);
+}
+
 #[test]
 fn fuzz_invites() {
     let ids = identities(6);

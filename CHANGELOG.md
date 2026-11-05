@@ -15,6 +15,16 @@ and the commit that fixed it.
   off moves or closes with `DisconnectReason::PathOff`. `Node::set_stun_servers` and `Node::set_signaling` swap
   servers live, links kept. No policy behaves as before. `PathKind` is `#[non_exhaustive]`, and code that matches on
   `DisconnectReason` needs the new variant. See [choosing paths](docs/guides/connection-paths.md).
+- **TURN:** a TURN client over UDP (RFC 8656; feature `turn`, on by default): `Builder::turn_servers` and
+  `Node::set_turn_servers` (live) with a `TurnServer` (`new` for a username and password, `rest` for credentials
+  minted from a shared secret), and `PathKind::Turn` in the policy, which alone turns it on. A node offers its
+  relayed address in an entry older nodes skip, dials through its allocation, and moves a TURN link to a direct path
+  ranked earlier once a punch answers. `Node::turn_status` shows the allocations, `Node::path_kind` the kind of path
+  a link takes. Off under `Privacy::RelayOnly`; no policy behaves as before.
+- **Changed:** `Node::path` returns an owned `Option<Path>` (it was `Option<&Path>`): a link through TURN shows the
+  peer's address as relayed, and `Node::path_kind` says `Turn`. Drop a `.cloned()`, or compare with `Some(path)`.
+  `peerwire_core::Address` has more provided methods (`relayed`, `turn_hop`, `turn_parts`, `relayed_hop`), and
+  `Endpoint` has `set_keep_turn`, `retag` and `peer_of`.
 - **LAN discovery:** `LanSignaling` runs rooms over UDP multicast and broadcast on the local network, with no
   internet. Broadcast, to the LAN's broadcast address only, reaches devices that a router never gives multicast to,
   such as an ESP32 on Wi-Fi.

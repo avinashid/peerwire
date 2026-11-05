@@ -141,7 +141,7 @@ fn invite_join_dials_back_over_signaling() {
     let h = guest.connect(&invite).unwrap();
     let g = guest.peer_id();
     assert!(pump(&mut [&mut host, &mut guest], 5, |n| linked(n[0], g) && linked(n[1], h)));
-    assert_eq!(guest.path(&h), Some(&peerwire::Path::Direct(host.local_addr())));
+    assert_eq!(guest.path(&h), Some(peerwire::Path::Direct(host.local_addr())));
 
     // Without signaling the same invite gets nowhere.
     let mut alone = Node::bind("127.0.0.1:0").unwrap();
