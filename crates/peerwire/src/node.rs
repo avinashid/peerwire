@@ -6,8 +6,8 @@ use crate::turn::TurnServer;
 use crate::Event;
 use peerwire_core::Event as Ev;
 use peerwire_core::{
-    Config, ConnectError, DisconnectReason, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError,
-    Stats, Transmit,
+    Address, Config, ConnectError, DisconnectReason, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats,
+    SendError, Stats, Transmit,
 };
 use rand_core::{OsRng, RngCore};
 use std::collections::{HashMap, VecDeque};
@@ -211,7 +211,7 @@ impl Builder {
         let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let (local_addrs, stun) = (local_addresses(local).into_iter().map(Hop::Net).collect(), net(stun));
         let mut trav = Traversal::new(&identity, seed, unix_ms, local_addrs, stun);
-        trav.set_privacy(&mut ep, self.privacy);
+        trav.set_privacy(peerwire_core::Instant::ZERO, &mut ep, self.privacy);
         trav.set_policy(peerwire_core::Instant::ZERO, &mut ep, self.policy);
         #[cfg(feature = "turn")]
         trav.set_turn_servers(peerwire_core::Instant::ZERO, &mut ep, resolve_turn(&self.turn, local));
@@ -235,6 +235,8 @@ impl Builder {
             extra: HashMap::new(),
             routes: HashMap::new(),
             next_extra: 0,
+            #[cfg(any(test, feature = "testing"))]
+            sources: None,
         };
         node.sync_port_mapping();
         node.pump_signals();
@@ -268,6 +270,9 @@ pub struct Node {
     /// The extra socket that sends to an address: the first to hear from it.
     routes: HashMap<SocketAddr, u64>,
     next_extra: u64,
+    /// Where the datagrams the socket read came from, once a test asked ([`Node::note_sources`]).
+    #[cfg(any(test, feature = "testing"))]
+    sources: Option<std::collections::BTreeSet<SocketAddr>>,
 }
 
 /// An extra socket, opened for birthday punching.
@@ -352,7 +357,8 @@ impl Node {
     }
 
     /// An `pw:` invite with this node's [`addresses`](Node::addresses) (under
-    /// [`Privacy::RelayOnly`], none: its relay instead, for joiners linked to it).
+    /// [`Privacy::RelayOnly`], none: its relay instead, for joiners linked to it,
+    /// and with TURN on under it the relayed addresses of its allocations).
     /// It also carries this node's invite key: a holder may ask it, over
     /// signaling, to dial back. Share it with those you want to link with.
     pub fn invite(&self) -> String {
@@ -360,7 +366,12 @@ impl Node {
             Some(r) => self.ep.path(&r).and_then(|p| p.direct()).map(|a| (r, *a.addr())).into_iter().collect(),
             None => Vec::new(),
         };
-        Invite { peer: self.peer_id(), key: Some(self.trav.invite_key()), addrs: self.addresses(), relays }.to_link()
+        // Under relay-only with TURN on, the relayed addresses of its allocations, which a holder dials (NB-101).
+        let mut addrs = self.addresses();
+        if self.trav.turn_private() {
+            addrs.extend(self.trav.relayed_addrs().iter().map(|a| *a.addr()));
+        }
+        Invite { peer: self.peer_id(), key: Some(self.trav.invite_key()), addrs, relays }.to_link()
     }
 
     /// Which addresses this node gives out.
@@ -375,16 +386,25 @@ impl Node {
     /// to [`Privacy::RelayOnly`] closes their links (unless one is the relay it
     /// names), and switching out of it dials them again.
     ///
+    /// Under [`Privacy::RelayOnly`] with TURN on ([`set_turn_servers`](Node::set_turn_servers) and [`PathKind::Turn`]
+    /// in the policy), links to peers but the relay that show this node's address move onto its allocations or the
+    /// relay at once, or close with [`DisconnectReason::PathOff`] (and are dialled afresh through the relay, with
+    /// no allocation to go through). Those closes, and relay peers', send the peer nothing from the socket: it times
+    /// the link out. From then on nothing to them leaves the socket, but from a dial already under way that neither
+    /// an allocation nor the relay can take, which runs on to its end.
+    ///
     /// With [`Builder::port_mapping`] on, switching to [`Privacy::RelayOnly`]
     /// removes the router mapping (in the background), and switching out of it
     /// asks the router again; that waits, like dropping the node, up to 7 s for
     /// the last mapping's removal if the router stalls.
     pub fn set_privacy(&mut self, privacy: Privacy) {
-        self.trav.set_privacy(&mut self.ep, privacy);
+        let now = self.now();
+        self.trav.set_privacy(now, &mut self.ep, privacy);
         if matches!(privacy, Privacy::RelayOnly { .. }) {
             let own = self.trav.relay();
             for r in self.relay_peers.iter().filter(|r| Some(r.peer) != own) {
-                self.ep.disconnect(&r.peer);
+                // Unannounced if a Close would show this node's address (NB101-I1).
+                self.trav.hang_up(&mut self.ep, &r.peer);
                 self.status.remove(&r.peer);
             }
         }
@@ -474,10 +494,15 @@ impl Node {
 
     /// Replaces this node's own TURN servers ([`Builder::turn_servers`]; empty: none); names are resolved now.
     ///
-    /// TURN runs only with [`PathKind::Turn`] in the [policy](Node::set_policy), and not under
-    /// [`Privacy::RelayOnly`]. Then this node keeps an allocation on each server, offers its relayed address to
-    /// peers (in an entry nodes without TURN skip), and a dial's `Turn` step goes through it. A link on TURN moves
-    /// to a `Direct` or `Birthday` path the policy ranks earlier once one answers, never to a relay peer.
+    /// TURN runs only with [`PathKind::Turn`] in the [policy](Node::set_policy). Then this node keeps an allocation on
+    /// each server, offers its relayed address to peers (in an entry nodes without TURN skip), and a dial's `Turn`
+    /// step goes through it. A link on TURN moves to a `Direct` or `Birthday` path the policy ranks earlier once one
+    /// answers, never to a relay peer.
+    ///
+    /// Under [`Privacy::RelayOnly`] TURN hides this node's address as its relay does: links to peers but the relay go
+    /// only through its allocations and the relay, its offers to them carry the relayed address alone, and a link
+    /// through an allocation that is gone moves to the relay or closes with [`DisconnectReason::PathOff`], never onto
+    /// this node's socket. See [`Privacy::RelayOnly`].
     ///
     /// An allocation stays on a server kept with the same credentials; the others are released, and links through
     /// them move to a path the policy allows, or close with [`DisconnectReason::PathOff`]. New credentials for a
@@ -544,7 +569,10 @@ impl Node {
     ///
     /// Under [`Privacy::RelayOnly`] it dials through the relay only (the relay
     /// itself directly), and fails with [`ConnectError::NoRelay`] while no relay
-    /// is connected: it never falls back to a direct path.
+    /// is connected: it never falls back to a direct path. With TURN on under it
+    /// ([`set_turn_servers`](Node::set_turn_servers)), it dials through the relay
+    /// and this node's own allocations, in the policy's order, and fails with
+    /// [`ConnectError::NoPath`] while neither is up.
     ///
     /// Under a [`Policy`] it dials the paths the policy allows, step by step, and
     /// fails with [`ConnectError::NoPath`] if none has anything to dial.
@@ -559,15 +587,17 @@ impl Node {
                 targets.extend(Some(addr).filter(reaches).map(direct));
             }
         }
-        let relay = self.trav.relay();
-        if matches!(self.privacy(), Privacy::RelayOnly { .. }) && relay != Some(inv.peer) && inv.peer != self.peer_id()
-        {
+        let (relay, relay_only) = (self.trav.relay(), matches!(self.privacy(), Privacy::RelayOnly { .. }));
+        let hidden = relay_only && relay != Some(inv.peer) && inv.peer != self.peer_id();
+        if hidden && !self.trav.turn_private() {
             let r = relay.filter(|r| self.ep.is_connected(r)).ok_or(Error::Connect(ConnectError::NoRelay))?;
             targets = vec![Path::Via(r)];
         }
         let now = self.now();
-        let relay_only = matches!(self.privacy(), Privacy::RelayOnly { .. });
-        if self.trav.policy().is_some() && !relay_only && !self.is_relay_peer(&inv.peer) {
+        // With TURN under relay-only, step by step through the relay and this node's allocations (NB-101), a relay
+        // peer too: dialled directly, it would see this node's address (NB101-1).
+        let stepped = !relay_only || (hidden && self.trav.turn_private());
+        if self.trav.policy().is_some() && stepped && (hidden || !self.is_relay_peer(&inv.peer)) {
             let (mut addrs, mut vias) = (Vec::new(), Vec::new());
             for t in targets {
                 match t {
@@ -801,6 +831,10 @@ impl Node {
                 Ok((n, from)) => {
                     // A dual-stack socket sees IPv4 peers as ::ffff:a.b.c.d.
                     let from = Hop::Net(SocketAddr::new(from.ip().to_canonical(), from.port()));
+                    #[cfg(any(test, feature = "testing"))]
+                    if let Some(s) = self.sources.as_mut() {
+                        s.insert(*from.addr());
+                    }
                     // From a TURN server of ours: what a peer sent through it, or its answers to TURN requests (its
                     // Binding answers, as a STUN server of ours too, go on to STUN).
                     match self.trav.handle_turn(now, &from, &self.buf[..n]) {
@@ -848,8 +882,8 @@ impl Node {
             match e {
                 Ev::AddrObserved { .. } | Ev::Disconnected { reason: DisconnectReason::Replaced, .. } => held.push(e),
                 // In a room, a link from a peer that never proved the room key, a relay-only node's new direct link
-                // to anyone but its relay, or a link on a path the policy has off: closed unseen, with what came in
-                // with it. A link it replaced was closed for its path (NB97-I1).
+                // to anyone but its relay (but through its own TURN allocation), or a link on a path the policy has
+                // off: closed unseen, with what came in with it. A link it replaced was closed for its path (NB97-I1).
                 Ev::Connected { peer, .. } if !self.admits(&peer, &e) => {
                     for h in std::mem::take(&mut held) {
                         match h {
@@ -960,6 +994,21 @@ impl Node {
         }
     }
 
+    /// Starts noting where the datagrams this node's socket reads come from, forgetting those noted so far: a test's
+    /// view of the socket (feature `testing`). Not for apps.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn note_sources(&mut self) {
+        self.sources = Some(Default::default());
+    }
+
+    /// The sources of the datagrams the socket read since [`note_sources`](Node::note_sources) (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn sources(&self) -> Vec<SocketAddr> {
+        self.sources.iter().flatten().copied().collect()
+    }
+
     /// The UDP socket, for hosts that wait on its readiness (it is non-blocking).
     /// While a birthday punch keeps extra sockets open (see
     /// [`Traversal::poll_birthday`]), [`next_timeout`](Node::next_timeout) is at most
@@ -999,7 +1048,8 @@ impl Node {
 
     /// Whether an event about a not yet connected `peer` belongs (see `poll_drained`).
     fn admits(&self, peer: &PeerId, e: &Ev<Addr>) -> bool {
-        let direct = matches!(e, Ev::Connected { path: Path::Direct(_), .. });
+        // Through its own TURN allocation, a relay-only node's address is hidden as through its relay (NB-101).
+        let direct = matches!(e, Ev::Connected { path: Path::Direct(a), .. } if !a.own_turn());
         let relay_only = matches!(self.privacy(), Privacy::RelayOnly { .. });
         let allowed = match e {
             Ev::Connected { path, .. } => self.trav.allows(peer, path),

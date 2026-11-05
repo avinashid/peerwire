@@ -53,14 +53,19 @@ Two details differ:
 | Every path, fastest first | no policy (or `fallback: 'auto'`) | no policy |
 | No other member carries your packets | `['direct', 'turn']` (`fallback: 'off'`) | `[Direct, Birthday, RelayPeers]` |
 | TURN only when nothing free works | `['direct', 'peers', 'signaling', 'turn']` | `[Direct, Birthday, Peers, Turn]` |
-| Peers never see your IP address | `['turn']`, with your TURN server | `Privacy::RelayOnly`, not a policy |
+| Peers never see your IP address | `['turn']`, with your TURN server | `[Turn]` under `Privacy::RelayOnly`, with your TURN server (or `RelayOnly` alone, through a relay) |
 | Your own relay first, direct only if it fails | not available | `[RelayPeers, Direct, Birthday]` |
 | Only direct links, nothing relayed | `['direct']` | `[Direct, Birthday]` |
 
 With `['turn']` alone, WebRTC offers relay candidates only (`iceTransportPolicy: 'relay'`), so no address of yours
 reaches the peer; the TURN server still sees it. A Rust policy chooses the paths links take, not the addresses a node
 gives out: under `[RelayPeers]` its offers still carry its addresses. To hide them, use `Privacy::RelayOnly`, which
-links through one relay (see [privacy](privacy.md)).
+links through one relay (see [privacy](privacy.md)). With your TURN server and `Turn` in the policy, `RelayOnly` links
+through your allocations too, as `['turn']` does: offers carry the relayed address alone, and nothing to a peer but
+the relay leaves the node's socket. The exception is a dial already under way when relay-only comes on, if neither
+an allocation nor the relay can take it: it runs on to its end, at addresses the peer had from earlier offers, and a
+link it makes is refused. A dial takes `Turn` and `RelayPeers` (the relay) in the policy's order, `RelayPeers` last
+if left out, and a link moves between them only when its allocation goes.
 
 ## Bring your own servers
 
@@ -130,9 +135,9 @@ way: links stay up, and the node says hello on the new one. `set_policy(None)` g
 
 ## Limits
 
-- Rust's TURN client speaks UDP only (no `turns:` over TCP or TLS), is off under `Privacy::RelayOnly`, and doesn't
-  move a TURN link to a relay peer. New credentials for a server make a new allocation, at a new relayed address,
-  so its links move or close as when a server is dropped.
+- Rust's TURN client speaks UDP only (no `turns:` over TCP or TLS), and doesn't move a TURN link to a relay peer
+  (under `Privacy::RelayOnly`, only once its allocation is gone). New credentials for a server make a new
+  allocation, at a new relayed address, so its links move or close as when a server is dropped.
 - The `'signaling'` path is JavaScript's; a Rust node uses signalling to meet peers, not to carry a link.
 - After a link moves off a member, the peer can still send through that member for a while: the core takes relayed
   packets from any member that forwards them.

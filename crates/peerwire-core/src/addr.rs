@@ -49,6 +49,13 @@ pub trait Address: Clone + Eq + Hash + Debug {
     fn turn_parts(&self) -> Option<(Self, SocketAddr)> {
         None
     }
+    /// Whether this is a [`turn_hop`](Address::turn_hop): packets to it leave through the host's own allocation, so
+    /// the peer sees the TURN server's relayed address, never the host's. A relay-only endpoint
+    /// ([`Endpoint::set_relay_only`](crate::Endpoint::set_relay_only)) takes such a path as it takes a relay peer.
+    /// `false`, the default, for a host without TURN.
+    fn own_turn(&self) -> bool {
+        false
+    }
     /// For a host with TURN: `addr`, a peer's relayed address (on its TURN server), which this host sends to from
     /// its own socket; [`relayed`](Address::relayed). `None`, the default, for a host without.
     fn relayed_hop(_addr: &Self) -> Option<Self> {

@@ -144,8 +144,8 @@ impl World {
     }
 
     fn set_privacy(&mut self, p: usize, privacy: Privacy) {
-        let ep = &mut self.sim.nodes[self.peers[p].node].endpoint;
-        self.peers[p].trav.set_privacy(ep, privacy);
+        let (now, ep) = (self.sim.now, &mut self.sim.nodes[self.peers[p].node].endpoint);
+        self.peers[p].trav.set_privacy(now, ep, privacy);
     }
 
     fn set_policy(&mut self, p: usize, policy: Option<Policy>) {

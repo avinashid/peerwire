@@ -617,6 +617,19 @@ gives out. Changing it affects the next invites and offers; links already up kee
     when relay-only is turned on) drops its direct targets and ignores an answer at the endpoint's own address. A
     direct dial later given a relay keeps its direct targets. A direct handshake is answered only from a peer it
     is itself dialling directly or already has a direct link with. It sends no OBSERVED frames or origin tags.
+  - With TURN servers and `PathKind::Turn` in the policy (NB-101), links also go through the node's own
+    allocations, which show peers the TURN server's address. Offers to peers but the relay carry the relayed
+    address alone (the relay gets none: it links directly), and a dial takes `Turn` and the relay in the policy's
+    order, through the allocations only. The endpoint takes a path through its own allocation
+    (`Address::own_turn`) as a relay: a dial given one goes through those alone, a handshake through one is
+    answered, and a link on one drops what the peer sends from anywhere else. Turning relay-only on puts a link that
+    shows the node's address onto an allocation at once (`Endpoint::retag`), at the same address if one relays
+    there, else at another of the peer's, and dials it again through the allocations and the relay. With no
+    allocation to go through, the link closes unannounced (`Endpoint::abandon`: no Close leaves the socket, and the
+    peer times it out) and is dialled afresh through the relay; relay peers' links close the same way. A link whose
+    allocation goes moves to the relay or closes. Nothing to a peer but the relay leaves the node's socket, except
+    from a dial already under way when relay-only came on that neither an allocation nor the relay can take: it
+    runs on to its end, at addresses the peer had from earlier offers, and a link it makes is refused.
   - It sends its relayed packets in `FWD_QUIET` frames: the relay forwards them in `RELAYED` frames with no
     origin address. (`FWD` asks the relay to say where it sees the sender, so that the far end can punch.) A
     build older than `FWD_QUIET` takes frame type 11 as a protocol violation and drops the link. In the same way

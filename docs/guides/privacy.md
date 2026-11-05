@@ -35,6 +35,12 @@ fn main() -> std::io::Result<()> {
 first member that proves the host role and is dialled. With no relay linked, `connect` fails with
 `ConnectError::NoRelay` rather than going direct.
 
+With your own TURN server and `PathKind::Turn` in the policy (feature `turn`), relay-only goes through your
+allocations too, and needs no relay: peers see the TURN server's address, never yours, and `connect` dials through
+an allocation (failing with `ConnectError::NoPath` while neither an allocation nor the relay is up). Turning
+relay-only on moves the links that show your address onto an allocation or the relay at once, or closes them. See
+[choosing paths](connection-paths.md).
+
 ### Godot
 
 `peer.set_privacy_mode(PRIVACY_PUBLIC_ONLY)`, or `PRIVACY_DIRECT`, `PRIVACY_RELAY_ONLY`. In Godot every player links
