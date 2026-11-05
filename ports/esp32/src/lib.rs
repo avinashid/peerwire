@@ -247,3 +247,8 @@ pub fn free_heap() -> u32 {
 pub fn idle(node: &Node) {
     std::thread::sleep(node.next_timeout().unwrap_or(IDLE_MAX).min(IDLE_MAX));
 }
+
+// The README's sample is a doc test too (`cargo test --doc` for the chip's target).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

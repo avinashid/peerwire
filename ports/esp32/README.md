@@ -22,14 +22,14 @@ identity each boot.
 ```sh
 cargo generate --git https://github.com/avinashid/peerwire templates/esp32
 cd my-board
-cargo run --release      # builds, flashes the board on USB and opens its log
+./flash.sh               # builds, flashes the board on USB and opens its log
 ```
 
 The template asks for the chip, your Wi-Fi and a room. The
 [ESP32 guide](https://avinashid.github.io/peerwire/docs/guides/esp32) has the toolchain,
 every step, and how to talk to the board from a PC.
 
-```rust
+```rust,no_run
 use peerwire_esp::peerwire::{Event, Lane};
 
 fn main() {
