@@ -10,8 +10,8 @@ description = "Peerwire on the ESP32-C3 and ESP32 under ESP-IDF: Wi-Fi, a clock 
 readme = "README.md"
 keywords = ["esp32", "esp-idf", "embedded", "p2p", "iot"]
 categories = ["embedded", "network-programming"]
-rust-version = "1.82"
-include = ["/src", "/examples", "/build.rs", "/README.md", "/sdkconfig.defaults"]
+rust-version = "1.88"
+include = ["/src", "/examples", "/build.rs", "/README.md", "/sdkconfig.defaults", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 # Not a member of the repo's workspace: it builds for the ESP32-C3 and ESP32 only, with their own toolchains (see README.md).
 [workspace]
