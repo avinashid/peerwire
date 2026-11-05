@@ -6,6 +6,15 @@ versioning](https://semver.org); before 1.0, a minor version may break the API.
 Every security finding behind a fix below is in the [threat model](docs/project/threat-model.md), with its severity
 and the commit that fixed it.
 
+## Unreleased
+
+- **The doctor:** `npx @peerwire/js doctor` (a `bin` in `@peerwire/js`) and the Rust example `doctor`, which
+  replaces `natcheck`, report what a network does to peer-to-peer traffic: NAT mapping over IPv4 and IPv6,
+  filtering (RFC 5780, `--stun5780`), router port mapping (Rust) and whether each Nostr relay and the LAN carrier
+  (Rust) work, as text or `--json`, with `--redact` to mask public addresses. Nothing is uploaded. The doctor's
+  `room` run reads `DOCTOR_PORT`, as natcheck's read `NATCHECK_PORT`. Results from real networks go in
+  [Connectivity in the field](docs/project/field-connectivity.md).
+
 ## peerwire-esp 0.1.1 (2026-11-05)
 
 On crates.io; the ESP32 template's `peerwire-esp = "0.1"` takes it in a new project.

@@ -7,6 +7,7 @@
   "type": "module",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
+  "bin": { "peerwire": "bin/peerwire.js" },
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
@@ -15,7 +16,7 @@
     "./peerwire_ffi.wasm": "./pkg/peerwire_ffi.wasm",
     "./package.json": "./package.json"
   },
-  "files": ["src", "pkg/peerwire_ffi.wasm"],
+  "files": ["src", "bin", "pkg/peerwire_ffi.wasm"],
   "sideEffects": false,
   "engines": { "node": ">=20" },
   "keywords": ["p2p", "webrtc", "multiplayer", "nostr", "wasm", "rooms"],

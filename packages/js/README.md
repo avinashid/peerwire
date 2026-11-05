@@ -62,6 +62,14 @@ page: `<script type="importmap">{"imports":{"@peerwire/js":"/path/to/packages/js
 - [All the docs](https://avinashid.github.io/peerwire/docs/README.html) and the
   [source](https://github.com/avinashid/peerwire)
 
+## Checking a network
+
+`npx @peerwire/js doctor` prints what the network it runs on does to peer-to-peer traffic: the NAT's mapping over
+IPv4 and IPv6, and whether each Nostr relay works. Nothing is uploaded; `--redact` masks your public IP addresses
+before you paste the report anywhere, and `--json` prints it as JSON.
+[Connectivity in the field](https://avinashid.github.io/peerwire/docs/project/field-connectivity.html) explains
+each result.
+
 ## From source
 
 ```sh

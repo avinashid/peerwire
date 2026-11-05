@@ -1012,6 +1012,21 @@ interface Transport {
 | `natFromSdp(sdp)` | `{ type: 'symmetric' \| 'cone' \| 'unknown', ip?, next?, step? }`: the NAT as the server-reflexive candidates show it, with a prediction for a sequential symmetric one. |
 | `predictedCandidates(nat, sdpMid?)` | ICE candidates at the ports around a peer's prediction, for `addIceCandidate`; `[]` unless it is a public IPv4 address and ports in range. |
 
+## Command line: doctor
+
+```sh
+npx @peerwire/js doctor [--json] [--redact] [--stun host:port]... [--stun5780 host:port] [--relay url]...
+```
+
+Prints what the network it runs on does to peer-to-peer traffic, from Node: the NAT's mapping over IPv4 and IPv6
+(STUN to Google's and Cloudflare's servers), its filtering (the RFC 5780 test, against a server named with
+`--stun5780`), and whether each Nostr relay takes connections and forwards a room hello. Nothing is uploaded: the
+report goes to stdout and progress to stderr. `--redact` masks public IP addresses, `--json` prints the report as
+JSON, and `--stun` and `--relay` (each repeatable) replace the default servers. Router port mapping and the LAN
+carrier aren't in this package and Node has no WebRTC, so the first two say `not-available`; the Rust doctor
+(`cargo run -p peerwire --features nostr --example doctor`) checks them. [Connectivity in the
+field](../project/field-connectivity.md) explains each result.
+
 ## Source files and demos
 
 | File | What it is |
@@ -1032,6 +1047,7 @@ interface Transport {
 | `src/nostr.js` | `NostrSignaling` over public relays: ephemeral events, a throwaway key per session, payloads sealed to the recipient's PeerId. |
 | `src/local.js` | `LocalTransport`: datagrams over the BroadcastChannel, for Node and tests. |
 | `src/index.d.ts` | TypeScript types. |
+| `bin/peerwire.js`, `bin/doctor.js` | The `peerwire` command (`npx @peerwire/js doctor`): the network report, in Node. |
 
 The demos are in `packages/js/demo/`: build the wasm with `packages/js/build.sh`, then serve `packages/js` with any
 static server (`python3 -m http.server -d packages/js 8000`).
@@ -1084,6 +1100,8 @@ Those marked (Chromium) open headless browser tabs on loopback. None touches a p
   without trickle a lost first offer or answer still links (in about 3.2 s).
 - `nat_predict.mjs`: NAT type and prediction from server-reflexive candidates, the 32 predicted candidates, and a
   peer's prediction refused unless it is an IPv4 address and ports in range.
+- `doctor.mjs`: the doctor command against loopback fixtures (STUN servers, an RFC 5780 server, a ws:// relay of
+  its own): the NAT verdicts, the filtering test, `--redact`, `--json`, bad usage.
 - `ice_restart.mjs` (Chromium): ICE restarts by either side keep the DataChannel; the 2 s grace, `failed` at once,
   at most 3 a minute; `networkChanged()`.
 - `restart_budget.mjs`: a peer can't keep us publishing to the signalling relays: 3 restarts, 6 answers to 200 copies

@@ -95,6 +95,7 @@ NODE=(
   "node room retry|node packages/js/test/room_retry.mjs"
   "node retry backoff|node packages/js/test/retry_backoff.mjs"
   "node nat prediction|node packages/js/test/nat_predict.mjs"
+  "node doctor|node packages/js/test/doctor.mjs"
   "node late ice|node packages/js/test/late_ice.mjs"
   "node restart budget|node packages/js/test/restart_budget.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"

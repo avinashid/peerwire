@@ -91,6 +91,7 @@ jobs:
       - run: node packages/js/test/room_same_nat.mjs
       - run: node packages/js/test/room_policy.mjs
       - run: node packages/js/test/nat_predict.mjs
+      - run: node packages/js/test/doctor.mjs
       - run: node packages/js/test/late_ice.mjs
       - run: node packages/js/test/birthday.mjs
       - name: '@peerwire/react: install, build, types'
