@@ -116,7 +116,7 @@ const PREDICTION_TAG: [u8; 2] = [0xfe, 1];
 const MAPPING_TAG: [u8; 2] = [0xfe, 2];
 /// Starts an entry holding a relayed address of the sender's (its TURN allocation's, NB-099), skipped the same way.
 const RELAYED_TAG: [u8; 2] = [0xfe, 3];
-/// Relayed addresses an offer carries, and peers' relayed addresses remembered.
+/// Relayed addresses an offer carries, and peers' claims to relayed addresses remembered.
 const MAX_RELAYED: usize = 2;
 const MAX_RELAYED_OF: usize = 256;
 /// Paths through TURN a dial takes at most.
@@ -678,8 +678,9 @@ pub struct Traversal<A: Address> {
     turn: TurnSet<A>,
     /// The privacy changed: TURN starts or stops at the next timer, at once.
     turn_stale: bool,
-    /// Peers' relayed addresses, from their offers: what comes from one is from a [relayed hop](Address::relayed_hop).
-    relayed_of: HashMap<A, PeerId>,
+    /// Peers' relayed addresses, from their offers, and the peers that named each: what one of them sends from there is
+    /// from a [relayed hop](Address::relayed_hop). A later claim to an address leaves the earlier ones (NB-100).
+    relayed_of: HashMap<A, Vec<PeerId>>,
     sockets: VecDeque<Birthday<A>>,
     transmits: VecDeque<Transmit<A>>,
     signals: VecDeque<Signal>,
@@ -911,7 +912,7 @@ impl<A: Address> Traversal<A> {
             return true;
         }
         match path {
-            Path::Direct(a) if a.relayed() || self.relayed_of.get(a) == Some(peer) => p.allows(PathKind::Turn),
+            Path::Direct(a) if a.relayed() || self.claimed(a, peer) => p.allows(PathKind::Turn),
             Path::Direct(_) => p.allows(PathKind::Direct) || p.allows(PathKind::Birthday),
             Path::Via(r) => p.allows(self.relay_kind(r)),
         }
@@ -1220,7 +1221,7 @@ impl<A: Address> Traversal<A> {
     /// reached the link at before the offer did, the endpoint takes it as one ([`Endpoint::retag`]).
     fn retag(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: &PeerId, path: &Path<A>) {
         let Path::Direct(at) = path else { return };
-        if self.relayed_of.get(at) == Some(peer) {
+        if self.claimed(at, peer) {
             if let Some(hop) = A::relayed_hop(at) {
                 ep.retag(now, peer, at, hop);
             }
@@ -1277,7 +1278,10 @@ impl<A: Address> Traversal<A> {
         }
         self.remotes.retain(|p, r| now - r.seen_at < FORGET || ep.is_connected(p));
         let remotes = &self.remotes;
-        self.relayed_of.retain(|_, p| remotes.contains_key(p));
+        for peers in self.relayed_of.values_mut() {
+            peers.retain(|p| remotes.contains_key(p));
+        }
+        self.relayed_of.retain(|_, peers| !peers.is_empty());
         self.turn.retain_peers(|p| remotes.contains_key(p));
         self.nonces.retain(|_, t| now - *t < Duration::from_millis(2 * FRESH_MS));
         self.punch_ips.retain(|_, times| {
@@ -1789,13 +1793,20 @@ impl<A: Address> Traversal<A> {
     /// The address the endpoint takes `data`, which the socket got from `from`, to be from: a [relayed
     /// hop](Address::relayed_hop) if `from` is a relayed address a peer offered and `data` names that peer's link or
     /// dial ([`Endpoint::peer_of`]); else `from`. Another peer's packets from there stay as they are, whoever claims
-    /// the address (NB99-1). A handshake's first message names no link: one it makes there is retagged when it comes
-    /// up.
+    /// the address (NB99-1), and a later claim leaves the earlier claimant's packets relayed (NB-100). A handshake's
+    /// first message names no link: one it makes there is retagged when it comes up.
     pub fn hop(&self, ep: &Endpoint<A>, from: A, data: &[u8]) -> A {
         match self.relayed_of.get(&from) {
-            Some(p) if ep.peer_of(data) == Some(*p) => A::relayed_hop(&from).unwrap_or(from),
+            Some(peers) if ep.peer_of(data).is_some_and(|p| peers.contains(&p)) => {
+                A::relayed_hop(&from).unwrap_or(from)
+            }
             _ => from,
         }
+    }
+
+    /// Whether `peer` offered `a` as a relayed address of its own, in its last offer acted on.
+    fn claimed(&self, a: &A, peer: &PeerId) -> bool {
+        self.relayed_of.get(a).is_some_and(|peers| peers.contains(peer))
     }
 
     /// The paths through TURN to a peer at `addrs` with relayed addresses `relayed`: those, from this node's socket,
@@ -1940,11 +1951,20 @@ impl<A: Address> Traversal<A> {
             r.addrs.clone_from(&addrs);
             r.relayed.clone_from(&o.relayed);
         }
-        // What comes from its relayed addresses is from them; and it may send through our allocations.
-        self.relayed_of.retain(|_, p| *p != from);
+        // What it sends from its relayed addresses is from them; and it may send through our allocations. Its claims
+        // replace its earlier ones, and leave other peers' to the same address (NB-100).
+        for peers in self.relayed_of.values_mut() {
+            peers.retain(|p| *p != from);
+        }
+        self.relayed_of.retain(|_, peers| !peers.is_empty());
+        let mut held: usize = self.relayed_of.values().map(Vec::len).sum();
         for a in o.relayed.iter().take(MAX_RELAYED) {
-            if self.relayed_of.len() < MAX_RELAYED_OF {
-                self.relayed_of.insert(a.clone(), from);
+            if held < MAX_RELAYED_OF {
+                let peers = self.relayed_of.entry(a.clone()).or_default();
+                if !peers.contains(&from) {
+                    peers.push(from);
+                    held += 1;
+                }
             }
             // Linked there before this offer said what it is (its dial through its allocation came first): a link
             // through TURN now, which the policy may have off (NB99-I1).
@@ -4609,6 +4629,54 @@ mod tests {
         dialler.connect(now, Hop::Net(a_at), a).unwrap();
         let hs1 = dialler.poll_transmit(now).unwrap().payload;
         assert_eq!(ta.hop(&ea, Hop::Net(r), &hs1), Hop::Net(r), "an HS1 names no link");
+    }
+
+    /// NB-100 (NB99-I2): m (`id(3)`) names a's relayed address too, after a's offer did. a's packets from there are
+    /// still relayed, and a new link a makes from there is retagged when it comes up (unfixed: m's claim displaced
+    /// a's, so both came in as from a network address). a's next offer, without the address, takes its claim back,
+    /// and m's stays. Claims in all stay at most `MAX_RELAYED_OF`.
+    #[cfg(feature = "turn")]
+    #[test]
+    fn a_later_claim_leaves_the_first_claimants_address() {
+        let (r, b): (SocketAddr, SocketAddr) = (R.parse().unwrap(), "203.0.113.2:7000".parse().unwrap());
+        let (a, m, now) = (id(1).peer_id(), id(3).peer_id(), Instant::from_millis(500));
+        let [mut ea, mut eb] = hop_link(Hop::Net(r), Hop::Net(b));
+        let mut tb = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
+        tb.on_offer(now, &mut eb, a, hop_offer(&tb, now, &[], &[R]));
+        tb.on_offer(now, &mut eb, m, hop_offer(&tb, now + Duration::from_millis(1), &[], &[R]));
+        assert_eq!(eb.path(&a), Some(&Path::Direct(Hop::Relayed(r))));
+        ea.send(&id(2).peer_id(), peerwire_core::Lane::Reliable, b"from r").unwrap();
+        let data = ea.poll_transmit(now).unwrap().payload;
+        assert_eq!(tb.hop(&eb, Hop::Net(r), &data), Hop::Relayed(r), "still the first claimant's own");
+        let [_, mut fresh] = hop_link(Hop::Net(r), Hop::Net(b));
+        let up = std::iter::from_fn(|| fresh.poll_event()).find(|e| matches!(e, Event::Connected { .. })).unwrap();
+        tb.handle_event(now, &mut fresh, &up);
+        assert_eq!(fresh.path(&a), Some(&Path::Direct(Hop::Relayed(r))), "a new link from there, retagged");
+        tb.on_offer(now, &mut eb, a, hop_offer(&tb, now + Duration::from_millis(2), &[], &[]));
+        assert_eq!(tb.hop(&eb, Hop::Net(r), &data), Hop::Net(r), "taken back by its next offer");
+        assert!(tb.claimed(&Hop::Net(r), &m) && !tb.claimed(&Hop::Net(r), &a));
+
+        let mut t = Traversal::new(&id(2), [5; 32], 1_700_000_000_000, vec![Hop::Net(b)], vec![]);
+        let mut e = Endpoint::new(&id(2), Config::default(), [6; 32]);
+        // Peer `i` names `n` relayed addresses of its own: how many of them it holds a claim to.
+        let claim = |t: &mut Traversal<Hop<SocketAddr>>, e: &mut Endpoint<Hop<SocketAddr>>, i: u8, n, at| {
+            let p = id(10 + i).peer_id();
+            t.remotes.entry(p).or_default().invited = true; // past the node's offer budget
+            let own: Vec<String> = (1..=n).map(|port| format!("198.51.100.{i}:{port}")).collect();
+            t.on_offer(at, e, p, hop_offer(t, at, &[], &own.iter().map(String::as_str).collect::<Vec<_>>()));
+            own.iter().filter(|a| t.claimed(&Hop::Net(a.parse().unwrap()), &p)).count()
+        };
+        let ms = |i: u8| now + Duration::from_millis(u64::from(i));
+        assert_eq!(claim(&mut t, &mut e, 0, 1, ms(0)), 1);
+        let full = (MAX_RELAYED_OF / MAX_RELAYED) as u8; // then 2 each, to MAX_RELAYED_OF - 1
+        for i in 1..full {
+            assert_eq!(claim(&mut t, &mut e, i, 2, ms(i)), 2, "claim {i}");
+        }
+        assert_eq!(claim(&mut t, &mut e, full, 2, ms(full)), 1, "the last one left");
+        assert_eq!(claim(&mut t, &mut e, full + 1, 2, ms(full + 1)), 0, "past MAX_RELAYED_OF");
+        let later = now + Duration::from_secs(2);
+        t.on_offer(later, &mut e, id(11).peer_id(), hop_offer(&t, later, &[], &[]));
+        assert_eq!(claim(&mut t, &mut e, full + 1, 2, later), 2, "once a peer's claims are taken back");
     }
 
     /// NB-099: under `[Turn, Direct]` a link at a relayed address is kept there, by the endpoint too: given a direct
