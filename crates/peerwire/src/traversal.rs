@@ -1729,8 +1729,9 @@ impl<A: Address> Traversal<A> {
     /// to the address it is at if one relays there, else to another of the peer's (NB101-I1), so nothing more of it
     /// leaves the socket, and is dialled again through the allocations and the relay ([`Endpoint::redial`]), as the
     /// peer still sends to the socket; one a policy change is moving already keeps that dial (NB101-I2). With no
-    /// allocation to go through, it is closed unannounced and dialled afresh through the relay, if one is linked. A
-    /// link with nowhere to go, or whose move fails or hasn't happened in 6 s, is closed
+    /// allocation to go through, it is closed unannounced and dialled through the relay, if one is linked: afresh, or,
+    /// for one a policy change is moving, by the relay joining that move's dial ([`Endpoint::connect_with`]). A link
+    /// with nowhere to go, or whose move fails or hasn't happened in 6 s, is closed
     /// ([`poll_dropped`](Traversal::poll_dropped)): never moved to a path that shows this node's address.
     fn hide(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: PeerId) {
         let Some(path) = ep.path(&peer).cloned() else { return };
