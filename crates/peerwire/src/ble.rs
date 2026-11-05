@@ -2278,6 +2278,28 @@ mod tests {
         }
     }
 
+    /// NB110-T1: with all but one of its connections open, and bound (so its unbound ones are free), a node starts one
+    /// connect, not two: a connect under way counts against its connections as well as its unbound ones.
+    #[test]
+    fn connects_under_way_count_against_the_connections_too() {
+        let key = ble_key("app", "room");
+        let t = Instant::from_millis(1);
+        let air = FakeAir::new(23);
+        let limits = Limits { connections: 3, centrals: 3, ..Limits::DESKTOP };
+        let (mut node, mut ep) = lone(&air, limits, 1, t);
+        for conn in 1..limits.connections as u32 {
+            node.on_event(t, &mut ep, RadioEvent::Connected { conn: ConnId(1_000 + conn), device: None, mtu: 23 });
+        }
+        node.conns.values_mut().for_each(|c| c.bound = Some(id(5).peer_id()));
+        assert_eq!((node.conns.len(), node.unbound()), (limits.connections - 1, 0));
+        (node.n, node.advertised) = (1, None); // below both adverts
+        node.refresh(t);
+        for d in 0..2 {
+            node.on_seen(t, DeviceId(100 + d), &advert(&key, 1_000 + d as u32, false));
+        }
+        assert_eq!(node.pending.len(), 1, "one connect, for the one connection left");
+    }
+
     /// NB110-11: a connect the node has given up on, whose `Connected` comes after all, is closed, not taken, and
     /// the device's advert stays held.
     #[test]

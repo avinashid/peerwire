@@ -309,8 +309,10 @@ tests use an in-process pair of fake radios.
 
   As the peripheral the driver serves the central whose subscription to `tx` BlueZ hands over, as a socket with its
   address (`AcquireNotify`), and takes writes from that device alone; another that writes meanwhile is disconnected.
-  As the central it gives a connect 10 s to come up (the link, the service found, both sockets), and disconnects one
-  that fails or doesn't, which also stops a connect BlueZ still has under way.
+  As the central it gives a connect 10 s to come up (the link, the service found, both sockets), and reports one that
+  fails or doesn't as failed, then disconnects it, which also stops a connect BlueZ still has under way. BlueZ answers
+  a disconnect only once the link is down, 2 s or more later, so the driver never waits on one: each runs on its own
+  (NB110-12).
   bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone
   browser that doesn't raise it, say; to be checked with NB-110d) can't carry the codec's 20-byte values and isn't
   used.

@@ -517,31 +517,15 @@ impl Driver {
                     None => self.ctx.events.send(RadioEvent::ConnectFailed { device }),
                 }
             }
-            Cmd::Disconnect(conn) => self.disconnect(conn).await,
+            Cmd::Disconnect(conn) => self.disconnect(conn),
         }
     }
 
-    async fn disconnect(&mut self, conn: ConnId) {
-        let adapter = self.on.as_ref().map(|on| on.adapter.clone());
-        let central = self.ctx.centrals.lock().unwrap().remove(&conn.0);
-        if let Some(link) = central {
-            link.write.abort();
-            link.read.abort();
-            if let Some(dev) = adapter.and_then(|a| a.device(link.addr).ok()) {
-                let _ = dev.disconnect().await;
-            }
-            return;
-        }
-        // The central of ours: its notify session ends with its link, which BlueZ can close given its address.
-        let from = {
-            let mut p = self.ctx.peripheral.lock().unwrap();
-            match p.conn == Some(conn.0) {
-                true => std::mem::take(&mut *p).from,
-                false => None,
-            }
-        };
-        if let Some(dev) = from.zip(adapter).and_then(|(a, adapter)| adapter.device(a).ok()) {
-            let _ = dev.disconnect().await;
+    /// Closes `conn`, as the node did: in the books at once, and at BlueZ in a task of its own (`drop_later`). Not
+    /// `async`, so the loop never waits on a remote link (NB110-12).
+    fn disconnect(&mut self, conn: ConnId) {
+        if let (Some(addr), Some(on)) = (forget(&self.ctx, conn.0), &self.on) {
+            drop_later(&on.adapter, &self.ctx.centrals, [addr]);
         }
     }
 
@@ -631,14 +615,7 @@ impl Driver {
             for t in on.app.take().map(|(_, t)| t).into_iter().chain(on.scan.take()) {
                 t.abort();
             }
-            let adapter = on.adapter.clone();
-            tokio::spawn(async move {
-                for a in addrs {
-                    if let Ok(dev) = adapter.device(a) {
-                        let _ = dev.disconnect().await;
-                    }
-                }
-            });
+            drop_later(&on.adapter, &self.ctx.centrals, addrs);
         }
         if self.advert.is_some() && !std::mem::replace(&mut self.off_air, true) {
             self.ctx.events.send(RadioEvent::Advertising(false));
@@ -699,6 +676,29 @@ fn drop_links(ctx: &Ctx, connects: &mut Vec<(DeviceId, JoinHandle<()>)>) -> Vec<
     }
     addrs.extend(p.from);
     addrs
+}
+
+/// Takes `conn` out of the driver's books, as the node closed it: a central connection's tasks stop, or the one
+/// central's slot frees. The device, to close the link to.
+fn forget(ctx: &Ctx, conn: u32) -> Option<Address> {
+    let central = ctx.centrals.lock().unwrap().remove(&conn);
+    if let Some(link) = central {
+        link.write.abort();
+        link.read.abort();
+        return Some(link.addr);
+    }
+    // The central of ours: its notify session ends with its link, which BlueZ can close given its address.
+    let mut p = ctx.peripheral.lock().unwrap();
+    (p.conn == Some(conn)).then(|| std::mem::take(&mut *p).from).flatten()
+}
+
+/// Closes the links to `addrs` ([`drop_link`]), each in a task of its own: BlueZ answers a disconnect only once the
+/// link is down, 2 s or more later, so nothing waits behind it (NB110-12).
+fn drop_later(adapter: &Adapter, centrals: &Centrals, addrs: impl IntoIterator<Item = Address>) {
+    for a in addrs {
+        let (adapter, centrals) = (adapter.clone(), centrals.clone());
+        tokio::spawn(async move { drop_link(&adapter, &centrals, a).await });
+    }
 }
 
 /// Serves the GATT service on `adapter`: the app, and the task that serves its subscriptions to `tx`.
@@ -885,8 +885,9 @@ impl Drop for Watching {
 }
 
 /// Connects to `device` as a central: the service's `tx` notifications as a socket to read, its `rx` as one to write
-/// without response. One that isn't set up within `SETUP`, or fails, is disconnected, which also stops a connect
-/// BlueZ still has under way.
+/// without response. One that isn't set up within `SETUP`, or fails, is reported failed and then disconnected, which
+/// also stops a connect BlueZ still has under way: reported first, as the disconnect is answered only once the link
+/// is down (NB110-12), and this task ends with it, so one still under way has said nothing (`drop_links`).
 async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     let addr = address(device);
     let Ok(dev) = adapter.device(addr) else {
@@ -918,8 +919,8 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     let set_up = tokio::time::timeout(SETUP, setup).await.ok().and_then(Result::ok);
     let mtu = set_up.as_ref().and_then(|(r, w)| att_mtu(w.mtu().min(r.mtu())));
     let (Some((reader, writer)), Some(mtu)) = (set_up, mtu) else {
-        let _ = dev.disconnect().await;
-        return ctx.events.send(RadioEvent::ConnectFailed { device });
+        ctx.events.send(RadioEvent::ConnectFailed { device });
+        return drop_later(&adapter, &ctx.centrals, [addr]);
     };
     // Nothing from here on waits, so a connect still under way hasn't said `Connected` (`drop_links`).
     let conn = ctx.shared.next.fetch_add(1, Ordering::Relaxed);
@@ -999,23 +1000,32 @@ impl Central {
             std::future::pending::<()>().await
         };
         tokio::pin!(left);
-        loop {
+        // Whether the node closed it (its queue ended).
+        let closed = loop {
             tokio::select! {
                 v = queue.recv() => {
-                    let Some(v) = v else { break };
+                    let Some(v) = v else { break true };
                     if writer.send(&v).await.is_err() {
-                        break;
+                        break false;
                     }
                 }
-                _ = writer.closed() => break,
-                _ = &mut left => break,
+                _ = writer.closed() => break false,
+                _ = &mut left => break false,
+            }
+        };
+        ctx.shared.senders.lock().unwrap().remove(&conn);
+        {
+            let mut p = ctx.peripheral.lock().unwrap();
+            if p.conn == Some(conn) {
+                *p = Peripheral::default();
+                ctx.events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
             }
         }
-        ctx.shared.senders.lock().unwrap().remove(&conn);
-        let mut p = ctx.peripheral.lock().unwrap();
-        if p.conn == Some(conn) {
-            *p = Peripheral::default();
-            ctx.events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
+        // Its link drops here too, so that it does whichever of this and the driver's own close takes the slot
+        // first: else the central could subscribe again at once (NB110-12).
+        if closed {
+            drop(writer);
+            drop_link(&self.adapter, &ctx.centrals, addr).await;
         }
     }
 }
@@ -1166,6 +1176,29 @@ mod tests {
             assert!(ctx.shared.senders.lock().unwrap().is_empty() && ctx.peripheral.lock().unwrap().conn.is_none());
             quiet().await;
             assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished), "their tasks stopped");
+        });
+    }
+
+    /// NB110-12: a connection the node closes leaves the books at once (the link is closed at BlueZ in a task of its
+    /// own): a central connection's tasks stop, the one central's slot frees, and another connection's is untouched.
+    #[test]
+    fn a_connection_the_node_closes_leaves_the_books_at_once() {
+        runtime().block_on(async {
+            let (ctx, _events) = ctx();
+            let idle = || tokio::spawn(std::future::pending::<()>());
+            let link = Link { write: idle(), read: idle(), addr: addr(3) };
+            let tasks = [link.write.abort_handle(), link.read.abort_handle()];
+            ctx.centrals.lock().unwrap().insert(5, link);
+            *ctx.peripheral.lock().unwrap() = Peripheral { conn: Some(7), from: Some(addr(4)) };
+            assert_eq!(forget(&ctx, 9), None, "not one of its");
+            assert_eq!(ctx.peripheral.lock().unwrap().conn, Some(7));
+            assert_eq!(forget(&ctx, 5), Some(addr(3)), "a central connection");
+            assert!(ctx.centrals.lock().unwrap().is_empty());
+            assert_eq!(forget(&ctx, 7), Some(addr(4)), "the central's");
+            assert_eq!(ctx.peripheral.lock().unwrap().conn, None);
+            assert_eq!(forget(&ctx, 7), None, "once");
+            quiet().await;
+            assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished), "its tasks stopped");
         });
     }
 
