@@ -8,12 +8,14 @@ does the rest.
 ## Build and flash
 
 ```sh
-cargo run --release
+./flash.sh
 ```
 
 That builds the firmware, flashes the board on USB and opens its log (Ctrl+C leaves it).
-The first build downloads ESP-IDF and its tools to `~/.espressif`, several GB, and
-takes 10 to 20 minutes; later builds take seconds. The log shows, in order:
+`./flash.sh build` only builds; options after either go to cargo. The script holds the
+chip's build settings, so a plain `cargo build` builds for your PC, and fails. The
+first build downloads ESP-IDF and its tools to `~/.espressif`, several GB, and takes 10
+to 20 minutes; later builds take seconds. The log shows, in order:
 
 ```text
 joined on attempt 1 at 20 dBm
@@ -44,7 +46,7 @@ With the `nostr` feature the board also joins its room over the Nostr relay
 `wss://nostr.mom`, so peers anywhere link with it:
 
 ```sh
-cargo run --release --features nostr
+./flash.sh --features nostr
 cargo run -p peerwire --features nostr --example room_chat -- ROOM   # on a PC anywhere
 ```
 

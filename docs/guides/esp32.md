@@ -20,7 +20,7 @@ chip, and signaling on the LAN and, optionally, over a Nostr relay. A
 1. [Rust](https://rustup.rs), then `cargo install espup ldproxy espflash cargo-generate`. On Linux, espflash needs
    `libudev-dev` and `pkg-config` first.
 2. `espup install`: Espressif's Rust (the `esp` toolchain, for the ESP32-C3 and the ESP32 alike) and its GCC. It
-   writes `~/export-esp.sh`: run `. ~/export-esp.sh` in each shell you build in, or from your shell's profile.
+   writes `~/export-esp.sh`, which the project's `flash.sh` loads.
 3. ESP-IDF's own prerequisites. On Debian or Ubuntu: `sudo apt install git wget flex bison gperf python3 python3-pip
    python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0`; on macOS:
    `brew install cmake ninja dfu-util`. On Linux, add yourself to the `dialout` group to reach the board's serial port.
@@ -30,13 +30,14 @@ chip, and signaling on the LAN and, optionally, over a Nostr relay. A
 ```sh
 cargo generate --git https://github.com/avinashid/peerwire templates/esp32 --name my-board
 cd my-board
-cargo run --release
+./flash.sh
 ```
 
 The template asks for the chip (`esp32c3` or `esp32`), your Wi-Fi network (2.4 GHz only) and its password, which it
-keeps in `cfg.toml` (git ignores that file), and a room. `cargo run --release` builds the firmware, flashes the board
-on USB and opens its log. The first build downloads ESP-IDF and its tools to `~/.espressif`, several GB, and takes 10
-to 20 minutes; later builds take seconds.
+keeps in `cfg.toml` (git ignores that file), and a room. `./flash.sh` builds the firmware, flashes the board on USB
+and opens its log; it holds the chip's build settings (target, linker, `build-std`), so build with it, or with
+`./flash.sh build`, not plain `cargo build`. The first build downloads ESP-IDF and its tools to `~/.espressif`,
+several GB, and takes 10 to 20 minutes; later builds take seconds.
 
 **Talk to it** from a PC on the same Wi-Fi, in the room you chose:
 

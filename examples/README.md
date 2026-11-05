@@ -115,7 +115,7 @@ Wi-Fi and a room, and answers what peers send it; `lan_chat` on a PC on the same
 
 ```sh
 cargo generate --git https://github.com/avinashid/peerwire templates/esp32
-cd my-board && cargo run --release   # builds, flashes the board on USB and opens its log
+cd my-board && ./flash.sh   # builds, flashes the board on USB and opens its log
 ```
 
 [`ports/esp32`](../ports/esp32): the `peerwire-esp` crate the template uses, and its `mesh` example, the port's
