@@ -3,9 +3,16 @@
 # image for Espressif's QEMU or a real board. Needs the toolchain in README.md.
 # CHIP=esp32c3 (default, RISC-V, upstream nightly) or CHIP=esp32 (the original
 # ESP32, as on an ESP32-WROOM-32: Xtensa, Espressif's `esp` toolchain from espup).
-# Usage: [CHIP=chip] ./build.sh [cargo args]
+# EXAMPLE and FEATURES pick another example (default mesh, with nostr); one that isn't
+# mesh is written to out/<example>.bin.
+# Usage: [CHIP=chip] [EXAMPLE=name FEATURES=list] ./build.sh [cargo args]
 set -euo pipefail
 cd "$(dirname "$0")"
+
+EXAMPLE=${EXAMPLE:-mesh}
+FEATURES=${FEATURES:-nostr}
+# The `ble` feature needs ESP-IDF built with NimBLE (NB-110).
+case ",$FEATURES," in *,ble,*) export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ble" ;; esac
 
 CHIP=${CHIP:-esp32c3}
 case "$CHIP" in
@@ -34,9 +41,11 @@ export "CC_$(echo "$target" | tr - _)=$cc"
 export "CFLAGS_$(echo "$target" | tr - _)=$cflags"
 
 cargo "${toolchain[@]}" build --release --target "$target" -Z build-std=std,panic_abort \
-  --example mesh --features nostr "${@}"
+  --example "$EXAMPLE" --features "$FEATURES" "${@}"
 
 mkdir -p out
-elf=target/$target/release/examples/mesh
-espflash save-image --chip "$CHIP" --flash-size 4mb --merge "$elf" out/flash.bin
-ls -l "$elf" out/flash.bin
+elf=target/$target/release/examples/$EXAMPLE
+bin=out/flash.bin
+[ "$EXAMPLE" = mesh ] || bin=out/$EXAMPLE.bin
+espflash save-image --chip "$CHIP" --flash-size 4mb --merge "$elf" "$bin"
+ls -l "$elf" "$bin"
