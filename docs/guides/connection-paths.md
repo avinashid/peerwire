@@ -62,8 +62,10 @@ reaches the peer; the TURN server still sees it. A Rust policy chooses the paths
 gives out: under `[RelayPeers]` its offers still carry its addresses. To hide them, use `Privacy::RelayOnly`, which
 links through one relay (see [privacy](privacy.md)). With your TURN server and `Turn` in the policy, `RelayOnly` links
 through your allocations too, as `['turn']` does: offers carry the relayed address alone, and nothing to a peer but
-the relay leaves the node's socket. A dial takes `Turn` and `RelayPeers` (the relay) in the policy's order,
-`RelayPeers` last if left out, and a link moves between them only when its allocation goes.
+the relay leaves the node's socket. The exception is a dial already under way when relay-only comes on, if neither
+an allocation nor the relay can take it: it runs on to its end, at addresses the peer had from earlier offers, and a
+link it makes is refused. A dial takes `Turn` and `RelayPeers` (the relay) in the policy's order, `RelayPeers` last
+if left out, and a link moves between them only when its allocation goes.
 
 ## Bring your own servers
 

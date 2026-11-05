@@ -227,7 +227,8 @@ both profiles first, about 5 minutes. With no Rust change since `origin/main`, t
   across one; a punch answered at one moves nothing; `retag`; `peer_of` reads an HS2's and a Data packet's receiver
   index, not an HS1's. NB-101 (bit `OWN`: through the endpoint's own allocation): relay-only takes such a path as a
   relay; a dial given one goes through it alone, ignoring guesses and sprays; answers, punches, data and a crossing
-  dial at the endpoint's socket are dropped; nothing leaves the socket.
+  dial at the endpoint's socket are dropped; nothing leaves the socket. NB101-I1: `abandon` closes a link as
+  `disconnect` does, links it relayed back on their slow addresses, with nothing sent to the peer.
 - Traversal: an observed address that is our relayed one isn't taken, and offers carry it only in their relayed
   entry; a link at an address offered as relayed is retagged, before or after it comes up; a peer's relayed address
   is dialled; `[Turn, Direct]` keeps a TURN link, `[Direct, Turn]` lets it punch; an allocation made is offered to
@@ -238,7 +239,10 @@ both profiles first, about 5 minutes. With no Rust change since `origin/main`, t
   under `RelayOnly` with TURN: offers carry the relayed address alone and the relay's none; dials take `Turn` and the
   relay in the policy's order and nothing from the socket, with the policy gone too; a link at a peer's address goes
   onto the allocation at once, is dialled again there and closes unanswered; one whose allocation goes, with no
-  relay, closes.
+  relay, closes. NB101-I1: a link at an address no allocation relays to (IPv6, the allocation IPv4) goes onto the
+  allocation at once at another of the peer's, and nothing more leaves the socket over 6.5 s, the app's data and the
+  close included; with no address an allocation relays to, the link closes unannounced, and is dialled afresh
+  through the relay if one is linked.
 - Loopback (a TURN server on UDP sockets of its own): a link through TURN alone (`path_kind` `Turn` at both ends);
   `Turn` first keeping it there; `Direct` first moving it off TURN with `PathChanged` at both ends; `Turn` taken out
   moving it; a dropped server closing it with `PathOff`; new credentials making a new allocation; no policy or no
@@ -248,7 +252,9 @@ both profiles first, about 5 minutes. With no Rust change since `origin/main`, t
   with `Turn` in the policy; a relay-only node links through its allocation alone, and neither its socket nor the
   peer's hears from the other's; two relay-only nodes link through both allocations, each socket hearing only the
   server; a lost allocation moves a relay-only node's link to its relay; switching to relay-only takes a direct link
-  onto TURN at once, after which the peer hears nothing from the node's socket; `connect` through the allocation.
+  onto TURN at once, after which the peer hears nothing from the node's socket; `connect` through the allocation,
+  to a relay peer's invite too (NB101-1); switching to relay-only drops a relay peer's link without a Close
+  (NB101-I1).
 - Simulator (`Sim::add_turn_server`, external nodes): two symmetric NATs with random ports link only through TURN;
   two that can punch move from TURN to the direct path once `Direct` ranks first; a TURN server that is the only STUN
   server too gives the NAT's mapping, and a link.

@@ -213,7 +213,7 @@ Identity and addresses:
 | `public_addr(&self) -> Option<SocketAddr>` | The public address STUN reported, once a server answered |
 | `nat_type(&self) -> NatType` | What STUN says about this node's NAT |
 | `privacy(&self) -> Privacy` | Which addresses the node gives out |
-| `set_privacy(&mut self, privacy: Privacy)` | Changes that from the next offer and invite on. Links already up keep their path; disconnect a peer to stop it knowing an address it has. Switching to `RelayOnly` closes the links to relay peers (except the relay it names) and removes a router mapping; switching out of it dials them and maps again. Under `RelayOnly` with TURN on (servers, and `Turn` in the policy), links to peers but the relay that show this node's address move onto its allocations or the relay at once, or close with `PathOff` |
+| `set_privacy(&mut self, privacy: Privacy)` | Changes that from the next offer and invite on. Links already up keep their path; disconnect a peer to stop it knowing an address it has. Switching to `RelayOnly` closes the links to relay peers (except the relay it names) and removes a router mapping; switching out of it dials them and maps again. Under `RelayOnly` with TURN on (servers, and `Turn` in the policy), links to peers but the relay that show this node's address move onto its allocations or the relay at once, or close with `PathOff`; those closes, and relay peers', send nothing from the socket (the peer times the link out) |
 | `port_mapping(&self) -> PortMapping` | Where router port mapping stands; updated by `poll` |
 
 Paths and servers, live:
@@ -392,7 +392,7 @@ and [privacy modes](../concepts/nat-traversal.md#privacy-modes).
 |---|---|
 | `Direct` (default) | Every candidate: public, LAN, loopback. The lowest latency; peers on one LAN link over it |
 | `PublicOnly` | Public addresses only: LAN, loopback, link-local, CGNAT (100.64/10) and other private ranges are left out of invites and offers. Two peers behind one NAT then link only if it hairpins, or through a relay |
-| `RelayOnly { via: Option<PeerId> }` | No address at all, except to the relay: every other link goes through it (`Path::Via`) and never moves to a direct path. The relay is `via`, or, in a host/client room, the host. Costs the relay's upload (it carries every packet twice) and a detour in latency. With TURN servers and `PathKind::Turn` in the policy, links also go through this node's own allocations, which show peers the TURN server's address: offers to peers but the relay carry the relayed address alone, and nothing to them leaves the node's socket |
+| `RelayOnly { via: Option<PeerId> }` | No address at all, except to the relay: every other link goes through it (`Path::Via`) and never moves to a direct path. The relay is `via`, or, in a host/client room, the host. Costs the relay's upload (it carries every packet twice) and a detour in latency. With TURN servers and `PathKind::Turn` in the policy, links also go through this node's own allocations, which show peers the TURN server's address: offers to peers but the relay carry the relayed address alone, and nothing to them leaves the node's socket, except from a dial already under way when relay-only came on that neither an allocation nor the relay can take (it runs on to its end, at addresses the peer had from earlier offers, and a link it makes is refused) |
 
 ### Policy
 

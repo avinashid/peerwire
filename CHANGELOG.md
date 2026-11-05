@@ -23,14 +23,18 @@ and the commit that fixed it.
   a link takes. No policy behaves as before.
 - **TURN under `Privacy::RelayOnly`:** with `Turn` in the policy, a relay-only node links through its own allocations
   as well as its relay, so it needs no relay: offers to peers but the relay carry the relayed address alone, dials
-  take `Turn` and the relay in the policy's order, nothing to a peer but the relay leaves the node's socket, and a
-  link whose allocation goes moves to the relay or closes with `PathOff`. Turning relay-only on moves links that show
-  the node's address onto an allocation or the relay at once. Without `Turn` in the policy, relay-only is as before.
+  take `Turn` and the relay in the policy's order, and a link whose allocation goes moves to the relay or closes with
+  `PathOff`. Turning relay-only on moves links that show the node's address onto an allocation or the relay at once,
+  or closes them unannounced, as it does relay peers' links: from then on nothing to a peer but the relay leaves the
+  node's socket, except from a dial already under way that neither an allocation nor the relay can take. That one
+  runs on to its end, at addresses the peer had from earlier offers, and a link it makes is refused. Without `Turn`
+  in the policy, relay-only is as before.
 - **Changed:** `Node::path` returns an owned `Option<Path>` (it was `Option<&Path>`): a link through TURN shows the
   peer's address as relayed, and `Node::path_kind` says `Turn`. Drop a `.cloned()`, or compare with `Some(path)`.
   `peerwire_core::Address` has more provided methods (`relayed`, `turn_hop`, `turn_parts`, `own_turn`,
-  `relayed_hop`), and `Endpoint` has `set_keep_turn`, `retag` and `peer_of`. `Traversal::set_privacy` takes the time
-  first, as `set_policy` does: under relay-only with TURN on it moves links at once.
+  `relayed_hop`), and `Endpoint` has `set_keep_turn`, `retag`, `peer_of` and `abandon` (`disconnect` with no Close
+  sent). `Traversal::set_privacy` takes the time first, as `set_policy` does: under relay-only with TURN on it moves
+  links at once.
 - **LAN discovery:** `LanSignaling` runs rooms over UDP multicast and broadcast on the local network, with no
   internet. Broadcast, to the LAN's broadcast address only, reaches devices that a router never gives multicast to,
   such as an ESP32 on Wi-Fi.
