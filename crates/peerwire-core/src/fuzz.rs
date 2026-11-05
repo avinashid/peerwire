@@ -8,6 +8,7 @@
 //! ```
 
 use crate::addr::{Address, MAX_ADDR_LEN};
+use crate::ble::{self, Chunker, Reassembler, MAX_MESSAGE};
 use crate::endpoint::{Config, DisconnectReason, Endpoint, Event, Lane, SendError};
 use crate::identity::{Identity, PeerId};
 use crate::invite::Invite;
@@ -1032,4 +1033,194 @@ fn fuzz_handshakes_under_load() {
     assert_eq!(cookied, [true, false], "a cookie over UDP, none over a channel");
     assert!(ep.is_connected(&ids[h]) && ep.is_connected(&ids[o]));
     assert!(dials.iter().all(|d| d.is_connected(&ids[b])));
+}
+
+/// A trace of GATT values for `fuzz_ble_framing`: the ATT MTU (u16 LE), then records of a delay (u8, in 10 ms) and a
+/// value (u16 LE length, then its bytes). A truncated record ends it.
+fn ble_trace(b: &[u8]) -> (u16, Vec<(u64, &[u8])>) {
+    let Some((mtu, mut rest)) = b.split_first_chunk::<2>().map(|(m, r)| (u16::from_le_bytes(*m), r)) else {
+        return (0, Vec::new());
+    };
+    let mut out = Vec::new();
+    while let [dt, a, b, tail @ ..] = rest {
+        let n = usize::from(u16::from_le_bytes([*a, *b]));
+        let Some(value) = tail.get(..n) else { break };
+        out.push((u64::from(*dt) * 10, value));
+        rest = &tail[n..];
+    }
+    (mtu, out)
+}
+
+/// Bluetooth LE framing (ble.rs, NB-110): a connection's GATT values put back into messages. Values come from a
+/// `Chunker` at an MTU from 0 to 600, lost, copied, swapped and delayed as a full buffer or a slow link would, and
+/// half the time mutated byte by byte. Whatever comes out is never empty or over `MAX_MESSAGE`, and nothing held ever
+/// is; with only those faults and no run that could join two messages' parts (the documented limit: chunk counters
+/// that differ by a multiple of 64), every message out is one that was sent, unaltered. Also: `value_len` stays
+/// within GATT's bounds and every split fits it; `hs1_id` names exactly the HS1s and their resends.
+#[test]
+fn fuzz_ble_framing() {
+    // What the last case sent; whether only whole values were dropped, copied, swapped or delayed; and whether none
+    // was moved (GATT keeps the order, so only a swap here takes a copy away from its original).
+    let sent = RefCell::new((Vec::<Vec<u8>>::new(), false, false));
+    let (mut values, mut delivered, mut checked) = (0usize, 0usize, 0usize);
+    run(
+        "ble",
+        cases(4_000),
+        |rng| {
+            let mtu = match rng.below(4) {
+                0 => rng.below(600) as u16,
+                1 => *rng.pick(&[0, 22, 23, 24, 185, 247, 514, 515, 516, 517, u16::MAX]),
+                _ => 23 + rng.below(100) as u16,
+            };
+            let mut tx = Chunker::new();
+            let mut msgs = Vec::new();
+            // (index in the chunk stream, delay, value)
+            let mut trace: Vec<(usize, u64, Vec<u8>)> = Vec::new();
+            for _ in 0..1 + rng.below(12) {
+                let len = match rng.below(5) {
+                    0 => MAX_MESSAGE - rng.below(3),
+                    1 => 1 + rng.below(3),
+                    _ => 1 + rng.below(MAX_MESSAGE),
+                };
+                let m = rng.bytes(len);
+                let mut parts = Vec::new();
+                assert!(tx.split(&m, mtu, |v| {
+                    parts.push(v.to_vec());
+                    true
+                }));
+                let fits = parts.iter().all(|v| v.len() >= 2 && v.len() <= ble::value_len(mtu));
+                assert!(fits, "a split at mtu {mtu} doesn't fit its values");
+                let mut alone = Reassembler::new();
+                let whole: Vec<Vec<u8>> =
+                    parts.iter().filter_map(|v| alone.push(Instant::ZERO, v).map(<[u8]>::to_vec)).collect();
+                assert_eq!(whole, std::slice::from_ref(&m), "a split at mtu {mtu} doesn't put back together");
+                for v in parts {
+                    trace.push((trace.len(), rng.below(3) as u64, v));
+                }
+                msgs.push(m);
+            }
+            assert!(!tx.split(&[], mtu, |_| true) && !tx.split(&vec![0; MAX_MESSAGE + 1], mtu, |_| true));
+            // A sender that gives up on a message (a full buffer) and numbers only the chunks it sent: the rest of
+            // the message goes, and what follows is numbered on from the last chunk that went.
+            if rng.one_in(4) {
+                let firsts: Vec<usize> = (0..trace.len()).filter(|&i| trace[i].2[0] & 0x80 != 0).collect();
+                let at = *rng.pick(&firsts);
+                let end = (at + 1..trace.len()).find(|&i| trace[i].2[0] & 0x80 != 0).unwrap_or(trace.len());
+                if end - at >= 2 {
+                    let keep = 1 + rng.below(end - at - 1);
+                    let gone = end - (at + keep);
+                    trace.drain(at + keep..end);
+                    for (i, _, v) in &mut trace[at + keep..] {
+                        *i -= gone;
+                        v[0] = (v[0] & 0xc0) | (((v[0] & 0x3f) + 64 - (gone % 64) as u8) % 64);
+                    }
+                }
+            }
+            for _ in 0..rng.below(1 + trace.len() / 4) {
+                let i = rng.below(trace.len().max(1));
+                match rng.below(5) {
+                    _ if trace.is_empty() => {}
+                    0 => drop(trace.remove(i)),
+                    1 => trace.insert(i, trace[i].clone()),
+                    2 if i + 1 < trace.len() => trace.swap(i, i + 1),
+                    3 => trace[i].1 = 150 + rng.below(106) as u64, // 1.5 to 2.55 s: past the 2 s timeout, or not
+                    _ => {
+                        // A run of losses, up to 70: `joins` below says which could join two messages.
+                        let n = (1 + rng.below(70)).min(trace.len() - i);
+                        trace.drain(i..i + n);
+                    }
+                }
+            }
+            // Two values in a row whose counters follow on but which weren't neighbours could join two messages.
+            let joins = trace.windows(2).any(|w| {
+                let d = w[1].0 as i64 - w[0].0 as i64;
+                d != 1 && d.rem_euclid(64) == 1
+            });
+            let ordered = trace.windows(2).all(|w| w[1].0 >= w[0].0);
+            let mut b = mtu.to_le_bytes().to_vec();
+            for (_, dt, v) in &trace {
+                b.push(*dt as u8);
+                b.extend((v.len() as u16).to_le_bytes());
+                b.extend(v);
+            }
+            let mutated = rng.one_in(2);
+            if mutated {
+                mutate(rng, &mut b, 40_000);
+            }
+            *sent.borrow_mut() = (msgs, !mutated && !joins, ordered);
+            b
+        },
+        |b| {
+            let (mtu, trace) = ble_trace(b);
+            assert!((20..=512).contains(&ble::value_len(mtu)));
+            let (msgs, whole, ordered) = &*sent.borrow();
+            let mut rx = Reassembler::new();
+            let (mut now, mut dropped) = (Instant::ZERO, 0);
+            let mut out: HashMap<Vec<u8>, usize> = HashMap::new();
+            for (dt, v) in trace {
+                now = now + Duration::from_millis(dt);
+                values += 1;
+                if let Some(m) = rx.push(now, v) {
+                    assert!(!m.is_empty() && m.len() <= MAX_MESSAGE, "a message of {} bytes", m.len());
+                    delivered += 1;
+                    if *whole {
+                        // Sent and unaltered; in order, no more often than it was sent (a copy isn't a second one).
+                        let times = msgs.iter().filter(|s| *s == m).count();
+                        let n = out.entry(m.to_vec()).or_default();
+                        *n += 1;
+                        assert!(times > 0, "a message that wasn't sent: {}", hex(m));
+                        assert!(!*ordered || *n <= times, "a message out more often than sent: {}", hex(m));
+                        checked += 1;
+                    }
+                }
+                assert!(rx.pending() <= MAX_MESSAGE);
+                assert!(rx.dropped() >= dropped, "dropped went down");
+                dropped = rx.dropped();
+            }
+        },
+    );
+    println!("fuzz ble: {values} values, {delivered} messages out, {checked} checked against what was sent");
+    assert!(delivered > 0 && checked > 0);
+
+    // hs1_id: an HS1 and its resends (and one with a cookie) name one handshake; another dial, another; anything
+    // else, mutated or not, none, and never a panic.
+    let ids = identities(3);
+    let peer = ids[1].peer_id();
+    let hs1 = |seed: u8, at: u64| {
+        let mut ep = Endpoint::<u32>::new(&ids[0], Config::default(), [seed; 32]);
+        let t = Instant::from_millis(1);
+        ep.connect(t, 2, peer).unwrap();
+        let first = ep.poll_transmit(t).unwrap().payload;
+        ep.handle_timeout(Instant::from_millis(at));
+        (first, ep.poll_transmit(Instant::from_millis(at)).map(|x| x.payload))
+    };
+    let (a, again) = hs1(1, 700);
+    let (b, _) = hs1(2, 700);
+    let id = ble::hs1_id(&a).expect("an HS1");
+    assert_eq!(again.as_deref().and_then(ble::hs1_id), Some(id), "a resend");
+    assert_ne!(ble::hs1_id(&b), Some(id), "another dial");
+    let mut named = 0usize;
+    run(
+        "ble-hs1",
+        cases(3_000),
+        |rng| {
+            let n = rng.below(300);
+            let mut d = if rng.one_in(2) { a.clone() } else { rng.bytes(n) };
+            if rng.below(4) != 0 {
+                mutate(rng, &mut d, 600);
+            }
+            d
+        },
+        |d| {
+            let got = ble::hs1_id(d);
+            let want = match wire::parse(d) {
+                Some(Packet::Hs1 { sender, noise, .. }) => noise.get(..32).map(|e| (sender, e.try_into().unwrap())),
+                _ => None,
+            };
+            assert_eq!(got, want);
+            named += got.is_some() as usize;
+        },
+    );
+    println!("fuzz ble hs1_id: {named} named");
+    assert!(named > 0);
 }
