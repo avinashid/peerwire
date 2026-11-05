@@ -2,8 +2,8 @@
 
 > [!NOTE]
 > This is the design of Peerwire over Bluetooth Low Energy (NB-110), the contract that the Rust host on Linux, the
-> ESP32 port and the browser build to. The framing codec is in `peerwire-core` (`ble.rs`); the Linux host is the
-> `peerwire` feature `ble`. Nothing here has run over a real radio yet.
+> ESP32 port and the browser build to. The framing codec is in `peerwire-core` (`ble.rs`); the node's side is the
+> `peerwire` feature `ble`, and the Linux driver `ble-bluez`. Nothing here has run over a real radio yet.
 
 Peers near each other link over Bluetooth LE when they share no network: a laptop and an ESP32 board with the Wi-Fi
 down, say. A Bluetooth connection is one more path for a link, beside its UDP paths: the same identities, Noise
@@ -143,6 +143,43 @@ to this peer), and after 60 s without one since.
 - **Connections:** the link layer isn't encrypted, as nothing is paired, so a sniffer that follows a connection sees
   sealed hellos, sealed offers and Noise packets: their sizes and timing, not their contents or a lasting identifier.
 - **What it can do:** jam the radio, or refuse to carry what it should, as an on-path attacker on any network can.
+
+## The radio driver
+
+The node runs all of the above itself (adverts, who connects, framing, binding, limits) over a small driver for the
+radio, so each platform writes only the driver. In `peerwire` (feature `ble`, no dependencies):
+
+```text
+pub trait Radio: Send {
+    /// Advertises with `data` as the service data, replacing the last; `None` stops. Serves the GATT service, and
+    /// accepts centrals, while advertising.
+    fn advertise(&mut self, data: Option<&[u8]>);
+    /// Starts or stops scanning for the service's adverts.
+    fn scan(&mut self, on: bool);
+    /// Connects to `device` (from `Seen`) as a central, subscribes to `tx`, and asks for the largest ATT MTU.
+    fn connect(&mut self, device: DeviceId);
+    /// Sends one value of at most ATT_MTU - 3 bytes on `conn`: a write without response to `rx` as the central, a
+    /// notification on `tx` as the peripheral. `false` if it can't now (a full buffer): the value is dropped.
+    fn send(&mut self, conn: ConnId, value: &[u8]) -> bool;
+    /// Closes `conn`.
+    fn disconnect(&mut self, conn: ConnId);
+    /// The next event, without blocking.
+    fn poll(&mut self) -> Option<RadioEvent>;
+}
+
+pub enum RadioEvent {
+    Seen { device: DeviceId, data: Vec<u8> },                   // an advert of the service, its service data
+    Connected { conn: ConnId, device: Option<DeviceId>, mtu: u16 }, // ours to `device`, or a central's (`None`)
+    ConnectFailed { device: DeviceId },
+    Mtu { conn: ConnId, mtu: u16 },                              // the ATT MTU changed
+    Value { conn: ConnId, value: Vec<u8> },                      // a write to `rx`, or a notification on `tx`
+    Disconnected { conn: ConnId },
+}
+```
+
+`DeviceId(u64)` and `ConnId(u32)` are the driver's own numbers. `Builder::bluetooth(radio)` gives a node its radio.
+Feature `ble-bluez` adds the Linux driver, `BlueZ`; the ESP32's NimBLE driver lives in `peerwire-esp` (NB-110c), and
+tests use an in-process pair of fake radios.
 
 ## Platforms
 
