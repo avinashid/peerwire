@@ -6,11 +6,14 @@ versioning](https://semver.org); before 1.0, a minor version may break the API.
 Every security finding behind a fix below is in the [threat model](docs/project/threat-model.md), with its severity
 and the commit that fixed it.
 
-## Unreleased
+## peerwire-esp 0.1.1 (2026-11-05)
 
-- **peerwire-esp 0.1.1:** a board whose clock no server set in the 60 s before its node bound restarts once a later
+On crates.io; the ESP32 template's `peerwire-esp = "0.1"` takes it in a new project.
+
+- **A clock set late:** a board whose clock no server set in the 60 s before its node bound restarts once a later
   ask sets it, so the node binds again with the time; before, the node kept 1970 and PCs dropped its hellos until the
-  board was reset (NB103-I2). An SNTP answer giving a time in 1968–1969 is refused; it wrapped the clock's
+  board was reset (NB103-I2).
+- **Times before 1970 refused:** an SNTP answer giving a time in 1968–1969 is refused; it wrapped the clock's
   arithmetic, a panic in a debug build (NB103-I1).
 
 ## Rust crates 0.1.0 (2026-11-05)
