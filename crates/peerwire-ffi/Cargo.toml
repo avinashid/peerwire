@@ -5,10 +5,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+rust-version.workspace = true
 description = "C ABI for peerwire-core: one surface for a zero-import WebAssembly module (browsers) and native FFI (Dart, Swift, C)"
 readme = "README.md"
 keywords = ["p2p", "ffi", "wasm", "webassembly", "networking"]
 categories = ["network-programming", "wasm"]
+# A package ships its sources, README and licences; tests, examples and fixtures stay in the repo.
+include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+[package.metadata.docs.rs]
+# The shared documents too (pw_docs_*, pw_doc_*).
+features = ["sync"]
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
@@ -19,8 +26,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 sync = ["dep:peerwire-sync"]
 
 [dependencies]
-peerwire-core = { path = "../peerwire-core" }
-peerwire-sync = { path = "../peerwire-sync", optional = true }
+peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
+peerwire-sync = { version = "0.1.0", path = "../peerwire-sync", optional = true }
 rand_core = "0.6"
 rand_chacha = "0.3"
 k256 = { version = "0.13", default-features = false, features = ["schnorr", "arithmetic"] }

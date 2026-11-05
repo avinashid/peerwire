@@ -17,6 +17,10 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/avinashid/peerwire"
 homepage = "https://avinashid.github.io/peerwire/"
+# The oldest Rust the published crates build with: the code calls is_multiple_of (1.87) and the arena example
+# as_chunks (1.88); the dependencies ask for 1.85 at most (snow 0.10, tokio, zeroize). clippy's incompatible_msrv
+# lint holds the code to it, and CI's msrv job builds the published crates with it.
+rust-version = "1.88"
 
 # The test builds of scripts/gate.sh (docs/project/testing.md). Neither changes what ships: that is the release
 # profile, left at cargo's defaults.

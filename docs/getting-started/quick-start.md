@@ -91,13 +91,7 @@ A chat between terminals. Create a project:
 
 ```sh
 cargo new chat && cd chat
-```
-
-In `Cargo.toml`:
-
-```toml
-[dependencies]
-peerwire = { git = "https://github.com/avinashid/peerwire", features = ["nostr"] }
+cargo add peerwire --features nostr
 ```
 
 In `src/main.rs`:

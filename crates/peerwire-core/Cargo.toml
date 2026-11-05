@@ -5,10 +5,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+rust-version.workspace = true
 description = "Sans-IO peer-to-peer session core for Peerwire: Noise IK links, reliable, urgent and unreliable lanes, congestion control, peer relay and hole punching"
 readme = "README.md"
 keywords = ["p2p", "networking", "noise", "nat-traversal", "sans-io"]
 categories = ["network-programming", "cryptography"]
+# A package ships its sources, README and licences; tests, examples and fixtures stay in the repo.
+include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+[package.metadata.docs.rs]
+# The TURN codec too, which the `peerwire` crate turns on by default.
+features = ["turn"]
 
 [dependencies]
 snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2"] }

@@ -30,11 +30,14 @@ the peers' addresses, which of them talk, and how much. See
 ## Example
 
 ```sh
+cargo install peerwire-peer                           # Linux and macOS
 mkdir -p ~/.local/share/peerwire-peer                 # outside the repo: it holds the secret key
 export PEERWIRE_DATA=~/.local/share/peerwire-peer
-cargo run --release -p peerwire-peer                  # run; prints the peer id and invite
-cargo run --release -p peerwire-peer -- check         # link to it from loopback; exit 0 if it answers
+peerwire-peer                                         # run; prints the peer id and invite
+peerwire-peer check                                   # link to it from loopback; exit 0 if it answers
 ```
+
+From a clone of the repo, `cargo run --release -p peerwire-peer` (and `-- check`) does the same.
 
 In Docker, with the examples server next to it:
 
@@ -49,7 +52,7 @@ defaults and covers exposing the peer, its logs (they hold peer addresses) and t
 
 ## Status
 
-Early development (v0.1). A binary only (`publish = false`). It serves native peers (Rust, C, Godot); browsers speak
+Early development (v0.1). A binary only. It serves native peers (Rust, C, Godot); browsers speak
 WebRTC and can't reach it yet.
 
 Not yet: joining rooms over Nostr, acting as a room's super-peer, and storing messages for offline peers.

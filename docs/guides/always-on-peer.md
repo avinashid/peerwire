@@ -41,11 +41,14 @@ binary natively instead.
 it a directory outside the repo for its identity, so the secret key can't be committed by mistake:
 
 ```sh
+cargo install peerwire-peer
 mkdir -p ~/.local/share/peerwire-peer
 export PEERWIRE_DATA=~/.local/share/peerwire-peer
-cargo run --release -p peerwire-peer              # prints its peer id and invite, then runs until stopped
-cargo run --release -p peerwire-peer -- check     # in another shell: links to it from loopback, exits 0 if it answers
+peerwire-peer                 # prints its peer id and invite, then runs until stopped
+peerwire-peer check           # in another shell: links to it from loopback, exits 0 if it answers
 ```
+
+From a clone of the repo, `cargo run --release -p peerwire-peer` (and `-- check`) does the same.
 
 Without `PEERWIRE_DATA` it makes a new identity on each start and writes no files.
 

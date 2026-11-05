@@ -80,12 +80,11 @@ function Counter() {
 }
 ```
 
-**Rust**: Peerwire isn't on crates.io yet, so add it from git.
+**Rust** (1.88 or later):
 
-```toml
-[dependencies]
-peerwire = { git = "https://github.com/avinashid/peerwire", features = ["nostr", "tokio"] }
-tokio = { version = "1", features = ["macros", "rt"] }
+```sh
+cargo add peerwire --features nostr,tokio
+cargo add tokio --features macros,rt
 ```
 
 ```rust
@@ -133,8 +132,8 @@ The [quick start](docs/getting-started/quick-start.md) walks through each of the
 | [`peerwire-peer`](crates/peerwire-peer) | An optional always-on peer that relays for the peers linked to it. Runs natively or in Docker. |
 | [`peerwire-game`](crates/peerwire-game), [`peerwire-sim`](crates/peerwire-sim) | Game building blocks (fixed-point maths, islands, desync detection) and a deterministic network simulator. |
 
-`@peerwire/js` 0.3.0 and `@peerwire/react` 0.1.1 are on npm. The Rust crates aren't on crates.io yet; use them from
-git ([installation](docs/getting-started/installation.md)).
+`@peerwire/js` 0.3.0 and `@peerwire/react` 0.1.1 are on npm, and the Rust crates 0.1.0 are on crates.io
+([installation](docs/getting-started/installation.md)).
 
 ## Status
 

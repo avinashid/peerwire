@@ -10,7 +10,7 @@ what's next. It's updated as parts land; the [changelog](../../CHANGELOG.md) has
 |---|---|---|
 | `@peerwire/js` | 0.3.0 on npm (4 Nov 2026) | 0.3.0 |
 | `@peerwire/react` | 0.1.1 on npm (1 Nov 2026) | 0.1.1 |
-| Rust crates | not on crates.io; use them from git | 0.1.0 |
+| Rust crates | 0.1.0 on crates.io | 0.1.0 |
 | Godot extension | built from source | |
 
 ## What works
@@ -55,7 +55,6 @@ details.
 
 Near term:
 
-- Publish the Rust crates on crates.io.
 - An outer tag on signaling messages, so junk floods can't stop two members linking (NB-065).
 - Real entropy and stored keys on ESP32 boards (NB-063).
 

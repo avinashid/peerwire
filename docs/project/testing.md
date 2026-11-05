@@ -373,13 +373,14 @@ invite; decoding is now canonical (`b64::rejects_non_canonical_tails`, `invite::
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push and pull request, on Ubuntu, in three jobs that call the same
-commands as the gate:
+`.github/workflows/ci.yml` runs on every push and pull request, on Ubuntu, in four jobs. All but `rust-version` call
+the same commands as the gate:
 
 | Job | Runs |
 |---|---|
 | fmt + clippy + test | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`, and again for `peerwire-ffi --features sync`; `cargo test --workspace --release` and the `sync` feature's tests; the fuzz tests in a debug build |
 | wasm + node | `./packages/js/build.sh`, the wasm size and import check, the Node tests listed in the job (Node 22), and `@peerwire/react`'s build, types and tests |
+| rust-version (1.88) | `cargo check --locked --all-features` of the seven crates on crates.io, on Rust 1.88: the workspace's `rust-version`, which the gate's clippy holds the code to (`incompatible_msrv`) but can't build with |
 | docker build | `docker compose config` and a build of the peer and examples images (never pushed) |
 
 Browser tests (headless Chromium) run in the gate, not in CI. `scripts/gate.sh --strict` runs CI's Node list again
@@ -389,6 +390,10 @@ on CI's Node version, read from `ci.yml`, so a change that passes the strict gat
 with `scripts/site.sh`, runs `site_build.mjs`, and deploys `target/site/` to GitHub Pages. The gate runs both site
 tests above. Its build job uses only GitHub's own `actions/*`, with rustup from the runner image and no build cache,
 because what it builds is what Pages serves; `site_build.mjs` checks the `actions/*` rule.
+
+`scripts/publish-crates.sh` (NB-102) publishes the Rust crates, by hand: its dry run, the default, checks each
+crate's version, licences, order and files, then runs `cargo publish --dry-run`, which builds every crate from its
+package; `--execute` publishes them one at a time.
 
 ## Turning acceptance criteria into tests
 

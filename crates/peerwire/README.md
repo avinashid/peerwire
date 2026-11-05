@@ -92,8 +92,13 @@ cargo run -p peerwire --features nostr --example nostr_relay -- 127.0.0.1:7447  
 
 ## Features
 
+```sh
+cargo add peerwire --features tokio,nostr
+```
+
 | Feature | Adds |
 |---|---|
+| `turn` (default) | the TURN client (`Builder::turn_servers`, `TurnServer`) |
 | `tokio` | `AsyncNode` |
 | `nostr` | `NostrSignaling` (websocket client with rustls, BIP-340 signatures) |
 | `testing` | test hooks for bindings (`Builder::port_mapping_at`); not for apps |

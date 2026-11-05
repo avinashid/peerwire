@@ -7,33 +7,45 @@ each of the others. How the parts fit: [architecture](../concepts/architecture.m
 
 ## Crates
 
-Every crate has the workspace version 0.1.0, edition 2021 and the license `MIT OR Apache-2.0` (root `Cargo.toml`).
-None is on crates.io yet.
+Every crate has the workspace version 0.1.0, edition 2021, `rust-version` 1.88 (the oldest Rust that builds it, which
+CI checks) and the license `MIT OR Apache-2.0` (root `Cargo.toml`). All but the Godot binding are on crates.io.
 
 | Package | Path | What it is | Published |
 |---|---|---|---|
-| `peerwire` | `crates/peerwire` | Peer-to-peer nodes over UDP with no server: STUN, rooms, signaling and NAT traversal on `peerwire-core`. Start here | Not yet |
-| `peerwire-core` | `crates/peerwire-core` | Sans-IO session core: identity, Noise IK links, reliable, urgent and unreliable lanes, congestion control, peer relay, hole punching, invites | Not yet |
-| `peerwire-sync` | `crates/peerwire-sync` | Shared documents (maps, sets, logs) that every member holds and that converge, in the frames of `room.doc()` in `@peerwire/js` | Not yet |
-| `peerwire-game` | `crates/peerwire-game` | Deterministic fixed-point maths, Hilbert-curve islands and desync detection for multiplayer games | Not yet |
-| `peerwire-sim` | `crates/peerwire-sim` | Deterministic network simulator: real endpoints over simulated latency, loss, uplinks and NATs, in virtual time | Not yet |
-| `peerwire-peer` | `crates/peerwire-peer` | An optional always-on peer, a binary: keeps one identity across restarts and relays for the peers linked to it | No (`publish = false`) |
-| `peerwire-ffi` | `crates/peerwire-ffi` | C ABI (`pw_*`): the zero-import wasm module for browsers, and `cdylib` / `staticlib` for native hosts | Not yet |
+| `peerwire` | `crates/peerwire` | Peer-to-peer nodes over UDP with no server: STUN, rooms, signaling and NAT traversal on `peerwire-core`. Start here | Yes |
+| `peerwire-core` | `crates/peerwire-core` | Sans-IO session core: identity, Noise IK links, reliable, urgent and unreliable lanes, congestion control, peer relay, hole punching, invites | Yes |
+| `peerwire-sync` | `crates/peerwire-sync` | Shared documents (maps, sets, logs) that every member holds and that converge, in the frames of `room.doc()` in `@peerwire/js` | Yes |
+| `peerwire-game` | `crates/peerwire-game` | Deterministic fixed-point maths, Hilbert-curve islands and desync detection for multiplayer games | Yes |
+| `peerwire-sim` | `crates/peerwire-sim` | Deterministic network simulator: real endpoints over simulated latency, loss, uplinks and NATs, in virtual time | Yes |
+| `peerwire-peer` | `crates/peerwire-peer` | An optional always-on peer, a binary: keeps one identity across restarts and relays for the peers linked to it | Yes (`cargo install peerwire-peer`) |
+| `peerwire-ffi` | `crates/peerwire-ffi` | C ABI (`pw_*`): the zero-import wasm module for browsers, and `cdylib` / `staticlib` for native hosts | Yes |
 | `peerwire-godot` | `bindings/godot` | Godot 4 GDExtension: `PeerwireMultiplayerPeer`, Godot's high-level multiplayer over Peerwire | No (`publish = false`) |
 
-"Not yet": the manifest doesn't forbid publishing, but no release is on crates.io.
+`scripts/publish-crates.sh` publishes the seven in dependency order: a dry run, unless `--execute`.
 
 ## Depending on a crate
 
-Until there is a release, depend on the git repository. Cargo finds each package by name in the workspace:
+```sh
+cargo add peerwire --features tokio,nostr
+```
+
+That is, in `Cargo.toml`:
+
+```toml
+[dependencies]
+peerwire = { version = "0.1.0", features = ["tokio", "nostr"] }
+```
+
+To build from `main` between releases, depend on the git repository instead. Cargo finds each package by name in the
+workspace, and `rev = "<commit>"` pins a commit:
 
 ```toml
 [dependencies]
 peerwire = { git = "https://github.com/avinashid/peerwire", features = ["tokio", "nostr"] }
 ```
 
-Add `rev = "<commit>"` to pin a commit. Take every Peerwire crate from the same source and `rev`, so they share one
-`peerwire-core` and its types (`PeerId`, `Instant`) are the same types in each.
+Take every Peerwire crate from the same source, one version or one `rev`, so they share one `peerwire-core` and its
+types (`PeerId`, `Instant`) are the same types in each.
 
 `AsyncNode` needs a tokio runtime of your own. The examples' tokio dependency (a dev-dependency in
 `crates/peerwire/Cargo.toml`) is:
