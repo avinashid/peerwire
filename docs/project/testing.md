@@ -27,6 +27,7 @@ browser tests.
 | Fuzz, debug build (`--strict`) | `cargo nextest run --profile gate --cargo-profile fuzz --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim -p peerwire-sync fuzz` (or `cargo test --profile fuzz` with the same arguments) | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
 | Node tests on CI's Node (`--strict`) | CI's `wasm + node` job's `node packages/<pkg>/test/<file>.mjs` steps again, on its `node-version` (22): the newest `~/.nvm/versions/node/v22.*`, or `NODE_CI`. Both are read from `.github/workflows/ci.yml`, so neither drifts from CI; each is its own step, `node22 <name>` | each passes (NB-055: Node 22's `JSON.stringify` recurses and 26's doesn't, so NB-053 failed only in CI); no Node 22 is one SKIP with its reason, a CI test step it can't read a FAIL (`node22 list`) |
 | Format | `cargo fmt --all -- --check` | no diff (skipped if rustfmt is not installed) |
+| Lock against the MSRV | `node scripts/rust-version.mjs`: `cargo metadata --locked --all-features`, from each workspace member with a `rust-version` (the published crates), through normal and build dependencies on every platform | no crate in `Cargo.lock` that they build with declares a newer `rust-version` than theirs (NB-110: `uuid` 1.29 asked for 1.89, and only CI's `rust-version` job, which builds on 1.88, would have seen it). The workspace's `resolver = "3"` has `cargo update` pick versions that fit; one already locked moves only with `cargo update -p <crate> --precise <version>` |
 | wasm build | `packages/js/build.sh` | builds `packages/js/pkg/peerwire_ffi.wasm` |
 | wasm size and imports | `WebAssembly.Module.imports` in Node | ≤ `WASM_MAX_BYTES` (350 KB) and 0 imports |
 | Node glue | `node packages/js/test/node_pair.mjs` | two endpoints connect; 1000 × 64 B and one 64 KiB reliable message arrive, the large one intact |
@@ -411,7 +412,7 @@ the same commands as the gate:
 |---|---|
 | fmt + clippy + test | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`, and again for `peerwire-ffi --features sync`; `cargo test --workspace --release` and the `sync` feature's tests; the fuzz tests in a debug build |
 | wasm + node | `./packages/js/build.sh`, the wasm size and import check, the Node tests listed in the job (Node 22), and `@peerwire/react`'s build, types and tests |
-| rust-version (1.88) | `cargo check --locked --all-features` of the seven crates on crates.io, on Rust 1.88: the workspace's `rust-version`, which the gate's clippy holds the code to (`incompatible_msrv`) but can't build with |
+| rust-version (1.88) | `cargo check --locked --all-features` of the seven crates on crates.io, on Rust 1.88: the workspace's `rust-version`, which the gate's clippy holds the code to (`incompatible_msrv`) and its `rust-version` step the lock to, but can't build with |
 | docker build | `docker compose config` and a build of the peer and examples images (never pushed) |
 
 Browser tests (headless Chromium) run in the gate, not in CI. `scripts/gate.sh --strict` runs CI's Node list again

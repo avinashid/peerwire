@@ -21,6 +21,7 @@
 //! holds that identity's secret key.
 
 mod addr;
+pub mod ble;
 mod crypto;
 mod endpoint;
 #[cfg(test)]

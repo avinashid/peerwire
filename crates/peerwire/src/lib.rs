@@ -55,6 +55,10 @@
 
 #[cfg(feature = "tokio")]
 mod async_node;
+#[cfg(feature = "ble")]
+pub mod ble;
+#[cfg(feature = "ble-bluez")]
+mod bluez;
 mod lan;
 mod node;
 #[cfg(feature = "nostr")]

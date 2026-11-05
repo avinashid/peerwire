@@ -13,12 +13,12 @@
 #   scripts/gate.sh --full      run the Rust steps (tests, clippy, fmt, fuzz) even when no Rust changed: they are
 #                               skipped when every file changed since GATE_BASE is JS, docs or another non-Rust path
 #
-# Order: two lanes from the start. The Rust lane, at a lower CPU priority: clippy, fmt, the test builds, then the
-# tests. The JS lane: the wasm and React builds, then the Node tests (GATE_JOBS at a time) beside the browser tests
-# (GATE_BROWSER_JOBS at a time). The Rust tests are built with the gate profile (release, built incrementally) and
-# the debug fuzzers with the fuzz one (Cargo.toml), and run under cargo-nextest when it is installed (doctests
-# through cargo test --doc), else under cargo test. Each step writes its own log, target/gate-logs/<step>.log; a
-# failed step's log is printed in full before the summary.
+# Order: two lanes from the start. The Rust lane, at a lower CPU priority: clippy, fmt, the lock against the MSRV, the
+# test builds, then the tests. The JS lane: the wasm and React builds, then the Node tests (GATE_JOBS at a time) beside
+# the browser tests (GATE_BROWSER_JOBS at a time). The Rust tests are built with the gate profile (release, built
+# incrementally) and the debug fuzzers with the fuzz one (Cargo.toml), and run under cargo-nextest when it is installed
+# (doctests through cargo test --doc), else under cargo test. Each step writes its own log, target/gate-logs/<step>.log;
+# a failed step's log is printed in full before the summary.
 # The docs' samples are tested too (NB-070): the Rust ones compile, never run, in "rust doc samples" (on a change to
 # Rust or Markdown); the JS ones and every link in "node docs samples" and "node docs links".
 #
@@ -400,6 +400,7 @@ rust_lane() {
     skip "cargo clippy" "$rust_skip"
     [ $strict = 0 ] || skip "fuzz (debug)" "$rust_skip"
     skip "cargo fmt" "$rust_skip"
+    skip "rust-version" "$rust_skip"
     [ -z "$samples_skip" ] || skip "rust doc samples" "$samples_skip"
   else
     if [ $strict = 1 ]; then
@@ -412,6 +413,8 @@ rust_lane() {
     else
       skip "cargo fmt" "rustfmt not installed"
     fi
+    # No Rust 1.88 here to build with, as CI's msrv job does: each locked crate's rust-version against ours.
+    step "rust-version" node scripts/rust-version.mjs
   fi
   if [ -z "$rust_skip" ]; then
     echo "==> build the Rust tests (log: $LOGS/rust-build.log)"
@@ -489,7 +492,7 @@ fi
 # The summary, in the order of the old one-at-a-time gate.
 order=("cargo test" "rust doc samples" "cargo clippy")
 [ $strict = 0 ] || order+=("fuzz (debug)")
-order+=("cargo fmt" "wasm build" "wasm size+imports" "react build+types")
+order+=("cargo fmt" "rust-version" "wasm build" "wasm size+imports" "react build+types")
 for s in "${NODE[@]}"; do order+=("${s%%|*}"); done
 order+=("${CI_NAMES[@]}")
 for s in "${BROWSER[@]}"; do order+=("${s%%|*}"); done

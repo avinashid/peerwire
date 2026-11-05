@@ -867,13 +867,15 @@ fn hidden<A: Address>(path: &Path<A>) -> bool {
 }
 
 /// The relayed links that stay relayed: through a relay listed in `.0` if `.1`, through any other if `.2`
-/// ([`Endpoint::set_keep_relayed`]), and on a relayed address if `.3` ([`Endpoint::set_keep_turn`]).
-type Keep = (Vec<PeerId>, bool, bool, bool);
+/// ([`Endpoint::set_keep_relayed`]), on a relayed address but a radio's if `.3` ([`Endpoint::set_keep_turn`]), and
+/// on a radio connection if `.4` ([`Endpoint::set_keep_radio`]).
+type Keep = (Vec<PeerId>, bool, bool, bool, bool);
 
 /// Whether a link on `path` stays there ([`Keep`]).
 fn keeps_path<A: Address>(keep: &Keep, path: &Path<A>) -> bool {
     match path {
         Path::Via(r) => keeps(keep, r),
+        Path::Direct(a) if a.radio() => keep.4,
         Path::Direct(a) => keep.3 && a.relayed(),
     }
 }
@@ -939,7 +941,7 @@ impl<A: Address> Endpoint<A> {
             events: VecDeque::new(),
             stats: Stats::default(),
             relay_only: false,
-            keep_relayed: (Vec::new(), false, false, false),
+            keep_relayed: (Vec::new(), false, false, false, false),
             relay_total: (0, None),
         }
     }
@@ -1012,7 +1014,7 @@ impl<A: Address> Endpoint<A> {
     /// next timer; an answer to that punch moves it nowhere); let go, it punches to its candidates once given one
     /// more. Replaces the last call; by default no link is kept.
     pub fn set_keep_relayed(&mut self, relays: &[PeerId], listed: bool, others: bool) {
-        self.keep_relayed = (relays.to_vec(), listed, others, self.keep_relayed.3);
+        self.keep_relayed = (relays.to_vec(), listed, others, self.keep_relayed.3, self.keep_relayed.4);
         self.stop_kept();
     }
 
@@ -1021,6 +1023,14 @@ impl<A: Address> Endpoint<A> {
     /// no punch and stop punching at once. Off by default.
     pub fn set_keep_turn(&mut self, on: bool) {
         self.keep_relayed.3 = on;
+        self.stop_kept();
+    }
+
+    /// Keeps links on radio connections ([`Address::radio`]) there, as [`set_keep_turn`](Endpoint::set_keep_turn)
+    /// keeps them on relayed addresses: they punch to nothing, answer no punch and stop punching at once, so neither
+    /// end moves them to a direct path. For a host whose links may take a radio but no direct path. Off by default.
+    pub fn set_keep_radio(&mut self, on: bool) {
+        self.keep_relayed.4 = on;
         self.stop_kept();
     }
 
@@ -1777,6 +1787,36 @@ impl<A: Address> Endpoint<A> {
             return None;
         }
         self.sessions.get(&idx).filter(|s| s.path.direct() == Some(&from)).map(|s| (s.peer, auth == Auth::Fresh))
+    }
+
+    /// Like [`Endpoint::handle_datagram_direct`], for a channel no peer is bound to yet, such as a new Bluetooth
+    /// connection (`docs/concepts/bluetooth.md`, BLE-R10). It takes only an HS1, which opens a session on `from`; an
+    /// HS2 or a cookie answering a dial that targets `from`; and a data packet for a session whose path is `from`.
+    /// Anything else is dropped unread ([`Stats::rx_wrong_peer`]), so a packet sniffed from another path can't move a
+    /// link onto the channel. Returns the peer to bind the channel to: the one whose session on `from` the packet
+    /// authenticated as fresh (an HS2 that finished a dial over it, or data with a new nonce). An HS1 never binds one,
+    /// as a copy of one reads again (NB85-1). Once bound, the host hands the channel's datagrams to
+    /// [`handle_datagram_from`](Endpoint::handle_datagram_from).
+    pub fn handle_datagram_unbound(&mut self, now: Instant, from: A, data: &[u8]) -> Option<PeerId> {
+        let takes = match wire::parse(data) {
+            // Malformed: counted as such by `on_packet`.
+            None | Some(Packet::Hs1 { .. }) => true,
+            Some(Packet::Hs2 { receiver, .. } | Packet::Cookie { receiver, .. }) => {
+                let target = Path::Direct(from.clone());
+                let dials = |s: &Session<A>| matches!(&s.state, State::Dialing(d) if d.targets.contains(&target));
+                self.sessions.get(&receiver).is_some_and(dials)
+            }
+            Some(Packet::Data { receiver, .. }) => {
+                self.sessions.get(&receiver).is_some_and(|s| s.path.direct() == Some(&from))
+            }
+        };
+        if !takes {
+            self.stats.rx_packets += 1;
+            self.stats.rx_wrong_peer += 1;
+            return None;
+        }
+        let (peer, fresh) = self.handle_datagram_direct(now, from, data)?;
+        fresh.then_some(peer)
     }
 
     /// Returns the session the packet belonged to, and whether it authenticated
@@ -3745,6 +3785,61 @@ mod tests {
         assert!(ex.is_connected(&y));
     }
 
+    /// BLE-R10: on a channel no peer is bound to, an HS1 opens a session but binds nothing; the initiator's first fresh
+    /// data packet on it binds the channel to the initiator. On the initiator's side the HS2 that finishes its dial
+    /// over the channel binds it at once.
+    #[test]
+    fn an_unbound_channel_binds_on_a_fresh_packet_not_an_hs1() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (x, y) = (ids[0].peer_id(), ids[1].peer_id());
+        let mut ex = Endpoint::<u32>::new(&ids[0], Config::default(), [1; 32]);
+        let mut ey = Endpoint::<u32>::new(&ids[1], Config::default(), [2; 32]);
+        let t = Instant::from_millis(1);
+        ex.connect(t, 20, y).unwrap();
+        let hs1 = ex.poll_transmit(t).unwrap().payload;
+        assert_eq!(ey.handle_datagram_unbound(t, 10, &hs1), None, "an HS1 binds nothing");
+        let hs2 = ey.poll_transmit(t).unwrap().payload;
+        assert_eq!(ey.handle_datagram_unbound(t, 10, &hs1), None, "nor its copy");
+        assert_eq!(ex.handle_datagram_unbound(t, 20, &hs2), Some(y), "the HS2 that finishes the dial over it");
+        assert!(ex.is_connected(&y));
+        ex.send(&y, Lane::Reliable, b"hi").unwrap();
+        let data = ex.poll_transmit(t).unwrap().payload;
+        assert_eq!(ey.handle_datagram_unbound(t, 10, &data), Some(x), "fresh data on the session there");
+        assert_eq!(ey.handle_datagram_unbound(t, 10, &data), None, "a copy isn't fresh");
+        assert_eq!((ex.stats().rx_wrong_peer, ey.stats().rx_wrong_peer), (0, 0));
+    }
+
+    /// BLE-R10: an unbound channel takes no HS2 or cookie for a dial elsewhere, and no data of a link on another
+    /// path, even a fresh packet of it: dropped unread and counted, so a sniffed packet can't move a link onto it.
+    #[test]
+    fn an_unbound_channel_takes_nothing_of_a_link_elsewhere() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let y = ids[1].peer_id();
+        let mut ex = Endpoint::<u32>::new(&ids[0], Config::default(), [1; 32]);
+        let mut ey = Endpoint::<u32>::new(&ids[1], Config::default(), [2; 32]);
+        let t = Instant::from_millis(1);
+        ex.connect(t, 2, y).unwrap();
+        let hs1 = ex.poll_transmit(t).unwrap().payload;
+        ey.handle_datagram(t, 1, &hs1);
+        let hs2 = ey.poll_transmit(t).unwrap().payload;
+        assert_eq!(ex.handle_datagram_unbound(t, 9, &hs2), None, "the dial targets 2, not 9");
+        assert_eq!((ex.stats().rx_wrong_peer, ex.is_connected(&y)), (1, false));
+        ex.handle_datagram(t, 2, &hs2);
+        assert!(ex.is_connected(&y));
+        ex.send(&y, Lane::Reliable, b"one").unwrap();
+        let data = ex.poll_transmit(t).unwrap().payload;
+        ey.handle_datagram(t, 1, &data);
+        events(&mut ey);
+        ex.send(&y, Lane::Reliable, b"two").unwrap();
+        let data = ex.poll_transmit(t).unwrap().payload;
+        assert_eq!(ey.handle_datagram_unbound(t, 9, &data), None);
+        assert_eq!(ey.stats().rx_wrong_peer, 1);
+        assert_eq!(ey.path(&ids[0].peer_id()), Some(&Path::Direct(1)), "the link stays where it was");
+        assert_eq!(events(&mut ey).iter().filter(|e| matches!(e, Event::Message { .. })).count(), 0);
+        ey.handle_datagram(t, 1, &data);
+        assert_eq!(events(&mut ey).iter().filter(|e| matches!(e, Event::Message { .. })).count(), 1, "still fresh");
+    }
+
     /// NB99-1: `peer_of` names a peer by the receiver index of an HS2 (to its dial) or a Data packet, read from the
     /// header; an HS1, an index no link has, or a datagram that isn't a packet names none.
     #[test]
@@ -5028,12 +5123,15 @@ mod tests {
     }
 
     /// An address that may go through a relay server (bit `TR`), which forwards both ways as a TURN server does:
-    /// what endpoint `i` sends to `j | TR` reaches `j` from `i | TR`.
+    /// what endpoint `i` sends to `j | TR` reaches `j` from `i | TR`; or over a radio connection (bit `RADIO`), the
+    /// same way.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     struct Tr(u32);
     const TR: u32 = 0x100;
     /// With `TR`: through the sending endpoint's own allocation on the relay server ([`Address::own_turn`]).
     const OWN: u32 = 0x200;
+    /// A radio connection ([`Address::radio`]).
+    const RADIO: u32 = 0x400;
 
     impl Address for Tr {
         fn encode(&self, out: &mut Vec<u8>) {
@@ -5043,18 +5141,21 @@ mod tests {
             u32::decode(b).map(Tr)
         }
         fn relayed(&self) -> bool {
-            self.0 & TR != 0
+            self.0 & (TR | RADIO) != 0
         }
         fn own_turn(&self) -> bool {
             self.0 & OWN != 0
+        }
+        fn radio(&self) -> bool {
+            self.0 & RADIO != 0
         }
     }
 
     /// Where what endpoint `i` sends to `dst` goes: to the endpoint at `dst`, from `i`'s address, through the relay
     /// server if `dst` is; `None` if no endpoint is there.
     fn to(i: usize, dst: Tr) -> Option<(usize, Tr)> {
-        let j = ((dst.0 & !TR) as usize).checked_sub(1)?;
-        Some((j, Tr((i as u32 + 1) | (dst.0 & TR))))
+        let j = ((dst.0 & !(TR | RADIO)) as usize).checked_sub(1)?;
+        Some((j, Tr((i as u32 + 1) | (dst.0 & (TR | RADIO)))))
     }
 
     /// As `to`, with endpoint 0's allocation on the relay server: what 0 sends through it (`j | TR | OWN`) reaches `j`
@@ -5118,6 +5219,34 @@ mod tests {
 
     fn tr_events(ep: &mut Endpoint<Tr>) -> Vec<Event<Tr>> {
         std::iter::from_fn(|| ep.poll_event()).collect()
+    }
+
+    /// NB-110: a link on a radio connection kept there (`set_keep_radio`, as for a policy with no direct path)
+    /// punches to none of the peer's addresses and answers none of its punches, so neither end moves it to the direct
+    /// path, though that works and the peer punches to it. Let go, it moves to the first address that answers.
+    #[test]
+    fn kept_radio_links_stay_on_the_radio() {
+        let (mut eps, ids) = tr_endpoints(2);
+        let (a, b) = (ids[0], ids[1]);
+        let mut t = Instant::from_millis(1);
+        eps[0].set_keep_radio(true);
+        eps[0].connect_with(t, b, &[Path::Direct(Tr(2 | RADIO))]).unwrap();
+        route_tr(&mut eps, &mut t, 300, to);
+        let radio = (Some(&Path::Direct(Tr(2 | RADIO))), Some(&Path::Direct(Tr(1 | RADIO))));
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), radio, "linked over the radio");
+        eps[0].add_candidates(t, &b, &[Tr(2)]);
+        eps[1].add_candidates(t, &a, &[Tr(1)]);
+        assert!(eps[0].sessions[&eps[0].peers[&b]].punch.is_none(), "a kept link arms no punch");
+        route_tr(&mut eps, &mut t, 6000, to);
+        assert!(eps[1].stats().punches_sent > 0, "b punches to a's address");
+        assert_eq!(eps[0].stats().punches_sent, 0, "a punches to nothing");
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), radio, "and answers none of b's punches");
+        assert!(tr_events(&mut eps[0]).iter().all(|e| !matches!(e, Event::PathChanged { .. })));
+
+        eps[0].set_keep_radio(false);
+        eps[0].add_candidates(t, &b, &[Tr(2)]);
+        route_tr(&mut eps, &mut t, 1000, to);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(Tr(2))), Some(&Path::Direct(Tr(1)))));
     }
 
     /// NB-099: a link at a relayed address (a dialled b through the relay server and directly, and only the relay
