@@ -1,3 +1,5 @@
+#[cfg(feature = "ble")]
+use crate::ble::{Ble, Inbound, Radio};
 use crate::portmap::{self, PortMapping, Worker};
 use crate::signaling::Signaling;
 use crate::traversal::{Birthday, Failure, Hop, NatType, PathKind, Policy, Privacy, Role, Signal, Traversal};
@@ -103,6 +105,8 @@ pub struct Builder {
     policy: Option<Policy>,
     #[cfg(feature = "turn")]
     turn: Vec<TurnServer>,
+    #[cfg(feature = "ble")]
+    radio: Option<Box<dyn Radio>>,
 }
 
 impl Builder {
@@ -189,6 +193,16 @@ impl Builder {
         self
     }
 
+    /// A Bluetooth LE radio (feature `ble`): while in a room, the node advertises and links with the members it hears
+    /// over it, with no network, ranking it below every UDP path ([`PathKind::Bluetooth`]); see the
+    /// [`ble`](crate::ble) module and `docs/concepts/bluetooth.md`. Under [`Privacy::RelayOnly`] the radio stays off.
+    /// Default: none.
+    #[cfg(feature = "ble")]
+    pub fn bluetooth(mut self, radio: impl Radio + 'static) -> Self {
+        self.radio = Some(Box::new(radio));
+        self
+    }
+
     /// Binds the UDP socket: `"[::]:0"` for any interface, IPv4 and IPv6, and a
     /// free port (see [`Node::bind`]).
     pub fn bind(self, addr: impl ToSocketAddrs) -> io::Result<Node> {
@@ -215,6 +229,12 @@ impl Builder {
         trav.set_policy(peerwire_core::Instant::ZERO, &mut ep, self.policy);
         #[cfg(feature = "turn")]
         trav.set_turn_servers(peerwire_core::Instant::ZERO, &mut ep, resolve_turn(&self.turn, local));
+        #[cfg(feature = "ble")]
+        let ble = self.radio.map(|r| {
+            let mut b = Ble::new(r, identity.peer_id(), peerwire_core::Instant::ZERO);
+            b.set_enabled(peerwire_core::Instant::ZERO, !matches!(self.privacy, Privacy::RelayOnly { .. }));
+            b
+        });
         let mut node = Node {
             sock,
             local,
@@ -237,6 +257,10 @@ impl Builder {
             next_extra: 0,
             #[cfg(any(test, feature = "testing"))]
             sources: None,
+            #[cfg(any(test, feature = "testing"))]
+            udp_off: false,
+            #[cfg(feature = "ble")]
+            ble,
         };
         node.sync_port_mapping();
         node.pump_signals();
@@ -273,6 +297,12 @@ pub struct Node {
     /// Where the datagrams the socket read came from, once a test asked ([`Node::note_sources`]).
     #[cfg(any(test, feature = "testing"))]
     sources: Option<std::collections::BTreeSet<SocketAddr>>,
+    /// The socket's datagrams are dropped both ways, as with the Wi-Fi gone ([`Node::set_udp_off`]).
+    #[cfg(any(test, feature = "testing"))]
+    udp_off: bool,
+    /// The Bluetooth side, with a radio ([`Builder::bluetooth`]).
+    #[cfg(feature = "ble")]
+    ble: Option<Ble>,
 }
 
 /// An extra socket, opened for birthday punching.
@@ -343,6 +373,8 @@ impl Node {
             policy: None,
             #[cfg(feature = "turn")]
             turn: Vec::new(),
+            #[cfg(feature = "ble")]
+            radio: None,
         }
     }
 
@@ -400,6 +432,10 @@ impl Node {
     pub fn set_privacy(&mut self, privacy: Privacy) {
         let now = self.now();
         self.trav.set_privacy(now, &mut self.ep, privacy);
+        #[cfg(feature = "ble")]
+        if let Some(b) = self.ble.as_mut() {
+            b.set_enabled(now, !matches!(privacy, Privacy::RelayOnly { .. }));
+        }
         if matches!(privacy, Privacy::RelayOnly { .. }) {
             let own = self.trav.relay();
             for r in self.relay_peers.iter().filter(|r| Some(r.peer) != own) {
@@ -713,6 +749,10 @@ impl Node {
     pub fn join_room_with(&mut self, app_id: &str, room: &str, role: Role, host: Option<PeerId>) {
         let now = self.now();
         self.trav.join_room(now, app_id, room, role, host);
+        #[cfg(feature = "ble")]
+        if let Some(b) = self.ble.as_mut() {
+            b.set_room(now, Some((crate::ble::ble_key(app_id, room), crate::Topic::room(app_id, room))));
+        }
         self.pump_signals();
     }
 
@@ -724,6 +764,12 @@ impl Node {
     /// Leaves the room: stops announcing and dialling. Links stay up.
     pub fn leave_room(&mut self) {
         self.trav.leave_room();
+        #[cfg(feature = "ble")]
+        let now = self.now();
+        #[cfg(feature = "ble")]
+        if let Some(b) = self.ble.as_mut() {
+            b.set_room(now, None);
+        }
         self.pump_signals();
     }
 
@@ -778,6 +824,7 @@ impl Node {
             Path::Via(_) => PathKind::Peers,
             Path::Direct(Hop::Net(_)) if self.via_birthday(peer) => PathKind::Birthday,
             Path::Direct(Hop::Net(_)) => PathKind::Direct,
+            Path::Direct(Hop::Ble(_)) => PathKind::Bluetooth,
             Path::Direct(_) => PathKind::Turn,
         })
     }
@@ -828,6 +875,8 @@ impl Node {
         let mut drained = false;
         for _ in 0..MAX_READS_PER_POLL {
             match self.sock.recv_from(&mut self.buf[..]) {
+                #[cfg(any(test, feature = "testing"))]
+                Ok(_) if self.udp_off => {}
                 Ok((n, from)) => {
                     // A dual-stack socket sees IPv4 peers as ::ffff:a.b.c.d.
                     let from = Hop::Net(SocketAddr::new(from.ip().to_canonical(), from.port()));
@@ -862,6 +911,8 @@ impl Node {
                 self.trav.handle_signal(now, &mut self.ep, topic, &payload);
             }
         }
+        #[cfg(feature = "ble")]
+        self.poll_ble(now);
         if self.ep.poll_timeout().is_some_and(|t| t <= now) {
             self.ep.handle_timeout(now);
         }
@@ -924,7 +975,31 @@ impl Node {
         self.keep_relay_links(wall);
         self.flush(now);
         self.pump_signals();
+        #[cfg(feature = "ble")]
+        if let Some(b) = self.ble.as_mut() {
+            b.send_queued();
+        }
         drained
+    }
+
+    /// Takes what the radio reported: datagrams go to the endpoint as it comes, signals to the traversal, which
+    /// may dial their sender over the connection they came on.
+    #[cfg(feature = "ble")]
+    fn poll_ble(&mut self, now: peerwire_core::Instant) {
+        let Some(b) = self.ble.as_mut() else { return };
+        b.poll(now, &mut self.ep);
+        while let Some(i) = self.ble.as_mut().and_then(Ble::take) {
+            match i {
+                Inbound::Signal { topic, payload, via, conn } => {
+                    let proved = self.trav.handle_signal_via(now, &mut self.ep, topic, &payload, Some(via));
+                    if let (Some(peer), Some(b)) = (proved, self.ble.as_mut()) {
+                        b.heard(conn, now, peer);
+                    }
+                }
+                Inbound::Proven => self.trav.hello_soon(now),
+                Inbound::Closed(hop) => self.trav.forget_radio(&hop),
+            }
+        }
     }
 
     /// Hands on an event of the core's: to the traversal and the node, then to the app unless it is the node's own
@@ -977,7 +1052,7 @@ impl Node {
 
     /// How long until a timer needs [`poll`](Node::poll), if one is armed. A host that
     /// sleeps should wake at this or when the socket is readable, whichever is first.
-    /// With a signaling carrier it is at most 50 ms, as carriers are polled.
+    /// With a signaling carrier or a radio it is at most 50 ms, as both are polled.
     pub fn next_timeout(&self) -> Option<Duration> {
         let wall = Instant::now();
         let now = self.at(wall);
@@ -988,10 +1063,29 @@ impl Node {
         let redial = redial.filter(|_| !matches!(self.privacy(), Privacy::RelayOnly { .. }) && self.relay_peers_on());
         let extra = (!self.extra.is_empty()).then_some(EXTRA_POLL);
         let t = [t, redial, extra].into_iter().flatten().min();
-        match self.signaling {
-            Some(_) => Some(t.map_or(SIGNAL_POLL, |t| t.min(SIGNAL_POLL))),
-            None => t,
+        #[cfg(feature = "ble")]
+        let polled = self.signaling.is_some() || self.ble.is_some();
+        #[cfg(not(feature = "ble"))]
+        let polled = self.signaling.is_some();
+        match polled {
+            true => Some(t.map_or(SIGNAL_POLL, |t| t.min(SIGNAL_POLL))),
+            false => t,
         }
+    }
+
+    /// Drops the socket's datagrams both ways while `off`, as with the Wi-Fi gone: a test's (feature `testing`). Not
+    /// for apps.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn set_udp_off(&mut self, off: bool) {
+        self.udp_off = off;
+    }
+
+    /// The radio's connections: open, proven and bound to a peer (features `ble` and `testing`). Not for apps.
+    #[cfg(all(feature = "ble", any(test, feature = "testing")))]
+    #[doc(hidden)]
+    pub fn ble_counts(&self) -> (usize, usize, usize) {
+        self.ble.as_ref().map_or((0, 0, 0), Ble::counts)
     }
 
     /// Starts noting where the datagrams this node's socket reads come from, forgetting those noted so far: a test's
@@ -1037,6 +1131,18 @@ impl Node {
                 self.trav.send_turn(now, &t.dst, &t.payload); // through the allocation: to its server, next
                 continue;
             }
+            if let Hop::Ble(at) = t.dst {
+                #[cfg(feature = "ble")]
+                if let Some(b) = self.ble.as_mut() {
+                    b.send_datagram(&at, &t.payload);
+                }
+                let _ = at; // never to the socket
+                continue;
+            }
+            #[cfg(any(test, feature = "testing"))]
+            if self.udp_off {
+                continue;
+            }
             if !self.try_send(&t) {
                 if self.pending.len() >= MAX_PENDING_SENDS {
                     self.pending.pop_front();
@@ -1061,6 +1167,10 @@ impl Node {
     /// Hands the traversal's signaling actions to the carrier (dropped without one).
     fn pump_signals(&mut self) {
         while let Some(s) = self.trav.poll_signal() {
+            #[cfg(feature = "ble")]
+            if let (Signal::Publish(t, payload), Some(b)) = (&s, self.ble.as_mut()) {
+                b.publish(*t, payload);
+            }
             let Some(sig) = self.signaling.as_mut() else { continue };
             match s {
                 Signal::Subscribe(t) => sig.subscribe(t),
