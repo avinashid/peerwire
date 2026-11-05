@@ -35,7 +35,7 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 |---|---|---|
 | Signaling relay (Nostr, BroadcastChannel) | No | May read, drop, reorder, replay or inject any signaling message. Cannot forge a sealed payload or impersonate a PeerId. |
 | The LAN, for `LanSignaling` | No | Every device on the link, and every program on the machine, hears each frame and can send its own, with no relay to pace it. The same limits as a relay: cannot open or forge a sealed payload. See [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6). |
-| Devices in Bluetooth range, for a node with a radio (`ble`, NB-110) | No | Hear every advert and can follow any connection, as nothing is paired; may connect, replay adverts, relay between two connections, jam or cut a link. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [Bluetooth LE](#bluetooth-le-nb-110--nb110-1nb110-12). |
+| Devices in Bluetooth range, for a node with a radio (`ble`, NB-110) | No | Hear every advert and can follow any connection, as nothing is paired; may connect, replay adverts, relay between two connections, jam or cut a link. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1). |
 | Peer relay (`FWD`/`RELAYED`) | No | Sees only ciphertext; rate-limited; forwards only to already-connected peers. |
 | NAT / on-path network | No | Noise authenticates the endpoints; cannot MITM. Can drop/delay. |
 | A TURN server the app lists (`iceServers`; in Rust `turn_servers`, NB-099) | Partially | The app's choice, not ours. Sees our address, the peers' addresses, sizes and timing, never a payload; can drop or delay; picks the relayed address we offer. Under `Privacy::RelayOnly` with `Turn` in the policy (NB-101) the peers see its relayed address instead of ours. See [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) and [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1). |
@@ -172,15 +172,16 @@ release of each.
 | NB99-I2 (Info) | **Fixed** by `1551da7` (NB-100, merged with NB-101), reviewed 2026-11-05: every claimant of a relayed address is kept, and a claim relabels its claimant's packets alone; the 256-claim cap stays, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
 | NB101-1 (Low), NB101-I1 (Info) | **Fixed** by `ee3ef67` and `016c77f` before NB-101 merged, so never on main (under relay-only with TURN, a relay peer's invite is dialled through the allocation; a link that shows the node's address goes onto an allocation at any of the peer's addresses, or closes without a Close and is dialled afresh through the relay), reviewed 2026-11-05; residuals accepted, [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1) |
 | NB101-I2 (Info) | **Fixed** by `807d66a` (NB-108), reviewed 2026-11-05: `hide()` retags a link a policy change is moving onto an allocation, or closes it, before its `moving` guard, then leaves it to that move, which closes it if it fails or is late, so nothing more of the link leaves the socket, same section |
-| NB110-1, NB110-2, NB110-3 (Low) | **Fixed** by `7ae7ac8`, `4cb542f`, `fee4639`, `ebf3530` and `33b1f4f` before NB-110 merged (`74c7452`), so never on main, before `ble` was published (a connection no peer is bound to takes only an HS1, the answer to a dial over it and data of a session on it; a newcomer closes the weakest unbound connection, and standbys leave one slot free; new handshakes on unbound connections are budgeted per connection and across the radio), reviewed 2026-11-05; residual: Bluetooth can hold 4 of an ESP32-C3's 8 half-open handshakes, [Bluetooth LE](#bluetooth-le-nb-110--nb110-1nb110-12) |
+| NB110-1, NB110-2, NB110-3 (Low) | **Fixed** by `7ae7ac8`, `4cb542f`, `fee4639`, `ebf3530` and `33b1f4f` before NB-110 merged (`74c7452`), so never on main, before `ble` was published (a connection no peer is bound to takes only an HS1, the answer to a dial over it and data of a session on it; a newcomer closes the weakest unbound connection, and standbys leave one slot free; new handshakes on unbound connections are budgeted per connection and across the radio), reviewed 2026-11-05; residual: Bluetooth can hold 4 of an ESP32-C3's 8 half-open handshakes, [Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1) |
 | NB110-4, NB110-5 (Low) | **Fixed** on the node's side by `ec79f1a`, `fee4639` and `4cb542f` before NB-110 merged (the address, `n` and tag change together; the GAP name is `Peerwire`, and `BlueZ::names_this_host` says when Linux's is the host name), reviewed 2026-11-05; on Linux BlueZ picks the address and the name: accepted as documented, same section |
 | NB110-6…NB110-9 (Low) | **Fixed** by `33b1f4f`, `287ebd8` and `d202fd3` before NB-110 merged (only a `PeerId` proven on the connection, or a session bound to it, counts for anything; the BlueZ driver serves the subscriber BlueZ hands over and takes its writes alone; a refused central tries again in 1–4 s; a central the advert doesn't count makes way), reviewed 2026-11-05; NB110-8 has one BlueZ behaviour to check on a radio, same section |
 | NB110-10 (Low) | **Fixed** by `b95141b`, merged `6efda8b`, before `ble` was published (a central holds an advert by the device it came from as well as its `n`, so a replayed copy holds itself alone), reviewed 2026-11-05, same section |
-| NB110-11 (Low) | **Fixed** by `708038f`, merged `51b4e8f`, before `ble` was published (a connect not up within 12 s is given up as a failed one and holds that device's advert; connects under way count against the node's own connects alone; the BlueZ driver gives its setup 10 s and disconnects on a failure), reviewed 2026-11-05; residual: a replayed advert heard first costs each race it wins 12 s, 10 s once NB-112 is in, same section |
-| NB110-12 (Low), NB110-T1 (Info) | Open, folded into NB-112 (the BlueZ driver): the driver's command loop waits on each disconnect, so a device in range that subscribes and is closed can delay the node's connects past their 12 s; no test pins a connect under way against the connection limit, same section |
+| NB110-11 (Low) | **Fixed** by `708038f`, merged `51b4e8f`, before `ble` was published (a connect not up within 12 s is given up as a failed one and holds that device's advert; connects under way count against the node's own connects alone; the BlueZ driver gives its setup 10 s and disconnects on a failure), reviewed 2026-11-05; residual: a replayed advert heard first costs each race it wins 10 s, the driver's own deadline, since NB-112 (`86fee9d`), same section |
+| NB110-12 (Low), NB110-T1 (Info) | **Fixed** by `86fee9d` (NB-112), before `ble-bluez` was published, reviewed 2026-11-05: the BlueZ driver's command loop awaits no disconnect (each runs in a task of its own, the served central's task drops its link, a failed connect is reported first), and a test pins a connect under way against the connection limit, same section |
+| NB112-1 (Low), NB112-I1, NB112-I2 (Info) | **Fixed** by `680e273` before NB-112 merged, so never on main (the BlueZ scan never drops a device that has advertised the service for another, and lists BlueZ's devices again, at most every 30 s, for those it left out; connects the driver gives up when it leaves an adapter are stopped at BlueZ; the driver powers an adapter on only at start), reviewed 2026-11-05; residual: while a burst of service adverts holds all 256 slots, a member that arrives is reported once, then not followed, same section |
 | NB110-I1 (Info) | Open (on main, over UDP): on the ESP32 port one source that knows the node's PeerId fills all 8 half-open handshake slots, 10 s at a time, same section |
 | NB110-I2…NB110-I10 (Info) | NB110-I3 **fixed** by `33b1f4f`, and NB110-I10's first edge by `708038f`; I2, I4 documented; I5, I6, I8 accepted; I7, I9 and I10's second edge open, same section |
-| BlueZ 5.87 (NB-113) | Not Peerwire's: `bluetoothd` 5.87 crashes when a UUID discovery filter meets an advert that lists a UUID; fixed upstream by `82af2beaf`, in no BlueZ release yet. The Linux driver's scan sets such a filter until NB-112 (open) drops it, same section |
+| BlueZ 5.87 (NB-113) | Not Peerwire's: `bluetoothd` 5.87 crashes when a UUID discovery filter meets an advert that lists a UUID; fixed upstream by `82af2beaf`, in no BlueZ release yet. The Linux driver's scan set such a filter until NB-112 (`bb4857c`) dropped it, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -4537,7 +4538,7 @@ and one it did, gave 0 datagrams of the link from the socket after the switch; u
   address hides ours only if the server isn't on the node's own host or behind its NAT:
   there it carries our public IP.
 
-### Bluetooth LE (NB-110) — NB110-1…NB110-12
+### Bluetooth LE (NB-110, NB-112) — NB110-1…NB110-12, NB112-1
 
 Since NB-110, a node given a radio (`Builder::bluetooth`, `peerwire` feature `ble`)
 links with peers in Bluetooth LE range over GATT, beside its UDP paths, and finds room
@@ -4552,16 +4553,17 @@ hop ranks as a relayed address does, last, and isn't in `Policy::default()`. The
 NimBLE driver (NB-110c) and the browser's (NB-110d) aren't on main yet, and none of it
 is in a release.
 
-Reviewed 2026-11-05 in seven passes: security's requirements, BLE-R1…R15 (NB-110b), read
+Reviewed 2026-11-05 in nine passes: security's requirements, BLE-R1…R15 (NB-110b), read
 against main `25c92d0` and the `bluer` 0.17.4 and ESP-IDF 5.5.5 sources; the spec at
 `ac2d952` (NB110-1…NB110-5); the code from `ebf3530` to `3ae92bc` (NB110-6…NB110-8,
 I2…I5); and re-checks of `287ebd8` (NB110-9, I6…I9), `d202fd3` (NB110-10, I10),
-`b95141b` (NB110-11) and `708038f` (NB110-12, T1). Probes ran in a copy of the tree,
-each beside its control on the unfixed head: on real Nodes over the in-process fake
-radios, and in the node's simulated air. BlueZ's behaviour was read from its 5.87
-source. The probes aren't in the tree; the author's tests of the node's findings are.
-Nothing was run over a real radio, as the review host has none: the radio checks named
-below are owed on our own hardware.
+`b95141b` (NB110-11) and `708038f` (NB110-12, T1); then NB-112 at `86fee9d` (NB110-12
+and T1 fixed; NB112-1, I1, I2) and its fix `680e273`, both by reading, as their D-Bus
+paths need an adapter. Probes ran in a copy of the tree, each beside its control on the
+unfixed head: on real Nodes over the in-process fake radios, and in the node's simulated
+air. BlueZ's behaviour was read from its 5.87 source. The probes aren't in the tree; the
+author's tests of the node's findings are. Nothing was run over a real radio, as the
+review host has none: the radio checks named below are owed on our own hardware.
 
 **What holds.**
 - The advert carries the flags, `n` and the tag alone (R1, R2), and `n`, the tag and the
@@ -4775,12 +4777,13 @@ took meanwhile: 1 on a desktop, 2 on an ESP32 (**theoretical**); an extra connec
 that doesn't prove the room closes within 3 s.
 
 Residual, **theoretical**: a copy heard first still wins some of Bob's connects, and
-each costs that connect the full wait: 12 s, as the driver reports a failure only after
-its disconnect returns, 2 s or more after its own 10 s deadline, so the node's 12 s
-give-up comes first; 10 s once NB110-12's fix is in. At a win rate p the expected wait
-is `wait × p/(1−p)`: 1.8 min at 12 s and p = 0.9, 1.5 min at 10 s. It needs no fresh
-address: the hold is by device and `n`, so the same address with another recorded `n` is
-drawn again. A copy that sends one challenge and nothing more costs a race up to 3 s.
+each costs that connect the full wait: 10 s, the driver's own deadline, as since NB-112
+(`86fee9d`) it reports a failure before its disconnect; it was 12 s before, when the
+report waited on the disconnect, 2 s or more past that deadline, and the node's 12 s
+give-up came first. At a win rate p the expected wait is `10 s × p/(1−p)`: 1.5 min at
+p = 0.9 (1.8 min at 12 s). It needs no fresh address: the hold is by device and `n`, so
+the same address with another recorded `n` is drawn again. A copy that sends one
+challenge and nothing more costs a race up to 3 s.
 
 **NB110-12 — The BlueZ driver waits on each disconnect (Low).** At `51b4e8f` the
 driver's command loop awaits each `Disconnect` (`bluez.rs`). BlueZ 5.87 answers one for
@@ -4801,8 +4804,13 @@ Fix: spawn the D-Bus `Disconnect`, so the loop never waits on a remote link; hav
 served central's task drop the link itself; and send `ConnectFailed` before awaiting the
 disconnect.
 
-**Status: open** (Low), reported on NB-110 at `708038f`, and folded into NB-112, the
-BlueZ driver's next change, which is open. `ble-bluez` is in no release.
+**Status: fixed** by `86fee9d` (NB-112), before `ble-bluez` was published; reviewed
+2026-11-05. `Driver::disconnect` takes the connection out of the driver's books at once
+and closes the link in a task of its own, so the command loop awaits no disconnect; the
+served central's task drops its link itself once the node closes it, which ends the
+second effect; and a connect that fails or passes its 10 s reports `ConnectFailed`
+before it disconnects. The author's test covers the books; that the loop never waits
+follows from `disconnect` no longer being `async`.
 
 **NB110-T1 — No test pins a connect under way against the connection limit (Info).** A
 mutant of `708038f` that leaves connects under way out of the connection term of the
@@ -4810,8 +4818,36 @@ node's check before it connects passes every BLE test (25 unit tests, and the 5 
 `tests/ble.rs`). Fix: a test that, with `connections` − 1 bound connections open, a node
 starts one connect, not two.
 
-**Status: open** (Info), reported on NB-110 at `708038f`, and folded into NB-112, which
-is open.
+**Status: fixed** by `86fee9d` (NB-112); reviewed 2026-11-05. In
+`connects_under_way_count_against_the_connections_too` a node with 2 of 3 connections
+bound starts one connect, not two; read against the mutant, it fails.
+
+**NB112-1 — A burst of service adverts pushed members out of the scan (Low).** NB-112
+drops the UUID discovery filter (BlueZ 5.87, below), so the Linux driver's scan hears
+every LE advert, and at `86fee9d` it followed at most 256 devices for changes to their
+adverts. At that cap a device advertising the service took the place of the oldest
+followed, a member when all were of the service, and any device counts as of the service
+once it puts the service UUID in its adverts, with no room key. A Linux member without
+`Privacy=device` advertises from the adapter's own address, so BlueZ keeps it as one
+device, and its new `n` or a repeat reaches the scan only as a change to that device,
+heard only while it is followed. Reproduction, by reading (no adapter on the review
+host): a board advertises the service from 256 fresh addresses in a few seconds; Alice
+and Bob each stop following the other, and BlueZ, which still hears them, never adds
+them again, so once their link drops they don't link over Bluetooth again until a scan
+restarts or one goes quiet for 30 s, long after the board has gone. Fix: never drop a
+device that has advertised the service for another; note one left out, and once a device
+of the service could be followed, list BlueZ's devices again, at most every 30 s.
+
+**Status: fixed** by `680e273` before NB-112 merged, so never on main; reviewed
+2026-11-05. In the author's test a member followed stays through a burst from 512
+addresses, and one left out is listed again at once when there is room, then not again
+for 30 s. Once a burst ends a member is followed again within about 60 s: the burst's
+devices leave BlueZ 30 s after they were last heard, and a listing runs at once, then
+30 s on (**theoretical**). A listing reads each device not followed once, in the scan's
+own task, at most every 30 s. Residual: while a burst holds all 256 slots with devices
+of the service, a member that arrives is reported once, then not followed, so a retry
+after a hold waits for the burst to end; holding them takes about 9 adverts a second
+(**theoretical**, 256 addresses / 30 s) from a device that could jam the radio anyway.
 
 **NB110-I1 — On the ESP32 port one UDP source fills every half-open slot (Info).** On
 main since the port, over UDP, with no Bluetooth: `ports/esp32` sets
@@ -4872,20 +4908,29 @@ the heap allows.
   stays: a central over the limits can close this end's own connection whose peer's
   identity proof runs past the 1 s grace, and that close holds the advert 60 s. Proofs
   take about 0.1 s in the simulated air; the time over a radio is a check. Open.
+- **NB112-I1 — Connects left under way at BlueZ.** When the driver left an adapter that
+  was still there, it reported its connects under way failed but left them pending in
+  BlueZ: harmless, as that adapter was no longer used. **Fixed** by `680e273`: each is
+  disconnected there too.
+- **NB112-I2 — An adapter its user turned off came back on.** At `86fee9d` the driver
+  powered on each adapter it set up on, so one turned off that came back (a USB reset, a
+  restart of `bluetoothd`) was powered again. **Fixed** by `680e273`: the driver powers
+  an adapter on only at start, and one that is off stays off until its user powers it
+  on; BlueZ's `AutoEnable`, on by default, powers on one it finds.
 
 **BlueZ 5.87 (NB-113).** `bluetoothd` from BlueZ 5.87 without upstream commit
 `82af2beaf` (on BlueZ's master, in no release yet) crashes when a scan with a UUID
 discovery filter is running and an advert or scan response that lists a service UUID
 reaches the filter's check: it calls the filter's UUID text as code, so the daemon dies,
 with nothing written first, and the host has no Bluetooth until it restarts. BlueZ 5.86
-and earlier are unaffected. At `51b4e8f` the Linux driver's scan sets such a filter, for
-the service UUID, so on 5.87 a nearby advert or scan response that lists the service
-UUID (a peer's scan response does, where its stack has one) crashes it. NB-112 drops the
-filter and matches the service in the driver. That doesn't make 5.87 safe: any local
-program that can reach `bluetoothd` on the system bus can set such a filter, and once
-NB-112 is in, another app's UUID filter running beside the node's scan, which has none,
-can let any advert that lists a UUID crash it. The fix is BlueZ's: a later release, or a
-5.87 build that carries `82af2beaf`.
+and earlier are unaffected. Until NB-112 the Linux driver's scan set such a filter, for
+the service UUID, so on 5.87 a nearby advert or scan response that listed the service
+UUID (a peer's scan response does, where its stack has one) crashed it. NB-112
+(`bb4857c`) dropped the filter: the driver scans for every LE advert and matches the
+service itself (NB112-1). That doesn't make 5.87 safe: any local program that can reach
+`bluetoothd` on the system bus can set such a filter, and another app's UUID filter
+running beside the node's scan, which has none, can let any advert that lists a UUID
+crash it. The fix is BlueZ's: a later release, or a 5.87 build that carries `82af2beaf`.
 
 **Residuals, accepted.**
 - **Presence.** Anyone in range sees that a Peerwire peer is near (the service UUID in
@@ -4920,10 +4965,10 @@ can let any advert that lists a UUID crash it. The fix is BlueZ's: a later relea
 - **Owed with NB-110c and NB-110d:** the ESP32 driver's pairing refusal (R5), its random
   draws and clock (R15), its 5 s subscribe deadline, NimBLE's connection cap and its 10
   s connect deadline; a phone at an ATT MTU of 23 (R14).
-- **Radio checks owed on our own hardware:** the honest connect time (S above), the time
-  a `Disconnect` takes, NB110-8's subscribers, the gap between a device's reconnects
-  (NB110-I8), the idle links an adapter holds (NB110-I9), and the time from connect to a
-  proven identity (NB110-I10).
+- **Radio checks owed on our own hardware:** the honest connect time (S above),
+  NB110-8's subscribers, the gap between a device's reconnects (NB110-I8), the idle
+  links an adapter holds (NB110-I9), the time from connect to a proven identity
+  (NB110-I10), and the driver's recovery from a refused advert and a USB reset (NB-112).
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 

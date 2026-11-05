@@ -301,8 +301,8 @@ tests use an in-process pair of fake radios.
     nearby may raise a pairing prompt. Nothing in Peerwire pairs or needs it: refuse such a prompt.
   - on BlueZ 5.87 without upstream commit `82af2beaf` (in no release yet), `bluetoothd` crashes when a scan with a UUID
     discovery filter meets an advert or scan response that lists a service UUID, and the host has no Bluetooth until it
-    restarts. Before NB-112 this driver's scan sets such a filter, for the service UUID, so a peer nearby whose advert
-    or scan response lists that UUID sets it off; any other program can set one too, so use a BlueZ with that commit (a
+    restarts. Before NB-112 this driver's scan set such a filter, for the service UUID, so a peer nearby whose advert
+    or scan response listed that UUID set it off; any other program can set one too, so use a BlueZ with that commit (a
     later release, or a 5.87 package that carries it). 5.86 and earlier are unaffected.
 
   As the peripheral the driver serves the central whose subscription to `tx` BlueZ hands over, as a socket with its
