@@ -1370,10 +1370,11 @@ impl<A: Address> Endpoint<A> {
         }
     }
 
-    /// Says that `old`, an address the linked `peer` is at, is `new`: the same address, of another kind (the host
-    /// learnt that a peer's address it linked at is a relayed one, [`Address::relayed`]). The link's path and
-    /// candidates take `new`; a link now on a relayed address punches off it, its race ends. No event. Ignored for
-    /// a peer that isn't linked.
+    /// Says that the linked `peer`, at `old`, is to be reached at `new`: the same address of another kind (the host
+    /// learnt that a peer's address it linked at is a relayed one, [`Address::relayed`]), or another way there, maybe
+    /// to another of the peer's addresses (the host takes a link off its socket onto one of its own TURN allocations,
+    /// [`Address::own_turn`]). The link's path and candidates take `new`; a link now on a relayed address punches off
+    /// it, its race ends. No event. Ignored for a peer that isn't linked.
     pub fn retag(&mut self, now: Instant, peer: &PeerId, old: &A, new: A) {
         let Some(&idx) = self.peers.get(peer) else { return };
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
