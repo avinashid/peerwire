@@ -16,8 +16,10 @@ and the commit that fixed it.
   `peerwire-esp`. Not yet run on a radio.
 - `peerwire-core`: `ble`, the framing codec every host shares (`Chunker`, `Reassembler`, the service's UUIDs);
   `Endpoint::handle_datagram_unbound`, for a channel no peer is bound to yet; `Address::radio`.
-- **Breaking:** `peerwire::Hop` has a new variant, `Ble`, so a `match` on it needs an arm for it (the next release of
-  `peerwire` is 0.2). `Traversal::handle_signal_via`, `Traversal::forget_radio` and `Traversal::hello_soon` are new.
+- **Breaking:** `peerwire::Hop` has a new variant, `Ble`, and is `#[non_exhaustive]` from now on, so a `match` on it
+  outside the crate needs a `_` arm (the next release of `peerwire` is 0.2; `peerwire-peer` and `peerwire-esp` move
+  with it). `Traversal::handle_signal_via`, `Traversal::forget_radio` and `Traversal::hello_soon` are new, and so
+  are `Node::set_waker` (feature `ble`) and `AsyncNode` waking on its radio.
 
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 

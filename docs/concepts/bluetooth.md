@@ -176,7 +176,7 @@ puts a link on.
 | | Linux | ESP32 |
 |---|---|---|
 | Connections | 8, one of them as the peripheral | 3 |
-| Unproven or unbound connections | 4; more are closed at once | 2 |
+| Unproven or unbound connections | 4; a central over that closes the oldest of them, so held ones can't lock newcomers out | 2 |
 | Time to prove the room | 10 s, then the connection closes | same |
 | A proven connection bound to no peer | open while a signal proves a member at least every 60 s | same |
 | Distinct HS1s on an unbound connection | 1 per 10 s (a half-open handshake's life); its resends pass | same |
@@ -186,8 +186,9 @@ puts a link on.
 | Partial messages per connection | one per direction, at most 1,233 B | same |
 | Values queued to send per connection | 64; more are dropped, never waited for | 16 |
 
-A peer that is full stops advertising as connectable, or marks its advert full. Linux takes one central at a time
-because BlueZ sends a notification to every subscribed central (BLE-R8).
+A peer that holds all the connections or all the centrals it can marks its advert full and refuses another central.
+Linux takes one central at a time because BlueZ sends a notification to every subscribed central (BLE-R8). The
+addresses naming connections (`Hop::Ble`) are never reused within a process, nor handed to another connection.
 
 ## What a listener on the radio sees
 
@@ -207,7 +208,8 @@ driver for the radio, so each platform writes only the driver. In `peerwire` (fe
 ```text
 pub trait Radio: Send {
     /// Advertises with `data` as the service data, replacing the last; `None` stops. Serves the GATT service, and
-    /// accepts centrals, while advertising. Each call with data comes from a new random address.
+    /// accepts centrals, while advertising. Each call with data comes from a new random address, and lists the
+    /// service UUID (AD 0x07) in the scan response where the stack can set one.
     fn advertise(&mut self, data: Option<&[u8]>);
     /// Starts or stops scanning, passively, for the service's adverts.
     fn scan(&mut self, on: bool);
@@ -224,6 +226,9 @@ pub trait Radio: Send {
     /// What it holds at once (connections, unbound ones, centrals, values queued): `Limits::DESKTOP` unless the
     /// driver says otherwise; an ESP32's says `Limits::SMALL`.
     fn limits(&self) -> Limits { Limits::DESKTOP }
+    /// A waker to wake each time it queues an event, so a node asleep until its next timer polls at once; a driver
+    /// that never wakes it still works, as a node with a radio polls at least every 50 ms. Default: ignored.
+    fn set_waker(&mut self, waker: Waker) {}
 }
 
 pub enum RadioEvent {
@@ -236,7 +241,8 @@ pub enum RadioEvent {
 }
 ```
 
-`DeviceId(u64)` and `ConnId(u32)` are the driver's own numbers. `Builder::bluetooth(radio)` gives a node its radio.
+`DeviceId(u64)` and `ConnId(u32)` are the driver's own numbers. `Builder::bluetooth(radio)` gives a node its radio;
+`Node::poll` drains its events, and `Node::set_waker` (which `AsyncNode` calls itself) hands it a waker.
 Feature `ble-bluez` adds the Linux driver, `BlueZ`; the ESP32's NimBLE driver lives in `peerwire-esp` (NB-110c), and
 tests use an in-process pair of fake radios.
 
@@ -247,8 +253,9 @@ tests use an in-process pair of fake radios.
   - with `Privacy=device` in `/etc/bluetooth/main.conf` BlueZ advertises from a resolvable private address that
     changes every 15 minutes, and without it from the adapter's own, which tracks the machine (the driver can't
     tell which);
-  - the GAP name is the adapter's alias, the host name unless set (`bluetoothctl system-alias Peerwire`), which
-    `BlueZ::alias` reports for the app to check;
+  - the GAP name is the adapter's alias, the host name unless set (`bluetoothctl system-alias Peerwire`):
+    `BlueZ::alias` reports it, and `BlueZ::names_this_host` says when it is the host name, for the app to tell its
+    user;
   - its discovery scans actively, so the radio sends scan requests from its address;
   - it can't add a scan response, so Web Bluetooth's picker must filter on the service data (to be checked on a
     phone).

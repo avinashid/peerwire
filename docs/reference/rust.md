@@ -109,7 +109,7 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND` and `NostrStats` | `src/nostr.rs` |
 | `Privacy`, `Role`, `NatType`, `Failure`, `Side` | Which addresses a node gives out, room roles, the NAT type, why a dial failed | `src/traversal.rs` |
 | `PathKind`, `Policy`, `Hop` | The kinds of path, a connection policy, and the addresses a host with TURN or a radio gives its endpoint (a network address, a peer through this node's TURN allocation, a peer's relayed address, or a Bluetooth connection) | `src/traversal.rs` |
-| `ble` (feature `ble`) | Bluetooth LE: the `Radio` driver trait, `RadioEvent`, `DeviceId`, `ConnId`, `Limits`, the service's UUIDs, and `BlueZ` with `ble-bluez` | `src/ble.rs`, `src/bluez.rs` |
+| `ble` (feature `ble`) | Bluetooth LE: the `Radio` driver trait, `RadioEvent`, `DeviceId`, `ConnId`, `Limits`, the service's UUIDs, and `BlueZ` with `ble-bluez` (`BlueZ::alias`, `BlueZ::names_this_host`) | `src/ble.rs`, `src/bluez.rs` |
 | `TurnServer` (feature `turn`) | A TURN server and the credentials for it | `src/turn.rs` |
 | `PortMapping`, `MapProtocol` | Where router port mapping stands | `src/portmap.rs` |
 | `Config`, `ConnectError`, `DisconnectReason`, `Identity`, `Invite`, `Lane`, `PeerId`, `PeerStats`, `SendError`, `Stats`, `MAX_UNRELIABLE`, `MAX_URGENT` | Re-exported from `peerwire-core` | `crates/peerwire-core/src` |
@@ -267,6 +267,7 @@ Messages and links:
 | `peer_stats(&self, peer: &PeerId) -> Option<PeerStats>` | A link's RTT, path RTT, congestion window, fragments sent and retransmitted; `PeerStats::loss()` estimates loss |
 | `path(&self, peer: &PeerId) -> Option<Path>` | The route the link takes: `Path::Direct(addr)` or `Path::Via(relay)`. The address is where its packets go: a link through TURN shows the peer's address as this node's TURN server relays to it, or the peer's relayed address; `path_kind` says which |
 | `path_kind(&self, peer: &PeerId) -> Option<PathKind>` | The kind of route: `Direct`, `Birthday` (out of a birthday-punch socket, as `via_birthday`), `Peers` or `RelayPeers` (through a peer), `Turn` (through a TURN server, this node's or the peer's), or `Bluetooth` (over a radio connection; its `path` is `Path::Direct` at an address in `0.0.0.0/8`, port 0) |
+| `set_waker(&mut self, waker: Waker)` | Feature `ble`. A waker the node's radio wakes when something comes over it, for a host that sleeps until `next_timeout` or the socket: it then polls at once, not within 50 ms. `AsyncNode` sets one itself |
 | `via_birthday(&self, peer: &PeerId) -> bool` | Whether the direct link leaves from one of this node's birthday-punch sockets |
 | `birthday_sockets_opened(&self) -> u64` | How many sockets this node has opened for birthday punching |
 | `stats(&self) -> Stats` | Node-wide counters: packets, drops, relaying, hole punching |
