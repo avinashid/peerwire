@@ -6,14 +6,14 @@ versioning](https://semver.org); before 1.0, a minor version may break the API.
 Every security finding behind a fix below is in the [threat model](docs/project/threat-model.md), with its severity
 and the commit that fixed it.
 
-## Unreleased
+## Rust crates 0.1.0 (2026-11-05)
 
-### Rust crates and Godot
+The Godot extension, built from source, has these changes too.
 
 - **On crates.io:** the first release of the Rust crates, 0.1.0: `peerwire`, `peerwire-core`, `peerwire-sync`,
-  `peerwire-game`, `peerwire-sim`, `peerwire-ffi` and `peerwire-peer`. `cargo add peerwire`, and `cargo install
-  peerwire-peer` for the always-on peer. They need Rust 1.88 or later. A node built from git before 29 October 2026
-  doesn't find a 0.1.0 node in a room, as room hellos are sealed now (Security, below).
+  `peerwire-game`, `peerwire-sim`, `peerwire-ffi`, `peerwire-peer` and `peerwire-esp`. `cargo add peerwire`, and
+  `cargo install peerwire-peer` for the always-on peer. They need Rust 1.88 or later. A node built from git before
+  29 October 2026 doesn't find a 0.1.0 node in a room, as room hellos are sealed now (Security, below).
 - **Connection policy:** `Policy` orders the paths links take (`PathKind::Direct`, `Birthday`, `Peers`,
   `RelayPeers`) and turns the rest off: `Builder::policy`, and `Node::set_policy` live, where a link on a path turned
   off moves or closes with `DisconnectReason::PathOff`. `Node::set_stun_servers` and `Node::set_signaling` swap
