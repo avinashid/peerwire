@@ -49,10 +49,10 @@ pub fn time(answer: &[u8], token: &[u8; 8]) -> Result<Duration, Refused> {
     }
     // RFC 4330 section 3: with the top bit clear the seconds count from 2036-02-07 06:28:16 UTC, NTP's era 1.
     let ntp = if secs >> 31 == 0 { secs + (1 << 32) } else { secs };
-    let unix = ntp - NTP_TO_UNIX;
-    if unix < SET_AFTER {
+    // Checked: era 0's seconds from 1 << 31 are 1968 and 1969, before 1970 (NB103-I1).
+    let Some(unix) = ntp.checked_sub(NTP_TO_UNIX).filter(|&unix| unix >= SET_AFTER) else {
         return Err(Refused::NoTime("a time before 2023-11-14"));
-    }
+    };
     Ok(Duration::from_secs(unix) + Duration::from_nanos((frac * 1_000_000_000) >> 32))
 }
 
@@ -117,6 +117,11 @@ mod tests {
         // 2020-01-01: era 0, before 2023-11-14.
         let old = 3_786_825_600u32.to_be_bytes();
         refused(&|a| a[40..44].copy_from_slice(&old), Refused::NoTime("a time before 2023-11-14"));
+        // Era 0's first and last seconds before 1970 (1968-01-20 and 1969-12-31): unchecked, they wrap (NB103-I1).
+        for secs in [1u32 << 31, NTP_TO_UNIX as u32 - 1] {
+            let early = secs.to_be_bytes();
+            refused(&|a| a[40..44].copy_from_slice(&early), Refused::NoTime("a time before 2023-11-14"));
+        }
         assert_eq!(time(&good[..47], &TOKEN), Err(Refused::NotOurs));
         // A leap second announced (leap indicator 1) is still a time.
         let mut leap = good;
