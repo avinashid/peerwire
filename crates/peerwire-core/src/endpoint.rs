@@ -1619,14 +1619,26 @@ impl<A: Address> Endpoint<A> {
     /// Closes the link to `peer`, telling it so. No event is emitted for `peer`;
     /// links it relayed go back to their slow addresses (`PathChanged`).
     pub fn disconnect(&mut self, peer: &PeerId) {
+        self.close(peer, true);
+    }
+
+    /// [`disconnect`](Endpoint::disconnect), unannounced: nothing goes to `peer`, which times the link out. For a
+    /// link on a path the host must send nothing more on, such as one that would show this node's address.
+    pub fn abandon(&mut self, peer: &PeerId) {
+        self.close(peer, false);
+    }
+
+    fn close(&mut self, peer: &PeerId, tell: bool) {
         let Some(idx) = self.peers.remove(peer) else { return };
         if let Some(mut sess) = self.sessions.remove(&idx) {
             if let State::Live(link) = &mut sess.state {
-                let mut pt = Vec::with_capacity(1);
-                wire::put_close(&mut pt);
                 let heard = link.last_recv;
-                if let Some(p) = seal(link, &pt) {
-                    self.emit(sess.path, sess.peer, p);
+                if tell {
+                    let mut pt = Vec::with_capacity(1);
+                    wire::put_close(&mut pt);
+                    if let Some(p) = seal(link, &pt) {
+                        self.emit(sess.path, sess.peer, p);
+                    }
                 }
                 self.unrelay(*peer, heard);
             }
@@ -3344,6 +3356,25 @@ mod tests {
         let relayed = eps[2].stats().relayed;
         assert!(both_ways(&mut eps, &p, &mut t, |_, _| false));
         assert_eq!(eps[2].stats().relayed, relayed);
+    }
+
+    /// NB101-I1: `abandon` closes a link as `disconnect` does, the links its peer relayed going back to their slow
+    /// addresses, but sends that peer nothing: it keeps its end, to time out.
+    #[test]
+    fn an_abandoned_link_closes_without_a_word() {
+        let mut t = Instant::from_millis(1);
+        let (mut eps, p) = slow_trio(&mut t);
+        let [a, b, c] = p;
+        eps[0].add_relay(t, c, &b);
+        route(&mut eps, &mut t, 500, None);
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(c)));
+        events(&mut eps[0]);
+        eps[0].abandon(&c);
+        assert!(!eps[0].is_connected(&c));
+        assert_eq!(events(&mut eps[0]), vec![Event::PathChanged { peer: b, path: Path::Direct(2) }]);
+        let sent = route(&mut eps, &mut t, 100, None);
+        assert!(!sent.contains(&(0, 3)), "{sent:?}");
+        assert!(eps[2].is_connected(&a) && events(&mut eps[2]).is_empty());
     }
 
     /// A relay path that works one way moves nothing: a's probes through c reach
