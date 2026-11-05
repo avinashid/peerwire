@@ -132,7 +132,7 @@ The [quick start](docs/getting-started/quick-start.md) walks through each of the
 | [`peerwire-peer`](crates/peerwire-peer) | An optional always-on peer that relays for the peers linked to it. Runs natively or in Docker. |
 | [`peerwire-game`](crates/peerwire-game), [`peerwire-sim`](crates/peerwire-sim) | Game building blocks (fixed-point maths, islands, desync detection) and a deterministic network simulator. |
 
-`@peerwire/js` 0.3.0 and `@peerwire/react` 0.1.1 are on npm, and the Rust crates 0.1.0 are on crates.io
+`@peerwire/js` 0.3.1 and `@peerwire/react` 0.1.1 are on npm, and the Rust crates 0.1.0 are on crates.io
 ([installation](docs/getting-started/installation.md)).
 
 ## Status

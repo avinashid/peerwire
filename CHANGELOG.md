@@ -6,7 +6,7 @@ versioning](https://semver.org); before 1.0, a minor version may break the API.
 Every security finding behind a fix below is in the [threat model](docs/project/threat-model.md), with its severity
 and the commit that fixed it.
 
-## Unreleased
+## `@peerwire/js` 0.3.1 (2026-11-05)
 
 - **The doctor:** `npx @peerwire/js doctor` (a `bin` in `@peerwire/js`) and the Rust example `doctor`, which
   replaces `natcheck`, report what a network does to peer-to-peer traffic: NAT mapping over IPv4 and IPv6,
@@ -14,6 +14,8 @@ and the commit that fixed it.
   (Rust) work, as text or `--json`, with `--redact` to mask public addresses. Nothing is uploaded. The doctor's
   `room` run reads `DOCTOR_PORT`, as natcheck's read `NATCHECK_PORT`. Results from real networks go in
   [Connectivity in the field](docs/project/field-connectivity.md).
+- The wasm is rebuilt from main, with the same exports as 0.3.0 (356,902 B). The Rust doctor runs from a clone:
+  `cargo run -p peerwire --features nostr --example doctor`.
 
 ## peerwire-esp 0.1.1 (2026-11-05)
 
