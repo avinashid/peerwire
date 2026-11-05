@@ -4,21 +4,29 @@
 //! A message is split into chunks, one per GATT value: a header byte, then as much of the message as the value has
 //! room for ([`value_len`]). The header marks the message's first and last chunks and counts the chunks sent on the
 //! connection, so the receiver drops a message one of whose chunks a full buffer lost. Sans-IO: the host moves the
-//! values.
+//! values and passes the time in.
 //!
 //! ```
 //! use peerwire_core::ble::{Chunker, Reassembler};
+//! use peerwire_core::Instant;
 //!
 //! let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
 //! let message = vec![0u8; 300];
+//! let mut values = Vec::new();
+//! tx.split(&message, 23, |v| {
+//!     values.push(v.to_vec()); // each one a write or a notification, 20 bytes at most
+//!     true
+//! });
 //! let mut got = None;
-//! for value in tx.split(&message, 23) {
-//!     got = rx.push(&value); // each one a write or a notification, 20 bytes at most
+//! for v in &values {
+//!     got = rx.push(Instant::ZERO, v).map(<[u8]>::to_vec);
 //! }
 //! assert_eq!(got, Some(message));
 //! ```
 
+use crate::time::Instant;
 use crate::wire::MAX_DATAGRAM;
+use std::time::Duration;
 
 /// The GATT service a peer serves, as a 128-bit UUID: `1c3eea41-c2be-493c-ab0b-7707ad2dbed6`.
 pub const SERVICE_UUID: u128 = 0x1c3eea41_c2be_493c_ab0b_7707ad2dbed6;
@@ -29,10 +37,14 @@ pub const TX_UUID: u128 = 0x1c3eea43_c2be_493c_ab0b_7707ad2dbed6;
 
 /// A message's first byte: the rest is one Peerwire datagram.
 pub const KIND_DATAGRAM: u8 = 0;
-/// A message's first byte: the rest is a sealed hello for the receiver's room.
-pub const KIND_ROOM: u8 = 1;
-/// A message's first byte: the rest is sealed to the receiver (an offer).
-pub const KIND_PEER: u8 = 2;
+/// A message's first byte: the rest is a signal sealed under the connection's link key.
+pub const KIND_SIGNAL: u8 = 1;
+/// A message's first byte: the peripheral's challenge, which opens the room proof.
+pub const KIND_CHALLENGE: u8 = 3;
+/// A message's first byte: the central's answer to the challenge.
+pub const KIND_ANSWER: u8 = 4;
+/// A message's first byte: the peripheral's proof, which closes the room proof.
+pub const KIND_PROOF: u8 = 5;
 
 /// The largest message: a kind byte and a datagram.
 pub const MAX_MESSAGE: usize = 1 + MAX_DATAGRAM;
@@ -40,6 +52,8 @@ pub const MAX_MESSAGE: usize = 1 + MAX_DATAGRAM;
 pub const MIN_ATT_MTU: u16 = 23;
 /// The longest attribute value GATT allows.
 const MAX_VALUE: usize = 512;
+/// A message whose last chunk came longer ago than this is dropped.
+pub const PARTIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 const FIRST: u8 = 0x80;
 const LAST: u8 = 0x40;
@@ -62,40 +76,46 @@ impl Chunker {
         Chunker::default()
     }
 
-    /// The chunks of `message` for a link with ATT MTU `mtu`, in the order to send them, each a GATT value of at most
-    /// [`value_len`]`(mtu)` bytes. None for an empty message or one over [`MAX_MESSAGE`]. Chunks of one message must
-    /// go out before the next message's; if one can't be sent, the rest of its message is no use and may be dropped.
-    pub fn split(&mut self, message: &[u8], mtu: u16) -> Vec<Vec<u8>> {
-        let mut out = Vec::new();
+    /// Hands `send` the chunks of `message` for a link with ATT MTU `mtu`, in order, each a GATT value of at most
+    /// [`value_len`]`(mtu)` bytes, and stops at the first it can't send (`false`): the rest of a message is no use
+    /// without it. Whether all went; nothing goes for an empty message or one over [`MAX_MESSAGE`]. Chunks of one
+    /// message must go out before the next message's.
+    pub fn split(&mut self, message: &[u8], mtu: u16, mut send: impl FnMut(&[u8]) -> bool) -> bool {
         if message.is_empty() || message.len() > MAX_MESSAGE {
-            return out;
+            return false;
         }
         let room = value_len(mtu) - 1;
-        let mut rest = message;
+        let mut value = [0u8; MAX_VALUE];
         let mut first = FIRST;
-        while !rest.is_empty() {
-            let (part, tail) = rest.split_at(rest.len().min(room));
-            let last = if tail.is_empty() { LAST } else { 0 };
-            let mut value = Vec::with_capacity(1 + part.len());
-            value.push(first | last | self.next);
-            value.extend_from_slice(part);
-            out.push(value);
+        for (i, part) in message.chunks(room).enumerate() {
+            let last = if (i + 1) * room >= message.len() { LAST } else { 0 };
+            value[0] = first | last | self.next;
+            value[1..=part.len()].copy_from_slice(part);
             self.next = (self.next + 1) & COUNTER;
-            (rest, first) = (tail, 0);
+            first = 0;
+            if !send(&value[..=part.len()]) {
+                return false;
+            }
         }
-        out
+        true
     }
 }
 
 /// Puts messages back together from one connection's chunks, in one direction. It holds at most one message being
-/// assembled, of at most [`MAX_MESSAGE`] bytes.
+/// assembled, of at most [`MAX_MESSAGE`] bytes, in one buffer it keeps.
 #[derive(Debug, Default)]
 pub struct Reassembler {
     buf: Vec<u8>,
     /// The counter the next chunk of the open message must have; `None` with no message open.
     next: Option<u8>,
+    /// When the open message's last chunk came.
+    at: Instant,
     /// Chunks of the open message.
     held: u64,
+    /// The counter of the last chunk taken: one that repeats it is a copy.
+    last: Option<u8>,
+    /// The buffer holds a message handed out by the last `push`.
+    done: bool,
     dropped: u64,
 }
 
@@ -104,20 +124,32 @@ impl Reassembler {
         Reassembler::default()
     }
 
-    /// Takes one GATT value: the whole message once its last chunk is in. A chunk whose counter shows a lost one, a
-    /// first chunk while a message is open (its end was lost), a message growing past [`MAX_MESSAGE`], or a chunk with
-    /// no payload drops the open message; the chunk goes with it unless it is a first one, which starts the next. A
-    /// chunk that isn't a first one with no message open is dropped.
+    /// Takes one GATT value that came at `now`: the whole message once its last chunk is in, valid until the next
+    /// call. A chunk whose counter shows a lost one, a first chunk while a message is open (its end was lost), a
+    /// message growing past [`MAX_MESSAGE`] or left for [`PARTIAL_TIMEOUT`], or a chunk with no payload drops the open
+    /// message; the chunk goes with it unless it is a first one, which starts the next. A chunk that isn't a first one
+    /// with no message open, or that repeats the last chunk's counter (a copy), is dropped, with the open message.
     ///
-    /// Only a run of exactly 64 lost chunks (or a multiple) between two that arrive goes unseen, and joins the parts
-    /// of two messages: Peerwire packets are authenticated, so such a message fails its checks.
-    pub fn push(&mut self, value: &[u8]) -> Option<Vec<u8>> {
+    /// Only a run of exactly 64 lost chunks (or a multiple) between two that arrive within the timeout goes unseen,
+    /// and joins the parts of two messages: Peerwire packets are authenticated, so such a message fails its checks.
+    pub fn push(&mut self, now: Instant, value: &[u8]) -> Option<&[u8]> {
+        if std::mem::take(&mut self.done) {
+            self.buf.clear();
+        }
+        if self.next.is_some() && now.saturating_duration_since(self.at) > PARTIAL_TIMEOUT {
+            self.drop_open();
+        }
         let Some((&header, data)) = value.split_first().filter(|(_, d)| !d.is_empty()) else {
             self.drop_open();
             self.dropped += 1;
             return None;
         };
         let (first, counter) = (header & FIRST != 0, header & COUNTER);
+        if self.last == Some(counter) {
+            self.drop_open();
+            self.dropped += 1;
+            return None;
+        }
         if self.next.is_some() && (first || self.next != Some(counter)) {
             self.drop_open();
         }
@@ -130,14 +162,16 @@ impl Reassembler {
             self.dropped += 1;
             return None;
         }
-        self.buf.extend_from_slice(data);
-        self.next = Some((counter + 1) & COUNTER);
-        self.held += 1;
-        if header & LAST != 0 {
-            (self.next, self.held) = (None, 0);
-            return Some(std::mem::take(&mut self.buf));
+        if self.buf.capacity() < MAX_MESSAGE {
+            self.buf.reserve_exact(MAX_MESSAGE - self.buf.len());
         }
-        None
+        self.buf.extend_from_slice(data);
+        (self.next, self.at, self.held, self.last) = (Some((counter + 1) & COUNTER), now, self.held + 1, Some(counter));
+        if header & LAST == 0 {
+            return None;
+        }
+        (self.next, self.held, self.done) = (None, 0, true);
+        Some(&self.buf)
     }
 
     /// Chunks dropped so far: invalid ones, those of messages that lost one, and strays after a lost first chunk.
@@ -147,7 +181,11 @@ impl Reassembler {
 
     /// Bytes of the message being assembled.
     pub fn pending(&self) -> usize {
-        self.buf.len()
+        if self.done {
+            0
+        } else {
+            self.buf.len()
+        }
     }
 
     fn drop_open(&mut self) {
@@ -163,6 +201,8 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
     use rand_core::{RngCore, SeedableRng};
 
+    const T0: Instant = Instant::ZERO;
+
     fn below(rng: &mut ChaCha8Rng, n: usize) -> usize {
         (rng.next_u64() % n as u64) as usize
     }
@@ -171,6 +211,20 @@ mod tests {
         let mut m = vec![0u8; len];
         rng.fill_bytes(&mut m);
         m
+    }
+
+    fn split(tx: &mut Chunker, m: &[u8], mtu: u16) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        tx.split(m, mtu, |v| {
+            out.push(v.to_vec());
+            true
+        });
+        out
+    }
+
+    /// The messages `rx` gives for `values`, all at `now`.
+    fn feed(rx: &mut Reassembler, values: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        values.iter().filter_map(|v| rx.push(T0, v).map(<[u8]>::to_vec)).collect()
     }
 
     #[test]
@@ -186,34 +240,51 @@ mod tests {
     #[test]
     fn a_message_splits_into_values_that_fit_with_first_and_last_marked() {
         let mut tx = Chunker::new();
-        let m = vec![7u8; 100];
-        let chunks = tx.split(&m, 23);
+        let chunks = split(&mut tx, &[7u8; 100], 23);
         assert_eq!(chunks.len(), 6, "19 bytes each: 100 = 5 x 19 + 5");
         assert!(chunks.iter().all(|c| c.len() <= 20));
         assert_eq!(chunks[0][0], FIRST);
         assert_eq!(chunks[5][0], LAST | 5);
+        assert_eq!(chunks[5].len(), 6);
         assert!(chunks[1..5].iter().enumerate().all(|(i, c)| c[0] == i as u8 + 1));
-        let one = tx.split(&[1, 2, 3], 23);
+        let one = split(&mut tx, &[1, 2, 3], 23);
         assert_eq!(one, vec![vec![FIRST | LAST | 6, 1, 2, 3]], "the counter goes on across messages");
+        let exact = split(&mut tx, &[9u8; 38], 23);
+        assert_eq!((exact.len(), exact[1][0] & LAST), (2, LAST), "a message that fills its chunks exactly");
     }
 
     #[test]
     fn empty_and_oversized_messages_make_no_chunks() {
         let mut tx = Chunker::new();
-        assert!(tx.split(&[], 517).is_empty());
-        assert!(tx.split(&vec![0; MAX_MESSAGE + 1], 517).is_empty());
-        assert_eq!(tx.split(&vec![0; MAX_MESSAGE], 517).len(), 3);
+        assert!(split(&mut tx, &[], 517).is_empty());
+        assert!(split(&mut tx, &vec![0; MAX_MESSAGE + 1], 517).is_empty());
+        assert!(!tx.split(&[], 517, |_| true));
+        assert_eq!(split(&mut tx, &vec![0; MAX_MESSAGE], 517).len(), 3);
         assert_eq!(tx.next, 3, "nothing was counted for the refused ones");
+    }
+
+    #[test]
+    fn a_send_that_fails_stops_the_message() {
+        let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
+        let mut sent = Vec::new();
+        let all = tx.split(&[1u8; 60], 23, |v| {
+            sent.push(v.to_vec());
+            sent.len() < 2
+        });
+        assert!(!all);
+        assert_eq!(sent.len(), 2, "the second was refused, and nothing after it was tried");
+        assert_eq!(feed(&mut rx, &sent[..1]), Vec::<Vec<u8>>::new());
+        // The next message's first chunk has the counter the receiver expects next, and still starts anew.
+        assert_eq!(feed(&mut rx, &split(&mut tx, &[2u8; 5], 23)), vec![vec![2u8; 5]]);
     }
 
     #[test]
     fn a_largest_message_reassembles_at_the_smallest_mtu() {
         let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
         let m: Vec<u8> = (0..MAX_MESSAGE).map(|i| i as u8).collect();
-        let chunks = tx.split(&m, 23);
+        let chunks = split(&mut tx, &m, 23);
         assert_eq!(chunks.len(), 65);
-        let got: Vec<_> = chunks.iter().filter_map(|c| rx.push(c)).collect();
-        assert_eq!(got, vec![m]);
+        assert_eq!(feed(&mut rx, &chunks), vec![m]);
         assert_eq!((rx.dropped(), rx.pending()), (0, 0));
     }
 
@@ -221,47 +292,72 @@ mod tests {
     fn a_lost_middle_chunk_drops_its_message_and_the_next_one_arrives() {
         let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
         let (a, b) = (vec![1u8; 50], vec![2u8; 50]);
-        let mut chunks = tx.split(&a, 23);
+        let mut chunks = split(&mut tx, &a, 23);
         chunks.remove(1);
-        chunks.extend(tx.split(&b, 23));
-        let got: Vec<_> = chunks.iter().filter_map(|c| rx.push(c)).collect();
-        assert_eq!(got, vec![b]);
+        chunks.extend(split(&mut tx, &b, 23));
+        assert_eq!(feed(&mut rx, &chunks), vec![b]);
         assert!(rx.dropped() >= 1);
+    }
+
+    #[test]
+    fn a_repeated_chunk_drops_its_message() {
+        let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
+        let mut chunks = split(&mut tx, &[1u8; 50], 23);
+        chunks.insert(2, chunks[1].clone());
+        assert!(feed(&mut rx, &chunks).is_empty());
+    }
+
+    #[test]
+    fn a_copy_of_a_whole_message_comes_out_once() {
+        let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
+        let one = split(&mut tx, &[1, 2], 23);
+        assert_eq!(feed(&mut rx, &[one[0].clone(), one[0].clone()]), vec![vec![1, 2]]);
+        let two = split(&mut tx, &[3u8; 30], 23);
+        assert_eq!(feed(&mut rx, &[two[0].clone(), two[1].clone(), two[1].clone()]), vec![vec![3u8; 30]]);
+        assert_eq!(rx.dropped(), 2);
     }
 
     #[test]
     fn a_lost_last_chunk_is_seen_at_the_next_first_one() {
         let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
         let (a, b) = (vec![1u8; 30], vec![2u8; 30]);
-        let mut chunks = tx.split(&a, 23);
+        let mut chunks = split(&mut tx, &a, 23);
         chunks.pop();
-        chunks.extend(tx.split(&b, 23));
-        let got: Vec<_> = chunks.iter().filter_map(|c| rx.push(c)).collect();
-        assert_eq!(got, vec![b], "a's start isn't glued to b");
+        chunks.extend(split(&mut tx, &b, 23));
+        assert_eq!(feed(&mut rx, &chunks), vec![b], "a's start isn't glued to b");
     }
 
     #[test]
     fn a_lost_first_chunk_drops_the_strays_after_it() {
         let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
-        let mut chunks = tx.split(&[3u8; 60], 23);
+        let mut chunks = split(&mut tx, &[3u8; 60], 23);
         chunks.remove(0);
-        assert!(chunks.iter().all(|c| rx.push(c).is_none()));
+        assert!(feed(&mut rx, &chunks).is_empty());
         assert_eq!((rx.dropped(), rx.pending()), (3, 0));
+    }
+
+    #[test]
+    fn a_first_chunk_with_the_expected_counter_still_starts_a_new_message() {
+        // A sender that counts only the chunks it sends: the rest of a message it gave up on never got numbers.
+        let mut rx = Reassembler::new();
+        assert_eq!(rx.push(T0, &[FIRST, 1, 1]), None);
+        assert_eq!(rx.push(T0, &[FIRST | LAST | 1, 2, 2]), Some(&[2u8, 2][..]));
+        assert_eq!(rx.dropped(), 1);
     }
 
     #[test]
     fn empty_and_header_only_values_drop_the_open_message() {
         let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
-        let chunks = tx.split(&[4u8; 40], 23);
-        assert_eq!(rx.push(&chunks[0]), None);
-        assert_eq!(rx.push(&[]), None);
+        let chunks = split(&mut tx, &[4u8; 40], 23);
+        assert_eq!(rx.push(T0, &chunks[0]), None);
+        assert_eq!(rx.push(T0, &[]), None);
         assert_eq!(rx.pending(), 0);
-        assert_eq!(rx.push(&chunks[1]), None);
-        assert_eq!(rx.push(&chunks[2]), None, "the rest of it is strays now");
-        let chunks = tx.split(&[5u8; 40], 23);
-        assert_eq!(rx.push(&chunks[0]), None);
-        assert_eq!(rx.push(&[chunks[1][0]]), None, "a header with no payload");
+        assert!(feed(&mut rx, &chunks[1..]).is_empty(), "the rest of it is strays now");
+        let chunks = split(&mut tx, &[5u8; 40], 23);
+        assert_eq!(rx.push(T0, &chunks[0]), None);
+        assert_eq!(rx.push(T0, &[chunks[1][0]]), None, "a header with no payload");
         assert_eq!(rx.pending(), 0);
+        assert_eq!(rx.dropped(), 1 + 1 + 2 + 1 + 1);
     }
 
     #[test]
@@ -270,27 +366,14 @@ mod tests {
         // A forged run of continuation chunks with the right counters, never a last one.
         let mut value = vec![FIRST];
         value.extend([0u8; 511]);
-        assert_eq!(rx.push(&value), None);
+        assert_eq!(rx.push(T0, &value), None);
         for i in 1..=2u8 {
             value[0] = i;
-            assert_eq!(rx.push(&value), None);
+            assert_eq!(rx.push(T0, &value), None);
         }
-        assert!(rx.pending() <= MAX_MESSAGE);
         assert_eq!(rx.pending(), 0, "1,533 bytes would be over");
-        // A largest message fills it exactly.
         let mut tx = Chunker::new();
-        let chunks = tx.split(&vec![9u8; MAX_MESSAGE], 517);
-        let got: Vec<_> = chunks.iter().filter_map(|c| rx.push(c)).collect();
-        assert_eq!(got.len(), 1);
-    }
-
-    #[test]
-    fn a_first_chunk_with_the_expected_counter_still_starts_a_new_message() {
-        // A sender that counts only the chunks it sends: the rest of a message it gave up on never got numbers.
-        let mut rx = Reassembler::new();
-        assert_eq!(rx.push(&[FIRST, 1, 1]), None);
-        assert_eq!(rx.push(&[FIRST | LAST | 1, 2, 2]), Some(vec![2, 2]));
-        assert_eq!(rx.dropped(), 1);
+        assert_eq!(feed(&mut rx, &split(&mut tx, &vec![9u8; MAX_MESSAGE], 517)).len(), 1);
     }
 
     #[test]
@@ -298,34 +381,53 @@ mod tests {
         let mut rx = Reassembler::new();
         let first = |n: usize| [&[FIRST][..], &vec![0u8; n]].concat();
         let last = |n: usize| [&[LAST | 1][..], &vec![0u8; n]].concat();
-        assert_eq!(rx.push(&first(1000)), None);
-        assert_eq!(rx.push(&last(MAX_MESSAGE - 1000)).map(|m| m.len()), Some(MAX_MESSAGE));
-        assert_eq!(rx.push(&first(1000)), None);
-        assert_eq!(rx.push(&last(MAX_MESSAGE - 999)), None, "one byte over");
+        assert_eq!(rx.push(T0, &first(1000)), None);
+        assert_eq!(rx.push(T0, &last(MAX_MESSAGE - 1000)).map(<[u8]>::len), Some(MAX_MESSAGE));
+        assert_eq!(rx.push(T0, &first(1000)), None);
+        assert_eq!(rx.push(T0, &last(MAX_MESSAGE - 999)), None, "one byte over");
         assert_eq!((rx.pending(), rx.dropped()), (0, 2));
     }
 
-    /// Property: with no loss, every message comes out whole and in order, at any MTU, across counter wraps.
+    #[test]
+    fn a_message_left_too_long_is_dropped() {
+        let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
+        let chunks = split(&mut tx, &[8u8; 50], 23);
+        let at = |ms| Instant::from_millis(ms);
+        assert_eq!(rx.push(at(0), &chunks[0]), None);
+        assert_eq!(rx.push(at(2000), &chunks[1]), None, "2 s after the last chunk: still in time");
+        assert_eq!(rx.push(at(4001), &chunks[2]).map(<[u8]>::to_vec), None, "over 2 s after it");
+        assert_eq!((rx.pending(), rx.dropped()), (0, 3));
+    }
+
+    #[test]
+    fn the_buffer_is_allocated_once() {
+        let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
+        for len in [1, MAX_MESSAGE, 600, MAX_MESSAGE, 2] {
+            assert_eq!(feed(&mut rx, &split(&mut tx, &vec![1u8; len], 23)).len(), 1);
+            assert_eq!(rx.buf.capacity(), MAX_MESSAGE);
+        }
+    }
+
+    /// Property: with no loss, every message comes out whole and in order, at every MTU from 23 to 517, across counter
+    /// wraps.
     #[test]
     fn prop_lossless_round_trip() {
         let mut rng = ChaCha8Rng::seed_from_u64(110);
-        for _ in 0..300 {
-            let mtu = 23 + below(&mut rng, 600) as u16;
+        for mtu in 23..=517u16 {
             let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
-            for _ in 0..20 {
+            for _ in 0..6 {
                 let len = 1 + below(&mut rng, MAX_MESSAGE);
                 let m = message(&mut rng, len);
-                let chunks = tx.split(&m, mtu);
+                let chunks = split(&mut tx, &m, mtu);
                 assert!(chunks.iter().all(|c| c.len() <= value_len(mtu) && c.len() >= 2));
-                let got: Vec<_> = chunks.iter().filter_map(|c| rx.push(c)).collect();
-                assert_eq!(got, vec![m], "mtu {mtu}");
+                assert_eq!(feed(&mut rx, &chunks), vec![m], "mtu {mtu}");
             }
             assert_eq!(rx.dropped(), 0);
         }
     }
 
     /// Property: with chunks lost at random (no run of 64 or more), exactly the messages none of whose chunks was lost
-    /// come out, unaltered and in order; nothing else does, and nothing over the bound is held.
+    /// come out, unaltered and in order; nothing else does, and every chunk that arrived is accounted for.
     #[test]
     fn prop_loss_drops_whole_messages_only() {
         let mut rng = ChaCha8Rng::seed_from_u64(1100);
@@ -338,14 +440,14 @@ mod tests {
                 let len = 1 + below(&mut rng, 400);
                 let m = message(&mut rng, len);
                 let mut whole = true;
-                for c in tx.split(&m, mtu) {
+                for c in split(&mut tx, &m, mtu) {
                     if below(&mut rng, 100) < loss && run < 63 {
                         (whole, run) = (false, run + 1);
                         continue;
                     }
                     run = 0;
                     pushed += 1;
-                    got.extend(rx.push(&c));
+                    got.extend(rx.push(T0, &c).map(<[u8]>::to_vec));
                     assert!(rx.pending() <= MAX_MESSAGE);
                 }
                 if whole {
@@ -353,17 +455,52 @@ mod tests {
                 }
             }
             assert_eq!(got, expect, "round {round}, mtu {mtu}, loss {loss}%");
-            // Every chunk that arrived went into a message, was dropped, or is held.
             let delivered: u64 = got.iter().map(|m| m.len().div_ceil(value_len(mtu) - 1) as u64).sum();
             assert_eq!(delivered + rx.dropped() + rx.held, pushed, "round {round}");
         }
     }
 
-    /// Property: arbitrary values never panic, never yield an empty message or one over the bound, and never hold more.
+    /// Property: with chunks lost, repeated and swapped at random, every message that comes out is one that was sent,
+    /// unaltered. (GATT keeps the order, so only this fault injection can swap two whole messages.)
+    #[test]
+    fn prop_faults_never_alter_or_reorder_a_message() {
+        let mut rng = ChaCha8Rng::seed_from_u64(1101);
+        let mut delivered = 0;
+        for round in 0..300 {
+            let mtu = 23 + below(&mut rng, 100) as u16;
+            let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
+            let mut sent = Vec::new();
+            let mut values = Vec::new();
+            for _ in 0..30 {
+                let len = 1 + below(&mut rng, 300);
+                let m = message(&mut rng, len);
+                values.extend(split(&mut tx, &m, mtu));
+                sent.push(m);
+            }
+            for _ in 0..values.len() / 10 {
+                let i = below(&mut rng, values.len());
+                match below(&mut rng, 3) {
+                    0 => drop(values.remove(i)),
+                    1 => values.insert(i, values[i].clone()),
+                    _ if i + 1 < values.len() => values.swap(i, i + 1),
+                    _ => {}
+                }
+            }
+            for m in feed(&mut rx, &values) {
+                assert!(sent.contains(&m), "round {round}");
+                delivered += 1;
+            }
+        }
+        assert!(delivered > 3000, "most still come out: {delivered}");
+    }
+
+    /// Property: arbitrary values at arbitrary times never panic, never yield an empty message or one over the bound,
+    /// and never hold more.
     #[test]
     fn prop_arbitrary_values_are_bounded() {
         let mut rng = ChaCha8Rng::seed_from_u64(11);
         let mut rx = Reassembler::new();
+        let mut now = 0;
         for _ in 0..200_000 {
             let len = below(&mut rng, 40);
             let mut value = message(&mut rng, len);
@@ -371,10 +508,12 @@ mod tests {
             if len > 0 && below(&mut rng, 4) > 0 {
                 value[0] = (value[0] & (FIRST | LAST)) | rx.next.unwrap_or(0);
             }
-            if let Some(m) = rx.push(&value) {
+            now += below(&mut rng, 300) as u64;
+            if let Some(m) = rx.push(Instant::from_millis(now), &value) {
                 assert!(!m.is_empty() && m.len() <= MAX_MESSAGE);
             }
             assert!(rx.pending() <= MAX_MESSAGE);
+            assert!(rx.buf.capacity() == 0 || rx.buf.capacity() == MAX_MESSAGE);
         }
     }
 
@@ -382,23 +521,20 @@ mod tests {
     #[test]
     fn a_run_of_64_lost_chunks_goes_unseen() {
         let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
-        let mut chunks = tx.split(&[1u8; 19 * 10], 23); // counters 0 to 9
-        chunks.extend(tx.split(&[2u8; 19 * 60], 23)); // 10 to 69: 65 is its 56th chunk, with counter 1
-        assert_eq!(rx.push(&chunks[0]), None);
-        let got: Vec<_> = chunks[65..].iter().filter_map(|c| rx.push(c)).collect();
+        let mut chunks = split(&mut tx, &[1u8; 19 * 10], 23); // counters 0 to 9
+        chunks.extend(split(&mut tx, &[2u8; 19 * 60], 23)); // 10 to 69: 65 is its 56th chunk, with counter 1
+        assert_eq!(rx.push(T0, &chunks[0]), None);
         let mut joined = vec![1u8; 19];
         joined.extend([2u8; 19 * 5]);
-        assert_eq!(got, vec![joined]);
+        assert_eq!(feed(&mut rx, &chunks[65..]), vec![joined]);
     }
 
     #[test]
     fn dropped_counts_every_chunk_of_a_message_cut_short() {
         let (mut tx, mut rx) = (Chunker::new(), Reassembler::new());
-        let chunks = tx.split(&[6u8; 19 * 4], 23);
-        for c in &chunks[..3] {
-            assert_eq!(rx.push(c), None);
-        }
-        assert_eq!(rx.push(&tx.split(&[7], 23)[0]), Some(vec![7]), "a first chunk cuts the open one short");
+        let chunks = split(&mut tx, &[6u8; 19 * 4], 23);
+        assert!(feed(&mut rx, &chunks[..3]).is_empty());
+        assert_eq!(feed(&mut rx, &split(&mut tx, &[7], 23)), vec![vec![7]], "a first chunk cuts the open one short");
         assert_eq!(rx.dropped(), 3);
     }
 }
