@@ -4,7 +4,8 @@
 //! The node does everything but move GATT values. This driver serves the Peerwire service, advertises the node's
 //! service data from a non-resolvable random address that changes with each new advert (BLE-R3), with the service's
 //! UUID in the scan response, scans passively, connects where the node asks, and moves values on up to three
-//! connections ([`Limits::SMALL`]). Nothing is paired or bonded (BLE-R5): bonding, MITM and Secure Connections are
+//! connections ([`Limits::SMALL`]). A central that doesn't subscribe to `tx` within 5 s is closed, so a silent one
+//! can't hold a connection the node never hears of. Nothing is paired or bonded (BLE-R5): bonding, MITM and Secure Connections are
 //! off, and a connection that a pairing completes on anyway is closed. `rx` takes writes without response, and
 //! sdkconfig.ble leaves NimBLE no room for prepared (long) writes (BLE-R7).
 //!
@@ -15,9 +16,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::task::Waker;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, ensure};
 use esp32_nimble::enums::{AuthReq, OwnAddrType};
@@ -39,6 +41,11 @@ const SCAN_WINDOW: u16 = 48;
 /// A connect NimBLE gives up on, and how long the driver waits on each step after it.
 const CONNECT_MS: i32 = 10_000;
 const STEP_WAIT: Duration = Duration::from_secs(5);
+/// A central that hasn't subscribed to `tx` this long after connecting is closed: the node never hears of it, so it
+/// couldn't, and it holds one of NimBLE's three connections. Checked about once a second while the driver's thread
+/// isn't connecting.
+const SUBSCRIBE_WITHIN: Duration = Duration::from_secs(5);
+const SWEEP: Duration = Duration::from_secs(1);
 /// Events queued for the node at most; adverts beyond the first number and values beyond the second are dropped,
 /// as the radio would drop them, so a device nearby can't fill the heap.
 const MAX_SEEN_QUEUED: usize = 16;
@@ -93,6 +100,8 @@ struct State {
     links: HashMap<u16, Link>,
     /// Connections centrals made to this radio, subscribed or not.
     peripheral: usize,
+    /// Those not subscribed yet, by NimBLE's handle, with when they connected.
+    waiting: Vec<(u16, Instant)>,
     /// The last [`ConnId`] given: never reused.
     last: u32,
 }
@@ -144,8 +153,11 @@ impl Nimble {
         server.advertise_on_disconnect(false);
         server.on_connect({
             let shared = shared.clone();
-            move |_, _| {
-                shared.lock().peripheral += 1;
+            move |_, desc| {
+                let mut state = shared.lock();
+                state.peripheral += 1;
+                state.waiting.push((desc.conn_handle(), Instant::now()));
+                drop(state);
                 shared.send(Cmd::Readvertise);
             }
         });
@@ -294,6 +306,7 @@ impl State {
     fn subscribed(&mut self, handle: u16, mtu: u16, on: bool) -> bool {
         match (self.links.get(&handle), on) {
             (None, true) => {
+                self.waiting.retain(|&(h, _)| h != handle);
                 let conn = self.next_conn();
                 self.links.insert(handle, Link { conn, rx: None, up: true, mtu, early: Vec::new() });
                 self.push(RadioEvent::Connected { conn, device: None, mtu });
@@ -338,6 +351,7 @@ impl State {
     }
 
     fn closed(&mut self, handle: u16) {
+        self.waiting.retain(|&(h, _)| h != handle);
         if let Some(link) = self.links.remove(&handle).filter(|link| link.up) {
             self.push(RadioEvent::Disconnected { conn: link.conn });
         }
@@ -360,27 +374,45 @@ struct Worker {
 
 impl Worker {
     fn run(mut self) {
-        while let Ok(cmd) = self.cmds.recv() {
-            match cmd {
-                Cmd::Advertise(data) => self.advertise(data),
-                Cmd::Readvertise => self.readvertise(),
-                Cmd::Scan(on) => {
+        loop {
+            match self.cmds.recv_timeout(SWEEP) {
+                Ok(Cmd::Advertise(data)) => self.advertise(data),
+                Ok(Cmd::Readvertise) => self.readvertise(),
+                Ok(Cmd::Scan(on)) => {
                     self.scanning = on;
                     match on {
                         true => self.start_scan(),
                         false => stop_scan(),
                     }
                 }
-                Cmd::Rescan if self.scanning => self.start_scan(),
-                Cmd::Rescan => {}
-                Cmd::Connect(device) => {
+                Ok(Cmd::Rescan) if self.scanning => self.start_scan(),
+                Ok(Cmd::Rescan) | Err(RecvTimeoutError::Timeout) => {}
+                Ok(Cmd::Connect(device)) => {
                     stop_scan(); // NimBLE can't connect while it scans
                     self.connect(device);
                     if self.scanning {
                         self.start_scan();
                     }
                 }
+                Err(RecvTimeoutError::Disconnected) => return,
             }
+            self.close_unsubscribed();
+        }
+    }
+
+    /// Closes the centrals that haven't subscribed within [`SUBSCRIBE_WITHIN`] of connecting.
+    fn close_unsubscribed(&self) {
+        let mut late = Vec::new();
+        self.shared.lock().waiting.retain(|&(handle, at)| match at.elapsed() < SUBSCRIBE_WITHIN {
+            true => true,
+            false => {
+                late.push(handle);
+                false
+            }
+        });
+        for handle in late {
+            debug!("ble: a central didn't subscribe within {SUBSCRIBE_WITHIN:?}, closing it");
+            terminate(handle);
         }
     }
 
