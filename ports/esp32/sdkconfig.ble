@@ -15,7 +15,10 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
 CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=0
 # Nothing asks for pairing (BLE-R5). The security manager stays in, Secure Connections too:
 # esp32-nimble 0.13 doesn't build without the first, nor ESP-IDF 5.5.5 without the second.
-# The firmware turns SC and bonding off at run time instead (see examples/ble_probe.rs).
+# The firmware turns SC and bonding off at run time instead (src/ble.rs).
+# No NimBLE host logs: a central nearby can make it log an error at will (a long write, say),
+# and each line holds the console. src/ble.rs logs what the node needs to know.
+CONFIG_BT_NIMBLE_LOG_LEVEL_NONE=y
 # The original ESP32's controller also does Classic: keep it to LE (the C3's is LE only).
 CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
 CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n

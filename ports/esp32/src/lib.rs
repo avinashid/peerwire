@@ -49,6 +49,8 @@ use peerwire::{Builder, Config, LanSignaling, Node};
 #[cfg(feature = "nostr")]
 use peerwire::{MultiSignaling, NostrSignaling, Signaling};
 
+#[cfg(feature = "ble")]
+pub mod ble;
 pub mod clock;
 mod ntp;
 pub mod wifi;
