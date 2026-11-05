@@ -26,7 +26,8 @@ LAN signals to 239.255.80.87 and 192.168.1.255
 ```
 
 `cfg.toml` holds the Wi-Fi network, its password and the room. Git ignores it, but the
-firmware image holds the password, so keep images to yourself.
+password is also in the firmware image and in the build's output under `target/` (and
+`cargo -vv` prints it), so keep both to yourself.
 
 ## Talk to it from a PC
 
@@ -38,7 +39,8 @@ cargo run -p peerwire --example lan_chat -- esp32
 ```
 
 The board logs `linked to …` and answers each line with `echo: …`. The PC's firewall
-must let in UDP from the LAN: port 20567 and `lan_chat`'s port, which is random.
+must let in UDP from the board, and as `lan_chat`'s port is random, allow it by address:
+`sudo ufw allow from 192.168.1.13 proto udp`, with your board's address.
 
 ## Across the internet
 
@@ -57,6 +59,8 @@ board's LAN address, so name the room something others can't guess.
 
 ## If it doesn't link
 
+- **Firewall.** `lan_chat` says `(sent to 0)` and the board never logs `linked to`: the
+  PC drops the board's UDP. Allow the board's address, as above.
 - **Clock.** Peers drop hellos more than a minute off their own clock, and a board
   starts at 1970. If the log says `no SNTP answer`, the board can't reach
   `pool.ntp.org` and a PC ignores it. It asks again every minute, and restarts once one

@@ -22,8 +22,9 @@ chip, and signaling on the LAN and, optionally, over a Nostr relay. A
 2. `espup install`: Espressif's Rust (the `esp` toolchain, for the ESP32-C3 and the ESP32 alike) and its GCC. It
    writes `~/export-esp.sh`, which the project's `flash.sh` loads.
 3. ESP-IDF's own prerequisites. On Debian or Ubuntu: `sudo apt install git wget flex bison gperf python3 python3-pip
-   python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0`; on macOS:
-   `brew install cmake ninja dfu-util`. On Linux, add yourself to the `dialout` group to reach the board's serial port.
+   python3-venv ccache libffi-dev libssl-dev dfu-util libusb-1.0-0`; on macOS: `brew install dfu-util`. The first
+   build fetches CMake and Ninja itself if you have none. On Linux, add yourself to the `dialout` group to reach the
+   board's serial port.
 
 **Then, a project:**
 
@@ -46,8 +47,10 @@ git clone https://github.com/avinashid/peerwire && cd peerwire
 cargo run -p peerwire --example lan_chat -- esp32
 ```
 
-Type a line, and the board answers `echo: …`. With `--features nostr` the board also joins its room over a Nostr
-relay, so `room_chat` on a PC anywhere links with it. The project's README says what to check if it doesn't link.
+Type a line, and the board answers `echo: …`. If `lan_chat` says `(sent to 0)`, the PC's firewall is likely dropping
+the board's UDP; as `lan_chat`'s port is random, allow the board by address (`sudo ufw allow from 192.168.1.13 proto
+udp`, with your board's address). With `--features nostr` the board also joins its room over a Nostr relay, so
+`room_chat` on a PC anywhere links with it. The project's README says what else to check if it doesn't link.
 
 | `peerwire-esp` | |
 |---|---|
@@ -114,6 +117,20 @@ Getting there took three fixes, each now in the firmware or the library:
 With Wi-Fi up before the node is built, seven boots gave seven different PeerIds, and every random draw the node
 makes comes after Wi-Fi is up (NB62-2 in the threat model).
 The [port's README](../../ports/esp32/README.md#on-a-board-nb-091-3-nov-2026) has the details and the flashing steps.
+
+On 5 November 2026 the starter, as a user gets it, ran on the same board: a project generated from the template, on
+`peerwire-esp` 0.1.1 from crates.io, built and flashed with `./flash.sh`, and echoed `lan_chat`'s lines:
+
+| | |
+|---|---|
+| First `./flash.sh build`, ESP-IDF included | 11 min 6 s, no warnings; `~/.espressif` 5.5 GB |
+| App image | 1,636,480 B |
+| Clock set by SNTP | in 52 and 87 ms (two boots) |
+| Reset to link with `lan_chat` | 8.4 s |
+| A line to its echo | 51 ms |
+
+The PC's firewall dropped the board's UDP until it was allowed by address, and when the board restarts with a new
+identity, `lan_chat` counts the old one as a peer until its link times out, 30 s later.
 
 ### Rooms across the internet
 
