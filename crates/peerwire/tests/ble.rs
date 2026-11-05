@@ -140,3 +140,34 @@ fn relay_only_keeps_the_radio_off() {
     assert_eq!(air.advert(0), None, "no advert");
     assert_eq!((air.links(), a.peers().count()), (0, 0));
 }
+
+/// `ble_chat --no-udp`: a node whose policy allows Bluetooth alone, beside a peer with no policy and UDP working
+/// between them (an ESP32 on the same Wi-Fi, say). The link comes up over the radio and stays there, though the peer
+/// dials and punches to its UDP addresses: nothing moves it or reconnects it. Before, the node took the peer's UDP
+/// dial and closed it for its policy, and the peer dialled again at once, often on UDP again (1 run in 4 never
+/// linked in 15 s); once on the radio, it answered the peer's punches, moved to UDP and was closed there, every 15 s.
+#[test]
+fn a_bluetooth_only_node_keeps_its_links_on_the_radio() {
+    let air = FakeAir::new(185);
+    let only = Some(Policy::new([PathKind::Bluetooth]));
+    let (mut a, mut b) = (node(&air, only, Config::default()), node(&air, None, Config::default()));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    a.join_room("pw-test", "ble-only");
+    b.join_room("pw-test", "ble-only");
+    let mut ev = Vec::new();
+    let on_radio =
+        |n: &[&mut Node]| kind(n[0], &pb) == Some(PathKind::Bluetooth) && kind(n[1], &pa) == Some(PathKind::Bluetooth);
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 15, on_radio), "{:?} {:?} {ev:?}", kind(&a, &pb), kind(&b, &pa));
+    // Crossing dials may replace the first link once while it comes up; from here on nothing changes.
+    pump(&mut [&mut a, &mut b], &mut ev, 1, |_| false);
+    let since: Vec<usize> = ev.iter().map(Vec::len).collect();
+    pump(&mut [&mut a, &mut b], &mut ev, 20, |_| false);
+    let after: Vec<&Event> = ev.iter().zip(&since).flat_map(|(e, n)| &e[*n..]).collect();
+    let churn =
+        |e: &&&Event| matches!(e, Event::PathChanged { .. } | Event::Connected { .. } | Event::Disconnected { .. });
+    assert_eq!(after.iter().filter(churn).count(), 0, "{after:?}");
+    assert_eq!((kind(&a, &pb), kind(&b, &pa)), (Some(PathKind::Bluetooth), Some(PathKind::Bluetooth)));
+    a.send(&pb, Lane::Reliable, b"still over the radio").unwrap();
+    pump(&mut [&mut a, &mut b], &mut ev, 2, |_| false);
+    assert!(got(&ev[1], pa, b"still over the radio"));
+}

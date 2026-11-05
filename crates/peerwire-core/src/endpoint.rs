@@ -867,14 +867,16 @@ fn hidden<A: Address>(path: &Path<A>) -> bool {
 }
 
 /// The relayed links that stay relayed: through a relay listed in `.0` if `.1`, through any other if `.2`
-/// ([`Endpoint::set_keep_relayed`]), and on a relayed address but a radio's if `.3` ([`Endpoint::set_keep_turn`]).
-type Keep = (Vec<PeerId>, bool, bool, bool);
+/// ([`Endpoint::set_keep_relayed`]), on a relayed address but a radio's if `.3` ([`Endpoint::set_keep_turn`]), and
+/// on a radio connection if `.4` ([`Endpoint::set_keep_radio`]).
+type Keep = (Vec<PeerId>, bool, bool, bool, bool);
 
 /// Whether a link on `path` stays there ([`Keep`]).
 fn keeps_path<A: Address>(keep: &Keep, path: &Path<A>) -> bool {
     match path {
         Path::Via(r) => keeps(keep, r),
-        Path::Direct(a) => keep.3 && a.relayed() && !a.radio(),
+        Path::Direct(a) if a.radio() => keep.4,
+        Path::Direct(a) => keep.3 && a.relayed(),
     }
 }
 
@@ -939,7 +941,7 @@ impl<A: Address> Endpoint<A> {
             events: VecDeque::new(),
             stats: Stats::default(),
             relay_only: false,
-            keep_relayed: (Vec::new(), false, false, false),
+            keep_relayed: (Vec::new(), false, false, false, false),
             relay_total: (0, None),
         }
     }
@@ -1012,7 +1014,7 @@ impl<A: Address> Endpoint<A> {
     /// next timer; an answer to that punch moves it nowhere); let go, it punches to its candidates once given one
     /// more. Replaces the last call; by default no link is kept.
     pub fn set_keep_relayed(&mut self, relays: &[PeerId], listed: bool, others: bool) {
-        self.keep_relayed = (relays.to_vec(), listed, others, self.keep_relayed.3);
+        self.keep_relayed = (relays.to_vec(), listed, others, self.keep_relayed.3, self.keep_relayed.4);
         self.stop_kept();
     }
 
@@ -1021,6 +1023,14 @@ impl<A: Address> Endpoint<A> {
     /// no punch and stop punching at once. Off by default.
     pub fn set_keep_turn(&mut self, on: bool) {
         self.keep_relayed.3 = on;
+        self.stop_kept();
+    }
+
+    /// Keeps links on radio connections ([`Address::radio`]) there, as [`set_keep_turn`](Endpoint::set_keep_turn)
+    /// keeps them on relayed addresses: they punch to nothing, answer no punch and stop punching at once, so neither
+    /// end moves them to a direct path. For a host whose links may take a radio but no direct path. Off by default.
+    pub fn set_keep_radio(&mut self, on: bool) {
+        self.keep_relayed.4 = on;
         self.stop_kept();
     }
 
@@ -5113,12 +5123,15 @@ mod tests {
     }
 
     /// An address that may go through a relay server (bit `TR`), which forwards both ways as a TURN server does:
-    /// what endpoint `i` sends to `j | TR` reaches `j` from `i | TR`.
+    /// what endpoint `i` sends to `j | TR` reaches `j` from `i | TR`; or over a radio connection (bit `RADIO`), the
+    /// same way.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     struct Tr(u32);
     const TR: u32 = 0x100;
     /// With `TR`: through the sending endpoint's own allocation on the relay server ([`Address::own_turn`]).
     const OWN: u32 = 0x200;
+    /// A radio connection ([`Address::radio`]).
+    const RADIO: u32 = 0x400;
 
     impl Address for Tr {
         fn encode(&self, out: &mut Vec<u8>) {
@@ -5128,18 +5141,21 @@ mod tests {
             u32::decode(b).map(Tr)
         }
         fn relayed(&self) -> bool {
-            self.0 & TR != 0
+            self.0 & (TR | RADIO) != 0
         }
         fn own_turn(&self) -> bool {
             self.0 & OWN != 0
+        }
+        fn radio(&self) -> bool {
+            self.0 & RADIO != 0
         }
     }
 
     /// Where what endpoint `i` sends to `dst` goes: to the endpoint at `dst`, from `i`'s address, through the relay
     /// server if `dst` is; `None` if no endpoint is there.
     fn to(i: usize, dst: Tr) -> Option<(usize, Tr)> {
-        let j = ((dst.0 & !TR) as usize).checked_sub(1)?;
-        Some((j, Tr((i as u32 + 1) | (dst.0 & TR))))
+        let j = ((dst.0 & !(TR | RADIO)) as usize).checked_sub(1)?;
+        Some((j, Tr((i as u32 + 1) | (dst.0 & (TR | RADIO)))))
     }
 
     /// As `to`, with endpoint 0's allocation on the relay server: what 0 sends through it (`j | TR | OWN`) reaches `j`
@@ -5203,6 +5219,34 @@ mod tests {
 
     fn tr_events(ep: &mut Endpoint<Tr>) -> Vec<Event<Tr>> {
         std::iter::from_fn(|| ep.poll_event()).collect()
+    }
+
+    /// NB-110: a link on a radio connection kept there (`set_keep_radio`, as for a policy with no direct path)
+    /// punches to none of the peer's addresses and answers none of its punches, so neither end moves it to the direct
+    /// path, though that works and the peer punches to it. Let go, it moves to the first address that answers.
+    #[test]
+    fn kept_radio_links_stay_on_the_radio() {
+        let (mut eps, ids) = tr_endpoints(2);
+        let (a, b) = (ids[0], ids[1]);
+        let mut t = Instant::from_millis(1);
+        eps[0].set_keep_radio(true);
+        eps[0].connect_with(t, b, &[Path::Direct(Tr(2 | RADIO))]).unwrap();
+        route_tr(&mut eps, &mut t, 300, to);
+        let radio = (Some(&Path::Direct(Tr(2 | RADIO))), Some(&Path::Direct(Tr(1 | RADIO))));
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), radio, "linked over the radio");
+        eps[0].add_candidates(t, &b, &[Tr(2)]);
+        eps[1].add_candidates(t, &a, &[Tr(1)]);
+        assert!(eps[0].sessions[&eps[0].peers[&b]].punch.is_none(), "a kept link arms no punch");
+        route_tr(&mut eps, &mut t, 6000, to);
+        assert!(eps[1].stats().punches_sent > 0, "b punches to a's address");
+        assert_eq!(eps[0].stats().punches_sent, 0, "a punches to nothing");
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), radio, "and answers none of b's punches");
+        assert!(tr_events(&mut eps[0]).iter().all(|e| !matches!(e, Event::PathChanged { .. })));
+
+        eps[0].set_keep_radio(false);
+        eps[0].add_candidates(t, &b, &[Tr(2)]);
+        route_tr(&mut eps, &mut t, 1000, to);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Direct(Tr(2))), Some(&Path::Direct(Tr(1)))));
     }
 
     /// NB-099: a link at a relayed address (a dialled b through the relay server and directly, and only the relay

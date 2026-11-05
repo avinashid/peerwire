@@ -287,8 +287,10 @@ pub enum PathKind {
     Turn,
     /// Over a Bluetooth LE connection (feature `ble`, [`Builder::bluetooth`](crate::Builder::bluetooth)) to a peer
     /// whose room hellos or offers came over it (`docs/concepts/bluetooth.md`). Last wherever it is listed: a dial
-    /// takes it in its last step, and a link on it punches to the peer's addresses and moves off it. Off under
-    /// [`Privacy::RelayOnly`], and not in [`Policy::default`].
+    /// takes it in its last step, and a link on it punches to the peer's addresses and moves off it, unless the
+    /// order has neither `Direct` nor `Birthday`: then it stays, punching to nothing and answering no punch. Alone in
+    /// the order, it leaves the node's UDP socket unused, both ways. Off under [`Privacy::RelayOnly`], and not in
+    /// [`Policy::default`].
     Bluetooth,
 }
 
@@ -1046,6 +1048,8 @@ impl<A: Address> Traversal<A> {
             let (listed, others) = (keeps(PathKind::RelayPeers), keeps(PathKind::Peers));
             ep.set_keep_relayed(&self.relay_peers, listed, others);
             ep.set_keep_turn(keeps(PathKind::Turn));
+            // A link on a radio connection leaves it only for a direct path: with none in the order, it stays.
+            ep.set_keep_radio(self.policy.as_ref().is_some_and(|p| p.direct_rank().is_none()));
         }
     }
 
@@ -3248,6 +3252,23 @@ mod tests {
         assert!(crossed <= lost && (1..=2 * 3).contains(&(over_radio - crossed)), "{all}");
         assert!((1..=2 * 3).contains(&to_udp), "{all}");
         assert!(w.paths().iter().all(on_udp), "back on UDP at the end: {:?}", w.paths());
+    }
+
+    /// NB-110: under a policy with no direct kind (here relays and the radio), a link on a radio stays there: it
+    /// answers none of the peer's punches (`Endpoint::set_keep_radio`), so the peer, with no policy, can't move it to
+    /// UDP, where this end's policy would close it, every `RADIO_PUNCH`.
+    #[test]
+    fn a_policy_with_no_direct_path_keeps_a_link_on_the_radio() {
+        let mut w = OnAir::new(Config::default());
+        w.run(12_000, |_| false);
+        assert!(w.paths().iter().all(on_radio), "{:?}", w.paths());
+        w.t[0].set_policy(w.now, &mut w.e[0], Some(Policy::new([PathKind::Peers, PathKind::Bluetooth])));
+        let connected = w.count(|e| matches!(e, Event::Connected { .. }));
+        let moved = w.count(|e| matches!(e, Event::PathChanged { .. }));
+        w.run(2 * RADIO_PUNCH.as_millis() as u64 + 2_000, |_| true);
+        assert!(w.paths().iter().all(on_radio), "{:?}", w.paths());
+        assert_eq!(w.count(|e| matches!(e, Event::Connected { .. })), connected, "no reconnect");
+        assert_eq!(w.count(|e| matches!(e, Event::PathChanged { .. })), moved, "no move");
     }
 
     /// NB-031: knowing the room topic (what relays see) is not enough to be linked

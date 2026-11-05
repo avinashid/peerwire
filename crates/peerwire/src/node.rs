@@ -873,10 +873,12 @@ impl Node {
             self.trav.set_mapped(s.addr().map(Hop::Net));
         }
         let mut drained = false;
+        let radio_only = self.radio_only();
         for _ in 0..MAX_READS_PER_POLL {
             match self.sock.recv_from(&mut self.buf[..]) {
                 #[cfg(any(test, feature = "testing"))]
                 Ok(_) if self.udp_off => {}
+                Ok(_) if radio_only => {}
                 Ok((n, from)) => {
                     // A dual-stack socket sees IPv4 peers as ::ffff:a.b.c.d.
                     let from = Hop::Net(SocketAddr::new(from.ip().to_canonical(), from.port()));
@@ -1125,11 +1127,22 @@ impl Node {
         self.at(Instant::now())
     }
 
+    /// Whether the policy allows Bluetooth links alone ([`PathKind::Bluetooth`]), none of which go over UDP: then the
+    /// socket is left alone both ways, so a peer that dials or punches to it hears nothing and links over the radio,
+    /// rather than linking on UDP only to have the policy close it.
+    fn radio_only(&self) -> bool {
+        self.trav.policy().is_some_and(|p| p.order == [PathKind::Bluetooth])
+    }
+
     fn at(&self, now: Instant) -> peerwire_core::Instant {
         peerwire_core::Instant::from_micros(now.saturating_duration_since(self.epoch).as_micros() as u64)
     }
 
     fn flush(&mut self, now: peerwire_core::Instant) {
+        let radio_only = self.radio_only();
+        if radio_only {
+            self.pending.clear();
+        }
         while let Some(t) = self.pending.pop_front() {
             if !self.try_send(&t) {
                 self.pending.push_front(t);
@@ -1151,6 +1164,9 @@ impl Node {
             }
             #[cfg(any(test, feature = "testing"))]
             if self.udp_off {
+                continue;
+            }
+            if radio_only {
                 continue;
             }
             if !self.try_send(&t) {

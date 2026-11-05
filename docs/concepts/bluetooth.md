@@ -165,9 +165,12 @@ puts a link on.
   Tested on simulated time: with UDP off 5 s at a time for 2 minutes, nothing moves; off 40 s and on 40 s for 4
   minutes, each side loses its link once and moves back to UDP once each time.
 - **Policy.** Bluetooth is `PathKind::Bluetooth`, not in `Policy::default()`: with a policy, the radio carries links
-  only if its order lists it, and it ranks last wherever it is listed. Under `Privacy::RelayOnly` no link goes over
-  Bluetooth, which would announce the device within radio range; `PublicOnly` allows it, as no IP address goes over
-  the radio.
+  only if its order lists it, and it ranks last wherever it is listed. With neither `Direct` nor `Birthday` in the
+  order, a link on Bluetooth stays there: it punches to nothing and answers none of the peer's punches
+  (`Endpoint::set_keep_radio`), so a peer with another policy can't move it to UDP, only to have this node drop it
+  there. With Bluetooth alone in the order the node leaves its UDP socket unused, both ways, so a peer's dials to it
+  there get no answer, and the peer links over the radio. Under `Privacy::RelayOnly` no link goes over Bluetooth,
+  which would announce the device within radio range; `PublicOnly` allows it, as no IP address goes over the radio.
 - **What the app sees.** A link on Bluetooth reports `Path::Direct` at an address in `0.0.0.0/8` with port 0, which no
   network uses, one per connection; `Node::path_kind` says `PathKind::Bluetooth`.
 
