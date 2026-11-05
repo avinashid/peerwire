@@ -12,6 +12,7 @@ repository. Don't open a public issue. We aim to acknowledge within 7 days.
 
 - the `peerwire-core` handshake, wire format, relaying and NAT traversal;
 - the C ABI (`peerwire-ffi`) and the JavaScript glue;
+- the Bluetooth LE transport (`peerwire` features `ble` and `ble-bluez`);
 - the signaling adapters.
 
 ## Threat model
@@ -42,6 +43,13 @@ its trust boundaries, and the standing findings.
   every device on the local network sees that you run Peerwire, your rooms' topics,
   your inbox topic and your IP and MAC addresses, and one that knows two members'
   PeerIds can keep them from linking (NB64-6).
+- **Privacy and availability within Bluetooth range.** With a radio (`ble`), any device
+  in range sees that a Peerwire peer is near and the sizes and timing of its
+  connections, and can jam or cut them; a link over Bluetooth proves nothing about
+  distance. On BlueZ 5.87 without upstream commit `82af2beaf`, `bluetoothd` crashes on a
+  UUID discovery filter, which the Linux driver sets before NB-112 and any local program
+  can set: use a BlueZ with that commit ([threat model](docs/project/threat-model.md),
+  NB-110).
 - **Connection-setup DoS resistance** against an attacker with many real
   addresses: 256 IPv4 addresses or IPv6 /64s (one IPv6 /56, which many ISPs and
   hosts give a single customer), at 4 half-open handshakes each, fill the quarter
