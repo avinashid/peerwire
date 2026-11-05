@@ -34,11 +34,17 @@ with the package. The [React guide](../guides/react.md) shows how to use them.
 
 ## Rust
 
-Peerwire isn't on crates.io yet. Add it from git:
+Peerwire needs Rust 1.88 or later.
+
+```sh
+cargo add peerwire --features nostr,tokio
+```
+
+That adds to `Cargo.toml`:
 
 ```toml
 [dependencies]
-peerwire = { git = "https://github.com/avinashid/peerwire", features = ["nostr", "tokio"] }
+peerwire = { version = "0.1.0", features = ["nostr", "tokio"] }
 ```
 
 | Feature | Adds |
@@ -47,11 +53,19 @@ peerwire = { git = "https://github.com/avinashid/peerwire", features = ["nostr",
 | `tokio` | `AsyncNode`: the node as a tokio task that waits on its socket and timers |
 
 With neither feature, you get the blocking `Node`, invites, `MemoryHub` for tests and `LanSignaling` for the local
-network. Pin a commit with `rev = "…"` if you need builds to stay reproducible while the API changes.
+network. Before 1.0 a minor version may break the API, and `0.1.0` there takes 0.1 releases only.
 
-The other crates come from the same repository the same way: `peerwire-core` (the sans-IO core on its own),
-`peerwire-sync` (shared documents), `peerwire-game` and `peerwire-sim`. [Rust crates](../reference/rust.md) says
-what each one is for.
+To build from `main` between releases, take it from git instead, with `rev = "…"` to pin a commit:
+
+```toml
+[dependencies]
+peerwire = { git = "https://github.com/avinashid/peerwire", features = ["nostr", "tokio"] }
+```
+
+The other crates are on crates.io too: `peerwire-core` (the sans-IO core on its own), `peerwire-sync` (shared
+documents), `peerwire-game`, `peerwire-sim` and `peerwire-ffi` (the C ABI). Take them all from one source, crates.io
+or one git `rev`, so they share one `peerwire-core`. The always-on peer installs with `cargo install peerwire-peer`
+(Linux and macOS). [Rust crates](../reference/rust.md) says what each one is for.
 
 ## Godot 4
 
