@@ -72,12 +72,14 @@ That is 30 of the 31 bytes a legacy advert holds. Where the stack allows a scan 
 **Who connects.** Native peers both advertise and scan. A peer connects, as the central, to an advert that isn't full
 when its own `n` is the smaller, or when its own advert is full; with equal values neither does until one changes. A
 peer with no advert of its own (a browser) connects to the device the user picks. So a native peer accepts a central
-that never advertises. A peer doesn't connect to an `n` it is connected or connecting to, nor within 60 s to one whose
-connection closed or failed; but one whose connection closed before it sent a challenge (it refused the central, or
-never challenged) is tried again after 1 to 4 s, at random, so a device that connects on a cycle of its own can't keep a
-newcomer landing in its grace (see the limits). Nothing a peer says of its own advert is taken, as a member could name
-another's to keep two members apart: so two peers may make two connections (a full desktop connects back to the peer
-that filled it, say), and the [second one closes](#binding-a-connection-to-its-peer).
+that never advertises. A peer doesn't connect to an `n` it is connected or connecting to, nor within 60 s to an `n`
+from a device whose connection closed or failed. The hold is that device's alone, so a copy of a member's advert, which
+anyone in range can replay, holds only the copy, not the member's own. But one whose connection closed before it sent a
+challenge (it refused the central, or never challenged) is tried again after 1 to 4 s, at random, so a device that
+connects on a cycle of its own can't keep a newcomer landing in its grace (see the limits). Nothing a peer says of its
+own advert is taken, as a member could name another's to keep two members apart: so two peers may make two connections
+(a full desktop connects back to the peer that filled it, say), and the
+[second one closes](#binding-a-connection-to-its-peer).
 
 ## Framing
 
@@ -214,9 +216,9 @@ puts a link on.
 A peer that holds all the connections or all the centrals it can marks its advert full and refuses another central,
 counting no central whose peer hasn't proven who it is, nor a second one to a peer: those make way for a new central
 (one whose peer hasn't proven who it is, once it has had 1 s), so an advert that says it takes a central refuses one
-only within another's first second. Linux takes one central at a time
-because BlueZ sends a notification to every subscribed central (BLE-R8). The addresses naming connections (`Hop::Ble`)
-aren't reused within a process before 2^24 (16.7 million) more connections have been made.
+only within another's first second, or while its own connect is under way. Linux takes one central at a time because
+BlueZ sends a notification to every subscribed central (BLE-R8). The addresses naming connections (`Hop::Ble`) aren't
+reused within a process before 2^24 (16.7 million) more connections have been made.
 
 ## What a listener on the radio sees
 
