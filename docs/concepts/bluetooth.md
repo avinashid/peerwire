@@ -301,7 +301,10 @@ tests use an in-process pair of fake radios.
     user;
   - its discovery scans actively, so the radio sends scan requests from its address;
   - the driver scans for every LE advert, as a discovery filter on the service UUID crashes bluetoothd 5.87 (NB-112),
-    and follows at most 256 devices at once: past that, only ones advertising the service, in place of others;
+    and follows at most 256 devices at once: past that, only one advertising the service, in place of one that never
+    has. Any device can put the service in its adverts, so one that has is never dropped for another, and one left
+    out is picked up once there is room: the driver lists BlueZ's devices again, at most every 30 s. While a burst of
+    such adverts holds all 256, a member that comes is reported once, then not followed until it ends;
   - it can't add a scan response, so Web Bluetooth's picker must filter on the service data (to be checked on a
     phone);
   - pairing is the system's: BlueZ answers a central's pairing request through the desktop's agent, so a device
@@ -311,8 +314,7 @@ tests use an in-process pair of fake radios.
   address (`AcquireNotify`), and takes writes from that device alone; another that writes meanwhile is disconnected.
   As the central it gives a connect 10 s to come up (the link, the service found, both sockets), and reports one that
   fails or doesn't as failed, then disconnects it, which also stops a connect BlueZ still has under way. BlueZ answers
-  a disconnect only once the link is down, 2 s or more later, so the driver never waits on one: each runs on its own
-  (NB110-12).
+  a disconnect only once the link is down, 2 s or more later, so the driver never waits on one: each runs on its own.
   bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone
   browser that doesn't raise it, say; to be checked with NB-110d) can't carry the codec's 20-byte values and isn't
   used.
@@ -322,9 +324,10 @@ tests use an in-process pair of fake radios.
   logged once; an advert that isn't on the air is reported (`Advertising`). When the adapter in use goes (a USB reset
   brings it back as `hci1`, say), stops answering (it is asked every 10 s, as a bluetoothd that crashed says nothing)
   or comes again (bluetoothd restarted, and forgot what was set up on it), or another becomes the default, its links
-  are reported closed, connects under way fail, and the driver sets up on the default adapter: powered on, serving,
-  advertising and scanning. One powered off has its links reported closed too, and is set up again once powered on:
-  the driver doesn't power on an adapter its user turned off.
+  are reported closed, connects under way fail, and the driver sets up on the default adapter: serving, advertising
+  and scanning. One powered off has its links reported closed too, and is set up again once powered on. The driver
+  powers an adapter on only at start (`BlueZ::new`), never one its user turned off; BlueZ's `AutoEnable`, on by
+  default, powers on one it finds, as after a USB reset.
 
   Ordinary users need access to `bluetoothd` over D-Bus, which most desktop distributions give the logged-in user.
 - **ESP32 (NB-110c):** NimBLE, three connections, an ATT MTU of 256 and a random non-resolvable address.

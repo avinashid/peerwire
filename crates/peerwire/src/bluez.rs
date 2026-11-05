@@ -15,7 +15,8 @@
 //! is reported ([`RadioEvent::Advertising`]). When the adapter goes (a USB reset brings it back as another), stops
 //! answering (bluetoothd crashed) or comes again (bluetoothd restarted, forgetting what was set up on it), or another
 //! becomes the default, the links on it are reported closed and the driver sets up on the default adapter. One powered
-//! off has its links reported closed too, and is set up again once powered on, by its user.
+//! off has its links reported closed too, and is set up again once powered on: the driver powers an adapter on only
+//! at start, never one its user turned off (BlueZ's `AutoEnable` powers on one it finds, as after a USB reset).
 
 use crate::ble::{ConnId, DeviceId, Limits, Radio, RadioEvent, RX_UUID, SERVICE_UUID, TX_UUID};
 use bluer::adv::{Advertisement, AdvertisementHandle, Type};
@@ -56,6 +57,8 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 const CHECK: Duration = Duration::from_secs(10);
 /// Devices the scan follows at once ([`Watching`]).
 const WATCH: usize = 256;
+/// How often at most the scan lists BlueZ's devices again, for those it left out ([`Watching`]).
+const RELIST: Duration = Duration::from_secs(30);
 
 /// The Linux driver: the default BlueZ adapter, powered on, serving the Peerwire GATT service.
 ///
@@ -403,20 +406,24 @@ impl Driver {
     /// Sets up on the default adapter at start: its alias, or why not. A missing adapter or GATT service fails
     /// [`BlueZ::new`]; later, a part that fails is tried again.
     async fn start(&mut self) -> Result<String, String> {
-        let mut on = self.find().await?;
+        let mut on = self.find(true).await?;
         let alias = on.adapter.alias().await.map_err(|e| e.to_string())?;
         on.app = Some(serve(&on.adapter, &self.ctx).await.map_err(|e| e.to_string())?);
         self.on = Some(on);
         Ok(alias)
     }
 
-    /// The default adapter, powered on.
-    async fn find(&self) -> Result<On, String> {
+    /// The default adapter: powered on if `power` (at start), else as it is, as its user may have turned it off.
+    async fn find(&self, power: bool) -> Result<On, String> {
         let adapter = self.session.default_adapter().await.map_err(|e| e.to_string())?;
-        adapter.set_powered(true).await.map_err(|e| format!("powering {} on: {e}", adapter.name()))?;
+        if power {
+            adapter.set_powered(true).await.map_err(|e| format!("powering {} on: {e}", adapter.name()))?;
+        }
+        // Its events before its state, so that it being powered on after it answers is heard.
         let changes = adapter.events().await.map_err(|e| e.to_string())?.boxed_local();
-        log::info!("Bluetooth: on adapter {}", adapter.name());
-        Ok(On { adapter, changes, powered: true, app: None, advert: None, scan: None })
+        let powered = adapter.is_powered().await.map_err(|e| e.to_string())?;
+        log::info!("Bluetooth: on adapter {}{}", adapter.name(), if powered { "" } else { ", powered off" });
+        Ok(On { adapter, changes, powered, app: None, advert: None, scan: None })
     }
 
     /// Brings up what is down and due: the adapter, then on it the GATT service, the advert and the scan.
@@ -426,7 +433,7 @@ impl Driver {
             if !self.retry_adapter.due(now) {
                 return;
             }
-            match self.find().await {
+            match self.find(false).await {
                 Ok(on) => {
                     self.retry_adapter.up();
                     self.on = Some(on);
@@ -605,11 +612,12 @@ impl Driver {
         self.retry_adapter.now();
     }
 
-    /// The adapter in use holds no links now, for `why`: each is reported closed, and closed at BlueZ for an adapter
-    /// still there; connects under way fail; the GATT service, the advert and the scan are down.
+    /// The adapter in use holds no links now, for `why`: each is reported closed, and connects under way failed, and
+    /// on an adapter still there they are closed and stopped at BlueZ; the GATT service, the advert and the scan are
+    /// down.
     fn lose(&mut self, why: &str) {
-        let addrs = drop_links(&self.ctx, &mut self.connects);
-        log::warn!("Bluetooth: {why}; {} links closed", addrs.len());
+        let (closed, addrs) = drop_links(&self.ctx, &mut self.connects);
+        log::warn!("Bluetooth: {why}; {closed} links closed");
         if let Some(on) = &mut self.on {
             on.advert = None;
             for t in on.app.take().map(|(_, t)| t).into_iter().chain(on.scan.take()) {
@@ -650,17 +658,20 @@ async fn until(at: Option<Instant>) {
 }
 
 /// Reports every link closed and every connect under way failed: each connect still under way stops, each connection
-/// closes. The devices they were to, to close at BlueZ.
-fn drop_links(ctx: &Ctx, connects: &mut Vec<(DeviceId, JoinHandle<()>)>) -> Vec<Address> {
+/// closes. How many links there were, and the devices to close at BlueZ: theirs, and those of the connects, which
+/// BlueZ may have under way still.
+fn drop_links(ctx: &Ctx, connects: &mut Vec<(DeviceId, JoinHandle<()>)>) -> (usize, Vec<Address>) {
+    let mut addrs = Vec::new();
     // One that hasn't finished hasn't said `Connected` (nothing between that and its end waits), nor `ConnectFailed`.
     for (device, t) in connects.drain(..) {
         if !t.is_finished() {
             t.abort();
             ctx.events.send(RadioEvent::ConnectFailed { device });
+            addrs.push(address(device));
         }
     }
     let links: Vec<(u32, Link)> = ctx.centrals.lock().unwrap().drain().collect();
-    let mut addrs = Vec::new();
+    let mut closed = links.len();
     for (conn, link) in links {
         link.write.abort();
         link.read.abort();
@@ -673,9 +684,10 @@ fn drop_links(ctx: &Ctx, connects: &mut Vec<(DeviceId, JoinHandle<()>)>) -> Vec<
     if let Some(conn) = p.conn {
         ctx.shared.senders.lock().unwrap().remove(&conn);
         ctx.events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
+        closed += 1;
     }
     addrs.extend(p.from);
-    addrs
+    (closed, addrs)
 }
 
 /// Takes `conn` out of the driver's books, as the node closed it: a central connection's tasks stop, or the one
@@ -792,30 +804,62 @@ async fn follow(
     mut found: impl Stream<Item = AdapterEvent> + Send + Unpin + 'static,
 ) {
     let mut watching = Watching::default();
-    while let Some(e) = found.next().await {
-        match e {
-            AdapterEvent::DeviceAdded(addr) => {
-                let Ok(dev) = adapter.device(addr) else { continue };
-                let ours = matches!(dev.service_data().await, Ok(Some(data)) if seen(&events, addr, &data));
-                if !watching.room(addr, ours) {
-                    continue;
+    loop {
+        let again = watching.relist_at(Instant::now());
+        tokio::select! {
+            e = found.next() => match e {
+                Some(AdapterEvent::DeviceAdded(addr)) => {
+                    let Ok(dev) = adapter.device(addr) else { continue };
+                    let ours = matches!(dev.service_data().await, Ok(Some(data)) if seen(&events, addr, &data));
+                    watch(&mut watching, &events, dev, ours).await;
                 }
-                let Ok(mut changes) = dev.events().await else { continue };
-                let (events, ours) = (events.clone(), Arc::new(AtomicBool::new(ours)));
-                let flag = ours.clone();
-                let watch = tokio::spawn(async move {
-                    while let Some(DeviceEvent::PropertyChanged(p)) = changes.next().await {
-                        if let DeviceProperty::ServiceData(data) = p {
-                            if seen(&events, addr, &data) {
-                                flag.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                });
-                watching.add(addr, watch, ours);
+                Some(AdapterEvent::DeviceRemoved(addr)) => watching.remove(addr),
+                Some(_) => {}
+                None => return,
+            },
+            () = until(again) => list_again(&adapter, &events, &mut watching).await,
+        }
+    }
+}
+
+/// Follows `dev`, which has advertised the service if `ours`, if `watching` has room for it: each advert of its with
+/// the service's data is reported.
+async fn watch(watching: &mut Watching, events: &Events, dev: bluer::Device, ours: bool) {
+    let addr = dev.address();
+    if !watching.room(addr, ours) {
+        return;
+    }
+    let Ok(mut changes) = dev.events().await else { return };
+    let (events, ours) = (events.clone(), Arc::new(AtomicBool::new(ours)));
+    let flag = ours.clone();
+    let task = tokio::spawn(async move {
+        while let Some(DeviceEvent::PropertyChanged(p)) = changes.next().await {
+            if let DeviceProperty::ServiceData(data) = p {
+                if seen(&events, addr, &data) {
+                    flag.store(true, Ordering::Relaxed);
+                }
             }
-            AdapterEvent::DeviceRemoved(addr) => watching.remove(addr),
-            _ => {}
+        }
+    });
+    watching.add(addr, task, ours);
+}
+
+/// Lists BlueZ's devices again, for those the scan left out: each one it doesn't follow is reported if it advertises
+/// the service, and followed as there is room, the service's first (NB112-1).
+async fn list_again(adapter: &Adapter, events: &Events, watching: &mut Watching) {
+    let Ok(addrs) = adapter.device_addresses().await else {
+        watching.listed = Some(Instant::now());
+        return;
+    };
+    let mut found = Vec::new();
+    for addr in addrs.into_iter().filter(|a| !watching.follows(*a)) {
+        let Ok(dev) = adapter.device(addr) else { continue };
+        let ours = matches!(dev.service_data().await, Ok(Some(data)) if seen(events, addr, &data));
+        found.push((addr, ours));
+    }
+    for (addr, ours) in watching.listed(Instant::now(), found) {
+        if let Ok(dev) = adapter.device(addr) {
+            watch(watching, events, dev, ours).await;
         }
     }
 }
@@ -828,12 +872,19 @@ fn seen(events: &Events, addr: Address, data: &HashMap<Uuid, Vec<u8>>) -> bool {
 }
 
 /// The devices the scan follows for changes to their adverts, at most `WATCH`: under that, each one BlueZ adds; at it,
-/// only one that advertises the service already, in place of the device followed longest that never has. One BlueZ
-/// removes (unheard for its `TemporaryTimeout`, 30 s by default) is dropped, and all of them with the scan.
+/// only one that advertises the service already, in place of the device followed longest that never has. One that has
+/// is never dropped for another, as any device can put the service in its adverts: a burst of them would push the
+/// members out, unfollowed once it stops (NB112-1). One left out is missed: once a device of the service could be
+/// followed, BlueZ's devices are listed again, at most every `RELIST` ([`list_again`]). One BlueZ removes (unheard
+/// for its `TemporaryTimeout`, 30 s by default) is dropped, and all of them with the scan.
 #[derive(Default)]
 struct Watching {
     devices: HashMap<Address, Watched>,
     added: u64,
+    /// A device BlueZ has was left out, for want of room.
+    missed: bool,
+    /// When BlueZ's devices were last listed again.
+    listed: Option<Instant>,
 }
 
 struct Watched {
@@ -844,24 +895,50 @@ struct Watched {
 }
 
 impl Watching {
-    /// Whether to follow `addr`, which advertises the service if `ours`, making room for it if need be.
+    /// Whether to follow `addr`, which advertises the service if `ours`, making room for it if need be: else it is
+    /// missed.
     fn room(&mut self, addr: Address, ours: bool) -> bool {
         self.remove(addr);
         self.devices.retain(|_, w| !w.task.is_finished());
         if self.devices.len() < WATCH {
             return true;
         }
-        if !ours {
+        let Some(other) = self.oldest_other().filter(|_| ours) else {
+            self.missed = true;
             return false;
-        }
-        let oldest = |others: bool| {
-            let them = self.devices.iter().filter(|(_, w)| !(others && w.ours.load(Ordering::Relaxed)));
-            them.min_by_key(|(_, w)| w.added).map(|(a, _)| *a)
         };
-        if let Some(a) = oldest(true).or_else(|| oldest(false)) {
-            self.remove(a);
-        }
+        self.remove(other);
         true
+    }
+
+    /// The device followed longest that never advertised the service, if any.
+    fn oldest_other(&self) -> Option<Address> {
+        let others = self.live().filter(|(_, w)| !w.ours.load(Ordering::Relaxed));
+        others.min_by_key(|(_, w)| w.added).map(|(a, _)| *a)
+    }
+
+    fn live(&self) -> impl Iterator<Item = (&Address, &Watched)> {
+        self.devices.iter().filter(|(_, w)| !w.task.is_finished())
+    }
+
+    fn follows(&self, addr: Address) -> bool {
+        self.devices.contains_key(&addr)
+    }
+
+    /// When to list BlueZ's devices again, as of `now`: once one was missed and a device of the service could be
+    /// followed (there is room, or one followed never advertised it), `RELIST` after the last listing.
+    fn relist_at(&self, now: Instant) -> Option<Instant> {
+        let room = self.live().count() < WATCH || self.oldest_other().is_some();
+        (self.missed && room).then(|| self.listed.map_or(now, |t| t + RELIST))
+    }
+
+    /// BlueZ's devices were listed at `now`: of them (`found`, each with whether it advertises the service), those
+    /// not followed, in the order to follow them, the service's first.
+    fn listed(&mut self, now: Instant, mut found: Vec<(Address, bool)>) -> Vec<(Address, bool)> {
+        (self.missed, self.listed) = (false, Some(now));
+        found.retain(|(a, _)| !self.follows(*a));
+        found.sort_by_key(|(_, ours)| !ours);
+        found
     }
 
     fn add(&mut self, addr: Address, task: JoinHandle<()>, ours: Arc<AtomicBool>) {
@@ -1105,12 +1182,14 @@ mod tests {
     fn the_scan_follows_a_bounded_number_of_devices() {
         runtime().block_on(async {
             let idle = || tokio::spawn(std::future::pending::<()>());
+            let t = Instant::now();
             let mut w = Watching::default();
             for i in 0..WATCH {
                 assert!(w.room(addr(i), false));
                 w.add(addr(i), idle(), Arc::new(AtomicBool::new(i == 0 || i == 2)));
             }
             assert!(!w.room(addr(WATCH), false), "full: not a device that doesn't advertise the service");
+            assert_eq!(w.relist_at(t), Some(t), "missed, and one of the service could take another's place");
             assert!(w.room(addr(WATCH), true), "but one that does");
             w.add(addr(WATCH), idle(), Arc::new(AtomicBool::new(true)));
             assert!(!w.devices.contains_key(&addr(1)), "in place of the oldest that never has");
@@ -1126,17 +1205,57 @@ mod tests {
             quiet().await;
             assert!(ended && w.room(addr(WATCH + 2), false), "one that ended makes room");
             assert!(!w.devices.contains_key(&addr(5)));
-            // All of them members: the oldest goes.
-            let mut m = Watching::default();
-            for i in 0..WATCH {
-                m.room(addr(i), true);
-                m.add(addr(i), idle(), Arc::new(AtomicBool::new(true)));
-            }
-            assert!(m.room(addr(WATCH), true) && !m.devices.contains_key(&addr(0)));
-            let task = m.devices[&addr(1)].task.abort_handle();
-            drop(m);
+            let task = w.devices[&addr(0)].task.abort_handle();
+            drop(w);
             quiet().await;
             assert!(task.is_finished(), "they stop with the scan");
+        });
+    }
+
+    /// NB112-1: no device that has advertised the service is pushed out for another, as any device can put the
+    /// service in its adverts: one that comes at the cap is missed instead. Once a device of the service could be
+    /// followed, BlueZ's devices are listed again, at most every `RELIST`, and those not followed are followed, the
+    /// service's first.
+    #[test]
+    fn a_burst_of_service_adverts_pushes_no_member_out() {
+        runtime().block_on(async {
+            let idle = || tokio::spawn(std::future::pending::<()>());
+            let follow = |w: &mut Watching, a: Address, ours: bool| {
+                let room = w.room(a, ours);
+                if room {
+                    w.add(a, idle(), Arc::new(AtomicBool::new(ours)));
+                }
+                room
+            };
+            let t = Instant::now();
+            let mut w = Watching::default();
+            let (alice, bob) = (addr(1000), addr(1001));
+            assert!(follow(&mut w, alice, true));
+            assert_eq!(w.relist_at(t), None, "none missed");
+            // Mallory's burst, from as many addresses as it takes, with Bob's first advert in the middle of it.
+            for i in 0..2 * WATCH {
+                follow(&mut w, addr(i), true);
+            }
+            assert!(!follow(&mut w, bob, true), "full of the service's devices: one more is left out");
+            assert!(w.follows(alice), "and the member followed stays");
+            assert!((0..WATCH - 1).all(|i| w.follows(addr(i))) && !w.follows(addr(WATCH - 1)));
+            assert_eq!(w.relist_at(t), None, "missed, but none could be followed: not listed again");
+            // The burst stops, and BlueZ forgets its devices as they go unheard.
+            w.devices[&addr(0)].task.abort();
+            quiet().await;
+            assert_eq!(w.relist_at(t), Some(t), "listed again at once");
+            let found = vec![(addr(3000), false), (addr(1), true), (bob, true)];
+            assert_eq!(
+                w.listed(t, found),
+                [(bob, true), (addr(3000), false)],
+                "those not followed, the service's first"
+            );
+            assert_eq!(w.relist_at(t), None, "none missed now");
+            assert!(follow(&mut w, bob, true) && w.follows(bob), "Bob is followed");
+            assert!(!follow(&mut w, addr(3000), false), "and the cap is reached again");
+            // Left out again: listed again `RELIST` after the last time, not before.
+            w.remove(addr(1));
+            assert_eq!(w.relist_at(t), Some(t + RELIST));
         });
     }
 
@@ -1167,8 +1286,9 @@ mod tests {
             for conn in [5, 7] {
                 ctx.shared.senders.lock().unwrap().insert(conn, mpsc::channel(1).0);
             }
-            let addrs = drop_links(&ctx, &mut connects);
-            assert_eq!(addrs, [addr(3), addr(4)]);
+            let (closed, addrs) = drop_links(&ctx, &mut connects);
+            assert_eq!(closed, 2);
+            assert_eq!(addrs, [addr(1), addr(3), addr(4)], "the connect's device too, to stop it at BlueZ");
             let said: Vec<RadioEvent> = events.try_iter().collect();
             let closed = |c| RadioEvent::Disconnected { conn: ConnId(c) };
             assert_eq!(said, [RadioEvent::ConnectFailed { device: DeviceId(1) }, closed(5), closed(7)]);
