@@ -110,8 +110,16 @@ docker compose -f docker/compose.yml down
 
 ## ESP32
 
-[`ports/esp32`](../ports/esp32): a prototype of the unchanged `peerwire::Node` on an ESP32-C3 under ESP-IDF, run in
-Espressif's QEMU. Emulated chips on one virtual LAN find each other and link into a full mesh. It has its own
+[`templates/esp32`](../templates/esp32): a project to start from, for an ESP32-C3 or ESP32 board. It joins your
+Wi-Fi and a room, and answers what peers send it; `lan_chat` on a PC on the same Wi-Fi talks to it.
+
+```sh
+cargo generate --git https://github.com/avinashid/peerwire templates/esp32
+cd my-board && cargo run --release   # builds, flashes the board on USB and opens its log
+```
+
+[`ports/esp32`](../ports/esp32): the `peerwire-esp` crate the template uses, and its `mesh` example, the port's
+test: emulated chips in Espressif's QEMU on one virtual LAN find each other and link into a full mesh. It has its own
 toolchain (a pinned nightly, ESP-IDF, QEMU); its [README](../ports/esp32/README.md) sets it up.
 
 ```sh

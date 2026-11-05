@@ -24,7 +24,8 @@ WebAssembly module with a small JS package, and a C ABI. Status: early developme
 | `packages/js` | `@peerwire/js`: `src/room.js` (`joinRoom`), `src/peerwire.js` (`loadPeerwire`, class `Peerwire`), WebRTC transport, Nostr signaling, types in `src/index.d.ts`, demos, tests |
 | `packages/react` | `@peerwire/react`: React hooks in TypeScript (`src/`, built by `tsc` to `dist/`), a Vite example, tests. Its dev dependencies come from `npm ci` there; the gate runs it |
 | `examples/` | Runnable examples: `rust/` (examples of the `peerwire` crate) and the Godot demo `godot/`; `examples/README.md` indexes every example in the repo |
-| `ports/esp32` | ESP32-C3 prototype under ESP-IDF, with its own `[workspace]` and pinned nightly: not built by the workspace, CI or the gate |
+| `ports/esp32` | `peerwire-esp`: the ESP32-C3 and ESP32 crate under ESP-IDF (Wi-Fi, the clock, signaling) and its `mesh` example, with its own `[workspace]` and pinned nightly: not built by the workspace, CI or the gate |
+| `templates/esp32` | The `cargo generate` template for an ESP32 project on `peerwire-esp`, built with Espressif's `esp` toolchain |
 | `docker/` | `Dockerfile` (the always-on peer and the examples server), `compose.yml`, the nginx config; the build context is the repo root |
 | `docs/` | `README.md` (the index), `getting-started/`, `guides/`, `concepts/` (architecture, NAT traversal, protocol, security model, scaling), `reference/`, `project/` (status, performance, testing, comparison, threat model, offline-store design) |
 | `scripts/` | `gate.sh` (the gate), `site.sh` and `site/` (the docs and demos site), benchmarks |

@@ -7,7 +7,55 @@
 The unchanged `peerwire::Node` runs under ESP-IDF on an ESP32-C3 and on the original ESP32, the chip in the
 ESP32-WROOM-32 module. Emulated chips on one virtual LAN find each other with [LAN discovery](lan-discovery.md) and
 link into a full mesh, with the same handshake, encryption and reliable lane as every other Peerwire node. The code
-is in [`ports/esp32`](../../ports/esp32).
+is in [`ports/esp32`](../../ports/esp32): the `peerwire-esp` crate.
+
+## Start a project
+
+`peerwire-esp` wraps what a board needs around the node: Wi-Fi, a clock set before the node binds, caps sized for the
+chip, and signaling on the LAN and, optionally, over a Nostr relay. A
+[`cargo generate`](https://github.com/cargo-generate/cargo-generate) template starts a project on it.
+
+**Once, the toolchain:**
+
+1. [Rust](https://rustup.rs), then `cargo install espup ldproxy espflash cargo-generate`. On Linux, espflash needs
+   `libudev-dev` and `pkg-config` first.
+2. `espup install`: Espressif's Rust (the `esp` toolchain, for the ESP32-C3 and the ESP32 alike) and its GCC. It
+   writes `~/export-esp.sh`: run `. ~/export-esp.sh` in each shell you build in, or from your shell's profile.
+3. ESP-IDF's own prerequisites. On Debian or Ubuntu: `sudo apt install git wget flex bison gperf python3 python3-pip
+   python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0`; on macOS:
+   `brew install cmake ninja dfu-util`. On Linux, add yourself to the `dialout` group to reach the board's serial port.
+
+**Then, a project:**
+
+```sh
+cargo generate --git https://github.com/avinashid/peerwire templates/esp32 --name my-board
+cd my-board
+cargo run --release
+```
+
+The template asks for the chip (`esp32c3` or `esp32`), your Wi-Fi network (2.4 GHz only) and its password, which it
+keeps in `cfg.toml` (git ignores that file), and a room. `cargo run --release` builds the firmware, flashes the board
+on USB and opens its log. The first build downloads ESP-IDF and its tools to `~/.espressif`, several GB, and takes 10
+to 20 minutes; later builds take seconds.
+
+**Talk to it** from a PC on the same Wi-Fi, in the room you chose:
+
+```sh
+git clone https://github.com/avinashid/peerwire && cd peerwire
+cargo run -p peerwire --example lan_chat -- esp32
+```
+
+Type a line, and the board answers `echo: …`. With `--features nostr` the board also joins its room over a Nostr
+relay, so `room_chat` on a PC anywhere links with it. The project's README says what to check if it doesn't link.
+
+| `peerwire-esp` | |
+|---|---|
+| `peerwire_esp::run(app)` | Starts ESP-IDF's logger and runs `app`; restarts the chip if it fails |
+| `Board::connect(ssid, password)` | Joins Wi-Fi, sets the clock by SNTP (waiting up to 60 s) and keeps it in step |
+| `board.node()` | A node on the board's address, sized for the chip, with LAN signaling |
+| `board.node_with_nostr(relay)` | The same, with a Nostr relay too (feature `nostr`) |
+| `board.builder()` | The node's builder, to change before binding: an identity of your own, say |
+| `peerwire_esp::idle(&node)` | The loop's sleep: until the node's next timer, 10 ms at most |
 
 ## What it shows
 
