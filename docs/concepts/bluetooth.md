@@ -73,10 +73,13 @@ That is 30 of the 31 bytes a legacy advert holds. Where the stack allows a scan 
 when its own `n` is the smaller, or when its own advert is full; with equal values neither does until one changes. A
 peer with no advert of its own (a browser) connects to the device the user picks. So a native peer accepts a central
 that never advertises. A peer doesn't connect to an `n` it is connected or connecting to, nor within 60 s to an `n`
-from a device whose connection closed or failed. The hold is that device's alone, so a copy of a member's advert, which
-anyone in range can replay, holds only the copy, not the member's own. But one whose connection closed before it sent a
-challenge (it refused the central, or never challenged) is tried again after 1 to 4 s, at random, so a device that
-connects on a cycle of its own can't keep a newcomer landing in its grace (see the limits). Nothing a peer says of its
+from a device whose connection closed or failed. A connect not up within 12 s counts as failed (a driver fails its own
+within 10 s and drops the link), and one that comes up after that is closed: so a device that takes the link and
+stalls its setup holds a connect 12 s at most, and then not again for 60 s. The hold is that device's alone, so a copy
+of a member's advert, which anyone in range can replay, holds only the copy, not the member's own. But one whose
+connection closed before it sent a challenge (it refused the central, or never challenged) is tried again after 1 to
+4 s, at random, so a device that connects on a cycle of its own can't keep a newcomer landing in its grace (see the
+limits). Nothing a peer says of its
 own advert is taken, as a member could name another's to keep two members apart: so two peers may make two connections
 (a full desktop connects back to the peer that filled it, say), and the
 [second one closes](#binding-a-connection-to-its-peer).
@@ -202,6 +205,7 @@ puts a link on.
 | Connections | 8, one of them as the peripheral | 3 |
 | Connections bound to no peer | 4; proven ones (standbys) leave one free: one that proves the room into the last closes the weakest other (unproven, then with no proven peer, then the oldest), so standbys can't lock newcomers out | 2 |
 | Time to prove the room and the peer's identity | 3 s, then the connection closes | same |
+| A connect of the peer's own | up within 12 s, or given up as a failed one; the driver fails it within 10 s | same |
 | A central's connection whose peer hasn't proven who it is | makes way, after 1 s, for a new central over the limits; a second one to a peer, at once | same |
 | A proven connection bound to no peer | open while a signal proves a member at least every 60 s | same |
 | Distinct HS1s on an unbound connection | 1 per 10 s (a half-open handshake's life); its resends pass | same |
@@ -216,8 +220,10 @@ puts a link on.
 A peer that holds all the connections or all the centrals it can marks its advert full and refuses another central,
 counting no central whose peer hasn't proven who it is, nor a second one to a peer: those make way for a new central
 (one whose peer hasn't proven who it is, once it has had 1 s), so an advert that says it takes a central refuses one
-only within another's first second, or while its own connect is under way. Linux takes one central at a time because
-BlueZ sends a notification to every subscribed central (BLE-R8). The addresses naming connections (`Hop::Ble`) aren't
+only within another's first second. A peer's own connects under way count against its own connects alone, never
+against a central or a connection that proves the room, as one that never completes can't make way: a device that
+stalls them can't keep centrals out. Linux takes one central at a time because BlueZ sends a notification to every
+subscribed central (BLE-R8). The addresses naming connections (`Hop::Ble`) aren't
 reused within a process before 2^24 (16.7 million) more connections have been made.
 
 ## What a listener on the radio sees
@@ -243,7 +249,9 @@ pub trait Radio: Send {
     fn advertise(&mut self, data: Option<&[u8]>);
     /// Starts or stops scanning, passively, for the service's adverts.
     fn scan(&mut self, on: bool);
-    /// Connects to `device` (from `Seen`) as a central, subscribes to `tx`, and asks for the largest ATT MTU.
+    /// Connects to `device` (from `Seen`) as a central, subscribes to `tx`, and asks for the largest ATT MTU. A
+    /// connect not set up within 10 s fails (`ConnectFailed`) and leaves no link up; the node gives one up after
+    /// 12 s, and closes a connection that comes after that.
     fn connect(&mut self, device: DeviceId);
     /// Sends one value of at most ATT_MTU - 3 bytes on `conn`: a write without response to `rx` as the central, a
     /// notification on `tx` to that one central as the peripheral. `false` if it can't take it now (a full buffer):
@@ -294,6 +302,8 @@ tests use an in-process pair of fake radios.
 
   As the peripheral the driver serves the central whose subscription to `tx` BlueZ hands over, as a socket with its
   address (`AcquireNotify`), and takes writes from that device alone; another that writes meanwhile is disconnected.
+  As the central it gives a connect 10 s to come up (the link, the service found, both sockets), and disconnects one
+  that fails or doesn't, which also stops a connect BlueZ still has under way.
   bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone
   browser that doesn't raise it, say; to be checked with NB-110d) can't carry the codec's 20-byte values and isn't
   used.

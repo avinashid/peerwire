@@ -82,7 +82,9 @@ pub trait Radio: Send {
     /// Starts or stops scanning, passively, for the service's adverts.
     fn scan(&mut self, on: bool);
     /// Connects to `device` (from [`RadioEvent::Seen`]) as a central, subscribes to `tx`, and asks for the largest
-    /// ATT MTU.
+    /// ATT MTU. A connect not set up within 10 s fails ([`RadioEvent::ConnectFailed`]) and leaves no link up, so a
+    /// device that stalls it can't hold this radio's connects: the node gives one up after 12 s, and closes a
+    /// connection that comes after that.
     fn connect(&mut self, device: DeviceId);
     /// Sends one value of at most ATT MTU - 3 bytes on `conn`: a write without response to `rx` as the central, a
     /// notification on `tx` to that one central as the peripheral. `false` if it can't take it now (its buffer is
@@ -139,8 +141,9 @@ const RECONNECT_HOLD: Duration = Duration::from_secs(60);
 /// newcomer landing in its grace (NB110-7).
 const REFUSED_HOLD: Duration = Duration::from_secs(1);
 const REFUSED_JITTER_MS: u32 = 3_000;
-/// A connect the driver never answers is given up after this.
-const CONNECT_WAIT: Duration = Duration::from_secs(30);
+/// A connect the driver hasn't answered by then is given up, as a failed one: a driver gives up its own sooner
+/// ([`Radio::connect`]), so this is for one that doesn't (NB110-11).
+const CONNECT_WAIT: Duration = Duration::from_secs(12);
 /// Adverts looked at: a burst, then one per `ADVERT_REFILL` (50 a second).
 const ADVERT_BURST: u32 = 50;
 const ADVERT_REFILL: Duration = Duration::from_millis(20);
@@ -442,11 +445,7 @@ impl Ble {
         match e {
             RadioEvent::Seen { device, data } => self.on_seen(now, device, &data),
             RadioEvent::Connected { conn, device, mtu } => self.on_connected(now, conn, device, mtu),
-            RadioEvent::ConnectFailed { device } => {
-                if let Some((n, _)) = self.pending.remove(&device) {
-                    self.held.insert((device, n), now + RECONNECT_HOLD);
-                }
-            }
+            RadioEvent::ConnectFailed { device } => self.failed(now, device),
             RadioEvent::Mtu { conn, mtu } => {
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.mtu = mtu;
@@ -503,27 +502,38 @@ impl Ble {
         self.radio.connect(device);
     }
 
-    /// Connections bound to no peer, with the connects under way.
-    fn unbound(&self) -> usize {
-        self.conns.values().filter(|c| c.bound.is_none()).count() + self.pending.len()
+    /// A connect to `device` failed, or was given up: that device's advert isn't connected to again for
+    /// `RECONNECT_HOLD`.
+    fn failed(&mut self, now: Instant, device: DeviceId) {
+        if let Some((n, _)) = self.pending.remove(&device) {
+            self.held.insert((device, n), now + RECONNECT_HOLD);
+        }
     }
 
-    /// Whether a connection this end makes fits: one more connection, and one more unbound.
+    /// Open connections bound to no peer.
+    fn unbound(&self) -> usize {
+        self.conns.values().filter(|c| c.bound.is_none()).count()
+    }
+
+    /// Whether a connection this end makes fits: one more connection, and one more unbound, counting its connects
+    /// under way. They count only here: a central is taken, and a proven connection makes way, by the open ones alone,
+    /// as a connect that never completes can't be closed for them (NB110-11).
     fn room_out(&self) -> bool {
-        self.conns.len() + self.pending.len() < self.limits.connections && self.unbound() < self.limits.unbound
+        let under_way = self.pending.len();
+        self.conns.len() + under_way < self.limits.connections && self.unbound() + under_way < self.limits.unbound
     }
 
     /// Whether this radio takes no central now (its advert says so): it holds all the connections, or all the
     /// centrals, it can. A central's connection whose peer hasn't proven who it is doesn't count, as it soon has, or
     /// closes, or makes way for a newcomer after `GRACE` (NB110-7); nor does a second one to a peer, which its central
     /// closes or which makes way at once (NB110-9). These are what `make_way` closes for a newcomer, so an advert
-    /// that says it takes a central refuses one only within another's `GRACE`, or while a connect of this end's own
-    /// is under way: it counts, and only an open connection makes way (I10).
+    /// that says it takes a central refuses one only within another's `GRACE`. Connects of this end's under way don't
+    /// count (NB110-11).
     fn full(&self) -> bool {
         let weak = |(i, c): &(&ConnId, &Conn)| !c.central && (c.known().is_none() || self.second(**i, c));
         let weak = self.conns.iter().filter(weak).count();
         let centrals = self.conns.values().filter(|c| !c.central).count() - weak;
-        self.conns.len() + self.pending.len() - weak >= self.limits.connections || centrals >= self.limits.centrals
+        self.conns.len() - weak >= self.limits.connections || centrals >= self.limits.centrals
     }
 
     /// Whether `c` (`conn`) reaches a peer that another connection was proven to reach first.
@@ -554,7 +564,7 @@ impl Ble {
     /// central's for the limits of connections and centrals (NB110-7, NB110-9). Whether the central is taken.
     fn make_way(&mut self, now: Instant) -> bool {
         let centrals = self.conns.values().filter(|c| !c.central).count();
-        if self.conns.len() + self.pending.len() >= self.limits.connections || centrals >= self.limits.centrals {
+        if self.conns.len() >= self.limits.connections || centrals >= self.limits.centrals {
             match self.weakest(|i, c| !c.central && self.spare(i, c, now)) {
                 Some(w) => self.close(w),
                 None => return false,
@@ -573,7 +583,7 @@ impl Ble {
         let n = match device {
             Some(d) => match self.pending.remove(&d) {
                 Some((n, _)) => Some(n),
-                None => return self.radio.disconnect(conn), // not one we asked for
+                None => return self.radio.disconnect(conn), // not one we asked for, or given up (NB110-11)
             },
             None if !self.on || !self.make_way(now) => return self.radio.disconnect(conn),
             None => None,
@@ -929,7 +939,15 @@ impl Ble {
             self.close_for(c, ROTATE);
         }
         self.check_ids();
-        self.pending.retain(|_, (_, at)| now.saturating_duration_since(*at) < CONNECT_WAIT);
+        let given_up: Vec<DeviceId> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, at))| now.saturating_duration_since(*at) >= CONNECT_WAIT)
+            .map(|(d, _)| *d)
+            .collect();
+        for d in given_up {
+            self.failed(now, d);
+        }
         self.held.retain(|_, t| now < *t);
         self.seen.retain(|(_, _, at, _)| now.saturating_duration_since(*at) < SEEN_FOR);
         if now >= self.rotate_at {
@@ -1226,6 +1244,8 @@ mod fake {
 mod tests {
     use super::*;
     use peerwire_core::{Config, Identity, Lane, Path};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn id(n: u8) -> Identity {
         Identity::from_secret_bytes(&[n; 32])
@@ -1262,8 +1282,7 @@ mod tests {
 
     #[test]
     fn a_radio_wakes_its_node_when_something_comes() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
         struct Count(AtomicUsize);
         impl std::task::Wake for Count {
             fn wake(self: Arc<Self>) {
@@ -1295,23 +1314,38 @@ mod tests {
         ids: Vec<Vec<(PeerId, Hop<SocketAddr>)>>,
         /// Datagrams cross between endpoints.
         datagrams: bool,
+        /// The radio of node 0: the test's own come first.
+        first: usize,
     }
 
     impl Air {
         /// Nodes `1..=limits.len()` (identities `id(i)`), the `i`th with `limits[i - 1]`, in room "room".
         fn new(limits: &[Limits]) -> Air {
+            Air::with(limits, 0, |_, r| Box::new(r)).0
+        }
+
+        /// As `new`, after `k` radios of the test's (radios `0..k`, which every scan hears first), with node `i`'s
+        /// radio given to `wrap(i, radio)`.
+        fn with(
+            limits: &[Limits],
+            k: usize,
+            wrap: impl Fn(usize, FakeRadio) -> Box<dyn Radio>,
+        ) -> (Air, Vec<FakeRadio>) {
             let air = FakeAir::new(23);
+            let mine = (0..k).map(|_| air.radio(Limits::DESKTOP)).collect();
             let now = Instant::from_millis(1);
             let b = (1..=limits.len() as u8)
                 .map(|i| {
-                    let mut b = Ble::new(Box::new(air.radio(limits[usize::from(i) - 1])), &id(i), now);
+                    let radio = wrap(usize::from(i) - 1, air.radio(limits[usize::from(i) - 1]));
+                    let mut b = Ble::new(radio, &id(i), now);
                     b.set_room(now, room());
                     b
                 })
                 .collect();
             let eps = (1..=limits.len() as u8).map(|i| Endpoint::new(&id(i), Config::default(), [i; 32])).collect();
             let n = limits.len();
-            Air { air, b, eps, now, got: vec![Vec::new(); n], ids: vec![Vec::new(); n], datagrams: false }
+            let (got, ids) = (vec![Vec::new(); n], vec![Vec::new(); n]);
+            (Air { air, b, eps, now, got, ids, datagrams: false, first: k }, mine)
         }
 
         /// Gives node `i` (from 0) the advert value `n`.
@@ -1353,9 +1387,68 @@ mod tests {
         fn linked(&self, i: usize, j: usize) -> bool {
             let (pi, pj) = (id(i as u8 + 1).peer_id(), id(j as u8 + 1).peer_id());
             let to = |a: usize, b: usize, p: PeerId| {
-                self.b[a].conns.iter().any(|(c, x)| self.air.peer_of(a, *c) == Some(b) && x.known() == Some(p))
+                let other = |c: &ConnId| self.air.peer_of(self.first + a, *c) == Some(self.first + b);
+                self.b[a].conns.iter().any(|(c, x)| other(c) && x.known() == Some(p))
             };
             to(i, j, pj) && to(j, i, pi)
+        }
+    }
+
+    /// A radio whose connects to the `deaf` devices its driver doesn't answer, as when a device takes the link and
+    /// stalls its setup, until `late` is set; and whose connects to the `refused` ones fail at once.
+    struct Stall {
+        radio: FakeRadio,
+        deaf: Vec<DeviceId>,
+        refused: Vec<DeviceId>,
+        stalled: Vec<DeviceId>,
+        late: Arc<AtomicBool>,
+        failed: VecDeque<RadioEvent>,
+    }
+
+    impl Stall {
+        fn new(radio: FakeRadio, deaf: &[u64], refused: &[u64]) -> Stall {
+            let ids = |ds: &[u64]| -> Vec<DeviceId> { ds.iter().map(|d| DeviceId(*d)).collect() };
+            let late = Arc::new(AtomicBool::new(false));
+            Stall { radio, deaf: ids(deaf), refused: ids(refused), stalled: Vec::new(), late, failed: VecDeque::new() }
+        }
+    }
+
+    impl Radio for Stall {
+        fn advertise(&mut self, data: Option<&[u8]>) {
+            self.radio.advertise(data);
+        }
+
+        fn scan(&mut self, on: bool) {
+            self.radio.scan(on);
+        }
+
+        fn connect(&mut self, device: DeviceId) {
+            match (self.deaf.contains(&device), self.refused.contains(&device)) {
+                (true, _) => self.stalled.push(device),
+                (_, true) => self.failed.push_back(RadioEvent::ConnectFailed { device }),
+                _ => self.radio.connect(device),
+            }
+        }
+
+        fn send(&mut self, conn: ConnId, value: &[u8]) -> bool {
+            self.radio.send(conn, value)
+        }
+
+        fn disconnect(&mut self, conn: ConnId) {
+            self.radio.disconnect(conn);
+        }
+
+        fn poll(&mut self) -> Option<RadioEvent> {
+            if self.late.load(Ordering::Relaxed) {
+                for d in std::mem::take(&mut self.stalled) {
+                    self.radio.connect(d);
+                }
+            }
+            self.failed.pop_front().or_else(|| self.radio.poll())
+        }
+
+        fn limits(&self) -> Limits {
+            self.radio.limits()
         }
     }
 
@@ -2002,6 +2095,148 @@ mod tests {
             w.b[1].on_seen(now, from, &advert(&ble_key("app", "room"), 3_000, false));
             assert!(w.b[1].pending.contains_key(&from), "{what}: a new advert from that device isn't");
         }
+    }
+
+    /// Runs `w` until nodes `i` and `j` link, or `limit` passes: how long that took, if they did.
+    fn link_time(w: &mut Air, i: usize, j: usize, limit: Duration) -> Option<Duration> {
+        let start = w.now;
+        while !w.linked(i, j) && w.now - start < limit {
+            w.run(10);
+        }
+        w.linked(i, j).then(|| w.now - start)
+    }
+
+    /// NB110-11 (security's case g1): an outsider replays Alice's advert, Bob hears the copy first, and his connect
+    /// to it never completes. Bob gives it up after `CONNECT_WAIT`, as a failed one, holds that device's copy, and
+    /// connects to Alice (before, never: the copy was drawn again each time).
+    #[test]
+    fn a_connect_that_never_completes_is_given_up_and_held() {
+        let copy = advert(&ble_key("app", "room"), 2_000, false);
+        for attack in [false, true] {
+            // Radio 0 the replayer, then Alice and Bob, whose connects to it never complete.
+            let deaf = |i: usize| if i == 1 { vec![0] } else { vec![] };
+            let (mut w, mut rp) = Air::with(&[Limits::DESKTOP; 2], 1, |i, r| Box::new(Stall::new(r, &deaf(i), &[])));
+            rp[0].advertise(attack.then_some(&copy[..]));
+            w.set_n(0, 2_000); // Alice
+            w.set_n(1, 1_000); // Bob
+            let took = link_time(&mut w, 0, 1, Duration::from_secs(20));
+            eprintln!("attack {attack}: linked in {took:?}");
+            let Some(took) = took else { panic!("attack {attack}: never linked") };
+            if !attack {
+                assert!(took < Duration::from_secs(1), "linked in {took:?}");
+                continue;
+            }
+            let given_up = CONNECT_WAIT..CONNECT_WAIT + Duration::from_secs(2);
+            assert!(given_up.contains(&took), "linked in {took:?}, once the connect to the copy was given up");
+            assert!(w.b[1].held.contains_key(&(DeviceId(0), 2_000)), "the copy is held");
+            assert!(w.b[1].pending.is_empty(), "and not connected to again");
+        }
+    }
+
+    /// NB110-11 (security's case g2): four outsiders advertise recorded adverts above Bob's, and his connects to
+    /// them, made first, never complete: they take all his unbound slots. Carol, whose advert is below Bob's,
+    /// connects to him at once all the same, as connects under way don't count against a central, even when they
+    /// fill the connections a radio holds; and Bob links with Alice once he gives them up (before: neither, ever).
+    #[test]
+    fn connects_that_never_complete_dont_keep_centrals_out() {
+        let key = ble_key("app", "room");
+        let stale: Vec<[u8; ADVERT_LEN]> = (0..4).map(|i| advert(&key, 5_000 + i, false)).collect();
+        for bob in [Limits::DESKTOP, Limits { connections: 4, ..Limits::DESKTOP }] {
+            for attack in [false, true] {
+                // Radios 0..4 the replayers, then Alice, Bob and Carol. Bob's connects to the replayers never
+                // complete, and Alice's and Carol's fail at once; so do Carol's to Alice, whose one central is Bob.
+                let wrap = |i: usize, r: FakeRadio| -> Box<dyn Radio> {
+                    let (deaf, refused): (&[u64], &[u64]) = match i {
+                        0 => (&[], &[0, 1, 2, 3]),
+                        1 => (&[0, 1, 2, 3], &[]),
+                        _ => (&[], &[0, 1, 2, 3, 4]),
+                    };
+                    Box::new(Stall::new(r, deaf, refused))
+                };
+                let (mut w, mut rp) = Air::with(&[Limits::DESKTOP, bob, Limits::DESKTOP], 4, wrap);
+                for (r, a) in rp.iter_mut().zip(&stale) {
+                    r.advertise(attack.then_some(&a[..]));
+                }
+                w.set_n(0, 2_000); // Alice
+                w.set_n(1, 1_000); // Bob
+                w.set_n(2, 500); // Carol
+                let second = Duration::from_secs(1);
+                w.run(1_000);
+                let what = format!("Bob's connections {}, attack {attack}", bob.connections);
+                assert_eq!(w.b[1].pending.len(), if attack { 4 } else { 0 }, "{what}: the replayers took his slots");
+                assert!(w.linked(2, 1), "{what}: Carol links within 1 s");
+                assert_eq!(w.linked(0, 1), !attack, "{what}: Alice within 1 s, but for the replayers");
+                if !attack {
+                    continue;
+                }
+                let took = link_time(&mut w, 0, 1, Duration::from_secs(20)).map(|t| t + second);
+                eprintln!("{what}: Carol linked within 1 s, Alice in {took:?}");
+                let given_up = CONNECT_WAIT..CONNECT_WAIT + Duration::from_secs(2);
+                assert!(took.is_some_and(|t| given_up.contains(&t)), "{what}: Alice linked in {took:?}, once given up");
+                assert!((0..4).all(|i| w.b[1].held.contains_key(&(DeviceId(i), 5_000 + i as u32))), "{what}: held");
+            }
+        }
+    }
+
+    /// NB110-11: with all its unbound slots taken by connects under way, a node still takes centrals, and says so
+    /// in its advert, even when those connects fill the connections it holds; and a central proving the room closes
+    /// no other, as connects under way can't be closed to make way.
+    #[test]
+    fn connects_under_way_count_only_against_the_nodes_own() {
+        let t = Instant::from_millis(1);
+        for limits in
+            [Limits { centrals: 2, ..Limits::DESKTOP }, Limits { connections: 4, centrals: 2, ..Limits::DESKTOP }]
+        {
+            let air = FakeAir::new(23);
+            let (mut node, mut ep) = lone(&air, limits, 1, t);
+            for d in 0..4 {
+                node.pending.insert(DeviceId(100 + d), (5_000 + d as u32, t));
+            }
+            assert!(!node.room_out(), "no connect of its own fits");
+            node.refresh(t);
+            assert_eq!(air.advert(0).map(|a| a[0] & FULL), Some(0), "{limits:?}: the advert takes a central");
+            let mut rs: Vec<Rogue> = (5..7)
+                .map(|i| {
+                    let mut r = Rogue::prove(&air, DeviceId(0), &mut node, &mut ep, t);
+                    r.prove_id(&id(i), &r.transcript.clone());
+                    r.read(&mut node, &mut ep, t);
+                    r
+                })
+                .collect();
+            assert!(rs.iter_mut().all(|r| !r.closed()), "{limits:?}: both taken, and neither closed");
+            assert_eq!(node.counts(), (2, 2, 0));
+        }
+    }
+
+    /// NB110-11: a connect the node has given up on, whose `Connected` comes after all, is closed, not taken, and
+    /// the device's advert stays held.
+    #[test]
+    fn a_connect_given_up_is_closed_when_it_comes() {
+        let key = ble_key("app", "room");
+        let air = FakeAir::new(23);
+        let t = Instant::from_millis(1);
+        let mut yp = air.radio(Limits::DESKTOP);
+        yp.advertise(Some(&advert(&key, u32::MAX, false)));
+        let stall = Stall::new(air.radio(Limits::DESKTOP), &[0], &[]);
+        let late = stall.late.clone();
+        let mut node = Ble::new(Box::new(stall), &id(1), t);
+        node.set_room(t, room());
+        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
+        let mut now = t;
+        while !node.pending.contains_key(&DeviceId(0)) {
+            assert!(now - t < Duration::from_secs(1), "the node connects to the advert");
+            node.poll(now, &mut ep);
+            now = now + Duration::from_millis(10);
+        }
+        node.poll(now + CONNECT_WAIT, &mut ep);
+        assert!(node.pending.is_empty() && node.held.contains_key(&(DeviceId(0), u32::MAX)), "given up and held");
+        late.store(true, Ordering::Relaxed);
+        node.poll(now + CONNECT_WAIT, &mut ep);
+        let seen: Vec<RadioEvent> = std::iter::from_fn(|| yp.poll()).collect();
+        let closed = matches!(seen[..], [RadioEvent::Connected { .. }, RadioEvent::Disconnected { .. }]);
+        assert!(closed, "the connection came, and closed: {seen:?}");
+        assert_eq!((node.counts().0, air.links()), (0, 0), "not taken");
+        assert!(node.held.contains_key(&(DeviceId(0), u32::MAX)), "still held");
     }
 
     /// NB110-2: Mallory's four members, with adverts above everyone's, take all of Bob's unbound connections, and
