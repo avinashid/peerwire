@@ -1,0 +1,31 @@
+[package]
+name = "{{project-name}}"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[[bin]]
+name = "{{project-name}}"
+# ESP-IDF has no test harness.
+harness = false
+
+[features]
+# Rooms across the internet over a Nostr relay too, not only the LAN: see README.md before you turn it on.
+nostr = ["peerwire-esp/nostr"]
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+peerwire-esp = "0.1"
+esp-idf-svc = "0.53"
+log = "0.4"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.33"
+toml = "0.8"

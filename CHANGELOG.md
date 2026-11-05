@@ -44,6 +44,12 @@ and the commit that fixed it.
   such as an ESP32 on Wi-Fi.
 - **ESP32:** `peerwire` builds for ESP-IDF; a prototype runs on emulated ESP32-C3s and ESP32s, and links over Wi-Fi
   with a PC from an ESP32-C3 board.
+- **`peerwire-esp`:** the ESP32 port as a crate. `Board::connect` joins Wi-Fi, sets the clock by SNTP before the node
+  binds and keeps it in step; `Board::node` binds a node sized for the chip with LAN signaling, and
+  `Board::node_with_nostr` (feature `nostr`) adds a Nostr relay. The clock no longer comes from lwIP's SNTP, which
+  took any answer that reached its port: its own asks must be echoed, and unsynchronised servers are refused.
+  `cargo generate --git https://github.com/avinashid/peerwire templates/esp32` starts a project for the ESP32-C3 or
+  ESP32. See [ESP32](docs/guides/esp32.md).
 - **Shared documents:** `peerwire-sync` gives shared documents in Rust, wire-compatible with `room.doc()`, in the
   Godot binding (`open_doc`) and the C ABI.
 - **Harder NATs:**

@@ -1,19 +1,68 @@
-# Peerwire on ESP32 (prototype)
+# peerwire-esp
 
-A feasibility prototype, not a supported target: the unchanged `peerwire::Node`
-running under ESP-IDF on an ESP32-C3 and on the original ESP32 (the chip in the
-ESP32-WROOM-32 module), tested in Espressif's QEMU and on one ESP32-C3 board on Wi-Fi
-([On a board](#on-a-board-nb-091-3-nov-2026)). N emulated
-chips share one virtual LAN, find each other by themselves (NB-064, LAN discovery)
-and link into a full mesh with the same handshake, encryption and reliable lane as
-every other Peerwire node.
+[Peerwire](https://avinashid.github.io/peerwire/) on the ESP32-C3 and the original
+ESP32 (the chip in the ESP32-WROOM-32 module), under ESP-IDF: the unchanged
+`peerwire::Node`, and what a board needs around it.
 
-It is not built by the repo's workspace, CI or `scripts/gate.sh`: it has its own
-`[workspace]` and its own pinned toolchain.
+- `Board::connect` joins Wi-Fi, stepping the transmit power down when the access point
+  doesn't answer (small C3 boards need it), sets the clock by SNTP before the node binds
+  and keeps it in step: a board starts at 1970, and peers drop hellos more than a minute
+  off their own clock.
+- `Board::node` binds a node with caps sized for the chip's ~250 KB of heap, and LAN
+  signaling that also broadcasts, for routers that drop multicast.
+- With the `nostr` feature, `Board::node_with_nostr` joins rooms across the internet
+  over a Nostr relay too.
+
+A prototype, not yet a supported target: it has run in Espressif's QEMU and on one
+ESP32-C3 board ([On a board](#on-a-board-nb-091-3-nov-2026)), and it draws a new
+identity each boot.
+
+## Start a project
+
+```sh
+cargo generate --git https://github.com/avinashid/peerwire templates/esp32
+cd my-board
+cargo run --release      # builds, flashes the board on USB and opens its log
+```
+
+The template asks for the chip, your Wi-Fi and a room. The
+[ESP32 guide](https://avinashid.github.io/peerwire/docs/guides/esp32) has the toolchain,
+every step, and how to talk to the board from a PC.
+
+```rust
+use peerwire_esp::peerwire::{Event, Lane};
+
+fn main() {
+    peerwire_esp::run(|| {
+        let board = peerwire_esp::Board::connect("my-wifi", "its password")?;
+        let mut node = board.node()?;
+        node.join_room("peerwire-lan-chat", "esp32"); // `lan_chat esp32` on a PC
+        loop {
+            node.poll();
+            while let Some(event) = node.try_recv_event() {
+                if let Event::Message { peer, data, .. } = event {
+                    let _ = node.send(&peer, Lane::Reliable, &data);
+                }
+            }
+            peerwire_esp::idle(&node);
+        }
+    })
+}
+```
+
+## The port's mesh test
+
+The crate's `mesh` example is the port's test: N emulated chips share one virtual LAN,
+find each other by themselves (NB-064, LAN discovery) and link into a full mesh with the
+same handshake, encryption and reliable lane as every other Peerwire node.
+
+The crate is not built by the repo's workspace, CI or `scripts/gate.sh`: it has its own
+`[workspace]` and its own pinned toolchain. `src/ntp.rs` has host tests:
+`rustc --edition 2021 --test src/ntp.rs -o /tmp/ntp && /tmp/ntp`.
 
 ## What it does
 
-`src/main.rs` reads its node number and a 32-byte identity seed from the last flash
+`examples/mesh.rs` reads its node number and a 32-byte identity seed from the last flash
 sector (`run.sh` patches them into each node's copy of the image), and takes:
 
 - the address `10.62.0.<10+n>` on QEMU's emulated Ethernet (the OpenCores MAC);
@@ -32,7 +81,12 @@ heap so far, unused main-task stack and its links' RTTs.
 On a board's Wi-Fi it sets its clock by SNTP before binding the `Node`. Room hellos and
 offers carry the sender's clock and are dropped more than a minute off the receiver's,
 and a board's clock starts at 1970: unset, the board and a PC never linked (NB-091).
-QEMU's chips all start at 1970, so they agree without it.
+QEMU's chips all start at 1970, so they agree without it. `src/clock.rs` asks the pool
+itself, and asks again every 6 hours to keep the clock in step; since NB-103 it no
+longer leaves that to lwIP's SNTP, which took any answer that reached its port, so a
+device on the LAN could step the clock (NB95-I2). An answer must echo the ask's 8
+random bytes, and one from an unsynchronised server (leap indicator 3, stratum 0 or
+16 and up) is refused.
 
 `l2hub.mjs` carries Ethernet frames between the QEMU instances (`-netdev dgram`
 on 127.0.0.1), as a hub on one LAN segment would. Nothing leaves the host.

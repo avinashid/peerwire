@@ -1,0 +1,8 @@
+# The node's loop runs on the main task: the handshake's curve math and the node's buffers want more than the
+# default 3 KB.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
+# A 1 ms tick: at the default 100 Hz a sleep shorter than 10 ms lasts 10 ms, and the node's timers fire late.
+CONFIG_FREERTOS_HZ=1000

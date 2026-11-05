@@ -1,0 +1,5 @@
+# The board's settings, built into its firmware: copy this file to cfg.toml and fill it in. Git ignores cfg.toml.
+wifi_ssid = '''my-network'''
+wifi_password = '''its password'''
+# Anyone on the LAN who knows the room's name can join it.
+room = '''esp32'''

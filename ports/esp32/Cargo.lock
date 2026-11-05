@@ -1388,7 +1388,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "peerwire-esp32"
+name = "peerwire-esp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
