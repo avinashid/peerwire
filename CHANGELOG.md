@@ -12,8 +12,9 @@ and the commit that fixed it.
   gives a node a radio, `Builder::bluetooth`: in a room it advertises, links with the members it hears with no
   network, and ranks the radio below every UDP path (`PathKind::Bluetooth`, not in `Policy::default()`, off under
   `Privacy::RelayOnly`); a link that loses UDP comes back over the radio, and moves to UDP again once it works.
-  Feature `ble-bluez` adds the Linux driver, `ble::BlueZ`. Drivers implement `ble::Radio`; the ESP32's comes in
-  `peerwire-esp`. Not yet run on a radio.
+  Feature `ble-bluez` adds the Linux driver, `ble::BlueZ`, which tries again what fails (logged through `log`) and
+  follows the default adapter. Drivers implement `ble::Radio`; the ESP32's comes in `peerwire-esp`. Not yet run on a
+  radio.
 - `peerwire-core`: `ble`, the framing codec every host shares (`Chunker`, `Reassembler`, the service's UUIDs);
   `Endpoint::handle_datagram_unbound`, for a channel no peer is bound to yet; `Address::radio`.
 - **Breaking:** `peerwire::Hop` has a new variant, `Ble`, and is `#[non_exhaustive]` from now on, so a `match` on it

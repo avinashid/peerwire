@@ -911,6 +911,7 @@ dependencies = [
  "hmac",
  "if-addrs",
  "k256",
+ "log",
  "peerwire",
  "peerwire-core",
  "peerwire-sim",
