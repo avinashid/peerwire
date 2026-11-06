@@ -5,9 +5,10 @@
 //! service data from a non-resolvable random address that changes with each new advert (BLE-R3), with the service's
 //! UUID in the scan response, scans passively, connects where the node asks, and moves values on up to three
 //! connections ([`Limits::SMALL`]). A central that doesn't subscribe to `tx` within 5 s is closed, so a silent one
-//! can't hold a connection the node never hears of. Nothing is paired or bonded (BLE-R5): bonding, MITM and Secure Connections are
-//! off, and a connection that a pairing completes on anyway is closed. `rx` takes writes without response, and
-//! sdkconfig.ble leaves NimBLE no room for prepared (long) writes (BLE-R7).
+//! can't hold a connection the node never hears of. Nothing is paired or bonded (BLE-R5): bonding, MITM and Secure
+//! Connections are off, and a connection that a pairing completes on anyway is closed. `rx` takes writes without
+//! response, and sdkconfig.ble leaves NimBLE no room for prepared (long) writes (BLE-R7). An advert that isn't on the
+//! air is reported to the node (`Advertising`) and tried again.
 //!
 //! NimBLE calls back on its own task, where the driver only queues events for [`Radio::poll`]. What waits on the
 //! radio (a new address, connecting, finding the service, subscribing) runs on a thread of the driver's own, so no
@@ -46,6 +47,9 @@ const SETUP: Duration = Duration::from_secs(10);
 /// isn't connecting.
 const SUBSCRIBE_WITHIN: Duration = Duration::from_secs(5);
 const SWEEP: Duration = Duration::from_secs(1);
+/// An advert that won't go on the air is tried again after the first, then twice as long each time up to the second.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
 /// Events queued for the node at most; adverts beyond the first number and values beyond the second are dropped,
 /// as the radio would drop them, so a device nearby can't fill the heap.
 const MAX_SEEN_QUEUED: usize = 16;
@@ -207,7 +211,16 @@ impl Nimble {
 
         // NimBLE's discovery callback gets the shared state for as long as the program runs.
         let scan_arg = Arc::into_raw(shared.clone()) as usize;
-        let worker = Worker { shared: shared.clone(), cmds, scan_arg, advert: None, scanning: false };
+        let worker = Worker {
+            shared: shared.clone(),
+            cmds,
+            scan_arg,
+            advert: None,
+            unset: None,
+            on_air: true,
+            retry: None,
+            scanning: false,
+        };
         std::thread::Builder::new().name("ble".into()).stack_size(8 * 1024).spawn(move || worker.run())?;
         info!("ble: NimBLE up, serving the Peerwire service, {} B free", crate::free_heap());
         Ok(Nimble { shared, tx })
@@ -369,13 +382,27 @@ struct Worker {
     cmds: mpsc::Receiver<Cmd>,
     /// The `Shared` NimBLE's discovery callback gets, never freed.
     scan_arg: usize,
+    /// The advert set up, from its own address.
     advert: Option<Vec<u8>>,
+    /// The one the node asked for, while it couldn't be set up.
+    unset: Option<Vec<u8>>,
+    /// Whether the node was last told its advert is on the air, as it takes it to be until told otherwise.
+    on_air: bool,
+    /// While the advert isn't on the air: when to try it again, and the wait before that.
+    retry: Option<(Instant, Duration)>,
     scanning: bool,
 }
 
 impl Worker {
     fn run(mut self) {
         loop {
+            // The advert back on the air if it isn't, once a second at most, and one that failed when it's due.
+            if self.retry.is_none_or(|(at, _)| Instant::now() >= at) {
+                match self.unset.take() {
+                    Some(data) => self.set_advert(data),
+                    None => self.readvertise(),
+                }
+            }
             match self.cmds.recv_timeout(SWEEP) {
                 Ok(Cmd::Advertise(data)) => self.advertise(data),
                 Ok(Cmd::Readvertise) => self.readvertise(),
@@ -419,14 +446,19 @@ impl Worker {
 
     /// A new advert, from a new address (BLE-R3), or none.
     fn advertise(&mut self, data: Option<Vec<u8>>) {
-        let advertising = BLEDevice::take().get_advertising();
-        let _ = advertising.lock().stop();
-        self.advert = None;
-        let Some(data) = data else { return };
+        let _ = BLEDevice::take().get_advertising().lock().stop();
+        (self.advert, self.unset, self.retry) = (None, None, None);
+        if let Some(data) = data {
+            self.set_advert(data);
+        }
+    }
+
+    /// Sets `data` up as the advert, from a new address, and starts it.
+    fn set_advert(&mut self, data: Vec<u8>) {
         // NimBLE takes a new address only while it neither advertises nor scans.
         stop_scan();
         let set = new_address().and_then(|()| {
-            let mut a = advertising.lock();
+            let mut a = BLEDevice::take().get_advertising().lock();
             a.set_raw_data(&advert(&data)?).map_err(|e| anyhow!("advert: {e:?}"))?;
             a.set_raw_scan_response_data(&SCAN_RESPONSE).map_err(|e| anyhow!("scan response: {e:?}"))
         });
@@ -436,7 +468,10 @@ impl Worker {
                 self.readvertise();
             }
             // Never the new advert from the old address, which would tie the two together.
-            Err(e) => warn!("ble: not advertising: {e}"),
+            Err(e) => {
+                self.unset = Some(data);
+                self.off_air(format_args!("not advertising: {e}"));
+            }
         }
         if self.scanning {
             self.start_scan();
@@ -444,17 +479,46 @@ impl Worker {
     }
 
     /// The same advert from the same address: the address changes with `n`, when the node gives a new advert (the
-    /// spec's Rotation), not when a connection opens or closes.
-    fn readvertise(&self) {
-        let advertising = BLEDevice::take().get_advertising();
+    /// spec's Rotation), not when a connection opens or closes. With no room for a connection there is no advert, as
+    /// the node's own count says.
+    fn readvertise(&mut self) {
         let state = self.shared.lock();
         let room = state.peripheral + state.centrals() < MAX_CONNECTIONS;
         drop(state);
-        if self.advert.is_none() || !room || advertising.lock().is_advertising() {
+        if self.advert.is_none() || !room {
+            self.retry = None;
             return;
         }
-        if let Err(e) = advertising.lock().start() {
-            debug!("ble: advertising didn't start: {e:?}");
+        let mut a = BLEDevice::take().get_advertising().lock();
+        let started = if a.is_advertising() { Ok(()) } else { a.start() };
+        drop(a);
+        match started {
+            Ok(()) => self.on_air(),
+            Err(e) => self.off_air(format_args!("advertising didn't start: {e:?}")),
+        }
+    }
+
+    /// The advert is on the air: tells the node if it last heard otherwise.
+    fn on_air(&mut self) {
+        self.retry = None;
+        if !self.on_air {
+            self.on_air = true;
+            info!("ble: advertising works again");
+            self.shared.lock().push(RadioEvent::Advertising(true));
+        }
+    }
+
+    /// The advert isn't on the air: tells the node once, so it connects to a peer of a larger `n` too (the spec's
+    /// Who connects), and tries again 1, 2, 4, 8, 16, then every 30 s.
+    fn off_air(&mut self, why: std::fmt::Arguments) {
+        let wait = self.retry.map_or(RETRY_FIRST, |(_, wait)| (wait * 2).min(RETRY_MAX));
+        self.retry = Some((Instant::now() + wait, wait));
+        if self.on_air {
+            self.on_air = false;
+            warn!("ble: {why}; trying again in {wait:?}");
+            self.shared.lock().push(RadioEvent::Advertising(false));
+        } else {
+            debug!("ble: {why}; trying again in {wait:?}");
         }
     }
 

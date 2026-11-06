@@ -350,6 +350,10 @@ tests use an in-process pair of fake radios.
     bonds are stored.
   - The prepared-write pool is empty (`BT_NIMBLE_ATT_MAX_PREP_ENTRIES=0`), so NimBLE itself refuses a long write
     before the driver sees it: on an ESP32-C3, a 300 B write fails with `rc=6`.
+  - As the central it gives a connect 10 s in all (the link, the MTU, the service, subscribing to `tx`). A peer that
+    asks for the MTU first, as BlueZ does as soon as the link is up, has done the exchange: NimBLE refuses a second.
+  - An advert NimBLE won't set up or start is reported (`Advertising(false)`) and tried again 1, 2, 4, 8, 16, then
+    every 30 s; one that falls off the air while there is room for a connection is put back within a second.
   - With Wi-Fi off, every random draw comes after the Bluetooth controller starts (`nimble_port_init`), as NB-063 has
     it for Wi-Fi.
   - A board with no Wi-Fi has no SNTP, and room hellos must be within a minute of the receiver's clock. So a board
