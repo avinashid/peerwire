@@ -8,13 +8,14 @@ and the commit that fixed it.
 
 ## Unreleased: Rust crates
 
-- **Bluetooth LE** (NB-110, [Bluetooth](docs/concepts/bluetooth.md)): `peerwire` feature `ble` (no dependencies)
-  gives a node a radio, `Builder::bluetooth`: in a room it advertises, links with the members it hears with no
+- **Bluetooth LE** (NB-110, [Bluetooth](docs/concepts/bluetooth.md)): `peerwire` feature `ble` (its one dependency
+  `log`) gives a node a radio, `Builder::bluetooth`: in a room it advertises, links with the members it hears with no
   network, and ranks the radio below every UDP path (`PathKind::Bluetooth`, not in `Policy::default()`, off under
   `Privacy::RelayOnly`); a link that loses UDP comes back over the radio, and moves to UDP again once it works.
-  Feature `ble-bluez` adds the Linux driver, `ble::BlueZ`, which tries again what fails (logged through `log`) and
-  follows the default adapter. Drivers implement `ble::Radio`; the ESP32's comes in `peerwire-esp`. Not yet run on a
-  radio.
+  Feature `ble-bluez` adds the Linux driver, `ble::BlueZ`, which tries again what fails and follows the default
+  adapter, and reports a link that drops at once (NB-114). The node and the driver log each connection (at `debug`,
+  and failures at `info`), devices named by a hash, never an address. Drivers implement `ble::Radio`; the ESP32's
+  comes in `peerwire-esp`.
 - `peerwire-core`: `ble`, the framing codec every host shares (`Chunker`, `Reassembler`, the service's UUIDs);
   `Endpoint::handle_datagram_unbound`, for a channel no peer is bound to yet; `Address::radio`.
 - **Breaking:** `peerwire::Hop` has a new variant, `Ble`, and is `#[non_exhaustive]` from now on, so a `match` on it

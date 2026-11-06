@@ -23,6 +23,7 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::OnceLock;
 use std::task::Waker;
 use std::time::Duration;
 
@@ -121,7 +122,8 @@ pub enum RadioEvent {
     Mtu { conn: ConnId, mtu: u16 },
     /// A value the other end sent on `conn`: a write to `rx`, or a notification on `tx`.
     Value { conn: ConnId, value: Vec<u8> },
-    /// `conn` closed.
+    /// `conn` closed: reported as soon as its link goes down, unless the node closed it ([`Radio::disconnect`]). Till
+    /// then the node takes it to be up, and connects to that advert again only after it (NB-114).
     Disconnected { conn: ConnId },
     /// Whether the advert asked for is on the air: `false` when it isn't (the stack refused it, or the adapter went),
     /// `true` once it is again. A radio that never says is taken to advertise as asked. While it doesn't, the node
@@ -208,6 +210,27 @@ pub(crate) fn advert(key: &[u8; 32], n: u32, full: bool) -> [u8; ADVERT_LEN] {
 /// What an identity proof signs: the connection's challenges, `c_p ‖ c_c`, under a label of its own.
 fn id_message(transcript: &[u8; 2 * CHALLENGE]) -> Vec<u8> {
     [&b"pw-ble-id"[..], transcript].concat()
+}
+
+/// How the log names `device`: a hash under a key drawn in each process, so that it carries no address, yet one run's
+/// lines about a device, the node's and its driver's, can be matched (NB-114).
+pub(crate) fn tag(device: DeviceId) -> impl std::fmt::Display {
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut k = [0u8; 32];
+        OsRng.fill_bytes(&mut k);
+        k
+    });
+    let h = hmac(key, &[b"pw-ble-log", &device.0.to_be_bytes()]);
+    Tag([h[0], h[1], h[2]])
+}
+
+struct Tag([u8; 3]);
+
+impl std::fmt::Display for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dev:{:02x}{:02x}{:02x}", self.0[0], self.0[1], self.0[2])
+    }
 }
 
 /// A token bucket.
@@ -311,6 +334,50 @@ impl Conn {
             _ => None,
         }
     }
+
+    /// Whom it reaches, for the log: the device this end connected to, or a central.
+    fn who(&self) -> String {
+        self.to.map_or_else(|| "from a central".into(), |d| format!("to {}", tag(d)))
+    }
+}
+
+/// An advert lately looked at: whether it was this room's, and why the node last logged it didn't connect to it.
+struct Heard {
+    device: DeviceId,
+    data: [u8; ADVERT_LEN],
+    at: Instant,
+    ours: bool,
+    said: Option<Skip>,
+}
+
+/// Why a node doesn't connect to an advert of its room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Skip {
+    /// It has this node's own `n`.
+    Own,
+    /// It takes no central.
+    Full,
+    /// Its end connects: this node's `n` is the larger, and its own advert is on the air and not full.
+    Theirs,
+    /// A connection of this node's to it is open, or under way.
+    Known,
+    /// Its last connection closed or failed: not connected to again until then.
+    Held(Instant),
+    /// This node has no room for another connection of its own.
+    NoRoom,
+}
+
+impl Skip {
+    fn says(self, now: Instant) -> String {
+        match self {
+            Skip::Own => "it has this node's n".into(),
+            Skip::Full => "it is full".into(),
+            Skip::Theirs => "its end connects (this node's n is the larger)".into(),
+            Skip::Known => "connected or connecting to it already".into(),
+            Skip::Held(t) => format!("held for {} s more", t.saturating_duration_since(now).as_secs()),
+            Skip::NoRoom => "no room for another connection".into(),
+        }
+    }
 }
 
 /// What the node does with what came over the radio.
@@ -354,9 +421,8 @@ pub(crate) struct Ble {
     /// Adverts not to connect to again until then, by device and `n`: one device's copy of another's advert holds
     /// only its own (NB110-10).
     held: HashMap<(DeviceId, u32), Instant>,
-    /// Adverts lately looked at, and whether each was this room's: another room's is skipped, this room's is
-    /// judged again without its tag checked again.
-    seen: VecDeque<(DeviceId, [u8; ADVERT_LEN], Instant, bool)>,
+    /// Adverts lately looked at: another room's is skipped, this room's is judged again without its tag checked again.
+    seen: VecDeque<Heard>,
     adverts: Bucket,
     /// New handshakes on unbound connections, across the radio ([`Limits::hs1_gap`]).
     hs1s: Bucket,
@@ -403,7 +469,7 @@ impl Ble {
         self.rotate_at = now + ROTATE;
         let unbound: Vec<ConnId> = self.conns.iter().filter(|(_, c)| c.bound.is_none()).map(|(i, _)| *i).collect();
         for c in unbound {
-            self.close_for(c, Duration::ZERO);
+            self.close_for(c, Duration::ZERO, "the room changed");
         }
         self.refresh(now);
     }
@@ -415,7 +481,7 @@ impl Ble {
         if !on {
             let all: Vec<ConnId> = self.conns.keys().copied().collect();
             for c in all {
-                self.close_for(c, Duration::ZERO);
+                self.close_for(c, Duration::ZERO, "the radio is off");
             }
         }
         self.refresh(now);
@@ -464,9 +530,12 @@ impl Ble {
             RadioEvent::Value { conn, value } => self.on_value(now, ep, conn, &value),
             RadioEvent::Advertising(up) => self.on_air = up,
             RadioEvent::Disconnected { conn } => {
-                if let Some((at, until)) = self.conns.get(&conn).and_then(|c| Some((c.to.zip(c.n)?, now + hold(c)))) {
-                    let t = self.held.entry(at).or_insert(until);
-                    *t = (*t).max(until);
+                let Some(c) = self.conns.get(&conn) else { return };
+                let held = c.to.zip(c.n).map(|at| (at, hold(c)));
+                log::debug!("Bluetooth: conn {} ({}) went{}", conn.0, c.who(), held_for(held.map(|(_, h)| h)));
+                if let Some((at, hold)) = held {
+                    let t = self.held.entry(at).or_insert(now + hold);
+                    *t = (*t).max(now + hold);
                 }
                 self.forget(conn);
                 self.refresh(now);
@@ -474,15 +543,17 @@ impl Ble {
         }
     }
 
+    /// An advert of the service `device` sent: connected to if this node is the one to, and logged if not, once a
+    /// `SEEN_FOR` for each reason (NB-114).
     fn on_seen(&mut self, now: Instant, device: DeviceId, data: &[u8]) {
         let Some(((key, _), data)) = self.room.zip(<[u8; ADVERT_LEN]>::try_from(data).ok()) else { return };
         if !self.on || data[0] & !FULL != 0 {
             return;
         }
         let n = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-        match self.seen.iter().find(|(d, a, ..)| *d == device && *a == data) {
-            Some(&(.., ours)) if !ours => return,
-            Some(_) => {}
+        let i = match self.seen.iter().position(|h| h.device == device && h.data == data) {
+            Some(i) if !self.seen[i].ours => return,
+            Some(i) => i,
             None => {
                 if !self.adverts.take(now, ADVERT_BURST, ADVERT_REFILL) {
                     return;
@@ -491,33 +562,59 @@ impl Ble {
                     self.seen.pop_front();
                 }
                 let ours = advert(&key, n, data[0] & FULL != 0) == data;
-                self.seen.push_back((device, data, now, ours));
+                self.seen.push_back(Heard { device, data, at: now, ours, said: None });
                 if !ours {
                     return; // another room's
                 }
+                self.seen.len() - 1
             }
+        };
+        let skip = self.skip(now, device, n, data[0] & FULL != 0);
+        if let Some(s) = skip.filter(|s| self.seen[i].said != Some(*s)) {
+            log::debug!("Bluetooth: not connecting to {}: {}", tag(device), s.says(now));
         }
+        self.seen[i].said = skip;
+        if skip.is_none() {
+            log::debug!("Bluetooth: connecting to {}", tag(device));
+            self.pending.insert(device, (n, now));
+            self.radio.connect(device);
+        }
+    }
+
+    /// Why this node doesn't connect to `device`'s advert of its room, with `n`, and full if `full`; `None` if it does.
+    fn skip(&self, now: Instant, device: DeviceId, n: u32, full: bool) -> Option<Skip> {
         // Not our own. The smaller `n` connects to an advert that isn't full; the larger one does if its own is full,
         // or isn't on the air, as a peer with no advert does (NB-112).
-        let theirs_full = data[0] & FULL != 0;
-        if n == self.n || theirs_full || !(self.n < n || self.full() || !self.on_air) {
-            return;
+        if n == self.n {
+            return Some(Skip::Own);
+        }
+        if full {
+            return Some(Skip::Full);
+        }
+        if !(self.n < n || self.full() || !self.on_air) {
+            return Some(Skip::Theirs);
         }
         // Nor one this end is connected or connecting to, or holds from this device (NB110-10). Only adverts it
         // connected to itself count, as nothing a central says of its own is taken (NB110-6): two connections to one
         // peer may happen, and one closes.
-        let known = self.conns.values().any(|c| c.n == Some(n)) || self.pending.values().any(|(m, _)| *m == n);
-        if known || self.held.get(&(device, n)).is_some_and(|t| now < *t) || !self.room_out() {
-            return;
+        if self.conns.values().any(|c| c.n == Some(n)) || self.pending.values().any(|(m, _)| *m == n) {
+            return Some(Skip::Known);
         }
-        self.pending.insert(device, (n, now));
-        self.radio.connect(device);
+        if let Some(&t) = self.held.get(&(device, n)).filter(|t| now < **t) {
+            return Some(Skip::Held(t));
+        }
+        (!self.room_out()).then_some(Skip::NoRoom)
     }
 
     /// A connect to `device` failed, or was given up: that device's advert isn't connected to again for
     /// `RECONNECT_HOLD`.
     fn failed(&mut self, now: Instant, device: DeviceId) {
         if let Some((n, _)) = self.pending.remove(&device) {
+            log::debug!(
+                "Bluetooth: the connect to {} failed; its advert held {} s",
+                tag(device),
+                RECONNECT_HOLD.as_secs()
+            );
             self.held.insert((device, n), now + RECONNECT_HOLD);
         }
     }
@@ -578,13 +675,13 @@ impl Ble {
         let centrals = self.conns.values().filter(|c| !c.central).count();
         if self.conns.len() >= self.limits.connections || centrals >= self.limits.centrals {
             match self.weakest(|i, c| !c.central && self.spare(i, c, now)) {
-                Some(w) => self.close(w),
+                Some(w) => self.close(w, "made way for a new central"),
                 None => return false,
             }
         }
         if self.unbound() >= self.limits.unbound {
             match self.weakest(|i, c| self.spare(i, c, now)) {
-                Some(w) => self.close(w),
+                Some(w) => self.close(w, "made way for a new central"),
                 None => return false,
             }
         }
@@ -592,16 +689,20 @@ impl Ble {
     }
 
     fn on_connected(&mut self, now: Instant, conn: ConnId, device: Option<DeviceId>, mtu: u16) {
+        let refuse = |b: &mut Ble, why: &str| {
+            log::debug!("Bluetooth: conn {} refused: {why}", conn.0);
+            b.radio.disconnect(conn);
+        };
         let n = match device {
             Some(d) => match self.pending.remove(&d) {
                 Some((n, _)) => Some(n),
-                None => return self.radio.disconnect(conn), // not one we asked for, or given up (NB110-11)
+                None => return refuse(self, "not a connect under way (given up?)"), // NB110-11
             },
-            None if !self.on || !self.make_way(now) => return self.radio.disconnect(conn),
+            None if !self.on || !self.make_way(now) => return refuse(self, "no room for a central"),
             None => None,
         };
         if self.room.is_none() {
-            return self.radio.disconnect(conn);
+            return refuse(self, "in no room");
         }
         self.next_hop = self.next_hop.wrapping_add(1) & 0x00ff_ffff;
         let [_, a, b, c] = self.next_hop.to_be_bytes();
@@ -637,6 +738,7 @@ impl Ble {
         if let Some(old) = self.by_hop.insert(at, conn) {
             self.forget(old);
         }
+        log::debug!("Bluetooth: conn {} up ({}), ATT MTU {mtu}", conn.0, c.who());
         self.conns.insert(conn, c);
         if !central {
             self.send(conn, &[&[KIND_CHALLENGE], &challenge]);
@@ -667,7 +769,7 @@ impl Ble {
         let Some(c) = self.conns.get_mut(&conn) else { return };
         c.drops += n;
         if c.drops >= MAX_DROPS {
-            self.close(conn);
+            self.close(conn, "too many values dropped or refused");
         }
     }
 
@@ -678,7 +780,7 @@ impl Ble {
             (Proof::Challenged(c_p), KIND_ANSWER) if body.len() == CHALLENGE + MAC => {
                 let (c_p, c_c) = (*c_p, <[u8; CHALLENGE]>::try_from(&body[..CHALLENGE]).expect("16 bytes"));
                 if !same(&hmac(&key, &[b"pw-ble-c", &c_p, &c_c]), &body[CHALLENGE..]) {
-                    return self.close(conn);
+                    return self.close(conn, "a wrong answer to the room challenge");
                 }
                 let proof = hmac(&key, &[b"pw-ble-p", &c_c, &c_p]);
                 self.send(conn, &[&[KIND_PROOF], &proof]);
@@ -695,12 +797,14 @@ impl Ble {
             (Proof::Answered(c_p, c_c), KIND_PROOF) if body.len() == MAC => {
                 let (c_p, c_c) = (*c_p, *c_c);
                 if !same(&hmac(&key, &[b"pw-ble-p", &c_c, &c_p]), body) {
-                    return self.close(conn);
+                    return self.close(conn, "a wrong room proof");
                 }
                 self.proven(now, conn, c_p, c_c);
             }
             // Before the proof, nothing else: a connection that tries closes.
-            (Proof::Challenged(_) | Proof::Awaiting | Proof::Answered(..), _) => self.close(conn),
+            (Proof::Challenged(_) | Proof::Awaiting | Proof::Answered(..), _) => {
+                self.close(conn, "something else came before the room proof")
+            }
             (Proof::Proven { .. }, KIND_SIGNAL) => self.on_signal(now, conn, topic, body),
             (Proof::Proven { .. }, KIND_DATAGRAM) if !body.is_empty() => self.on_datagram(now, ep, conn, body),
             (Proof::Proven { .. }, _) => self.dropped(conn, 1),
@@ -719,9 +823,10 @@ impl Ble {
         let sig = self.me.sign(&id_message(&transcript));
         self.signal(conn, INNER_ID, &[&self.me.peer_id().as_bytes()[..], &sig].concat());
         self.out.push_back(Inbound::Proven(conn));
+        log::debug!("Bluetooth: conn {} proved the room", conn.0);
         if self.unbound() >= self.limits.unbound {
             if let Some(w) = self.weakest(|i, _| i != conn) {
-                self.close(w);
+                self.close(w, "made way for one that proved the room");
             }
         }
     }
@@ -775,7 +880,7 @@ impl Ble {
             }
             match peer != self.me.peer_id() && peer.verify(&message, &sig) {
                 true => self.reaches(conn, peer, false),
-                false => self.close(conn),
+                false => self.close(conn, "a wrong identity proof"),
             }
         }
     }
@@ -790,14 +895,19 @@ impl Ble {
         let Some(c) = self.conns.get_mut(&conn) else { return };
         (c.id, c.inbox, c.known_at) = (Id::Known(peer), Some(Topic::peer(&peer)), self.now);
         let (central, via) = (c.central, c.hop);
+        log::debug!(
+            "Bluetooth: conn {} reaches a peer that proved who it is{}",
+            conn.0,
+            if binds { ", bound" } else { "" }
+        );
         if binds {
             c.bound = Some(peer);
             for t in twins {
-                self.close_for(t, ROTATE);
+                self.close_for(t, ROTATE, "a second connection to a peer whose link is on another");
             }
         } else if !twins.is_empty() {
             if central {
-                self.close_for(conn, ROTATE);
+                self.close_for(conn, ROTATE, "a second connection to a peer reached already");
             }
             return self.refresh(self.now);
         }
@@ -921,17 +1031,20 @@ impl Ble {
     }
 
     fn timers(&mut self, now: Instant) {
-        let late: Vec<(ConnId, Duration)> = self
+        let late: Vec<(ConnId, Duration, &str)> = self
             .conns
             .iter()
-            .filter(|(_, c)| match c.proven() && c.id != Id::Unknown {
-                false => now.saturating_duration_since(c.opened) > PROVE_WITHIN,
-                true => c.bound.is_none() && now.saturating_duration_since(c.heard) > UNBOUND_FOR,
+            .filter_map(|(i, c)| {
+                match c.proven() && c.id != Id::Unknown {
+                    false => (now.saturating_duration_since(c.opened) > PROVE_WITHIN).then_some("not proven in time"),
+                    true => (c.bound.is_none() && now.saturating_duration_since(c.heard) > UNBOUND_FOR)
+                        .then_some("bound to no peer, and no member heard over it lately"),
+                }
+                .map(|why| (*i, hold(c), why))
             })
-            .map(|(i, c)| (*i, hold(c)))
             .collect();
-        for (c, hold) in late {
-            self.close_for(c, hold);
+        for (c, hold, why) in late {
+            self.close_for(c, hold, why);
         }
         // Two connections to one peer, each made by one end, which each took as its first (they were made at once):
         // once the other end's has been proven that long, the one whose central has the larger `PeerId` closes, at the
@@ -948,7 +1061,7 @@ impl Ble {
             .map(|(i, _)| *i)
             .collect();
         for c in lose {
-            self.close_for(c, ROTATE);
+            self.close_for(c, ROTATE, "a twin of the other end's, made at once");
         }
         self.check_ids();
         let given_up: Vec<DeviceId> = self
@@ -961,7 +1074,7 @@ impl Ble {
             self.failed(now, d);
         }
         self.held.retain(|_, t| now < *t);
-        self.seen.retain(|(_, _, at, _)| now.saturating_duration_since(*at) < SEEN_FOR);
+        self.seen.retain(|h| now.saturating_duration_since(h.at) < SEEN_FOR);
         if now >= self.rotate_at {
             self.rotate_at = now + ROTATE;
             self.n = OsRng.next_u32();
@@ -993,16 +1106,18 @@ impl Ble {
         self.radio.advertise(Some(&advert(&key, self.n, full)));
     }
 
-    /// Closes `conn` and forgets it.
-    fn close(&mut self, conn: ConnId) {
-        self.close_for(conn, RECONNECT_HOLD);
+    /// Closes `conn` and forgets it, for `why`.
+    fn close(&mut self, conn: ConnId, why: &str) {
+        self.close_for(conn, RECONNECT_HOLD, why);
     }
 
-    /// Closes `conn` and forgets it; if this end connected to an advert for it, that isn't connected to again for
-    /// `hold`.
-    fn close_for(&mut self, conn: ConnId, hold: Duration) {
+    /// Closes `conn` and forgets it, for `why`; if this end connected to an advert for it, that isn't connected to
+    /// again for `hold`.
+    fn close_for(&mut self, conn: ConnId, hold: Duration, why: &str) {
         let Some(c) = self.conns.get(&conn) else { return };
-        if let Some(at) = c.to.zip(c.n).filter(|_| !hold.is_zero()) {
+        let held = c.to.zip(c.n).filter(|_| !hold.is_zero());
+        log::debug!("Bluetooth: conn {} ({}) closed: {why}{}", conn.0, c.who(), held_for(held.map(|_| hold)));
+        if let Some(at) = held {
             let until = self.now + hold;
             let t = self.held.entry(at).or_insert(until);
             *t = (*t).max(until);
@@ -1035,6 +1150,11 @@ fn hold(c: &Conn) -> Duration {
         Proof::Awaiting => REFUSED_HOLD + Duration::from_millis(u64::from(OsRng.next_u32() % REFUSED_JITTER_MS)),
         _ => RECONNECT_HOLD,
     }
+}
+
+/// How long the advert of a connection that closed is held, for the log.
+fn held_for(hold: Option<Duration>) -> String {
+    hold.map_or_else(String::new, |h| format!("; its advert held {:.1} s", h.as_secs_f32()))
 }
 
 fn same(a: &[u8], b: &[u8]) -> bool {
@@ -2426,5 +2546,59 @@ mod tests {
         let got = std::iter::from_fn(|| w.eps[1].poll_event())
             .any(|e| matches!(e, peerwire_core::Event::Message { data, .. } if data == vec![5u8; 900]));
         assert!(got, "900 bytes in 45 chunks of 20");
+    }
+
+    /// NB-114 (the NB-112 laptop run): a laptop (the smaller `n`) linked with a small board loses the link at the
+    /// radio, which says so at once. Both ends forget the connection, and the laptop holds the board's advert, whose
+    /// `n` stays, as one central doesn't fill a small board: after the hold it connects on the next advert, and they
+    /// link again.
+    #[test]
+    fn a_link_the_radio_drops_relinks_after_the_hold() {
+        let mut w = Air::new(&[Limits::DESKTOP, Limits::SMALL]);
+        w.set_n(0, 1_000); // the laptop
+        w.set_n(1, 2_000); // the board
+        w.run(3_000);
+        assert!(w.linked(0, 1));
+        let (board, made) = (DeviceId((w.first + 1) as u64), w.air.connects());
+        w.air.set_off(w.first + 1, true); // the link drops
+        w.air.set_off(w.first + 1, false);
+        let cut = w.now;
+        w.run(10);
+        assert_eq!((w.b[0].conns.len(), w.b[1].conns.len()), (0, 0), "both forgot it at once");
+        assert_eq!(w.b[1].n, 2_000, "the board's advert stays");
+        assert_eq!(w.b[0].skip(w.now, board, 2_000, false), Some(Skip::Held(cut + RECONNECT_HOLD)));
+        w.run(59_000);
+        assert_eq!(w.air.connects(), made, "no connect during the hold");
+        w.run(2_000);
+        assert!(w.linked(0, 1), "linked again after it");
+        assert_eq!(w.air.connects(), made + 1, "with one connect");
+    }
+
+    /// NB-114: why a node doesn't connect to an advert of its room, which it logs once a `SEEN_FOR` for each advert.
+    #[test]
+    fn a_node_says_why_it_doesnt_connect() {
+        let key = ble_key("app", "room");
+        let air = FakeAir::new(23);
+        let t = Instant::from_millis(1);
+        let (mut node, mut ep) = lone(&air, Limits { connections: 2, ..Limits::DESKTOP }, 1, t);
+        node.n = 2_000;
+        let (d, e) = (DeviceId(100), DeviceId(101));
+        assert_eq!(node.skip(t, d, 2_000, false), Some(Skip::Own));
+        assert_eq!(node.skip(t, d, 1_000, true), Some(Skip::Full));
+        assert_eq!(node.skip(t, d, 1_000, false), Some(Skip::Theirs));
+        assert_eq!(node.skip(t, d, 3_000, false), None, "the smaller n connects");
+        node.on_seen(t, d, &advert(&key, 3_000, false));
+        assert!(node.pending.contains_key(&d));
+        assert_eq!(node.seen.back().map(|h| h.said), Some(None), "connecting: nothing said");
+        assert_eq!(node.skip(t, e, 3_000, false), Some(Skip::Known), "another device's copy of it");
+        node.on_seen(t, d, &advert(&key, 3_000, false));
+        assert_eq!(node.seen.back().map(|h| h.said), Some(Some(Skip::Known)));
+        node.on_event(t, &mut ep, RadioEvent::ConnectFailed { device: d });
+        let held = Skip::Held(t + RECONNECT_HOLD);
+        assert_eq!(node.skip(t, d, 3_000, false), Some(held));
+        assert_eq!(held.says(t + Duration::from_secs(15)), "held for 45 s more");
+        assert_eq!(node.skip(t + RECONNECT_HOLD, d, 3_000, false), None, "not after it");
+        node.pending.extend([(DeviceId(200), (5_000, t)), (DeviceId(201), (5_001, t))]);
+        assert_eq!(node.skip(t, e, 3_000, false), Some(Skip::NoRoom), "its connects fill its connections");
     }
 }

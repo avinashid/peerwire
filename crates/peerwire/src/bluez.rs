@@ -17,8 +17,13 @@
 //! becomes the default, the links on it are reported closed and the driver sets up on the default adapter. One powered
 //! off has its links reported closed too, and is set up again once powered on: the driver powers an adapter on only
 //! at start, never one its user turned off (BlueZ's `AutoEnable` powers on one it finds, as after a USB reset).
+//!
+//! A link that drops is reported closed at once, whoever dropped it: as the central's, once BlueZ says the device
+//! isn't connected or shuts the notification socket, which a read sees as an empty value (NB-114). A connect that
+//! fails is logged with the step it failed at and BlueZ's error, and a link that goes down with why; a device is named
+//! by a hash that holds for the run alone.
 
-use crate::ble::{ConnId, DeviceId, Limits, Radio, RadioEvent, RX_UUID, SERVICE_UUID, TX_UUID};
+use crate::ble::{tag, ConnId, DeviceId, Limits, Radio, RadioEvent, RX_UUID, SERVICE_UUID, TX_UUID};
 use bluer::adv::{Advertisement, AdvertisementHandle, Type};
 use bluer::gatt::local::{
     characteristic_control, Application, ApplicationHandle, Characteristic, CharacteristicControl,
@@ -33,6 +38,7 @@ use bluer::{
 use futures::stream::{LocalBoxStream, Stream};
 use futures::{FutureExt, StreamExt};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
@@ -218,6 +224,22 @@ fn device_id(a: Address) -> DeviceId {
     let mut b = [0u8; 8];
     b[2..].copy_from_slice(&a.0);
     DeviceId(u64::from_be_bytes(b))
+}
+
+/// `s` with each Bluetooth address in it masked (`AA:BB:CC:DD:EE:FF`, or `AA_BB_CC_DD_EE_FF` in a D-Bus path), for
+/// the log: BlueZ's errors may name a device (NB-114).
+fn masked(s: &str) -> String {
+    let address_at = |b: &[u8]| {
+        let hex = |k: usize| b[3 * k].is_ascii_hexdigit() && b[3 * k + 1].is_ascii_hexdigit();
+        b.len() >= 17 && (0..6).all(hex) && (0..5).all(|k| matches!(b[3 * k + 2], b':' | b'_'))
+    };
+    let (mut out, mut rest) = (String::with_capacity(s.len()), s);
+    while let Some(c) = rest.chars().next() {
+        let skip = if address_at(rest.as_bytes()) { 17 } else { c.len_utf8() };
+        out.push_str(if skip == 17 { "<address>" } else { &rest[..skip] });
+        rest = &rest[skip..];
+    }
+    out
 }
 
 fn address(d: DeviceId) -> Address {
@@ -744,6 +766,7 @@ fn application(adapter: &Adapter, ctx: &Ctx, control: CharacteristicControlHandl
             let (adapter, centrals, addr) = (adapter.clone(), centrals.clone(), req.device_address);
             async move {
                 if stranger {
+                    log::debug!("Bluetooth: a write from {} refused: another central is served", tag(device_id(addr)));
                     tokio::spawn(async move { drop_link(&adapter, &centrals, addr).await });
                 }
                 if taken {
@@ -968,10 +991,13 @@ impl Drop for Watching {
 async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     let addr = address(device);
     let Ok(dev) = adapter.device(addr) else {
+        log::info!("Bluetooth: the connect to {} failed: BlueZ doesn't have it", tag(device));
         return ctx.events.send(RadioEvent::ConnectFailed { device });
     };
+    let mut step = "connecting";
     let setup = async {
         dev.connect().await?;
+        step = "finding the service";
         let mut rx = None;
         let mut tx = None;
         for s in dev.services().await? {
@@ -987,17 +1013,36 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
             }
         }
         let (Some(rx), Some(tx)) = (rx, tx) else {
-            return Err(bluer::Error { kind: bluer::ErrorKind::ServicesUnresolved, message: String::new() });
+            let message = "it has no Peerwire service".into();
+            return Err(bluer::Error { kind: bluer::ErrorKind::ServicesUnresolved, message });
         };
+        step = "subscribing to tx";
         let reader = tx.notify_io().await?;
+        step = "taking rx";
         let writer = rx.write_io().await?;
-        Ok::<_, bluer::Error>((reader, writer))
+        // Its events before its state, so that its link going down from here on is heard (NB-114).
+        step = "following it";
+        let changes = dev.events().await?;
+        if !dev.is_connected().await? {
+            return Err(bluer::Error { kind: bluer::ErrorKind::Failed, message: "its link went down".into() });
+        }
+        Ok::<_, bluer::Error>((reader, writer, changes))
     };
-    let set_up = tokio::time::timeout(SETUP, setup).await.ok().and_then(Result::ok);
-    let mtu = set_up.as_ref().and_then(|(r, w)| att_mtu(w.mtu().min(r.mtu())));
-    let (Some((reader, writer)), Some(mtu)) = (set_up, mtu) else {
-        ctx.events.send(RadioEvent::ConnectFailed { device });
-        return drop_later(&adapter, &ctx.centrals, [addr]);
+    let set_up = match tokio::time::timeout(SETUP, setup).await {
+        Ok(Ok((r, w, changes))) => {
+            let len = w.mtu().min(r.mtu());
+            att_mtu(len).map(|mtu| (r, w, changes, mtu)).ok_or_else(|| format!("its sockets take {len} bytes"))
+        }
+        Ok(Err(e)) => Err(format!("{step}: {e}")),
+        Err(_) => Err(format!("{step}: not done after {} s", SETUP.as_secs())),
+    };
+    let (reader, writer, changes, mtu) = match set_up {
+        Ok(s) => s,
+        Err(why) => {
+            log::info!("Bluetooth: the connect to {} failed, {}", tag(device), masked(&why));
+            ctx.events.send(RadioEvent::ConnectFailed { device });
+            return drop_later(&adapter, &ctx.centrals, [addr]);
+        }
     };
     // Nothing from here on waits, so a connect still under way hasn't said `Connected` (`drop_links`).
     let conn = ctx.shared.next.fetch_add(1, Ordering::Relaxed);
@@ -1013,23 +1058,67 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     });
     let c = ctx.clone();
     let read = tokio::spawn(async move {
-        while let Ok(value) = reader.recv().await {
-            c.events.send(RadioEvent::Value { conn: ConnId(conn), value });
-        }
-        if link_down(&c, conn) {
+        let values = futures::stream::unfold(reader, |r| async move { Some((r.recv().await, r)) });
+        if read_link(&c, conn, values, link_gone(changes)).await {
             let _ = dev.disconnect().await;
         }
     });
     ctx.centrals.lock().unwrap().insert(conn, Link { write, read, addr });
 }
 
-/// The link of central connection `conn` went down: it is reported closed, unless the driver already took it out of
-/// `centrals` (closing it, or losing the adapter), and its writer stops. Whether it was reported. Its reader, which
-/// calls this, isn't stopped: tokio would cancel a task that aborts itself at its next wait, before it reports.
-fn link_down(ctx: &Ctx, conn: u32) -> bool {
+/// Reports central connection `conn`'s values from `values` until its link goes down ([`until_down`]), and then the
+/// connection closed ([`link_down`]): whether it was.
+async fn read_link(
+    ctx: &Ctx,
+    conn: u32,
+    values: impl Stream<Item = io::Result<Vec<u8>>>,
+    gone: impl Future<Output = ()>,
+) -> bool {
+    let value = |value| ctx.events.send(RadioEvent::Value { conn: ConnId(conn), value });
+    let why = until_down(values, gone, value).await;
+    link_down(ctx, conn, &why)
+}
+
+/// Hands each value from `values` to `each` until the link goes down: why it went. BlueZ shuts the socket down as the
+/// link drops, and a read then gives nothing, again and again, not an error; an empty value, which a peer never sends,
+/// reads the same, so it ends the link too. `gone` comes when BlueZ says the device isn't connected (NB-114).
+async fn until_down(
+    values: impl Stream<Item = io::Result<Vec<u8>>>,
+    gone: impl Future<Output = ()>,
+    mut each: impl FnMut(Vec<u8>),
+) -> String {
+    tokio::pin!(values, gone);
+    loop {
+        tokio::select! {
+            biased;
+            v = values.next() => match v {
+                Some(Ok(v)) if !v.is_empty() => each(v),
+                Some(Ok(_)) | None => return "its socket closed".into(),
+                Some(Err(e)) => return format!("reading it: {e}"),
+            },
+            () = &mut gone => return "BlueZ says it isn't connected".into(),
+        }
+    }
+}
+
+/// Comes once `changes` (a device's) say it isn't connected, or end, as BlueZ forgot it.
+async fn link_gone(changes: impl Stream<Item = DeviceEvent>) {
+    tokio::pin!(changes);
+    while let Some(DeviceEvent::PropertyChanged(p)) = changes.next().await {
+        if matches!(p, DeviceProperty::Connected(false)) {
+            return;
+        }
+    }
+}
+
+/// The link of central connection `conn` went down, for `why`: it is reported closed, unless the driver already took
+/// it out of `centrals` (closing it, or losing the adapter), and its writer stops. Whether it was reported. Its reader,
+/// which calls this, isn't stopped: tokio would cancel a task that aborts itself at its next wait, before it reports.
+fn link_down(ctx: &Ctx, conn: u32, why: &str) -> bool {
     ctx.shared.senders.lock().unwrap().remove(&conn);
     let Some(link) = ctx.centrals.lock().unwrap().remove(&conn) else { return false };
     link.write.abort();
+    log::info!("Bluetooth: conn {conn} (to {}) went down: {}", tag(device_id(link.addr)), masked(why));
     ctx.events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
     true
 }
@@ -1058,9 +1147,13 @@ impl Central {
             }
         };
         let Some((conn, mtu)) = conn else {
+            let why =
+                if att_mtu(writer.mtu()).is_some() { "one is served already" } else { "its socket takes too little" };
+            log::debug!("Bluetooth: a central ({}) refused: {why}", tag(device_id(addr)));
             drop(writer);
             return drop_link(&self.adapter, &ctx.centrals, addr).await;
         };
+        log::debug!("Bluetooth: conn {conn}: a central ({}) subscribed", tag(device_id(addr)));
         let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
         ctx.shared.senders.lock().unwrap().insert(conn, out);
         ctx.events.send(RadioEvent::Connected { conn: ConnId(conn), device: None, mtu });
@@ -1077,24 +1170,27 @@ impl Central {
             std::future::pending::<()>().await
         };
         tokio::pin!(left);
-        // Whether the node closed it (its queue ended).
-        let closed = loop {
+        // Why it went, unless the node closed it (its queue ended).
+        let went = loop {
             tokio::select! {
                 v = queue.recv() => {
-                    let Some(v) = v else { break true };
+                    let Some(v) = v else { break None };
                     if writer.send(&v).await.is_err() {
-                        break false;
+                        break Some("a notification failed");
                     }
                 }
-                _ = writer.closed() => break false,
-                _ = &mut left => break false,
+                _ = writer.closed() => break Some("it unsubscribed, or its socket closed"),
+                _ = &mut left => break Some("BlueZ says it isn't connected"),
             }
         };
+        let closed = went.is_none();
         ctx.shared.senders.lock().unwrap().remove(&conn);
         {
             let mut p = ctx.peripheral.lock().unwrap();
             if p.conn == Some(conn) {
                 *p = Peripheral::default();
+                let why = went.unwrap_or("closed");
+                log::info!("Bluetooth: conn {conn} (from {}) went down: {why}", tag(device_id(addr)));
                 ctx.events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
             }
         }
@@ -1110,6 +1206,11 @@ impl Central {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::BoxFuture;
+    use futures::stream::BoxStream;
+
+    /// What a central link's socket reads.
+    type Values = BoxStream<'static, io::Result<Vec<u8>>>;
 
     #[test]
     fn device_ids_and_addresses_round_trip() {
@@ -1132,6 +1233,20 @@ mod tests {
         assert_eq!(peerwire_core::ble::value_len(att_mtu(251).unwrap()), 251, "an ESP32's 256");
         assert_eq!(att_mtu(512), Some(515));
         assert_eq!(peerwire_core::ble::value_len(att_mtu(512).unwrap()), 512, "517");
+    }
+
+    /// NB-114: the log carries no device's address, so BlueZ's errors, which may name one, have theirs masked.
+    #[test]
+    fn the_log_masks_addresses_in_bluez_errors() {
+        let path = "Method \"Connect\" doesn't exist on /org/bluez/hci0/dev_AA_BB_CC_DD_EE_0f";
+        assert_eq!(masked(path), "Method \"Connect\" doesn't exist on /org/bluez/hci0/dev_<address>");
+        assert_eq!(
+            masked("aa:bb:cc:dd:ee:ff: le-connection-abort-by-local"),
+            "<address>: le-connection-abort-by-local"
+        );
+        assert_eq!(masked("AA:BB:CC:DD:EE"), "AA:BB:CC:DD:EE", "not an address");
+        assert_eq!(masked("AA-BB-CC-DD-EE-FF, é"), "AA-BB-CC-DD-EE-FF, é", "nor that, which BlueZ doesn't write");
+        assert_eq!(masked("x11:22:33:44:55:66:77"), "x<address>:77");
     }
 
     #[test]
@@ -1322,6 +1437,53 @@ mod tests {
         });
     }
 
+    /// NB-114 (the NB-112 laptop run): a central link that drops is reported closed at once. BlueZ shuts its
+    /// notification socket down, and a read then gives an empty value again and again, not an error: the reader took
+    /// those for values and never reported it. BlueZ saying the device isn't connected, or forgetting it, or a read
+    /// that fails ends it too; and one the driver took out of its books already isn't reported again.
+    #[test]
+    fn a_central_link_that_drops_is_reported_at_once() {
+        runtime().block_on(async {
+            let (ctx, events) = ctx();
+            let link = |conn: u32| {
+                let write = tokio::spawn(std::future::pending::<()>());
+                let writer = write.abort_handle();
+                let read = tokio::spawn(std::future::pending::<()>());
+                ctx.centrals.lock().unwrap().insert(conn, Link { write, read, addr: addr(conn as usize) });
+                writer
+            };
+            let never = futures::stream::pending::<io::Result<Vec<u8>>>;
+            let c = &ctx;
+            let read = |conn, values: Values, gone: BoxFuture<'static, ()>| async move {
+                let read = read_link(c, conn, values, gone);
+                tokio::time::timeout(Duration::from_secs(1), read).await.expect("it ends")
+            };
+            let closed = |c| RadioEvent::Disconnected { conn: ConnId(c) };
+            let writer = link(5);
+            let shut = (0..9).map(|i| Ok(if i == 0 { vec![1, 2] } else { Vec::new() }));
+            assert!(read(5, futures::stream::iter(shut).chain(never()).boxed(), std::future::pending().boxed()).await);
+            let value = RadioEvent::Value { conn: ConnId(5), value: vec![1, 2] };
+            assert_eq!(events.try_iter().collect::<Vec<_>>(), [value, closed(5)], "the value, then its end");
+            quiet().await;
+            assert!(writer.is_finished() && ctx.centrals.lock().unwrap().is_empty(), "its writer stopped");
+            let connected = |c| DeviceEvent::PropertyChanged(DeviceProperty::Connected(c));
+            let up = futures::stream::iter([connected(true)]).chain(futures::stream::pending());
+            let wait = tokio::time::timeout(Duration::from_millis(50), link_gone(up)).await;
+            assert!(wait.is_err(), "not gone while it is connected");
+            link(6);
+            let says = futures::stream::iter([connected(true), connected(false)]).chain(futures::stream::pending());
+            assert!(read(6, never().boxed(), link_gone(says).boxed()).await, "BlueZ says it isn't connected");
+            link(7);
+            assert!(read(7, never().boxed(), link_gone(futures::stream::empty()).boxed()).await, "BlueZ forgot it");
+            link(8);
+            let fails = futures::stream::iter([Err(io::Error::other("reset"))]).chain(never());
+            assert!(read(8, fails.boxed(), std::future::pending().boxed()).await, "a read failed");
+            assert_eq!(events.try_iter().collect::<Vec<_>>(), [closed(6), closed(7), closed(8)]);
+            assert!(!read(9, futures::stream::empty().boxed(), std::future::pending().boxed()).await);
+            assert_eq!(events.try_iter().count(), 0, "not one it had");
+        });
+    }
+
     /// A central connection whose link goes down is reported closed once, by its reader or by the driver, whichever
     /// takes it out of `centrals` first; and its reader isn't cancelled on its way out, as it was when it aborted
     /// itself with the writer (the node never heard: NB-112).
@@ -1334,7 +1496,7 @@ mod tests {
             let (c, o) = (ctx.clone(), out.clone());
             let read = tokio::spawn(async move {
                 let _ = wait.await;
-                if link_down(&c, 5) {
+                if link_down(&c, 5, "its socket closed") {
                     tokio::task::yield_now().await; // as it waits for BlueZ to drop the link
                     o.store(true, Ordering::Relaxed);
                 }
@@ -1347,7 +1509,7 @@ mod tests {
             assert_eq!(events.try_iter().collect::<Vec<_>>(), [RadioEvent::Disconnected { conn: ConnId(5) }]);
             assert!(out.load(Ordering::Relaxed), "the reader went on");
             assert!(writer.is_finished(), "the writer stopped");
-            assert!(!link_down(&ctx, 5), "and it isn't reported again");
+            assert!(!link_down(&ctx, 5, "BlueZ says it isn't connected"), "and it isn't reported again");
             assert_eq!(events.try_iter().count(), 0);
         });
     }
