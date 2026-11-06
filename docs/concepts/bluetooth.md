@@ -278,14 +278,15 @@ pub enum RadioEvent {
     ConnectFailed { device: DeviceId },
     Mtu { conn: ConnId, mtu: u16 },                                  // the ATT MTU changed
     Value { conn: ConnId, value: Vec<u8> },                          // a write to `rx`, or a notification on `tx`
-    Disconnected { conn: ConnId },
+    Disconnected { conn: ConnId },                                   // as soon as its link goes down
     Advertising(bool),                                               // whether the advert asked for is on the air
 }
 ```
 
-`DeviceId(u64)` and `ConnId(u32)` are the driver's own numbers. A driver that never sends `Advertising` is taken to
-advertise as asked. `Builder::bluetooth(radio)` gives a node its radio;
-`Node::poll` drains its events, and `Node::set_waker` (which `AsyncNode` calls itself) hands it a waker.
+`DeviceId(u64)` and `ConnId(u32)` are the driver's own numbers. A driver reports `Disconnected` as soon as a link
+goes down, unless the node closed it: till then the node takes it to be up, and doesn't connect to that advert again.
+A driver that never sends `Advertising` is taken to advertise as asked. `Builder::bluetooth(radio)` gives a node its
+radio; `Node::poll` drains its events, and `Node::set_waker` (which `AsyncNode` calls itself) hands it a waker.
 Feature `ble-bluez` adds the Linux driver, `BlueZ`; the ESP32's NimBLE driver lives in `peerwire-esp` (NB-110c), and
 tests use an in-process pair of fake radios.
 
@@ -320,6 +321,8 @@ tests use an in-process pair of fake radios.
   As the central it gives a connect 10 s to come up (the link, the service found, both sockets), and reports one that
   fails or doesn't as failed, then disconnects it, which also stops a connect BlueZ still has under way. BlueZ answers
   a disconnect only once the link is down, 2 s or more later, so the driver never waits on one: each runs on its own.
+  A link that drops is reported closed at once: as the central, once BlueZ says the device isn't connected, or shuts
+  the `tx` socket down, which it does as a link drops (a read then gives nothing, not an error).
   bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone
   browser that doesn't raise it, say; to be checked with NB-110d) can't carry the codec's 20-byte values and isn't
   used.
@@ -333,6 +336,12 @@ tests use an in-process pair of fake radios.
   and scanning. One powered off has its links reported closed too, and is set up again once powered on. The driver
   powers an adapter on only at start (`BlueZ::new`), never one its user turned off; BlueZ's `AutoEnable`, on by
   default, powers on one it finds, as after a USB reset.
+
+  The log names a device by a hash under a key drawn for each run, never by its address. At `info` the driver logs a
+  connect that fails, with the step and BlueZ's error, and a link that goes down, with why. At `debug` the node adds
+  each connection's life (made, refused, proven, closed and why, and how long its advert is held) and, once each 10 s
+  for an advert, why it doesn't connect to one of its room: it has the larger `n`, the advert is full, a connection
+  to it is open or under way, it is held, or the node has no room.
 
   Ordinary users need access to `bluetoothd` over D-Bus, which most desktop distributions give the logged-in user.
 - **ESP32 (NB-110c):** NimBLE, three connections, an ATT MTU of 256 and a random non-resolvable address.
@@ -360,6 +369,7 @@ or beside an ESP32 in the same room (`room_chat`'s rooms, app `peerwire-lan-chat
 ```sh
 cargo run -p peerwire --features ble-bluez --example ble_chat -- kitchen            # UDP first, the radio as well
 cargo run -p peerwire --features ble-bluez --example ble_chat -- kitchen --no-udp   # Bluetooth only
+RUST_LOG=debug cargo run -p peerwire --features ble-bluez --example ble_chat -- kitchen --no-udp   # and each connection
 ```
 
 `--no-udp` gives the node no LAN carrier and the policy `[PathKind::Bluetooth]`, so its links stay on the radio even
