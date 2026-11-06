@@ -10,6 +10,11 @@ CONFIG_BT_NIMBLE_NVS_PERSIST=n
 # 5 writes, not 62, and costs less heap than 517.
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+# On by default for the C3 only: a connection that fails to establish (HCI 0x3E) is
+# made again by NimBLE itself, with no event for the driver, so one that then comes up
+# is a link nobody uses or closes; as a peripheral, it restarts advertising from
+# NimBLE's own fields, not ours. The node tries again where it wants to.
+CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n
 # Peers write one value at a time: no prepared (long) writes, so a central can't fill the
 # stack's prepare queue before our callback runs (BLE-R7).
 CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=0

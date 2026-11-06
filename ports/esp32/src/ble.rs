@@ -8,7 +8,8 @@
 //! can't hold a connection the node never hears of. Nothing is paired or bonded (BLE-R5): bonding, MITM and Secure
 //! Connections are off, and a connection that a pairing completes on anyway is closed. `rx` takes writes without
 //! response, and sdkconfig.ble leaves NimBLE no room for prepared (long) writes (BLE-R7). An advert that isn't on the
-//! air is reported to the node (`Advertising`) and tried again.
+//! air is reported to the node (`Advertising`) and tried again. Each connection coming up or closing is logged with
+//! its role and reason, and so are NimBLE's connections against the driver's whenever either count changes.
 //!
 //! NimBLE calls back on its own task, where the driver only queues events for [`Radio::poll`]. What waits on the
 //! radio (a new address, connecting, finding the service, subscribing) runs on a thread of the driver's own, so no
@@ -73,6 +74,10 @@ const OWN_ADDR: u8 = sys::BLE_OWN_ADDR_RANDOM as u8;
 const EDONE: u16 = sys::BLE_HS_EDONE as u16;
 const ENOTCONN: u16 = sys::BLE_HS_ENOTCONN as u16;
 const EALREADY: i32 = sys::BLE_HS_EALREADY as i32;
+/// NimBLE gives a disconnect's HCI reason plus this.
+const HCI_BASE: i32 = sys::BLE_HS_ERR_HCI_BASE as i32;
+/// The connection handles looked at for those NimBLE has: ESP's controllers number them from 0, a few at most.
+const HANDLES: u16 = 32;
 
 /// The board's radio as a node drives it: NimBLE, serving the Peerwire GATT service.
 ///
@@ -209,8 +214,12 @@ impl Nimble {
         server.start()?;
         let tx = tx_handle()?;
 
-        // NimBLE's discovery callback gets the shared state for as long as the program runs.
+        // NimBLE's discovery callback and its event listener get the shared state for as long as the program runs.
         let scan_arg = Arc::into_raw(shared.clone()) as usize;
+        // Each connection coming and going, in either role and whether or not the node hears of it, for the log.
+        let listener = Box::leak(Box::new(unsafe { std::mem::zeroed::<sys::ble_gap_event_listener>() }));
+        let rc = unsafe { sys::ble_gap_event_listener_register(listener, Some(on_link), scan_arg as *mut c_void) };
+        ensure!(rc == 0, "ble_gap_event_listener_register: {rc}");
         let worker = Worker {
             shared: shared.clone(),
             cmds,
@@ -220,6 +229,7 @@ impl Nimble {
             on_air: true,
             retry: None,
             scanning: false,
+            said: None,
         };
         std::thread::Builder::new().name("ble".into()).stack_size(8 * 1024).spawn(move || worker.run())?;
         info!("ble: NimBLE up, serving the Peerwire service, {} B free", crate::free_heap());
@@ -391,6 +401,16 @@ struct Worker {
     /// While the advert isn't on the air: when to try it again, and the wait before that.
     retry: Option<(Instant, Duration)>,
     scanning: bool,
+    /// The connections last logged.
+    said: Option<Count>,
+}
+
+/// The connections NimBLE has and those the driver has, each in (a central connected) and out (this radio did).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Count {
+    nimble: (usize, usize),
+    driver: (usize, usize),
+    advertising: bool,
 }
 
 impl Worker {
@@ -425,6 +445,33 @@ impl Worker {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             self.close_unsubscribed();
+            self.count();
+        }
+    }
+
+    /// Logs the connections NimBLE has and the driver's when either changes: one NimBLE keeps that the driver doesn't
+    /// is a link nobody uses or closes.
+    fn count(&mut self) {
+        // NimBLE's own lock first, never inside the driver's.
+        let mut nimble = (0, 0);
+        for handle in 0..HANDLES {
+            let mut desc: sys::ble_gap_conn_desc = unsafe { std::mem::zeroed() };
+            if unsafe { sys::ble_gap_conn_find(handle, &mut desc) } == 0 {
+                match u32::from(desc.role) == sys::BLE_GAP_ROLE_MASTER {
+                    true => nimble.1 += 1,
+                    false => nimble.0 += 1,
+                }
+            }
+        }
+        let advertising = unsafe { sys::ble_gap_adv_active() } != 0;
+        let state = self.shared.lock();
+        let now = Count { nimble, driver: (state.peripheral, state.centrals()), advertising };
+        drop(state);
+        if self.said != Some(now) {
+            self.said = Some(now);
+            let (n, d) = (now.nimble, now.driver);
+            let air = if advertising { "advertising" } else { "not advertising" };
+            info!("ble: NimBLE has {} in, {} out; the driver {} in, {} out; {air}", n.0, n.1, d.0, d.1);
         }
     }
 
@@ -544,7 +591,12 @@ impl Worker {
         let central = Arc::new(Central { shared: self.shared.clone(), conn, done, found: Mutex::default() });
         if let Err(e) = self.set_up(&central, device, &steps) {
             info!("ble: connect to {:012x} failed: {e:#}", device.0 & 0xffff_ffff_ffff);
-            let handle = central.found().handle;
+            // A connection that comes up from now on is closed as it does (on_central).
+            let handle = {
+                let mut found = central.found();
+                found.gave_up = true;
+                found.handle
+            };
             if let Some(handle) = handle {
                 terminate(handle);
             }
@@ -628,6 +680,9 @@ struct Found {
     cccd: Option<u16>,
     /// `tx`'s value handle, once subscribed to.
     tx: u16,
+    /// Whether the driver's thread gave the connect up, so the node heard it failed: a connection that comes up after
+    /// that would be used and closed by nobody.
+    gave_up: bool,
 }
 
 impl Central {
@@ -675,7 +730,15 @@ unsafe extern "C" fn on_central(event: *mut sys::ble_gap_event, arg: *mut c_void
         sys::BLE_GAP_EVENT_CONNECT => {
             let connect = unsafe { event.__bindgen_anon_1.connect };
             if connect.status == 0 {
-                central.found().handle = Some(connect.conn_handle);
+                let gave_up = {
+                    let mut found = central.found();
+                    found.handle = Some(connect.conn_handle);
+                    found.gave_up
+                };
+                if gave_up {
+                    terminate(connect.conn_handle); // its DISCONNECT frees `arg`
+                    return 0;
+                }
                 let link = Link { conn: central.conn, rx: Some(0), up: false, mtu: MIN_MTU, early: Vec::new() };
                 central.shared.lock().links.insert(connect.conn_handle, link);
                 central.done(0);
@@ -709,6 +772,65 @@ unsafe extern "C" fn on_central(event: *mut sys::ble_gap_event, arg: *mut c_void
         _ => {}
     }
     0
+}
+
+/// Each connection coming and going as NimBLE has it, in either role, from NimBLE's task, for the log: before the
+/// connection's own callback. Its `arg` is the driver's `Shared`.
+unsafe extern "C" fn on_link(event: *mut sys::ble_gap_event, arg: *mut c_void) -> i32 {
+    let shared = unsafe { &*(arg as *const Shared) };
+    let event = unsafe { &*event };
+    match u32::from(event.type_) {
+        sys::BLE_GAP_EVENT_CONNECT => {
+            let connect = unsafe { event.__bindgen_anon_1.connect };
+            let handle = connect.conn_handle;
+            let mut desc: sys::ble_gap_conn_desc = unsafe { std::mem::zeroed() };
+            match connect.status {
+                0 if unsafe { sys::ble_gap_conn_find(handle, &mut desc) } == 0 => {
+                    info!("ble: link {handle} up, as the {}", role(desc.role));
+                }
+                0 => info!("ble: link {handle} up"),
+                status => info!("ble: a link didn't come up ({status})"),
+            }
+        }
+        sys::BLE_GAP_EVENT_DISCONNECT => {
+            let disconnect = unsafe { event.__bindgen_anon_1.disconnect };
+            let (handle, role, why) =
+                (disconnect.conn.conn_handle, role(disconnect.conn.role), Reason(disconnect.reason));
+            let conn = shared.lock().links.get(&handle).filter(|link| link.up).map(|link| link.conn.0);
+            match conn {
+                Some(conn) => info!("ble: link {handle} (conn {conn}) closed, as the {role}: {why}"),
+                None => info!("ble: link {handle} closed, as the {role}, not one the node had: {why}"),
+            }
+        }
+        _ => {}
+    }
+    0
+}
+
+fn role(role: u8) -> &'static str {
+    match u32::from(role) {
+        sys::BLE_GAP_ROLE_MASTER => "central",
+        _ => "peripheral",
+    }
+}
+
+/// A disconnect's reason as NimBLE gives it: an HCI reason plus [`HCI_BASE`], or else the host's own error.
+struct Reason(i32);
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(hci) = self.0.checked_sub(HCI_BASE).filter(|hci| (0..0x100).contains(hci)) else {
+            return write!(f, "host error {}", self.0);
+        };
+        let what = match hci {
+            0x08 => ", timed out",
+            0x13 => ", the peer closed it",
+            0x16 => ", this radio closed it",
+            0x3e => ", never established",
+            _ => "",
+        };
+        write!(f, "HCI 0x{hci:02x}{what}")
+    }
 }
 
 /// The ATT minimum, until the exchange says otherwise.
