@@ -4553,17 +4553,18 @@ hop ranks as a relayed address does, last, and isn't in `Policy::default()`. The
 NimBLE driver (NB-110c) and the browser's (NB-110d) aren't on main yet, and none of it
 is in a release.
 
-Reviewed 2026-11-05 in nine passes: security's requirements, BLE-R1…R15 (NB-110b), read
-against main `25c92d0` and the `bluer` 0.17.4 and ESP-IDF 5.5.5 sources; the spec at
-`ac2d952` (NB110-1…NB110-5); the code from `ebf3530` to `3ae92bc` (NB110-6…NB110-8,
-I2…I5); and re-checks of `287ebd8` (NB110-9, I6…I9), `d202fd3` (NB110-10, I10),
-`b95141b` (NB110-11) and `708038f` (NB110-12, T1); then NB-112 at `86fee9d` (NB110-12
-and T1 fixed; NB112-1, I1, I2) and its fix `680e273`, both by reading, as their D-Bus
-paths need an adapter. Probes ran in a copy of the tree, each beside its control on the
-unfixed head: on real Nodes over the in-process fake radios, and in the node's simulated
-air. BlueZ's behaviour was read from its 5.87 source. The probes aren't in the tree; the
-author's tests of the node's findings are. Nothing was run over a real radio, as the
-review host has none: the radio checks named below are owed on our own hardware.
+Reviewed on 2026-11-05 and 2026-11-06 in ten passes: security's requirements, BLE-R1…R15
+(NB-110b), read against main `25c92d0` and the `bluer` 0.17.4 and ESP-IDF 5.5.5 sources;
+the spec at `ac2d952` (NB110-1…NB110-5); the code from `ebf3530` to `3ae92bc`
+(NB110-6…NB110-8, I2…I5); and re-checks of `287ebd8` (NB110-9, I6…I9), `d202fd3`
+(NB110-10, I10), `b95141b` (NB110-11) and `708038f` (NB110-12, T1); then NB-112 at
+`86fee9d` (NB110-12 and T1 fixed; NB112-1, I1, I2) and its fix `680e273`; and NB-114 at
+`46cf2fe` (no finding), all three by reading, as their D-Bus paths need an adapter.
+Probes ran in a copy of the tree, each beside its control on the unfixed head: on real
+Nodes over the in-process fake radios, and in the node's simulated air. BlueZ's
+behaviour was read from its 5.87 source. The probes aren't in the tree; the author's
+tests of the node's findings are. Nothing was run over a real radio, as the review host
+has none: the radio checks named below are owed on our own hardware.
 
 **What holds.**
 - The advert carries the flags, `n` and the tag alone (R1, R2), and `n`, the tag and the
@@ -4593,6 +4594,18 @@ review host has none: the radio checks named below are owed on our own hardware.
   signature is checked; and a close after 32 messages dropped. Linux's `rx` takes only
   writes without response at offset 0, from the served central; nothing is readable
   (R7).
+- A link that drops is reported at once (NB-114). The BlueZ driver ends a central's link
+  when BlueZ says the device isn't connected or forgets it, or shuts the `tx` socket
+  down, which a read sees as an empty value. No honest end sends an empty value, as
+  every chunk has a header byte, so one from a peer ends its own link alone, and that
+  advert is held as on any close by the peer: 1–4 s before a challenge, else 60 s, by
+  its device and `n` (NB110-7, NB110-10).
+- The log (NB-114) names a device by `dev:` and 24 bits of an HMAC of its id under a key
+  drawn for each process, so one run's lines match and two runs' don't; BlueZ's error
+  text has its addresses masked; no `PeerId`, `n`, room, advert or data is logged. An
+  `info` line follows each connection that fails or goes down, so the radio bounds their
+  rate; `debug` adds each connection's life and, once each 10 s for an advert, why the
+  node doesn't connect to it.
 - No `pw_*` function changed, so no C ABI review was owed.
 
 **NB110-1 — An unbound connection could take a peer's link (Low).** In the spec at
@@ -4968,7 +4981,8 @@ crash it. The fix is BlueZ's: a later release, or a 5.87 build that carries `82a
 - **Radio checks owed on our own hardware:** the honest connect time (S above),
   NB110-8's subscribers, the gap between a device's reconnects (NB110-I8), the idle
   links an adapter holds (NB110-I9), the time from connect to a proven identity
-  (NB110-I10), and the driver's recovery from a refused advert and a USB reset (NB-112).
+  (NB110-I10), the driver's recovery from a refused advert and a USB reset (NB-112), and
+  a link BlueZ drops reported at once, then linked again after its hold (NB-114).
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
