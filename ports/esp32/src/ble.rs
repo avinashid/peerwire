@@ -38,9 +38,9 @@ const GAP_NAME: &str = "Peerwire";
 /// Passive scanning, 30 ms in every 100 (0.625 ms units).
 const SCAN_INTERVAL: u16 = 160;
 const SCAN_WINDOW: u16 = 48;
-/// A connect NimBLE gives up on, and how long the driver waits on each step after it.
-const CONNECT_MS: i32 = 10_000;
-const STEP_WAIT: Duration = Duration::from_secs(5);
+/// A connect, with the steps after it (the MTU, the service, `tx`'s CCCD), fails if not done within this: the node
+/// gives a connect up after 12 s, and the driver's own failure comes first (the spec's Limits).
+const SETUP: Duration = Duration::from_secs(10);
 /// A central that hasn't subscribed to `tx` this long after connecting is closed: the node never hears of it, so it
 /// couldn't, and it holds one of NimBLE's three connections. Checked about once a second while the driver's thread
 /// isn't connecting.
@@ -68,6 +68,7 @@ const TERMINATED: u8 = sys::ble_error_codes_BLE_ERR_REM_USER_CONN_TERM as u8;
 const OWN_ADDR: u8 = sys::BLE_OWN_ADDR_RANDOM as u8;
 const EDONE: u16 = sys::BLE_HS_EDONE as u16;
 const ENOTCONN: u16 = sys::BLE_HS_ENOTCONN as u16;
+const EALREADY: i32 = sys::BLE_HS_EALREADY as i32;
 
 /// The board's radio as a node drives it: NimBLE, serving the Peerwire GATT service.
 ///
@@ -488,15 +489,17 @@ impl Worker {
     }
 
     fn set_up(&self, central: &Arc<Central>, device: DeviceId, steps: &mpsc::Receiver<u16>) -> anyhow::Result<()> {
+        let by = Instant::now() + SETUP;
         let addr = ble_addr(device);
         // The connection's callback holds this until its last event.
         let arg = Arc::into_raw(central.clone()) as *mut c_void;
-        let rc = unsafe { sys::ble_gap_connect(OWN_ADDR, &addr, CONNECT_MS, ptr::null(), Some(on_central), arg) };
+        let ms = SETUP.as_millis() as i32;
+        let rc = unsafe { sys::ble_gap_connect(OWN_ADDR, &addr, ms, ptr::null(), Some(on_central), arg) };
         if rc != 0 {
             drop(unsafe { Arc::from_raw(arg as *const Central) });
             bail!("ble_gap_connect: {rc}");
         }
-        if let Err(e) = step(steps, CONNECT_MS as u64 + 2_000) {
+        if let Err(e) = step(steps, by) {
             // NimBLE ends every connect with an event, which frees `arg`: this ends one it has let run on.
             if unsafe { sys::ble_gap_conn_active() } != 0 {
                 unsafe { sys::ble_gap_conn_cancel() };
@@ -504,16 +507,27 @@ impl Worker {
             bail!("connect: {e}");
         }
         let handle = central.found().handle.ok_or_else(|| anyhow!("connected with no handle"))?;
-        ok("MTU", unsafe { sys::ble_gattc_exchange_mtu(handle, Some(on_mtu), arg) }, steps)?;
+        // A peer may ask first, as BlueZ does as soon as the link is up: NimBLE answers it and then takes the MTU as
+        // exchanged, so there is nothing to wait for. The MTU is read once subscribed, below.
+        match unsafe { sys::ble_gattc_exchange_mtu(handle, Some(on_mtu), arg) } {
+            EALREADY => {}
+            rc => ok("MTU", rc, steps, by)?,
+        }
         let service = uuid128(SERVICE_UUID);
-        ok("service", unsafe { sys::ble_gattc_disc_svc_by_uuid(handle, &service.u, Some(on_service), arg) }, steps)?;
+        let rc = unsafe { sys::ble_gattc_disc_svc_by_uuid(handle, &service.u, Some(on_service), arg) };
+        ok("service", rc, steps, by)?;
         let (start, end) = central.found().service.ok_or_else(|| anyhow!("no Peerwire service"))?;
-        ok("characteristics", unsafe { sys::ble_gattc_disc_all_chrs(handle, start, end, Some(on_chr), arg) }, steps)?;
+        ok(
+            "characteristics",
+            unsafe { sys::ble_gattc_disc_all_chrs(handle, start, end, Some(on_chr), arg) },
+            steps,
+            by,
+        )?;
         let (rx, tx, tx_end) = central.found().handles(end).ok_or_else(|| anyhow!("no rx or tx"))?;
-        ok("descriptors", unsafe { sys::ble_gattc_disc_all_dscs(handle, tx, tx_end, Some(on_dsc), arg) }, steps)?;
+        ok("descriptors", unsafe { sys::ble_gattc_disc_all_dscs(handle, tx, tx_end, Some(on_dsc), arg) }, steps, by)?;
         let cccd = central.found().cccd.ok_or_else(|| anyhow!("tx has no CCCD"))?;
         let on = NOTIFY_ON.as_ptr().cast();
-        ok("subscribe", unsafe { sys::ble_gattc_write_flat(handle, cccd, on, 2, Some(on_write), arg) }, steps)?;
+        ok("subscribe", unsafe { sys::ble_gattc_write_flat(handle, cccd, on, 2, Some(on_write), arg) }, steps, by)?;
 
         // NimBLE's own lock first, never inside the driver's.
         let mtu = unsafe { sys::ble_att_mtu(handle) };
@@ -574,19 +588,19 @@ impl Found {
     }
 }
 
-/// Waits for the next step's status.
-fn step(steps: &mpsc::Receiver<u16>, ms: u64) -> anyhow::Result<()> {
-    match steps.recv_timeout(Duration::from_millis(ms)) {
+/// Waits for the next step's status, until `by`.
+fn step(steps: &mpsc::Receiver<u16>, by: Instant) -> anyhow::Result<()> {
+    match steps.recv_timeout(by.saturating_duration_since(Instant::now())) {
         Ok(0) => Ok(()),
         Ok(status) => bail!("status {status}"),
-        Err(_) => bail!("no answer"),
+        Err(_) => bail!("no answer within {SETUP:?} of the connect"),
     }
 }
 
-/// A step started with `rc`, then its status.
-fn ok(what: &str, rc: i32, steps: &mpsc::Receiver<u16>) -> anyhow::Result<()> {
+/// A step started with `rc`, then its status by `by`.
+fn ok(what: &str, rc: i32, steps: &mpsc::Receiver<u16>, by: Instant) -> anyhow::Result<()> {
     ensure!(rc == 0, "{what}: {rc}");
-    step(steps, STEP_WAIT.as_millis() as u64).map_err(|e| anyhow!("{what}: {e}"))
+    step(steps, by).map_err(|e| anyhow!("{what}: {e}"))
 }
 
 /// A connection's events, from NimBLE's task. Its `arg` is a `Central` the connection holds until its last event.
