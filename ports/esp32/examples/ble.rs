@@ -6,12 +6,16 @@
 //! off. It joins room.sh's room ("esp32" if the flash names none) of the `lan_chat` and `room_chat` app, over
 //! Bluetooth alone: a PC nearby running `ble_chat` in that room links with it over the radio.
 //!
+//! Built with `PW_KEEP_WIFI` set, it keeps Wi-Fi on and its socket on the board's address, with no signaling: a peer
+//! is still found over Bluetooth only, and a link moves to UDP once that works (the spec's Paths: UDP first), so a PC
+//! on the same network running `ble_chat` without `--no-udp` sees it move.
+//!
 //! It logs each link with its path kind, answers each message with "echo: " and the message, sends each linked peer
 //! a numbered message every 5 s (every fourth one 2,000 B, a few GATT values long), and logs the links, the free heap
 //! and the lowest it has been every 10 s. Build it with `FEATURES=ble EXAMPLE=ble ./build.sh`, then flash
 //! out/ble.bin, or the copy wifi.sh writes.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -32,6 +36,8 @@ const ROOM: &str = "esp32";
 const SEND_EVERY: Duration = Duration::from_secs(5);
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 const LONG: usize = 2000;
+/// Wi-Fi stays on, if wifi.sh named a network: set `PW_KEEP_WIFI` when building.
+const KEEP_WIFI: bool = option_env!("PW_KEEP_WIFI").is_some();
 
 fn main() {
     peerwire_esp::run(run)
@@ -63,22 +69,28 @@ fn run() -> anyhow::Result<()> {
     if let Some(both) = both {
         info!("ble: Wi-Fi and NimBLE up, free heap {both} B, lowest {} B", lowest());
     }
-    drop(board); // Wi-Fi off: links have the radio alone
+    // Wi-Fi off, so links have the radio alone, unless kept.
+    let board = board.filter(|_| KEEP_WIFI);
+    let ip = board.as_ref().map_or(Ipv4Addr::LOCALHOST, Board::ip);
     let alone = free_heap();
-    info!("ble: Wi-Fi off, NimBLE up, free heap {alone} B");
+    match &board {
+        Some(_) => info!("ble: Wi-Fi kept on at {ip}, NimBLE up, free heap {alone} B"),
+        None => info!("ble: Wi-Fi off, NimBLE up, free heap {alone} B"),
+    }
 
     let mut node = Node::builder()
         .config(config())
         .stun_servers(Vec::<String>::new())
         .bluetooth(radio)
-        .bind(SocketAddr::from(([127, 0, 0, 1], PORT)))?;
+        .bind(SocketAddr::from((ip, PORT)))?;
     node.join_room(APP, &room);
     let joined = Instant::now();
     info!("ble: node {} joined {APP}/{room} over Bluetooth, free heap {} B", node.peer_id(), free_heap());
     let both = both.map_or("no Wi-Fi".into(), |b| format!("Wi-Fi and NimBLE {b} B"));
+    let radios = if board.is_some() { "Wi-Fi kept, now" } else { "NimBLE alone" };
     let clock = if clock::is_set() { "set" } else { "unset" };
     let startup =
-        format!("boot {boot} B, {both}, NimBLE alone {alone} B, joined {APP}/{room} over Bluetooth, clock {clock}");
+        format!("boot {boot} B, {both}, {radios} {alone} B, joined {APP}/{room} over Bluetooth, clock {clock}");
 
     let (mut next_send, mut next_report, mut sent, mut reports) = (joined + SEND_EVERY, joined, 0u32, 0u32);
     loop {
