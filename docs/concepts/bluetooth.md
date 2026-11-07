@@ -349,14 +349,17 @@ tests use an in-process pair of fake radios.
   connects make their links one at a time too, each in its turn (NB116-2): a device asked for after a member's can't
   take the member's place. The scan is held off for the connect making its link, once the scan has run 2 s since it
   last started, until the link is up, about 0.13 s after the device's next advert. A link not up 3 s after the scan
-  was held off for it fails, and the driver disconnects the device before the next connect's turn and the scan start
-  again: the kernel would hold both behind it until the connect's 10 s ran out, as a device that sends one advert and
-  goes silent would have it. So however many connects there are, which a device can draw by replaying a room's
-  advert, the scan runs about 2 s of every 5 at worst, and hears each device in range each time it starts (BlueZ
-  advertises every 1.28 s by default). A connect's 10 s count from its turn; in a room of three or more, links come up
-  one after another. Should BlueZ not answer the disconnect, the scan starts again 5 s after it was held off, reports
-  the device of the link being made again, which starts it, and is held off again 2 s later. A connect whose turn
-  comes within those 2 s waits for the rest of them, unless the scan's report of its device starts it first.
+  was held off for it fails, and the driver disconnects the device before the scan starts again: the kernel would hold
+  the scan's start and the next link behind it until the connect's 10 s ran out, as a device that sends one advert and
+  goes silent would have it. The next connect's turn comes once the scan has started again (NB116-3), or 1 s after at
+  most should BlueZ not start it, so that its link is asked for with the scan running, not as it starts. So however
+  many connects there are, which a device can draw by replaying a room's advert, the scan runs 2 s of every 5 to 6 at
+  worst (2 s, the link's 3 s, and up to 1 s for BlueZ to disconnect the device: **theoretical**), and hears each
+  device in range each time it starts (BlueZ advertises every 1.28 s by default). A connect's 10 s count from its
+  turn; in a room of three or more, links come up one after another. Should BlueZ not answer a connect at all, the
+  scan starts again 5 s after it was held off, reports the device of the link being made again, which starts it, and
+  is held off again 2 s later. A connect whose turn comes within those 2 s waits for the rest of them, unless the
+  scan's report of its device starts it first.
   A link that drops is reported closed at once: as the central, once BlueZ says the device isn't connected, or shuts
   the `tx` socket down, which it does as a link drops (a read then gives nothing, not an error).
   bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone

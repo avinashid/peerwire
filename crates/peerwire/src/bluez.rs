@@ -511,6 +511,9 @@ struct Ctx {
     linking: watch::Sender<usize>,
     /// How many discovery sessions run ([`Discovery`]): a connect's link is given `LINK` once none does ([`linked`]).
     scans: watch::Sender<usize>,
+    /// How many discovery sessions are held off ([`Discovery`]): the next connect's turn waits for none to be
+    /// ([`Making::release`]).
+    held: watch::Sender<usize>,
     strangers: Arc<Mutex<Strangers>>,
     /// How many strangers' removals are under way ([`remove_stranger`]): a driver that closes waits for them.
     removals: watch::Sender<usize>,
@@ -622,8 +625,9 @@ impl Driver {
         let centrals = Arc::new(Mutex::new(HashMap::new()));
         let strangers = Arc::new(Mutex::new(Strangers::default()));
         let turn = Arc::new(tokio::sync::Semaphore::new(1));
-        let (linking, scans, removals) = (watch::Sender::new(0), watch::Sender::new(0), watch::Sender::new(0));
-        let ctx = Ctx { events, shared, peripheral, centrals, turn, linking, scans, strangers, removals };
+        let (linking, scans, held) = (watch::Sender::new(0), watch::Sender::new(0), watch::Sender::new(0));
+        let removals = watch::Sender::new(0);
+        let ctx = Ctx { events, shared, peripheral, centrals, turn, linking, scans, held, strangers, removals };
         let mut d = Driver {
             session,
             ctx,
@@ -1149,16 +1153,20 @@ type Start = Box<dyn FnMut() -> BoxFuture<'static, Result<Reports, String>> + Se
 /// itself, and it starts at the device's next advert. The session is held off only once it has run `run` since it
 /// started, so that it hears each device in range each time it starts, however many connects there are (NB116-1); and
 /// until the link is up, or the connect has failed and its device been disconnected ([`linked`]), which stops the
-/// kernel's attempt: a session started meanwhile would wait behind it, or fail. It starts again after `pause` at most,
-/// should BlueZ not answer. With a link being made still as it starts again, it reports that device again, which
-/// starts it, and is held off again once it has run `run`.
+/// kernel's attempt: a session started meanwhile would wait behind it, or fail. The next connect's turn comes once it
+/// has started again ([`Making::release`]). It starts again after `pause` at most, should BlueZ not answer. With a link
+/// being made still as it starts again, it reports that device again, which starts it, and is held off again once it
+/// has run `run`.
 struct Discovery {
     /// The session, while it runs, counted in [`Ctx::scans`].
     found: Option<(Reports, Counted)>,
+    /// While the session is held off, counted in [`Ctx::held`].
+    off: Option<Counted>,
     start: Start,
     /// Whether a connect is making its link ([`Ctx::linking`]).
     linking: watch::Receiver<usize>,
     scans: watch::Sender<usize>,
+    held: watch::Sender<usize>,
     /// When the session started, or was held off.
     since: Instant,
     /// How long it runs at least before a connect holds it off, and how long it is held off at most.
@@ -1179,9 +1187,9 @@ enum Next {
 impl Discovery {
     /// Follows `found`, a session that has just started, counted in `scans`.
     fn new(found: Reports, start: Start, ctx: &Ctx, run: Duration, pause: Duration) -> Self {
-        let (linking, scans) = (ctx.linking.subscribe(), ctx.scans.clone());
+        let (linking, scans, held) = (ctx.linking.subscribe(), ctx.scans.clone(), ctx.held.clone());
         let found = Some((found, Counted::new(&scans)));
-        Discovery { found, start, linking, scans, since: Instant::now(), run, pause }
+        Discovery { found, off: None, start, linking, scans, held, since: Instant::now(), run, pause }
     }
 
     /// Stops the session for a connect making its link once it has run `run`, and starts it again once none is, or
@@ -1191,17 +1199,19 @@ impl Discovery {
         let now = Instant::now();
         if self.found.is_some() {
             if linking && now >= self.since + self.run {
-                (self.found, self.since) = (None, now);
+                (self.found, self.off, self.since) = (None, Some(Counted::new(&self.held)), now);
                 log::debug!("Bluetooth: the scan paused for a connect");
             }
         } else if !linking || now >= self.since + self.pause {
             match (self.start)().await {
                 Ok(found) => {
-                    (self.found, self.since) = (Some((found, Counted::new(&self.scans))), Instant::now());
+                    let found = Some((found, Counted::new(&self.scans)));
+                    (self.found, self.off, self.since) = (found, None, Instant::now());
                     let still = if linking { ", with a link being made still" } else { "" };
                     log::debug!("Bluetooth: the scan resumed{still}");
                 }
                 Err(e) => {
+                    self.off = None;
                     log::info!("Bluetooth: the scan didn't resume: {}", masked(&e));
                     return false;
                 }
@@ -1234,8 +1244,8 @@ impl Discovery {
     }
 }
 
-/// One of what a count in [`Ctx`] counts (a connect making its link, a discovery session, a stranger's removal), from
-/// its start to its end, or its task's abort.
+/// One of what a count in [`Ctx`] counts (a connect making its link, a discovery session running or held off, a
+/// stranger's removal), from its start to its end, or its task's abort.
 struct Counted(watch::Sender<usize>);
 
 impl Counted {
@@ -1248,6 +1258,31 @@ impl Counted {
 impl Drop for Counted {
     fn drop(&mut self) {
         self.0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// A connect's turn ([`Ctx::turn`]), and the scan held off for it ([`Ctx::linking`]), while it makes its link.
+struct Making {
+    turn: tokio::sync::OwnedSemaphorePermit,
+    linking: Counted,
+}
+
+impl Making {
+    fn new(turn: tokio::sync::OwnedSemaphorePermit, ctx: &Ctx) -> Making {
+        Making { turn, linking: Counted::new(&ctx.linking) }
+    }
+
+    /// Ends it, its link up, or given up and its device disconnected: the scan may start again, and the next connect's
+    /// turn comes once no session is held off (`held`, [`Ctx::held`]), at once with none, `ABORT` after at most should
+    /// BlueZ not start it (NB116-3). So the next link is asked for with the scan running, not as it starts, which would
+    /// wait behind it or fail (NB116-2), and the scan runs `RUN` between two connects however many there are.
+    async fn release(self, held: watch::Sender<usize>) {
+        let Making { turn, linking } = self;
+        drop(linking);
+        let mut held = held.subscribe();
+        // Not held as it waits: the session writes it.
+        let _ = tokio::time::timeout(ABORT, async { drop(held.wait_for(|n| *n == 0).await) }).await;
+        drop(turn);
     }
 }
 
@@ -1401,10 +1436,11 @@ impl Drop for Watching {
 /// is down (NB110-12), and this task ends with it, so one still under way has said nothing (`drop_links`). It waits
 /// for its turn ([`Ctx::turn`]), the scan is held off while it makes its link ([`Discovery`]), and a link not made
 /// `LINK` after that fails ([`linked`]): disconnected first, which BlueZ answers at once, holding its turn and the
-/// scan off until then, as that stops the kernel's attempt (NB116-2). A device that lists HID among its services
-/// isn't connected to, or its connect fails or its link closes as soon as BlueZ lists it, whenever that is
-/// (NB110-14); one BlueZ had neither paired nor trusted is removed from it once this connect, or its link, ends
-/// ([`Strangers`], NB110-13).
+/// scan off until then, as that stops the kernel's attempt (NB116-2). Its link up or given up, its turn passes on once
+/// the scan has started again ([`Making::release`], NB116-3). A device that lists HID among its services isn't
+/// connected to, or its connect fails or its link closes as soon as BlueZ lists it, whenever that is (NB110-14); one
+/// BlueZ had neither paired nor trusted is removed from it once this connect, or its link, ends ([`Strangers`],
+/// NB110-13).
 async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     let addr = address(device);
     let Ok(dev) = adapter.device(addr) else {
@@ -1413,7 +1449,7 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     };
     // Its turn, and the scan held off, until its link is up (`SETUP` counts from here). None once the driver is gone.
     let Ok(turn) = ctx.turn.clone().acquire_owned().await else { return };
-    let mut making = Some((turn, Counted::new(&ctx.linking)));
+    let mut making = Some(Making::new(turn, &ctx));
     let asked = Instant::now();
     let mut step = "reading it";
     let setup = async {
@@ -1429,8 +1465,11 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         let connecting = dev.connect();
         tokio::pin!(connecting);
         let answered = linked(connecting.as_mut(), &mut changes, ctx.scans.subscribe(), LINK).await?;
-        // Its link is up: the next connect's turn, and the scan may run again.
-        making = None;
+        // Its link is up: the scan may run again, and the next connect's turn comes once it does, as this set-up goes
+        // on.
+        if let Some(making) = making.take() {
+            tokio::spawn(making.release(ctx.held.clone()));
+        }
         // BlueZ answers once it has read the device's services, and its input plugin taken HID as an input device,
         // which a disconnect asked for detaches at once; or at once, if the link is up already (the device connected
         // to this one), and reads them after.
@@ -1486,12 +1525,13 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         Ok(s) => s,
         Err(why) => {
             log::info!("Bluetooth: the connect to {} failed, {}", tag(device), masked(&why));
-            if making.is_some() {
+            if let Some(making) = making {
                 // Its link not made, it holds its turn and the scan off until BlueZ has disconnected it, which stops
-                // the kernel's attempt, which the next link and the scan's start would wait behind (NB116-2).
+                // the kernel's attempt, which the next link and the scan's start would wait behind (NB116-2); reported
+                // before the scan has started again, which the release waits for.
                 let _ = tokio::time::timeout(ABORT, drop_link(&adapter, &ctx.centrals, addr)).await;
-                drop(making);
-                return ctx.events.send(RadioEvent::ConnectFailed { device });
+                ctx.events.send(RadioEvent::ConnectFailed { device });
+                return making.release(ctx.held.clone()).await;
             }
             ctx.events.send(RadioEvent::ConnectFailed { device });
             return drop_later(&adapter, &ctx.centrals, [addr]);
@@ -1980,8 +2020,9 @@ mod tests {
         let centrals = Arc::new(Mutex::new(HashMap::new()));
         let strangers = Arc::new(Mutex::new(Strangers::default()));
         let turn = Arc::new(tokio::sync::Semaphore::new(1));
-        let (linking, scans, removals) = (watch::Sender::new(0), watch::Sender::new(0), watch::Sender::new(0));
-        (Ctx { events, shared, peripheral, centrals, turn, linking, scans, strangers, removals }, rx)
+        let (linking, scans, held) = (watch::Sender::new(0), watch::Sender::new(0), watch::Sender::new(0));
+        let removals = watch::Sender::new(0);
+        (Ctx { events, shared, peripheral, centrals, turn, linking, scans, held, strangers, removals }, rx)
     }
 
     /// NB-112: when the adapter goes, every link on it is reported closed, a connect under way fails, and one that
@@ -2395,7 +2436,7 @@ mod tests {
             let held = Counted::new(connects);
             assert!(d.settle().await && d.found.is_none(), "held off, it isn't started");
             drop(held);
-            assert!(!d.settle().await, "it doesn't start again");
+            assert!(!d.settle().await && *ctx.held.borrow() == 0, "it doesn't start again, nor is it held off");
             drop(ctx);
             assert!(matches!(soon(&mut d).await, Some(Next::Ended)), "nor once the driver is gone");
         });
@@ -2521,6 +2562,68 @@ mod tests {
             assert!(due(&mut d).await && scans() == 1);
             drop(d);
             assert_eq!(scans(), 0, "not once it has ended");
+        });
+    }
+
+    /// NB116-3: a connect that ends, its link given up (or up), passes its turn on once the scan it held off has
+    /// started again, however long BlueZ takes to start it: so the next connect's link is asked for with the scan
+    /// running, and the scan runs `run` between two connects that never link. At once with no session held off, as
+    /// with no scan; `ABORT` after at most, should BlueZ not start it.
+    #[test]
+    fn a_connect_passes_its_turn_on_once_the_scan_runs_again() {
+        runtime().block_on(async {
+            let (ctx, _events) = ctx();
+            let (mut start, fed) = sessions();
+            let found = start().await.unwrap();
+            let slow = Duration::from_millis(100);
+            let slowly: Start = Box::new(move || {
+                let started = start();
+                async move {
+                    tokio::time::sleep(slow).await;
+                    started.await
+                }
+                .boxed()
+            });
+            let (run, ms) = (Duration::from_millis(300), Duration::from_millis(1));
+            let mut d = Discovery::new(found, slowly, &ctx, run, Duration::from_secs(3600));
+            // As `follow` runs it.
+            let scan = tokio::spawn(async move { while d.settle().await && !matches!(d.next().await, Next::Ended) {} });
+            let (scans, held) = (|| *ctx.scans.borrow(), || *ctx.held.borrow());
+            let turn = |ctx: &Ctx| ctx.turn.clone().acquire_owned();
+            // A makes its link, and B waits for its turn.
+            let a = Making::new(turn(&ctx).await.unwrap(), &ctx);
+            let c = ctx.clone();
+            let b = tokio::spawn(async move {
+                let b = Making::new(turn(&c).await.unwrap(), &c);
+                (Instant::now(), *c.scans.borrow(), b)
+            });
+            tokio::time::sleep(run + 50 * ms).await;
+            assert_eq!((scans(), held()), (0, 1), "the scan is held off for A once it has run `run`");
+            // A's link is given up: B's turn comes once the scan has started again.
+            let t = Instant::now();
+            a.release(ctx.held.clone()).await;
+            let (turned, running, b) = b.await.unwrap();
+            assert!(turned - t >= slow && turned - t < ABORT, "B's turn {:?} after A's end", turned - t);
+            assert_eq!((running, held(), fed.lock().unwrap().len()), (1, 0, 2), "with the scan running");
+            // It runs `run` before it is held off for B.
+            tokio::time::sleep_until(turned + run - 50 * ms).await;
+            assert_eq!(scans(), 1, "not held off for B before it has run `run`");
+            tokio::time::sleep(100 * ms).await;
+            assert_eq!((scans(), held()), (0, 1), "but once it has");
+            // With no scan, the next turn comes at once.
+            scan.abort();
+            quiet().await;
+            assert_eq!(held(), 0, "a scan that ended isn't held off");
+            let t = Instant::now();
+            b.release(ctx.held.clone()).await;
+            assert!(t.elapsed() < 50 * ms && ctx.turn.available_permits() == 1, "{:?}", t.elapsed());
+            // A session BlueZ doesn't start again holds the next turn back `ABORT` at most.
+            let c = Making::new(turn(&ctx).await.unwrap(), &ctx);
+            let _off = Counted::new(&ctx.held);
+            let t = Instant::now();
+            let released = tokio::time::timeout(ABORT + 100 * ms, c.release(ctx.held.clone())).await;
+            assert!(released.is_ok() && t.elapsed() >= ABORT, "{:?}", t.elapsed());
+            assert_eq!(ctx.turn.available_permits(), 1);
         });
     }
 }
