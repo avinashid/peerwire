@@ -6,12 +6,12 @@
 //! UUID in the scan response, scans passively, connects where the node asks, and moves values on up to three
 //! connections ([`Limits::SMALL`]). A central that doesn't subscribe to `tx` within 5 s is closed, so a silent one
 //! can't hold a connection the node never hears of. Nothing is paired or bonded (BLE-R5): bonding, MITM and Secure
-//! Connections are off, and a connection that a pairing completes on anyway is closed. `rx` takes writes without
-//! response, and sdkconfig.ble leaves NimBLE no room for prepared (long) writes (BLE-R7). An advert that isn't on the
-//! air is reported to the node (`Advertising`) and tried again. A connect to an address NimBLE still has a connection
-//! to, one whose link has gone until its supervision timeout ends it, is tried again within the connect's 10 s rather
-//! than failed. Each connection coming up or closing is logged with its role and reason, and so are NimBLE's
-//! connections against the driver's whenever either count changes.
+//! Connections are off, a pairing hands over no keys, and a connection one completes on is closed. `rx` takes writes
+//! without response, and sdkconfig.ble leaves NimBLE no room for prepared (long) writes (BLE-R7). An advert that isn't
+//! on the air is reported to the node (`Advertising`) and tried again. A connect to an address NimBLE still has a
+//! connection to, one whose link has gone until its supervision timeout ends it, is tried again within the connect's
+//! 10 s rather than failed. Each connection coming up or closing is logged with its role and reason, and so are
+//! NimBLE's connections against the driver's whenever either count changes.
 //!
 //! NimBLE calls back on its own task, where the driver only queues events for [`Radio::poll`]. What waits on the
 //! radio (a new address, connecting, finding the service, subscribing) runs on a thread of the driver's own, so no
@@ -26,7 +26,7 @@ use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, ensure};
-use esp32_nimble::enums::{AuthReq, OwnAddrType};
+use esp32_nimble::enums::{AuthReq, OwnAddrType, PairKeyDist};
 use esp32_nimble::utilities::BleUuid;
 use esp32_nimble::{BLEDevice, NimbleProperties, NimbleSub};
 use esp_idf_svc::sys;
@@ -82,6 +82,15 @@ const EALREADY: i32 = sys::BLE_HS_EALREADY as i32;
 const HCI_BASE: i32 = sys::BLE_HS_ERR_HCI_BASE as i32;
 /// The connection handles looked at for those NimBLE has: ESP's controllers number them from 0, a few at most.
 const HANDLES: u16 = 32;
+
+// NimBLE's host privacy: on the original ESP32, built in whatever sdkconfig says (ESP-IDF's esp_nimble_cfg.h), but not
+// in esp-idf-sys's bindings.
+#[cfg(esp32)]
+extern "C" {
+    fn ble_hs_pvcy_rpa_config(enable: u8) -> std::ffi::c_int;
+}
+#[cfg(esp32)]
+const NIMBLE_HOST_DISABLE_PRIVACY: u8 = 0;
 
 /// The board's radio as a node drives it: NimBLE, serving the Peerwire GATT service.
 ///
@@ -153,13 +162,30 @@ impl Nimble {
         ble.set_preferred_mtu(MTU)?;
         // What a connected central reads as the GAP name: the spec's, not esp32-nimble's `nimble`.
         BLEDevice::set_device_name(GAP_NAME)?;
+        ble.set_own_addr_type(OwnAddrType::Random);
+        // On the original ESP32 that also turns on NimBLE's host privacy, which makes addresses of its own on its own
+        // timer and gives the efuse MAC as the identity address in a pairing (NB110c-1): off, as the driver makes
+        // every address.
+        #[cfg(esp32)]
+        {
+            let rc = unsafe { ble_hs_pvcy_rpa_config(NIMBLE_HOST_DISABLE_PRIVACY) };
+            ensure!(rc == 0, "ble_hs_pvcy_rpa_config: {rc}");
+        }
         // Every address this radio uses is a fresh non-resolvable random one, never the efuse MAC (BLE-R3).
         // esp32-nimble does that only on the original ESP32: ask NimBLE here, for each advert.
         new_address()?;
-        ble.set_own_addr_type(OwnAddrType::Random);
         // No bonding, MITM or Secure Connections (BLE-R5): a central that pairs anyway gets legacy Just Works, which
-        // runs no P-256, and the connection then closes.
-        ble.security().set_auth(AuthReq::empty());
+        // runs no P-256, and the connection then closes. No keys go either way, where set_own_addr_type asked for
+        // the identity ones: a pairing would hand over the IRK, the same for every advert of a boot (NB110c-1).
+        ble.security()
+            .set_auth(AuthReq::empty())
+            .set_security_init_key(PairKeyDist::empty())
+            .set_security_resp_key(PairKeyDist::empty());
+        // esp32-nimble's server logs each MTU exchange at info, and a central can ask for one after another: its
+        // lines from warn up only (NB110c-I1). ESP-IDF matches a log target whole, not by its prefix.
+        unsafe {
+            sys::esp_log_level_set(c"esp32_nimble::server::ble_server".as_ptr(), sys::esp_log_level_t_ESP_LOG_WARN)
+        };
 
         let (worker, cmds) = mpsc::channel();
         let shared = Arc::new(Shared { state: Mutex::default(), worker: Mutex::new(worker) });
@@ -595,15 +621,14 @@ impl Worker {
         let central = Arc::new(Central { shared: self.shared.clone(), conn, done, found: Mutex::default() });
         if let Err(e) = self.set_up(&central, device, &steps) {
             info!("ble: a connect failed: {e:#}");
-            // A connection that comes up from now on is closed as it does (on_central).
-            let handle = {
-                let mut found = central.found();
-                found.gave_up = true;
-                found.handle
-            };
-            if let Some(handle) = handle {
+            // A connection that comes up from now on is closed as it does (on_central). One that has closed has no
+            // handle, which may be another connection's by now: closed under the lock its DISCONNECT clears it under.
+            let mut found = central.found();
+            found.gave_up = true;
+            if let Some(handle) = found.handle {
                 terminate(handle);
             }
+            drop(found);
             self.shared.lock().push(RadioEvent::ConnectFailed { device });
         }
     }
@@ -615,21 +640,21 @@ impl Worker {
         // connection that closes before its challenge for a second or so, but one whose link has gone stays
         // NimBLE's until its supervision timeout, a few seconds: that is waited out rather than failed, which would
         // hold the advert for a minute (omarchy's run 19).
-        let arg = loop {
+        loop {
             // The connection's callback holds this until its last event.
             let arg = Arc::into_raw(central.clone()) as *mut c_void;
             // Not 0, which NimBLE takes as its default of 30 s.
             let ms = by.saturating_duration_since(Instant::now()).as_millis().max(1) as i32;
             let rc = unsafe { sys::ble_gap_connect(OWN_ADDR, &addr, ms, ptr::null(), Some(on_central), arg) };
             if rc == 0 {
-                break arg;
+                break;
             }
             drop(unsafe { Arc::from_raw(arg as *const Central) });
             if rc != i32::from(EDONE) || Instant::now() + STILL_LINKED_RETRY >= by {
                 bail!("ble_gap_connect: {rc}");
             }
             std::thread::sleep(STILL_LINKED_RETRY);
-        };
+        }
         if let Err(e) = step(steps, by) {
             // NimBLE ends every connect with an event, which frees `arg`: this ends one it has let run on.
             if unsafe { sys::ble_gap_conn_active() } != 0 {
@@ -637,33 +662,41 @@ impl Worker {
             }
             bail!("connect: {e}");
         }
-        let handle = central.found().handle.ok_or_else(|| anyhow!("connected with no handle"))?;
         // A peer may ask first, as BlueZ does as soon as the link is up: NimBLE answers it and then takes the MTU as
         // exchanged, so there is nothing to wait for. The MTU is read once subscribed, below.
-        match unsafe { sys::ble_gattc_exchange_mtu(handle, Some(on_mtu), arg) } {
+        match start(central, |handle, arg| unsafe { sys::ble_gattc_exchange_mtu(handle, Some(on_mtu), arg) }) {
             EALREADY => {}
             rc => ok("MTU", rc, steps, by)?,
         }
         let service = uuid128(SERVICE_UUID);
-        let rc = unsafe { sys::ble_gattc_disc_svc_by_uuid(handle, &service.u, Some(on_service), arg) };
+        let rc = start(central, |handle, arg| unsafe {
+            sys::ble_gattc_disc_svc_by_uuid(handle, &service.u, Some(on_service), arg)
+        });
         ok("service", rc, steps, by)?;
-        let (start, end) = central.found().service.ok_or_else(|| anyhow!("no Peerwire service"))?;
-        ok(
-            "characteristics",
-            unsafe { sys::ble_gattc_disc_all_chrs(handle, start, end, Some(on_chr), arg) },
-            steps,
-            by,
-        )?;
+        let (first, end) = central.found().service.ok_or_else(|| anyhow!("no Peerwire service"))?;
+        let rc = start(central, |handle, arg| unsafe {
+            sys::ble_gattc_disc_all_chrs(handle, first, end, Some(on_chr), arg)
+        });
+        ok("characteristics", rc, steps, by)?;
         let (rx, tx, tx_end) = central.found().handles(end).ok_or_else(|| anyhow!("no rx or tx"))?;
-        ok("descriptors", unsafe { sys::ble_gattc_disc_all_dscs(handle, tx, tx_end, Some(on_dsc), arg) }, steps, by)?;
+        let rc = start(central, |handle, arg| unsafe {
+            sys::ble_gattc_disc_all_dscs(handle, tx, tx_end, Some(on_dsc), arg)
+        });
+        ok("descriptors", rc, steps, by)?;
         let cccd = central.found().cccd.ok_or_else(|| anyhow!("tx has no CCCD"))?;
         let on = NOTIFY_ON.as_ptr().cast();
-        ok("subscribe", unsafe { sys::ble_gattc_write_flat(handle, cccd, on, 2, Some(on_write), arg) }, steps, by)?;
+        let rc = start(central, |handle, arg| unsafe {
+            sys::ble_gattc_write_flat(handle, cccd, on, 2, Some(on_write), arg)
+        });
+        ok("subscribe", rc, steps, by)?;
 
+        let handle = central.found().handle.ok_or_else(|| anyhow!("closed while setting up"))?;
         // NimBLE's own lock first, never inside the driver's.
         let mtu = unsafe { sys::ble_att_mtu(handle) };
         let mut state = self.shared.lock();
-        let link = state.links.get_mut(&handle).ok_or_else(|| anyhow!("closed while setting up"))?;
+        // This connect's own: the handle may be another connection's if this one closed just now.
+        let link = state.links.get_mut(&handle).filter(|link| link.conn == central.conn);
+        let link = link.ok_or_else(|| anyhow!("closed while setting up"))?;
         link.rx = Some(rx);
         link.up = true;
         link.mtu = mtu;
@@ -688,10 +721,10 @@ struct Central {
 /// What finding the service has found.
 #[derive(Default)]
 struct Found {
+    /// The connection's, from its CONNECT to its DISCONNECT: NimBLE may give it to the next connection after that.
     handle: Option<u16>,
     service: Option<(u16, u16)>,
-    /// Each characteristic's definition and value handles, and its UUID if a 128-bit one.
-    chrs: Vec<(u16, u16, Option<u128>)>,
+    chrs: Chrs,
     cccd: Option<u16>,
     /// `tx`'s value handle, once subscribed to.
     tx: u16,
@@ -711,15 +744,55 @@ impl Central {
     }
 }
 
+/// All that is kept of the characteristics found, so a peer listing thousands can't use up the heap (NB110c-3).
+#[derive(Default, Clone, Copy)]
+struct Chrs {
+    /// The first `rx`'s and `tx`'s value handles.
+    rx: Option<u16>,
+    tx: Option<u16>,
+    /// The smallest definition handle after `tx`'s value: `tx`'s descriptors end before it.
+    after_tx: Option<u16>,
+}
+
 impl Found {
+    /// Notes a characteristic found: its definition and value handles, and its UUID if a 128-bit one.
+    fn chr(&mut self, def: u16, value: u16, uuid: Option<u128>) {
+        let chrs = &mut self.chrs;
+        if chrs.tx.is_some_and(|tx| def > tx) {
+            chrs.after_tx = Some(chrs.after_tx.map_or(def, |after| after.min(def)));
+        }
+        if uuid == Some(RX_UUID) {
+            chrs.rx.get_or_insert(value);
+        } else if uuid == Some(TX_UUID) {
+            chrs.tx.get_or_insert(value);
+        }
+    }
+
     /// `rx`'s and `tx`'s value handles, and the last handle that can be `tx`'s descriptor. Notes `tx`'s.
     fn handles(&mut self, service_end: u16) -> Option<(u16, u16, u16)> {
-        let value = |uuid| self.chrs.iter().find(|c| c.2 == Some(uuid)).map(|c| c.1);
-        let (rx, tx) = (value(RX_UUID)?, value(TX_UUID)?);
-        let next = self.chrs.iter().map(|c| c.0).filter(|&def| def > tx).min();
+        let Chrs { rx, tx, after_tx } = self.chrs;
+        let (rx, tx) = (rx?, tx?);
         self.tx = tx;
-        Some((rx, tx, next.map_or(service_end, |def| def - 1)))
+        Some((rx, tx, after_tx.map_or(service_end, |def| def - 1)))
     }
+}
+
+/// Starts a GATT procedure on the connect's connection, if it still has one: `call` gets the handle and an `arg` of
+/// the procedure's own, a reference to `central` that its last callback ends, so the `Central` outlives every
+/// procedure that names it. The handle is checked and the procedure started under `found`'s lock, which the
+/// connection's DISCONNECT takes to clear it: NimBLE may give a closed connection's handle to the next one, a
+/// stranger's, which a step started after that would run on (NB110c-2). NimBLE calls nothing back from within the
+/// call, or for a procedure that didn't start.
+fn start(central: &Arc<Central>, call: impl FnOnce(u16, *mut c_void) -> i32) -> i32 {
+    let found = central.found();
+    let Some(handle) = found.handle else { return ENOTCONN.into() };
+    let arg = Arc::into_raw(central.clone()) as *mut c_void;
+    let rc = call(handle, arg);
+    if rc != 0 {
+        drop(unsafe { Arc::from_raw(arg as *const Central) });
+    }
+    drop(found);
+    rc
 }
 
 /// Waits for the next step's status, until `by`.
@@ -764,6 +837,7 @@ unsafe extern "C" fn on_central(event: *mut sys::ble_gap_event, arg: *mut c_void
         }
         sys::BLE_GAP_EVENT_DISCONNECT => {
             let handle = unsafe { event.__bindgen_anon_1.disconnect.conn.conn_handle };
+            central.found().handle = None; // no longer this connection's (start)
             central.shared.lock().closed(handle);
             central.done(ENOTCONN);
             drop(unsafe { Arc::from_raw(arg as *const Central) }); // its last event
@@ -852,7 +926,7 @@ impl std::fmt::Display for Reason {
 const MIN_MTU: u16 = peerwire::ble::MIN_ATT_MTU;
 
 unsafe extern "C" fn on_mtu(_: u16, error: *const sys::ble_gatt_error, _: u16, arg: *mut c_void) -> i32 {
-    unsafe { central(arg).done((*error).status) };
+    unsafe { last(arg).done((*error).status) };
     0
 }
 
@@ -862,13 +936,12 @@ unsafe extern "C" fn on_service(
     service: *const sys::ble_gatt_svc,
     arg: *mut c_void,
 ) -> i32 {
-    let central = unsafe { central(arg) };
     match unsafe { (*error).status } {
         0 => {
             let service = unsafe { &*service };
-            central.found().service.get_or_insert((service.start_handle, service.end_handle));
+            unsafe { central(arg) }.found().service.get_or_insert((service.start_handle, service.end_handle));
         }
-        status => central.done(if status == EDONE { 0 } else { status }),
+        status => unsafe { last(arg) }.done(if status == EDONE { 0 } else { status }),
     }
     0
 }
@@ -879,14 +952,13 @@ unsafe extern "C" fn on_chr(
     chr: *const sys::ble_gatt_chr,
     arg: *mut c_void,
 ) -> i32 {
-    let central = unsafe { central(arg) };
     match unsafe { (*error).status } {
         0 => {
             let chr = unsafe { &*chr };
             let uuid = unsafe { uuid_of(&chr.uuid) };
-            central.found().chrs.push((chr.def_handle, chr.val_handle, uuid));
+            unsafe { central(arg) }.found().chr(chr.def_handle, chr.val_handle, uuid);
         }
-        status => central.done(if status == EDONE { 0 } else { status }),
+        status => unsafe { last(arg) }.done(if status == EDONE { 0 } else { status }),
     }
     0
 }
@@ -898,16 +970,15 @@ unsafe extern "C" fn on_dsc(
     dsc: *const sys::ble_gatt_dsc,
     arg: *mut c_void,
 ) -> i32 {
-    let central = unsafe { central(arg) };
     match unsafe { (*error).status } {
         0 => {
             let dsc = unsafe { &*dsc };
             let is_cccd = unsafe { dsc.uuid.u.type_ == sys::BLE_UUID_TYPE_16 as u8 && dsc.uuid.u16_.value == CCCD };
             if is_cccd {
-                central.found().cccd.get_or_insert(dsc.handle);
+                unsafe { central(arg) }.found().cccd.get_or_insert(dsc.handle);
             }
         }
-        status => central.done(if status == EDONE { 0 } else { status }),
+        status => unsafe { last(arg) }.done(if status == EDONE { 0 } else { status }),
     }
     0
 }
@@ -918,13 +989,20 @@ unsafe extern "C" fn on_write(
     _: *mut sys::ble_gatt_attr,
     arg: *mut c_void,
 ) -> i32 {
-    unsafe { central(arg).done((*error).status) };
+    unsafe { last(arg).done((*error).status) };
     0
 }
 
-/// A GATT procedure's `arg`: the connection's `Central`, alive while the connection is.
+/// A GATT procedure's `arg` before its last call: a reference to the connect's `Central` of the procedure's own
+/// ([`start`]). NimBLE calls a procedure's callback with status 0 for each thing it finds, then once with another
+/// (EDONE when all is found, else an error, ENOTCONN as the connection closes), or once only for the MTU or a write.
 unsafe fn central<'a>(arg: *mut c_void) -> &'a Central {
     unsafe { &*(arg as *const Central) }
+}
+
+/// The same at its last call, which ends that reference.
+unsafe fn last(arg: *mut c_void) -> Arc<Central> {
+    unsafe { Arc::from_raw(arg as *const Central) }
 }
 
 /// Adverts heard while scanning, from NimBLE's task: the service's, with their service data, go to the node.
@@ -1064,6 +1142,30 @@ mod tests {
         assert_eq!(service_data(&[3, 0x21, 1]), None);
         assert_eq!(service_data(&[0]), None);
         assert!(advert(&[0; 11]).is_err());
+    }
+
+    #[test]
+    fn keeps_only_the_handles_it_needs() {
+        let mut found = Found::default();
+        found.chr(1, 2, Some(RX_UUID));
+        found.chr(3, 4, Some(TX_UUID));
+        for def in (8..4000).step_by(2) {
+            found.chr(def, def + 1, None); // a peer's many, kept as one handle
+        }
+        found.chr(4002, 4003, Some(TX_UUID)); // a second tx is ignored
+        assert_eq!(found.handles(0xffff), Some((2, 4, 7)));
+        assert_eq!(found.tx, 4);
+
+        let mut found = Found::default();
+        found.chr(1, 2, Some(TX_UUID));
+        found.chr(5, 6, Some(RX_UUID));
+        assert_eq!(found.handles(9), Some((6, 2, 4)));
+        let mut found = Found::default();
+        found.chr(1, 2, Some(TX_UUID));
+        assert_eq!(found.handles(9), None);
+        found.chr(3, 4, Some(RX_UUID));
+        found.chr(5, 6, Some(RX_UUID));
+        assert_eq!(found.handles(9), Some((4, 2, 2)));
     }
 
     #[test]
