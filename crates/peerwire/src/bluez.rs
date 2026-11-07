@@ -1547,11 +1547,13 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
             log::info!("Bluetooth: the connect to {} failed, {}", tag(device), masked(&why));
             if let Some(making) = making {
                 // Its link not made, it holds its turn and the scan off until BlueZ has disconnected it, which stops
-                // the kernel's attempt, which the next link and the scan's start would wait behind (NB116-2); reported
-                // before the scan has started again, which the release waits for.
+                // the kernel's attempt, which the next link and the scan's start would wait behind (NB116-2). Then
+                // reported, before the scan has started again, which the release waits for in a task of its own: this
+                // one ends with its report (`drop_links`).
                 let _ = tokio::time::timeout(ABORT, drop_link(&adapter, &ctx.centrals, addr)).await;
                 ctx.events.send(RadioEvent::ConnectFailed { device });
-                return making.release(ctx.held.clone()).await;
+                tokio::spawn(making.release(ctx.held.clone()));
+                return;
             }
             ctx.events.send(RadioEvent::ConnectFailed { device });
             return drop_later(&adapter, &ctx.centrals, [addr]);
