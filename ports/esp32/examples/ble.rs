@@ -50,6 +50,8 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let boot = free_heap();
     info!("ble: boot, free heap {boot} B");
+    // Before any radio, as a new one is drawn only then.
+    let identity = identity::load_or_create()?;
     let (wifi, room) = flash_config();
     let room = room.unwrap_or_else(|| ROOM.into());
 
@@ -84,7 +86,7 @@ fn run() -> anyhow::Result<()> {
 
     let console = Console::start()?;
     let mut node = Node::builder()
-        .identity(identity::load_or_create()?)
+        .identity(identity)
         .config(config())
         .stun_servers(Vec::<String>::new())
         .bluetooth(radio)

@@ -4,7 +4,8 @@
 //! [`Console::line`] gives each line typed, trimmed. It reads UART0, the console of a board with a USB-to-serial chip,
 //! and on a chip with USB-Serial-JTAG (the C3) that too: a C3 board with native USB only prints there, as ESP-IDF's
 //! secondary console, which takes no input until its driver is installed. Installing it moves the console's output
-//! onto the driver as well, as ESP-IDF's own REPL does.
+//! onto the driver as well, as ESP-IDF's own REPL does. Firmware whose sdkconfig makes USB-Serial-JTAG the primary
+//! console has no UART0 console: then it reads the driver alone.
 //!
 //! A terminal sends each key as it's pressed and the board echoes nothing: what's typed shows once the firmware logs
 //! the line. Anyone with a cable to the board can type commands, as anyone with one can reflash it.
@@ -34,7 +35,10 @@ impl Console {
     /// Starts reading the console, on a thread at the main task's priority, 1.
     pub fn start() -> anyhow::Result<Console> {
         // A read with nothing to read then returns at once.
-        unsafe { sys::fcntl(0, sys::F_SETFL as i32, sys::O_NONBLOCK as i32) };
+        #[cfg(not(esp_idf_esp_console_usb_serial_jtag))]
+        unsafe {
+            sys::fcntl(0, sys::F_SETFL as i32, sys::O_NONBLOCK as i32)
+        };
         #[cfg(esp_idf_soc_usb_serial_jtag_supported)]
         if !unsafe { sys::usb_serial_jtag_is_driver_installed() } {
             let mut config = sys::usb_serial_jtag_driver_config_t { tx_buffer_size: 256, rx_buffer_size: 256 };
@@ -59,14 +63,19 @@ impl Console {
 /// The console's thread: it reads each source, and sends `lines` each line typed, until the [`Console`] is dropped.
 fn read(lines: SyncSender<String>) {
     let mut buf = [0u8; 128];
+    // fd 0 is UART0, unless USB-Serial-JTAG is the primary console: then it's the driver read below.
+    #[cfg(not(esp_idf_esp_console_usb_serial_jtag))]
     let mut uart = Line::default();
     #[cfg(esp_idf_soc_usb_serial_jtag_supported)]
     let mut usb = Line::default();
     loop {
-        // -1 with nothing to read.
-        let n = unsafe { sys::read(0, buf.as_mut_ptr().cast(), buf.len()) };
-        if n > 0 && !uart.take(&buf[..n as usize], &lines) {
-            return;
+        #[cfg(not(esp_idf_esp_console_usb_serial_jtag))]
+        {
+            // -1 with nothing to read.
+            let n = unsafe { sys::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 && !uart.take(&buf[..n as usize], &lines) {
+                return;
+            }
         }
         #[cfg(esp_idf_soc_usb_serial_jtag_supported)]
         {

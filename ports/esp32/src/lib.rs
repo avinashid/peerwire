@@ -35,7 +35,8 @@
 //! [`Node`] another way must do the same.
 //!
 //! **Identity.** A node draws a new identity each time it's built unless it's given one. [`identity::load_or_create`]
-//! keeps one in NVS across restarts, for [`Builder::identity`].
+//! keeps one in NVS across restarts, for [`Builder::identity`]. Call it first, before Wi-Fi or Bluetooth is set up:
+//! it draws a new one from the SAR ADC, ESP-IDF's true random source until then.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
