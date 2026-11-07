@@ -181,10 +181,13 @@ impl Nimble {
             .set_auth(AuthReq::empty())
             .set_security_init_key(PairKeyDist::empty())
             .set_security_resp_key(PairKeyDist::empty());
-        // esp32-nimble's server logs each MTU exchange at info, and a central can ask for one after another: its
-        // lines from warn up only (NB110c-I1). ESP-IDF matches a log target whole, not by its prefix.
+        // esp32-nimble's server logs lines a central can draw one after another: each MTU exchange at info
+        // (NB110c-I1), and each notification it sends us, which it doesn't handle, at warn (NB110c-4). The console
+        // spins on its UART at 115200 baud, on NimBLE's host task, so a flood of either would starve every task
+        // below it on a single core. Its lines from error up only: its one error line needs a characteristic that
+        // asks for encryption, which ours don't. ESP-IDF matches a log target whole, not by its prefix.
         unsafe {
-            sys::esp_log_level_set(c"esp32_nimble::server::ble_server".as_ptr(), sys::esp_log_level_t_ESP_LOG_WARN)
+            sys::esp_log_level_set(c"esp32_nimble::server::ble_server".as_ptr(), sys::esp_log_level_t_ESP_LOG_ERROR)
         };
 
         let (worker, cmds) = mpsc::channel();
