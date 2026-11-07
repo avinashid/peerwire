@@ -35,7 +35,7 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 |---|---|---|
 | Signaling relay (Nostr, BroadcastChannel) | No | May read, drop, reorder, replay or inject any signaling message. Cannot forge a sealed payload or impersonate a PeerId. |
 | The LAN, for `LanSignaling` | No | Every device on the link, and every program on the machine, hears each frame and can send its own, with no relay to pace it. The same limits as a relay: cannot open or forge a sealed payload. See [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6). |
-| Devices in Bluetooth range, for a node with a radio (`ble`, NB-110) | No | Hear every advert and can follow any connection, as nothing is paired; may connect, replay adverts, relay between two connections, jam or cut a link. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1). |
+| Devices in Bluetooth range, for a node with a radio (`ble`, NB-110) | No | Hear every advert and can follow any connection, as nothing is paired; may connect, replay adverts, relay between two connections, jam or cut a link. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1) and [on the ESP32](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5). |
 | Peer relay (`FWD`/`RELAYED`) | No | Sees only ciphertext; rate-limited; forwards only to already-connected peers. |
 | NAT / on-path network | No | Noise authenticates the endpoints; cannot MITM. Can drop/delay. |
 | A TURN server the app lists (`iceServers`; in Rust `turn_servers`, NB-099) | Partially | The app's choice, not ours. Sees our address, the peers' addresses, sizes and timing, never a payload; can drop or delay; picks the relayed address we offer. Under `Privacy::RelayOnly` with `Turn` in the policy (NB-101) the peers see its relayed address instead of ours. See [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) and [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1). |
@@ -182,6 +182,9 @@ release of each.
 | NB110-I1 (Info) | Open (on main, over UDP): on the ESP32 port one source that knows the node's PeerId fills all 8 half-open handshake slots, 10 s at a time, same section |
 | NB110-I2…NB110-I10 (Info) | NB110-I3 **fixed** by `33b1f4f`, and NB110-I10's first edge by `708038f`; I2, I4 documented; I5, I6, I8 accepted; I7, I9 and I10's second edge open, same section |
 | BlueZ 5.87 (NB-113) | Not Peerwire's: `bluetoothd` 5.87 crashes when a UUID discovery filter meets an advert that lists a UUID; fixed upstream by `82af2beaf`, in no BlueZ release yet. The Linux driver's scan set such a filter until NB-112 (`bb4857c`) dropped it, same section |
+| NB110c-1 (Low), NB110c-2 (Medium), NB110c-3 (Low), NB110c-I1 (Info) | **Fixed** by `53ff209` before NB-110c merged (`6f297d7`), so never on main, before `ble::Nimble` was published (a pairing hands over no keys, and NimBLE's host privacy is off on the original ESP32; each GATT step holds its own reference to the connect and starts only on a handle still its own; discovery keeps three handles; esp32-nimble's MTU line is off), reviewed 2026-11-07; residual: NB110c-I2, [Bluetooth LE on the ESP32](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5) |
+| NB110c-4, NB110c-5 (Low) | **Fixed** by `5544d92` and `e3e3510` before NB-110c merged, so never on main (esp32-nimble's server and ESP-IDF's Wi-Fi library log errors only, so a central's notifications can't spin the console on NimBLE's host task, and a join names neither the network nor its access point), reviewed 2026-11-07; residual: NB110c-I3, same section |
+| NB110c-I2, NB110c-I3 (Info) | Accepted: NimBLE's own gap can leave a GATT step that, 30 s on, ends whatever connection then holds its handle, once; the Wi-Fi library's error lines on a replayed or malformed frame name the access point, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -3861,6 +3864,16 @@ NB103-I2's residuals (accepted):
 - The restart drops the board's links and its firmware's state, once; `Board::connect`'s
   docs say the board restarts.
 
+**NB-117 — A silent server hung a board at boot.** Found on our C3, not in a review.
+Each ask reads with the socket's timeout set to what is left of its 2 s, and lwIP counts
+a timeout in whole milliseconds, 0 meaning none. So when an ask got no answer, its last
+read, with under 1 ms left, waited for ever: a board whose first pool server was silent,
+or whose ask the path dropped, hung at boot with no warning, before its Node started,
+until it was restarted. Reproduced in QEMU. **Fixed** by `51b2de9` (NB-117, merged
+`6f297d7`), reviewed 2026-11-07 by reading, with no finding: under 1 ms left ends the
+ask, so every path ends by its 2 s, a packet from the server's address with a wrong
+token included, and the token and source checks are unchanged.
+
 Residuals (accepted):
 - With one relay, the relay, or anyone who publishes on the board's topics, can deny the
   board's internet side: a flood its inbox can't hold, or one event over 4 KiB, which
@@ -4550,8 +4563,9 @@ each end's `PeerId` and its signature over both challenges; signals sealed under
 of the connection's own; the framing codec in `peerwire-core`; and the core's rules for
 a connection no peer is bound to yet (`Endpoint::handle_datagram_unbound`). A Bluetooth
 hop ranks as a relayed address does, last, and isn't in `Policy::default()`. The ESP32's
-NimBLE driver (NB-110c) and the browser's (NB-110d) aren't on main yet, and none of it
-is in a release.
+NimBLE driver is on main since NB-110c
+([below](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5)); the browser's (NB-110d)
+isn't, and none of it is in a release.
 
 Reviewed on 2026-11-05 and 2026-11-06 in ten passes: security's requirements, BLE-R1…R15
 (NB-110b), read against main `25c92d0` and the `bluer` 0.17.4 and ESP-IDF 5.5.5 sources;
@@ -4882,7 +4896,8 @@ the heap allows.
 - **NB110-I2 — Pairing on Linux.** BlueZ, not the driver, answers a central's pairing
   request, through the desktop's agent, so a device nearby may raise a pairing prompt,
   or get a bond (a radio check). Documented by `33b1f4f`: nothing in Peerwire pairs or
-  needs it, so refuse such a prompt. The ESP32 driver refuses pairing itself (NB-110c).
+  needs it, so refuse such a prompt. The ESP32 driver lets a pairing run as Just Works,
+  hands over no keys and closes the connection (NB110c-1).
 - **NB110-I3 — A proven connection reset the hello back-off on every carrier.** A member
   reconnecting every 2 s kept the node's Nostr hellos at one per 2 s, not one per 30 s:
   15 times as many (**theoretical**, 30 s / 2 s). **Fixed** by `33b1f4f`: a new
@@ -4975,14 +4990,246 @@ crash it. The fix is BlueZ's: a later release, or a 5.87 build that carries `82a
 - **The ESP32's clock.** Room hellos must be within a minute of the receiver's clock, so
   a board with no Wi-Fi joins over Bluetooth only with a clock set since power-on
   (NB-093).
-- **Owed with NB-110c and NB-110d:** the ESP32 driver's pairing refusal (R5), its random
-  draws and clock (R15), its 5 s subscribe deadline, NimBLE's connection cap and its 10
-  s connect deadline; a phone at an ATT MTU of 23 (R14).
+- **Owed with NB-110d:** a phone at an ATT MTU of 23 (R14). The ESP32 driver's pairing
+  (R5), random draws (R15), 5 s subscribe deadline, connection cap and 10 s connect,
+  owed with NB-110c, are [below](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5).
 - **Radio checks owed on our own hardware:** the honest connect time (S above),
   NB110-8's subscribers, the gap between a device's reconnects (NB110-I8), the idle
   links an adapter holds (NB110-I9), the time from connect to a proven identity
   (NB110-I10), the driver's recovery from a refused advert and a USB reset (NB-112), and
   a link BlueZ drops reported at once, then linked again after its hold (NB-114).
+
+### Bluetooth LE on the ESP32 (NB-110c) — NB110c-1…NB110c-5
+
+Since NB-110c (merged `6f297d7`), `peerwire-esp` (feature `ble`) has `ble::Nimble`, a
+radio driver for the node of
+[Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1) on ESP-IDF's
+NimBLE, for the ESP32-C3 and the original ESP32, with `Limits::SMALL`: three connections
+and an ATT MTU of 256. It serves the Peerwire service, advertises from a new
+non-resolvable random address with each new advert, scans passively and connects as a
+central. NimBLE calls back on its host task, at priority 21, where the driver only
+queues events; what waits on the radio runs on the driver's own thread, at 5. The `ble`
+example joins a room over Bluetooth, with Wi-Fi off or kept (`PW_KEEP_WIFI`). It is in
+no release yet.
+
+Reviewed on 2026-11-07 in four passes, by reading: the driver up to `51b2de9`
+(NB110c-1…NB110c-3, I1), its fold-in `53ff209` (NB110c-4, I2), `5544d92` and `5c2dd8c`
+(NB110c-5), and `e3e3510` (I3), against esp32-nimble 0.13.0, ESP-IDF 5.5.5's NimBLE, log
+component and Wi-Fi libraries (the closed ones disassembled, for both chips),
+esp-idf-svc 0.53.0 and the `sdkconfig.h` of the C3 and ESP32 builds. The passes read the
+branch before its rebase onto `a026ab1`, which left its 15 patches unchanged; the shas
+here are main's. NB-117's clock fix came in the same branch
+([above](#several-carriers-and-the-esp32-on-nostr-nb-095--nb95-1nb95-6)). Nothing was
+run over a radio, as the review host has none: the radio checks named below are owed on
+our own hardware.
+
+**What holds.**
+- **Addresses (R3).** Each new advert comes from a new non-resolvable random address
+  that NimBLE draws, never the chip's own; advertising the same data again keeps it, and
+  an advert whose address can't be made stays off the air. On the original ESP32
+  NimBLE's host privacy, which made addresses on its own timer, is off (NB110c-1); that
+  R3 holds there is a radio check.
+- **Pairing (R5).** Nothing asks for encryption, and the driver turns bonding, MITM
+  protection and Secure Connections off, so a pairing a peer starts runs as legacy Just
+  Works, hands over no keys either way and closes the connection once it completes; no
+  bond is stored (NB110c-1).
+- **Writes (R7).** `rx` takes writes without response of at most MTU − 3 bytes, neither
+  characteristic is readable, and NimBLE has no room for prepared writes, so it refuses
+  a long write itself.
+- **Handshakes (R9).** `Limits::SMALL` budgets new handshakes on unbound connections
+  across the radio, 2 at once, then one per 5 s, each 156 ms of a C3's time (about 3%),
+  and identity checks at four times that rate, from room-proven connections only, each
+  dropped over its budget before its cryptography.
+- **Random draws (R15).** With Wi-Fi off every draw comes after the Bluetooth controller
+  starts: before `Nimble::new` the `ble` example only starts its logger, reads its flash
+  record and sets up the network interface, and the driver's docs say to make it first.
+  `ble_probe`'s throwaway keys come earlier; it joins no room.
+- **Connections.** NimBLE holds three, as `Limits::SMALL` counts. A central that hasn't
+  subscribed to `tx` 5 s after connecting is closed, checked about once a second but not
+  while the driver's own connect runs, so within about 15 s; the node never hears of one
+  before it subscribes. NimBLE's own reattempt of a failed connection, on by default for
+  the C3, is off, so no connection comes up that the driver doesn't know of, and one
+  that comes up after the driver gave its connect up is closed.
+- **Connecting.** A connect with its steps (the link, the MTU, the service, `tx`'s
+  subscription) gets 10 s in all, under the node's 12 s. One NimBLE refuses because it
+  still has a connection to that address, a link gone until its supervision timeout ends
+  it, is tried again every 250 ms within those 10 s and logs no address; at worst it is
+  a connect that stalls, NB110-11's residual.
+- **Queues and logs.** Events for the node queue bounded (16 adverts, 64 values, 4 early
+  values per connection), so a device nearby can't fill the heap. The driver logs each
+  link up or closed with its role and reason, a pairing, and its connection counts when
+  they change, nothing per packet; NimBLE's host logs are compiled out; esp32-nimble's
+  server and ESP-IDF's Wi-Fi library log errors only (NB110c-4, NB110c-5).
+- No `pw_*` function changed, so no C ABI review was owed.
+
+**NB110c-1 — A pairing handed over the board's identity keys (Low).** At `51b2de9` the
+driver set its address type with esp32-nimble's `set_own_addr_type(Random)`, which also
+asks for the identity keys in a pairing, both ways. Nothing in Peerwire pairs, and the
+driver closed a connection once a pairing completed, but NimBLE hands its keys over
+before it tells the app, so the close came after them. Any central can pair with the
+board, with no key or input (legacy Just Works), and a peripheral the board connects to
+can start a pairing with a Security Request. On the C3 the board gave its IRK, drawn
+once a boot, so a device that paired at two adverts linked them, undoing R3 for the
+boot. On the original ESP32, where that call also turns NimBLE's host privacy on, it
+gave the chip's public address, the same at every boot, as its identity, and NimBLE
+changed the address on its own 15-minute timer. Reproduction, a radio check: pair with
+the board from a laptop under `btmon`, which shows Identity Information and Identity
+Address Information before the disconnect, then again at the next advert: the IRK is the
+same. Fix: no key distribution either way, and on the original ESP32 NimBLE's host
+privacy off.
+
+**Status: fixed** by `53ff209` before NB-110c merged (`6f297d7`), so never on main;
+reviewed 2026-11-07. The driver sets both key distributions empty after the address
+type; NimBLE sends its own as initiator and what both allow as responder, so no key goes
+in either role, and esp32-nimble sets them only at start-up, so they stay empty when
+NimBLE's host syncs again. On the original ESP32 `ble_hs_pvcy_rpa_config(0)` stops
+NimBLE's address timer, and the driver's first address replaces the one NimBLE made.
+[Bluetooth](../concepts/bluetooth.md) now says a pairing runs as Just Works, hands over
+no keys and closes the connection, where it said the board refused one. Residual: a
+pairing still runs to its end before the close, as esp32-nimble builds NimBLE's security
+manager in; legacy Just Works runs no P-256, so it costs the board little. The radio
+check after the fix is owed: key distribution 0x00 both ways and no Identity frames.
+
+**NB110c-2 — A reused handle could run a connect's steps on another connection, and free
+their state (Medium).** At `51b2de9` the driver's connect read NimBLE's connection
+handle once, then started each GATT step with that handle and, as the callback's
+argument, the reference the connection held, which its close drops. NimBLE deletes a
+connection before it reports the close, and the C3's controller gives the same few
+handles out again: 2 and 3 on our board, in both roles. So if the peer the board was
+connecting to ended its link as it answered a step, and a central connected to the
+board's advert before the driver's thread, at priority 5, ran again after NimBLE's host
+task, at 21, the next step started on that central's connection. The driver then saw the
+first link's failure, closed the central's link and freed the connect's state, which
+NimBLE's callbacks for that step went on to use. The first peer can be any device: a
+member, or one with no room key replaying a member's advert from a fresh address.
+Effect: a use-after-free on NimBLE's host task, from a device with no room key; most
+likely an abort and a restart, which drops every link, and heap corruption is possible,
+as freed blocks are reused for values a peer sends. The window is a few ms, which the
+first peer times, and each try costs it one advert; even without the use-after-free, an
+honest central's link closed. Reproduction: by reading NimBLE's source; on a radio it
+needs link-layer timing, or a test build that sleeps after each step while a second
+central connects. Fix: give each procedure a reference of its own that its last callback
+ends, and check the handle and start the step under the lock that the close clears the
+handle under.
+
+**Status: fixed** by `53ff209` before NB-110c merged, so never on main; reviewed
+2026-11-07 by reading it against NimBLE. Each procedure holds a reference of its own,
+and NimBLE calls each back exactly once at its end, on every path (an error, a timeout,
+a close), and never one that didn't start, which the driver then ends itself. Nothing
+calls back from within the call that starts a procedure, as attribute caching and
+procedure pre-emption protection are off in both builds. The handle is checked and the
+step started under the lock that the close clears it under, so no step lands on a later
+connection, and the driver closes only a handle still its own. NimBLE calls back without
+its own lock held and acknowledges a close's HCI command from its transport, not its
+host task, so holding the driver's lock across a start or a close can't deadlock.
+Residual: NB110c-I2.
+
+**NB110c-3 — A peripheral could exhaust the board's heap during discovery (Low).** At
+`51b2de9` the driver kept every characteristic a peer listed in the Peerwire service's
+range, which the peer sets, up to handle 0xFFFF, and may make up. At an ATT MTU of
+256 a response lists up to 36 with 16-bit UUIDs, and each took at least 24 B, so growing
+the list past 4,096, about 114 responses, asked for 192 KB, more than the 180 KB a board
+has free with Wi-Fi off; with Wi-Fi kept, a few hundred were enough. At the 7.5 ms
+connection interval a peripheral may ask for, that is about 2 s of the connect's 10 (all
+**theoretical**: 36 entries of 7 B in 256 − 2 B; 8,192 × 24 B; 4,097 / 36 ≈ 114). On
+ESP-IDF a failed allocation aborts, so the board restarted and dropped its links, and a
+device with no room key could do it again whenever the board connected to it: an advert
+replayed from a fresh address, with an `n` above the board's, draws its connect.
+Reproduction, a radio check: a GATT application on our laptop that serves the Peerwire
+service with 4,096 characteristics and advertises a member's recorded advert. Fix: keep
+only what the next steps need.
+
+**Status: fixed** by `53ff209` before NB-110c merged, so never on main; reviewed
+2026-11-07. Discovery keeps three handles, `rx`'s and `tx`'s value handles and the
+smallest definition handle after `tx`'s, whatever number or order a peer sends, and
+NimBLE takes definition handles only in ascending order. The radio check is owed.
+
+**NB110c-4 — A central with no room key could stall a C3 with notifications (Low).**
+Missed in the first pass, found at `53ff209`. A central may send ATT notifications on
+its link unasked, and NimBLE passes them to the connection's handler with no check, as
+nothing is encrypted; on a link to the board's advert that is esp32-nimble's server,
+which logged each at warn (`unhandled event: 12`), a level `53ff209` kept for NB110c-I1.
+The console is the UART at 115200 baud with no driver, so a log write spins until the
+FIFO drains, here on NimBLE's host task, at priority 21. The console carries about 160
+lines a second, and a central can send two notifications in each 7.5 ms connection
+event, about 267 a second, with no round trip (**theoretical**: 11,520 B/s / ≈ 70 B a
+line; 2 / 7.5 ms), so the host task spun without a break, and on the single-core C3
+every task below it starved: the driver's thread, so the 5 s rule never closed the
+flooder; the node, whose links stalled; lwIP, in Wi-Fi builds; and the idle task, so the
+watchdog warned every 5 s. The original ESP32 runs them on its second core, so there it
+was a log flood alone. It takes one connection, with no key or subscription, for as long
+as the device stays in range. Reproduction, a radio check: a short program on our laptop
+opens an L2CAP socket on the ATT channel to the board's current address and writes the
+notification `1b 01 00 00` in a loop; expected, unbroken log lines and a link that
+outlives 5 s. Fix: esp32-nimble's server logs errors only.
+
+**Status: fixed** by `5544d92` before NB-110c merged, so never on main; reviewed
+2026-11-07. The server's log tag is at error, and its one error line needs a
+characteristic that asks for encryption, authentication or authorisation, which neither
+of ours does. No other line a central can draw comes at packet rate: NimBLE's host logs
+are compiled out, esp32-nimble's debug logging is off, and the driver doesn't use the
+crate's client, advert parser or notify path, which log. A notification now costs the
+host task microseconds. The radio check, the flood before and after, is owed; it shows
+the stall only if the link carries about 160 notifications a second, which needs a short
+connection interval on the laptop. Hardening, optional: ESP-IDF's UART driver for the
+console, so a full console blocks the writer rather than spinning.
+
+**NB110c-5 — The board logged its network's name and its access point's address (Low).**
+`5c2dd8c` took the network's name and the access points' addresses out of the port's own
+lines, as a log people share would tell where the board is: an access point's address
+can be looked up on public maps of Wi-Fi networks. But ESP-IDF's closed Wi-Fi library
+logs under a tag of its own, `wifi`, at info, the board's default level: on each join
+`connected with <name>, …, bssid = <address>`, which our C3's log showed, and `<ba-add>`
+lines with the access point's address; the board's own MAC at start; and, at warning,
+the address and name of other networks in range on some failures (`Invalid AP`).
+Reproduction: the serial log of any join. Fix: that tag at error.
+
+**Status: fixed** by `e3e3510` before NB-110c merged, so never on main; reviewed
+2026-11-07 by reading ESP-IDF's log component and disassembling the C3's and the ESP32's
+Wi-Fi libraries. Every line the library prints goes out under the tag `wifi`, which
+ESP-IDF sets once, in a start-up constructor; the port sets it after that, before Wi-Fi
+starts, and both builds keep a level per tag. Error, not warning: two of the
+`Invalid AP` lines are warnings. The other loggers on a join print no name or address:
+the library's `lib_printf` lines on a station, the supplicant's, which are compiled out,
+and esp-idf-svc's. On our C3 the fixed image joined with no `connected with`, `bssid` or
+`SSID=` line in its log. Residual: NB110c-I3.
+
+**Info.**
+- **NB110c-I1 — A central could make the board log at will.** esp32-nimble's server
+  logged each MTU exchange at info, and NimBLE takes every request a central sends:
+  about 65 lines a second at a 7.5 ms interval (**theoretical**, one round trip each).
+  **Fixed** by `53ff209` (the tag at warn) and `5544d92` (at error, NB110c-4).
+- **NB110c-I2 — A step started as its connection closes can end a later connection 30 s
+  on.** NimBLE sends a procedure's request, drops its lock, then takes it again to queue
+  the procedure, and its close handling drops the lock between failing the connection's
+  procedures and deleting it. A close that lands in between misses the new procedure:
+  the start still succeeds, and the driver's step fails on the close, as it should, but
+  the procedure stays queued until NimBLE's 30 s timeout, which ends the driver's
+  reference, memory-safe since `53ff209`, then terminates whatever connection has that
+  handle by then: a member's link, once. Accepted: a peer can't aim at a window of
+  microseconds from 7.5 ms connection events (**theoretical**: about 20 µs / 7.5 ms,
+  under 1% a try), any NimBLE app has it, and NimBLE's pre-emption protection doesn't
+  close it.
+- **NB110c-I3 — The Wi-Fi library's error lines can still name the access point.** With
+  its tag at error, five of the library's error lines that a station reaches carry the
+  access point's address: on a CCMP frame replayed, without its extended IV, or with a
+  reserved bit set (on a station, such a frame's sender is its access point); on a
+  block-ack answer whose BSSID changed, a race on a rejoin; and on a join whose access
+  point the library can't look up. A normal join logs none. Anyone in Wi-Fi range can
+  replay a captured frame and draw a line each time, but is near the board already, so
+  it tells them nothing: the exposure is a log shared after such an event, and as a
+  flood it adds nothing to the jamming or deauthentication someone in range can do.
+  Accepted; `ESP_LOG_NONE` on the tag would drop these, and every other line the library
+  prints.
+
+**Residuals, accepted.**
+- **A silent central.** A central that never subscribes holds one of the three
+  connections for 5 s, or up to about 15 s while the driver's own connect runs, and can
+  connect again once closed: the bounded form of NB110-I9, accepted as a device in range
+  could jam the radio anyway.
+- **Radio checks owed on our own hardware:** a pairing under `btmon` (NB110c-1), the
+  4,096-characteristic peripheral (NB110c-3), the notification flood before and after
+  its fix (NB110c-4), and R3 on an original ESP32.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
@@ -5786,3 +6033,6 @@ NB92-1 and NB92-2, and two containers on a Docker bridge for NB92-3.
 The Bluetooth review (NB-110, 2026-11-05) used Node probes over the in-process fake
 radios and probes in the node's simulated air, and read BlueZ 5.87's source; nothing ran
 over a real radio.
+The ESP32 driver's review (NB-110c, 2026-11-07) read esp32-nimble's, NimBLE's and
+ESP-IDF's sources and each build's `sdkconfig.h`, and disassembled ESP-IDF's closed
+Wi-Fi libraries; nothing ran over a radio there either.
