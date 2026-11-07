@@ -8,8 +8,10 @@
 //! can't hold a connection the node never hears of. Nothing is paired or bonded (BLE-R5): bonding, MITM and Secure
 //! Connections are off, and a connection that a pairing completes on anyway is closed. `rx` takes writes without
 //! response, and sdkconfig.ble leaves NimBLE no room for prepared (long) writes (BLE-R7). An advert that isn't on the
-//! air is reported to the node (`Advertising`) and tried again. Each connection coming up or closing is logged with
-//! its role and reason, and so are NimBLE's connections against the driver's whenever either count changes.
+//! air is reported to the node (`Advertising`) and tried again. A connect to an address NimBLE still has a connection
+//! to, one whose link has gone until its supervision timeout ends it, is tried again within the connect's 10 s rather
+//! than failed. Each connection coming up or closing is logged with its role and reason, and so are NimBLE's
+//! connections against the driver's whenever either count changes.
 //!
 //! NimBLE calls back on its own task, where the driver only queues events for [`Radio::poll`]. What waits on the
 //! radio (a new address, connecting, finding the service, subscribing) runs on a thread of the driver's own, so no
@@ -43,6 +45,8 @@ const SCAN_WINDOW: u16 = 48;
 /// A connect, with the steps after it (the MTU, the service, `tx`'s CCCD), fails if not done within this: the node
 /// gives a connect up after 12 s, and the driver's own failure comes first (the spec's Limits).
 const SETUP: Duration = Duration::from_secs(10);
+/// A connect NimBLE refuses as it still has a connection to that address is tried again this often, within `SETUP`.
+const STILL_LINKED_RETRY: Duration = Duration::from_millis(250);
 /// A central that hasn't subscribed to `tx` this long after connecting is closed: the node never hears of it, so it
 /// couldn't, and it holds one of NimBLE's three connections. Checked about once a second while the driver's thread
 /// isn't connecting.
@@ -590,7 +594,7 @@ impl Worker {
         let (done, steps) = mpsc::sync_channel(4);
         let central = Arc::new(Central { shared: self.shared.clone(), conn, done, found: Mutex::default() });
         if let Err(e) = self.set_up(&central, device, &steps) {
-            info!("ble: connect to {:012x} failed: {e:#}", device.0 & 0xffff_ffff_ffff);
+            info!("ble: a connect failed: {e:#}");
             // A connection that comes up from now on is closed as it does (on_central).
             let handle = {
                 let mut found = central.found();
@@ -607,14 +611,25 @@ impl Worker {
     fn set_up(&self, central: &Arc<Central>, device: DeviceId, steps: &mpsc::Receiver<u16>) -> anyhow::Result<()> {
         let by = Instant::now() + SETUP;
         let addr = ble_addr(device);
-        // The connection's callback holds this until its last event.
-        let arg = Arc::into_raw(central.clone()) as *mut c_void;
-        let ms = SETUP.as_millis() as i32;
-        let rc = unsafe { sys::ble_gap_connect(OWN_ADDR, &addr, ms, ptr::null(), Some(on_central), arg) };
-        if rc != 0 {
+        // NimBLE refuses a connect to an address it still has a connection to (EDONE). The node gives up a
+        // connection that closes before its challenge for a second or so, but one whose link has gone stays
+        // NimBLE's until its supervision timeout, a few seconds: that is waited out rather than failed, which would
+        // hold the advert for a minute (omarchy's run 19).
+        let arg = loop {
+            // The connection's callback holds this until its last event.
+            let arg = Arc::into_raw(central.clone()) as *mut c_void;
+            // Not 0, which NimBLE takes as its default of 30 s.
+            let ms = by.saturating_duration_since(Instant::now()).as_millis().max(1) as i32;
+            let rc = unsafe { sys::ble_gap_connect(OWN_ADDR, &addr, ms, ptr::null(), Some(on_central), arg) };
+            if rc == 0 {
+                break arg;
+            }
             drop(unsafe { Arc::from_raw(arg as *const Central) });
-            bail!("ble_gap_connect: {rc}");
-        }
+            if rc != i32::from(EDONE) || Instant::now() + STILL_LINKED_RETRY >= by {
+                bail!("ble_gap_connect: {rc}");
+            }
+            std::thread::sleep(STILL_LINKED_RETRY);
+        };
         if let Err(e) = step(steps, by) {
             // NimBLE ends every connect with an event, which frees `arg`: this ends one it has let run on.
             if unsafe { sys::ble_gap_conn_active() } != 0 {
