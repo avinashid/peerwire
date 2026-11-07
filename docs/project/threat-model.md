@@ -35,7 +35,7 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 |---|---|---|
 | Signaling relay (Nostr, BroadcastChannel) | No | May read, drop, reorder, replay or inject any signaling message. Cannot forge a sealed payload or impersonate a PeerId. |
 | The LAN, for `LanSignaling` | No | Every device on the link, and every program on the machine, hears each frame and can send its own, with no relay to pace it. The same limits as a relay: cannot open or forge a sealed payload. See [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6). |
-| Devices in Bluetooth range, for a node with a radio (`ble`, NB-110) | No | Hear every advert and can follow any connection, as nothing is paired; may connect, replay adverts, relay between two connections, jam or cut a link. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1) and [on the ESP32](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5). |
+| Devices in Bluetooth range, for a node with a radio (`ble`, NB-110) | No | Hear every advert and can follow any connection, as nothing is paired; may connect, replay adverts, relay between two connections, jam or cut a link. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1), [on the ESP32](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5) and [BlueZ connects](#bluez-connects-and-the-scan-nb-116--nb116-1-nb116-2). |
 | Peer relay (`FWD`/`RELAYED`) | No | Sees only ciphertext; rate-limited; forwards only to already-connected peers. |
 | NAT / on-path network | No | Noise authenticates the endpoints; cannot MITM. Can drop/delay. |
 | A TURN server the app lists (`iceServers`; in Rust `turn_servers`, NB-099) | Partially | The app's choice, not ours. Sees our address, the peers' addresses, sizes and timing, never a payload; can drop or delay; picks the relayed address we offer. Under `Privacy::RelayOnly` with `Turn` in the policy (NB-101) the peers see its relayed address instead of ours. See [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) and [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1). |
@@ -176,7 +176,7 @@ release of each.
 | NB110-4, NB110-5 (Low) | **Fixed** on the node's side by `ec79f1a`, `fee4639` and `4cb542f` before NB-110 merged (the address, `n` and tag change together; the GAP name is `Peerwire`, and `BlueZ::names_this_host` says when Linux's is the host name), reviewed 2026-11-05; on Linux BlueZ picks the address and the name: accepted as documented, same section |
 | NB110-6…NB110-9 (Low) | **Fixed** by `33b1f4f`, `287ebd8` and `d202fd3` before NB-110 merged (only a `PeerId` proven on the connection, or a session bound to it, counts for anything; the BlueZ driver serves the subscriber BlueZ hands over and takes its writes alone; a refused central tries again in 1–4 s; a central the advert doesn't count makes way), reviewed 2026-11-05; NB110-8 has one BlueZ behaviour to check on a radio, same section |
 | NB110-10 (Low) | **Fixed** by `b95141b`, merged `6efda8b`, before `ble` was published (a central holds an advert by the device it came from as well as its `n`, so a replayed copy holds itself alone), reviewed 2026-11-05, same section |
-| NB110-11 (Low) | **Fixed** by `708038f`, merged `51b4e8f`, before `ble` was published (a connect not up within 12 s is given up as a failed one and holds that device's advert; connects under way count against the node's own connects alone; the BlueZ driver gives its setup 10 s and disconnects on a failure), reviewed 2026-11-05; residual: a replayed advert heard first costs each race it wins 10 s, the driver's own deadline, since NB-112 (`86fee9d`), same section |
+| NB110-11 (Low) | **Fixed** by `708038f`, merged `51b4e8f`, before `ble` was published (a connect not up within 12 s is given up as a failed one and holds that device's advert; connects under way count against the node's own connects alone; the BlueZ driver gives its setup 10 s and disconnects on a failure), reviewed 2026-11-05; residual: a replayed advert heard first costs each race it wins 10 s, the driver's own deadline, since NB-112 (`86fee9d`), and on Linux can hold the node's other connects and its scan as long ([NB116-2](#bluez-connects-and-the-scan-nb-116--nb116-1-nb116-2)), same section |
 | NB110-12 (Low), NB110-T1 (Info) | **Fixed** by `86fee9d` (NB-112), before `ble-bluez` was published, reviewed 2026-11-05: the BlueZ driver's command loop awaits no disconnect (each runs in a task of its own, the served central's task drops its link, a failed connect is reported first), and a test pins a connect under way against the connection limit, same section |
 | NB112-1 (Low), NB112-I1, NB112-I2 (Info) | **Fixed** by `680e273` before NB-112 merged, so never on main (the BlueZ scan never drops a device that has advertised the service for another, and lists BlueZ's devices again, at most every 30 s, for those it left out; connects the driver gives up when it leaves an adapter are stopped at BlueZ; the driver powers an adapter on only at start), reviewed 2026-11-05; residual: while a burst of service adverts holds all 256 slots, a member that arrives is reported once, then not followed, same section |
 | NB110-I1 (Info) | Open (on main, over UDP): on the ESP32 port one source that knows the node's PeerId fills all 8 half-open handshake slots, 10 s at a time, same section |
@@ -185,6 +185,8 @@ release of each.
 | NB110c-1 (Low), NB110c-2 (Medium), NB110c-3 (Low), NB110c-I1 (Info) | **Fixed** by `53ff209` before NB-110c merged (`6f297d7`), so never on main, before `ble::Nimble` was published (a pairing hands over no keys, and NimBLE's host privacy is off on the original ESP32; each GATT step holds its own reference to the connect and starts only on a handle still its own; discovery keeps three handles; esp32-nimble's MTU line is off), reviewed 2026-11-07; residual: NB110c-I2, [Bluetooth LE on the ESP32](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5) |
 | NB110c-4, NB110c-5 (Low) | **Fixed** by `5544d92` and `e3e3510` before NB-110c merged, so never on main (esp32-nimble's server and ESP-IDF's Wi-Fi library log errors only, so a central's notifications can't spin the console on NimBLE's host task, and a join names neither the network nor its access point), reviewed 2026-11-07; residual: NB110c-I3, same section |
 | NB110c-I2, NB110c-I3 (Info) | Accepted: NimBLE's own gap can leave a GATT step that, 30 s on, ends whatever connection then holds its handle, once; the Wi-Fi library's error lines on a replayed or malformed frame name the access point, same section |
+| NB116-1 (Low), NB116-I1 (Info) | **Fixed** by `d51e64e` before NB-116 merged (`6641641`), so never on main (a connect holds the BlueZ scan off only once it has run 2 s since it started, and for 3 s at most, so it runs at least 40% of the time whatever connects a replayed advert draws), reviewed 2026-11-07; NB116-I1 bounded by it, at most one pause each 2 s, and accepted; residual: NB116-2, [BlueZ connects and the scan](#bluez-connects-and-the-scan-nb-116--nb116-1-nb116-2) |
+| NB116-2 (Low) | Open: a device that sends one connectable advert as its connect waits, then goes silent, holds Linux's one LE connect until the driver's 10 s deadline, and the scan's resume, the node's other connects and its advertising wait with it, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -4810,7 +4812,12 @@ report waited on the disconnect, 2 s or more past that deadline, and the node's 
 give-up came first. At a win rate p the expected wait is `10 s × p/(1−p)`: 1.5 min at
 p = 0.9 (1.8 min at 12 s). It needs no fresh address: the hold is by device and `n`, so
 the same address with another recorded `n` is drawn again. A copy that sends one
-challenge and nothing more costs a race up to 3 s.
+challenge and nothing more costs a race up to 3 s. On Linux since NB-116 (`6641641`), a
+copy that sends one connectable advert once its connect is asked, then goes silent, also
+holds the kernel's one LE connect those 10 s, and the node's other connects, its scan
+and its advertising wait with it:
+[NB116-2](#bluez-connects-and-the-scan-nb-116--nb116-1-nb116-2), open. Before
+NB-116 a Linux node's connects as a central failed while its scan ran, copy or not.
 
 **NB110-12 — The BlueZ driver waits on each disconnect (Low).** At `51b4e8f` the
 driver's command loop awaits each `Disconnect` (`bluez.rs`). BlueZ 5.87 answers one for
@@ -5230,6 +5237,147 @@ and esp-idf-svc's. On our C3 a run of the fixed image logged none of these lines
 - **Radio checks owed on our own hardware:** a pairing under `btmon` (NB110c-1), the
   4,096-characteristic peripheral (NB110c-3), the notification flood before and after
   its fix (NB110c-4), and R3 on an original ESP32.
+
+### BlueZ connects and the scan (NB-116) — NB116-1, NB116-2
+
+Until NB-116 (merged `6641641`), every connect the Linux driver made as a central failed
+while its scan ran, which was always. Linux starts an LE connect only once it hears the
+device advertise. While a discovery runs the kernel doesn't scan for a connect itself,
+and starts one only from the discovery's reports; for a discovery the kernel has the
+controller drop repeated adverts, on all but a few controllers, so a device is reported
+once each time the discovery starts, every 10.24 s, as the kernel ends it and bluetoothd
+starts it again. The driver connects right after a report, so the kernel started the
+connect only at the next one, after the driver's 10 s `SETUP` had given it up, and the
+next try, after the node's 60 s hold, again followed a report: every such connect
+failed, about 75 s apart. On our laptop (BlueZ 5.87, Linux 7.2.8, a Realtek controller)
+a device's reports came 10.25–10.96 s apart (54 of 58 gaps, median about 10.75 s); 3 of
+3 connects to a known address failed at 10 s, and 5 of 5 came up, the link 0.12–0.14 s
+after a report, with the discovery restarted by hand just before each. NB-116 holds the
+driver's discovery off while a connect is under way, so the kernel's own scan catches
+the device's next advert: once the scan has run `RUN` (2 s) since it started, and for
+`PAUSE` (3 s) at most (NB116-1). The debug log shows each pause, each resume and how
+long each connect took.
+
+Reviewed on 2026-11-07 in two passes, by reading, against `bluer` 0.17.4 and BlueZ
+5.87's source: `1004b56` and `8e045d8` (NB116-1, NB116-I1), then the fold-in `d51e64e`
+(NB116-2). The author checked NB116-2's kernel steps against Linux 7.2.8's
+`net/bluetooth` source. The passes read the branch before its rebase onto `13e4bdd`,
+which left `bluez.rs` unchanged; the shas here are main's. The diagnosis was measured on
+our own hardware, as above; nothing else was run over a radio, as the review host has
+none.
+
+**What holds.**
+- **Every way out of a connect.** A connect counts itself under way from its first
+  binding, so the count drops on success, an error, a timeout, a panic or its task's
+  abort (a test covers the abort), and the scan always starts again.
+- **No discovery left over.** The scan starts again in a task of its own, and `bluer`
+  holds its session lock across SetDiscoveryFilter and StartDiscovery and waits for the
+  last StopDiscovery, so a scan stopped as it starts again can't leave BlueZ discovering
+  for a session no one holds.
+- **The filter.** `bluer` sets the stored filter again before each start, so the scan
+  stays LE-only, with duplicate data and no UUID filter (NB-112, NB-113).
+- **Failures.** A start that fails ends the scan task, and the driver starts it again
+  1 s later, doubling, as since NB-112.
+- **Devices followed.** A discovery that starts again lists BlueZ's devices; one the
+  scan follows already is left as it is, so no stale advert is read again, and the cap
+  of 256 (NB112-1) holds.
+- **No spin.** The scan's timer is armed only while it runs with a connect under way, or
+  while it is held off, and never fires early, so with no connect the scan task only
+  waits (a test covers it).
+- **Logs.** The new lines are at `debug` and name a device by its hash alone; a resume
+  that fails is logged with BlueZ's error masked.
+- No `pw_*` function changed, so no C ABI review was owed.
+
+**NB116-1 — Connects a replayed advert drew kept the fix off (Low).** At `8e045d8` any
+connect held the scan off, for up to 10 s, and a scan that came back with a connect
+still under way wasn't held off again until none was. A device with no room key that
+replays a room's advert with an `n` above the node's, from a fresh address each time,
+draws a connect with each copy (NB110-10), and can leave it pending for `SETUP`
+(NB110-11). (a) A copy every few seconds keeps a connect always under way, so after the
+first 10 s the scan ran on and every connect failed as before NB-116. (b) Copies one at
+a time each held the scan off 10 s, so it ran only from each start to the next copy's
+report, tens of ms: a Linux member, which advertises every 1.28 s by default, was heard
+in about one start in 25, and its connect waited about 4 min (**theoretical**:
+`10 s × (1−p)/p` at p ≈ 50 ms / 1.28 s ≈ 0.04). Reproduction: by reading; the author's
+test at `8e045d8` showed (a)'s step, a connect that starts while one from before is
+under way not holding the scan off. Fix: hold the scan off for a connect only once it
+has run a minimum time since it started, more than 1.28 s, and for a few seconds at
+most, whatever the connects.
+
+**Status: fixed** by `d51e64e` before NB-116 merged (`6641641`), so never on main;
+reviewed 2026-11-07. A connect holds the scan off only once it has run `RUN` (2 s) since
+it started, counted from when the start returned, and for `PAUSE` (3 s) at most, the
+scan starting again sooner once no connect is under way. So with any number of connects,
+of any length, it runs at least 2 s of each 5, 40% (**theoretical**,
+`RUN / (RUN + PAUSE)`), hears each device in range each time it starts, and gives each
+connect a passive window within 2 s. A connect still under way as the scan starts again
+holds it off again 2 s later: a second window for an honest connect that missed its
+first, with the same bounds. `connects_leave_the_scan_running_between_pauses` checks the
+gaps on the times the scan started and stopped, so it can't pass early. Residual:
+NB116-2, which these bounds don't cover.
+
+**NB116-2 — A silent device holds Linux's one LE connect, and the scan with it (Low).**
+Found in the re-check of `d51e64e`; the author confirmed each kernel step in Linux
+7.2.8's source. NB-116 has the kernel start the driver's connects from its own scan, and
+Linux runs one LE connect at a time: the first advert of a pending device sends LE
+Create Connection, which holds the kernel's one command worker until the link comes up
+or 20 s pass. Meanwhile the kernel doesn't scan, so it starts no other connect, and it
+pauses the node's advertising, as bluetoothd doesn't turn on LE simultaneous roles. A
+device that sends one connectable advert as its connect waits, then goes silent, keeps
+that connect pending until the driver's 10 s `SETUP` gives it up and disconnects, which
+cancels it. The driver's resume at `PAUSE`, a Start Discovery, waits behind it, and the
+scan task with it. Once the connect is cancelled, the start runs before the kernel has
+told the controller to stop initiating, and on a host with LL privacy on the kernel
+refuses it (`-EPERM`), so the scan task ends and starts again 1 s later. Who: a device
+in range with no room key that replays a room's advert from fresh addresses, as for
+NB116-1; Low, as availability alone, on opt-in Bluetooth, like NB110-10, NB110-11 and
+NB116-1. Effect while it does, all **theoretical**: the scan runs about `RUN` of each
+`SETUP`, 20% (2 s / 10 s), not the "2 s of every 5" that
+[Bluetooth](../concepts/bluetooth.md) states; a member whose connect waits behind it
+fails at `SETUP`, the failure NB-116 fixed, and is held; and the node can't be connected
+to for about 8 s of every 10. Its worst case for a member is main before NB-116, where
+every such connect failed; there the device could hold the connect only at a discovery's
+report, every 10.24 s. Reproduction, a radio check owed: a laptop node, and a second
+board as the silent device. The node's debug log shows `scan paused`, no resume at 3 s,
+the device's connect `not done after 10 s`, then the scan resumed or
+`the scan didn't resume`; `btmon` shows LE Create Connection outstanding for about 8 s,
+then its cancel, with advertising off in between. Fix, the author's plan: give a connect
+a deadline for its link, about `PAUSE` from its window, and disconnect one whose device
+isn't connected by then, before the scan is asked to start again; and keep only one of
+the driver's connects pending in the kernel at a time, asking the next once its link is
+up, about 0.13 s on: the kernel connects only to devices it has pending, so a silent
+device's advert can't take a member's window. Links then come up one at a time, in rooms
+of three or more. Tests: the deadline, with a device that never links; and a discovery
+whose start takes longer than `PAUSE` still running `RUN` after it returns.
+
+**Status: open** (Low), reported on NB-116 at `d51e64e`.
+
+**Info.**
+- **NB116-I1 — Each pause is a round for BlueZ and the controller.** A pause and resume
+  costs a StopDiscovery, a SetDiscoveryFilter and a StartDiscovery, a listing of BlueZ's
+  devices with a read of each one the scan doesn't follow, and a scan stop and start at
+  the controller; when the driver is BlueZ's only discovery client, each pause also has
+  BlueZ forget the non-connectable devices it holds as temporary (members advertise as
+  connectable, so they stay). At `8e045d8` only the number of connects, which a replayed
+  advert draws, bounded the rounds. Since `d51e64e` a pause comes only after the scan
+  has run 2 s, so at most one round each 2 s, 0.5 a second (**theoretical**, 1 / `RUN`):
+  not one each 5 s, as a connect that ends early starts the scan early. Accepted.
+
+**Residuals, accepted.**
+- **Another discovery on the adapter.** BlueZ runs one discovery for all its clients,
+  under their filters merged. When another program discovers, the driver's pause changes
+  the merged filter, so BlueZ starts the discovery again, and its report starts the
+  connect, as a pause would. A program whose filter merges to the same, as a second
+  Peerwire process on the adapter's does, changes nothing, so while it discovers the
+  driver's connects fail as before NB-116. Accepted: a local program that can reach
+  `bluetoothd` can turn the adapter off.
+- **Adverts missed while the scan is held off.** With connects under way the scan is off
+  up to 3 s at a time, at most 60% of the time (**theoretical**), so a device that
+  arrives meanwhile is heard up to 3 s later; every device in range is heard each time
+  the scan starts. Under NB116-2, about 8 s.
+- **Radio checks owed on our own hardware:** each connect on main logging `scan paused`,
+  then how long it took, then `scan resumed`, with no `not done after 10 s`; and
+  NB116-2's silent device, under `btmon`.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
@@ -6036,3 +6184,6 @@ over a real radio.
 The ESP32 driver's review (NB-110c, 2026-11-07) read esp32-nimble's, NimBLE's and
 ESP-IDF's sources and each build's `sdkconfig.h`, and disassembled ESP-IDF's closed
 Wi-Fi libraries; nothing ran over a radio there either.
+The BlueZ connect review (NB-116, 2026-11-07) read `bluer`'s and BlueZ 5.87's sources,
+and its author read Linux 7.2.8's for NB116-2; the diagnosis was measured on our own
+laptop and board, with no root, so no `btmon`.
