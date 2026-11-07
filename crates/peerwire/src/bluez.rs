@@ -24,6 +24,12 @@
 //! by a hash that holds for the run alone. The scan is held off while a connect is under way, 3 s at a time and once
 //! it has run 2 s: with it on, Linux starts the connect only at the scan's next report of the device, up to 10.24 s
 //! on ([`Discovery`], NB-116).
+//!
+//! BlueZ's input plugin takes a device that serves HID as an input device, on the driver's links too, and asks to pair
+//! with one that isn't paired first, unless `/etc/bluetooth/input.conf` sets `LEAutoSecurity` false, as the driver
+//! logs at start if not. So a device that lists HID isn't used, and one BlueZ had neither paired nor trusted before
+//! the driver connected to it is removed from BlueZ once the last of the driver's connects and links on it ends
+//! ([`Strangers`], NB110-13).
 
 use crate::ble::{tag, ConnId, DeviceId, Limits, Radio, RadioEvent, RX_UUID, SERVICE_UUID, TX_UUID};
 use bluer::adv::{Advertisement, AdvertisementHandle, Type};
@@ -74,6 +80,10 @@ const CHECK: Duration = Duration::from_secs(10);
 const WATCH: usize = 256;
 /// How often at most the scan lists BlueZ's devices again, for those it left out ([`Watching`]).
 const RELIST: Duration = Duration::from_secs(30);
+/// The HID service, 0x1812, which BlueZ's input plugin takes as an input device.
+const HID_UUID: u128 = 0x0000_1812_0000_1000_8000_0080_5f9b_34fb;
+/// The input plugin's settings, `LEAutoSecurity` among them ([`le_auto_security`]).
+const INPUT_CONF: &str = "/etc/bluetooth/input.conf";
 
 /// The Linux driver: the default BlueZ adapter, powered on, serving the Peerwire GATT service.
 ///
@@ -146,6 +156,13 @@ impl BlueZ {
             rt.block_on(Driver::run(rx, events, s, ready_tx));
         })?;
         let alias = ready.recv_timeout(START).map_err(|_| io::Error::other("BlueZ didn't answer in time"))??;
+        if le_auto_security(&std::fs::read_to_string(INPUT_CONF).unwrap_or_default()) {
+            log::info!(
+                "Bluetooth: LEAutoSecurity isn't false in {INPUT_CONF}, so BlueZ asks to pair with a device that \
+                 serves HID, on this driver's links too, to take it as an input device: set it to false under \
+                 [General] and restart bluetoothd (docs/concepts/bluetooth.md)"
+            );
+        }
         Ok(BlueZ { cmds, events, shared, alias })
     }
 
@@ -168,6 +185,48 @@ impl BlueZ {
 fn same_name(alias: &str, host: &str) -> bool {
     let host = host.trim();
     !host.is_empty() && alias.trim().eq_ignore_ascii_case(host)
+}
+
+/// Whether BlueZ's input plugin, given `conf` as its `input.conf`, asks to pair with a device that serves HID on a
+/// link that isn't paired, to take it as an input device (`LEAutoSecurity`, true unless set false). As GLib reads
+/// the file: the last `LEAutoSecurity` in a `[General]` group, false if it is `false` or `0`, white space aside; and
+/// true if a line isn't a comment, a group or a key with a valid name, or a key comes before any group, which fails
+/// the whole file.
+fn le_auto_security(conf: &str) -> bool {
+    // GLib's white space is ASCII's, without the vertical tab, as Rust's is; and it drops a `\r` before a `\n`.
+    let space = |c: char| c.is_ascii_whitespace();
+    let group_name = |g: &str| !g.is_empty() && !g.contains('[') && !g.contains(|c: char| c.is_ascii_control());
+    // A name and, in brackets, a locale: `Name[en_GB]`.
+    let key_name = |k: &str| {
+        let (name, locale) = k.split_once('[').map_or((k, None), |(n, l)| (n, Some(l)));
+        let locale_ok = |l: &str| l.chars().all(|c| c.is_alphanumeric() || "-_.@".contains(c));
+        !name.is_empty() && !name.contains(']') && locale.is_none_or(|l| l.strip_suffix(']').is_some_and(locale_ok))
+    };
+    let (mut group, mut value) = (None, None);
+    for line in conf.lines().map(|l| l.trim_start_matches(space)) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[') {
+            match name.split_once(']') {
+                Some((name, rest)) if rest.trim_matches([' ', '\t']).is_empty() && group_name(name) => {
+                    group = Some(name)
+                }
+                _ => return true,
+            }
+        } else if let Some((key, v)) = line.split_once('=') {
+            let key = key.trim_end_matches(space);
+            if group.is_none() || !key_name(key) {
+                return true;
+            }
+            if group == Some("General") && key == "LEAutoSecurity" {
+                value = Some(v.trim_matches(space));
+            }
+        } else {
+            return true;
+        }
+    }
+    !matches!(value, Some("false" | "0"))
 }
 
 impl Radio for BlueZ {
@@ -261,10 +320,122 @@ struct Link {
     write: JoinHandle<()>,
     read: JoinHandle<()>,
     addr: Address,
+    /// Its device's use, if it is a stranger ([`Strangers`]): it ends as the link leaves the books.
+    _touch: Option<Touch>,
 }
 
 /// The central connections, by number.
 type Centrals = Arc<Mutex<HashMap<u32, Link>>>;
+
+/// The devices the driver connects to as the central that BlueZ had neither paired nor trusted then, each with how
+/// many of the driver's connects and links are on it (NB110-13). Each is removed from BlueZ once none is
+/// ([`remove_stranger`]), so that nothing BlueZ set up on a link the driver made stays: a bond, an input device (its
+/// input plugin takes a device that serves HID as one), or the device itself, stored for good. One whose removal
+/// failed is kept, with none, to be removed again ([`Driver::sweep`]). A device paired or trusted before the driver
+/// first connected to it is the user's, and never removed.
+#[derive(Default)]
+struct Strangers(HashMap<Address, usize>);
+
+impl Strangers {
+    /// A connect to `addr` starts, which BlueZ has paired or trusted if `known`: whether it counts, as a stranger now
+    /// or one already.
+    fn touch(&mut self, addr: Address, known: bool) -> bool {
+        match self.0.get_mut(&addr) {
+            Some(n) => *n += 1,
+            None if known => return false,
+            None => drop(self.0.insert(addr, 1)),
+        }
+        true
+    }
+
+    /// One of `addr`'s connects or links ended: whether none is left now, and it is to be removed.
+    fn release(&mut self, addr: Address) -> bool {
+        self.0.get_mut(&addr).is_some_and(|n| {
+            *n = n.saturating_sub(1);
+            *n == 0
+        })
+    }
+
+    /// Whether one of the driver's connects or links is on `addr`.
+    fn in_use(&self, addr: Address) -> bool {
+        self.0.get(&addr).is_some_and(|n| *n > 0)
+    }
+
+    /// `addr` was removed from BlueZ, or BlueZ didn't have it: no stranger now, unless a connect to it started since.
+    fn removed(&mut self, addr: Address) {
+        if self.0.get(&addr) == Some(&0) {
+            self.0.remove(&addr);
+        }
+    }
+
+    /// Those to remove: none of the driver's connects or links is on them.
+    fn idle(&self) -> Vec<Address> {
+        self.0.iter().filter(|(_, n)| **n == 0).map(|(a, _)| *a).collect()
+    }
+}
+
+/// A use of a stranger ([`Strangers`]): one of the driver's connects to it, from its start to its link's end, or its
+/// task's abort. `remove` runs once the last one on the device ends.
+struct Touch {
+    addr: Address,
+    strangers: Arc<Mutex<Strangers>>,
+    remove: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Touch {
+    /// A connect to `addr` starts, which BlueZ has paired or trusted if `known`: `None` if it isn't a stranger.
+    fn new(
+        strangers: &Arc<Mutex<Strangers>>,
+        addr: Address,
+        known: bool,
+        remove: impl FnOnce() + Send + 'static,
+    ) -> Option<Touch> {
+        let counts = strangers.lock().unwrap().touch(addr, known);
+        counts.then(|| Touch { addr, strangers: strangers.clone(), remove: Some(Box::new(remove)) })
+    }
+}
+
+impl Drop for Touch {
+    fn drop(&mut self) {
+        let last = self.strangers.lock().unwrap().release(self.addr);
+        if let Some(remove) = self.remove.take().filter(|_| last) {
+            remove();
+        }
+    }
+}
+
+/// Removes `addr`, a stranger none of the driver's connects or links is on, from BlueZ ([`Strangers`]). Its link is
+/// closed first, which also stops at once a connect BlueZ has under way to it, as `RemoveDevice` may not; then the
+/// device goes, with its bond and what BlueZ stored of it. Not if a connect to it started meanwhile, whose end
+/// removes it.
+async fn remove_stranger(adapter: Adapter, strangers: Arc<Mutex<Strangers>>, addr: Address) {
+    if let Ok(dev) = adapter.device(addr) {
+        let _ = dev.disconnect().await;
+    }
+    if strangers.lock().unwrap().in_use(addr) {
+        return;
+    }
+    let device = tag(device_id(addr));
+    match adapter.remove_device(addr).await {
+        Err(e) if !matches!(e.kind, bluer::ErrorKind::DoesNotExist) => {
+            let why = masked(&e.to_string());
+            return log::info!("Bluetooth: {device} wasn't removed from BlueZ, {why}; it is once an adapter is set up");
+        }
+        _ => log::debug!("Bluetooth: {device} removed from BlueZ"),
+    }
+    strangers.lock().unwrap().removed(addr);
+}
+
+/// What runs once the last use of stranger `addr` ends ([`Touch`]): [`remove_stranger`], in a task of its own.
+fn removes(adapter: &Adapter, strangers: &Arc<Mutex<Strangers>>, addr: Address) -> impl FnOnce() + Send + 'static {
+    let (adapter, strangers) = (adapter.clone(), strangers.clone());
+    move || {
+        // None as the runtime shuts down, its tasks dropped.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(remove_stranger(adapter, strangers, addr));
+        }
+    }
+}
 
 /// The one central this radio serves, if any.
 #[derive(Default)]
@@ -283,6 +454,7 @@ struct Ctx {
     centrals: Centrals,
     /// How many connects are under way: the scan is held off for them ([`Discovery`]).
     connects: watch::Sender<usize>,
+    strangers: Arc<Mutex<Strangers>>,
 }
 
 /// One part of the radio that should be up, and when to try it again: each failure is logged, and the first success
@@ -389,7 +561,8 @@ impl Driver {
         };
         let peripheral = Arc::new(Mutex::new(Peripheral::default()));
         let centrals = Arc::new(Mutex::new(HashMap::new()));
-        let ctx = Ctx { events, shared, peripheral, centrals, connects: watch::Sender::new(0) };
+        let strangers = Arc::new(Mutex::new(Strangers::default()));
+        let ctx = Ctx { events, shared, peripheral, centrals, connects: watch::Sender::new(0), strangers };
         let mut d = Driver {
             session,
             ctx,
@@ -474,6 +647,7 @@ impl Driver {
                     self.retry_app.now();
                     self.retry_advert.now();
                     self.retry_scan.now();
+                    self.sweep();
                 }
                 Err(e) => return self.retry_adapter.failed(now, &e),
             }
@@ -616,6 +790,7 @@ impl Driver {
             self.retry_app.now();
             self.retry_advert.now();
             self.retry_scan.now();
+            self.sweep();
         } else {
             self.lose(&format!("{name} powered off"));
         }
@@ -629,6 +804,15 @@ impl Driver {
         match powered {
             Ok(powered) => self.powered(powered),
             Err(e) => self.leave(&format!("{name} doesn't answer ({e})")),
+        }
+    }
+
+    /// Removes from BlueZ again, once the adapter in use is powered, each stranger whose removal failed, as the adapter
+    /// was off or gone ([`Strangers`]).
+    fn sweep(&self) {
+        let Some(on) = self.on.as_ref().filter(|on| on.powered) else { return };
+        for addr in self.ctx.strangers.lock().unwrap().idle() {
+            tokio::spawn(remove_stranger(on.adapter.clone(), self.ctx.strangers.clone(), addr));
         }
     }
 
@@ -1126,7 +1310,9 @@ impl Drop for Watching {
 /// without response. One that isn't set up within `SETUP`, or fails, is reported failed and then disconnected, which
 /// also stops a connect BlueZ still has under way: reported first, as the disconnect is answered only once the link
 /// is down (NB110-12), and this task ends with it, so one still under way has said nothing (`drop_links`). The scan
-/// is held off for it ([`Discovery`]).
+/// is held off for it ([`Discovery`]). A device that lists HID among its services isn't connected to, or its connect
+/// fails or its link closes as soon as BlueZ lists it, whenever that is (NB110-14); one BlueZ had neither paired nor
+/// trusted is removed from it once this connect, or its link, ends ([`Strangers`], NB110-13).
 async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     let _connecting = Connecting::new(&ctx.connects);
     let asked = Instant::now();
@@ -1135,49 +1321,63 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         log::info!("Bluetooth: the connect to {} failed: BlueZ doesn't have it", tag(device));
         return ctx.events.send(RadioEvent::ConnectFailed { device });
     };
-    let mut step = "connecting";
+    let mut step = "reading it";
     let setup = async {
+        // Read before the connect, which may pair it.
+        let known = dev.is_paired().await? || dev.is_trusted().await?;
+        no_hid(&dev).await?;
+        let touch = Touch::new(&ctx.strangers, addr, known, removes(&adapter, &ctx.strangers, addr));
+        step = "connecting";
         dev.connect().await?;
-        step = "finding the service";
-        let mut rx = None;
-        let mut tx = None;
-        for s in dev.services().await? {
-            if s.uuid().await? != uuid(SERVICE_UUID) {
-                continue;
-            }
-            for c in s.characteristics().await? {
-                match c.uuid().await? {
-                    u if u == uuid(RX_UUID) => rx = Some(c),
-                    u if u == uuid(TX_UUID) => tx = Some(c),
-                    _ => {}
+        // Its events before its state, so that its link going down, or it listing HID, is heard from here on: the
+        // rest of the set-up is given up for either, and then its link closed (NB-114, NB110-14).
+        step = "following it";
+        let mut changes = dev.events().await?.boxed();
+        // BlueZ answers once it has read the device's services, and its input plugin taken HID as an input device,
+        // which a disconnect asked for detaches at once; or at once, if the link is up already (the device connected
+        // to this one), and reads them after.
+        step = "reading its services";
+        no_hid(&dev).await?;
+        let sockets = async {
+            step = "finding the service";
+            let mut rx = None;
+            let mut tx = None;
+            for s in dev.services().await? {
+                if s.uuid().await? != uuid(SERVICE_UUID) {
+                    continue;
+                }
+                for c in s.characteristics().await? {
+                    match c.uuid().await? {
+                        u if u == uuid(RX_UUID) => rx = Some(c),
+                        u if u == uuid(TX_UUID) => tx = Some(c),
+                        _ => {}
+                    }
                 }
             }
-        }
-        let (Some(rx), Some(tx)) = (rx, tx) else {
-            let message = "it has no Peerwire service".into();
-            return Err(bluer::Error { kind: bluer::ErrorKind::ServicesUnresolved, message });
+            let (Some(rx), Some(tx)) = (rx, tx) else {
+                let message = "it has no Peerwire service".into();
+                return Err(bluer::Error { kind: bluer::ErrorKind::ServicesUnresolved, message });
+            };
+            step = "subscribing to tx";
+            let reader = tx.notify_io().await?;
+            step = "taking rx";
+            Ok((reader, rx.write_io().await?))
         };
-        step = "subscribing to tx";
-        let reader = tx.notify_io().await?;
-        step = "taking rx";
-        let writer = rx.write_io().await?;
-        // Its events before its state, so that its link going down from here on is heard (NB-114).
-        step = "following it";
-        let changes = dev.events().await?;
+        let (reader, writer) = unless_gone(sockets, &mut changes).await?;
         if !dev.is_connected().await? {
             return Err(bluer::Error { kind: bluer::ErrorKind::Failed, message: "its link went down".into() });
         }
-        Ok::<_, bluer::Error>((reader, writer, changes))
+        Ok::<_, bluer::Error>((reader, writer, changes, touch))
     };
     let set_up = match tokio::time::timeout(SETUP, setup).await {
-        Ok(Ok((r, w, changes))) => {
+        Ok(Ok((r, w, changes, touch))) => {
             let len = w.mtu().min(r.mtu());
-            att_mtu(len).map(|mtu| (r, w, changes, mtu)).ok_or_else(|| format!("its sockets take {len} bytes"))
+            att_mtu(len).map(|mtu| (r, w, changes, touch, mtu)).ok_or_else(|| format!("its sockets take {len} bytes"))
         }
         Ok(Err(e)) => Err(format!("{step}: {e}")),
         Err(_) => Err(format!("{step}: not done after {} s", SETUP.as_secs())),
     };
-    let (reader, writer, changes, mtu) = match set_up {
+    let (reader, writer, changes, touch, mtu) = match set_up {
         Ok(s) => s,
         Err(why) => {
             log::info!("Bluetooth: the connect to {} failed, {}", tag(device), masked(&why));
@@ -1205,7 +1405,31 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
             let _ = dev.disconnect().await;
         }
     });
-    ctx.centrals.lock().unwrap().insert(conn, Link { write, read, addr });
+    ctx.centrals.lock().unwrap().insert(conn, Link { write, read, addr, _touch: touch });
+}
+
+/// Fails if BlueZ lists HID among `dev`'s services, from its adverts or, once connected, its GATT database: BlueZ's
+/// input plugin takes a device that serves it as an input device, asking to pair with one that isn't paired
+/// (`LEAutoSecurity`), and no Peerwire peer serves it (NB110-13).
+async fn no_hid(dev: &bluer::Device) -> bluer::Result<()> {
+    if dev.uuids().await?.is_some_and(|u| u.contains(&uuid(HID_UUID))) {
+        let message = "it serves HID".into();
+        return Err(bluer::Error { kind: bluer::ErrorKind::NotPermitted, message });
+    }
+    Ok(())
+}
+
+/// `step`, of a connect's set-up, given up if `changes` (its device's) say first that its link went down or it lists
+/// HID ([`link_gone`]): a device can stall a step, up to `SETUP`, with HID listed meanwhile (NB110-14).
+async fn unless_gone<T>(
+    step: impl Future<Output = bluer::Result<T>>,
+    changes: &mut BoxStream<'static, DeviceEvent>,
+) -> bluer::Result<T> {
+    tokio::select! {
+        biased;
+        why = link_gone(changes) => Err(bluer::Error { kind: bluer::ErrorKind::Failed, message: why.into() }),
+        r = step => r,
+    }
 }
 
 /// Reports central connection `conn`'s values from `values` until its link goes down ([`until_down`]), and then the
@@ -1214,7 +1438,7 @@ async fn read_link(
     ctx: &Ctx,
     conn: u32,
     values: impl Stream<Item = io::Result<Vec<u8>>>,
-    gone: impl Future<Output = ()>,
+    gone: impl Future<Output = &'static str>,
 ) -> bool {
     let value = |value| ctx.events.send(RadioEvent::Value { conn: ConnId(conn), value });
     let why = until_down(values, gone, value).await;
@@ -1223,10 +1447,11 @@ async fn read_link(
 
 /// Hands each value from `values` to `each` until the link goes down: why it went. BlueZ shuts the socket down as the
 /// link drops, and a read then gives nothing, again and again, not an error; an empty value, which a peer never sends,
-/// reads the same, so it ends the link too. `gone` comes when BlueZ says the device isn't connected (NB-114).
+/// reads the same, so it ends the link too. `gone` comes, with why, when BlueZ says the device isn't connected
+/// (NB-114), or lists HID among its services (NB110-14).
 async fn until_down(
     values: impl Stream<Item = io::Result<Vec<u8>>>,
-    gone: impl Future<Output = ()>,
+    gone: impl Future<Output = &'static str>,
     mut each: impl FnMut(Vec<u8>),
 ) -> String {
     tokio::pin!(values, gone);
@@ -1238,19 +1463,23 @@ async fn until_down(
                 Some(Ok(_)) | None => return "its socket closed".into(),
                 Some(Err(e)) => return format!("reading it: {e}"),
             },
-            () = &mut gone => return "BlueZ says it isn't connected".into(),
+            why = &mut gone => return why.into(),
         }
     }
 }
 
-/// Comes once `changes` (a device's) say it isn't connected, or end, as BlueZ forgot it.
-async fn link_gone(changes: impl Stream<Item = DeviceEvent>) {
+/// Comes once `changes` (a device's) say it isn't connected, or end, as BlueZ forgot it, or list HID among its
+/// services, which a device can add once connected (NB110-14): why.
+async fn link_gone(changes: impl Stream<Item = DeviceEvent>) -> &'static str {
     tokio::pin!(changes);
     while let Some(DeviceEvent::PropertyChanged(p)) = changes.next().await {
-        if matches!(p, DeviceProperty::Connected(false)) {
-            return;
+        match p {
+            DeviceProperty::Connected(false) => break,
+            DeviceProperty::Uuids(u) if u.contains(&uuid(HID_UUID)) => return "it lists HID now",
+            _ => {}
         }
     }
+    "BlueZ says it isn't connected"
 }
 
 /// The link of central connection `conn` went down, for `why`: it is reported closed, unless the driver already took
@@ -1362,6 +1591,7 @@ mod tests {
         assert_eq!(uuid(SERVICE_UUID).to_string(), "1c3eea41-c2be-493c-ab0b-7707ad2dbed6");
         assert_eq!(uuid(RX_UUID).to_string(), "1c3eea42-c2be-493c-ab0b-7707ad2dbed6");
         assert_eq!(uuid(TX_UUID).to_string(), "1c3eea43-c2be-493c-ab0b-7707ad2dbed6");
+        assert_eq!(uuid(HID_UUID).to_string(), "00001812-0000-1000-8000-00805f9b34fb");
     }
 
     /// bluer's sockets take values of up to 5 bytes under the ATT MTU: the node is told 3 over what they take, so its
@@ -1397,6 +1627,83 @@ mod tests {
         assert!(same_name("Laptop", "laptop"));
         assert!(!same_name("Peerwire", "laptop"));
         assert!(!same_name("", ""), "no host name to name");
+    }
+
+    /// NB110-13: BlueZ's input plugin asks to pair with a device that serves HID unless its `input.conf` sets
+    /// `LEAutoSecurity` false, read as GLib reads it. Each answer here is GLib 2.80's own: `GKeyFile`, as `hog.c`'s
+    /// `hog_read_config` loads the file and reads the key, keeping true if either fails.
+    #[test]
+    fn le_auto_security_is_read_as_bluez_reads_it() {
+        let cases = [
+            ("", true),
+            ("[General]\n#LEAutoSecurity=false\n", true),
+            ("[General]\nLEAutoSecurity=false\n", false),
+            ("[General]\nLEAutoSecurity=0\n", false),
+            ("[General]\nLEAutoSecurity=true\n", true),
+            ("[General]\nLEAutoSecurity=1\n", true),
+            ("[General]\n  LEAutoSecurity  =  false  \n", false),
+            ("[General]\r\nLEAutoSecurity=false\r\n", false),
+            ("[General]  \nLEAutoSecurity=false", false),
+            ("[General]\t\nLEAutoSecurity=false", false),
+            ("[General] x\nLEAutoSecurity=false\n", true),
+            ("[General]\nLEAutoSecurity=False\n", true),
+            ("[General]\nLEAutoSecurity=no\n", true),
+            ("[General]\nLEAutoSecurity=false # off\n", true),
+            ("[General]\nLEAutoSecurity = \"false\"\n", true),
+            ("[General]\nleautosecurity=false\n", true),
+            ("[General]\nLEAutoSecurity[en]=false\n", true),
+            ("[Other]\nLEAutoSecurity=false\n", true),
+            ("LEAutoSecurity=false\n[General]\n", true),
+            ("[General]\nLEAutoSecurity=false\nLEAutoSecurity=true\n", true),
+            ("[General]\nLEAutoSecurity=true\nLEAutoSecurity=false\n", false),
+            ("[General]\nLEAutoSecurity=false\n[Other]\nLEAutoSecurity=true\n", false),
+            ("[General]\nLEAutoSecurity=true\n[Other]\n[General]\nLEAutoSecurity=false\n", false),
+            ("[General]\nLEAutoSecurity=false\njunk\n", true),
+            ("[General]\nLEAutoSecurity=false\n=x\n", true),
+            ("[General]\nLEAutoSecurity=false\na]b=1\n", true),
+            ("[General]\nLEAutoSecurity=false\na[en=1\n", true),
+            ("[General]\nLEAutoSecurity=false\na[en]x=1\n", true),
+            ("[General]\nLEAutoSecurity=false\na[en_GB.UTF-8@euro]=1\n", false),
+            ("[General]\nLEAutoSecurity=false\na[]=1\n", false),
+            ("[General]\nLEAutoSecurity=false\na b=1\n", false),
+            ("[General]\nLEAutoSecurity=false\n[]\n", true),
+            ("[General]\nLEAutoSecurity=false\n[a[b]\n", true),
+            ("[General]\nLEAutoSecurity=false\n[a\n", true),
+            ("[General]\nLEAutoSecurity=false\n[a]b]\n", true),
+            ("[General]\nLEAutoSecurity=false\n[a\u{1}b]\n", true),
+            ("[General]\nLEAutoSecurity=false\n  # indented comment\n", false),
+            ("\n\n# comment first\n[General]\nLEAutoSecurity=false\n", false),
+            ("[General]\nLEAutoSecurity=\n", true),
+            ("[General]\nLEAutoSecurity=false\u{b}\n", true),
+            ("\u{b}[General]\nLEAutoSecurity=false\n", true),
+            ("[General]\nUserspaceHID=true\nClassicBondedOnly=true\nLEAutoSecurity=false\nIdleTimeout=0\n", false),
+        ];
+        for (conf, auto) in cases {
+            assert_eq!(le_auto_security(conf), auto, "{conf:?}");
+        }
+    }
+
+    /// NB110-13: a device the driver connects to that BlueZ had neither paired nor trusted counts as a stranger, with
+    /// each of the driver's connects and links on it, until BlueZ has removed it; it stays one if BlueZ pairs it
+    /// meanwhile, or its removal fails. One BlueZ had paired or trusted never counts.
+    #[test]
+    fn a_stranger_counts_until_bluez_has_removed_it() {
+        let mut s = Strangers::default();
+        let (a, b) = (addr(1), addr(2));
+        assert!(!s.touch(a, true), "paired or trusted: the user's own");
+        assert!(s.idle().is_empty() && !s.in_use(a));
+        assert!(s.touch(b, false) && s.touch(b, true), "a second connect counts, whatever BlueZ says by then");
+        assert!(s.in_use(b) && !s.release(b), "one is on it still");
+        assert!(s.release(b) && !s.in_use(b), "the last one ended: to remove");
+        assert_eq!(s.idle(), [b]);
+        // Its removal failed: a connect to it counts, though BlueZ has it paired by now.
+        assert!(s.touch(b, true) && s.idle().is_empty());
+        s.removed(b);
+        assert!(s.in_use(b), "not forgotten while a connect is on it");
+        assert!(s.release(b));
+        s.removed(b);
+        assert!(s.idle().is_empty() && !s.in_use(b), "forgotten once removed");
+        assert!(!s.release(a), "never counted");
     }
 
     /// NB-112: a part that fails is tried again 1, 2, 4, 8, 16 s later, then every 30 s, until it works; a new ask
@@ -1524,7 +1831,8 @@ mod tests {
         let events = Events { tx, shared: shared.clone() };
         let peripheral = Arc::new(Mutex::new(Peripheral::default()));
         let centrals = Arc::new(Mutex::new(HashMap::new()));
-        (Ctx { events, shared, peripheral, centrals, connects: watch::Sender::new(0) }, rx)
+        let strangers = Arc::new(Mutex::new(Strangers::default()));
+        (Ctx { events, shared, peripheral, centrals, connects: watch::Sender::new(0), strangers }, rx)
     }
 
     /// NB-112: when the adapter goes, every link on it is reported closed, a connect under way fails, and one that
@@ -1538,7 +1846,7 @@ mod tests {
             quiet().await;
             assert!(done.is_finished());
             let mut connects = vec![(DeviceId(1), idle()), (DeviceId(2), done)];
-            let link = Link { write: idle(), read: idle(), addr: addr(3) };
+            let link = Link { write: idle(), read: idle(), addr: addr(3), _touch: None };
             let tasks = [link.write.abort_handle(), link.read.abort_handle(), connects[0].1.abort_handle()];
             ctx.centrals.lock().unwrap().insert(5, link);
             *ctx.peripheral.lock().unwrap() = Peripheral { conn: Some(7), from: Some(addr(4)) };
@@ -1565,7 +1873,7 @@ mod tests {
         runtime().block_on(async {
             let (ctx, _events) = ctx();
             let idle = || tokio::spawn(std::future::pending::<()>());
-            let link = Link { write: idle(), read: idle(), addr: addr(3) };
+            let link = Link { write: idle(), read: idle(), addr: addr(3), _touch: None };
             let tasks = [link.write.abort_handle(), link.read.abort_handle()];
             ctx.centrals.lock().unwrap().insert(5, link);
             *ctx.peripheral.lock().unwrap() = Peripheral { conn: Some(7), from: Some(addr(4)) };
@@ -1593,12 +1901,13 @@ mod tests {
                 let write = tokio::spawn(std::future::pending::<()>());
                 let writer = write.abort_handle();
                 let read = tokio::spawn(std::future::pending::<()>());
-                ctx.centrals.lock().unwrap().insert(conn, Link { write, read, addr: addr(conn as usize) });
+                let link = Link { write, read, addr: addr(conn as usize), _touch: None };
+                ctx.centrals.lock().unwrap().insert(conn, link);
                 writer
             };
             let never = futures::stream::pending::<io::Result<Vec<u8>>>;
             let c = &ctx;
-            let read = |conn, values: Values, gone: BoxFuture<'static, ()>| async move {
+            let read = |conn, values: Values, gone: BoxFuture<'static, &'static str>| async move {
                 let read = read_link(c, conn, values, gone);
                 tokio::time::timeout(Duration::from_secs(1), read).await.expect("it ends")
             };
@@ -1628,6 +1937,51 @@ mod tests {
         });
     }
 
+    /// NB110-14: a device can list HID only once its connect has read its services (it adds it to its GATT database
+    /// later, or its link was up already, and BlueZ reads them after): a step of the set-up is given up for it, however
+    /// long the device stalls the step, and a link closes for it; the device's services without HID end neither.
+    #[test]
+    fn a_central_link_ends_once_its_device_lists_hid() {
+        runtime().block_on(async {
+            let (ctx, events) = ctx();
+            let services = |hid: bool| {
+                let mut u = std::collections::HashSet::from([uuid(SERVICE_UUID)]);
+                if hid {
+                    u.insert(uuid(HID_UUID));
+                }
+                DeviceEvent::PropertyChanged(DeviceProperty::Uuids(u))
+            };
+            let changes = |hid: bool| {
+                let first = DeviceEvent::PropertyChanged(DeviceProperty::Connected(true));
+                futures::stream::iter([first, services(false), services(hid)]).chain(futures::stream::pending()).boxed()
+            };
+            async fn within<F: Future>(f: F) -> Result<F::Output, tokio::time::error::Elapsed> {
+                tokio::time::timeout(Duration::from_millis(50), f).await
+            }
+            assert!(within(link_gone(changes(false))).await.is_err(), "not gone for its services without HID");
+            assert_eq!(within(link_gone(changes(true))).await, Ok("it lists HID now"));
+            // A step it stalls is given up, ...
+            let stalled = std::future::pending::<bluer::Result<()>>();
+            let e = within(unless_gone(stalled, &mut changes(true))).await.expect("given up").unwrap_err();
+            assert_eq!(e.message, "it lists HID now");
+            // ... and one that ends ends as it does, its services without HID.
+            let done = async { Ok::<_, bluer::Error>(7) };
+            assert_eq!(within(unless_gone(done, &mut changes(false))).await.expect("ends").unwrap(), 7);
+            let failed = async { Err::<(), _>(bluer::Error { kind: bluer::ErrorKind::Failed, message: "no".into() }) };
+            let e = within(unless_gone(failed, &mut changes(false))).await.expect("ends").unwrap_err();
+            assert_eq!(e.message, "no");
+            // A link: closed, and why, and reported closed.
+            let why = until_down(futures::stream::pending(), link_gone(changes(true)), |_| {});
+            assert_eq!(within(why).await.expect("it ends"), "it lists HID now");
+            let write = tokio::spawn(std::future::pending::<()>());
+            let read = tokio::spawn(std::future::pending::<()>());
+            ctx.centrals.lock().unwrap().insert(5, Link { write, read, addr: addr(5), _touch: None });
+            let never = futures::stream::pending::<io::Result<Vec<u8>>>();
+            assert!(within(read_link(&ctx, 5, never, link_gone(changes(true)))).await.expect("it ends"));
+            assert_eq!(events.try_iter().collect::<Vec<_>>(), [RadioEvent::Disconnected { conn: ConnId(5) }]);
+        });
+    }
+
     /// A central connection whose link goes down is reported closed once, by its reader or by the driver, whichever
     /// takes it out of `centrals` first; and its reader isn't cancelled on its way out, as it was when it aborted
     /// itself with the writer (the node never heard: NB-112).
@@ -1647,7 +2001,7 @@ mod tests {
             });
             let write = tokio::spawn(std::future::pending::<()>());
             let writer = write.abort_handle();
-            ctx.centrals.lock().unwrap().insert(5, Link { write, read, addr: addr(3) });
+            ctx.centrals.lock().unwrap().insert(5, Link { write, read, addr: addr(3), _touch: None });
             go.send(()).unwrap();
             quiet().await;
             assert_eq!(events.try_iter().collect::<Vec<_>>(), [RadioEvent::Disconnected { conn: ConnId(5) }]);
@@ -1655,6 +2009,57 @@ mod tests {
             assert!(writer.is_finished(), "the writer stopped");
             assert!(!link_down(&ctx, 5, "BlueZ says it isn't connected"), "and it isn't reported again");
             assert_eq!(events.try_iter().count(), 0);
+        });
+    }
+
+    /// NB110-13: a stranger is removed from BlueZ once the last of the driver's connects and links on it ends,
+    /// whichever way: a connect that fails or whose task is aborted, a link that drops, one the node closes, those on
+    /// an adapter that goes. A device BlueZ had paired or trusted never is.
+    #[test]
+    fn a_stranger_is_removed_once_the_last_link_on_it_ends() {
+        runtime().block_on(async {
+            let (ctx, _events) = ctx();
+            let removed = Arc::new(Mutex::new(Vec::new()));
+            let touch = |i: usize, known: bool| {
+                let r = removed.clone();
+                Touch::new(&ctx.strangers, addr(i), known, move || r.lock().unwrap().push(i))
+            };
+            let gone = || {
+                let mut g = std::mem::take(&mut *removed.lock().unwrap());
+                g.sort();
+                g
+            };
+            let idle = || tokio::spawn(std::future::pending::<()>());
+            let link = |conn: u32, i: usize, touch: Option<Touch>| {
+                let link = Link { write: idle(), read: idle(), addr: addr(i), _touch: touch };
+                ctx.centrals.lock().unwrap().insert(conn, link);
+            };
+            drop(touch(1, false));
+            assert_eq!(gone(), [1], "a connect that failed");
+            assert!(touch(2, true).is_none(), "the user's own device");
+            link(5, 3, touch(3, false));
+            let again = touch(3, false);
+            assert!(link_down(&ctx, 5, "its socket closed"));
+            assert!(gone().is_empty(), "a link that dropped, with a connect to its device under way still");
+            drop(again);
+            assert_eq!(gone(), [3], "once that ended too");
+            link(6, 4, touch(4, false));
+            assert_eq!(forget(&ctx, 6), Some(addr(4)));
+            assert_eq!(gone(), [4], "one the node closed");
+            // The adapter goes, with a link and a connect under way, whose task is aborted.
+            link(7, 5, touch(5, false));
+            let t = touch(6, false);
+            let task = tokio::spawn(async move {
+                let _touch = t;
+                std::future::pending::<()>().await
+            });
+            let mut connects = vec![(device_id(addr(6)), task)];
+            assert_eq!(drop_links(&ctx, &mut connects).0, 1);
+            quiet().await;
+            assert_eq!(gone(), [5, 6]);
+            let mut idle = ctx.strangers.lock().unwrap().idle();
+            idle.sort();
+            assert_eq!(idle, [1, 3, 4, 5, 6].map(addr), "each to remove until BlueZ has (`remove_stranger`)");
         });
     }
 
