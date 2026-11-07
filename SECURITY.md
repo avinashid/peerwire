@@ -12,7 +12,7 @@ repository. Don't open a public issue. We aim to acknowledge within 7 days.
 
 - the `peerwire-core` handshake, wire format, relaying and NAT traversal;
 - the C ABI (`peerwire-ffi`) and the JavaScript glue;
-- the Bluetooth LE transport (`peerwire` features `ble` and `ble-bluez`);
+- the Bluetooth LE transport (`peerwire` features `ble` and `ble-bluez`, and the ESP32's in `peerwire-esp`);
 - the signaling adapters.
 
 ## Threat model
