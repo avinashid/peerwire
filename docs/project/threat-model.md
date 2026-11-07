@@ -5790,10 +5790,10 @@ good, and the port turns neither on. Fixed in the docs by `2505f70`.
   after Wi-Fi starts ([NB62-2](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2)).
 - **An ESP32 BLE node's modem doesn't sleep**, so it draws more current between events.
   The C3's doesn't by default.
-- **Radio checks owed on our own hardware:** with NVS erased, `load_or_create` after
-  `Nimble::new` returns the error; the `ble` example's first boot draws before NimBLE
-  starts; and on the C3 the USB console, the identity kept across a reset, and a new one
-  once the NVS partition is erased.
+- **Radio checks owed on our own hardware (NB-124):** with NVS erased, `load_or_create`
+  after `Nimble::new` returns the error; the `ble` example's first boot draws before
+  NimBLE starts; and on the C3 the USB console, the identity kept across a reset, and a
+  new one once the NVS partition is erased.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
