@@ -335,8 +335,9 @@ tests use an in-process pair of fake radios.
   of the driver's connects and links on it ends: disconnected, then `RemoveDevice`. So nothing BlueZ set up on those
   links stays: a bond, an input device, or the device itself, which BlueZ stores for good once it connects to one
   with a public or static address. One whose removal fails, as the adapter was off or gone, is removed once an adapter
-  is set up and powered. A device paired or trusted before is the user's, and stays. The driver removes devices while
-  it runs: one whose link is up as its process ends stays in BlueZ.
+  is set up and powered. A device paired or trusted before is the user's, and stays. Dropping the driver closes its
+  links and waits up to 3 s for those removals; one whose link is up as its process is killed, or exits without
+  dropping it (a signal's default action), stays in BlueZ.
   It holds its scan off while a connect is under way (NB-116). Linux starts a connect only once it hears the device
   advertise: while a discovery runs, from its reports alone, which come once for each device each time the discovery
   starts, every 10.24 s. A connect follows such a report, so with the scan on it waited for the next one, longer than

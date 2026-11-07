@@ -65,6 +65,9 @@ const START: Duration = Duration::from_secs(10);
 /// that stalls it can't hold one of the node's connects for bluer's 120 s a step, and the node, which gives one up
 /// after 12 s, hears why first (NB110-11).
 const SETUP: Duration = Duration::from_secs(10);
+/// How long a driver that closes waits at most for BlueZ to remove the strangers it was linked to ([`close`]): one
+/// linked is removed in about 2 s, as BlueZ drops a link 2 s after it is asked to.
+const CLOSE: Duration = Duration::from_secs(3);
 /// A connect holds the scan off this long at most ([`Discovery`]): time for a device that advertises each 1.28 s, as
 /// BlueZ does by default, to be heard twice, and for its link and services to be set up (1.6 s on the ESP32).
 const PAUSE: Duration = Duration::from_secs(3);
@@ -96,11 +99,16 @@ const INPUT_CONF: &str = "/etc/bluetooth/input.conf";
 /// node.join_room("my-app", "kitchen"); // links with members nearby, over Bluetooth if there is no network
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+///
+/// Dropped, it closes its links, and waits up to 3 s for BlueZ to remove the devices among them that it had neither
+/// paired nor trusted (`docs/concepts/bluetooth.md`).
 pub struct BlueZ {
     cmds: mpsc::UnboundedSender<Cmd>,
     events: std_mpsc::Receiver<RadioEvent>,
     shared: Arc<Shared>,
     alias: String,
+    /// Disconnected once the driver's thread has ended, its runtime dropped.
+    done: std_mpsc::Receiver<()>,
 }
 
 enum Cmd {
@@ -146,8 +154,11 @@ impl BlueZ {
         let shared =
             Arc::new(Shared { senders: Mutex::new(HashMap::new()), next: AtomicU32::new(1), waker: Mutex::new(None) });
         let (ready_tx, ready) = std_mpsc::channel();
+        let (done_tx, done) = std_mpsc::channel::<()>();
         let s = shared.clone();
         std::thread::Builder::new().name("peerwire-bluez".into()).spawn(move || {
+            // Dropped last, after the runtime.
+            let _done = done_tx;
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => return drop(ready_tx.send(Err(e))),
@@ -163,7 +174,7 @@ impl BlueZ {
                  [General] and restart bluetoothd (docs/concepts/bluetooth.md)"
             );
         }
-        Ok(BlueZ { cmds, events, shared, alias })
+        Ok(BlueZ { cmds, events, shared, alias, done })
     }
 
     /// The adapter's alias, which is its GAP name: what a central that connects, or a phone's device picker, reads.
@@ -178,6 +189,14 @@ impl BlueZ {
     pub fn names_this_host(&self) -> bool {
         let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
         same_name(&self.alias, &host)
+    }
+}
+
+impl Drop for BlueZ {
+    fn drop(&mut self) {
+        // The driver closes as its commands end, and this is their one sender ([`close`]).
+        self.cmds = mpsc::unbounded_channel().0;
+        let _ = self.done.recv_timeout(CLOSE);
     }
 }
 
@@ -361,6 +380,11 @@ impl Strangers {
         self.0.get(&addr).is_some_and(|n| *n > 0)
     }
 
+    /// Whether one of the driver's connects or links is on any of them.
+    fn any_in_use(&self) -> bool {
+        self.0.values().any(|n| *n > 0)
+    }
+
     /// `addr` was removed from BlueZ, or BlueZ didn't have it: no stranger now, unless a connect to it started since.
     fn removed(&mut self, addr: Address) {
         if self.0.get(&addr) == Some(&0) {
@@ -404,19 +428,37 @@ impl Drop for Touch {
     }
 }
 
-/// Removes `addr`, a stranger none of the driver's connects or links is on, from BlueZ ([`Strangers`]). Its link is
-/// closed first, which also stops at once a connect BlueZ has under way to it, as `RemoveDevice` may not; then the
-/// device goes, with its bond and what BlueZ stored of it. Not if a connect to it started meanwhile, whose end
-/// removes it.
-async fn remove_stranger(adapter: Adapter, strangers: Arc<Mutex<Strangers>>, addr: Address) {
-    if let Ok(dev) = adapter.device(addr) {
-        let _ = dev.disconnect().await;
+/// What the driver asks BlueZ of a device, by its address: the adapter's, or a test's fake.
+trait Devices: Clone + Send + Sync + 'static {
+    /// `Device1.Disconnect`.
+    fn disconnect(&self, addr: Address) -> BoxFuture<'static, bluer::Result<()>>;
+    /// `Adapter1.RemoveDevice`.
+    fn remove(&self, addr: Address) -> BoxFuture<'static, bluer::Result<()>>;
+}
+
+impl Devices for Adapter {
+    fn disconnect(&self, addr: Address) -> BoxFuture<'static, bluer::Result<()>> {
+        let dev = self.device(addr);
+        async move { dev?.disconnect().await }.boxed()
     }
+
+    fn remove(&self, addr: Address) -> BoxFuture<'static, bluer::Result<()>> {
+        let adapter = self.clone();
+        async move { adapter.remove_device(addr).await }.boxed()
+    }
+}
+
+/// Removes `addr`, a stranger none of the driver's connects or links is on, from BlueZ ([`Strangers`]), counted in
+/// [`Ctx::removals`] until it ends (`_removal`). Its link is closed first, which also stops at once a connect BlueZ
+/// has under way to it, as `RemoveDevice` may not; then the device goes, with its bond and what BlueZ stored of it.
+/// Not if a connect to it started meanwhile, whose end removes it.
+async fn remove_stranger(bluez: impl Devices, strangers: Arc<Mutex<Strangers>>, addr: Address, _removal: Counted) {
+    let _ = bluez.disconnect(addr).await;
     if strangers.lock().unwrap().in_use(addr) {
         return;
     }
     let device = tag(device_id(addr));
-    match adapter.remove_device(addr).await {
+    match bluez.remove(addr).await {
         Err(e) if !matches!(e.kind, bluer::ErrorKind::DoesNotExist) => {
             let why = masked(&e.to_string());
             return log::info!("Bluetooth: {device} wasn't removed from BlueZ, {why}; it is once an adapter is set up");
@@ -426,13 +468,14 @@ async fn remove_stranger(adapter: Adapter, strangers: Arc<Mutex<Strangers>>, add
     strangers.lock().unwrap().removed(addr);
 }
 
-/// What runs once the last use of stranger `addr` ends ([`Touch`]): [`remove_stranger`], in a task of its own.
-fn removes(adapter: &Adapter, strangers: &Arc<Mutex<Strangers>>, addr: Address) -> impl FnOnce() + Send + 'static {
-    let (adapter, strangers) = (adapter.clone(), strangers.clone());
+/// What runs once the last use of stranger `addr` ends ([`Touch`]): [`remove_stranger`], in a task of its own,
+/// counted from now.
+fn removes(bluez: &impl Devices, ctx: &Ctx, addr: Address) -> impl FnOnce() + Send + 'static {
+    let (bluez, strangers, removals) = (bluez.clone(), ctx.strangers.clone(), ctx.removals.clone());
     move || {
         // None as the runtime shuts down, its tasks dropped.
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(remove_stranger(adapter, strangers, addr));
+            rt.spawn(remove_stranger(bluez, strangers, addr, Counted::new(&removals)));
         }
     }
 }
@@ -455,6 +498,8 @@ struct Ctx {
     /// How many connects are under way: the scan is held off for them ([`Discovery`]).
     connects: watch::Sender<usize>,
     strangers: Arc<Mutex<Strangers>>,
+    /// How many strangers' removals are under way ([`remove_stranger`]): a driver that closes waits for them.
+    removals: watch::Sender<usize>,
 }
 
 /// One part of the radio that should be up, and when to try it again: each failure is logged, and the first success
@@ -562,7 +607,8 @@ impl Driver {
         let peripheral = Arc::new(Mutex::new(Peripheral::default()));
         let centrals = Arc::new(Mutex::new(HashMap::new()));
         let strangers = Arc::new(Mutex::new(Strangers::default()));
-        let ctx = Ctx { events, shared, peripheral, centrals, connects: watch::Sender::new(0), strangers };
+        let (connects, removals) = (watch::Sender::new(0), watch::Sender::new(0));
+        let ctx = Ctx { events, shared, peripheral, centrals, connects, strangers, removals };
         let mut d = Driver {
             session,
             ctx,
@@ -591,7 +637,11 @@ impl Driver {
             tokio::select! {
                 cmd = cmds.recv() => match cmd {
                     Some(cmd) => d.command(cmd).await,
-                    None => break,
+                    None => {
+                        // The node closed it: nothing is advertised, served or scanned for meanwhile.
+                        d.on = None;
+                        return close(&d.ctx, &mut d.connects, CLOSE).await;
+                    }
                 },
                 e = adapters.next() => match e {
                     Some(e) => d.adapters_changed(e).await,
@@ -812,7 +862,7 @@ impl Driver {
     fn sweep(&self) {
         let Some(on) = self.on.as_ref().filter(|on| on.powered) else { return };
         for addr in self.ctx.strangers.lock().unwrap().idle() {
-            tokio::spawn(remove_stranger(on.adapter.clone(), self.ctx.strangers.clone(), addr));
+            removes(&on.adapter, &self.ctx, addr)();
         }
     }
 
@@ -906,6 +956,24 @@ fn drop_links(ctx: &Ctx, connects: &mut Vec<(DeviceId, JoinHandle<()>)>) -> (usi
     }
     addrs.extend(p.from);
     (closed, addrs)
+}
+
+/// The node closed the driver: each link closes and each connect under way stops, as when the adapter goes
+/// ([`drop_links`]), and it waits, `bound` at most, for BlueZ to remove the strangers among their devices
+/// ([`Strangers`]), as the runtime drops its tasks once it ends: until no connect or link is on one, and no removal is
+/// under way, those started earlier included. One whose removal failed earlier isn't tried again.
+async fn close(ctx: &Ctx, connects: &mut Vec<(DeviceId, JoinHandle<()>)>, bound: Duration) {
+    drop_links(ctx, connects);
+    let mut removals = ctx.removals.subscribe();
+    // An aborted connect's use ends as its task is dropped, and the last use on a device starts its removal.
+    let removed = async {
+        while ctx.strangers.lock().unwrap().any_in_use() || *removals.borrow_and_update() > 0 {
+            if removals.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(bound, removed).await;
 }
 
 /// Takes `conn` out of the driver's books, as the node closed it: a central connection's tasks stop, or the one
@@ -1146,17 +1214,18 @@ impl Discovery {
     }
 }
 
-/// A connect under way, counted in [`Ctx::connects`] from its start to its end, or its task's abort.
-struct Connecting(watch::Sender<usize>);
+/// One of what a count in [`Ctx`] counts (a connect under way, a stranger's removal), from its start to its end, or
+/// its task's abort.
+struct Counted(watch::Sender<usize>);
 
-impl Connecting {
-    fn new(connects: &watch::Sender<usize>) -> Connecting {
-        connects.send_modify(|n| *n += 1);
-        Connecting(connects.clone())
+impl Counted {
+    fn new(count: &watch::Sender<usize>) -> Counted {
+        count.send_modify(|n| *n += 1);
+        Counted(count.clone())
     }
 }
 
-impl Drop for Connecting {
+impl Drop for Counted {
     fn drop(&mut self) {
         self.0.send_modify(|n| *n -= 1);
     }
@@ -1314,7 +1383,7 @@ impl Drop for Watching {
 /// fails or its link closes as soon as BlueZ lists it, whenever that is (NB110-14); one BlueZ had neither paired nor
 /// trusted is removed from it once this connect, or its link, ends ([`Strangers`], NB110-13).
 async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
-    let _connecting = Connecting::new(&ctx.connects);
+    let _connecting = Counted::new(&ctx.connects);
     let asked = Instant::now();
     let addr = address(device);
     let Ok(dev) = adapter.device(addr) else {
@@ -1326,7 +1395,7 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         // Read before the connect, which may pair it.
         let known = dev.is_paired().await? || dev.is_trusted().await?;
         no_hid(&dev).await?;
-        let touch = Touch::new(&ctx.strangers, addr, known, removes(&adapter, &ctx.strangers, addr));
+        let touch = Touch::new(&ctx.strangers, addr, known, removes(&adapter, &ctx, addr));
         step = "connecting";
         dev.connect().await?;
         // Its events before its state, so that its link going down, or it listing HID, is heard from here on: the
@@ -1832,7 +1901,8 @@ mod tests {
         let peripheral = Arc::new(Mutex::new(Peripheral::default()));
         let centrals = Arc::new(Mutex::new(HashMap::new()));
         let strangers = Arc::new(Mutex::new(Strangers::default()));
-        (Ctx { events, shared, peripheral, centrals, connects: watch::Sender::new(0), strangers }, rx)
+        let (connects, removals) = (watch::Sender::new(0), watch::Sender::new(0));
+        (Ctx { events, shared, peripheral, centrals, connects, strangers, removals }, rx)
     }
 
     /// NB-112: when the adapter goes, every link on it is reported closed, a connect under way fails, and one that
@@ -2063,6 +2133,111 @@ mod tests {
         });
     }
 
+    /// A BlueZ for a test: what it was asked, in order, each answered `delay` later, and a removal never if `stuck`.
+    #[derive(Clone, Default)]
+    struct FakeBluez {
+        asked: Arc<Mutex<Vec<(&'static str, Address)>>>,
+        delay: Duration,
+        stuck: bool,
+    }
+
+    impl FakeBluez {
+        fn answer(&self, what: &'static str, addr: Address) -> BoxFuture<'static, bluer::Result<()>> {
+            self.asked.lock().unwrap().push((what, addr));
+            let (delay, stuck) = (self.delay, self.stuck && what == "remove");
+            async move {
+                tokio::time::sleep(delay).await;
+                if stuck {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+            .boxed()
+        }
+
+        /// What it was asked about `addr`, since last asked.
+        fn asked(&self, addr: Address) -> Vec<&'static str> {
+            let mut asked = self.asked.lock().unwrap();
+            let about = asked.iter().filter(|(_, a)| *a == addr).map(|(what, _)| *what).collect();
+            asked.retain(|(_, a)| *a != addr);
+            about
+        }
+    }
+
+    impl Devices for FakeBluez {
+        fn disconnect(&self, addr: Address) -> BoxFuture<'static, bluer::Result<()>> {
+            self.answer("disconnect", addr)
+        }
+
+        fn remove(&self, addr: Address) -> BoxFuture<'static, bluer::Result<()>> {
+            self.answer("remove", addr)
+        }
+    }
+
+    /// The lead's review of NB110-13: a driver that closes (its `BlueZ` dropped) waits for BlueZ to remove the
+    /// strangers it was linked or connecting to, and those whose removal was under way, as its runtime then drops the
+    /// removals' tasks; `bound` at most, and not at all with none to wait for. The user's own device isn't removed.
+    #[test]
+    fn a_close_removes_the_strangers_it_was_linked_to() {
+        runtime().block_on(async {
+            let (ctx, _events) = ctx();
+            let bluez = FakeBluez { delay: Duration::from_millis(100), ..Default::default() };
+            let touch = |b: &FakeBluez, i: usize, known: bool| {
+                Touch::new(&ctx.strangers, addr(i), known, removes(b, &ctx, addr(i)))
+            };
+            let link = |b: &FakeBluez, conn: u32, i: usize, known: bool| {
+                let idle = || tokio::spawn(std::future::pending::<()>());
+                let link = Link { write: idle(), read: idle(), addr: addr(i), _touch: touch(b, i, known) };
+                ctx.centrals.lock().unwrap().insert(conn, link);
+            };
+            let connect = |b: &FakeBluez, i: usize| {
+                let t = touch(b, i, false);
+                let task = tokio::spawn(async move {
+                    let _touch = t;
+                    std::future::pending::<()>().await
+                });
+                (device_id(addr(i)), task)
+            };
+            let c = &ctx;
+            // How long a close took.
+            let closing = |mut connects: Vec<(DeviceId, JoinHandle<()>)>, bound| async move {
+                let t = Instant::now();
+                close(c, &mut connects, bound).await;
+                t.elapsed()
+            };
+            let (removed, two) = (Duration::from_millis(200), Duration::from_secs(2));
+            // A removal that failed earlier isn't waited for.
+            ctx.strangers.lock().unwrap().0.insert(addr(9), 0);
+            assert!(closing(vec![], two).await < Duration::from_millis(50), "nothing to wait for");
+            assert!(bluez.asked(addr(9)).is_empty(), "nor tried again");
+            // A connect under way alone: its use ends once its aborted task is dropped.
+            let took = closing(vec![connect(&bluez, 1)], two).await;
+            assert!(took >= removed && took < two, "{took:?}");
+            assert_eq!(bluez.asked(addr(1)), ["disconnect", "remove"]);
+            // A removal under way, a stranger linked, the user's own device linked, and a connect under way.
+            link(&bluez, 4, 2, false);
+            assert!(link_down(&ctx, 4, "its socket closed"));
+            link(&bluez, 5, 3, false);
+            link(&bluez, 6, 4, true);
+            let took = closing(vec![connect(&bluez, 5)], two).await;
+            assert!(took >= removed && took < two, "{took:?}");
+            for i in [2, 3, 5] {
+                assert_eq!(bluez.asked(addr(i)), ["disconnect", "remove"], "{i}");
+            }
+            assert!(bluez.asked(addr(4)).is_empty(), "the user's own isn't removed");
+            assert!(ctx.centrals.lock().unwrap().is_empty());
+            assert_eq!(ctx.strangers.lock().unwrap().0.keys().collect::<Vec<_>>(), [&addr(9)], "the rest are gone");
+            // BlueZ doesn't answer: given up at the bound, and the device stays in it.
+            let stuck = FakeBluez { stuck: true, ..Default::default() };
+            link(&stuck, 7, 6, false);
+            let took = tokio::time::timeout(two, closing(vec![], Duration::from_millis(300))).await;
+            let took = took.expect("given up at the bound");
+            assert!(took >= Duration::from_millis(300), "{took:?}");
+            assert_eq!(stuck.asked(addr(6)), ["disconnect", "remove"]);
+            assert!(ctx.strangers.lock().unwrap().idle().contains(&addr(6)));
+        });
+    }
+
     /// Discovery sessions for a test to feed: the start that hands out a new one each time, and a sender for each one
     /// started, which finds it closed once the session is dropped.
     fn sessions() -> (Start, Arc<Mutex<Vec<mpsc::UnboundedSender<AdapterEvent>>>>) {
@@ -2110,10 +2285,10 @@ mod tests {
             assert!(d.settle().await);
             session(0).send(AdapterEvent::DeviceAdded(addr(1))).unwrap();
             assert!(added(soon(&mut d).await, 1), "it reports what it finds");
-            let first = Connecting::new(&connects);
+            let first = Counted::new(&connects);
             assert!(changed(soon(&mut d).await) && d.settle().await);
             assert!(session(0).is_closed(), "a connect stops the session");
-            let second = Connecting::new(&connects);
+            let second = Counted::new(&connects);
             assert!(changed(soon(&mut d).await) && d.settle().await);
             drop(first);
             assert!(changed(soon(&mut d).await) && d.settle().await);
@@ -2138,7 +2313,7 @@ mod tests {
             let fails: Start = Box::new(|| async { Err::<Reports, String>("org.bluez.Error.NotReady".into()) }.boxed());
             let mut d =
                 Discovery::new(futures::stream::pending().boxed(), fails, connects.subscribe(), Duration::ZERO, hour);
-            let held = Connecting::new(&connects);
+            let held = Counted::new(&connects);
             assert!(d.settle().await && d.found.is_none(), "held off, it isn't started");
             drop(held);
             assert!(!d.settle().await, "it doesn't start again");
@@ -2162,7 +2337,7 @@ mod tests {
             let started = || fed.lock().unwrap().len();
             let mut since = d.since;
             // One that starts as the session does holds it off once it has run `run`, ...
-            let first = Connecting::new(&connects);
+            let first = Counted::new(&connects);
             assert!(changed(soon(&mut d).await) && d.settle().await && !closed(0), "not before it has run `run`");
             assert!(due(&mut d).await && closed(0) && d.since - since >= run, "but once it has");
             since = d.since;
@@ -2176,7 +2351,7 @@ mod tests {
             assert!(changed(soon(&mut d).await) && d.settle().await && started() == 3, "started again once none is");
             since = d.since;
             // One that starts within `run` of that holds it off at `run`, ...
-            let second = Connecting::new(&connects);
+            let second = Counted::new(&connects);
             assert!(changed(soon(&mut d).await) && d.settle().await && !closed(2));
             assert!(due(&mut d).await && closed(2) && d.since - since >= run);
             drop(second);
@@ -2184,7 +2359,7 @@ mod tests {
             // ... and one after that, at once.
             tokio::time::sleep(run).await;
             assert!(soon(&mut d).await.is_none(), "nothing is due with no connect under way");
-            let _third = Connecting::new(&connects);
+            let _third = Counted::new(&connects);
             assert!(changed(soon(&mut d).await) && d.settle().await && closed(3), "held off at once after `run`");
             assert_eq!(started(), 4);
         });
