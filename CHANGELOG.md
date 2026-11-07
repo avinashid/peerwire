@@ -15,7 +15,11 @@ and the commit that fixed it.
   Feature `ble-bluez` adds the Linux driver, `ble::BlueZ`, which tries again what fails and follows the default
   adapter, and reports a link that drops at once (NB-114). The node and the driver log each connection (at `debug`,
   and failures at `info`), devices named by a hash, never an address. Drivers implement `ble::Radio`; the ESP32's
-  comes in `peerwire-esp`.
+  is in `peerwire-esp`.
+- `peerwire-esp`: feature `ble`, the ESP32's driver, `ble::Nimble`, on ESP-IDF's NimBLE (ESP32-C3 and ESP32): three
+  links, a new non-resolvable random address with each advert, and no bonds (a pairing hands over no keys, and its
+  connection is closed). The `ble` example is a room member that sets its clock over Wi-Fi, then links over
+  Bluetooth alone (NB-110c).
 - `peerwire-core`: `ble`, the framing codec every host shares (`Chunker`, `Reassembler`, the service's UUIDs);
   `Endpoint::handle_datagram_unbound`, for a channel no peer is bound to yet; `Address::radio`.
 - **Breaking:** `peerwire::Hop` has a new variant, `Ble`, and is `#[non_exhaustive]` from now on, so a `match` on it
