@@ -35,9 +35,9 @@ service with two characteristics, and nothing else of its own: no readable chara
 | `tx` | `1c3eea43-c2be-493c-ab0b-7707ad2dbed6` | notify | peripheral to central |
 
 - **No pairing or bonding.** Noise IK authenticates both ends and gives confidentiality, integrity and replay
-  protection over any path. No characteristic needs encryption, so no system shows a pairing prompt; a peer refuses
-  pairing and keeps no bonds. (Just Works, the only pairing a board with no screen can do, wouldn't stop a
-  man in the middle anyway.)
+  protection over any path. No characteristic needs encryption, so no system shows a pairing prompt; a peer never
+  asks for pairing and keeps no bonds, and [Platforms](#platforms) says what happens when a device pairs anyway.
+  (Just Works, the only pairing a board with no screen can do, wouldn't stop a man in the middle anyway.)
 - **Writes.** `rx` takes plain writes without response at offset 0; a write request, a prepared (long) write or a
   read is refused. Notifications on `tx` go to one connection only.
 - **MTU.** A central asks for the largest ATT MTU its stack allows (517). Each value carries at most ATT_MTU − 3
