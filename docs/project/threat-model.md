@@ -192,6 +192,7 @@ release of each.
 | NB110-15 (Low), NB110-I13 (Info) | **Fixed** by `70c587c` and `e804566` (NB110-15) and `48632e3` (NB110-I13), merged `74d9079`, before `ble-bluez` was published (a driver dropped closes its links and waits up to 3 s for BlueZ to remove the strangers among them, and `ble_chat` drops its node on Ctrl-C and SIGTERM; a device is checked for HID once more once BlueZ has read its services), reviewed 2026-11-07; residual: a process killed, or ended by a signal it doesn't handle, removes nothing, same section |
 | NB110-16 (Low) | **Fixed** by `7000929` and `3379747`, merged `bf5968d`, before `ble-bluez` was published (the BlueZ driver disconnects only a link it asked BlueZ to make: a device linked already isn't asked to connect, and its link stays when the connect fails or the connection over it ends, unless it lists HID), reviewed 2026-11-07; residuals: a device that links in the moment between the driver's read and its connect counts as the driver's; a connect under way as the adapter goes or the driver is dropped disconnects its device, same section |
 | NB110-I14 (Info) | Accepted: a failed connect's disconnect turns off BlueZ's own reconnection of a device it doesn't trust, until that device is connected again, same section |
+| NB119-1 (Low), NB119-I1, NB119-I2 (Info) | **Fixed** by `2505f70` before NB-119's first part merged (`9d721b1`), so never on main, before any release of `peerwire-esp` kept identities (a board's kept identity is drawn only from the SAR ADC, before Wi-Fi or Bluetooth is set up, or not at all, and an ESP32 BLE node keeps its Bluetooth modem awake; the docs say `id new` doesn't scrub the old key and how each chip can encrypt NVS), reviewed 2026-11-07; residuals: the key is in plain NVS; firmware must load it before it sets up a radio; an ESP32 BLE node draws more current, [Kept identity on the ESP32](#kept-identity-on-the-esp32-nb-119--nb119-1) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -3491,8 +3492,10 @@ Residuals:
   Node before it starts Wi-Fi, with modem sleep on, or on Ethernet draws pseudo-random
   numbers again; the ESP32 guide says so. On Ethernet an app needs
   `bootloader_random_enable()` around `bind`.
-- A board makes a new identity each boot: keeping one needs encrypted NVS, its own card
-  when a board needs a stable identity.
+- The `mesh` firmware makes a new identity each boot. Since NB-119
+  `identity::load_or_create` keeps one across restarts, drawn on the chip before any
+  radio is set up, in NVS that isn't encrypted
+  ([below](#kept-identity-on-the-esp32-nb-119--nb119-1)).
 - The two-chip nonce test needs a second board. By reading, the nonces come from the
   traversal seed, drawn after Wi-Fi.
 - The relay's TLS checks certificates against the clock, which SNTP sets without
@@ -5054,9 +5057,12 @@ our own hardware.
   across the radio, 2 at once, then one per 5 s, each 156 ms of a C3's time (about 3%),
   and identity checks at four times that rate, from room-proven connections only, each
   dropped over its budget before its cryptography.
-- **Random draws (R15).** With Wi-Fi off every draw comes after the Bluetooth controller
-  starts: before `Nimble::new` the `ble` example only starts its logger, reads its flash
-  record and sets up the network interface, and the driver's docs say to make it first.
+- **Random draws (R15).** With Wi-Fi off every draw but a new identity's comes after the
+  Bluetooth controller starts: before `Nimble::new` the `ble` example only starts its
+  logger, loads its identity, reads its flash record and sets up the network interface,
+  and the driver's docs say to make it first. Since NB-119 a new identity is drawn from
+  the SAR ADC before any radio is set up, and on the ESP32 the other draws are made with
+  the radio awake ([NB119-1](#kept-identity-on-the-esp32-nb-119--nb119-1)).
   `ble_probe`'s throwaway keys come earlier; it joins no room.
 - **Connections.** NimBLE holds three, as `Limits::SMALL` counts. A central that hasn't
   subscribed to `tx` 5 s after connecting is closed, checked about once a second but not
@@ -5705,6 +5711,89 @@ central it served as that connection ends, and a second writer it refuses, by de
   an input device is made), the same board as a central linking to the node (the
   peripheral side), and a stranger gone from BlueZ's list once its link ends, then
   linked again as before.
+
+### Kept identity on the ESP32 (NB-119) — NB119-1
+
+Since NB-119's first part (merged `9d721b1`), `peerwire-esp` keeps a board's identity
+across restarts. `identity::load_or_create` draws a 32-byte seed on the chip the first
+time, keeps it in NVS (namespace `peerwire`, key `id`) and gives the same identity on
+every later boot; `identity::renew` erases it, so the next boot draws another, as does
+erasing the NVS partition. `console::Console` reads command lines from the serial
+console: UART0 and, on the C3, USB-Serial-JTAG. The `ble` example keeps its identity and
+takes `id` and `id new` there. Neither is in a release yet.
+
+Reviewed on 2026-11-07 by reading `24988d2` (NB119-1, I1, I2) and its fix `2505f70`
+against ESP-IDF v5.5.5's random-number docs, `bootloader_random.h`, its NVS docs, the
+Wi-Fi and Bluetooth controller sources, the console's Kconfig and USB-Serial-JTAG
+driver, and the cfgs an existing build emits. The author's QEMU runs on the C3 and the
+ESP32 checked the Wi-Fi cases of the fix; QEMU has no Bluetooth controller, so its case
+is owed on a board.
+
+**What holds.**
+- **The seed.** It becomes the key through `Identity::from_secret_bytes`, never leaves
+  the chip, and only the PeerId is logged.
+- **The console.** Only someone with a cable to the board can type, and on the C3 that
+  port is also JTAG, which reads memory anyway, so the commands add no exposure. Lines
+  are bounded (128 B, eight queued, the rest dropped), control bytes are dropped,
+  commands match exactly, and a line echoed in a warning is escaped. On the C3 the
+  driver it installs takes the console's output too: with no host reading, a write waits
+  once for at most 50 ms, then drops bytes, so a board on a charger doesn't stall its
+  loop. Where USB-Serial-JTAG is the primary console it reads that driver alone, as two
+  readers would split a line's bytes (a nit fixed by `2505f70`).
+
+**NB119-1 — A kept identity could be drawn outside ESP-IDF's conditions for true random
+numbers (Low).** At `24988d2` the seed came from `esp_fill_random` while Wi-Fi or
+Bluetooth counted as on, and from the SAR ADC (`bootloader_random_enable`) otherwise.
+ESP-IDF promises true random numbers from Wi-Fi only once it has started, but a mode set
+counted as on, so Wi-Fi set up and not yet started, or stopped, did. It promises them
+from Bluetooth only while the radio is awake, but the ESP32 lets its Bluetooth modem
+sleep by default, and the `ble` example drew its seed with NimBLE up and Wi-Fi dropped.
+The SAR ADC covers neither, as ESP-IDF says to turn it off before any radio is set up.
+Low: nothing in the port reached the Wi-Fi gap, and the C3 keeps its Bluetooth modem
+awake by default; but the key is kept for the board's life, and the docs said any order
+was safe. Fix: draw only from the SAR ADC, before any radio is set up, and fail
+otherwise.
+
+**Status: fixed** by `2505f70` before NB-119's first part merged (`9d721b1`), so never
+on main, reviewed 2026-11-07. With no seed kept, `load_or_create` draws one from the SAR
+ADC only when `esp_wifi_get_mode` returns `ESP_ERR_WIFI_NOT_INIT` and, in a build with
+Bluetooth, the controller is idle; otherwise it returns an error. A kept seed loads in
+any state. A radio set up and torn down again passes the check, which is sound: Wi-Fi
+can't be torn down before it's stopped, nor the controller made idle before it's
+disabled, and `bootloader_random.h` allows the SAR source from app code "without
+initialized RF subsystem". The check sees a controller that firmware starts itself,
+without the `ble` feature. The `ble` example loads its identity first, before Wi-Fi and
+`Nimble::new`. A BLE-only node's other draws, at `bind`, come after its controller
+starts ([R15](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5)), and
+`sdkconfig.ble` now turns the ESP32's Bluetooth modem sleep off
+(`CONFIG_BTDM_CTRL_MODEM_SLEEP=n`), so they are made with the radio awake.
+
+**NB119-I1 — `id new` doesn't scrub the old key (Info).** NVS marks an erased entry and
+leaves it in flash until its page is reused, so after `renew` the old seed can still be
+read off the board. Fixed in the docs by `2505f70`: to retire a board's key before
+handing the board on, erase its flash.
+
+**NB119-I2 — NVS encryption, per chip (Info).** At `24988d2` the docs said NVS is
+encrypted only with flash encryption on. That holds for the ESP32; the C3 can also
+encrypt NVS under an HMAC key in eFuse, without flash encryption. Both burn eFuses for
+good, and the port turns neither on. Fixed in the docs by `2505f70`.
+
+**Residuals, accepted.**
+- **The key is in plain NVS.** Anyone with the board in hand can read it off the flash
+  and be the board until it's given a new key. Encrypting NVS is the app's call
+  (NB119-I2).
+- **`id new` leaves the old key in flash** until its page is reused (NB119-I1).
+- **The order is the firmware's.** Firmware that sets up Wi-Fi or Bluetooth before it
+  loads the identity gets an error, not a weaker key, at the first boot with none kept;
+  and it mustn't load one while it reads the ADC or, on the ESP32, uses I2S, which
+  `load_or_create`'s docs say. The `mesh` example keeps no identity: its draws stay
+  after Wi-Fi starts ([NB62-2](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2)).
+- **An ESP32 BLE node's modem doesn't sleep**, so it draws more current between events.
+  The C3's doesn't by default.
+- **Radio checks owed on our own hardware (NB-124):** with NVS erased, `load_or_create`
+  after `Nimble::new` returns the error; the `ble` example's first boot draws before
+  NimBLE starts; and on the C3 the USB console, the identity kept across a reset, and a
+  new one once the NVS partition is erased.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
