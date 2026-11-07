@@ -327,18 +327,22 @@ tests use an in-process pair of fake radios.
   As the central it gives a connect 10 s from the node's asking to come up (its turn, the link, the service found,
   both sockets), and reports one that fails or doesn't as failed, then disconnects it, which also stops a connect
   BlueZ still has under way. BlueZ answers a disconnect only once the link is down, 2 s or more later, so the driver
-  never waits on one whose link is up: each runs on its own.
+  never waits on one whose link is up: each runs on its own. It disconnects only a link it asked BlueZ to make: a
+  device whose link is up already, as it connected to this one or another program connected it (the user's keyboard,
+  say), isn't asked to connect, and its link stays when the connect fails, and when the connection over it ends (the
+  node closes it, its socket closes, the adapter goes).
   A device that lists HID among its services, in its adverts or once connected, isn't used: the driver doesn't
   connect to it, or fails the connect as soon as BlueZ has read its services, or closes its link as soon as it lists
-  HID later. Asked to disconnect, BlueZ detaches its input plugin from the device at once, though the link goes 2 s
-  later.
+  HID later, whoever made the link. Asked to disconnect, BlueZ detaches its input plugin from the device at once,
+  though the link goes 2 s later.
   A device BlueZ had neither paired nor trusted before the driver connected to it is removed from BlueZ once the last
   of the driver's connects and links on it ends: disconnected, then `RemoveDevice`. So nothing BlueZ set up on those
   links stays: a bond, an input device, or the device itself, which BlueZ stores for good once it connects to one
   with a public or static address. One whose removal fails, as the adapter was off or gone, is removed once an adapter
-  is set up and powered. A device paired or trusted before is the user's, and stays. Dropping the driver closes its
-  links and waits up to 3 s for those removals; one whose link is up as its process is killed, or exits without
-  dropping it (a signal's default action), stays in BlueZ.
+  is set up and powered. A device paired or trusted before is the user's, and stays, and so does one whose link was up
+  already, as the driver didn't make it. Dropping the driver closes its links and waits up to 3 s for those removals;
+  one whose link is up as its process is killed, or exits without dropping it (a signal's default action), stays in
+  BlueZ.
   It holds its scan off while a connect is under way (NB-116). Linux starts a connect only once it hears the device
   advertise: while a discovery runs, from its reports alone, which come once for each device each time the discovery
   starts, every 10.24 s. A connect follows such a report, so with the scan on it waited for the next one, longer than
@@ -353,15 +357,15 @@ tests use an in-process pair of fake radios.
   the scan's start and the next link behind it until the connect's 10 s ran out, as a device that sends one advert and
   goes silent would have it. The next connect's turn comes once the scan has started again (NB116-3), or 1 s after at
   most should BlueZ not start it, so that its link is asked for with the scan running, not as it starts. So however
-  many connects there are, which a device can draw by replaying a room's advert, the scan runs 2 s of every 5 to 6 at
-  worst (2 s, the link's 3 s, and up to 1 s for BlueZ to disconnect the device: **theoretical**), and hears each
-  device in range each time it starts (BlueZ advertises every 1.28 s by default). A connect's 10 s count from the
-  node's asking, its wait for its turn included (NB116-4): one queued behind connects to silent devices fails, with
-  nothing to disconnect, before the node's own 12 s run out, and its link isn't asked for once the node has given it
-  up. In a room of three or more, links come up one after another. Should BlueZ not answer a connect at all, the
-  scan starts again 5 s after it was held off, reports the device of the link being made again, which starts it, and
-  is held off again 2 s later. A connect whose turn comes within those 2 s waits for the rest of them, unless the
-  scan's report of its device starts it first.
+  many connects there are, which a device can draw by replaying a room's advert, the scan runs 2 s of every 5 to 7 at
+  worst (2 s, the link's 3 s, up to 1 s for BlueZ to disconnect the device and up to 1 s for it to start the scan
+  again, which the next turn waits for: **theoretical**), and hears each device in range each time it starts (BlueZ
+  advertises every 1.28 s by default). A connect's 10 s count from the node's asking, its wait for its turn included
+  (NB116-4): one queued behind connects to silent devices fails, with nothing to disconnect, before the node's own 12 s
+  run out, and its link isn't asked for once the node has given it up. In a room of three or more, links come up one
+  after another. Should BlueZ not answer a connect at all, the scan starts again 5 s after it was held off, reports the
+  device of the link being made again, which starts it, and is held off again 2 s later. A connect whose turn comes
+  within those 2 s waits for the rest of them, unless the scan's report of its device starts it first.
   A link that drops is reported closed at once: as the central, once BlueZ says the device isn't connected, or shuts
   the `tx` socket down, which it does as a link drops (a read then gives nothing, not an error).
   bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone
