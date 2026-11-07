@@ -833,7 +833,7 @@ async fn scan(adapter: &Adapter, ctx: &Ctx) -> Result<JoinHandle<()>, String> {
         let start = tokio::spawn(discover(a.clone()));
         async move { start.await.map_err(|e| e.to_string())? }.boxed()
     });
-    let discovery = Discovery { found: Some(found), start, connects: ctx.connects.subscribe() };
+    let discovery = Discovery::new(found, start, ctx.connects.subscribe(), SETUP);
     Ok(tokio::spawn(follow(adapter.clone(), ctx.events.clone(), discovery)))
 }
 
@@ -854,7 +854,7 @@ async fn follow(adapter: Adapter, events: Events, mut discovery: Discovery) {
                     watch(&mut watching, &events, dev, ours).await;
                 }
                 Next::Found(AdapterEvent::DeviceRemoved(addr)) => watching.remove(addr),
-                Next::Found(_) | Next::Connects => {}
+                Next::Found(_) | Next::Settle => {}
                 Next::Ended => return,
             },
             () = until(again) => list_again(&adapter, &events, &mut watching).await,
@@ -872,36 +872,52 @@ type Start = Box<dyn FnMut() -> BoxFuture<'static, Result<Reports, String>> + Se
 /// an LE device once it hears the device advertise: while a discovery runs, from its reports alone, which come once a
 /// device each time the discovery starts (every 10.24 s, as the kernel ends it and bluetoothd starts it again), and
 /// the report that drew the connect was that one. With no discovery, the kernel scans for the connect itself, and it
-/// starts at the device's next advert.
+/// starts at the device's next advert. The session is held off for `longest` at most (`SETUP`, a connect's longest),
+/// so that the scan misses no other device's adverts for longer: with connects under way still (one that started
+/// meanwhile), it runs again, and as it starts reports their devices again, which starts those connects; it is held
+/// off again only for a connect that starts once none is under way.
 struct Discovery {
     /// The session, while it runs.
     found: Option<Reports>,
     start: Start,
     /// How many connects are under way ([`Ctx::connects`]).
     connects: watch::Receiver<usize>,
+    /// When it was held off, while it is.
+    paused: Option<Instant>,
+    /// It runs again, held off for `longest` with connects under way still: it isn't held off again until none is.
+    overdue: bool,
+    longest: Duration,
 }
 
 /// What came next in the scan.
 enum Next {
     Found(AdapterEvent),
-    /// A connect started or ended.
-    Connects,
+    /// A connect started or ended, or the session was held off for its longest: [`Discovery::settle`] is due.
+    Settle,
     /// The session ended, or the driver is gone.
     Ended,
 }
 
 impl Discovery {
-    /// Stops the session while a connect is under way, and starts it again once none is: whether it runs, or is held
-    /// off, as it should be; not once it can't start again.
+    fn new(found: Reports, start: Start, connects: watch::Receiver<usize>, longest: Duration) -> Discovery {
+        Discovery { found: Some(found), start, connects, paused: None, overdue: false, longest }
+    }
+
+    /// Stops the session as a connect starts, and starts it again once none is under way, or it was held off for
+    /// `longest`: whether it runs, or is held off, as it should be; not once it can't start again.
     async fn settle(&mut self) -> bool {
         let connecting = *self.connects.borrow_and_update() > 0;
-        if connecting && self.found.take().is_some() {
+        self.overdue &= connecting;
+        let now = Instant::now();
+        if connecting && !self.overdue && self.found.is_some() {
+            (self.found, self.paused) = (None, Some(now));
             log::debug!("Bluetooth: the scan paused for a connect");
-        } else if !connecting && self.found.is_none() {
+        } else if self.found.is_none() && (!connecting || self.paused.is_none_or(|t| now >= t + self.longest)) {
             match (self.start)().await {
                 Ok(found) => {
-                    self.found = Some(found);
-                    log::debug!("Bluetooth: the scan resumed");
+                    (self.found, self.paused, self.overdue) = (Some(found), None, connecting);
+                    let still = if connecting { ", with a connect under way still" } else { "" };
+                    log::debug!("Bluetooth: the scan resumed{still}");
                 }
                 Err(e) => {
                     log::info!("Bluetooth: the scan didn't resume: {}", masked(&e));
@@ -912,8 +928,10 @@ impl Discovery {
         true
     }
 
-    /// What the session reports next, or a connect starting or ending. It can be dropped while it waits.
+    /// What the session reports next, or that [`settle`](Discovery::settle) is due. It can be dropped while it
+    /// waits.
     async fn next(&mut self) -> Next {
+        let due = until(self.paused.map(|t| t + self.longest));
         let (found, connects) = (&mut self.found, &mut self.connects);
         let found = async {
             match found {
@@ -923,7 +941,8 @@ impl Discovery {
         };
         tokio::select! {
             e = found => e.map_or(Next::Ended, Next::Found),
-            changed = connects.changed() => if changed.is_ok() { Next::Connects } else { Next::Ended },
+            changed = connects.changed() => if changed.is_ok() { Next::Settle } else { Next::Ended },
+            () = due => Next::Settle,
         }
     }
 }
@@ -1643,6 +1662,10 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), d.next()).await.ok()
     }
 
+    fn changed(n: Option<Next>) -> bool {
+        matches!(n, Some(Next::Settle))
+    }
+
     /// NB-116 (omarchy's runs 18–20): Linux starts a connect only from an advert the running discovery reports, and
     /// that reports a device once a cycle, so a connect asked for on one waited 10 s for the next, and was given up
     /// just before. The scan is held off while a connect is under way, until each one has ended or its task was
@@ -1652,12 +1675,12 @@ mod tests {
         runtime().block_on(async {
             let connects = watch::Sender::new(0);
             let (mut start, fed) = sessions();
-            let found = start().await.ok();
-            let mut d = Discovery { found, start, connects: connects.subscribe() };
+            let found = start().await.unwrap();
+            let hour = Duration::from_secs(3600);
+            let mut d = Discovery::new(found, start, connects.subscribe(), hour);
             let session = |k: usize| fed.lock().unwrap()[k].clone();
             let added =
                 |n: Option<Next>, i| matches!(n, Some(Next::Found(AdapterEvent::DeviceAdded(a))) if a == addr(i));
-            let changed = |n: Option<Next>| matches!(n, Some(Next::Connects));
             assert!(d.settle().await);
             session(0).send(AdapterEvent::DeviceAdded(addr(1))).unwrap();
             assert!(added(soon(&mut d).await, 1), "it reports what it finds");
@@ -1687,13 +1710,49 @@ mod tests {
             assert!(matches!(soon(&mut d).await, Some(Next::Ended)), "its session ended");
             // One that can't start again ends, once no connect holds it off.
             let fails: Start = Box::new(|| async { Err::<Reports, String>("org.bluez.Error.NotReady".into()) }.boxed());
-            let mut d = Discovery { found: None, start: fails, connects: connects.subscribe() };
+            let mut d = Discovery::new(futures::stream::pending().boxed(), fails, connects.subscribe(), hour);
             let held = Connecting::new(&connects);
-            assert!(d.settle().await, "held off, it isn't started");
+            assert!(d.settle().await && d.found.is_none(), "held off, it isn't started");
             drop(held);
             assert!(!d.settle().await, "it doesn't start again");
             drop(connects);
             assert!(matches!(soon(&mut d).await, Some(Next::Ended)), "nor once the driver is gone");
+        });
+    }
+
+    /// NB-116: the scan is held off for a connect's longest at most, so that it misses no other device's adverts for
+    /// longer: with connects under way still (one that started meanwhile), it runs again until none is, and is held
+    /// off again only for a connect that starts after that.
+    #[test]
+    fn the_scan_is_held_off_for_a_connects_longest_at_most() {
+        runtime().block_on(async {
+            let connects = watch::Sender::new(0);
+            let (mut start, fed) = sessions();
+            let found = start().await.unwrap();
+            let longest = Duration::from_millis(500);
+            let mut d = Discovery::new(found, start, connects.subscribe(), longest);
+            let closed = |k: usize| fed.lock().unwrap()[k].is_closed();
+            let first = Connecting::new(&connects);
+            assert!(changed(soon(&mut d).await) && d.settle().await && closed(0), "held off");
+            let second = Connecting::new(&connects);
+            assert!(changed(soon(&mut d).await) && d.settle().await);
+            drop(first);
+            assert!(changed(soon(&mut d).await) && d.settle().await);
+            assert_eq!(fed.lock().unwrap().len(), 1, "held off while the second is under way");
+            let due = tokio::time::timeout(Duration::from_secs(2), d.next()).await;
+            assert!(matches!(due, Ok(Next::Settle)) && d.settle().await);
+            assert_eq!(fed.lock().unwrap().len(), 2, "but runs again after the longest, the second under way still");
+            let third = Connecting::new(&connects);
+            assert!(changed(soon(&mut d).await) && d.settle().await);
+            assert!(!closed(1), "not held off again while one from before is under way");
+            assert!(soon(&mut d).await.is_none(), "nor is it due again");
+            drop((second, third));
+            assert!(changed(soon(&mut d).await) && d.settle().await && !closed(1));
+            let fourth = Connecting::new(&connects);
+            assert!(changed(soon(&mut d).await) && d.settle().await && closed(1), "held off for one after that");
+            drop(fourth);
+            assert!(changed(soon(&mut d).await) && d.settle().await);
+            assert_eq!(fed.lock().unwrap().len(), 3);
         });
     }
 }

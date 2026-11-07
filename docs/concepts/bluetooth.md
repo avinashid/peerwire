@@ -327,6 +327,8 @@ tests use an in-process pair of fake radios.
   its 10 s; with it off, the kernel scans for the connect itself, and it starts at the device's next advert. When
   another program discovers too, BlueZ merges the filters, so the scan stopping restarts that discovery, which comes
   to the same, unless the other's filter merges to the same as the driver's (another Peerwire process on the adapter).
+  The scan is held off 10 s at most, so that it misses no other device's adverts for longer: with connects under way
+  still (one that started meanwhile), it runs again until none is, and as it starts it reports their devices again.
   A link that drops is reported closed at once: as the central, once BlueZ says the device isn't connected, or shuts
   the `tx` socket down, which it does as a link drops (a read then gives nothing, not an error).
   bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone
