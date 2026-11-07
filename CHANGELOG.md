@@ -13,10 +13,11 @@ and the commit that fixed it.
   network, and ranks the radio below every UDP path (`PathKind::Bluetooth`, not in `Policy::default()`, off under
   `Privacy::RelayOnly`); a link that loses UDP comes back over the radio, and moves to UDP again once it works.
   Feature `ble-bluez` adds the Linux driver, `ble::BlueZ`, which tries again what fails and follows the default
-  adapter, and reports a link that drops at once (NB-114). It holds its scan off while it connects: with the scan on,
-  Linux started a connect only at the scan's next report of the device, 10 s on, and the connect failed (NB-116). The
-  node and the driver log each connection (at `debug`, and failures at `info`), devices named by a hash, never an
-  address. Drivers implement `ble::Radio`; the ESP32's is in `peerwire-esp`.
+  adapter, and reports a link that drops at once (NB-114). It holds its scan off while it connects, 3 s at a time
+  between runs of 2 s: with the scan on, Linux started a connect only at the scan's next report of the device, 10 s
+  on, and the connect failed (NB-116). The node and the driver log each connection (at `debug`, and failures at
+  `info`), devices named by a hash, never an address. Drivers implement `ble::Radio`; the ESP32's is in
+  `peerwire-esp`.
 - `peerwire-esp`: feature `ble`, the ESP32's driver, `ble::Nimble`, on ESP-IDF's NimBLE (ESP32-C3 and ESP32): three
   links, a new non-resolvable random address with each advert, and no bonds (a pairing hands over no keys, and its
   connection is closed). The `ble` example is a room member that sets its clock over Wi-Fi, then links over

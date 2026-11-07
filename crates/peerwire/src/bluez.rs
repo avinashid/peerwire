@@ -21,8 +21,9 @@
 //! A link that drops is reported closed at once, whoever dropped it: as the central's, once BlueZ says the device
 //! isn't connected or shuts the notification socket, which a read sees as an empty value (NB-114). A connect that
 //! fails is logged with the step it failed at and BlueZ's error, and a link that goes down with why; a device is named
-//! by a hash that holds for the run alone. The scan is held off while a connect is under way: with it on, Linux
-//! starts the connect only at the scan's next report of the device, up to 10.24 s on ([`Discovery`], NB-116).
+//! by a hash that holds for the run alone. The scan is held off while a connect is under way, 3 s at a time and once
+//! it has run 2 s: with it on, Linux starts the connect only at the scan's next report of the device, up to 10.24 s
+//! on ([`Discovery`], NB-116).
 
 use crate::ble::{tag, ConnId, DeviceId, Limits, Radio, RadioEvent, RX_UUID, SERVICE_UUID, TX_UUID};
 use bluer::adv::{Advertisement, AdvertisementHandle, Type};
@@ -58,6 +59,12 @@ const START: Duration = Duration::from_secs(10);
 /// that stalls it can't hold one of the node's connects for bluer's 120 s a step, and the node, which gives one up
 /// after 12 s, hears why first (NB110-11).
 const SETUP: Duration = Duration::from_secs(10);
+/// A connect holds the scan off this long at most ([`Discovery`]): time for a device that advertises each 1.28 s, as
+/// BlueZ does by default, to be heard twice, and for its link and services to be set up (1.6 s on the ESP32).
+const PAUSE: Duration = Duration::from_secs(3);
+/// The scan runs this long at least each time it starts, before a connect holds it off: more than 1.28 s, so that it
+/// hears each device in range each time, however many connects there are and however long they take (NB116-1).
+const RUN: Duration = Duration::from_secs(2);
 /// A part that failed is tried again this long after, doubled at each failure in a row, up to `RETRY_MAX`.
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
@@ -274,7 +281,7 @@ struct Ctx {
     shared: Arc<Shared>,
     peripheral: Arc<Mutex<Peripheral>>,
     centrals: Centrals,
-    /// How many connects are under way: the scan is held off while any is ([`Discovery`]).
+    /// How many connects are under way: the scan is held off for them ([`Discovery`]).
     connects: watch::Sender<usize>,
 }
 
@@ -833,7 +840,7 @@ async fn scan(adapter: &Adapter, ctx: &Ctx) -> Result<JoinHandle<()>, String> {
         let start = tokio::spawn(discover(a.clone()));
         async move { start.await.map_err(|e| e.to_string())? }.boxed()
     });
-    let discovery = Discovery::new(found, start, ctx.connects.subscribe(), SETUP);
+    let discovery = Discovery::new(found, start, ctx.connects.subscribe(), RUN, PAUSE);
     Ok(tokio::spawn(follow(adapter.clone(), ctx.events.clone(), discovery)))
 }
 
@@ -872,50 +879,53 @@ type Start = Box<dyn FnMut() -> BoxFuture<'static, Result<Reports, String>> + Se
 /// an LE device once it hears the device advertise: while a discovery runs, from its reports alone, which come once a
 /// device each time the discovery starts (every 10.24 s, as the kernel ends it and bluetoothd starts it again), and
 /// the report that drew the connect was that one. With no discovery, the kernel scans for the connect itself, and it
-/// starts at the device's next advert. The session is held off for `longest` at most (`SETUP`, a connect's longest),
-/// so that the scan misses no other device's adverts for longer: with connects under way still (one that started
-/// meanwhile), it runs again, and as it starts reports their devices again, which starts those connects; it is held
-/// off again only for a connect that starts once none is under way.
+/// starts at the device's next advert. The session is held off only once it has run `run` since it started, and for
+/// `pause` at most, so that connects, however many and however long, leave it running `run` of each `run + pause`,
+/// and it hears each device in range each time it starts (NB116-1). With connects under way still as it starts again,
+/// it reports their devices again, which starts them, and is held off again once it has run `run`.
 struct Discovery {
     /// The session, while it runs.
     found: Option<Reports>,
     start: Start,
     /// How many connects are under way ([`Ctx::connects`]).
     connects: watch::Receiver<usize>,
-    /// When it was held off, while it is.
-    paused: Option<Instant>,
-    /// It runs again, held off for `longest` with connects under way still: it isn't held off again until none is.
-    overdue: bool,
-    longest: Duration,
+    /// When the session started, or was held off.
+    since: Instant,
+    /// How long it runs at least before a connect holds it off, and how long it is held off at most.
+    run: Duration,
+    pause: Duration,
 }
 
 /// What came next in the scan.
 enum Next {
     Found(AdapterEvent),
-    /// A connect started or ended, or the session was held off for its longest: [`Discovery::settle`] is due.
+    /// A connect started or ended, or the session ran `run` with one under way, or was held off for `pause`:
+    /// [`Discovery::settle`] is due.
     Settle,
     /// The session ended, or the driver is gone.
     Ended,
 }
 
 impl Discovery {
-    fn new(found: Reports, start: Start, connects: watch::Receiver<usize>, longest: Duration) -> Discovery {
-        Discovery { found: Some(found), start, connects, paused: None, overdue: false, longest }
+    /// Follows `found`, a session that has just started.
+    fn new(found: Reports, start: Start, connects: watch::Receiver<usize>, run: Duration, pause: Duration) -> Self {
+        Discovery { found: Some(found), start, connects, since: Instant::now(), run, pause }
     }
 
-    /// Stops the session as a connect starts, and starts it again once none is under way, or it was held off for
-    /// `longest`: whether it runs, or is held off, as it should be; not once it can't start again.
+    /// Stops the session for a connect under way once it has run `run`, and starts it again once none is, or it was
+    /// held off for `pause`: whether it runs, or is held off, as it should be; not once it can't start again.
     async fn settle(&mut self) -> bool {
         let connecting = *self.connects.borrow_and_update() > 0;
-        self.overdue &= connecting;
         let now = Instant::now();
-        if connecting && !self.overdue && self.found.is_some() {
-            (self.found, self.paused) = (None, Some(now));
-            log::debug!("Bluetooth: the scan paused for a connect");
-        } else if self.found.is_none() && (!connecting || self.paused.is_none_or(|t| now >= t + self.longest)) {
+        if self.found.is_some() {
+            if connecting && now >= self.since + self.run {
+                (self.found, self.since) = (None, now);
+                log::debug!("Bluetooth: the scan paused for a connect");
+            }
+        } else if !connecting || now >= self.since + self.pause {
             match (self.start)().await {
                 Ok(found) => {
-                    (self.found, self.paused, self.overdue) = (Some(found), None, connecting);
+                    (self.found, self.since) = (Some(found), Instant::now());
                     let still = if connecting { ", with a connect under way still" } else { "" };
                     log::debug!("Bluetooth: the scan resumed{still}");
                 }
@@ -931,7 +941,12 @@ impl Discovery {
     /// What the session reports next, or that [`settle`](Discovery::settle) is due. It can be dropped while it
     /// waits.
     async fn next(&mut self) -> Next {
-        let due = until(self.paused.map(|t| t + self.longest));
+        // Held off once it has run `run` with a connect under way, and started again once held off for `pause`.
+        let due = match self.found {
+            Some(_) => (*self.connects.borrow() > 0).then_some(self.since + self.run),
+            None => Some(self.since + self.pause),
+        };
+        let due = until(due);
         let (found, connects) = (&mut self.found, &mut self.connects);
         let found = async {
             match found {
@@ -1111,7 +1126,7 @@ impl Drop for Watching {
 /// without response. One that isn't set up within `SETUP`, or fails, is reported failed and then disconnected, which
 /// also stops a connect BlueZ still has under way: reported first, as the disconnect is answered only once the link
 /// is down (NB110-12), and this task ends with it, so one still under way has said nothing (`drop_links`). The scan
-/// is held off until it ends ([`Discovery`]).
+/// is held off for it ([`Discovery`]).
 async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     let _connecting = Connecting::new(&ctx.connects);
     let asked = Instant::now();
@@ -1662,14 +1677,20 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), d.next()).await.ok()
     }
 
+    /// Whether the scan is due to settle within 2 s, and settles.
+    async fn due(d: &mut Discovery) -> bool {
+        matches!(tokio::time::timeout(Duration::from_secs(2), d.next()).await, Ok(Next::Settle)) && d.settle().await
+    }
+
     fn changed(n: Option<Next>) -> bool {
         matches!(n, Some(Next::Settle))
     }
 
     /// NB-116 (omarchy's runs 18–20): Linux starts a connect only from an advert the running discovery reports, and
     /// that reports a device once a cycle, so a connect asked for on one waited 10 s for the next, and was given up
-    /// just before. The scan is held off while a connect is under way, until each one has ended or its task was
-    /// aborted, and then starts again; one that can't start again ends, as one whose session ends does.
+    /// just before. The scan is held off while a connect is under way (here at once, and with no end to its pause),
+    /// until each one has ended or its task was aborted, and then starts again; one that can't start again ends, as
+    /// one whose session ends does.
     #[test]
     fn a_connect_holds_the_scan_off_until_it_ends() {
         runtime().block_on(async {
@@ -1677,7 +1698,7 @@ mod tests {
             let (mut start, fed) = sessions();
             let found = start().await.unwrap();
             let hour = Duration::from_secs(3600);
-            let mut d = Discovery::new(found, start, connects.subscribe(), hour);
+            let mut d = Discovery::new(found, start, connects.subscribe(), Duration::ZERO, hour);
             let session = |k: usize| fed.lock().unwrap()[k].clone();
             let added =
                 |n: Option<Next>, i| matches!(n, Some(Next::Found(AdapterEvent::DeviceAdded(a))) if a == addr(i));
@@ -1710,7 +1731,8 @@ mod tests {
             assert!(matches!(soon(&mut d).await, Some(Next::Ended)), "its session ended");
             // One that can't start again ends, once no connect holds it off.
             let fails: Start = Box::new(|| async { Err::<Reports, String>("org.bluez.Error.NotReady".into()) }.boxed());
-            let mut d = Discovery::new(futures::stream::pending().boxed(), fails, connects.subscribe(), hour);
+            let mut d =
+                Discovery::new(futures::stream::pending().boxed(), fails, connects.subscribe(), Duration::ZERO, hour);
             let held = Connecting::new(&connects);
             assert!(d.settle().await && d.found.is_none(), "held off, it isn't started");
             drop(held);
@@ -1720,39 +1742,46 @@ mod tests {
         });
     }
 
-    /// NB-116: the scan is held off for a connect's longest at most, so that it misses no other device's adverts for
-    /// longer: with connects under way still (one that started meanwhile), it runs again until none is, and is held
-    /// off again only for a connect that starts after that.
+    /// NB116-1: connects, however many and however long, leave the scan running `run` of each `run + pause`, so that
+    /// it hears each device in range each time it starts. It is held off for one only once it has run `run`, for
+    /// `pause` at most, and again once it has run `run`, while any is under way still.
     #[test]
-    fn the_scan_is_held_off_for_a_connects_longest_at_most() {
+    fn connects_leave_the_scan_running_between_pauses() {
         runtime().block_on(async {
             let connects = watch::Sender::new(0);
             let (mut start, fed) = sessions();
             let found = start().await.unwrap();
-            let longest = Duration::from_millis(500);
-            let mut d = Discovery::new(found, start, connects.subscribe(), longest);
+            let (run, pause) = (Duration::from_millis(300), Duration::from_millis(500));
+            let mut d = Discovery::new(found, start, connects.subscribe(), run, pause);
             let closed = |k: usize| fed.lock().unwrap()[k].is_closed();
+            let started = || fed.lock().unwrap().len();
+            let mut since = d.since;
+            // One that starts as the session does holds it off once it has run `run`, ...
             let first = Connecting::new(&connects);
-            assert!(changed(soon(&mut d).await) && d.settle().await && closed(0), "held off");
-            let second = Connecting::new(&connects);
-            assert!(changed(soon(&mut d).await) && d.settle().await);
+            assert!(changed(soon(&mut d).await) && d.settle().await && !closed(0), "not before it has run `run`");
+            assert!(due(&mut d).await && closed(0) && d.since - since >= run, "but once it has");
+            since = d.since;
+            // ... for `pause` at most, though it is under way still, ...
+            assert!(due(&mut d).await && started() == 2 && d.since - since >= pause, "it runs again after `pause`");
+            since = d.since;
+            assert!(soon(&mut d).await.is_none(), "and runs");
+            // ... and is held off again once it has run `run`, while it is under way still.
+            assert!(due(&mut d).await && closed(1) && d.since - since >= run, "held off again");
             drop(first);
-            assert!(changed(soon(&mut d).await) && d.settle().await);
-            assert_eq!(fed.lock().unwrap().len(), 1, "held off while the second is under way");
-            let due = tokio::time::timeout(Duration::from_secs(2), d.next()).await;
-            assert!(matches!(due, Ok(Next::Settle)) && d.settle().await);
-            assert_eq!(fed.lock().unwrap().len(), 2, "but runs again after the longest, the second under way still");
-            let third = Connecting::new(&connects);
-            assert!(changed(soon(&mut d).await) && d.settle().await);
-            assert!(!closed(1), "not held off again while one from before is under way");
-            assert!(soon(&mut d).await.is_none(), "nor is it due again");
-            drop((second, third));
-            assert!(changed(soon(&mut d).await) && d.settle().await && !closed(1));
-            let fourth = Connecting::new(&connects);
-            assert!(changed(soon(&mut d).await) && d.settle().await && closed(1), "held off for one after that");
-            drop(fourth);
-            assert!(changed(soon(&mut d).await) && d.settle().await);
-            assert_eq!(fed.lock().unwrap().len(), 3);
+            assert!(changed(soon(&mut d).await) && d.settle().await && started() == 3, "started again once none is");
+            since = d.since;
+            // One that starts within `run` of that holds it off at `run`, ...
+            let second = Connecting::new(&connects);
+            assert!(changed(soon(&mut d).await) && d.settle().await && !closed(2));
+            assert!(due(&mut d).await && closed(2) && d.since - since >= run);
+            drop(second);
+            assert!(changed(soon(&mut d).await) && d.settle().await && started() == 4);
+            // ... and one after that, at once.
+            tokio::time::sleep(run).await;
+            assert!(soon(&mut d).await.is_none(), "nothing is due with no connect under way");
+            let _third = Connecting::new(&connects);
+            assert!(changed(soon(&mut d).await) && d.settle().await && closed(3), "held off at once after `run`");
+            assert_eq!(started(), 4);
         });
     }
 }
