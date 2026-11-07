@@ -152,7 +152,7 @@ const REFUSED_HOLD: Duration = Duration::from_secs(1);
 const REFUSED_JITTER_MS: u32 = 3_000;
 /// A connect the driver hasn't answered by then is given up, as a failed one: a driver gives up its own sooner
 /// ([`Radio::connect`]), so this is for one that doesn't (NB110-11).
-const CONNECT_WAIT: Duration = Duration::from_secs(12);
+pub(crate) const CONNECT_WAIT: Duration = Duration::from_secs(12);
 /// Adverts looked at: a burst, then one per `ADVERT_REFILL` (50 a second).
 const ADVERT_BURST: u32 = 50;
 const ADVERT_REFILL: Duration = Duration::from_millis(20);
