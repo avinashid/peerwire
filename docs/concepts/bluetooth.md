@@ -329,11 +329,12 @@ tests use an in-process pair of fake radios.
   BlueZ still has under way. BlueZ answers a disconnect only once the link is down, 2 s or more later, so the driver
   never waits on one whose link is up: each runs on its own. It disconnects only a link it asked BlueZ to make: a
   device whose link is up already, as it connected to this one or another program connected it (the user's keyboard,
-  say), isn't asked to connect, and its link stays when the connect fails.
+  say), isn't asked to connect, and its link stays when the connect fails, and when the connection over it ends (the
+  node closes it, its socket closes, the adapter goes).
   A device that lists HID among its services, in its adverts or once connected, isn't used: the driver doesn't
   connect to it, or fails the connect as soon as BlueZ has read its services, or closes its link as soon as it lists
-  HID later. Asked to disconnect, BlueZ detaches its input plugin from the device at once, though the link goes 2 s
-  later.
+  HID later, whoever made the link. Asked to disconnect, BlueZ detaches its input plugin from the device at once,
+  though the link goes 2 s later.
   A device BlueZ had neither paired nor trusted before the driver connected to it is removed from BlueZ once the last
   of the driver's connects and links on it ends: disconnected, then `RemoveDevice`. So nothing BlueZ set up on those
   links stays: a bond, an input device, or the device itself, which BlueZ stores for good once it connects to one

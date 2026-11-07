@@ -347,6 +347,10 @@ struct Link {
     write: JoinHandle<()>,
     read: JoinHandle<()>,
     addr: Address,
+    /// BlueZ was asked to make its link, which is then the driver's to close: one that was up before, the device's own
+    /// to this one or another program's, is left as it is when the connection ends (NB110-16), unless its device lists
+    /// HID ([`link_down`]).
+    ours: bool,
     /// Its device's use, if it is a stranger ([`Strangers`]): it ends as the link leaves the books.
     _touch: Option<Touch>,
 }
@@ -806,8 +810,8 @@ impl Driver {
         }
     }
 
-    /// Closes `conn`, as the node did: in the books at once, and at BlueZ in a task of its own (`drop_later`). Not
-    /// `async`, so the loop never waits on a remote link (NB110-12).
+    /// Closes `conn`, as the node did: in the books at once, and at BlueZ in a task of its own (`drop_later`), if its
+    /// link is the driver's to close ([`forget`]). Not `async`, so the loop never waits on a remote link (NB110-12).
     fn disconnect(&mut self, conn: ConnId) {
         if let (Some(addr), Some(on)) = (forget(&self.ctx, conn.0), &self.on) {
             drop_later(&on.adapter, &self.ctx.centrals, [addr]);
@@ -946,8 +950,8 @@ async fn until(at: Option<Instant>) {
 }
 
 /// Reports every link closed and every connect under way failed: each connect still under way stops, each connection
-/// closes. How many links there were, and the devices to close at BlueZ: theirs, and those of the connects, which
-/// BlueZ may have under way still.
+/// closes. How many links there were, and the devices to close at BlueZ: theirs, of those BlueZ was asked to make
+/// ([`Link::ours`]), and those of the connects, which BlueZ may have under way still.
 fn drop_links(ctx: &Ctx, connects: &mut Vec<(DeviceId, JoinHandle<()>)>) -> (usize, Vec<Address>) {
     let mut addrs = Vec::new();
     // One that hasn't finished hasn't said `Connected` (nothing between that and its end waits), nor `ConnectFailed`.
@@ -965,7 +969,7 @@ fn drop_links(ctx: &Ctx, connects: &mut Vec<(DeviceId, JoinHandle<()>)>) -> (usi
         link.read.abort();
         ctx.shared.senders.lock().unwrap().remove(&conn);
         ctx.events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
-        addrs.push(link.addr);
+        addrs.extend(link.ours.then_some(link.addr));
     }
     // Its task ends as its queue closes.
     let p = std::mem::take(&mut *ctx.peripheral.lock().unwrap());
@@ -997,13 +1001,13 @@ async fn close(ctx: &Ctx, connects: &mut Vec<(DeviceId, JoinHandle<()>)>, bound:
 }
 
 /// Takes `conn` out of the driver's books, as the node closed it: a central connection's tasks stop, or the one
-/// central's slot frees. The device, to close the link to.
+/// central's slot frees. The device, to close the link to, unless BlueZ wasn't asked to make it ([`Link::ours`]).
 fn forget(ctx: &Ctx, conn: u32) -> Option<Address> {
     let central = ctx.centrals.lock().unwrap().remove(&conn);
     if let Some(link) = central {
         link.write.abort();
         link.read.abort();
-        return Some(link.addr);
+        return link.ours.then_some(link.addr);
     }
     // The central of ours: its notify session ends with its link, which BlueZ can close given its address.
     let mut p = ctx.peripheral.lock().unwrap();
@@ -1584,7 +1588,7 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
             let _ = dev.disconnect().await;
         }
     });
-    ctx.centrals.lock().unwrap().insert(conn, Link { write, read, addr, _touch: touch });
+    ctx.centrals.lock().unwrap().insert(conn, Link { write, read, addr, ours, _touch: touch });
 }
 
 /// A connect to `device` failed: it is reported, and its turn and its hold on the scan (`making`, while it made its
@@ -1668,7 +1672,7 @@ async fn linked(
 }
 
 /// Reports central connection `conn`'s values from `values` until its link goes down ([`until_down`]), and then the
-/// connection closed ([`link_down`]): whether it was.
+/// connection closed ([`link_down`]): whether it was, and its link is to close at BlueZ.
 async fn read_link(
     ctx: &Ctx,
     conn: u32,
@@ -1703,6 +1707,9 @@ async fn until_down(
     }
 }
 
+/// Why a link goes down when its device lists HID ([`link_gone`]).
+const LISTS_HID: &str = "it lists HID now";
+
 /// Comes once `changes` (a device's) say it isn't connected, or end, as BlueZ forgot it, or list HID among its
 /// services, which a device can add once connected (NB110-14): why.
 async fn link_gone(changes: impl Stream<Item = DeviceEvent>) -> &'static str {
@@ -1710,7 +1717,7 @@ async fn link_gone(changes: impl Stream<Item = DeviceEvent>) -> &'static str {
     while let Some(DeviceEvent::PropertyChanged(p)) = changes.next().await {
         match p {
             DeviceProperty::Connected(false) => break,
-            DeviceProperty::Uuids(u) if u.contains(&uuid(HID_UUID)) => return "it lists HID now",
+            DeviceProperty::Uuids(u) if u.contains(&uuid(HID_UUID)) => return LISTS_HID,
             _ => {}
         }
     }
@@ -1718,15 +1725,18 @@ async fn link_gone(changes: impl Stream<Item = DeviceEvent>) -> &'static str {
 }
 
 /// The link of central connection `conn` went down, for `why`: it is reported closed, unless the driver already took
-/// it out of `centrals` (closing it, or losing the adapter), and its writer stops. Whether it was reported. Its reader,
-/// which calls this, isn't stopped: tokio would cancel a task that aborts itself at its next wait, before it reports.
+/// it out of `centrals` (closing it, or losing the adapter), and its writer stops. Whether it was reported, and its
+/// link is to close at BlueZ: one BlueZ was asked to make ([`Link::ours`]), or any once its device lists HID, which
+/// BlueZ's input plugin detaches from at once as it is asked to (NB110-14); one up before, the device's own to this
+/// one or another program's, is left (NB110-16). Its reader, which calls this, isn't stopped: tokio would cancel a task
+/// that aborts itself at its next wait, before it reports.
 fn link_down(ctx: &Ctx, conn: u32, why: &str) -> bool {
     ctx.shared.senders.lock().unwrap().remove(&conn);
     let Some(link) = ctx.centrals.lock().unwrap().remove(&conn) else { return false };
     link.write.abort();
     log::info!("Bluetooth: conn {conn} (to {}) went down: {}", tag(device_id(link.addr)), masked(why));
     ctx.events.send(RadioEvent::Disconnected { conn: ConnId(conn) });
-    true
+    link.ours || why == LISTS_HID
 }
 
 /// What serving a central that subscribed to `tx` takes.
@@ -2084,7 +2094,7 @@ mod tests {
             quiet().await;
             assert!(done.is_finished());
             let mut connects = vec![(DeviceId(1), idle()), (DeviceId(2), done)];
-            let link = Link { write: idle(), read: idle(), addr: addr(3), _touch: None };
+            let link = Link { write: idle(), read: idle(), addr: addr(3), ours: true, _touch: None };
             let tasks = [link.write.abort_handle(), link.read.abort_handle(), connects[0].1.abort_handle()];
             ctx.centrals.lock().unwrap().insert(5, link);
             *ctx.peripheral.lock().unwrap() = Peripheral { conn: Some(7), from: Some(addr(4)) };
@@ -2111,7 +2121,7 @@ mod tests {
         runtime().block_on(async {
             let (ctx, _events) = ctx();
             let idle = || tokio::spawn(std::future::pending::<()>());
-            let link = Link { write: idle(), read: idle(), addr: addr(3), _touch: None };
+            let link = Link { write: idle(), read: idle(), addr: addr(3), ours: true, _touch: None };
             let tasks = [link.write.abort_handle(), link.read.abort_handle()];
             ctx.centrals.lock().unwrap().insert(5, link);
             *ctx.peripheral.lock().unwrap() = Peripheral { conn: Some(7), from: Some(addr(4)) };
@@ -2139,7 +2149,7 @@ mod tests {
                 let write = tokio::spawn(std::future::pending::<()>());
                 let writer = write.abort_handle();
                 let read = tokio::spawn(std::future::pending::<()>());
-                let link = Link { write, read, addr: addr(conn as usize), _touch: None };
+                let link = Link { write, read, addr: addr(conn as usize), ours: true, _touch: None };
                 ctx.centrals.lock().unwrap().insert(conn, link);
                 writer
             };
@@ -2213,7 +2223,7 @@ mod tests {
             assert_eq!(within(why).await.expect("it ends"), "it lists HID now");
             let write = tokio::spawn(std::future::pending::<()>());
             let read = tokio::spawn(std::future::pending::<()>());
-            ctx.centrals.lock().unwrap().insert(5, Link { write, read, addr: addr(5), _touch: None });
+            ctx.centrals.lock().unwrap().insert(5, Link { write, read, addr: addr(5), ours: true, _touch: None });
             let never = futures::stream::pending::<io::Result<Vec<u8>>>();
             assert!(within(read_link(&ctx, 5, never, link_gone(changes(true)))).await.expect("it ends"));
             assert_eq!(events.try_iter().collect::<Vec<_>>(), [RadioEvent::Disconnected { conn: ConnId(5) }]);
@@ -2239,7 +2249,7 @@ mod tests {
             });
             let write = tokio::spawn(std::future::pending::<()>());
             let writer = write.abort_handle();
-            ctx.centrals.lock().unwrap().insert(5, Link { write, read, addr: addr(3), _touch: None });
+            ctx.centrals.lock().unwrap().insert(5, Link { write, read, addr: addr(3), ours: true, _touch: None });
             go.send(()).unwrap();
             quiet().await;
             assert_eq!(events.try_iter().collect::<Vec<_>>(), [RadioEvent::Disconnected { conn: ConnId(5) }]);
@@ -2269,7 +2279,7 @@ mod tests {
             };
             let idle = || tokio::spawn(std::future::pending::<()>());
             let link = |conn: u32, i: usize, touch: Option<Touch>| {
-                let link = Link { write: idle(), read: idle(), addr: addr(i), _touch: touch };
+                let link = Link { write: idle(), read: idle(), addr: addr(i), ours: true, _touch: touch };
                 ctx.centrals.lock().unwrap().insert(conn, link);
             };
             drop(touch(1, false));
@@ -2355,7 +2365,7 @@ mod tests {
             };
             let link = |b: &FakeBluez, conn: u32, i: usize, known: bool| {
                 let idle = || tokio::spawn(std::future::pending::<()>());
-                let link = Link { write: idle(), read: idle(), addr: addr(i), _touch: touch(b, i, known) };
+                let link = Link { write: idle(), read: idle(), addr: addr(i), ours: true, _touch: touch(b, i, known) };
                 ctx.centrals.lock().unwrap().insert(conn, link);
             };
             let connect = |b: &FakeBluez, i: usize| {
@@ -2455,11 +2465,56 @@ mod tests {
             assert_eq!(bluez.asked(addr(4)), ["disconnect"]);
             // Unless the driver has a link to it, an earlier connect's, which goes on.
             let idle = || tokio::spawn(std::future::pending::<()>());
-            ctx.centrals.lock().unwrap().insert(5, Link { write: idle(), read: idle(), addr: addr(5), _touch: None });
+            let link = Link { write: idle(), read: idle(), addr: addr(5), ours: true, _touch: None };
+            ctx.centrals.lock().unwrap().insert(5, link);
             connect_failed(&bluez, &ctx, device_id(addr(5)), true, None).await;
             quiet().await;
             assert!(bluez.asked(addr(5)).is_empty());
             assert_eq!(said(), [failed(5)]);
+        });
+    }
+
+    /// NB110-16: a central connection over a link BlueZ wasn't asked to make (up before its connect, the device's own
+    /// to this one or another program's) leaves the link up as it ends: closed by the node, on an adapter that goes,
+    /// as its socket closes or BlueZ says it isn't connected; but not once its device lists HID, which closes any
+    /// (NB110-14). One the driver made is closed in each case.
+    #[test]
+    fn a_link_the_driver_didnt_make_is_left_up() {
+        runtime().block_on(async {
+            let (ctx, events) = ctx();
+            let idle = || tokio::spawn(std::future::pending::<()>());
+            let link = |conn: u32, ours| {
+                let link = Link { write: idle(), read: idle(), addr: addr(conn as usize), ours, _touch: None };
+                ctx.centrals.lock().unwrap().insert(conn, link);
+            };
+            // Closed by the node.
+            link(1, false);
+            link(2, true);
+            assert_eq!((forget(&ctx, 1), forget(&ctx, 2)), (None, Some(addr(2))));
+            // On an adapter that goes.
+            link(3, false);
+            link(4, true);
+            assert_eq!(drop_links(&ctx, &mut Vec::new()), (2, vec![addr(4)]));
+            // As it goes down.
+            let never = futures::stream::pending::<io::Result<Vec<u8>>>;
+            let shut = futures::stream::empty::<io::Result<Vec<u8>>>;
+            let pending = std::future::pending::<&'static str>;
+            let hid = DeviceProperty::Uuids(std::collections::HashSet::from([uuid(HID_UUID)]));
+            let lists = futures::stream::iter([DeviceEvent::PropertyChanged(hid)]).chain(futures::stream::pending());
+            link(5, false);
+            assert!(!read_link(&ctx, 5, shut(), pending()).await, "its socket closed");
+            link(6, false);
+            assert!(!read_link(&ctx, 6, never(), link_gone(futures::stream::empty())).await, "BlueZ says it's down");
+            link(7, false);
+            assert!(read_link(&ctx, 7, never(), link_gone(lists)).await, "its device lists HID");
+            link(8, true);
+            assert!(read_link(&ctx, 8, shut(), pending()).await, "the driver's own");
+            let mut closed: Vec<u32> = (events.try_iter())
+                .filter_map(|e| if let RadioEvent::Disconnected { conn } = e { Some(conn.0) } else { None })
+                .collect();
+            closed.sort_unstable();
+            assert_eq!(closed, [3, 4, 5, 6, 7, 8], "each reported closed, as ever");
+            assert!(ctx.centrals.lock().unwrap().is_empty());
         });
     }
 
