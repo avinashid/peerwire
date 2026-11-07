@@ -308,13 +308,11 @@ fn att_mtu(len: usize) -> Option<u16> {
 }
 
 /// Closes the link to `addr`, unless this radio connected to it as a central.
-async fn drop_link(adapter: &Adapter, centrals: &Centrals, addr: Address) {
+async fn drop_link(bluez: &impl Devices, centrals: &Centrals, addr: Address) {
     if centrals.lock().unwrap().values().any(|l| l.addr == addr) {
         return;
     }
-    if let Ok(dev) = adapter.device(addr) {
-        let _ = dev.disconnect().await;
-    }
+    let _ = bluez.disconnect(addr).await;
 }
 
 fn device_id(a: Address) -> DeviceId {
@@ -361,13 +359,14 @@ type Centrals = Arc<Mutex<HashMap<u32, Link>>>;
 /// ([`remove_stranger`]), so that nothing BlueZ set up on a link the driver made stays: a bond, an input device (its
 /// input plugin takes a device that serves HID as one), or the device itself, stored for good. One whose removal
 /// failed is kept, with none, to be removed again ([`Driver::sweep`]). A device paired or trusted before the driver
-/// first connected to it is the user's, and never removed.
+/// first connected to it is the user's, and never removed; nor is one whose link was up as a connect to it started,
+/// unless it is one already, as the driver didn't make that link (NB110-16).
 #[derive(Default)]
 struct Strangers(HashMap<Address, usize>);
 
 impl Strangers {
-    /// A connect to `addr` starts, which BlueZ has paired or trusted if `known`: whether it counts, as a stranger now
-    /// or one already.
+    /// A connect to `addr` starts, which is `known` if BlueZ has paired or trusted it, or its link is up already:
+    /// whether it counts, as a stranger now or one already.
     fn touch(&mut self, addr: Address, known: bool) -> bool {
         match self.0.get_mut(&addr) {
             Some(n) => *n += 1,
@@ -417,7 +416,7 @@ struct Touch {
 }
 
 impl Touch {
-    /// A connect to `addr` starts, which BlueZ has paired or trusted if `known`: `None` if it isn't a stranger.
+    /// A connect to `addr` starts, `known` or not ([`Strangers::touch`]): `None` if it isn't a stranger.
     fn new(
         strangers: &Arc<Mutex<Strangers>>,
         addr: Address,
@@ -1013,10 +1012,10 @@ fn forget(ctx: &Ctx, conn: u32) -> Option<Address> {
 
 /// Closes the links to `addrs` ([`drop_link`]), each in a task of its own: BlueZ answers a disconnect only once the
 /// link is down, 2 s or more later, so nothing waits behind it (NB110-12).
-fn drop_later(adapter: &Adapter, centrals: &Centrals, addrs: impl IntoIterator<Item = Address>) {
+fn drop_later(bluez: &impl Devices, centrals: &Centrals, addrs: impl IntoIterator<Item = Address>) {
     for a in addrs {
-        let (adapter, centrals) = (adapter.clone(), centrals.clone());
-        tokio::spawn(async move { drop_link(&adapter, &centrals, a).await });
+        let (bluez, centrals) = (bluez.clone(), centrals.clone());
+        tokio::spawn(async move { drop_link(&bluez, &centrals, a).await });
     }
 }
 
@@ -1288,6 +1287,14 @@ impl Making {
     }
 }
 
+/// [`Making::release`]s `making`, if any, in a task of its own: a connect's task goes on with its set-up, or ends with
+/// its report (`drop_links`), meanwhile.
+fn release_later(making: Option<Making>, ctx: &Ctx) {
+    if let Some(making) = making {
+        tokio::spawn(making.release(ctx.held.clone()));
+    }
+}
+
 /// The turn of a connect to `device`, if it comes `within`: else the connect is reported failed, with nothing to
 /// disconnect, as BlueZ wasn't asked to connect, so that a connect queued behind others fails by the time the driver
 /// says, and doesn't make its link after the node has given it up (NB116-4).
@@ -1450,17 +1457,16 @@ impl Drop for Watching {
 }
 
 /// Connects to `device` as a central: the service's `tx` notifications as a socket to read, its `rx` as one to write
-/// without response. One that isn't set up within `SETUP`, or fails, is reported failed and then disconnected, which
-/// also stops a connect BlueZ still has under way: reported first, as the disconnect is answered only once the link
-/// is down (NB110-12), and this task ends with it, so one still under way has said nothing (`drop_links`). It waits
-/// for its turn ([`Ctx::turn`]), and fails, with nothing to disconnect, if that doesn't come within `SETUP` either
-/// ([`take_turn`], NB116-4); the scan is held off while it makes its link ([`Discovery`]), and a link not made
-/// `LINK` after that fails ([`linked`]): disconnected first, which BlueZ answers at once, holding its turn and the
-/// scan off until then, as that stops the kernel's attempt (NB116-2). Its link up or given up, its turn passes on once
-/// the scan has started again ([`Making::release`], NB116-3). A device that lists HID among its services isn't
-/// connected to, or its connect fails or its link closes as soon as BlueZ lists it, whenever that is (NB110-14); one
-/// BlueZ had neither paired nor trusted is removed from it once this connect, or its link, ends ([`Strangers`],
-/// NB110-13).
+/// without response. One that isn't set up within `SETUP`, or fails, is reported failed ([`connect_failed`]), and
+/// its link closed if BlueZ was asked to make it, and only then: a device whose link is up already, its own to this
+/// one or another program's, isn't asked to connect, and its link is left (NB110-16). This task ends with the report,
+/// so one still under way has said nothing (`drop_links`). It waits for its turn ([`Ctx::turn`]), and fails, with
+/// nothing to disconnect, if that doesn't come within `SETUP` either ([`take_turn`], NB116-4); the scan is held off
+/// while it makes its link ([`Discovery`]), and a link not made `LINK` after that fails ([`linked`]) (NB116-2). Its
+/// link up or given up, its turn passes on once the scan has started again ([`Making::release`], NB116-3). A device
+/// that lists HID among its services isn't connected to, or its connect fails or its link closes as soon as BlueZ
+/// lists it, whenever that is (NB110-14); one BlueZ had neither paired nor trusted is removed from it once this
+/// connect, or its link, ends, if the driver made its link ([`Strangers`], NB110-13).
 async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     let addr = address(device);
     let Ok(dev) = adapter.device(addr) else {
@@ -1471,30 +1477,40 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     let asked = Instant::now();
     let Some(making) = take_turn(&ctx, device, SETUP).await else { return };
     let mut making = Some(making);
+    // Whether BlueZ was asked to make its link, which is then the driver's to close.
+    let mut ours = false;
     let mut step = "reading it";
     let setup = async {
         // Read before the connect, which may pair it.
         let known = dev.is_paired().await? || dev.is_trusted().await?;
         no_hid(&dev).await?;
-        let touch = Touch::new(&ctx.strangers, addr, known, removes(&adapter, &ctx, addr));
         // Its events before the connect, so that its link coming up, or going down, or it listing HID, is heard from
         // here on: the rest of the set-up is given up for the last two, and then its link closed (NB-114, NB110-14).
         step = "following it";
         let mut changes = dev.events().await?.boxed();
-        step = "connecting";
-        let connecting = dev.connect();
-        tokio::pin!(connecting);
-        let answered = linked(connecting.as_mut(), &mut changes, ctx.scans.subscribe(), LINK).await?;
-        // Its link is up: the scan may run again, and the next connect's turn comes once it does, as this set-up goes
-        // on.
-        if let Some(making) = making.take() {
-            tokio::spawn(making.release(ctx.held.clone()));
-        }
-        // BlueZ answers once it has read the device's services, and its input plugin taken HID as an input device,
-        // which a disconnect asked for detaches at once; or at once, if the link is up already (the device connected
-        // to this one), and reads them after.
-        if !answered {
-            unless_gone(connecting, &mut changes).await?;
+        // Read once its events are taken, so that a link up now that goes is heard of.
+        step = "reading it";
+        let up = dev.is_connected().await?;
+        // One up already isn't the driver's: its device a stranger only if it is one already (NB110-16).
+        let touch = Touch::new(&ctx.strangers, addr, known || up, removes(&adapter, &ctx, addr));
+        if up {
+            // Not asked to connect: BlueZ would answer at once, or connect over BR/EDR to a device that has it too.
+            release_later(making.take(), &ctx);
+        } else {
+            step = "connecting";
+            ours = true;
+            let connecting = dev.connect();
+            tokio::pin!(connecting);
+            let answered = linked(connecting.as_mut(), &mut changes, ctx.scans.subscribe(), LINK).await?;
+            // Its link is up: the scan may run again, and the next connect's turn comes once it does, as this set-up
+            // goes on.
+            release_later(making.take(), &ctx);
+            // BlueZ answers once it has read the device's services, and its input plugin taken HID as an input
+            // device, which a disconnect asked for detaches at once; or at once, if the link came up meanwhile (the
+            // device connected to this one), and reads them after.
+            if !answered {
+                unless_gone(connecting, &mut changes).await?;
+            }
         }
         step = "reading its services";
         no_hid(&dev).await?;
@@ -1545,18 +1561,7 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         Ok(s) => s,
         Err(why) => {
             log::info!("Bluetooth: the connect to {} failed, {}", tag(device), masked(&why));
-            if let Some(making) = making {
-                // Its link not made, it holds its turn and the scan off until BlueZ has disconnected it, which stops
-                // the kernel's attempt, which the next link and the scan's start would wait behind (NB116-2). Then
-                // reported, before the scan has started again, which the release waits for in a task of its own: this
-                // one ends with its report (`drop_links`).
-                let _ = tokio::time::timeout(ABORT, drop_link(&adapter, &ctx.centrals, addr)).await;
-                ctx.events.send(RadioEvent::ConnectFailed { device });
-                tokio::spawn(making.release(ctx.held.clone()));
-                return;
-            }
-            ctx.events.send(RadioEvent::ConnectFailed { device });
-            return drop_later(&adapter, &ctx.centrals, [addr]);
+            return connect_failed(&adapter, &ctx, device, ours, making).await;
         }
     };
     // Nothing from here on waits, so a connect still under way hasn't said `Connected` (`drop_links`).
@@ -1580,6 +1585,27 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         }
     });
     ctx.centrals.lock().unwrap().insert(conn, Link { write, read, addr, _touch: touch });
+}
+
+/// A connect to `device` failed: it is reported, and its turn and its hold on the scan (`making`, while it made its
+/// link) released, after the report and in a task of its own ([`release_later`]). Its link is closed only if BlueZ
+/// was asked to make it (`ours`), which also stops a connect BlueZ still has under way: one up before, the device's
+/// own or another program's, is left, and so is one never asked for, as nothing is under way to stop (NB110-16). Not
+/// made, it holds its turn and the scan off until BlueZ has disconnected it, `ABORT` at most, which BlueZ answers at
+/// once, as that stops the kernel's attempt, which the next link and the scan's start would wait behind (NB116-2);
+/// made, it is reported first, as BlueZ answers a disconnect only once the link is down, 2 s or more later
+/// (NB110-12).
+async fn connect_failed(bluez: &impl Devices, ctx: &Ctx, device: DeviceId, ours: bool, making: Option<Making>) {
+    let addr = address(device);
+    let made = making.is_none();
+    if ours && !made {
+        let _ = tokio::time::timeout(ABORT, drop_link(bluez, &ctx.centrals, addr)).await;
+    }
+    ctx.events.send(RadioEvent::ConnectFailed { device });
+    release_later(making, ctx);
+    if ours && made {
+        drop_later(bluez, &ctx.centrals, [addr]);
+    }
 }
 
 /// Fails if BlueZ lists HID among `dev`'s services, from its adverts or, once connected, its GATT database: BlueZ's
@@ -2377,6 +2403,63 @@ mod tests {
             assert!(took >= Duration::from_millis(300), "{took:?}");
             assert_eq!(stuck.asked(addr(6)), ["disconnect", "remove"]);
             assert!(ctx.strangers.lock().unwrap().idle().contains(&addr(6)));
+        });
+    }
+
+    /// NB110-16: a failed connect closes the device's link only if BlueZ was asked to make it, not one up before (the
+    /// user's keyboard, say) nor one never asked for. Not made, it is closed before the failure is reported (NB116-2);
+    /// made, after (NB110-12). It ends with its report, its turn passed on in a task of its own once the scan has
+    /// started again (NB116-3), so that one still under way has said nothing (`drop_links`).
+    #[test]
+    fn a_failed_connect_closes_only_a_link_it_asked_for() {
+        runtime().block_on(async {
+            let (ctx, events) = ctx();
+            let bluez = FakeBluez { delay: Duration::from_millis(100), ..Default::default() };
+            let failed = |i: usize| RadioEvent::ConnectFailed { device: device_id(addr(i)) };
+            let said = || events.try_iter().collect::<Vec<_>>();
+            let making = || Some(Making::new(ctx.turn.clone().try_acquire_owned().unwrap(), &ctx));
+            let turns = || ctx.turn.available_permits();
+            // Failed before it was asked for (its turn held), or its link up already (its turn given back): left.
+            for (i, making) in [(1, making()), (2, None)] {
+                let t = Instant::now();
+                connect_failed(&bluez, &ctx, device_id(addr(i)), false, making).await;
+                assert!(t.elapsed() < Duration::from_millis(50), "{i} waited on nothing");
+                quiet().await;
+                assert!(bluez.asked(addr(i)).is_empty(), "{i} left connected");
+                assert_eq!(said(), [failed(i)]);
+                assert_eq!((*ctx.linking.borrow(), turns()), (0, 1), "{i}'s turn given back");
+            }
+            // Asked for and not made: disconnected first, its turn held and nothing said until BlueZ answers; then
+            // reported, with the scan held off still, which its turn waits for.
+            let off = Counted::new(&ctx.held);
+            let t = Instant::now();
+            let failing = connect_failed(&bluez, &ctx, device_id(addr(3)), true, making());
+            tokio::pin!(failing);
+            assert!(tokio::time::timeout(Duration::from_millis(50), failing.as_mut()).await.is_err());
+            assert_eq!(bluez.asked(addr(3)), ["disconnect"]);
+            assert_eq!((*ctx.linking.borrow(), said()), (1, vec![]), "held, and not reported yet");
+            failing.await;
+            assert!(t.elapsed() >= Duration::from_millis(100) && t.elapsed() < Duration::from_millis(200));
+            assert_eq!(said(), [failed(3)]);
+            quiet().await;
+            assert_eq!((*ctx.linking.borrow(), turns()), (0, 0), "the scan may start, and its turn waits for it");
+            drop(off);
+            quiet().await;
+            assert_eq!(turns(), 1, "given back once it has");
+            // Made: reported at once, then disconnected in a task of its own.
+            let t = Instant::now();
+            connect_failed(&bluez, &ctx, device_id(addr(4)), true, None).await;
+            assert!(t.elapsed() < Duration::from_millis(50));
+            assert_eq!(said(), [failed(4)]);
+            quiet().await;
+            assert_eq!(bluez.asked(addr(4)), ["disconnect"]);
+            // Unless the driver has a link to it, an earlier connect's, which goes on.
+            let idle = || tokio::spawn(std::future::pending::<()>());
+            ctx.centrals.lock().unwrap().insert(5, Link { write: idle(), read: idle(), addr: addr(5), _touch: None });
+            connect_failed(&bluez, &ctx, device_id(addr(5)), true, None).await;
+            quiet().await;
+            assert!(bluez.asked(addr(5)).is_empty());
+            assert_eq!(said(), [failed(5)]);
         });
     }
 

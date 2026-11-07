@@ -327,7 +327,9 @@ tests use an in-process pair of fake radios.
   As the central it gives a connect 10 s from the node's asking to come up (its turn, the link, the service found,
   both sockets), and reports one that fails or doesn't as failed, then disconnects it, which also stops a connect
   BlueZ still has under way. BlueZ answers a disconnect only once the link is down, 2 s or more later, so the driver
-  never waits on one whose link is up: each runs on its own.
+  never waits on one whose link is up: each runs on its own. It disconnects only a link it asked BlueZ to make: a
+  device whose link is up already, as it connected to this one or another program connected it (the user's keyboard,
+  say), isn't asked to connect, and its link stays when the connect fails.
   A device that lists HID among its services, in its adverts or once connected, isn't used: the driver doesn't
   connect to it, or fails the connect as soon as BlueZ has read its services, or closes its link as soon as it lists
   HID later. Asked to disconnect, BlueZ detaches its input plugin from the device at once, though the link goes 2 s
@@ -336,9 +338,10 @@ tests use an in-process pair of fake radios.
   of the driver's connects and links on it ends: disconnected, then `RemoveDevice`. So nothing BlueZ set up on those
   links stays: a bond, an input device, or the device itself, which BlueZ stores for good once it connects to one
   with a public or static address. One whose removal fails, as the adapter was off or gone, is removed once an adapter
-  is set up and powered. A device paired or trusted before is the user's, and stays. Dropping the driver closes its
-  links and waits up to 3 s for those removals; one whose link is up as its process is killed, or exits without
-  dropping it (a signal's default action), stays in BlueZ.
+  is set up and powered. A device paired or trusted before is the user's, and stays, and so does one whose link was up
+  already, as the driver didn't make it. Dropping the driver closes its links and waits up to 3 s for those removals;
+  one whose link is up as its process is killed, or exits without dropping it (a signal's default action), stays in
+  BlueZ.
   It holds its scan off while a connect is under way (NB-116). Linux starts a connect only once it hears the device
   advertise: while a discovery runs, from its reports alone, which come once for each device each time the discovery
   starts, every 10.24 s. A connect follows such a report, so with the scan on it waited for the next one, longer than
