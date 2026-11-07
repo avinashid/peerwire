@@ -33,6 +33,11 @@ pub fn join(modem: Modem<'static>, sysloop: EspSystemEventLoop, ssid: &str, pass
         auth_method: if password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal },
         ..Default::default()
     }))?;
+    // ESP-IDF's Wi-Fi library logs under its own tag the network's name and its access point's address on each join
+    // (`connected with …, bssid = …`), and those of other networks in range on some failures (NB110c-5). Its lines
+    // from error up only: each failed attempt is logged here, with its reason. Set after ESP-IDF's own start-up
+    // setting, so it holds.
+    unsafe { sys::esp_log_level_set(c"wifi".as_ptr(), sys::esp_log_level_t_ESP_LOG_ERROR) };
     w.start()?;
     sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
     let aps = w.scan()?;
