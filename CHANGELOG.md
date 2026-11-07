@@ -15,7 +15,11 @@ and the commit that fixed it.
   Feature `ble-bluez` adds the Linux driver, `ble::BlueZ`, which tries again what fails and follows the default
   adapter, and reports a link that drops at once (NB-114). The node and the driver log each connection (at `debug`,
   and failures at `info`), devices named by a hash, never an address. Drivers implement `ble::Radio`; the ESP32's
-  comes in `peerwire-esp`.
+  is in `peerwire-esp`.
+- `peerwire-esp`: feature `ble`, the ESP32's driver, `ble::Nimble`, on ESP-IDF's NimBLE (ESP32-C3 and ESP32): three
+  links, a new non-resolvable random address with each advert, and no bonds (a pairing hands over no keys, and its
+  connection is closed). The `ble` example is a room member that sets its clock over Wi-Fi, then links over
+  Bluetooth alone (NB-110c).
 - `peerwire-core`: `ble`, the framing codec every host shares (`Chunker`, `Reassembler`, the service's UUIDs);
   `Endpoint::handle_datagram_unbound`, for a channel no peer is bound to yet; `Address::radio`.
 - **Breaking:** `peerwire::Hop` has a new variant, `Ble`, and is `#[non_exhaustive]` from now on, so a `match` on it
@@ -23,6 +27,11 @@ and the commit that fixed it.
   with it). `Traversal::handle_signal` returns the member a hello or an offer proved (it returned nothing), and
   `Traversal::radio_reaches`, `Traversal::forget_radio` and `Traversal::room_hello` are new, and so are
   `Node::set_waker` (feature `ble`) and `AsyncNode` waking on its radio.
+- **Fix,** `peerwire-esp`: a board whose first NTP server didn't answer within 2 s could hang at boot, with no
+  warning and before its node started. The clock's last wait could be under 1 ms, which lwIP takes as no timeout
+  (NB-117).
+- `peerwire-esp`: a board joining Wi-Fi no longer logs the network's name or its access points' addresses, which
+  would tell where it is.
 
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 

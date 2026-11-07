@@ -33,17 +33,22 @@ pub fn join(modem: Modem<'static>, sysloop: EspSystemEventLoop, ssid: &str, pass
         auth_method: if password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal },
         ..Default::default()
     }))?;
+    // ESP-IDF's Wi-Fi library logs under its own tag the network's name and its access point's address on each join
+    // (`connected with …, bssid = …`), and those of other networks in range on some failures (NB110c-5). Its lines
+    // from error up only: each failed attempt is logged here, with its reason. Set after ESP-IDF's own start-up
+    // setting, so it holds.
+    unsafe { sys::esp_log_level_set(c"wifi".as_ptr(), sys::esp_log_level_t_ESP_LOG_ERROR) };
     w.start()?;
     sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
     let aps = w.scan()?;
+    // The log names neither the network nor its access points: a log people share would tell where the board is.
     let seen: Vec<_> = aps.iter().filter(|ap| ap.ssid == ssid).collect();
     if seen.is_empty() {
-        warn!("{ssid:?} not among the {} networks in range", aps.len());
+        warn!("the network isn't among the {} in range", aps.len());
     }
     for ap in seen {
-        let bssid: Vec<_> = ap.bssid.iter().map(|b| format!("{b:02x}")).collect();
         let (channel, dbm, auth) = (ap.channel, ap.signal_strength, ap.auth_method);
-        info!("hears {ssid:?} at {} on channel {channel}, {dbm} dBm, {auth:?}", bssid.join(":"));
+        info!("hears the network on channel {channel}, {dbm} dBm, {auth:?}");
     }
     // The last disconnect's reason (ESP-IDF's wifi_err_reason_t); 0 while there is none.
     let reason = Arc::new(AtomicU16::new(0));
@@ -59,7 +64,7 @@ pub fn join(modem: Modem<'static>, sysloop: EspSystemEventLoop, ssid: &str, pass
         let power = TX_POWER[(attempt - 1) % TX_POWER.len()];
         let dbm = f32::from(power) / 4.0;
         sys::esp!(unsafe { sys::esp_wifi_set_max_tx_power(power) })?;
-        info!("joining Wi-Fi {ssid:?}, attempt {attempt} at {dbm} dBm");
+        info!("joining Wi-Fi, attempt {attempt} at {dbm} dBm");
         reason.store(0, Ordering::Relaxed);
         w.wifi_mut().connect()?;
         let start = Instant::now();

@@ -11,7 +11,10 @@ readme = "README.md"
 keywords = ["esp32", "esp-idf", "embedded", "p2p", "iot"]
 categories = ["embedded", "network-programming"]
 rust-version = "1.88"
-include = ["/src", "/examples", "/build.rs", "/README.md", "/sdkconfig.defaults", "/LICENSE-MIT", "/LICENSE-APACHE"]
+include = [
+  "/src", "/examples", "/build.rs", "/README.md", "/sdkconfig.defaults", "/sdkconfig.ble", "/LICENSE-MIT",
+  "/LICENSE-APACHE",
+]
 
 # Not a member of the repo's workspace: it builds for the ESP32-C3 and ESP32 only, with their own toolchains (see README.md).
 [workspace]
@@ -20,11 +23,25 @@ include = ["/src", "/examples", "/build.rs", "/README.md", "/sdkconfig.defaults"
 # Rooms across the internet over a Nostr relay (Board::node_with_nostr). Its TLS (rustls on ring) compiles C with the
 # chip's GCC: see README.md.
 nostr = ["peerwire/nostr", "dep:ring"]
+# Bluetooth LE on ESP-IDF's NimBLE (NB-110): the ble module's radio driver for a Node. ESP-IDF must be built with
+# sdkconfig.ble too: build.sh does it.
+ble = ["dep:esp32-nimble", "peerwire/ble"]
 
 # The port's mesh test: QEMU's emulated chips, or a board on Wi-Fi (run.sh, wifi.sh, room.sh).
 [[example]]
 name = "mesh"
 required-features = ["nostr"]
+
+# NimBLE's footprint next to a Node, and a GATT echo (NB-110c): `FEATURES=ble EXAMPLE=ble_probe ./build.sh`.
+[[example]]
+name = "ble_probe"
+required-features = ["ble"]
+
+# A room member over Bluetooth with Wi-Fi off, for a PC running `ble_chat` (NB-110c):
+# `FEATURES=ble EXAMPLE=ble ./build.sh`.
+[[example]]
+name = "ble"
+required-features = ["ble"]
 
 [profile.release]
 opt-level = "s"
@@ -42,6 +59,11 @@ anyhow = "1"
 # Nostr signaling's TLS (rustls on ring): ring draws from esp_fill_random only with this
 # feature, and the firmware starts Wi-Fi before any draw (NB62-2).
 ring = { version = "0.17", features = ["less-safe-getrandom-espidf"], optional = true }
+esp32-nimble = { version = "0.13", optional = true }
+
+[dev-dependencies]
+# ble_probe times a handshake between two endpoints in memory.
+peerwire-core = { version = "0.1.0", path = "../../crates/peerwire-core" }
 
 [build-dependencies]
 embuild = "0.33.5"
