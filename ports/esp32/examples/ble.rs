@@ -14,6 +14,9 @@
 //! a numbered message every 5 s (every fourth one 2,000 B, a few GATT values long), and logs the links, the free heap
 //! and the lowest it has been every 10 s. Build it with `FEATURES=ble EXAMPLE=ble ./build.sh`, then flash
 //! out/ble.bin, or the copy wifi.sh writes.
+//!
+//! It keeps its identity across restarts (`peerwire_esp::identity`); flashing a full image draws a new one. On the
+//! serial console, `id` logs it and `id new` draws a new one and restarts.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -23,8 +26,9 @@ use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::sys;
 use log::{info, warn};
 use peerwire_esp::ble::Nimble;
+use peerwire_esp::console::Console;
 use peerwire_esp::peerwire::{Event, Lane, Node, PeerId};
-use peerwire_esp::{clock, config, free_heap, Board, PORT};
+use peerwire_esp::{clock, config, free_heap, identity, Board, PORT};
 
 /// Where wifi.sh and room.sh write their records: the last sector of a 4 MB flash (see examples/mesh.rs).
 const CFG_ADDR: u32 = 0x3F_F000;
@@ -78,7 +82,9 @@ fn run() -> anyhow::Result<()> {
         None => info!("ble: Wi-Fi off, NimBLE up, free heap {alone} B"),
     }
 
+    let console = Console::start()?;
     let mut node = Node::builder()
+        .identity(identity::load_or_create()?)
         .config(config())
         .stun_servers(Vec::<String>::new())
         .bluetooth(radio)
@@ -115,6 +121,16 @@ fn run() -> anyhow::Result<()> {
                 Event::Disconnected { peer, reason } => info!("ble: {} left: {reason:?}", short(&peer)),
                 Event::ConnectFailed { peer } => warn!("ble: link to {} failed", short(&peer)),
                 _ => {}
+            }
+        }
+        while let Some(line) = console.line() {
+            match line.as_str() {
+                "id" => info!("ble: id {}", node.peer_id()),
+                "id new" => {
+                    identity::renew()?;
+                    peerwire_esp::restart();
+                }
+                _ => warn!("ble: {line:?} isn't a command: `id` or `id new`"),
             }
         }
         let now = Instant::now();
