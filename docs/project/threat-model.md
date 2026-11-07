@@ -35,7 +35,7 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 |---|---|---|
 | Signaling relay (Nostr, BroadcastChannel) | No | May read, drop, reorder, replay or inject any signaling message. Cannot forge a sealed payload or impersonate a PeerId. |
 | The LAN, for `LanSignaling` | No | Every device on the link, and every program on the machine, hears each frame and can send its own, with no relay to pace it. The same limits as a relay: cannot open or forge a sealed payload. See [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6). |
-| Devices in Bluetooth range, for a node with a radio (`ble`, NB-110) | No | Hear every advert and can follow any connection, as nothing is paired; may connect, replay adverts, relay between two connections, jam or cut a link. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1), [on the ESP32](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5) and [BlueZ connects](#bluez-connects-and-the-scan-nb-116--nb116-1-nb116-2). |
+| Devices in Bluetooth range, for a node with a radio (`ble`, NB-110) | No | Hear every advert and can follow any connection, as nothing is paired; may connect, replay adverts, relay between two connections, jam or cut a link. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1), [on the ESP32](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5), [BlueZ connects](#bluez-connects-and-the-scan-nb-116--nb116-1-nb116-2) and [devices the BlueZ driver connects to](#devices-the-bluez-driver-connects-to-nb110-13--nb110-13nb110-16). |
 | Peer relay (`FWD`/`RELAYED`) | No | Sees only ciphertext; rate-limited; forwards only to already-connected peers. |
 | NAT / on-path network | No | Noise authenticates the endpoints; cannot MITM. Can drop/delay. |
 | A TURN server the app lists (`iceServers`; in Rust `turn_servers`, NB-099) | Partially | The app's choice, not ours. Sees our address, the peers' addresses, sizes and timing, never a payload; can drop or delay; picks the relayed address we offer. Under `Privacy::RelayOnly` with `Turn` in the policy (NB-101) the peers see its relayed address instead of ours. See [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) and [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1). |
@@ -187,6 +187,8 @@ release of each.
 | NB110c-I2, NB110c-I3 (Info) | Accepted: NimBLE's own gap can leave a GATT step that, 30 s on, ends whatever connection then holds its handle, once; the Wi-Fi library's error lines on a replayed or malformed frame name the access point, same section |
 | NB116-1 (Low), NB116-I1 (Info) | **Fixed** by `d51e64e` before NB-116 merged (`6641641`), so never on main (a connect holds the BlueZ scan off only once it has run 2 s since it started, and for 3 s at most, so it runs at least 40% of the time whatever connects a replayed advert draws), reviewed 2026-11-07; NB116-I1 bounded by it, at most one pause each 2 s, and accepted; residual: NB116-2, [BlueZ connects and the scan](#bluez-connects-and-the-scan-nb-116--nb116-1-nb116-2) |
 | NB116-2 (Low) | Open: a device that sends one connectable advert as its connect waits, then goes silent, holds Linux's one LE connect until the driver's 10 s deadline, and the scan's resume, the node's other connects and its advertising wait with it, same section |
+| NB110-13, NB110-14 (High, provisional) | **Fixed** by `a0b849c` and `364cff4`, merged `025d386`, before `ble-bluez` was published (the BlueZ driver uses no device that lists HID, in its advert, as BlueZ answers the connect or later, giving the set-up up or closing the link as soon as BlueZ lists it; it removes from BlueZ each device it connected to that BlueZ had neither paired nor trusted, once its last connect or link ends; it warns at start while `LEAutoSecurity` isn't false), reviewed 2026-11-07; residuals accepted, NB110-I11, NB110-I12 (Info) accepted, [Devices the BlueZ driver connects to](#devices-the-bluez-driver-connects-to-nb110-13--nb110-13nb110-16) |
+| NB110-15, NB110-16 (Low), NB110-I13 (Info) | Open: stopping the driver removes no stranger still linked; a failed connect disconnects a device that was connected before it, such as the user's own keyboard; after `bluetoothd` restarts, a stranger it stored with HID that links to the node first is used with HID unseen, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -5379,6 +5381,196 @@ whose start takes longer than `PAUSE` still running `RUN` after it returns.
   then how long it took, then `scan resumed`, with no `not done after 10 s`; and
   NB116-2's silent device, under `btmon`.
 
+### Devices the BlueZ driver connects to (NB110-13) — NB110-13…NB110-16
+
+Found in the NB-116 review: on a link the Linux driver makes as a central, BlueZ uses
+the device's own services too. Its GATT client reads the device's database on any link
+and hands each service to the plugin that claims it, whoever asked for the link, and its
+input plugin takes a device that serves HID (0x1812, a keyboard or a mouse) as an input
+device. The node connects to any advert with its room's tag, a replayed copy included
+(NB110-10), so anyone in range who had heard a member's advert could draw such a link.
+NB-110's central connects had it from their merge (`74c7452`); it was fixed before
+`ble-bluez` was published.
+
+Reviewed on 2026-11-07 in two passes, by reading, against `bluer` 0.17.4 and BlueZ
+5.87's source (`device.c`, `adapter.c`, `hog.c`): the fix `a0b849c` (NB110-14…NB110-16,
+I11, I12), then the fold-in `364cff4` (NB110-I13). The lead read Linux 7.2's
+`net/bluetooth/smp.c` for the pairing. The passes read the author's branch; `a0b849c`
+and `364cff4` are main's copies of its commits, with the same trees, merged as
+`025d386`. The fold-in's test ran on the review host, beside a mutant of it; nothing ran
+over a radio, as the review host has none.
+
+**What holds.**
+- **Strangers are removed.** Before each connect the driver reads whether BlueZ has the
+  device paired or trusted; one that is neither is a stranger, and each of the driver's
+  connects and links on it counts. Once the last ends, whichever way (a failure,
+  `SETUP`, its link down, the node closing the connection, the adapter lost, a task's
+  abort), the driver disconnects the device, which also stops a connect BlueZ has under
+  way, then removes it (`RemoveDevice`), and its bond, an input device and what BlueZ
+  stored of it go with it. If a connect to it started meanwhile, the removal is skipped,
+  and that connect's end removes it.
+- **Failed removals.** Only BlueZ's `DoesNotExist` counts as removed. A removal that
+  fails, as the adapter was off or gone, is kept and tried again once an adapter is set
+  up powered or powered on.
+- **The user's devices stay.** A device BlueZ had paired or trusted before the driver
+  first connected to it is never removed. A bait that takes a paired device's address
+  gets nowhere: BlueZ asks a paired device for an encrypted link, which a device without
+  its keys fails. A trusted one is NB110-I12.
+- **No HID device is used.** The driver doesn't connect to a device whose advert lists
+  HID, fails the connect if BlueZ lists it once `Connect` returns, and follows the
+  device's property changes from then on: a set-up step is given up, or the link closed,
+  as soon as BlueZ lists HID. Each is reported as a failed connect or a closed link,
+  then disconnected, and a stranger removed.
+- **Nothing missed.** `bluer` registers a device's subscription before `events()`
+  returns, and queues without bound, so HID that BlueZ lists at any point is either in
+  the second check's read or comes as a change after it.
+- **Disconnect, then `RemoveDevice`.** A disconnect fails a `Connect` still pending,
+  closes the link's ATT channel and detaches the input plugin from the device, all at
+  once; `RemoveDevice` alone may leave a pending connect until the device's last
+  reference goes.
+- **The warning.** At start the driver reads `/etc/bluetooth/input.conf` as GLib does
+  (its 42 test cases are GLib 2.80's own answers) and logs once at `info` unless
+  `LEAutoSecurity` is false; a misread costs the log line alone.
+  [Bluetooth](../concepts/bluetooth.md) says how to set it.
+- **Logs.** The new lines name a device by its hash alone, with BlueZ's errors masked,
+  as since NB-114.
+- No `pw_*` function changed, so no C ABI review was owed.
+
+**NB110-13 — A device the driver connected to could attach as a keyboard (High,
+provisional).** Read in BlueZ 5.87: the driver's `Device1.Connect` brings up a link on
+which `bluetoothd`'s own GATT client reads the device's database and accepts each
+profile that claims a service (`register_gatt_services` → `add_gatt_service` →
+`service_accept`), whoever asked for the link. For HID that is `hog_accept`: with the
+device not bonded and `LEAutoSecurity` true, the default, it asks the kernel to encrypt
+the link, which starts a pairing, then attaches the device, which becomes an input
+device once BlueZ has read its report map. BlueZ also stores a device with a public or
+static address for good. The node connects to any copy of a room's advert (NB110-10) and
+closes a connection that hasn't proven the room within 3 s (`PROVE_WITHIN`), so each
+fresh address draws another link of up to about 3 s. Severity: keystrokes typed into the
+user's session, so code run as the user, if the pairing goes through unasked. Linux 7.2
+hands every Just Works pairing to user space to confirm, and BlueZ 5.87 accepts one
+itself only during a `Pair` it was asked for, else asks the desktop's pairing agent and
+fails with none, so that is the agent's call: High until a radio check on our own
+hardware settles it, Low where the agent asks (an unasked pairing prompt). Reproduction:
+by reading; the radio check, a board serving HID that sends no keys, connected to as the
+driver connects, wasn't made. Fix: (a) warn while `LEAutoSecurity` isn't false; (b) use
+no device that lists HID; (c) remove from BlueZ each device the driver connected to that
+BlueZ had neither paired nor trusted, once its last connect or link ends.
+
+**Status: fixed** by `a0b849c` and `364cff4` (NB110-14), merged `025d386`, before
+`ble-bluez` was published; reviewed 2026-11-07. As above: the driver uses no device that
+lists HID, whenever BlueZ lists it, and removes from BlueZ the strangers it connected
+to, with what BlueZ set up on their links; it warns while `LEAutoSecurity` isn't false,
+as only that setting closes the window left. Residuals: (b)'s race and the rest below,
+NB110-15, NB110-16, NB110-I13.
+
+**NB110-14 — HID listed after the check was used (High, provisional, as NB110-13).**
+Found in the review of `a0b849c`, which read the device's services once, as BlueZ
+answered `Connect`. Two ways round it: the device adds HID after the check, with a
+Service Changed indication, and BlueZ accepts it on the live link (`gatt_service_added`
+→ `add_gatt_service` → `service_accept` → `hog_accept`); or the device has connected to
+the node's own advert first, so `Connect` answers at once, before BlueZ has read
+anything, the check reads the advert's list, and HoG attaches once BlueZ's own read
+ends. Either way NB110-13's exposure was back for the link's life: up to 3 s if the
+device can't prove the room, as long as the link lasts if it can. The removal still
+held. Reproduction: by reading. Fix: follow the device's property changes from right
+after `Connect`, and end the set-up or the link once BlueZ lists HID.
+
+**Status: fixed** by `364cff4` before the merge `025d386`, so never on main; reviewed
+2026-11-07. The driver takes the device's events right after `Connect`, before its
+second check. Each set-up step after it, from finding the service to taking `rx`, is
+given up as soon as BlueZ lists HID (`unless_gone`), so a device can't stall a step, up
+to `SETUP`, with HID attached; the link's reader closes the link on the same change.
+`a_central_link_ends_once_its_device_lists_hid` checks the helpers: a change without HID
+leaves the link, one with HID ends it, a stalled step is given up and a finished one
+isn't; a mutant that drops the HID arm fails it. `connect()`'s order is checked by
+reading, below. Residuals: (b)'s race, NB110-I13.
+
+**NB110-15 — Stopping the driver removes no stranger still linked (Low).** Found by the
+lead in the review of `a0b849c`. When the driver stops, as the node is dropped or its
+program ends on Ctrl-C, its thread stops and its runtime drops its tasks, so the
+removals its last links' ends start never run. Each run leaves in BlueZ the strangers it
+was linked to as it stopped, each stored for good if its address is public or static, so
+they pile up across runs, as before NB110-13. The HID check isn't weakened: a link with
+HID listed was closed already. Reproduction: by reading; on our own hardware, link to a
+board, stop the node, and `bluetoothctl devices` still lists it. Fix: as the driver
+stops, close its links and wait, about 3 s at most, for the removals.
+[Bluetooth](../concepts/bluetooth.md) says a device whose link is up as the process ends
+stays.
+
+**Status: open** (Low), reported on NB110-13 at `a0b849c`; its fix goes with NB116-2.
+
+**NB110-16 — A failed connect disconnects a device that was connected before it (Low).**
+On main since `708038f` (NB110-11's fix). The driver disconnects a device whose connect
+failed, to stop a connect BlueZ still has under way; but BlueZ answers `Connect` at once
+for an LE device already connected, so the disconnect also drops a link the driver
+didn't make. A device in range that replays a room's advert under the address of the
+user's own LE keyboard or mouse, or of anything else linked to the host, draws the
+driver's connect; it fails, as the device has no Peerwire service or, since NB110-13,
+lists HID, and the disconnect drops the user's device, once for each `n` replayed. Low:
+availability alone, of a device that links again. Reproduction: by reading. Fix: after a
+failure, disconnect only a device that wasn't connected before the driver asked.
+
+**Status: open** (Low), reported on NB110-13 at `a0b849c`.
+
+**Info.**
+- **NB110-I11 — `UserspaceHID=persist` keeps an input device past the disconnect.** With
+  that setting in `input.conf`, BlueZ keeps the input device it made for a device when
+  that device disconnects (`hog_disconnect`), until the device is removed. A stranger's
+  goes with its removal, after the disconnect's 2 s; a device the driver spares keeps
+  it, as any device the user paired does. Accepted.
+- **NB110-I12 — A device trusted but never paired is spared.** A device BlueZ has as
+  trusted isn't counted as a stranger, so a bait at its address isn't removed; the HID
+  check still applies to it. Accepted: trusting a device is the user's call.
+- **NB110-I13 — A stored stranger after `bluetoothd` restarts.** BlueZ signals `UUIDs`
+  only when its list changes, and until it has read an LE device's services on a link,
+  the property gives the advert's list. A device BlueZ stored with HID among its
+  services, from an earlier link on which it read them (the device's own link to the
+  node, below, or one whose removal never ran), keeps that list across a restart of
+  `bluetoothd`, but the property gives its advert's. If it then advertises a room
+  without HID, connects to the node first and draws the driver's connect, both checks
+  read the advert's list; once BlueZ reads its services HID is back, but the list hasn't
+  changed, so no signal comes, and the link is used with HID attached. Info: that link
+  is the device's own, on which BlueZ attaches HID whatever the driver does (the
+  peripheral side, below), and `LEAutoSecurity=false` closes both. Fix, one line, with
+  NB116-2: check once more after the set-up's steps, as `services()` waits for BlueZ to
+  have read them. Open.
+
+**Residuals, accepted.**
+- **(b) races HoG.** BlueZ's input plugin asks for the pairing and attaches HID before
+  it answers `Connect` and, for a service added later, before it signals the `UUIDs`
+  change, which it sends from an idle callback once the list has changed. So HID is
+  attached until the driver has the answer or the signal and its disconnect lands, a
+  D-Bus round trip later; the disconnect detaches the input device at once, though the
+  link goes 2 s later. Only `LEAutoSecurity=false` closes the window, which is why the
+  driver warns.
+- **`connect()`'s wiring is checked by reading.** Its helpers are tested, but with no
+  fake BlueZ device the order in `connect()` (the stranger counted before `Connect`, the
+  events taken before the second check, each later step under `unless_gone`) and
+  `remove_stranger`'s order of calls aren't. NB116-2 is to bring a fake device that can
+  test them.
+- **A process killed mid-link removes nothing.** The driver keeps no state across runs,
+  so a stranger linked as it died stays in BlueZ, and one bonded meanwhile reads as
+  paired in the next run and is kept. A clean stop is NB110-15.
+- **A connect that starts while a removal is under way** can be cut by it: the removal
+  checks again after its disconnect, so the window is one D-Bus call, the race any of
+  the driver's disconnects has.
+- **The peripheral side.** `bluetoothd` reads the services of a central that connects to
+  the node's advert too (`ReverseServiceDiscovery`, true by default), and its input
+  plugin takes HID there as on any link, with no room advert needed. The driver doesn't
+  make that link, so it neither checks nor removes that device. `LEAutoSecurity=false`
+  closes it too, as BlueZ then takes HID only from a paired device, whoever made the
+  link, and [Bluetooth](../concepts/bluetooth.md) says to set it. Documented; to check
+  on a radio with NB110-13's run.
+- **A removal D-Bus policy denies** is logged at `info` each time and tried again at
+  each set-up; the driver keeps an entry for each, so the list grows by at most one a
+  connect.
+- **Radio checks owed on our own hardware:** NB110-13's severity (a board serving HID
+  that sends no keys, connected to as the driver connects: whether a prompt appears and
+  an input device is made), the same board as a central linking to the node (the
+  peripheral side), and a stranger gone from BlueZ's list once its link ends, then
+  linked again as before.
+
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
 `@peerwire/react` (`packages/react`, 0.1.0 published from `dec1554`) wraps a room in
@@ -6160,7 +6352,10 @@ mappings that carry over and are already handled in Peerwire:
   by the owner; NB16-2).
 - With a radio (`ble`, NB-110), what anyone in Bluetooth range sees and can do: that a
   Peerwire peer is near, the sizes and timing of its connections, and jamming or cutting
-  them. A link over Bluetooth proves nothing about distance.
+  them. A link over Bluetooth proves nothing about distance. On Linux, unless
+  `LEAutoSecurity` is false, BlueZ's input plugin acts on a device that serves HID for
+  the moment before the driver drops it, and on a central that links to the node's
+  advert (NB110-13).
 - The security of the underlying crypto crates is assumed.
 
 ## Review method
@@ -6187,3 +6382,6 @@ Wi-Fi libraries; nothing ran over a radio there either.
 The BlueZ connect review (NB-116, 2026-11-07) read `bluer`'s and BlueZ 5.87's sources,
 and its author read Linux 7.2.8's for NB116-2; the diagnosis was measured on our own
 laptop and board, with no root, so no `btmon`.
+The BlueZ HID review (NB110-13, 2026-11-07) read `bluer`'s and BlueZ 5.87's sources, and
+the lead read Linux 7.2's `smp.c`; the fold-in's test and a mutant of it ran on the
+review host, and nothing ran over a radio.
