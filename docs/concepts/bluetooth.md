@@ -321,6 +321,18 @@ tests use an in-process pair of fake radios.
   As the central it gives a connect 10 s to come up (the link, the service found, both sockets), and reports one that
   fails or doesn't as failed, then disconnects it, which also stops a connect BlueZ still has under way. BlueZ answers
   a disconnect only once the link is down, 2 s or more later, so the driver never waits on one: each runs on its own.
+  It holds its scan off while a connect is under way (NB-116). Linux starts a connect only once it hears the device
+  advertise: while a discovery runs, from its reports alone, which come once for each device each time the discovery
+  starts, every 10.24 s. A connect follows such a report, so with the scan on it waited for the next one, longer than
+  its 10 s; with it off, the kernel scans for the connect itself, and it starts at the device's next advert. When
+  another program discovers too, BlueZ merges the filters, so the scan stopping restarts that discovery, which comes
+  to the same, unless the other's filter merges to the same as the driver's (another Peerwire process on the adapter).
+  The scan is held off for 3 s at most, and only once it has run 2 s since it last started. So however many connects
+  there are, and however long they take, which a device can draw by replaying a room's advert, it runs 2 s of every 5
+  and hears each device in range each time it starts (BlueZ advertises every 1.28 s by default). With connects under
+  way still as it starts again, it reports their devices again, which starts them, and is held off again 2 s later.
+  A connect that starts within those 2 s waits for the rest of them, unless the scan's report of its device starts it
+  first.
   A link that drops is reported closed at once: as the central, once BlueZ says the device isn't connected, or shuts
   the `tx` socket down, which it does as a link drops (a read then gives nothing, not an error).
   bluer's sockets take values of up to 5 bytes under the ATT MTU, so a connection at an ATT MTU of 23 or 24 (a phone
@@ -338,10 +350,11 @@ tests use an in-process pair of fake radios.
   default, powers on one it finds, as after a USB reset.
 
   The log names a device by a hash under a key drawn for each run, never by its address. At `info` the driver logs a
-  connect that fails, with the step and BlueZ's error, and a link that goes down, with why. At `debug` the node adds
-  each connection's life (made, refused, proven, closed and why, and how long its advert is held) and, once each 10 s
-  for an advert, why it doesn't connect to one of its room: it has the larger `n`, the advert is full, a connection
-  to it is open or under way, it is held, or the node has no room.
+  connect that fails, with the step and BlueZ's error, and a link that goes down, with why. At `debug` the driver adds
+  how long each connect took, and its scan pausing and resuming around it; the node adds each connection's life
+  (made, refused, proven, closed and why, and how long its advert is held) and, once each 10 s for an advert, why it
+  doesn't connect to one of its room: it has the larger `n`, the advert is full, a connection to it is open or under
+  way, it is held, or the node has no room.
 
   Ordinary users need access to `bluetoothd` over D-Bus, which most desktop distributions give the logged-in user.
 - **ESP32 (NB-110c):** NimBLE, three connections, an ATT MTU of 256 and a random non-resolvable address.
