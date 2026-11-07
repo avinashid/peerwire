@@ -26,6 +26,8 @@ and the commit that fixed it.
 - **Fix,** `peerwire-esp`: a board whose first NTP server didn't answer within 2 s could hang at boot, with no
   warning and before its node started. The clock's last wait could be under 1 ms, which lwIP takes as no timeout
   (NB-117).
+- `peerwire-esp`: a board joining Wi-Fi no longer logs the network's name or its access points' addresses, which
+  would tell where it is.
 
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 
