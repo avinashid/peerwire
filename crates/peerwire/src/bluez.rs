@@ -21,7 +21,8 @@
 //! A link that drops is reported closed at once, whoever dropped it: as the central's, once BlueZ says the device
 //! isn't connected or shuts the notification socket, which a read sees as an empty value (NB-114). A connect that
 //! fails is logged with the step it failed at and BlueZ's error, and a link that goes down with why; a device is named
-//! by a hash that holds for the run alone.
+//! by a hash that holds for the run alone. The scan is held off while a connect is under way: with it on, Linux
+//! starts the connect only at the scan's next report of the device, up to 10.24 s on ([`Discovery`], NB-116).
 
 use crate::ble::{tag, ConnId, DeviceId, Limits, Radio, RadioEvent, RX_UUID, SERVICE_UUID, TX_UUID};
 use bluer::adv::{Advertisement, AdvertisementHandle, Type};
@@ -35,7 +36,8 @@ use bluer::{
     Adapter, AdapterEvent, AdapterProperty, Address, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport,
     Session, SessionEvent, Uuid,
 };
-use futures::stream::{LocalBoxStream, Stream};
+use futures::future::BoxFuture;
+use futures::stream::{BoxStream, LocalBoxStream, Stream};
 use futures::{FutureExt, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
@@ -44,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::task::Waker;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -272,6 +274,8 @@ struct Ctx {
     shared: Arc<Shared>,
     peripheral: Arc<Mutex<Peripheral>>,
     centrals: Centrals,
+    /// How many connects are under way: the scan is held off while any is ([`Discovery`]).
+    connects: watch::Sender<usize>,
 }
 
 /// One part of the radio that should be up, and when to try it again: each failure is logged, and the first success
@@ -377,7 +381,8 @@ impl Driver {
             Err(e) => return drop(ready.send(Err(io::Error::other(e)))),
         };
         let peripheral = Arc::new(Mutex::new(Peripheral::default()));
-        let ctx = Ctx { events, shared, peripheral, centrals: Arc::new(Mutex::new(HashMap::new())) };
+        let centrals = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = Ctx { events, shared, peripheral, centrals, connects: watch::Sender::new(0) };
         let mut d = Driver {
             session,
             ctx,
@@ -500,7 +505,7 @@ impl Driver {
             }
         }
         if self.scanning && on.scan.is_none() && self.retry_scan.due(now) {
-            match scan(&on.adapter, &self.ctx.events).await {
+            match scan(&on.adapter, &self.ctx).await {
                 Ok(task) => {
                     on.scan = Some(task);
                     self.retry_scan.up();
@@ -813,35 +818,129 @@ async fn subscriptions(adapter: Adapter, ctx: Ctx, mut control: CharacteristicCo
 
 /// Starts the scan on `adapter`: every LE advert, each heard again as it comes, and the service's reported
 /// ([`follow`]). A filter on the service UUID would have BlueZ drop the rest, but crashes bluetoothd 5.87 (NB-112).
-async fn scan(adapter: &Adapter, events: &Events) -> Result<JoinHandle<()>, String> {
+async fn scan(adapter: &Adapter, ctx: &Ctx) -> Result<JoinHandle<()>, String> {
     let filter = DiscoveryFilter { transport: DiscoveryTransport::Le, duplicate_data: true, ..Default::default() };
     adapter.set_discovery_filter(filter).await.map_err(|e| format!("the filter: {e}"))?;
-    let found = adapter.discover_devices().await.map_err(|e| format!("discovery: {e}"))?;
-    Ok(tokio::spawn(follow(adapter.clone(), events.clone(), found)))
+    let discover = |adapter: Adapter| async move {
+        let found = adapter.discover_devices().await.map_err(|e| format!("discovery: {e}"))?;
+        Ok::<Reports, String>(found.boxed())
+    };
+    let found = discover(adapter.clone()).await?;
+    let a = adapter.clone();
+    // In a task of its own, so that a scan stopped as it starts again can't stop it half way, with BlueZ discovering
+    // for a session no one holds.
+    let start: Start = Box::new(move || {
+        let start = tokio::spawn(discover(a.clone()));
+        async move { start.await.map_err(|e| e.to_string())? }.boxed()
+    });
+    let discovery = Discovery { found: Some(found), start, connects: ctx.connects.subscribe() };
+    Ok(tokio::spawn(follow(adapter.clone(), ctx.events.clone(), discovery)))
 }
 
 /// Reports the service's adverts among what the scan finds, until it ends.
-async fn follow(
-    adapter: Adapter,
-    events: Events,
-    mut found: impl Stream<Item = AdapterEvent> + Send + Unpin + 'static,
-) {
+async fn follow(adapter: Adapter, events: Events, mut discovery: Discovery) {
     let mut watching = Watching::default();
     loop {
+        if !discovery.settle().await {
+            return;
+        }
         let again = watching.relist_at(Instant::now());
         tokio::select! {
-            e = found.next() => match e {
-                Some(AdapterEvent::DeviceAdded(addr)) => {
+            next = discovery.next() => match next {
+                // A session starting again lists BlueZ's devices again: one followed already is left as it is.
+                Next::Found(AdapterEvent::DeviceAdded(addr)) if !watching.following(addr) => {
                     let Ok(dev) = adapter.device(addr) else { continue };
                     let ours = matches!(dev.service_data().await, Ok(Some(data)) if seen(&events, addr, &data));
                     watch(&mut watching, &events, dev, ours).await;
                 }
-                Some(AdapterEvent::DeviceRemoved(addr)) => watching.remove(addr),
-                Some(_) => {}
-                None => return,
+                Next::Found(AdapterEvent::DeviceRemoved(addr)) => watching.remove(addr),
+                Next::Found(_) | Next::Connects => {}
+                Next::Ended => return,
             },
             () = until(again) => list_again(&adapter, &events, &mut watching).await,
         }
+    }
+}
+
+/// What a discovery session reports: BlueZ's devices as it starts, then each one BlueZ adds or removes.
+type Reports = BoxStream<'static, AdapterEvent>;
+
+/// Starts a discovery session.
+type Start = Box<dyn FnMut() -> BoxFuture<'static, Result<Reports, String>> + Send>;
+
+/// The scan's discovery session, held off while the driver connects to a device (NB-116). Linux starts a connect to
+/// an LE device once it hears the device advertise: while a discovery runs, from its reports alone, which come once a
+/// device each time the discovery starts (every 10.24 s, as the kernel ends it and bluetoothd starts it again), and
+/// the report that drew the connect was that one. With no discovery, the kernel scans for the connect itself, and it
+/// starts at the device's next advert.
+struct Discovery {
+    /// The session, while it runs.
+    found: Option<Reports>,
+    start: Start,
+    /// How many connects are under way ([`Ctx::connects`]).
+    connects: watch::Receiver<usize>,
+}
+
+/// What came next in the scan.
+enum Next {
+    Found(AdapterEvent),
+    /// A connect started or ended.
+    Connects,
+    /// The session ended, or the driver is gone.
+    Ended,
+}
+
+impl Discovery {
+    /// Stops the session while a connect is under way, and starts it again once none is: whether it runs, or is held
+    /// off, as it should be; not once it can't start again.
+    async fn settle(&mut self) -> bool {
+        let connecting = *self.connects.borrow_and_update() > 0;
+        if connecting && self.found.take().is_some() {
+            log::debug!("Bluetooth: the scan paused for a connect");
+        } else if !connecting && self.found.is_none() {
+            match (self.start)().await {
+                Ok(found) => {
+                    self.found = Some(found);
+                    log::debug!("Bluetooth: the scan resumed");
+                }
+                Err(e) => {
+                    log::info!("Bluetooth: the scan didn't resume: {}", masked(&e));
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// What the session reports next, or a connect starting or ending. It can be dropped while it waits.
+    async fn next(&mut self) -> Next {
+        let (found, connects) = (&mut self.found, &mut self.connects);
+        let found = async {
+            match found {
+                Some(found) => found.next().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            e = found => e.map_or(Next::Ended, Next::Found),
+            changed = connects.changed() => if changed.is_ok() { Next::Connects } else { Next::Ended },
+        }
+    }
+}
+
+/// A connect under way, counted in [`Ctx::connects`] from its start to its end, or its task's abort.
+struct Connecting(watch::Sender<usize>);
+
+impl Connecting {
+    fn new(connects: &watch::Sender<usize>) -> Connecting {
+        connects.send_modify(|n| *n += 1);
+        Connecting(connects.clone())
+    }
+}
+
+impl Drop for Connecting {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
     }
 }
 
@@ -948,6 +1047,11 @@ impl Watching {
         self.devices.contains_key(&addr)
     }
 
+    /// Whether `addr` is followed still: BlueZ hasn't removed it since.
+    fn following(&self, addr: Address) -> bool {
+        self.devices.get(&addr).is_some_and(|w| !w.task.is_finished())
+    }
+
     /// When to list BlueZ's devices again, as of `now`: once one was missed and a device of the service could be
     /// followed (there is room, or one followed never advertised it), `RELIST` after the last listing.
     fn relist_at(&self, now: Instant) -> Option<Instant> {
@@ -987,8 +1091,11 @@ impl Drop for Watching {
 /// Connects to `device` as a central: the service's `tx` notifications as a socket to read, its `rx` as one to write
 /// without response. One that isn't set up within `SETUP`, or fails, is reported failed and then disconnected, which
 /// also stops a connect BlueZ still has under way: reported first, as the disconnect is answered only once the link
-/// is down (NB110-12), and this task ends with it, so one still under way has said nothing (`drop_links`).
+/// is down (NB110-12), and this task ends with it, so one still under way has said nothing (`drop_links`). The scan
+/// is held off until it ends ([`Discovery`]).
 async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
+    let _connecting = Connecting::new(&ctx.connects);
+    let asked = Instant::now();
     let addr = address(device);
     let Ok(dev) = adapter.device(addr) else {
         log::info!("Bluetooth: the connect to {} failed: BlueZ doesn't have it", tag(device));
@@ -1045,6 +1152,7 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         }
     };
     // Nothing from here on waits, so a connect still under way hasn't said `Connected` (`drop_links`).
+    log::debug!("Bluetooth: connected to {} in {} ms", tag(device), asked.elapsed().as_millis());
     let conn = ctx.shared.next.fetch_add(1, Ordering::Relaxed);
     let (out, mut queue) = mpsc::channel::<Vec<u8>>(QUEUE);
     ctx.shared.senders.lock().unwrap().insert(conn, out);
@@ -1318,6 +1426,7 @@ mod tests {
             // A device whose watch ended (BlueZ removed it) makes room too.
             let ended = w.devices.get(&addr(5)).map(|d| d.task.abort()).is_some();
             quiet().await;
+            assert!(w.following(addr(0)) && !w.following(addr(5)), "one that ended isn't followed still (NB-116)");
             assert!(ended && w.room(addr(WATCH + 2), false), "one that ended makes room");
             assert!(!w.devices.contains_key(&addr(5)));
             let task = w.devices[&addr(0)].task.abort_handle();
@@ -1380,7 +1489,8 @@ mod tests {
             Arc::new(Shared { senders: Mutex::new(HashMap::new()), next: AtomicU32::new(1), waker: Mutex::new(None) });
         let events = Events { tx, shared: shared.clone() };
         let peripheral = Arc::new(Mutex::new(Peripheral::default()));
-        (Ctx { events, shared, peripheral, centrals: Arc::new(Mutex::new(HashMap::new())) }, rx)
+        let centrals = Arc::new(Mutex::new(HashMap::new()));
+        (Ctx { events, shared, peripheral, centrals, connects: watch::Sender::new(0) }, rx)
     }
 
     /// NB-112: when the adapter goes, every link on it is reported closed, a connect under way fails, and one that
@@ -1511,6 +1621,79 @@ mod tests {
             assert!(writer.is_finished(), "the writer stopped");
             assert!(!link_down(&ctx, 5, "BlueZ says it isn't connected"), "and it isn't reported again");
             assert_eq!(events.try_iter().count(), 0);
+        });
+    }
+
+    /// Discovery sessions for a test to feed: the start that hands out a new one each time, and a sender for each one
+    /// started, which finds it closed once the session is dropped.
+    fn sessions() -> (Start, Arc<Mutex<Vec<mpsc::UnboundedSender<AdapterEvent>>>>) {
+        let fed = Arc::new(Mutex::new(Vec::new()));
+        let f = fed.clone();
+        let start: Start = Box::new(move || {
+            let (tx, rx) = mpsc::unbounded_channel();
+            f.lock().unwrap().push(tx);
+            let found = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) });
+            async move { Ok::<Reports, String>(found.boxed()) }.boxed()
+        });
+        (start, fed)
+    }
+
+    /// What the scan has next within 50 ms, if anything.
+    async fn soon(d: &mut Discovery) -> Option<Next> {
+        tokio::time::timeout(Duration::from_millis(50), d.next()).await.ok()
+    }
+
+    /// NB-116 (omarchy's runs 18–20): Linux starts a connect only from an advert the running discovery reports, and
+    /// that reports a device once a cycle, so a connect asked for on one waited 10 s for the next, and was given up
+    /// just before. The scan is held off while a connect is under way, until each one has ended or its task was
+    /// aborted, and then starts again; one that can't start again ends, as one whose session ends does.
+    #[test]
+    fn a_connect_holds_the_scan_off_until_it_ends() {
+        runtime().block_on(async {
+            let connects = watch::Sender::new(0);
+            let (mut start, fed) = sessions();
+            let found = start().await.ok();
+            let mut d = Discovery { found, start, connects: connects.subscribe() };
+            let session = |k: usize| fed.lock().unwrap()[k].clone();
+            let added =
+                |n: Option<Next>, i| matches!(n, Some(Next::Found(AdapterEvent::DeviceAdded(a))) if a == addr(i));
+            let changed = |n: Option<Next>| matches!(n, Some(Next::Connects));
+            assert!(d.settle().await);
+            session(0).send(AdapterEvent::DeviceAdded(addr(1))).unwrap();
+            assert!(added(soon(&mut d).await, 1), "it reports what it finds");
+            let first = Connecting::new(&connects);
+            assert!(changed(soon(&mut d).await) && d.settle().await);
+            assert!(session(0).is_closed(), "a connect stops the session");
+            let second = Connecting::new(&connects);
+            assert!(changed(soon(&mut d).await) && d.settle().await);
+            drop(first);
+            assert!(changed(soon(&mut d).await) && d.settle().await);
+            assert_eq!(fed.lock().unwrap().len(), 1, "not started again while one is under way");
+            assert!(soon(&mut d).await.is_none(), "and nothing found meanwhile");
+            // The second's task is aborted, as when the adapter goes.
+            let task = tokio::spawn(async move {
+                let _connecting = second;
+                std::future::pending::<()>().await
+            });
+            quiet().await;
+            task.abort();
+            quiet().await;
+            assert_eq!(*connects.borrow(), 0, "an aborted connect counts out");
+            assert!(changed(soon(&mut d).await) && d.settle().await);
+            assert_eq!(fed.lock().unwrap().len(), 2, "started again once none is under way");
+            session(1).send(AdapterEvent::DeviceAdded(addr(2))).unwrap();
+            assert!(added(soon(&mut d).await, 2));
+            fed.lock().unwrap().truncate(1);
+            assert!(matches!(soon(&mut d).await, Some(Next::Ended)), "its session ended");
+            // One that can't start again ends, once no connect holds it off.
+            let fails: Start = Box::new(|| async { Err::<Reports, String>("org.bluez.Error.NotReady".into()) }.boxed());
+            let mut d = Discovery { found: None, start: fails, connects: connects.subscribe() };
+            let held = Connecting::new(&connects);
+            assert!(d.settle().await, "held off, it isn't started");
+            drop(held);
+            assert!(!d.settle().await, "it doesn't start again");
+            drop(connects);
+            assert!(matches!(soon(&mut d).await, Some(Next::Ended)), "nor once the driver is gone");
         });
     }
 }
