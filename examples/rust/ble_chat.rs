@@ -13,7 +13,8 @@
 //! the room. It needs `bluetoothd` and a powered adapter; centrals nearby read the adapter's alias as its name. The
 //! driver's log goes to stderr: a part of the radio that failed and is tried again, the adapter going or changing, a
 //! connect that failed and a link that went down. `RUST_LOG=debug` adds each connection's life (made, refused, proven,
-//! closed and why), and why the node didn't connect to an advert it heard (once each 10 s).
+//! closed and why), and why the node didn't connect to an advert it heard (once each 10 s). Ctrl-C (or SIGTERM) ends
+//! it: the node closes, and the driver removes from BlueZ the devices it connected to, which takes up to 3 s.
 
 use peerwire::ble::BlueZ;
 use peerwire::{Event, LanSignaling, Lane, Node, PathKind, PeerId, Policy};
@@ -55,7 +56,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    loop {
+    // Ended by a signal's default action, the process would drop nothing, the radio included.
+    let (stop, stopped) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = stop.send(());
+    })?;
+    while stopped.try_recv().is_err() {
         node.poll();
         while let Some(event) = node.try_recv_event() {
             match event {
@@ -79,6 +85,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::thread::sleep(node.next_timeout().unwrap_or(Duration::MAX).min(Duration::from_millis(5)));
     }
+    println!("closing");
+    Ok(())
 }
 
 /// Prints Peerwire's log lines, such as the Bluetooth driver's, to stderr.

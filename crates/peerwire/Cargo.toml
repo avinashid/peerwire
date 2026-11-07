@@ -87,6 +87,9 @@ peerwire-sim = { path = "../peerwire-sim" }
 peerwire-sync = { path = "../peerwire-sync" }
 # ble_chat prints the Bluetooth driver's log (already in the tree through bluer and tungstenite).
 log = "0.4"
+# ble_chat ends on Ctrl-C and SIGTERM, so that its node closes and the BlueZ driver removes the devices it connected
+# to, which a signal's default action would skip. 3.4.5 uses the nix (0.29) bluer brings.
+ctrlc = { version = "3.4.5", features = ["termination"] }
 
 [[example]]
 name = "echo"
