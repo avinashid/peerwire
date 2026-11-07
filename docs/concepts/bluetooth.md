@@ -324,10 +324,10 @@ tests use an in-process pair of fake radios.
 
   As the peripheral the driver serves the central whose subscription to `tx` BlueZ hands over, as a socket with its
   address (`AcquireNotify`), and takes writes from that device alone; another that writes meanwhile is disconnected.
-  As the central it gives a connect 10 s from its turn to come up (the link, the service found, both sockets), and
-  reports one that fails or doesn't as failed, then disconnects it, which also stops a connect BlueZ still has under
-  way. BlueZ answers a disconnect only once the link is down, 2 s or more later, so the driver never waits on one
-  whose link is up: each runs on its own.
+  As the central it gives a connect 10 s from the node's asking to come up (its turn, the link, the service found,
+  both sockets), and reports one that fails or doesn't as failed, then disconnects it, which also stops a connect
+  BlueZ still has under way. BlueZ answers a disconnect only once the link is down, 2 s or more later, so the driver
+  never waits on one whose link is up: each runs on its own.
   A device that lists HID among its services, in its adverts or once connected, isn't used: the driver doesn't
   connect to it, or fails the connect as soon as BlueZ has read its services, or closes its link as soon as it lists
   HID later. Asked to disconnect, BlueZ detaches its input plugin from the device at once, though the link goes 2 s
@@ -355,8 +355,10 @@ tests use an in-process pair of fake radios.
   most should BlueZ not start it, so that its link is asked for with the scan running, not as it starts. So however
   many connects there are, which a device can draw by replaying a room's advert, the scan runs 2 s of every 5 to 6 at
   worst (2 s, the link's 3 s, and up to 1 s for BlueZ to disconnect the device: **theoretical**), and hears each
-  device in range each time it starts (BlueZ advertises every 1.28 s by default). A connect's 10 s count from its
-  turn; in a room of three or more, links come up one after another. Should BlueZ not answer a connect at all, the
+  device in range each time it starts (BlueZ advertises every 1.28 s by default). A connect's 10 s count from the
+  node's asking, its wait for its turn included (NB116-4): one queued behind connects to silent devices fails, with
+  nothing to disconnect, before the node's own 12 s run out, and its link isn't asked for once the node has given it
+  up. In a room of three or more, links come up one after another. Should BlueZ not answer a connect at all, the
   scan starts again 5 s after it was held off, reports the device of the link being made again, which starts it, and
   is held off again 2 s later. A connect whose turn comes within those 2 s waits for the rest of them, unless the
   scan's report of its device starts it first.

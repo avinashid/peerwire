@@ -63,9 +63,11 @@ use tokio::time::Instant;
 const QUEUE: usize = 32;
 /// How long [`BlueZ::new`] waits for the adapter.
 const START: Duration = Duration::from_secs(10);
-/// A connect not set up this long after its turn ([`Ctx::turn`]) (the link, the service found, both sockets) fails,
-/// and its link drops: so a device that stalls it can't hold one of the node's connects for bluer's 120 s a step, and
-/// the node, which gives one up after 12 s, hears why first (NB110-11).
+/// A connect not set up this long after it was asked for (its turn ([`Ctx::turn`]), the link, the service found, both
+/// sockets) fails, and its link drops if it was asked for: so a device that stalls it can't hold one of the node's
+/// connects for bluer's 120 s a step, nor connects queued ahead of it hold it past the node's wait (NB116-4); the
+/// node, which gives one up after 12 s, hears why first, as a link not made is disconnected, `ABORT` at most, before
+/// it is reported (NB110-11).
 const SETUP: Duration = Duration::from_secs(10);
 /// A connect whose link isn't up this long after the scan is held off for it fails ([`linked`]): time for a device that
 /// advertises each 1.28 s, as BlueZ does by default, to be heard twice, its link up 0.13 s after it is (NB116-2).
@@ -1286,6 +1288,23 @@ impl Making {
     }
 }
 
+/// The turn of a connect to `device`, if it comes `within`: else the connect is reported failed, with nothing to
+/// disconnect, as BlueZ wasn't asked to connect, so that a connect queued behind others fails by the time the driver
+/// says, and doesn't make its link after the node has given it up (NB116-4).
+async fn take_turn(ctx: &Ctx, device: DeviceId, within: Duration) -> Option<Making> {
+    match tokio::time::timeout(within, ctx.turn.clone().acquire_owned()).await {
+        Ok(Ok(turn)) => Some(Making::new(turn, ctx)),
+        // Closed: it never is.
+        Ok(Err(_)) => None,
+        Err(_) => {
+            let s = within.as_secs();
+            log::info!("Bluetooth: the connect to {} failed, waiting for its turn: not done after {s} s", tag(device));
+            ctx.events.send(RadioEvent::ConnectFailed { device });
+            None
+        }
+    }
+}
+
 /// Follows `dev`, which has advertised the service if `ours`, if `watching` has room for it: each advert of its with
 /// the service's data is reported.
 async fn watch(watching: &mut Watching, events: &Events, dev: bluer::Device, ours: bool) {
@@ -1434,7 +1453,8 @@ impl Drop for Watching {
 /// without response. One that isn't set up within `SETUP`, or fails, is reported failed and then disconnected, which
 /// also stops a connect BlueZ still has under way: reported first, as the disconnect is answered only once the link
 /// is down (NB110-12), and this task ends with it, so one still under way has said nothing (`drop_links`). It waits
-/// for its turn ([`Ctx::turn`]), the scan is held off while it makes its link ([`Discovery`]), and a link not made
+/// for its turn ([`Ctx::turn`]), and fails, with nothing to disconnect, if that doesn't come within `SETUP` either
+/// ([`take_turn`], NB116-4); the scan is held off while it makes its link ([`Discovery`]), and a link not made
 /// `LINK` after that fails ([`linked`]): disconnected first, which BlueZ answers at once, holding its turn and the
 /// scan off until then, as that stops the kernel's attempt (NB116-2). Its link up or given up, its turn passes on once
 /// the scan has started again ([`Making::release`], NB116-3). A device that lists HID among its services isn't
@@ -1447,10 +1467,10 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         log::info!("Bluetooth: the connect to {} failed: BlueZ doesn't have it", tag(device));
         return ctx.events.send(RadioEvent::ConnectFailed { device });
     };
-    // Its turn, and the scan held off, until its link is up (`SETUP` counts from here). None once the driver is gone.
-    let Ok(turn) = ctx.turn.clone().acquire_owned().await else { return };
-    let mut making = Some(Making::new(turn, &ctx));
+    // `SETUP` counts from here, its wait for its turn included, as the node's own wait does (NB116-4).
     let asked = Instant::now();
+    let Some(making) = take_turn(&ctx, device, SETUP).await else { return };
+    let mut making = Some(making);
     let mut step = "reading it";
     let setup = async {
         // Read before the connect, which may pair it.
@@ -1513,13 +1533,13 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         }
         Ok::<_, bluer::Error>((reader, writer, changes, touch))
     };
-    let set_up = match tokio::time::timeout(SETUP, setup).await {
+    let set_up = match tokio::time::timeout_at(asked + SETUP, setup).await {
         Ok(Ok((r, w, changes, touch))) => {
             let len = w.mtu().min(r.mtu());
             att_mtu(len).map(|mtu| (r, w, changes, touch, mtu)).ok_or_else(|| format!("its sockets take {len} bytes"))
         }
         Ok(Err(e)) => Err(format!("{step}: {e}")),
-        Err(_) => Err(format!("{step}: not done after {} s", SETUP.as_secs())),
+        Err(_) => Err(format!("{step}: not done {} s after it was asked for", SETUP.as_secs())),
     };
     let (reader, writer, changes, touch, mtu) = match set_up {
         Ok(s) => s,
@@ -2624,6 +2644,35 @@ mod tests {
             let released = tokio::time::timeout(ABORT + 100 * ms, c.release(ctx.held.clone())).await;
             assert!(released.is_ok() && t.elapsed() >= ABORT, "{:?}", t.elapsed());
             assert_eq!(ctx.turn.available_permits(), 1);
+        });
+    }
+
+    /// NB116-4: a connect's `SETUP` counts from the node's asking, its wait for its turn included, as the node's own
+    /// wait does: one queued behind a turn that is held, as by connects to silent devices, is reported failed once it
+    /// is up, and holds nothing; one whose turn comes in time takes it, and the scan is held off for it.
+    #[test]
+    fn a_connect_whose_turn_doesnt_come_in_time_fails() {
+        assert!(SETUP + ABORT < crate::ble::CONNECT_WAIT, "the node hears first");
+        runtime().block_on(async {
+            let (ctx, events) = ctx();
+            let within = Duration::from_millis(200);
+            let id = |i| device_id(addr(i));
+            let first = take_turn(&ctx, id(1), within).await.expect("its turn, at once");
+            assert_eq!(*ctx.linking.borrow(), 1);
+            let t = Instant::now();
+            let queued = tokio::time::timeout(4 * within, take_turn(&ctx, id(2), within)).await;
+            assert!(matches!(queued, Ok(None)), "not its turn");
+            assert!(t.elapsed() >= within && t.elapsed() < 2 * within, "{:?}", t.elapsed());
+            assert!(matches!(events.try_recv(), Ok(RadioEvent::ConnectFailed { device }) if device == id(2)));
+            assert_eq!(*ctx.linking.borrow(), 1, "the scan held off for the first alone");
+            // One whose turn comes in time.
+            let c = ctx.clone();
+            let third = tokio::spawn(async move { take_turn(&c, id(3), within).await.map(|m| *m.linking.0.borrow()) });
+            quiet().await;
+            first.release(ctx.held.clone()).await;
+            assert_eq!(third.await.unwrap(), Some(1), "it takes its turn");
+            assert!(events.try_recv().is_err(), "and isn't reported");
+            assert_eq!((*ctx.linking.borrow(), ctx.turn.available_permits()), (0, 1));
         });
     }
 }
