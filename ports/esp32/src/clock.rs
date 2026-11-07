@@ -127,7 +127,8 @@ fn ask(server: &str) -> io::Result<(SocketAddr, Duration)> {
     let mut buf = [0u8; 64];
     loop {
         let left = end.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        // lwIP counts a read timeout in whole ms and takes 0 as none, so under 1 ms left would wait for ever (NB-117).
+        if left < Duration::from_millis(1) {
             return Err(io::Error::new(io::ErrorKind::TimedOut, format!("no answer from {to} in 2 s")));
         }
         sock.set_read_timeout(Some(left))?;

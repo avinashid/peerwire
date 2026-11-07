@@ -23,6 +23,9 @@ and the commit that fixed it.
   with it). `Traversal::handle_signal` returns the member a hello or an offer proved (it returned nothing), and
   `Traversal::radio_reaches`, `Traversal::forget_radio` and `Traversal::room_hello` are new, and so are
   `Node::set_waker` (feature `ble`) and `AsyncNode` waking on its radio.
+- **Fix,** `peerwire-esp`: a board whose first NTP server didn't answer within 2 s could hang at boot, with no
+  warning and before its node started. The clock's last wait could be under 1 ms, which lwIP takes as no timeout
+  (NB-117).
 
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 
