@@ -5191,8 +5191,8 @@ ESP-IDF sets once, in a start-up constructor; the port sets it after that, befor
 starts, and both builds keep a level per tag. Error, not warning: two of the
 `Invalid AP` lines are warnings. The other loggers on a join print no name or address:
 the library's `lib_printf` lines on a station, the supplicant's, which are compiled out,
-and esp-idf-svc's. On our C3 the fixed image joined with no `connected with`, `bssid` or
-`SSID=` line in its log. Residual: NB110c-I3.
+and esp-idf-svc's. On our C3 a run of the fixed image logged none of these lines: no
+`connected with`, `bssid`, `SSID=`, `ba-add` or `mode : sta`. Residual: NB110c-I3.
 
 **Info.**
 - **NB110c-I1 — A central could make the board log at will.** esp32-nimble's server
