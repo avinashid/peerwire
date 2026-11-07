@@ -1443,7 +1443,11 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
             step = "finding the service";
             let mut rx = None;
             let mut tx = None;
-            for s in dev.services().await? {
+            let services = dev.services().await?;
+            // Resolved now, BlueZ lists the services it read: HID among them gets no signal if it had them stored, from
+            // before bluetoothd restarted, as the list it holds doesn't change (NB110-I13).
+            no_hid(&dev).await?;
+            for s in services {
                 if s.uuid().await? != uuid(SERVICE_UUID) {
                     continue;
                 }
