@@ -1388,6 +1388,7 @@ dependencies = [
  "hmac",
  "if-addrs",
  "k256",
+ "log",
  "peerwire-core",
  "rand_chacha",
  "rand_core",

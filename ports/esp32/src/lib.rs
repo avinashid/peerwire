@@ -33,16 +33,21 @@
 //! **Entropy.** Until Wi-Fi is started, ESP-IDF's random numbers are only pseudo-random, so a node built before it
 //! draws a guessable identity and keys (NB-063). [`Board::connect`] starts Wi-Fi first; firmware that builds a
 //! [`Node`] another way must do the same.
+//!
+//! **Identity.** A node draws a new identity each time it's built unless it's given one. [`identity::load_or_create`]
+//! keeps one in NVS across restarts, for [`Builder::identity`]. Call it first, before Wi-Fi or Bluetooth is set up:
+//! it draws a new one from the SAR ADC, ESP-IDF's true random source until then.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Once;
+use std::sync::{Mutex, Once, PoisonError};
 use std::time::Duration;
 
 use anyhow::anyhow;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys;
 use log::{error, info, warn};
 use peerwire::{Builder, Config, LanSignaling, Node};
@@ -52,6 +57,8 @@ use peerwire::{MultiSignaling, NostrSignaling, Signaling};
 #[cfg(feature = "ble")]
 pub mod ble;
 pub mod clock;
+pub mod console;
+pub mod identity;
 mod ntp;
 pub mod wifi;
 
@@ -91,6 +98,25 @@ pub fn run(app: impl FnOnce() -> anyhow::Result<()>) -> ! {
     error!("{e:#}; restarting in 5 s");
     std::thread::sleep(Duration::from_secs(5));
     unsafe { sys::esp_restart() }
+}
+
+/// Restarts the chip, after 100 ms for the last lines of the log to reach the console.
+pub fn restart() -> ! {
+    std::thread::sleep(Duration::from_millis(100));
+    unsafe { sys::esp_restart() }
+}
+
+/// ESP-IDF's default NVS partition. ESP-IDF lets it be taken only once, and Wi-Fi ([`wifi::join`]), the
+/// [`identity`] and the firmware's own settings all want it: the first call takes it, and each call gives a handle.
+pub fn nvs() -> anyhow::Result<EspDefaultNvsPartition> {
+    static NVS: Mutex<Option<EspDefaultNvsPartition>> = Mutex::new(None);
+    let mut nvs = NVS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(nvs) = &*nvs {
+        return Ok(nvs.clone());
+    }
+    let taken = EspDefaultNvsPartition::take()?;
+    *nvs = Some(taken.clone());
+    Ok(taken)
 }
 
 /// A board on Wi-Fi with its clock set: what a [`Node`] needs to bind.

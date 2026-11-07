@@ -28,3 +28,6 @@ CONFIG_BT_NIMBLE_LOG_LEVEL_NONE=y
 CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
 CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
 CONFIG_BTDM_CTRL_MODE_BTDM=n
+# And no modem sleep (on by default on the ESP32, off on the C3): ESP-IDF's random numbers
+# are true ones only while the radio is awake, and a node draws its keys with Wi-Fi off.
+CONFIG_BTDM_CTRL_MODEM_SLEEP=n

@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use anyhow::anyhow;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent};
 use log::{info, warn};
@@ -25,7 +24,7 @@ pub type Wifi = BlockingWifi<EspWifi<'static>>;
 pub fn join(modem: Modem<'static>, sysloop: EspSystemEventLoop, ssid: &str, password: &str) -> anyhow::Result<Wifi> {
     // ESP-IDF's quarter-dBm.
     const TX_POWER: [i8; 4] = [80, 60, 44, 34];
-    let nvs = EspDefaultNvsPartition::take()?;
+    let nvs = crate::nvs()?;
     let mut w = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop.clone())?;
     w.set_configuration(&Configuration::Client(ClientConfiguration {
         ssid: ssid.try_into().map_err(|_| anyhow!("SSID over 32 bytes"))?,

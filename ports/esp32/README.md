@@ -12,10 +12,14 @@ ESP32 (the chip in the ESP32-WROOM-32 module), under ESP-IDF: the unchanged
   signaling that also broadcasts, for routers that drop multicast.
 - With the `nostr` feature, `Board::node_with_nostr` joins rooms across the internet
   over a Nostr relay too.
+- `identity::load_or_create` keeps the node's identity in NVS across restarts. It's drawn
+  on the chip, before Wi-Fi or Bluetooth is set up, and `identity::renew` makes the next
+  boot draw a new one.
+- `console::Console` gives the lines typed on the serial console, for commands: over
+  UART0, or the C3's own USB.
 
 A prototype, not yet a supported target: it has run in Espressif's QEMU and on one
-ESP32-C3 board ([On a board](#on-a-board-nb-091-3-nov-2026)), and it draws a new
-identity each boot.
+ESP32-C3 board ([On a board](#on-a-board-nb-091-3-nov-2026)).
 
 ## Start a project
 
@@ -260,8 +264,13 @@ anywhere can join with `room_chat ROOM`. Without one it stays on the LAN, in roo
 
 ## What it would take to go further
 
-- **Identity.** A board draws its key after Wi-Fi is up (NB-063) but makes a new one each
-  boot. Keeping it needs encrypted NVS.
+- **Identity.** `identity::load_or_create` keeps the key in NVS (NB-119), which isn't
+  encrypted: anyone with the board in hand can read the key off its flash. ESP-IDF
+  encrypts NVS on the ESP32 only with flash encryption on, and on the C3 also with an
+  HMAC key in eFuse; both burn eFuses for good, and the port turns neither on.
+  `identity::renew` (`id new`) doesn't scrub the old key: NVS leaves it in flash until
+  its page is reused. To retire a board's key before handing the board on, erase its
+  flash.
 - **Clocks.** A board that can't reach an SNTP server can't link with a PC, whose clock
   differs by more than a minute (NB-093).
 - **More relays.** The board uses one Nostr relay, as each costs a thread and a TLS
