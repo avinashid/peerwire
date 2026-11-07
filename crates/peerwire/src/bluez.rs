@@ -1311,8 +1311,8 @@ impl Drop for Watching {
 /// also stops a connect BlueZ still has under way: reported first, as the disconnect is answered only once the link
 /// is down (NB110-12), and this task ends with it, so one still under way has said nothing (`drop_links`). The scan
 /// is held off for it ([`Discovery`]). A device that lists HID among its services isn't connected to, or its connect
-/// fails as soon as BlueZ has read them; one BlueZ had neither paired nor trusted is removed from it once this
-/// connect, or its link, ends ([`Strangers`], NB110-13).
+/// fails or its link closes as soon as BlueZ lists it, whenever that is (NB110-14); one BlueZ had neither paired nor
+/// trusted is removed from it once this connect, or its link, ends ([`Strangers`], NB110-13).
 async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
     let _connecting = Connecting::new(&ctx.connects);
     let asked = Instant::now();
@@ -1329,36 +1329,41 @@ async fn connect(adapter: Adapter, ctx: Ctx, device: DeviceId) {
         let touch = Touch::new(&ctx.strangers, addr, known, removes(&adapter, &ctx.strangers, addr));
         step = "connecting";
         dev.connect().await?;
+        // Its events before its state, so that its link going down, or it listing HID, is heard from here on: the
+        // rest of the set-up is given up for either, and then its link closed (NB-114, NB110-14).
+        step = "following it";
+        let mut changes = dev.events().await?.boxed();
         // BlueZ answers once it has read the device's services, and its input plugin taken HID as an input device,
-        // which a disconnect asked for detaches at once.
+        // which a disconnect asked for detaches at once; or at once, if the link is up already (the device connected
+        // to this one), and reads them after.
         step = "reading its services";
         no_hid(&dev).await?;
-        step = "finding the service";
-        let mut rx = None;
-        let mut tx = None;
-        for s in dev.services().await? {
-            if s.uuid().await? != uuid(SERVICE_UUID) {
-                continue;
-            }
-            for c in s.characteristics().await? {
-                match c.uuid().await? {
-                    u if u == uuid(RX_UUID) => rx = Some(c),
-                    u if u == uuid(TX_UUID) => tx = Some(c),
-                    _ => {}
+        let sockets = async {
+            step = "finding the service";
+            let mut rx = None;
+            let mut tx = None;
+            for s in dev.services().await? {
+                if s.uuid().await? != uuid(SERVICE_UUID) {
+                    continue;
+                }
+                for c in s.characteristics().await? {
+                    match c.uuid().await? {
+                        u if u == uuid(RX_UUID) => rx = Some(c),
+                        u if u == uuid(TX_UUID) => tx = Some(c),
+                        _ => {}
+                    }
                 }
             }
-        }
-        let (Some(rx), Some(tx)) = (rx, tx) else {
-            let message = "it has no Peerwire service".into();
-            return Err(bluer::Error { kind: bluer::ErrorKind::ServicesUnresolved, message });
+            let (Some(rx), Some(tx)) = (rx, tx) else {
+                let message = "it has no Peerwire service".into();
+                return Err(bluer::Error { kind: bluer::ErrorKind::ServicesUnresolved, message });
+            };
+            step = "subscribing to tx";
+            let reader = tx.notify_io().await?;
+            step = "taking rx";
+            Ok((reader, rx.write_io().await?))
         };
-        step = "subscribing to tx";
-        let reader = tx.notify_io().await?;
-        step = "taking rx";
-        let writer = rx.write_io().await?;
-        // Its events before its state, so that its link going down from here on is heard (NB-114).
-        step = "following it";
-        let changes = dev.events().await?;
+        let (reader, writer) = unless_gone(sockets, &mut changes).await?;
         if !dev.is_connected().await? {
             return Err(bluer::Error { kind: bluer::ErrorKind::Failed, message: "its link went down".into() });
         }
@@ -1414,13 +1419,26 @@ async fn no_hid(dev: &bluer::Device) -> bluer::Result<()> {
     Ok(())
 }
 
+/// `step`, of a connect's set-up, given up if `changes` (its device's) say first that its link went down or it lists
+/// HID ([`link_gone`]): a device can stall a step, up to `SETUP`, with HID listed meanwhile (NB110-14).
+async fn unless_gone<T>(
+    step: impl Future<Output = bluer::Result<T>>,
+    changes: &mut BoxStream<'static, DeviceEvent>,
+) -> bluer::Result<T> {
+    tokio::select! {
+        biased;
+        why = link_gone(changes) => Err(bluer::Error { kind: bluer::ErrorKind::Failed, message: why.into() }),
+        r = step => r,
+    }
+}
+
 /// Reports central connection `conn`'s values from `values` until its link goes down ([`until_down`]), and then the
 /// connection closed ([`link_down`]): whether it was.
 async fn read_link(
     ctx: &Ctx,
     conn: u32,
     values: impl Stream<Item = io::Result<Vec<u8>>>,
-    gone: impl Future<Output = ()>,
+    gone: impl Future<Output = &'static str>,
 ) -> bool {
     let value = |value| ctx.events.send(RadioEvent::Value { conn: ConnId(conn), value });
     let why = until_down(values, gone, value).await;
@@ -1429,10 +1447,11 @@ async fn read_link(
 
 /// Hands each value from `values` to `each` until the link goes down: why it went. BlueZ shuts the socket down as the
 /// link drops, and a read then gives nothing, again and again, not an error; an empty value, which a peer never sends,
-/// reads the same, so it ends the link too. `gone` comes when BlueZ says the device isn't connected (NB-114).
+/// reads the same, so it ends the link too. `gone` comes, with why, when BlueZ says the device isn't connected
+/// (NB-114), or lists HID among its services (NB110-14).
 async fn until_down(
     values: impl Stream<Item = io::Result<Vec<u8>>>,
-    gone: impl Future<Output = ()>,
+    gone: impl Future<Output = &'static str>,
     mut each: impl FnMut(Vec<u8>),
 ) -> String {
     tokio::pin!(values, gone);
@@ -1444,19 +1463,23 @@ async fn until_down(
                 Some(Ok(_)) | None => return "its socket closed".into(),
                 Some(Err(e)) => return format!("reading it: {e}"),
             },
-            () = &mut gone => return "BlueZ says it isn't connected".into(),
+            why = &mut gone => return why.into(),
         }
     }
 }
 
-/// Comes once `changes` (a device's) say it isn't connected, or end, as BlueZ forgot it.
-async fn link_gone(changes: impl Stream<Item = DeviceEvent>) {
+/// Comes once `changes` (a device's) say it isn't connected, or end, as BlueZ forgot it, or list HID among its
+/// services, which a device can add once connected (NB110-14): why.
+async fn link_gone(changes: impl Stream<Item = DeviceEvent>) -> &'static str {
     tokio::pin!(changes);
     while let Some(DeviceEvent::PropertyChanged(p)) = changes.next().await {
-        if matches!(p, DeviceProperty::Connected(false)) {
-            return;
+        match p {
+            DeviceProperty::Connected(false) => break,
+            DeviceProperty::Uuids(u) if u.contains(&uuid(HID_UUID)) => return "it lists HID now",
+            _ => {}
         }
     }
+    "BlueZ says it isn't connected"
 }
 
 /// The link of central connection `conn` went down, for `why`: it is reported closed, unless the driver already took
@@ -1884,7 +1907,7 @@ mod tests {
             };
             let never = futures::stream::pending::<io::Result<Vec<u8>>>;
             let c = &ctx;
-            let read = |conn, values: Values, gone: BoxFuture<'static, ()>| async move {
+            let read = |conn, values: Values, gone: BoxFuture<'static, &'static str>| async move {
                 let read = read_link(c, conn, values, gone);
                 tokio::time::timeout(Duration::from_secs(1), read).await.expect("it ends")
             };
@@ -1911,6 +1934,51 @@ mod tests {
             assert_eq!(events.try_iter().collect::<Vec<_>>(), [closed(6), closed(7), closed(8)]);
             assert!(!read(9, futures::stream::empty().boxed(), std::future::pending().boxed()).await);
             assert_eq!(events.try_iter().count(), 0, "not one it had");
+        });
+    }
+
+    /// NB110-14: a device can list HID only once its connect has read its services (it adds it to its GATT database
+    /// later, or its link was up already, and BlueZ reads them after): a step of the set-up is given up for it, however
+    /// long the device stalls the step, and a link closes for it; the device's services without HID end neither.
+    #[test]
+    fn a_central_link_ends_once_its_device_lists_hid() {
+        runtime().block_on(async {
+            let (ctx, events) = ctx();
+            let services = |hid: bool| {
+                let mut u = std::collections::HashSet::from([uuid(SERVICE_UUID)]);
+                if hid {
+                    u.insert(uuid(HID_UUID));
+                }
+                DeviceEvent::PropertyChanged(DeviceProperty::Uuids(u))
+            };
+            let changes = |hid: bool| {
+                let first = DeviceEvent::PropertyChanged(DeviceProperty::Connected(true));
+                futures::stream::iter([first, services(false), services(hid)]).chain(futures::stream::pending()).boxed()
+            };
+            async fn within<F: Future>(f: F) -> Result<F::Output, tokio::time::error::Elapsed> {
+                tokio::time::timeout(Duration::from_millis(50), f).await
+            }
+            assert!(within(link_gone(changes(false))).await.is_err(), "not gone for its services without HID");
+            assert_eq!(within(link_gone(changes(true))).await, Ok("it lists HID now"));
+            // A step it stalls is given up, ...
+            let stalled = std::future::pending::<bluer::Result<()>>();
+            let e = within(unless_gone(stalled, &mut changes(true))).await.expect("given up").unwrap_err();
+            assert_eq!(e.message, "it lists HID now");
+            // ... and one that ends ends as it does, its services without HID.
+            let done = async { Ok::<_, bluer::Error>(7) };
+            assert_eq!(within(unless_gone(done, &mut changes(false))).await.expect("ends").unwrap(), 7);
+            let failed = async { Err::<(), _>(bluer::Error { kind: bluer::ErrorKind::Failed, message: "no".into() }) };
+            let e = within(unless_gone(failed, &mut changes(false))).await.expect("ends").unwrap_err();
+            assert_eq!(e.message, "no");
+            // A link: closed, and why, and reported closed.
+            let why = until_down(futures::stream::pending(), link_gone(changes(true)), |_| {});
+            assert_eq!(within(why).await.expect("it ends"), "it lists HID now");
+            let write = tokio::spawn(std::future::pending::<()>());
+            let read = tokio::spawn(std::future::pending::<()>());
+            ctx.centrals.lock().unwrap().insert(5, Link { write, read, addr: addr(5), _touch: None });
+            let never = futures::stream::pending::<io::Result<Vec<u8>>>();
+            assert!(within(read_link(&ctx, 5, never, link_gone(changes(true)))).await.expect("it ends"));
+            assert_eq!(events.try_iter().collect::<Vec<_>>(), [RadioEvent::Disconnected { conn: ConnId(5) }]);
         });
     }
 
