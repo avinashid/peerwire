@@ -310,6 +310,12 @@ tests use an in-process pair of fake radios.
     phone);
   - pairing is the system's: BlueZ answers a central's pairing request through the desktop's agent, so a device
     nearby may raise a pairing prompt. Nothing in Peerwire pairs or needs it: refuse such a prompt.
+  - BlueZ's input plugin takes a device that serves HID (a keyboard, a mouse) as an input device, on any link, this
+    driver's included, and asks to pair with one that isn't paired first (`LEAutoSecurity`, true by default). Set
+    `LEAutoSecurity=false` under `[General]` in `/etc/bluetooth/input.conf` and restart `bluetoothd`, and it takes
+    only a paired one: an LE keyboard or mouse then has to be paired first, as a desktop's Bluetooth settings do when
+    one is added. The driver logs at `info` at start while it isn't set, and uses no link to a device that serves HID
+    (below).
   - on BlueZ 5.87 without upstream commit `82af2beaf` (in no release yet), `bluetoothd` crashes when a scan with a UUID
     discovery filter meets an advert or scan response that lists a service UUID, and the host has no Bluetooth until it
     restarts. Before NB-112 this driver's scan set such a filter, for the service UUID, so a peer nearby whose advert
@@ -321,6 +327,15 @@ tests use an in-process pair of fake radios.
   As the central it gives a connect 10 s to come up (the link, the service found, both sockets), and reports one that
   fails or doesn't as failed, then disconnects it, which also stops a connect BlueZ still has under way. BlueZ answers
   a disconnect only once the link is down, 2 s or more later, so the driver never waits on one: each runs on its own.
+  A device that lists HID among its services, in its adverts or once connected, isn't used: the driver doesn't
+  connect to it, or fails the connect as soon as BlueZ has read its services. Asked to disconnect, BlueZ detaches its
+  input plugin from the device at once, though the link goes 2 s later.
+  A device BlueZ had neither paired nor trusted before the driver connected to it is removed from BlueZ once the last
+  of the driver's connects and links on it ends: disconnected, then `RemoveDevice`. So nothing BlueZ set up on those
+  links stays: a bond, an input device, or the device itself, which BlueZ stores for good once it connects to one
+  with a public or static address. One whose removal fails, as the adapter was off or gone, is removed once an adapter
+  is set up and powered. A device paired or trusted before is the user's, and stays. The driver removes devices while
+  it runs: one whose link is up as its process ends stays in BlueZ.
   It holds its scan off while a connect is under way (NB-116). Linux starts a connect only once it hears the device
   advertise: while a discovery runs, from its reports alone, which come once for each device each time the discovery
   starts, every 10.24 s. A connect follows such a report, so with the scan on it waited for the next one, longer than
