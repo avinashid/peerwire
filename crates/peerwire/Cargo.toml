@@ -66,7 +66,7 @@ tokio = ["dep:tokio"]
 nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:serde_json"]
 # Bluetooth LE (docs/concepts/bluetooth.md): the radio driver trait and the node's side of it (Builder::bluetooth),
 # which logs its connections through `log`. Off by default; `ble-bluez` adds the Linux driver.
-ble = ["dep:log"]
+ble = ["dep:log", "peerwire-core/ble"]
 ble-bluez = ["ble", "dep:bluer", "dep:dbus", "dep:futures", "dep:tokio"]
 # Test hooks (Builder::port_mapping_at, a fake gateway's address; Node::note_sources, where the socket's datagrams
 # came from; ble::FakeAir, radios in one process). Not for apps.

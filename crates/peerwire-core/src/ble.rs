@@ -4,7 +4,8 @@
 //! A message is split into chunks, one per GATT value: a header byte, then as much of the message as the value has
 //! room for ([`value_len`]). The header marks the message's first and last chunks and counts the chunks sent on the
 //! connection, so the receiver drops a message one of whose chunks a full buffer lost. Sans-IO: the host moves the
-//! values and passes the time in.
+//! values and passes the time in. With feature `ble`, [`Link`] runs a connection's protocol over it: the room proof,
+//! the link key, identity proofs, sealed signals and datagrams.
 //!
 //! ```
 //! use peerwire_core::ble::{Chunker, Reassembler};
@@ -27,6 +28,14 @@
 use crate::time::Instant;
 use crate::wire::MAX_DATAGRAM;
 use std::time::Duration;
+
+#[cfg(feature = "ble")]
+mod link;
+#[cfg(feature = "ble")]
+pub use link::{
+    advert, ble_key, identity, open, seal, Bucket, Fault, Input, Link, ADVERT_FULL, ADVERT_LEN, CHALLENGE_LEN, ID_LEN,
+    INNER_ID, INNER_PEER, INNER_ROOM, MAX_DROPS, PROVE_WITHIN,
+};
 
 /// The GATT service a peer serves, as a 128-bit UUID: `1c3eea41-c2be-493c-ab0b-7707ad2dbed6`.
 pub const SERVICE_UUID: u128 = 0x1c3eea41_c2be_493c_ab0b_7707ad2dbed6;
