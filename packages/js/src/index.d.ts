@@ -908,6 +908,106 @@ export declare class WebRtcTransport implements Transport {
   close(): void;
 }
 
+/** The module with Bluetooth (`peerwire_ffi_ble.wasm`, next to this package's own): `loadPeerwire(BLUETOOTH_WASM)`.
+ * It is the default module and `pw_ble_*`, about 50 KB more, so only a page that uses Bluetooth loads it. */
+export declare const BLUETOOTH_WASM: URL;
+/** The GATT service a Peerwire peer serves over Bluetooth LE, and its `rx` (written) and `tx` (notified) characteristics. */
+export declare const SERVICE_UUID: string;
+export declare const RX_UUID: string;
+export declare const TX_UUID: string;
+
+/** Why a Bluetooth dial failed: see {@link BluetoothTransport.dial}. */
+export type BluetoothFailure = 'not-available' | 'cancelled' | 'not-allowed' | 'not-member' | 'refused' | 'wrong-peer'
+  | 'violation' | 'timeout' | 'failed' | 'closed';
+
+/**
+ * Bluetooth LE in the browser (Web Bluetooth: Chrome and Edge, Chrome on Android), as a central only: the user picks
+ * a device nearby that runs Peerwire (a Linux machine running `ble_chat`, an ESP32 board), and the page links with
+ * the room member there over Bluetooth alone, with no network. Two browsers can't link this way, and Firefox, Safari
+ * and every iPhone browser have no Web Bluetooth (`dial` rejects with `'not-available'`).
+ *
+ * The room is a native one, a Rust node's (`ble_led`, `ble_chat`), not a `joinRoom` room: the page sends the member a
+ * room hello over the connection and dials it there, and messages are the endpoint's, raw bytes
+ * (`endpoint.send(peer, 'led on')`, a `message` event back). The protocol runs in the wasm (`BleLink`); this moves
+ * GATT values, 20 bytes at most each, as Web Bluetooth doesn't say the ATT MTU.
+ *
+ * ```js
+ * const pw = await loadPeerwire(BLUETOOTH_WASM);
+ * const endpoint = pw.endpoint();
+ * const bt = new BluetoothTransport(endpoint, { appId: 'peerwire-lan-chat', roomId: 'esp32' });
+ * endpoint.onEvent = (e) => e.type === 'message' && show(new TextDecoder().decode(e.data));
+ * button.onclick = async () => endpoint.send(await bt.dial(), 'led on');
+ * ```
+ */
+export declare class BluetoothTransport implements Transport {
+  /** `endpoint`: one of the module with Bluetooth, else TypeError. `bluetooth`: Web Bluetooth, `navigator.bluetooth`
+   * by default. `onPeer`: `'open'` once a link is up, `'closed'` once its connection went (the endpoint's link then
+   * times out, unless it has another path). */
+  constructor(
+    endpoint: Endpoint,
+    options: {
+      appId: string;
+      roomId: string;
+      bluetooth?: { requestDevice(options: object): Promise<any>; getAvailability?(): Promise<boolean> } | null;
+      onPeer?: ((peer: PeerId, state: 'open' | 'closed') => void) | null;
+    },
+  );
+  /** Whether this browser has Web Bluetooth and a radio it can use now. */
+  available(): Promise<boolean>;
+  /**
+   * Asks the user to pick a device (call it from a click or another user gesture; the picker lists Peerwire devices
+   * alone), connects, proves the room and links with the member there: resolves to its PeerId once the link is up
+   * (within 15 s). With `peer`, only if the device proves it is that peer. A connection whose room challenge doesn't
+   * come within 2 s of subscribing (Chrome drops a notification that comes too early) is made again, 3 times in all.
+   * Rejects with an Error whose `code` is a {@link BluetoothFailure}: `'not-member'` when the device closes the
+   * connection on our answer to its room challenge (another room's name), `'refused'` when it closes it before
+   * challenging us (full), `'wrong-peer'` when it proves it is another peer than `peer` or one linked over another
+   * connection.
+   */
+  dial(peer?: PeerId | null): Promise<PeerId>;
+  has(peer: PeerId): boolean;
+  /** Ends the link to `peer`: the endpoint's goodbye goes over its connection, which then closes. */
+  drop(peer: PeerId): void;
+  /** Closes every connection; a dial under way rejects with `'closed'`. */
+  close(): void;
+}
+
+/** What a {@link BleLink} reports. */
+export type BleEvent =
+  | { type: 'proven' }
+  | { type: 'peer'; peer: PeerId }
+  | { type: 'signal'; inner: number; payload: Uint8Array }
+  | { type: 'closed'; reason: 'wrong-answer' | 'wrong-proof' | 'early' | 'drops' | 'wrong-identity' | 'late' | 'closed' };
+
+/**
+ * One Bluetooth LE connection's protocol in the module with Bluetooth (`pw_ble_*`), beside an endpoint of that module:
+ * the room proof, identity proofs, sealed signals and the framing. `BluetoothTransport` drives it over Web Bluetooth;
+ * another host moves the GATT values itself: `push` each value that came, send each of `values()`, call `timeout()`
+ * again by the time it gives, and hand `datagram` what the endpoint sends to `addr`. Datagrams pass only once the
+ * other end proved who it is (`'peer'`), and then only as from that peer.
+ */
+export declare class BleLink {
+  /** `central`: this end connected (default true). `mtu`: the ATT MTU values are cut to (default 23: 20-byte values).
+   * `addr`: the endpoint handle of the connection's datagrams. TypeError for an endpoint of a module without
+   * Bluetooth. */
+  constructor(endpoint: Endpoint, options: { appId: string; roomId: string; central?: boolean; mtu?: number; addr: number });
+  /** Takes a value that came; the events it brought. As the room is proven, our identity proof goes. */
+  push(value: Uint8Array | ArrayBuffer | ArrayBufferView): BleEvent[];
+  events(): BleEvent[];
+  /** The values to send, oldest first, each taken off the queue. */
+  values(): Uint8Array[];
+  /** Seals `payload` as a signal (`inner` 1 a room hello, 2 a message sealed to the peer): 0, or -1 before the room is
+   * proven, -2 over 1,207 bytes, -3 with the queue full, -4 for another kind. */
+  signal(inner: number, payload: Uint8Array): number;
+  /** A datagram the endpoint sent to `addr`: 0, or -1 before the peer proved who it is, -2 too large, -3 queue full. */
+  datagram(bytes: Uint8Array): number;
+  /** Closes the link if 3 s went without the room and the peer's identity proven; ms until the next call, or null. */
+  timeout(): number | null;
+  state(): 'proving' | 'answered' | 'proven' | 'identified' | 'closed';
+  setMtu(mtu: number): void;
+  free(): void;
+}
+
 export declare class LocalTransport implements Transport {
   constructor(endpoint: Endpoint, signaling: BroadcastSignaling);
   dial(peer: PeerId): void;

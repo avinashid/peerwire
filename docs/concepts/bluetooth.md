@@ -2,9 +2,10 @@
 
 > [!NOTE]
 > This is the design of Peerwire over Bluetooth Low Energy (NB-110), the contract that the Rust host on Linux, the
-> ESP32 port and the browser build to, with security's requirements (BLE-R1 to R15 on NB-110b) folded in. The framing
-> codec is in `peerwire-core` (`ble.rs`); the node's side is the `peerwire` feature `ble`, and the Linux driver
-> `ble-bluez`. Nothing here has run over a real radio yet.
+> ESP32 port and the browser build to, with security's requirements (BLE-R1 to R15 on NB-110b) folded in. One
+> connection's protocol (the framing, the room proof, identity proofs and sealed signals) is in `peerwire-core`
+> (`ble.rs`, `ble::Link` with feature `ble`); the node's side is the `peerwire` feature `ble`, the Linux driver
+> `ble-bluez`, and the browser's `BluetoothTransport` in `@peerwire/js`. Nothing here has run over a real radio yet.
 
 Peers near each other link over Bluetooth LE when they share no network: a laptop and an ESP32 board with the Wi-Fi
 down, say. A Bluetooth connection is one more path for a link, beside its UDP paths: the same identities, Noise
@@ -15,7 +16,7 @@ radio too, so no network is needed at all. It is opt-in: a node uses the radio o
 |---|---|---|---|
 | Rust on Linux (BlueZ) | yes | yes, one central at a time | feature `ble-bluez` |
 | ESP32-C3 and ESP32 (NimBLE) | yes | yes | NB-110c; three connections at most |
-| Chrome and Edge, Android Chrome | yes, after the user picks the device | no | NB-110d; central only |
+| Chrome and Edge, Android Chrome | yes, after the user picks the device | no | NB-110d; central only, `BluetoothTransport` |
 | Firefox, Safari, every iPhone browser | no | no | no Web Bluetooth |
 
 So a browser links only with a native peer nearby, never with another browser. Throughput is about 10 to 100 KB/s,
@@ -240,7 +241,9 @@ reused within a process before 2^24 (16.7 million) more connections have been ma
 ## The radio driver
 
 The node runs all of the above itself (adverts, who connects, the room proof, framing, binding, limits) over a small
-driver for the radio, so each platform writes only the driver. In `peerwire` (feature `ble`, no dependencies):
+driver for the radio, so each platform writes only the driver. One connection's part, the room proof, identity proofs,
+sealed signals, the framing and that connection's own limits, is `peerwire_core::ble::Link`, which the node runs on
+each connection and a browser through the C ABI (below). In `peerwire` (feature `ble`, no dependencies of its own):
 
 ```text
 pub trait Radio: Send {
@@ -408,10 +411,29 @@ tests use an in-process pair of fake radios.
   - A board with no Wi-Fi has no SNTP, and room hellos must be within a minute of the receiver's clock. So a board
     joins a room over Bluetooth only with a clock set since power-on (its RTC keeps it across restarts, not power
     cuts; NB-093).
-- **Browsers (NB-110d):** a central only. Each connection starts from a user gesture and the device picker, filtered
-  on the service UUID; never `acceptAllDevices`. The permission belongs to the page's origin. Nothing from the picker
-  (`device.name`, `device.id`) goes into signaling or is trusted: identity comes from Noise alone. The page runs the
-  room proof, the codec (from the wasm) and the binding rules as above.
+- **Browsers (NB-110d):** a central only, `BluetoothTransport` in `@peerwire/js`, which links with a native peer: two
+  browsers can't link over Bluetooth.
+  - Each connection starts from a user gesture and the device picker, filtered on the service UUID; never
+    `acceptAllDevices`. The ESP32 lists the UUID in its scan response; BlueZ can't, so whether the picker finds a Linux
+    peer, by its service data alone, is to be checked on a phone. The permission belongs to the page's origin. Nothing
+    from the picker (`device.name`, `device.id`) goes into signaling or is trusted: identity comes from the identity
+    proof and Noise alone.
+  - The protocol is the wasm's: the module with Bluetooth (`peerwire_ffi_ble.wasm`, the C ABI's `pw_ble_*`) runs
+    `ble::Link` as the node does, with its 3 s deadline, drop limit and signal budget, and signs the identity proof
+    with the endpoint's identity. The page only moves GATT values: notifications from `tx`, and writes without
+    response to `rx` of 20 bytes at most, one at a time, as Web Bluetooth doesn't say the ATT MTU.
+  - Datagrams pass only once the peer's identity proof checks out, and then only as from that peer
+    (`handle_datagram_from`): a browser keeps one connection to the member it picked, so it binds the connection to
+    the peer proven on it rather than to a session, which is stricter.
+  - Once the room is proven the page sends a room hello over the connection, as the node's traversal makes one (the
+    proof under the room key, sealed under the hello key): a node takes links only with members. Once the peer proved
+    who it is, the page dials it over the connection. It acts on neither the peer's hello nor its offers, as the
+    identity proof says who is there.
+  - A peer sends its challenge as soon as the central subscribes to `tx`, and Chrome drops a notification that comes
+    before `startNotifications()` settles: a connection with no challenge 2 s after subscribing is made again, 3
+    times in all.
+  - The room is a native one: the page doesn't join a `joinRoom` room over Bluetooth, and its messages are the
+    endpoint's, raw bytes, as a node sends them.
 
 ## Try it
 
@@ -429,6 +451,11 @@ RUST_LOG=debug cargo run -p peerwire --features ble-bluez --example ble_chat -- 
 where UDP works: the node leaves its UDP socket unused, and answers none of the peer's dials or punches there.
 At start it prints the adapter's alias, which centrals read as its name, and warns when that is the host name.
 Building it needs a C compiler for `libdbus` (built from source); running it, `bluetoothd` and a powered adapter.
+
+From a phone: `packages/js/demo/led.html` links with an ESP32 running `ble_led` (`ports/esp32`) and switches its LED.
+Build the wasm (`packages/js/build.sh`), serve `packages/js` over https, and open the page in Android Chrome (Web
+Bluetooth needs a secure page); `?room=` names the board's room if `room.sh` set one. The board's clock must be set,
+as its log says, or it drops the page's room hello.
 
 ## Not yet
 

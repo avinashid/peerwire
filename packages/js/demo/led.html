@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peerwire: a board's LED over Bluetooth</title>
+<style>
+  :root { color-scheme: dark; --bg: #0f1117; --panel: #181b24; --line: #2a2f3d; --text: #e6e8ee; --dim: #8b91a3; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
+  main { width: min(560px, 100vw - 24px); padding: 12px 0; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p { margin: 0 0 14px; color: var(--dim); }
+  label { display: block; color: var(--dim); font-size: 13px; }
+  input { width: 100%; margin: 2px 0 10px; padding: 8px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+  button { padding: 12px 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; }
+  button:disabled { opacity: 0.4; }
+  #connect { width: 100%; margin-bottom: 12px; }
+  .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+  #state { color: var(--dim); font-size: 13px; margin-bottom: 8px; }
+  #log { height: 40vh; overflow: auto; margin: 0; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+</style>
+<main>
+  <h1>A board's LED over Bluetooth</h1>
+  <p>Links with an ESP32 running <code>ble_led</code> over Bluetooth alone, no network, and switches its LED.</p>
+  <label>App <input id="app" autocomplete="off"></label>
+  <label>Room <input id="room" autocomplete="off"></label>
+  <button id="connect">Connect to the board</button>
+  <div id="state"></div>
+  <div class="row">
+    <button class="led" data-cmd="on">LED on</button>
+    <button class="led" data-cmd="off">LED off</button>
+    <button class="led" data-cmd="toggle">Toggle</button>
+  </div>
+  <pre id="log"></pre>
+</main>
+<script type="module" src="led.js"></script>
+</html>

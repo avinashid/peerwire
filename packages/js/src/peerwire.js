@@ -495,6 +495,129 @@ export class Endpoint {
   }
 }
 
+// Bluetooth LE: one connection's protocol (docs/concepts/bluetooth.md) in the module with Bluetooth
+// (peerwire_ffi_ble.wasm, pw_ble_*), beside an endpoint of that module: the room proof, the identity proofs, signals
+// sealed under the link key, and the framing. The host moves the GATT values, as bluetooth.js does over Web
+// Bluetooth: push() each value that came and handle the events it returns, send each of values(), call timeout()
+// again by the time it gives, and hand datagram() what the endpoint sends to `addr`. Once the other end proves who it
+// is ('peer'), its datagrams go into the endpoint as from that peer alone, and none pass before.
+const BLE_EVENTS = { 1: 'proven', 2: 'peer', 3: 'signal', 4: 'closed' };
+// Why the link closed (the C ABI's CLOSED reasons): a wrong answer to our challenge (the central isn't in the room),
+// a wrong proof (the peripheral isn't), something before the proof, too many messages dropped, a wrong identity
+// proof, or not proven, with the peer's identity, within 3 s.
+const BLE_CLOSED = ['wrong-answer', 'wrong-proof', 'early', 'drops', 'wrong-identity', 'late'];
+const BLE_STATES = ['proving', 'answered', 'proven', 'identified', 'closed'];
+// A buffer for one value in or out (GATT's longest is 512 bytes) or one event (a signal: 1,207 bytes and a head).
+const BLE_BUF = 2048;
+
+export class BleLink {
+  // `central`: this end connected (a browser always does). `mtu`: the ATT MTU, values are cut to it (23: 20-byte
+  // values, for a host that can't tell). `addr`: the endpoint handle the connection's datagrams take.
+  constructor(endpoint, { appId, roomId, central = true, mtu = 23, addr }) {
+    const pw = endpoint.pw;
+    const x = pw.x;
+    if (typeof x.pw_ble_new !== 'function') throw new TypeError('this Peerwire module has no Bluetooth: load peerwire_ffi_ble.wasm');
+    endpoint.live('BleLink');
+    if (typeof appId !== 'string' || typeof roomId !== 'string') throw new TypeError('BleLink needs an appId and a roomId');
+    const [app, room] = [encoder.encode(appId), encoder.encode(roomId)];
+    const [ap, rp, cp] = [pw.put(app), pw.put(room), pw.put(crypto.getRandomValues(new Uint8Array(16)))];
+    this.h = x.pw_ble_new(ap, app.length, rp, room.length, central ? 1 : 0, cp, mtu, nowUs(), addr >>> 0);
+    pw.free(ap, app.length);
+    pw.free(rp, room.length);
+    pw.free(cp, 16);
+    if (!this.h) throw new Error('BleLink: the module refused the link');
+    this.pw = pw;
+    this.ep = endpoint;
+    this.buf = x.pw_alloc(BLE_BUF);
+  }
+  // Takes a value that came, and returns the events it brought, oldest first: { type: 'proven' } (the room proof
+  // completed, and our identity proof went), { type: 'peer', peer } (the other end proved it is `peer`), { type:
+  // 'signal', inner, payload } (1 a room hello, 2 a message sealed to us) and { type: 'closed', reason }. A datagram
+  // in it goes to the endpoint, which pumps after this task.
+  push(value) {
+    if (!this.h || this.ep.closed) return [];
+    value = bytesOf(value);
+    const x = this.pw.x;
+    if (value.length <= BLE_BUF) {
+      this.pw.mem().set(value, this.buf);
+      x.pw_ble_push(this.h, this.ep.h, nowUs(), this.buf, value.length);
+    } else {
+      const p = this.pw.put(value);
+      x.pw_ble_push(this.h, this.ep.h, nowUs(), p, value.length);
+      this.pw.free(p, value.length);
+    }
+    this.ep.received = true;
+    this.ep.schedule();
+    return this.events();
+  }
+  // The events waiting (see push).
+  events() {
+    const out = [];
+    if (!this.h) return out;
+    for (;;) {
+      const n = this.pw.x.pw_ble_poll_event(this.h, this.buf, BLE_BUF);
+      if (n <= 0) return out;
+      const b = this.pw.mem().slice(this.buf, this.buf + n);
+      const type = BLE_EVENTS[b[0]];
+      if (type === 'peer') out.push({ type, peer: toHex(b.subarray(1, 33)) });
+      else if (type === 'signal') out.push({ type, inner: b[1], payload: b.subarray(2) });
+      else if (type === 'closed') out.push({ type, reason: BLE_CLOSED[b[1]] ?? 'closed' });
+      else out.push({ type });
+    }
+  }
+  // The values to send, oldest first, each taken off the queue.
+  values() {
+    const out = [];
+    if (!this.h) return out;
+    for (;;) {
+      const n = this.pw.x.pw_ble_poll_value(this.h, this.buf, BLE_BUF);
+      if (n <= 0) return out;
+      out.push(this.pw.mem().slice(this.buf, this.buf + n));
+    }
+  }
+  // Seals `payload` as a signal of inner kind `inner` (1 a room hello, 2 a message sealed to the peer) and queues it:
+  // 0, or -1 before the room is proven, -2 over 1,207 bytes, -3 with the queue full, -4 for another kind.
+  signal(inner, payload) {
+    if (!this.h) return -1;
+    const b = bytesOf(payload);
+    const p = this.pw.put(b);
+    const r = this.pw.x.pw_ble_signal(this.h, inner, p, b.length);
+    this.pw.free(p, b.length);
+    return r;
+  }
+  // Queues a datagram the endpoint sent to `addr`: 0, or -1 before the peer proved who it is, -2 for an empty one or
+  // one over 1,232 bytes, -3 with the queue full (dropped: the endpoint resends).
+  datagram(bytes) {
+    if (!this.h) return -1;
+    const b = bytesOf(bytes);
+    if (b.length > BLE_BUF) return -2;
+    this.pw.mem().set(b, this.buf);
+    return this.pw.x.pw_ble_datagram(this.h, this.buf, b.length);
+  }
+  // Closes the link if it has gone 3 s without proving the room and the peer's identity ({ type: 'closed', reason:
+  // 'late' } in events()); the ms until it must be called again, or null if it needn't be.
+  timeout() {
+    if (!this.h) return null;
+    const at = this.pw.x.pw_ble_timeout(this.h, nowUs());
+    return at < 0n ? null : Math.max(0, Number(at - nowUs()) / 1000);
+  }
+  // 'proving', 'answered' (the central answered the challenge, and waits for the proof), 'proven', 'identified' (the
+  // peer proved who it is) or 'closed'. A peripheral that closes the connection at 'answered' has another room's name,
+  // most likely.
+  state() {
+    return this.h ? BLE_STATES[this.pw.x.pw_ble_state(this.h)] : 'closed';
+  }
+  setMtu(mtu) {
+    if (this.h) this.pw.x.pw_ble_set_mtu(this.h, mtu);
+  }
+  free() {
+    if (!this.h) return;
+    this.pw.x.pw_ble_free(this.h);
+    this.pw.x.pw_free(this.buf, BLE_BUF);
+    this.h = 0;
+  }
+}
+
 function decodePath(b, o) {
   if (b[o] === 0) return { direct: new DataView(b.buffer, b.byteOffset).getUint32(o + 1, true) };
   return { via: toHex(b.subarray(o + 1, o + 33)) };

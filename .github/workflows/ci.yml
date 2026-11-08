@@ -73,6 +73,7 @@ jobs:
       - run: node packages/js/test/wasm_source.mjs
       - run: node packages/js/test/privacy.mjs
       - run: node packages/js/test/room_node.mjs
+      - run: node packages/js/test/bluetooth.mjs
       - run: node packages/js/test/peer_id.mjs
       - run: node packages/js/test/nostr_bounds.mjs
       - run: node packages/js/test/inbox.mjs
