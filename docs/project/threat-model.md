@@ -5727,7 +5727,7 @@ against ESP-IDF v5.5.5's random-number docs, `bootloader_random.h`, its NVS docs
 Wi-Fi and Bluetooth controller sources, the console's Kconfig and USB-Serial-JTAG
 driver, and the cfgs an existing build emits. The author's QEMU runs on the C3 and the
 ESP32 checked the Wi-Fi cases of the fix; QEMU has no Bluetooth controller, so its case
-is owed on a board.
+was checked on our own C3 (NB-124, below).
 
 **What holds.**
 - **The seed.** It becomes the key through `Identity::from_secret_bytes`, never leaves
@@ -5778,6 +5778,16 @@ encrypted only with flash encryption on. That holds for the ESP32; the C3 can al
 encrypt NVS under an HMAC key in eFuse, without flash encryption. Both burn eFuses for
 good, and the port turns neither on. Fixed in the docs by `2505f70`.
 
+**Checked on our own hardware (NB-124).** On 2026-11-08, on our own ESP32-C3, with the
+`ble` example built from main and a throwaway probe:
+- with NVS erased, `load_or_create` called after `Nimble::new` returns the error, as it
+  does with Wi-Fi set up and not started;
+- the `ble` example's first boot, with no identity kept, draws one about 690 ms after
+  reset, before NimBLE starts (about 7.6 s);
+- the USB console reads typed lines;
+- the identity is kept across a reset;
+- `id new` gives a new identity on the next boot (twice: three distinct identities).
+
 **Residuals, accepted.**
 - **The key is in plain NVS.** Anyone with the board in hand can read it off the flash
   and be the board until it's given a new key. Encrypting NVS is the app's call
@@ -5790,10 +5800,6 @@ good, and the port turns neither on. Fixed in the docs by `2505f70`.
   after Wi-Fi starts ([NB62-2](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2)).
 - **An ESP32 BLE node's modem doesn't sleep**, so it draws more current between events.
   The C3's doesn't by default.
-- **Radio checks owed on our own hardware (NB-124):** with NVS erased, `load_or_create`
-  after `Nimble::new` returns the error; the `ble` example's first boot draws before
-  NimBLE starts; and on the C3 the USB console, the identity kept across a reset, and a
-  new one once the NVS partition is erased.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
