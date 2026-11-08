@@ -14,9 +14,10 @@
       "default": "./src/index.js"
     },
     "./peerwire_ffi.wasm": "./pkg/peerwire_ffi.wasm",
+    "./peerwire_ffi_ble.wasm": "./pkg/peerwire_ffi_ble.wasm",
     "./package.json": "./package.json"
   },
-  "files": ["src", "bin", "pkg/peerwire_ffi.wasm"],
+  "files": ["src", "bin", "pkg/peerwire_ffi.wasm", "pkg/peerwire_ffi_ble.wasm"],
   "sideEffects": false,
   "engines": { "node": ">=20" },
   "keywords": ["p2p", "webrtc", "multiplayer", "nostr", "wasm", "rooms"],

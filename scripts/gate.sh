@@ -22,7 +22,8 @@
 # The docs' samples are tested too (NB-070): the Rust ones compile, never run, in "rust doc samples" (on a change to
 # Rust or Markdown); the JS ones and every link in "node docs samples" and "node docs links".
 #
-# Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs),
+# Env: WASM_MAX_BYTES (default 358400 = 350 KB), WASM_BLE_MAX_BYTES (the module with Bluetooth, peerwire_ffi_ble.wasm:
+#      default 430080 = 420 KB), PLAYWRIGHT (path to playwright's index.mjs),
 #      GATE_JOBS (Node tests at once, default 4), GATE_BROWSER_JOBS (browser tests at once, default 3),
 #      GATE_BASE (what "changed" is measured against, default origin/main),
 #      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 180),
@@ -48,7 +49,9 @@ done
 if ! command -v node >/dev/null && [ -s "$HOME/.nvm/nvm.sh" ]; then . "$HOME/.nvm/nvm.sh" >/dev/null; fi
 
 WASM_MAX_BYTES=${WASM_MAX_BYTES:-358400}
+WASM_BLE_MAX_BYTES=${WASM_BLE_MAX_BYTES:-430080}
 WASM=packages/js/pkg/peerwire_ffi.wasm
+WASM_BLE=packages/js/pkg/peerwire_ffi_ble.wasm
 GATE_JOBS=${GATE_JOBS:-4}
 GATE_BROWSER_JOBS=${GATE_BROWSER_JOBS:-3}
 GATE_BASE=${GATE_BASE:-origin/main}
@@ -234,17 +237,22 @@ entry() {
   step "${1%%|*}" timeout -k 10 "$GATE_STEP_TIMEOUT" "${cmd[@]}"
 }
 
-# Size and import count of the browser module: it must stay small and import nothing.
+# Size and import count of the browser modules, the default one and the one with Bluetooth: each must stay small and
+# import nothing.
 wasm_check() {
   node -e '
     const fs = require("fs");
-    const [path, max] = [process.argv[1], Number(process.argv[2])];
-    const bytes = fs.readFileSync(path);
-    const imports = WebAssembly.Module.imports(new WebAssembly.Module(bytes));
-    console.log(`${path}: ${bytes.length} bytes (limit ${max}), ${imports.length} imports`);
-    for (const i of imports) console.log(`  import ${i.module}.${i.name} (${i.kind})`);
-    process.exit(bytes.length <= max && imports.length === 0 ? 0 : 1);
-  ' "$WASM" "$WASM_MAX_BYTES"
+    let ok = true;
+    for (let i = 1; i < process.argv.length; i += 2) {
+      const [path, max] = [process.argv[i], Number(process.argv[i + 1])];
+      const bytes = fs.readFileSync(path);
+      const imports = WebAssembly.Module.imports(new WebAssembly.Module(bytes));
+      console.log(`${path}: ${bytes.length} bytes (limit ${max}), ${imports.length} imports`);
+      for (const i of imports) console.log(`  import ${i.module}.${i.name} (${i.kind})`);
+      ok &&= bytes.length <= max && imports.length === 0;
+    }
+    process.exit(ok ? 0 : 1);
+  ' "$WASM" "$WASM_MAX_BYTES" "$WASM_BLE" "$WASM_BLE_MAX_BYTES"
 }
 
 # @peerwire/react: its dev dependencies (npm ci, again only when package-lock.json changes), then tsc: the build
@@ -266,11 +274,11 @@ cargo nextest --version >/dev/null 2>&1 && nextest=1
 GATE=(--profile gate) FUZZ_PROFILE=(--profile fuzz)
 [ $nextest = 0 ] || GATE=(--cargo-profile gate) FUZZ_PROFILE=(--cargo-profile fuzz)
 FUZZ=(--lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim -p peerwire-sync "${FUZZ_PROFILE[@]}" fuzz)
-# peerwire-ffi's shared docs (`sync`) are off in the wasm build and so in the workspace's: built, linted and tested
-# on their own, so they can't rot.
-FFI_SYNC=(-p peerwire-ffi --features sync "${GATE[@]}")
+# peerwire-ffi's shared docs (`sync`) and Bluetooth (`ble`) are off in the default wasm build and so in the
+# workspace's: built, linted and tested on their own, so they can't rot.
+FFI_SYNC=(-p peerwire-ffi --features sync,ble "${GATE[@]}")
 # The same with overflow checks, beside the fuzzers: its length and buffer sums must not overflow either.
-FFI_SYNC_DEBUG=(-p peerwire-ffi --features sync --lib "${FUZZ_PROFILE[@]}")
+FFI_SYNC_DEBUG=(-p peerwire-ffi --features sync,ble --lib "${FUZZ_PROFILE[@]}")
 
 # Every Rust test: nextest runs each test in its own process, many at once, but skips doctests.
 rust_tests() {
@@ -322,7 +330,7 @@ rust_build() {
 }
 
 clippy() {
-  cargo clippy --workspace --all-targets "$@" && cargo clippy -p peerwire-ffi --features sync --all-targets "$@"
+  cargo clippy --workspace --all-targets "$@" && cargo clippy -p peerwire-ffi --features sync,ble --all-targets "$@"
 }
 
 # Skip the Rust steps when every file changed since GATE_BASE (committed, staged, unstaged or untracked) is on
