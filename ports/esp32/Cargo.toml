@@ -43,6 +43,12 @@ required-features = ["ble"]
 name = "ble"
 required-features = ["ble"]
 
+# The board's LED, switched by `ble_chat` in its room over Bluetooth (NB-125):
+# `FEATURES=ble EXAMPLE=ble_led ./build.sh`; `PW_LED_PIN`, `PW_LED_HIGH` for another board's LED.
+[[example]]
+name = "ble_led"
+required-features = ["ble"]
+
 [profile.release]
 opt-level = "s"
 
