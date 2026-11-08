@@ -193,6 +193,7 @@ release of each.
 | NB110-16 (Low) | **Fixed** by `7000929` and `3379747`, merged `bf5968d`, before `ble-bluez` was published (the BlueZ driver disconnects only a link it asked BlueZ to make: a device linked already isn't asked to connect, and its link stays when the connect fails or the connection over it ends, unless it lists HID), reviewed 2026-11-07; residuals: a device that links in the moment between the driver's read and its connect counts as the driver's; a connect under way as the adapter goes or the driver is dropped disconnects its device, same section |
 | NB110-I14 (Info) | Accepted: a failed connect's disconnect turns off BlueZ's own reconnection of a device it doesn't trust, until that device is connected again, same section |
 | NB119-1 (Low), NB119-I1, NB119-I2 (Info) | **Fixed** by `2505f70` before NB-119's first part merged (`9d721b1`), so never on main, before any release of `peerwire-esp` kept identities (a board's kept identity is drawn only from the SAR ADC, before Wi-Fi or Bluetooth is set up, or not at all, and an ESP32 BLE node keeps its Bluetooth modem awake; the docs say `id new` doesn't scrub the old key and how each chip can encrypt NVS), reviewed 2026-11-07; residuals: the key is in plain NVS; firmware must load it before it sets up a radio; an ESP32 BLE node draws more current, [Kept identity on the ESP32](#kept-identity-on-the-esp32-nb-119--nb119-1) |
+| NB110d-I1, NB110d-I2 (Info) | Open: a page's `dial()` with no `peer` links with any member the device it picked passes the connection to, which the docs don't say; `pw_ble_timeout`'s unchecked add and the 64-event cap, which the page doesn't reach, [Bluetooth LE in the browser](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1-nb110d-i2) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -4574,8 +4575,9 @@ of the connection's own; the framing codec in `peerwire-core`; and the core's ru
 a connection no peer is bound to yet (`Endpoint::handle_datagram_unbound`). A Bluetooth
 hop ranks as a relayed address does, last, and isn't in `Policy::default()`. The ESP32's
 NimBLE driver is on main since NB-110c
-([below](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5)); the browser's (NB-110d)
-isn't, and none of it is in a release.
+([below](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5)), and the browser's since
+NB-110d ([below](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1-nb110d-i2)); none of it
+is in a release.
 
 Reviewed on 2026-11-05 and 2026-11-06 in ten passes: security's requirements, BLE-R1…R15
 (NB-110b), read against main `25c92d0` and the `bluer` 0.17.4 and ESP-IDF 5.5.5 sources;
@@ -5007,9 +5009,11 @@ crash it. The fix is BlueZ's: a later release, or a 5.87 build that carries `82a
 - **The ESP32's clock.** Room hellos must be within a minute of the receiver's clock, so
   a board with no Wi-Fi joins over Bluetooth only with a clock set since power-on
   (NB-093).
-- **Owed with NB-110d:** a phone at an ATT MTU of 23 (R14). The ESP32 driver's pairing
-  (R5), random draws (R15), 5 s subscribe deadline, connection cap and 10 s connect,
-  owed with NB-110c, are [below](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5).
+- **Owed from a phone:** R14 at its ATT MTU, with NB-110d's other checks
+  ([below](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1-nb110d-i2)). The ESP32
+  driver's pairing (R5), random draws (R15), 5 s subscribe deadline, connection cap and
+  10 s connect, owed with NB-110c, are
+  [below](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5).
 - **Radio checks owed on our own hardware:** the honest connect time (S above),
   NB110-8's subscribers, the gap between a device's reconnects (NB110-I8), the idle
   links an adapter holds (NB110-I9), the time from connect to a proven identity
@@ -5800,6 +5804,96 @@ good, and the port turns neither on. Fixed in the docs by `2505f70`.
   after Wi-Fi starts ([NB62-2](#the-esp32-prototype-nb-062-nb-064--nb62-1-nb62-2)).
 - **An ESP32 BLE node's modem doesn't sleep**, so it draws more current between events.
   The C3's doesn't by default.
+
+### Bluetooth LE in the browser (NB-110d) — NB110d-I1, NB110d-I2
+
+Since NB-110d, `@peerwire/js` has `BluetoothTransport`, a Web Bluetooth central (Chrome
+and Edge; on a phone, Android Chrome) that links a page with a native peer nearby, a
+Linux node or an ESP32 board, over Bluetooth alone; two browsers can't link this way.
+One connection's protocol, the room proof, the link key, identity proofs, sealed
+signals, datagrams and the framing, with that connection's own limits, moved from the
+node into `peerwire_core::ble::Link` (core feature `ble`). The node runs it on each
+connection, and a page through the C ABI's new `pw_ble_*` functions (FFI feature `ble`),
+in a second wasm module, `peerwire_ffi_ble.wasm`; the default module is unchanged. None
+of it is in a release.
+
+Reviewed on 2026-11-08 by reading `fec76cc`, `09dad07`, `db74f20` and `5fa9ac1`: `Link`
+against the node's code it replaced, the node's diff, the C ABI, `bluetooth.js`,
+`BleLink`, the LED demo, and the new steps in the gate and CI. Nothing was re-run, as
+nothing needed reproducing, and nothing has run from a phone yet.
+
+**What holds.**
+- **The wire is unchanged.** A test pins the bytes the node made before the move: the
+  ble key, an advert, the answer, the proof, the link key, a signal each way and an
+  identity proof. `Link` keeps the node's rules: MACs compared in constant time; each
+  message of the room proof checked for its length, and anything else before the proof
+  closing the connection; signals dropped over their budget before any cryptography; and
+  `seq` rising, under a nonce of the direction and `seq`, and spent even when a signal
+  can't be queued, so no nonce is used twice.
+- **The room a connection proves.** A connection's ble key is now fixed when it opens,
+  where the node read its room's at each message; the node closes every unbound
+  connection when its room changes, so nothing differs.
+- **One change in the node.** A signal on a connection proven in an earlier room is now
+  taken from the connection's budget and opened before it is dropped and counted, where
+  it was dropped first: at most the budget's AES-GCM opens (16, then 2 a second) before
+  the connection closes at 32 drops.
+- **The C ABI.** Every input goes through the crate's null and length checks, and a
+  value or event too big for the host's buffer stays queued while its size is returned;
+  the queues are bounded (256 values, 64 events). The other end's identity proof is
+  checked once per connection, and one in this end's own name, or that doesn't check
+  out, closes it. A host sends signals of kinds 1 and 2 only, so never an identity proof
+  of its own making. No datagram passes either way until the other end has proven who it
+  is; then its datagrams go to the endpoint as from that peer alone
+  (`handle_datagram_from`), so another peer's packets and handshakes are dropped and
+  count against the connection, and new handshakes keep the node's budget (4, then one
+  per 5 s). That is stricter than the node, which binds a connection to a session. A
+  connection that hasn't proven the room, and the peer's identity, within 3 s closes,
+  and a closed one takes nothing more.
+- **The page.** The picker is filtered on the service, never `acceptAllDevices`, and
+  nothing from it (`device.name`, `device.id`) is used or sent: who is at the other end
+  comes from the identity proof and Noise. The challenge is 16 bytes from
+  `crypto.getRandomValues`. The page sends a room hello made as Rust's (the room proof
+  under the room key, sealed under the hello key) and acts on no signal from the device.
+  `BleLink` does nothing once freed, and each timer and write loop stops once its
+  connection ends. The LED demo shows what the board sends with `textContent`.
+- **The module.** `peerwire_ffi_ble.wasm` has no imports, and the gate and CI check that
+  and its size (at most 420 KiB) as they do the default module's, which pages that don't
+  use Bluetooth still load.
+
+**NB110d-I1 — The device picked isn't the peer proven (Info).** The identity proof shows
+who is at the far end of the connection, not which device the user picked: a device in
+range, with the room key or without it, can pass the connection's bytes on to another
+member's device (NB110-I7, in
+[Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1)). So `dial()` with
+no `peer` links with whichever member proves itself there. Members are trusted alike,
+and nothing may treat a peer linked over Bluetooth as near, so this gives no one more
+than they had; but at `db74f20` the docs said the page links with the member it picked.
+Fix: say that without `peer`, `dial()` links with any member the connection reaches, and
+that with it, it links with that one alone.
+
+**Status: open** (Info), reported on NB-110d at `5fa9ac1`.
+
+**NB110d-I2 — Two edges of the C ABI (Info).** `pw_ble_timeout` returns the deadline
+plus 1 µs with no check, so with a host clock within 3 s of 2^64 µs the sum overflows:
+it wraps to 0 in a release build, the wasm's, and panics in a debug one, which aborts
+across `extern "C"`. And a `PwBle` keeps 64 events at most and drops any past them, a
+CLOSED with them; the connection still closes, and `pw_ble_state` says so.
+`bluetooth.js` reads the events after each value, which brings one at most, and its
+clock is the page's, so the page reaches neither. Fix: a saturating add, and a CLOSED
+that is always queued.
+
+**Status: open** (Info), reported on NB-110d at `5fa9ac1`.
+
+**Residuals, accepted.**
+- **The grant is the origin's.** Once the user picks a device, the browser keeps a grant
+  for it under the page's origin, so a page on that origin may connect to it again
+  without the picker, for as long as the grant lasts. That is no more than any device in
+  range can do unasked, and the room proof still needs the room's name.
+- **Radio checks owed from a phone:** whether Chrome drops the first challenge (2 s,
+  three tries); the set-up time against an ESP32's 5 s subscribe deadline and the 3 s
+  proof; R14 at the phone's ATT MTU (the page writes values of 20 bytes at any MTU, and
+  a board's notifications may be longer); and whether the picker lists a Linux peer,
+  whose scan response can't carry the service UUID.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
