@@ -938,8 +938,11 @@ export type BluetoothFailure = 'not-available' | 'cancelled' | 'not-allowed' | '
  * endpoint.onEvent = (e) => e.type === 'message' && show(new TextDecoder().decode(e.data));
  * button.onclick = async () => endpoint.send(await bt.dial(), 'led on');
  * ```
+ *
+ * It has the {@link Transport} methods, but its `dial` takes no peer (or one to insist on) and resolves to the PeerId
+ * it linked with.
  */
-export declare class BluetoothTransport implements Transport {
+export declare class BluetoothTransport {
   /** `endpoint`: one of the module with Bluetooth, else TypeError. `bluetooth`: Web Bluetooth, `navigator.bluetooth`
    * by default. `onPeer`: `'open'` once a link is up, `'closed'` once its connection went (the endpoint's link then
    * times out, unless it has another path). */
