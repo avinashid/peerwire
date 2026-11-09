@@ -276,7 +276,8 @@ anywhere can join with `room_chat ROOM`. Without one it stays on the LAN, in roo
   takes the time from the first room member that links (`Node::clock_from_peer`), and
   `clock::set` sets the board's clock from it (NB-119). A member may give a wrong time,
   so it lasts one boot at most: `init` sets it back to 1970 at the next boot unless SNTP
-  set the clock since, and a late SNTP answer more than 30 s off restarts the board.
+  set the clock since, and a late SNTP answer more than 30 s off restarts the board. On
+  Wi-Fi it asks every minute while it has a member's time.
 - **More relays.** The board uses one Nostr relay, as each costs a thread and a TLS
   session; peers elsewhere must use that relay too. If it is down, only the LAN is left.
 - **Memory caps.** With heavy traffic each link holds its send and reassembly buffers.

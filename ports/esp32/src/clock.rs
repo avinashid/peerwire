@@ -38,7 +38,7 @@ pub const SERVERS: [&str; 4] = ["0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.
 /// carrier reads the clock for its event times and TLS. A bound node doesn't: it read the clock once, when bound.
 pub const RESYNC: Duration = Duration::from_secs(6 * 3600);
 
-/// How often [`keep_in_step`] asks again while the clock isn't set.
+/// How often [`keep_in_step`] asks again while the clock isn't set, or has a time a room member gave.
 const RETRY: Duration = Duration::from_secs(60);
 
 /// How long each server gets to answer. lwIP's own client gives one 15 s and can't be told less; on a board it took
@@ -79,13 +79,22 @@ pub fn set(time: SystemTime) -> io::Result<()> {
 /// At boot, before a node is bound: if the clock has a time a room member gave before the restart ([`set`]), sets it
 /// back to 1970, so the node takes the time afresh, from SNTP or a member (NB119-2). [`init`](crate::init) calls it.
 pub(crate) fn forget_member_time() {
-    if MEMBER_TIME.swap(0, Ordering::Relaxed) != MEMBER_MARK {
+    // A load and a store, no swap: on the classic ESP32 the mark is in RTC slow memory, which may not take the atomic
+    // read-modify-write (S32C1I). Nothing else runs this early.
+    let marked = member_time();
+    MEMBER_TIME.store(0, Ordering::Relaxed);
+    if !marked {
         return;
     }
     match settimeofday(Duration::ZERO) {
         Ok(()) => info!("clock: forgot the time a room member gave before the restart; at 1970 until it is set"),
         Err(e) => warn!("clock: the time a room member gave before the restart: {e}"),
     }
+}
+
+/// Whether the clock has a time a room member gave ([`set`]), and SNTP hasn't set it since.
+fn member_time() -> bool {
+    MEMBER_TIME.load(Ordering::Relaxed) == MEMBER_MARK
 }
 
 fn settimeofday(since_1970: Duration) -> io::Result<()> {
@@ -127,7 +136,8 @@ pub fn sync(timeout: Duration) -> io::Result<()> {
 }
 
 /// Starts a thread that keeps the clock in step: it asks again every [`RESYNC`], or every minute while the clock
-/// isn't set. It runs at the main task's priority, 1. A second call does nothing.
+/// isn't set or has a time a room member gave (NB119-I4). It runs at the main task's priority, 1. A second call does
+/// nothing.
 ///
 /// An answer that moves the clock more than 30 s restarts the chip 5 s later, as a node bound before keeps the time
 /// it had, and peers drop its hellos: 1970, if no server answered before it was bound (NB103-I2), or a wrong time a
@@ -142,7 +152,7 @@ pub fn keep_in_step() -> io::Result<()> {
         .set()
         .map_err(io::Error::other)?;
     let spawned = std::thread::Builder::new().stack_size(STACK).spawn(move || loop {
-        std::thread::sleep(if is_set() { RESYNC } else { RETRY });
+        std::thread::sleep(if is_set() && !member_time() { RESYNC } else { RETRY });
         let (wall, at) = (SystemTime::now(), Instant::now());
         match sync(Duration::from_secs(30)) {
             Ok(()) => {

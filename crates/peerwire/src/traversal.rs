@@ -74,7 +74,7 @@ const FRESH_MS: u64 = 60_000;
 /// ([`Traversal::handle_radio_signal`]).
 pub const CLOCK_SET_AFTER_MS: u64 = 1_700_000_000_000;
 /// A room member's time at or after this (2100-01-01) isn't taken: no clock set right is that far on, and one far
-/// past it wraps a board's (NB119-I1).
+/// past it wraps a board's (NB119-I3).
 const CLOCK_TAKEN_BEFORE_MS: u64 = 4_102_444_800_000;
 /// Hellos answered and offers acted on each have a budget: a burst of `BURST`, then
 /// one per `REFILL`, so a flood can't make a node dial or publish without bound,

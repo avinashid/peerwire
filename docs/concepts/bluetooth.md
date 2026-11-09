@@ -415,9 +415,9 @@ tests use an in-process pair of fake radios.
     needs no Wi-Fi: the `ble` and `ble_led` examples try a saved network for 20 s, then go on over Bluetooth alone.
   - A room member can give a wrong time, and peers then drop the board's hellos until the node is bound again with
     the right time: for one boot at most (NB119-2). The board restarts when a late SNTP answer moves its clock more
-    than 30 s, half the window. The RTC would keep a member's time across a restart (NB-093), so the port marks it
-    in RTC memory, and `peerwire_esp::init` sets a marked clock back to 1970 at boot, before the node binds: a
-    restart takes the time afresh.
+    than 30 s, half the window; on Wi-Fi it asks every minute while it has a member's time. The RTC would keep a
+    member's time across a restart (NB-093), so the port marks it in RTC memory, and `peerwire_esp::init` sets a
+    marked clock back to 1970 at boot, before the node binds: a restart takes the time afresh.
 - **Browsers (NB-110d):** a central only. Each connection starts from a user gesture and the device picker, filtered
   on the service UUID; never `acceptAllDevices`. The permission belongs to the page's origin. Nothing from the picker
   (`device.name`, `device.id`) goes into signaling or is trusted: identity comes from Noise alone. The page runs the
