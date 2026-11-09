@@ -73,6 +73,9 @@ const FRESH_MS: u64 = 60_000;
 /// starts at 1970. A node with one takes the time from a room member over a radio connection that proved the room
 /// ([`Traversal::handle_radio_signal`]).
 pub const CLOCK_SET_AFTER_MS: u64 = 1_700_000_000_000;
+/// A room member's time at or after this (2100-01-01) isn't taken: no clock set right is that far on, and one far
+/// past it wraps a board's (NB119-I1).
+const CLOCK_TAKEN_BEFORE_MS: u64 = 4_102_444_800_000;
 /// Hellos answered and offers acted on each have a budget: a burst of `BURST`, then
 /// one per `REFILL`, so a flood can't make a node dial or publish without bound,
 /// and a flood of one kind doesn't starve the other. Proofs are checked first, so
@@ -1181,11 +1184,12 @@ impl<A: Address> Traversal<A> {
     }
 
     /// [`handle_signal`](Traversal::handle_signal) for a signal that came over a radio connection which proved the
-    /// room: sealed under that connection's key, which comes from fresh challenges both ways, so the room member at
-    /// its other end sent it there, now. While this node's clock is unset ([`CLOCK_SET_AFTER_MS`]), the first room
-    /// hello there whose proof checks out sets it to the hello's time, whatever the freshness window says, and this
-    /// node says hello again at once, at the new time: the peers dropped its hellos from 1970. Once only, and only
-    /// from here: a hello over any other carrier could be one a member passed on from minutes ago.
+    /// room: sealed under that connection's key, which comes from fresh challenges both ways, so a room member at its
+    /// other end sent it there, now; the hello itself may be another member's, at whatever time that member chose.
+    /// While this node's clock is unset ([`CLOCK_SET_AFTER_MS`]), the first room hello there whose proof checks out,
+    /// at a time before 2100, sets it to the hello's time, whatever the freshness window says, and this node says
+    /// hello again at once, at the new time: the peers dropped its hellos from 1970. Once only, and only from here: a
+    /// hello over any other carrier could be one a member passed on from minutes ago.
     pub fn handle_radio_signal(
         &mut self,
         now: Instant,
@@ -1200,14 +1204,14 @@ impl<A: Address> Traversal<A> {
     }
 
     /// Sets the wall clock from `payload` if it is a room hello whose proof checks out, from another member, at a time
-    /// that is set.
+    /// that is set and before 2100.
     fn take_clock(&mut self, now: Instant, topic: Topic, payload: &[u8]) {
         let Some(room) = self.room.as_ref().filter(|r| r.topic == topic) else { return };
         let Some((from, role, ts, proof)) = open_room(&room.enc, payload).as_deref().and_then(parse_hello) else {
             return;
         };
         let proved = mac_ok(&room.key, &[b"pw-hello", from.as_bytes(), &[role as u8], &ts.to_le_bytes()], &proof);
-        if !proved || from == self.id || ts < CLOCK_SET_AFTER_MS {
+        if !proved || from == self.id || !(CLOCK_SET_AFTER_MS..CLOCK_TAKEN_BEFORE_MS).contains(&ts) {
             return;
         }
         let since_zero = now.as_micros() / 1000;
@@ -4151,8 +4155,9 @@ mod tests {
     }
 
     /// NB-119: a node whose clock is unset (1970, a board with no battery) takes the time from the first room hello a
-    /// radio connection that proved the room brings, if its proof checks out and its time is set, and from no other
-    /// carrier. Then it says hello at once, at that time, and a peer with a set clock takes that hello. Once only.
+    /// radio connection that proved the room brings, if its proof checks out and its time is set and before 2100, and
+    /// from no other carrier. Then it says hello at once, at that time, and a peer with a set clock takes that hello.
+    /// Once only.
     #[test]
     fn an_unset_clock_is_taken_from_a_room_hello_over_the_radio() {
         let (key, topic) = (room_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1));
@@ -4164,11 +4169,13 @@ mod tests {
 
         // Over another carrier: stale by this clock, dropped, and the clock stays unset.
         assert_eq!(t.handle_signal(now, &mut ep, topic, &room_hello(&key, &peer, Role::Peer, ts)), None);
-        // Over the radio: a proof under another room's key, a time that is unset too, or this node's own id: no.
+        // Over the radio: a proof under another room's key, a time that is unset too or in 2100 or later (19 digits,
+        // as many as a hello may carry), or this node's own id: no.
         let wrong_key = room_hello(&room_key(ROOM.0, "another"), &peer, Role::Peer, ts);
         let unset = room_hello(&key, &peer, Role::Peer, CLOCK_SET_AFTER_MS - 1);
+        let far = [CLOCK_TAKEN_BEFORE_MS, 9_999_999_999_999_999_999].map(|t| room_hello(&key, &peer, Role::Peer, t));
         let own = room_hello(&key, &me, Role::Peer, ts);
-        for h in [wrong_key, unset, own] {
+        for h in [wrong_key, unset, own].into_iter().chain(far) {
             assert_eq!(t.handle_radio_signal(now, &mut ep, topic, &h), None);
         }
         assert_eq!(t.clock_from_peer(now), None);

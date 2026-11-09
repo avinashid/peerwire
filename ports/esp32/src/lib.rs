@@ -79,13 +79,15 @@ const CLOCK_WAIT: Duration = Duration::from_secs(60);
 /// The longest [`idle`] sleeps.
 const IDLE_MAX: Duration = Duration::from_millis(10);
 
-/// Applies ESP-IDF's patches to the Rust runtime and starts its logger. [`run`] calls it; call it first if you don't
-/// use `run`. A second call does nothing.
+/// Applies ESP-IDF's patches to the Rust runtime and starts its logger, and sets the clock back to 1970 if a room
+/// member gave its time before the restart ([`clock::set`]), so the node takes the time afresh. [`run`] calls it; call
+/// it first if you don't use `run`. A second call does nothing.
 pub fn init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         sys::link_patches();
         esp_idf_svc::log::EspLogger::initialize_default();
+        clock::forget_member_time();
     });
 }
 

@@ -817,8 +817,9 @@ impl Node {
     /// at that time: peers drop hellos more than a minute off theirs. The system clock stays as it was: firmware sets
     /// it from this, so that what else reads it (a restart, the Nostr relay's events) has the time too.
     ///
-    /// The room member at the other end of that connection gives the time: one who wants this node's clock wrong can
-    /// make it so, and other peers then drop its hellos until something sets it right (SNTP, say).
+    /// A room member gives the time, and may give whatever time it chooses: one who wants this node's clock wrong can
+    /// make it so, and other peers then drop its hellos until the node is bound again with the right time.
+    /// `peerwire-esp`'s board restarts when SNTP disagrees with its clock, and forgets a member's time at a restart.
     pub fn clock_from_peer(&self) -> Option<SystemTime> {
         let ms = self.trav.clock_from_peer(self.now())?;
         Some(UNIX_EPOCH + Duration::from_millis(ms))

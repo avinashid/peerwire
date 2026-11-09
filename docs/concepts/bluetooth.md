@@ -407,13 +407,17 @@ tests use an in-process pair of fake radios.
     it for Wi-Fi.
   - A board with no Wi-Fi has no SNTP, and room hellos must be within a minute of the receiver's clock. A node whose
     clock read before 2023-11-14 when it was bound counts it as unset, and takes the time from the first room hello
-    that comes over a connection which proved the room, if its proof checks out and its time is set (NB-119). Once,
-    and from no other carrier: there it is sealed under the connection's key, made from fresh challenges both ways,
-    so the member at the other end sent it now. The node then says hello again at that time, as peers dropped its
-    hellos from 1970. `Node::clock_from_peer` gives the time, and the port's `clock::set` sets the system clock from
-    it (the RTC keeps it across restarts, not power cuts; NB-093). So a board needs no Wi-Fi: the `ble` and `ble_led`
-    examples try a saved network for 20 s, then go on over Bluetooth alone. A room member can give a wrong time, and
-    peers then drop the board's hellos until SNTP sets it right.
+    that comes over a connection which proved the room, if its proof checks out and its time is set and before 2100
+    (NB-119). Once, and from no other carrier: there it is sealed under the connection's key, made from fresh
+    challenges both ways, so a member at the other end sent it, now; the hello may be another member's, at whatever
+    time that member chose. The node then says hello again at that time, as peers dropped its hellos from 1970.
+    `Node::clock_from_peer` gives the time, and the port's `clock::set` sets the system clock from it. So a board
+    needs no Wi-Fi: the `ble` and `ble_led` examples try a saved network for 20 s, then go on over Bluetooth alone.
+  - A room member can give a wrong time, and peers then drop the board's hellos until the node is bound again with
+    the right time: for one boot at most (NB119-2). The board restarts when a late SNTP answer moves its clock more
+    than 30 s, half the window. The RTC would keep a member's time across a restart (NB-093), so the port marks it
+    in RTC memory, and `peerwire_esp::init` sets a marked clock back to 1970 at boot, before the node binds: a
+    restart takes the time afresh.
 - **Browsers (NB-110d):** a central only. Each connection starts from a user gesture and the device picker, filtered
   on the service UUID; never `acceptAllDevices`. The permission belongs to the page's origin. Nothing from the picker
   (`device.name`, `device.id`) goes into signaling or is trusted: identity comes from Noise alone. The page runs the
