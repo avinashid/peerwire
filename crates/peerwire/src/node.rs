@@ -101,6 +101,8 @@ pub struct Builder {
     port_mapping: bool,
     /// PCP/NAT-PMP server and SSDP target, instead of the default gateway's (tests).
     portmap_at: Option<(SocketAddr, SocketAddr)>,
+    /// The wall clock to bind with, instead of the system's (tests).
+    clock_at: Option<u64>,
     relay_peers: Vec<String>,
     policy: Option<Policy>,
     #[cfg(feature = "turn")]
@@ -170,6 +172,15 @@ impl Builder {
         self
     }
 
+    /// Binds as if the system clock read `unix_ms` (Unix milliseconds), for tests of a node with no clock (feature
+    /// `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn clock_at(mut self, unix_ms: u64) -> Self {
+        self.clock_at = Some(unix_ms);
+        self
+    }
+
     /// Always-on peers to keep linked as relays, by their invites: see
     /// [`Node::set_relay_peers`]. [`bind`](Builder::bind) fails with
     /// [`ErrorKind::InvalidInput`] if one is not an invite. Default: none.
@@ -222,7 +233,8 @@ impl Builder {
         // from both families would read as a symmetric NAT.
         let stun = if local.ip().is_loopback() { Vec::new() } else { resolve(&self.stun, local.is_ipv6() && !dual) };
         OsRng.fill_bytes(&mut seed);
-        let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let system = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let unix_ms = self.clock_at.unwrap_or_else(system);
         let (local_addrs, stun) = (local_addresses(local).into_iter().map(Hop::Net).collect(), net(stun));
         let mut trav = Traversal::new(&identity, seed, unix_ms, local_addrs, stun);
         trav.set_privacy(peerwire_core::Instant::ZERO, &mut ep, self.privacy);
@@ -369,6 +381,7 @@ impl Node {
             privacy: Privacy::Direct,
             port_mapping: false,
             portmap_at: None,
+            clock_at: None,
             relay_peers: Vec::new(),
             policy: None,
             #[cfg(feature = "turn")]
@@ -798,6 +811,19 @@ impl Node {
         self.status.get(peer).copied().unwrap_or(Status::Disconnected)
     }
 
+    /// The time now by the clock a room member gave this node, if one did. A node bound while the system clock read
+    /// before 2023-11-14 (a board with no battery for its clock, and no network to set it from) takes the time from
+    /// the first room hello that comes over a Bluetooth connection which proved the room, once, and then says hello
+    /// at that time: peers drop hellos more than a minute off theirs. The system clock stays as it was: firmware sets
+    /// it from this, so that what else reads it (a restart, the Nostr relay's events) has the time too.
+    ///
+    /// The room member at the other end of that connection gives the time: one who wants this node's clock wrong can
+    /// make it so, and other peers then drop its hellos until something sets it right (SNTP, say).
+    pub fn clock_from_peer(&self) -> Option<SystemTime> {
+        let ms = self.trav.clock_from_peer(self.now())?;
+        Some(UNIX_EPOCH + Duration::from_millis(ms))
+    }
+
     /// Peers with a live link, except [relay peers](Node::set_relay_peers).
     pub fn peers(&self) -> impl Iterator<Item = &PeerId> {
         self.ep.connected_peers().filter(|p| !self.is_relay_peer(p))
@@ -993,7 +1019,12 @@ impl Node {
         while let Some(i) = self.ble.as_mut().and_then(Ble::take) {
             match i {
                 Inbound::Signal { topic, payload, conn } => {
-                    let proved = self.trav.handle_signal(now, &mut self.ep, topic, &payload);
+                    // Only a connection that proved the room carries signals: a member there may set an unset clock.
+                    let unset = self.trav.clock_from_peer(now).is_none();
+                    let proved = self.trav.handle_radio_signal(now, &mut self.ep, topic, &payload);
+                    if unset && self.trav.clock_from_peer(now).is_some() {
+                        log::info!("Bluetooth: took the time from a room member on conn {}, as ours was unset", conn.0);
+                    }
                     if let (Some(_), Some(b)) = (proved, self.ble.as_mut()) {
                         b.heard(conn, now);
                     }
