@@ -10,9 +10,11 @@
 //! RGB LED, as on Espressif's C3 DevKits, needs the RMT driver, which this doesn't have. The LED blinks 3 times at
 //! boot: if it doesn't, the pin is wrong.
 //!
-//! As the `ble` example does, it joins wifi.sh's network to set its clock (room hellos must be within a minute of the
-//! receiver's), turns Wi-Fi off, and joins room.sh's room ("esp32" if the flash names none) of the `lan_chat` app over
-//! Bluetooth alone. Build it with `FEATURES=ble EXAMPLE=ble_led ./build.sh`, then flash out/ble_led.bin; on the PC:
+//! As the `ble` example does, it joins room.sh's room ("esp32" if the flash names none) of the `lan_chat` app over
+//! Bluetooth alone. Room hellos must be within a minute of the receiver's clock, and the board has none of its own: if
+//! wifi.sh saved a network and it is there within 20 s, the board sets its clock by SNTP and turns Wi-Fi off; if not,
+//! it takes the time from the first room member that links (a PC's `ble_chat`, a phone's browser page). Wi-Fi is never
+//! needed. Build it with `FEATURES=ble EXAMPLE=ble_led ./build.sh`, then flash out/ble_led.bin; on the PC:
 //!
 //! ```sh
 //! cargo run -p peerwire --features ble-bluez --example ble_chat -- ROOM --no-udp
@@ -43,6 +45,8 @@ const LED_PIN: Option<&str> = option_env!("PW_LED_PIN");
 const LED_HIGH: bool = option_env!("PW_LED_HIGH").is_some();
 const BLINK: Duration = Duration::from_millis(150);
 const REPORT_EVERY: Duration = Duration::from_secs(30);
+/// How long the board tries wifi.sh's network at boot before it goes on over Bluetooth alone.
+const WIFI_WAIT: Duration = Duration::from_secs(20);
 const HELP: &str = "send `led on`, `led off` or `led toggle`";
 
 fn main() {
@@ -63,20 +67,21 @@ fn run() -> anyhow::Result<()> {
     let (wifi, room) = flash_config();
     let room = room.unwrap_or_else(|| ROOM.into());
 
-    // Wi-Fi first, for the clock; its radio also makes the chip's random numbers true ones (BLE-R15).
+    // Wi-Fi first if it's there, for the clock; its radio also makes the chip's random numbers true ones (BLE-R15).
     let board = match &wifi {
         Some((ssid, password)) => {
             let modem = Peripherals::take()?.modem;
-            Some(Board::connect_with(modem, EspSystemEventLoop::take()?, ssid, password)?)
+            Board::connect_within(modem, EspSystemEventLoop::take()?, ssid, password, WIFI_WAIT)
+                .inspect_err(|e| warn!("led: {e:#}; going on over Bluetooth alone"))
+                .ok()
         }
-        None => {
-            // The node's socket needs lwIP, which Wi-Fi would start.
-            sys::esp!(unsafe { sys::esp_netif_init() })?;
-            None
-        }
+        None => None,
     };
-    if !clock::is_set() {
-        warn!("led: the clock isn't set, so peers drop this board's hellos: wifi.sh names a network to set it from");
+    // The node's socket needs lwIP, which Wi-Fi starts if it ran (a second call does nothing).
+    sys::esp!(unsafe { sys::esp_netif_init() })?;
+    let mut timed = clock::is_set();
+    if !timed {
+        info!("led: the clock isn't set: the first room member to link gives the time");
     }
     let radio = Nimble::new()?;
     // Wi-Fi off, so links have the radio alone.
@@ -95,6 +100,12 @@ fn run() -> anyhow::Result<()> {
     let mut next_report = Instant::now() + REPORT_EVERY;
     loop {
         node.poll();
+        if let Some(time) = node.clock_from_peer().filter(|_| !timed) {
+            timed = true;
+            if let Err(e) = clock::set(time) {
+                warn!("led: the time a room member gave: {e}");
+            }
+        }
         while let Some(event) = node.try_recv_event() {
             match event {
                 Event::Connected { peer, .. } => {

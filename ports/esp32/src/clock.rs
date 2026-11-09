@@ -9,6 +9,10 @@
 //! TLS right, not the node's, and can't move its replay guard. If no server answered before the node was bound, it
 //! keeps 1970: so when a later ask sets the clock, [`keep_in_step`] restarts the chip, to bind again (NB103-I2).
 //!
+//! With no network at all (no Wi-Fi saved, or none in range), a node in a room over Bluetooth takes the time from the
+//! first member that proves the room to it ([`Node::clock_from_peer`](crate::peerwire::Node::clock_from_peer)), and
+//! [`set`] sets the clock from that.
+//!
 //! The asks are this module's own, not lwIP's SNTP client, which takes any answer that reaches its port, so a device
 //! on the LAN could step the clock (NB95-I2). Each ask carries 8 random bytes that the answer must echo, and an
 //! answer from a server with no time to give (unsynchronised, or a kiss-o'-death) is refused.
@@ -41,9 +45,28 @@ const WAIT: Duration = Duration::from_secs(2);
 /// The keeper thread's stack: DNS, one socket and a log line.
 const STACK: usize = 6 * 1024;
 
+/// The node has the time: a room member gave it ([`set`]), so a late SNTP answer needs no restart.
+static NODE_HAS_TIME: AtomicBool = AtomicBool::new(false);
+
 /// Whether the clock has been set: one before 2023-11-14 never was.
 pub fn is_set() -> bool {
     SystemTime::now().duration_since(UNIX_EPOCH).is_ok_and(|d| d.as_secs() >= ntp::SET_AFTER)
+}
+
+/// Sets the clock to `time`, the time a room member gave the node over Bluetooth
+/// ([`Node::clock_from_peer`](crate::peerwire::Node::clock_from_peer)) on a board with no network to ask: what else
+/// reads the clock (TLS, the relay carrier's events, the next bind) then has it too, and the RTC keeps it across a
+/// restart, not a power cut. A late SNTP answer then sets the clock without restarting the chip
+/// ([`keep_in_step`]): the node has the time already.
+pub fn set(time: SystemTime) -> io::Result<()> {
+    let now = time.duration_since(UNIX_EPOCH).map_err(|_| io::Error::other("a time before 1970"))?;
+    let tv = sys::timeval { tv_sec: now.as_secs() as _, tv_usec: now.subsec_micros() as _ };
+    if unsafe { sys::settimeofday(&tv, std::ptr::null()) } != 0 {
+        return Err(io::Error::other("settimeofday failed"));
+    }
+    NODE_HAS_TIME.store(true, Ordering::Relaxed);
+    info!("clock set from a room member: {} s", now.as_secs());
+    Ok(())
 }
 
 /// Sets the clock from the first of [`SERVERS`] to answer, giving each 2 s in turn, for up to `timeout`. Call it
@@ -82,7 +105,8 @@ pub fn sync(timeout: Duration) -> io::Result<()> {
 /// isn't set. It runs at the main task's priority, 1. A second call does nothing.
 ///
 /// If the clock isn't set when it starts, the first answer sets it and restarts the chip 5 s later, as a node bound
-/// meanwhile keeps 1970 and peers with a set clock drop its hellos (NB103-I2). The next boot asks before binding.
+/// meanwhile keeps 1970 and peers with a set clock drop its hellos (NB103-I2). The next boot asks before binding. Not
+/// once a room member gave the node the time ([`set`]).
 pub fn keep_in_step() -> io::Result<()> {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::Relaxed) {
@@ -96,7 +120,7 @@ pub fn keep_in_step() -> io::Result<()> {
     let spawned = std::thread::Builder::new().stack_size(STACK).spawn(move || loop {
         std::thread::sleep(if is_set() { RESYNC } else { RETRY });
         match sync(Duration::from_secs(30)) {
-            Ok(()) if set_late => {
+            Ok(()) if set_late && !NODE_HAS_TIME.load(Ordering::Relaxed) => {
                 warn!("clock: set late; restarting in 5 s, so the node binds with the time and not 1970");
                 std::thread::sleep(Duration::from_secs(5));
                 unsafe { sys::esp_restart() }

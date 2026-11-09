@@ -146,7 +146,25 @@ impl Board {
         ssid: &str,
         password: &str,
     ) -> anyhow::Result<Board> {
-        let wifi = wifi::join(modem, sysloop, ssid, password)?;
+        Board::on(wifi::join(modem, sysloop, ssid, password)?)
+    }
+
+    /// [`connect_with`](Board::connect_with), giving up on the network once `within` has passed with no attempt
+    /// joined ([`wifi::join_within`]): for firmware that goes on over Bluetooth alone when the network isn't there. A
+    /// node in a room there takes the time from the first member that links ([`Node::clock_from_peer`]), and
+    /// [`clock::set`] sets the system clock from it.
+    pub fn connect_within(
+        modem: Modem<'static>,
+        sysloop: EspSystemEventLoop,
+        ssid: &str,
+        password: &str,
+        within: Duration,
+    ) -> anyhow::Result<Board> {
+        Board::on(wifi::join_within(modem, sysloop, ssid, password, within)?)
+    }
+
+    /// The board on `wifi`, with the clock set if a server answers.
+    fn on(wifi: Wifi) -> anyhow::Result<Board> {
         let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
         let (ip, prefix) = (ip_info.ip, ip_info.subnet.mask.0);
         info!("on Wi-Fi at {ip}/{prefix}, free heap {} B", free_heap());

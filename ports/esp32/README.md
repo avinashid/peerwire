@@ -271,8 +271,10 @@ anywhere can join with `room_chat ROOM`. Without one it stays on the LAN, in roo
   `identity::renew` (`id new`) doesn't scrub the old key: NVS leaves it in flash until
   its page is reused. To retire a board's key before handing the board on, erase its
   flash.
-- **Clocks.** A board that can't reach an SNTP server can't link with a PC, whose clock
-  differs by more than a minute (NB-093).
+- **Clocks.** A board that can't reach an SNTP server can't link with a PC over Wi-Fi,
+  whose clock differs by more than a minute (NB-093). Over Bluetooth it can: the node
+  takes the time from the first room member that links (`Node::clock_from_peer`), and
+  `clock::set` sets the board's clock from it (NB-119).
 - **More relays.** The board uses one Nostr relay, as each costs a thread and a TLS
   session; peers elsewhere must use that relay too. If it is down, only the LAN is left.
 - **Memory caps.** With heavy traffic each link holds its send and reassembly buffers.
