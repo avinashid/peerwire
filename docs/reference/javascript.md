@@ -963,7 +963,9 @@ Bluetooth doesn't say the ATT MTU.
   members) and dials it there. Messages are the endpoint's, raw bytes as a node sends them: `endpoint.send(peer,
   data)`, and `message` events.
 - **Trust.** Nothing from the picker (the device's name or id) is trusted or sent: who is at the other end comes from
-  its identity proof and the handshake. Datagrams pass only once the member proved who it is, and only from it.
+  its identity proof and the handshake. Datagrams pass only once the member proved who it is, and only from it. That
+  member needn't be on the device the user picked: a device in range can pass the connection on to another member's.
+  Without `peer`, `dial()` links with any member it reaches; with it, only with that one.
 
 | Option | Default | |
 |---|---|---|

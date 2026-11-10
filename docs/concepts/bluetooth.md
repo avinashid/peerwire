@@ -423,8 +423,10 @@ tests use an in-process pair of fake radios.
     with the endpoint's identity. The page only moves GATT values: notifications from `tx`, and writes without
     response to `rx` of 20 bytes at most, one at a time, as Web Bluetooth doesn't say the ATT MTU.
   - Datagrams pass only once the peer's identity proof checks out, and then only as from that peer
-    (`handle_datagram_from`): a browser keeps one connection to the member it picked, so it binds the connection to
-    the peer proven on it rather than to a session, which is stricter.
+    (`handle_datagram_from`): a browser keeps one connection, to the member proven on it, so it binds the connection
+    to that peer rather than to a session, which is stricter. That member needn't be on the device the user picked: a
+    device in range can pass the connection on to another member's, so `dial()` with no `peer` links with any member
+    it reaches.
   - Once the room is proven the page sends a room hello over the connection, as the node's traversal makes one (the
     proof under the room key, sealed under the hello key): a node takes links only with members. Once the peer proved
     who it is, the page dials it over the connection. It acts on neither the peer's hello nor its offers, as the

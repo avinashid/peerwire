@@ -69,7 +69,8 @@ impl PwBle {
     fn close(&mut self, reason: u8) {
         if !self.closed {
             self.closed = true;
-            self.event(vec![PW_BLE_CLOSED, reason]);
+            // Past MAX_EVENTS too: the host has to see that the connection closed (NB110d-I2).
+            self.events.push_back(vec![PW_BLE_CLOSED, reason]);
         }
     }
 
@@ -205,8 +206,8 @@ pub unsafe extern "C" fn pw_ble_timeout(b: *mut PwBle, now_us: u64) -> i64 {
         b.close(LATE);
         return -1;
     }
-    // Just past the deadline, so that the call then closes it.
-    (deadline.as_micros() + 1) as i64
+    // Just past the deadline, so that the call then closes it; never negative, on any host clock (NB110d-I2).
+    deadline.as_micros().saturating_add(1).min(i64::MAX as u64) as i64
 }
 
 /// Seals `payload` under the link key as this end's next signal of inner kind `inner` (1 a room hello, 2 a message
@@ -465,6 +466,32 @@ mod tests {
         assert_eq!(unsafe { pw_ble_state(c.0) }, 4);
         run((&c, &ec), (&p, &ep), 3_000_001);
         assert!(c.events().is_empty() && c.values().is_empty(), "nothing taken once closed");
+    }
+
+    /// NB110d-I2: a host clock near the top of its range gets a deadline, not a wrap to 0 or a negative.
+    #[test]
+    fn the_deadline_holds_at_the_top_of_the_clock() {
+        let (app, room, ch) = ("app", "room", [9u8; CHALLENGE_LEN]);
+        for at in [u64::MAX - 1_000_000, i64::MAX as u64 - 1_000_000] {
+            let b = Ble(unsafe { pw_ble_new(app.as_ptr(), 3, room.as_ptr(), 4, 1, ch.as_ptr(), 23, at, 1) });
+            assert!(!b.0.is_null());
+            assert_eq!(unsafe { pw_ble_timeout(b.0, at) }, i64::MAX, "opened at {at}");
+            assert!(b.events().is_empty(), "still open");
+        }
+    }
+
+    /// NB110d-I2: CLOSED reaches a host that let the events pile up past MAX_EVENTS.
+    #[test]
+    fn closed_is_queued_past_the_event_limit() {
+        let c = Ble::new("room", true, 9, 1);
+        for _ in 0..MAX_EVENTS {
+            unsafe { &mut *c.0 }.event(vec![PW_BLE_PROVEN]);
+        }
+        unsafe { &mut *c.0 }.event(vec![PW_BLE_PROVEN]);
+        assert_eq!(unsafe { pw_ble_timeout(c.0, 3_000_001) }, -1);
+        let events = c.events();
+        assert_eq!(events.len(), MAX_EVENTS + 1, "the one past the limit dropped, CLOSED kept");
+        assert_eq!(events.last(), Some(&vec![PW_BLE_CLOSED, 5]));
     }
 
     #[test]
