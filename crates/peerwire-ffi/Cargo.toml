@@ -24,6 +24,10 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # Shared documents (pw_docs_*, pw_doc_*). Off by default: the wasm build leaves them out (browsers use doc.js), and
 # its size doesn't change. gate.sh and CI build, lint and test them on their own.
 sync = ["dep:peerwire-sync"]
+# Bluetooth LE (pw_ble_*): one connection's protocol for a host whose own stack moves the GATT values, such as Web
+# Bluetooth. Off by default: it brings AES-GCM and HMAC-SHA256, about 20 KB of wasm, which build.sh puts in a module of
+# its own, peerwire_ffi_ble.wasm. gate.sh and CI build, lint and test it on their own.
+ble = ["peerwire-core/ble"]
 
 [dependencies]
 peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
@@ -33,5 +37,11 @@ rand_chacha = "0.3"
 k256 = { version = "0.13", default-features = false, features = ["schnorr", "arithmetic"] }
 
 [dev-dependencies]
+# tests/ble_node.rs: the C ABI's Bluetooth central, as a browser runs it, against a node over the in-process radios,
+# with the room hello made by hand as the browser makes it (the crates are in the tree already, through peerwire).
+peerwire = { path = "../peerwire", features = ["ble", "testing"] }
+sha2 = "0.10"
+hmac = "0.12"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 # The fuzz harness (peerwire_sim::fuzz).
 peerwire-sim = { path = "../peerwire-sim" }

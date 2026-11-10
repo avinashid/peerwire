@@ -116,6 +116,24 @@ export const b64 = (b) => {
 export const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const sha256 = async (bytes) => new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
 
+// The key a room's hellos are sealed under (AES-GCM): sha256("peerwire/room-enc/<room>"), `room` being
+// '<appId>/<roomId>', as Rust's traversal derives it.
+export async function roomSealKey(room) {
+  const raw = await sha256(enc.encode(`peerwire/room-enc/${room}`));
+  return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+// `obj` as JSON, sealed under a room's key: a random nonce (12 bytes), then the AES-GCM ciphertext and tag, as Rust's
+// traversal seals a room hello. Nostr carries it in base64 (sealRoom); Bluetooth as it is (bluetooth.js).
+export async function sealRoomBytes(key, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj))));
+  const out = new Uint8Array(iv.length + ct.length);
+  out.set(iv);
+  out.set(ct, iv.length);
+  return out;
+}
+
 export class NostrSignaling {
   constructor(pw, endpoint, { room, relays = DEFAULT_RELAYS, listen = true } = {}) {
     this.pw = pw;
@@ -149,9 +167,7 @@ export class NostrSignaling {
     // Presence bodies are encrypted under this key so only someone who knows the
     // room name can read them (SEC-2); the topic tag above is a hash of the name,
     // so the name itself can't be recovered from the traffic.
-    this.encKey = await crypto.subtle.importKey(
-      'raw', await sha256(enc.encode(`peerwire/room-enc/${this.room}`)),
-      { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    this.encKey = await roomSealKey(this.room);
     this.sub = hex(crypto.getRandomValues(new Uint8Array(8)));
     // Going online, a new connection type (a new network, as in room.js) or the page showing again redials the relays
     // that aren't open, their waits starting over; only going online recycles open sockets too. navigator.connection's
@@ -691,12 +707,7 @@ export class NostrSignaling {
 
   // Encrypts an object for the room: base64 of nonce (12 bytes) || AES-GCM ciphertext.
   async sealRoom(obj) {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.encKey, enc.encode(JSON.stringify(obj))));
-    const out = new Uint8Array(iv.length + ct.length);
-    out.set(iv);
-    out.set(ct, iv.length);
-    return b64(out);
+    return b64(await sealRoomBytes(this.encKey, obj));
   }
 
   // Decrypts a room-sealed body back to its object, or null if it isn't one for

@@ -809,7 +809,8 @@ function loadPeerwire(source: string | URL | BufferSource): Promise<Peerwire>
 
 Loads the wasm module from a URL (fetched; in a browser, relative and root-relative ones too), an absolute path or
 `file:` URL (read from disk, in Node only), or its bytes. A fetch with an HTTP error status rejects with it.
-`joinRoom` and `openInbox` load it once per source and share it.
+`joinRoom` and `openInbox` load it once per source and share it. The module with Bluetooth is
+[`BLUETOOTH_WASM`](#bluetoothtransport).
 
 | `Peerwire` method | |
 |---|---|
@@ -930,6 +931,63 @@ Datagrams over the BroadcastChannel, for Node and tests: peers in one process or
 browser. `joinRoom` uses it for `'local'` rooms when the runtime has no WebRTC. It has the
 [`Transport`](#transport) methods.
 
+## BluetoothTransport
+
+```js
+import { loadPeerwire, BluetoothTransport, BLUETOOTH_WASM } from '@peerwire/js';
+
+const pw = await loadPeerwire(BLUETOOTH_WASM);
+const endpoint = pw.endpoint();
+const bt = new BluetoothTransport(endpoint, { appId: 'peerwire-lan-chat', roomId: 'esp32' });
+endpoint.onEvent = (e) => {
+  if (e.type === 'message') console.log(new TextDecoder().decode(e.data));
+};
+globalThis.document?.querySelector('button')?.addEventListener('click', async () => {
+  const peer = await bt.dial(); // the device picker; resolves once linked
+  endpoint.send(peer, 'led on');
+});
+```
+
+Bluetooth LE in the browser, with Web Bluetooth (Chrome and Edge; on a phone, Android Chrome), as a central only: the
+user picks a device nearby that runs Peerwire (a Linux machine running `ble_chat`, an ESP32 board running `ble_led`)
+and the page links with the room member there over Bluetooth alone, with no network. Two browsers can't link this way,
+and Firefox, Safari and every iPhone browser have no Web Bluetooth. The protocol ([Bluetooth](../concepts/bluetooth.md))
+runs in the wasm; the transport moves GATT values, one write without response at a time, 20 bytes at most each, as Web
+Bluetooth doesn't say the ATT MTU.
+
+- **The module with Bluetooth.** It needs an endpoint of `peerwire_ffi_ble.wasm` (`BLUETOOTH_WASM`, also the package's
+  `./peerwire_ffi_ble.wasm`): the default module and `pw_ble_*`, about 50 KB more, so a page that doesn't use
+  Bluetooth doesn't load it. An endpoint of the default module is a `TypeError`.
+- **A native room.** The room is a Rust node's, not a `joinRoom` room: once the connection proves the room and the
+  member proves who it is, the page sends it a room hello over the connection (the node takes links only with
+  members) and dials it there. Messages are the endpoint's, raw bytes as a node sends them: `endpoint.send(peer,
+  data)`, and `message` events.
+- **Trust.** Nothing from the picker (the device's name or id) is trusted or sent: who is at the other end comes from
+  its identity proof and the handshake. Datagrams pass only once the member proved who it is, and only from it.
+
+| Option | Default | |
+|---|---|---|
+| `appId`, `roomId` | | The room, as the native peers name it (`ble_led`: `peerwire-lan-chat` and its room). |
+| `bluetooth` | `navigator.bluetooth` | Web Bluetooth, or a stand-in for tests. |
+| `onPeer(peer, state)` | none | `'open'` once a link is up, `'closed'` once its connection went (the endpoint's link then times out, unless it has another path). |
+
+| Member | |
+|---|---|
+| `available()` | Resolves to whether this browser has Web Bluetooth and a radio it can use now. |
+| `dial(peer?)` | Opens the device picker (call it from a click: Web Bluetooth needs a user gesture and an https page), filtered on the service, connects, proves the room and links. Resolves to the member's PeerId once the link is up, within 15 s; with `peer`, only if the device proves it is that one. A connection whose room challenge doesn't come within 2 s is made again, 3 times in all (Chrome drops a notification that comes before `startNotifications()` settles). |
+| `has(peer)`, `drop(peer)`, `close()` | The [`Transport`](#transport) methods. `drop` sends the endpoint's goodbye over the connection, then closes it. |
+
+`dial` rejects with an `Error` whose `code` says why: `'not-available'` (no Web Bluetooth, or Bluetooth is off),
+`'cancelled'` (no device picked), `'not-allowed'` (no user gesture, a page that isn't secure, or a policy),
+`'not-member'` (the device closed the connection on our answer to its room challenge: another room's name),
+`'refused'` (it closed the connection before challenging us: full), `'wrong-peer'`, `'violation'`, `'timeout'`,
+`'failed'` (Web Bluetooth failed) or `'closed'`.
+
+`BleLink` is the protocol of one connection in the module with Bluetooth, for a host that moves the GATT values
+itself: `push(value)` takes a value and returns its events (`proven`, `peer`, `signal`, `closed`), `values()` gives
+the values to send, `signal(inner, payload)` and `datagram(bytes)` queue, `timeout()` runs its 3 s deadline, and
+`state()` says where it stands. `index.d.ts` has its contract.
+
 ## BroadcastSignaling
 
 ```ts ignore
@@ -1046,6 +1104,7 @@ field](../project/field-connectivity.md) explains each result.
 | `src/punch.js` | The room's own birthday punch with a peer on a fallback, cone NAT against symmetric (`birthday`). |
 | `src/nostr.js` | `NostrSignaling` over public relays: ephemeral events, a throwaway key per session, payloads sealed to the recipient's PeerId. |
 | `src/local.js` | `LocalTransport`: datagrams over the BroadcastChannel, for Node and tests. |
+| `src/bluetooth.js` | `BluetoothTransport`: a central over Web Bluetooth, linking with a native peer nearby; the protocol is the wasm's (`BleLink` in `src/peerwire.js`). |
 | `src/index.d.ts` | TypeScript types. |
 | `bin/peerwire.js`, `bin/doctor.js` | The `peerwire` command (`npx @peerwire/js doctor`): the network report, in Node. |
 
@@ -1060,6 +1119,7 @@ static server (`python3 -m http.server -d packages/js 8000`).
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
 | `demo/netlab.html` | Net Lab, a connection diagnostics page: join a room by name or a private `#key=` link; per peer, ping on the route in use, ICE round trips, WebRTC traffic, restarts and port guesses, the route and candidate pair, the offer/answer exchange and ICE checks with a verdict on which way packets are blocked, and the other side's NAT; this device's public addresses and NAT mapping; the relays' state; chat, an event log and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. |
+| `demo/led.html` | A board's LED over Bluetooth: pick an ESP32 running `ble_led` and switch its LED (`led on`, `led off`, `led toggle`), its answers in a log. `?app=` and `?room=` name the room. Needs Web Bluetooth on an https page (Android Chrome on a phone). |
 | `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player. `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it. |
 
 Add `?signal=nostr&room=<something only you know>` to a demo page to reach other machines through the default relays
@@ -1091,6 +1151,9 @@ Those marked (Chromium) open headless browser tabs on loopback. None touches a p
   then real Node rooms. No relays.
 - `rust_hello.mjs`: a Rust or Godot member's room hello is the same base64 that `sealRoom` makes, and a `Room`
   doesn't dial a native peer. No relays.
+- `bluetooth.mjs`: `BluetoothTransport` against a peripheral made of the same wasm (`BleLink` as the peripheral, with
+  an endpoint) over a fake Web Bluetooth: the link and messages both ways, the room hello as a node takes it, values of
+  20 bytes at most, a challenge Chrome drops got over, `drop()`, and each failure's code. No radio.
 - `room_proof.mjs`: an attacker that knows only the room topic gets no dial, no answer and, on a link it dials
   itself, nothing but the link proof before it is dropped; the hello proof matches Rust's.
 - `fuzz.mjs`: seeded random and mutated input to the JS parsers (Nostr events and relay messages, hex and peer ids,

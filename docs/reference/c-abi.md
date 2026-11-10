@@ -6,9 +6,9 @@ does no I/O: the host passes in time and datagrams, and sends the datagrams that
 
 | | |
 |---|---|
-| Crate | `crates/peerwire-ffi`: `src/lib.rs` (the endpoint) and `src/sync.rs` (shared documents) |
-| Builds | `cdylib`, `staticlib` and `rlib`; `packages/js/pkg/peerwire_ffi.wasm` for `wasm32-unknown-unknown` |
-| Functions | 27 in every build, and 22 more for shared documents with the `sync` feature |
+| Crate | `crates/peerwire-ffi`: `src/lib.rs` (the endpoint), `src/sync.rs` (shared documents) and `src/ble.rs` (Bluetooth LE) |
+| Builds | `cdylib`, `staticlib` and `rlib`; `packages/js/pkg/peerwire_ffi.wasm` for `wasm32-unknown-unknown`, and `peerwire_ffi_ble.wasm` with Bluetooth |
+| Functions | 27 in every build, 22 more for shared documents with the `sync` feature, and 10 for Bluetooth LE with `ble` |
 | Header | none in the repo. The declarations on this page are translated from the Rust signatures |
 | Status | early development (v0.1). The ABI may still change |
 
@@ -18,9 +18,10 @@ full contract is its doc comment in `src/`.
 ## Build
 
 ```sh
-./packages/js/build.sh                                  # -> packages/js/pkg/peerwire_ffi.wasm
+./packages/js/build.sh                                  # -> packages/js/pkg/peerwire_ffi.wasm and peerwire_ffi_ble.wasm
 cargo build --release -p peerwire-ffi                   # -> target/release/libpeerwire_ffi.so (.dylib on macOS), .a
 cargo build --release -p peerwire-ffi --features sync   # the same, with the shared-document functions
+cargo build --release -p peerwire-ffi --features ble    # the same, with the Bluetooth LE functions
 ```
 
 From `crates/peerwire-ffi/Cargo.toml`:
@@ -31,19 +32,24 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
 sync = ["dep:peerwire-sync"]
+ble = ["peerwire-core/ble"]
 ```
 
-`sync` is off by default, so the wasm build and a plain `cargo build` leave out `pw_docs_*` and `pw_doc_*`. The gate
-and CI build, lint and test them on their own (`cargo test -p peerwire-ffi --features sync`).
+`sync` and `ble` are off by default, so the default wasm build and a plain `cargo build` leave out `pw_docs_*`,
+`pw_doc_*` and `pw_ble_*`. The gate and CI build, lint and test them on their own (`cargo test -p peerwire-ffi
+--features sync,ble`).
 
 `packages/js/build.sh` builds for `wasm32-unknown-unknown` into `target/web` with `opt-level=s`, LTO, one codegen
 unit, stripped symbols and `panic=abort`, then copies the module to `packages/js/pkg/`. `scripts/gate.sh` and CI
 (`.github/scripts/wasm-check.mjs`) fail if the module is over `WASM_MAX_BYTES` (358,400 bytes, 350 KiB) or has any
-import. On `main` it is 356,750 bytes with no imports, as the gate's `wasm size+imports` step reports it after
-`packages/js/build.sh`:
+import. It builds `peerwire_ffi_ble.wasm` too, the same with `ble`: AES-GCM, HMAC-SHA256 and Ed25519 signatures make
+it about 52 KB larger, so only a page that uses Bluetooth loads it, and it has a limit of its own,
+`WASM_BLE_MAX_BYTES` (430,080 bytes, 420 KiB). On `be/NB-110d` (`e16ea68` and this change) the gate's `wasm
+size+imports` step reports, after `packages/js/build.sh`:
 
 ```text
-packages/js/pkg/peerwire_ffi.wasm: 356750 bytes (limit 358400), 0 imports
+packages/js/pkg/peerwire_ffi.wasm: 356894 bytes (limit 358400), 0 imports
+packages/js/pkg/peerwire_ffi_ble.wasm: 409421 bytes (limit 430080), 0 imports
 ```
 
 ## Conventions
@@ -424,6 +430,55 @@ int32_t pw_doc_snapshot(PwDocs *h, uint32_t doc, uint8_t *buf, size_t cap);
 | `pw_doc_status` | Where catching up stands, as JSON, as doc.js's `doc.sync`: `{"state":…,"from":…,"have":…,"total":…,"source":…,"at":…}`. `source` is `"members"` once caught up, else `null`; `at` is `null` | its length or `-(needed)`; `PW_ERR_INVALID` |
 | `pw_doc_snapshot` | The doc as a copy to keep, for `pw_doc_open`'s `copy`. It holds what members wrote: keep it private | its length or `-(needed)`; `PW_ERR_INVALID` |
 
+### Bluetooth LE
+
+Only with `--features ble`. A `PwBle` is one Bluetooth LE connection's protocol (see
+[Bluetooth](../concepts/bluetooth.md)), `peerwire_core::ble::Link`, for a host whose own stack moves the GATT values,
+such as a browser's Web Bluetooth (`packages/js/src/bluetooth.js`). It runs beside an endpoint of the same build,
+with 16 random bytes for its challenge and the endpoint handle its datagrams take. Once the room is proven, it sends
+the endpoint's identity proof itself; once the other end's checks out, datagrams from it go to the endpoint as from
+that peer alone (`Endpoint::handle_datagram_from`), and none pass before. Strings are UTF-8 (pointer, length).
+
+```c
+typedef struct PwBle PwBle;   /* opaque; the ble feature */
+PwBle *pw_ble_new(const uint8_t *app, size_t app_len, const uint8_t *room, size_t room_len, uint32_t central,
+                  const uint8_t *challenge, uint32_t mtu, uint64_t now_us, uint32_t addr);
+void pw_ble_free(PwBle *b);
+void pw_ble_set_mtu(PwBle *b, uint32_t mtu);
+int32_t pw_ble_push(PwBle *b, PwEndpoint *ep, uint64_t now_us, const uint8_t *value, size_t len);
+int64_t pw_ble_timeout(PwBle *b, uint64_t now_us);
+int32_t pw_ble_signal(PwBle *b, uint32_t inner, const uint8_t *payload, size_t len);
+int32_t pw_ble_datagram(PwBle *b, const uint8_t *data, size_t len);
+int32_t pw_ble_state(const PwBle *b);
+int32_t pw_ble_poll_value(PwBle *b, uint8_t *buf, size_t cap);
+int32_t pw_ble_poll_event(PwBle *b, uint8_t *buf, size_t cap);
+```
+
+| Function | What it does | Returns |
+|---|---|---|
+| `pw_ble_new` | A connection's protocol at the central's end (`central` 1) or the peripheral's (0), made at `now_us`, in room `room` of app `app`, with ATT MTU `mtu` (23 if the host can't tell: values of 20 bytes) and endpoint handle `addr`. The peripheral's challenge is queued at once | the handle; null for a null or short input, or a name that isn't UTF-8 |
+| `pw_ble_free` | Frees it | nothing |
+| `pw_ble_set_mtu` | The ATT MTU changed: values are cut to it from now on | nothing |
+| `pw_ble_push` | Takes a GATT value that came: runs the room proof, and hands a datagram from the proven peer to `ep` (pump it after). Nothing once closed | 0; `PW_ERR_INVALID` for a null input |
+| `pw_ble_timeout` | Closes the connection (CLOSED, reason 5) if it hasn't proven the room and the peer's identity 3 s after it opened | when to call again (µs, the same clock), or -1 if there is no need |
+| `pw_ble_signal` | Seals `payload` under the link key as the next signal, inner kind 1 (a room hello) or 2 (a message sealed to the receiver) | 0; `PW_ERR_NOT_CONNECTED` before the room is proven, `PW_ERR_TOO_LARGE` over 1,207 bytes, `PW_ERR_WOULD_BLOCK` with the queue full, `PW_ERR_INVALID` for another kind |
+| `pw_ble_datagram` | Queues a datagram the endpoint sent to the connection's handle | 0; `PW_ERR_NOT_CONNECTED` until the peer proved who it is, `PW_ERR_TOO_LARGE`, `PW_ERR_WOULD_BLOCK` (dropped: the endpoint resends) |
+| `pw_ble_state` | 0 the room proof under way, 1 the central answered and waits for the proof (a peripheral that closes now has another room's name, most likely), 2 proven, 3 the peer proved who it is, 4 closed | the state; `PW_ERR_INVALID` |
+| `pw_ble_poll_value` | The next GATT value to send (as the central, a write without response to `rx`) | its length, 0 if none, or `-(needed)` |
+| `pw_ble_poll_event` | The next event | its length, 0 if none, or `-(needed)` |
+
+The events, from `src/ble.rs`:
+
+```text
+1 PROVEN                    the room proof completed, and this end's identity proof went
+2 PEER     peer(32)         the other end proved, on this connection, that it is `peer`
+3 SIGNAL   inner(u8) payload
+4 CLOSED   reason(u8)       0 a wrong answer, 1 a wrong proof, 2 something before the proof, 3 too many messages
+                            dropped or refused, 4 a wrong identity proof, 5 not proven in time
+```
+
+On CLOSED the host closes the connection and frees the `PwBle`.
+
 ## Example in C
 
 Two endpoints in one process, linked over an in-memory wire, as in the crate's `two_endpoints_through_the_c_abi`
@@ -505,8 +560,10 @@ native host needs no `pw_alloc`.
 ## WebAssembly
 
 `packages/js/build.sh` builds the crate without `sync`, so the module exports `memory` and the 27 functions of
-`src/lib.rs`, and imports nothing. [`packages/js/src/peerwire.js`](../../packages/js/src/peerwire.js) is its host; the
-API it gives apps is in the [JavaScript API](javascript.md).
+`src/lib.rs`, and imports nothing; `peerwire_ffi_ble.wasm` also exports the 10 of `src/ble.rs` (`BLUETOOTH_WASM` in
+the JS package, which `BleLink` and `BluetoothTransport` need).
+[`packages/js/src/peerwire.js`](../../packages/js/src/peerwire.js) is its host; the API it gives apps is in the
+[JavaScript API](javascript.md).
 
 - **Loading.** `loadPeerwire(source)` takes a URL, a path or the module's bytes. In Node, `file:` URLs and absolute
   paths are read from disk; anything else is fetched. It instantiates the module with an empty import object
@@ -579,6 +636,12 @@ Rust programs use the crates themselves: see [Rust crates](rust.md).
   and every event must have the documented encoding.
 - `cargo test -p peerwire-ffi --features sync` adds `src/sync.rs`: two members share a doc through the ABI, a copy
   opens it again elsewhere, and the ABI refuses what doc.js throws for, and null pointers.
+- `--features ble` adds `src/ble.rs`: a central and a peripheral prove the room and who they are, carry signals and
+  link; another room's peer is closed at either end, one not proven in 3 s closes, an identity proof in our own name
+  closes, and null and short inputs are refused. `tests/ble_node.rs` drives the ABI as a browser does, a central that
+  never advertises, against a `peerwire` node over the in-process radios: it links and swaps messages, a central that
+  sends no room hello isn't taken, and another room's is closed after its answer. `packages/js/test/bluetooth.mjs`
+  runs the same from JavaScript, against a peripheral of the wasm.
 - `packages/js/test/node_pair.mjs` links two endpoints of the wasm module in Node. Others there cover calls after
   `close()` (`endpoint_closed.mjs`), scratch-buffer reuse across memory growth (`scratch_buffers.mjs`), peer-id
   checks (`peer_id.mjs`), `pw_handle_datagram_from` (`receive_from.mjs`) and the event decoder (`fuzz.mjs`).

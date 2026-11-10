@@ -28,6 +28,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+#[cfg(feature = "ble")]
+pub mod ble;
 #[cfg(feature = "sync")]
 pub mod sync;
 

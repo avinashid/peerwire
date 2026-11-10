@@ -11,16 +11,14 @@
 
 use crate::signaling::Topic;
 use crate::traversal::Hop;
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use peerwire_core::ble::{
-    hs1_id, value_len, Chunker, Reassembler, KIND_ANSWER, KIND_CHALLENGE, KIND_DATAGRAM, KIND_PROOF, KIND_SIGNAL,
-    MAX_MESSAGE,
+    hs1_id, identity, Bucket, Fault, Input, Link, ADVERT_FULL as FULL, ADVERT_LEN, CHALLENGE_LEN as CHALLENGE,
+    INNER_ID, INNER_PEER, INNER_ROOM, PROVE_WITHIN,
 };
 use peerwire_core::{Endpoint, Identity, Instant, PeerId};
 use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::OnceLock;
@@ -29,6 +27,7 @@ use std::time::Duration;
 
 #[cfg(feature = "ble-bluez")]
 pub use crate::bluez::BlueZ;
+pub(crate) use peerwire_core::ble::{advert, ble_key};
 pub use peerwire_core::ble::{MIN_ATT_MTU, RX_UUID, SERVICE_UUID, TX_UUID};
 
 /// A device a radio heard advertising, by the driver's own number.
@@ -135,8 +134,6 @@ pub enum RadioEvent {
 /// Adverts change this often, with a new `n`, tag and address. An advert whose connection this end closed as a second
 /// one to the same peer isn't connected to again for as long, so until it changes.
 const ROTATE: Duration = Duration::from_secs(15 * 60);
-/// A connection that hasn't proven the room, and brought the other end's identity proof, by then closes.
-const PROVE_WITHIN: Duration = Duration::from_secs(3);
 /// A central's connection that hasn't proven the room makes way for a new central once it has had this long (an
 /// honest one needs a round trip), so one that never answers can't keep others out.
 const GRACE: Duration = Duration::from_secs(1);
@@ -163,32 +160,8 @@ const MAX_SEEN: usize = 256;
 /// life (`Config::handshake_timeout`), so such a connection holds at most one at a time, and a dial again after the
 /// last one ended (the network went, say) gets through.
 const HS1_WINDOW: Duration = Duration::from_secs(10);
-/// HS1s on a bound connection: a burst, then one per `BOUND_HS1_REFILL`.
-const BOUND_HS1_BURST: u32 = 4;
-const BOUND_HS1_REFILL: Duration = Duration::from_secs(5);
 /// Identity proofs checked across the radio for each new handshake it takes ([`Limits::hs1_gap`]).
 const CHECKS_PER_HS1: u32 = 4;
-/// Signals taken per connection: a burst, then one per `SIGNAL_REFILL`; the rest dropped before any cryptography.
-const SIGNAL_BURST: u32 = 16;
-const SIGNAL_REFILL: Duration = Duration::from_millis(500);
-/// Messages dropped or refused on a connection before it closes.
-const MAX_DROPS: u64 = 32;
-const CHALLENGE: usize = 16;
-const MAC: usize = 32;
-/// An identity proof: the sender's `PeerId` and its signature over the connection's challenges.
-const ID_LEN: usize = 32 + 64;
-/// The advert's service data: flags, `n`, tag.
-const ADVERT_LEN: usize = 9;
-const FULL: u8 = 1;
-/// A signal's inner kinds: a room hello, a message sealed to the receiver, or the sender's identity proof.
-const INNER_ROOM: u8 = 1;
-const INNER_PEER: u8 = 2;
-const INNER_ID: u8 = 3;
-
-/// The room's ble key: the room's name hashed under a label of its own, never the topic's.
-pub(crate) fn ble_key(app_id: &str, room: &str) -> [u8; 32] {
-    Sha256::digest(format!("peerwire/room-ble/{app_id}/{room}")).into()
-}
 
 fn hmac(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
     let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("any key length");
@@ -196,20 +169,6 @@ fn hmac(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
         m.update(p);
     }
     m.finalize().into_bytes().into()
-}
-
-/// The 9 bytes an advert carries: flags, `n` and the tag for `n` under the ble key.
-pub(crate) fn advert(key: &[u8; 32], n: u32, full: bool) -> [u8; ADVERT_LEN] {
-    let mut a = [0u8; ADVERT_LEN];
-    a[0] = if full { FULL } else { 0 };
-    a[1..5].copy_from_slice(&n.to_le_bytes());
-    a[5..].copy_from_slice(&hmac(key, &[b"pw-ble-adv", &n.to_le_bytes()])[..4]);
-    a
-}
-
-/// What an identity proof signs: the connection's challenges, `c_p ‖ c_c`, under a label of its own.
-fn id_message(transcript: &[u8; 2 * CHALLENGE]) -> Vec<u8> {
-    [&b"pw-ble-id"[..], transcript].concat()
 }
 
 /// How the log names `device`: a hash under a key drawn in each process, so that it carries no address, yet one run's
@@ -233,47 +192,6 @@ impl std::fmt::Display for Tag {
     }
 }
 
-/// A token bucket.
-#[derive(Clone, Copy, Debug, Default)]
-struct Bucket {
-    tokens: u32,
-    at: Option<Instant>,
-}
-
-impl Bucket {
-    /// Takes a token: a full `burst` at first, then one more each `refill`.
-    fn take(&mut self, now: Instant, burst: u32, refill: Duration) -> bool {
-        match self.at {
-            None => (self.tokens, self.at) = (burst, Some(now)),
-            Some(at) => {
-                let fresh = now.saturating_duration_since(at).as_micros() / refill.as_micros().max(1);
-                let fresh = u32::try_from(fresh).unwrap_or(u32::MAX);
-                if fresh > 0 {
-                    self.tokens = self.tokens.saturating_add(fresh).min(burst);
-                    self.at = Some(if self.tokens == burst { now } else { at + refill * fresh });
-                }
-            }
-        }
-        if self.tokens == 0 {
-            return false;
-        }
-        self.tokens -= 1;
-        true
-    }
-}
-
-/// Where a connection's room proof stands.
-enum Proof {
-    /// The peripheral sent this challenge.
-    Challenged([u8; CHALLENGE]),
-    /// The central waits for the challenge.
-    Awaiting,
-    /// The central answered `c_p` with `c_c`, and waits for the proof.
-    Answered([u8; CHALLENGE], [u8; CHALLENGE]),
-    /// Both ends hold the room's ble key: signals are sealed under `key`. `transcript` is `c_p ‖ c_c`.
-    Proven { key: [u8; 32], tx: u64, rx: u64, transcript: [u8; 2 * CHALLENGE] },
-}
-
 /// Who is at a connection's other end, as far as it is proven on the connection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Id {
@@ -295,11 +213,8 @@ struct Conn {
     to: Option<DeviceId>,
     /// The `n` of the advert it connected to.
     n: Option<u32>,
-    mtu: u16,
-    chunker: Chunker,
-    reassembler: Reassembler,
-    queue: VecDeque<Vec<u8>>,
-    proof: Proof,
+    /// The room proof, then signals and datagrams, in chunks: the connection's protocol.
+    link: Link,
     /// The room it was proven in ([`Ble::gen`]): it carries signals only for that one.
     gen: u32,
     id: Id,
@@ -311,20 +226,13 @@ struct Conn {
     known_at: Instant,
     /// When the last signal on it proved a room member (or it was proven).
     heard: Instant,
-    signals: Bucket,
     /// Unbound: the one HS1 it took, and when.
     hs1: Option<((u32, [u8; 32]), Instant)>,
-    /// Bound: the last HS1 it took, and their budget.
-    last_hs1: Option<(u32, [u8; 32])>,
-    hs1s: Bucket,
-    drops: u64,
-    /// The reassembler's drops already counted in `drops`.
-    counted: u64,
 }
 
 impl Conn {
     fn proven(&self) -> bool {
-        matches!(self.proof, Proof::Proven { .. })
+        self.link.proven()
     }
 
     /// The peer proven to be at the other end.
@@ -524,7 +432,7 @@ impl Ble {
             RadioEvent::ConnectFailed { device } => self.failed(now, device),
             RadioEvent::Mtu { conn, mtu } => {
                 if let Some(c) = self.conns.get_mut(&conn) {
-                    c.mtu = mtu;
+                    c.link.set_mtu(mtu);
                 }
             }
             RadioEvent::Value { conn, value } => self.on_value(now, ep, conn, &value),
@@ -701,26 +609,25 @@ impl Ble {
             None if !self.on || !self.make_way(now) => return refuse(self, "no room for a central"),
             None => None,
         };
-        if self.room.is_none() {
-            return refuse(self, "in no room");
-        }
+        let Some((key, _)) = self.room else { return refuse(self, "in no room") };
         self.next_hop = self.next_hop.wrapping_add(1) & 0x00ff_ffff;
         let [_, a, b, c] = self.next_hop.to_be_bytes();
         let at = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, a, b, c), 0));
         let mut challenge = [0u8; CHALLENGE];
         OsRng.fill_bytes(&mut challenge);
         let central = device.is_some();
+        // The peripheral's link sends its challenge at once; the central's answers the one that comes with its own.
+        let link = match central {
+            true => Link::central(key, challenge, mtu, self.limits.queue, now),
+            false => Link::peripheral(key, challenge, mtu, self.limits.queue, now),
+        };
         let c = Conn {
             hop: Hop::Ble(at),
             made: self.next_hop,
             central,
             to: device,
             n,
-            mtu,
-            chunker: Chunker::new(),
-            reassembler: Reassembler::new(),
-            queue: VecDeque::new(),
-            proof: if central { Proof::Awaiting } else { Proof::Challenged(challenge) },
+            link,
             gen: self.gen,
             id: Id::Unknown,
             bound: None,
@@ -728,100 +635,43 @@ impl Ble {
             opened: now,
             known_at: now,
             heard: now,
-            signals: Bucket::default(),
             hs1: None,
-            last_hs1: None,
-            hs1s: Bucket::default(),
-            drops: 0,
-            counted: 0,
         };
         if let Some(old) = self.by_hop.insert(at, conn) {
             self.forget(old);
         }
         log::debug!("Bluetooth: conn {} up ({}), ATT MTU {mtu}", conn.0, c.who());
         self.conns.insert(conn, c);
-        if !central {
-            self.send(conn, &[&[KIND_CHALLENGE], &challenge]);
-        }
         self.refresh(now);
     }
 
+    /// A value that came on `conn`, which its link runs the room proof on, then hands on signals and datagrams. Out of
+    /// a room (only connections bound to a peer stay open then), only its closing is acted on.
     fn on_value(&mut self, now: Instant, ep: &mut Endpoint<Hop<SocketAddr>>, conn: ConnId, value: &[u8]) {
         let Some(c) = self.conns.get_mut(&conn) else { return };
-        let Some(message) = c.reassembler.push(now, value).map(<[u8]>::to_vec) else {
-            return self.count_codec(conn);
-        };
-        self.count_codec(conn);
-        self.on_message(now, ep, conn, &message);
+        match (c.link.push(now, value), self.room) {
+            (Input::Close(why), _) => self.close(conn, &why.to_string()),
+            (_, None) | (Input::Nothing, _) => {}
+            (Input::Proven, _) => self.proven(now, conn),
+            (Input::Signal(inner, payload), Some((_, topic))) => self.on_signal(conn, topic, inner, payload),
+            (Input::Datagram(d), _) => self.on_datagram(now, ep, conn, &d),
+        }
     }
 
-    /// Counts the codec's new drops against `conn`.
-    fn count_codec(&mut self, conn: ConnId) {
-        let Some(c) = self.conns.get_mut(&conn) else { return };
-        let d = c.reassembler.dropped();
-        let fresh = d - c.counted;
-        c.counted = d;
-        self.dropped(conn, fresh);
-    }
-
-    /// Counts `n` drops against `conn`, and closes it at `MAX_DROPS`.
+    /// Counts `n` drops against `conn`, and closes it at the limit (`MAX_DROPS`).
     fn dropped(&mut self, conn: ConnId, n: u64) {
         let Some(c) = self.conns.get_mut(&conn) else { return };
-        c.drops += n;
-        if c.drops >= MAX_DROPS {
-            self.close(conn, "too many values dropped or refused");
+        if c.link.count(n) {
+            self.close(conn, &Fault::Drops.to_string());
         }
     }
 
-    fn on_message(&mut self, now: Instant, ep: &mut Endpoint<Hop<SocketAddr>>, conn: ConnId, m: &[u8]) {
-        let Some(((key, topic), c)) = self.room.zip(self.conns.get_mut(&conn)) else { return };
-        let (kind, body) = (m[0], &m[1..]);
-        match (&c.proof, kind) {
-            (Proof::Challenged(c_p), KIND_ANSWER) if body.len() == CHALLENGE + MAC => {
-                let (c_p, c_c) = (*c_p, <[u8; CHALLENGE]>::try_from(&body[..CHALLENGE]).expect("16 bytes"));
-                if !same(&hmac(&key, &[b"pw-ble-c", &c_p, &c_c]), &body[CHALLENGE..]) {
-                    return self.close(conn, "a wrong answer to the room challenge");
-                }
-                let proof = hmac(&key, &[b"pw-ble-p", &c_c, &c_p]);
-                self.send(conn, &[&[KIND_PROOF], &proof]);
-                self.proven(now, conn, c_p, c_c);
-            }
-            (Proof::Awaiting, KIND_CHALLENGE) if body.len() == CHALLENGE => {
-                let c_p = <[u8; CHALLENGE]>::try_from(body).expect("16 bytes");
-                let mut c_c = [0u8; CHALLENGE];
-                OsRng.fill_bytes(&mut c_c);
-                let mac = hmac(&key, &[b"pw-ble-c", &c_p, &c_c]);
-                c.proof = Proof::Answered(c_p, c_c);
-                self.send(conn, &[&[KIND_ANSWER], &c_c, &mac]);
-            }
-            (Proof::Answered(c_p, c_c), KIND_PROOF) if body.len() == MAC => {
-                let (c_p, c_c) = (*c_p, *c_c);
-                if !same(&hmac(&key, &[b"pw-ble-p", &c_c, &c_p]), body) {
-                    return self.close(conn, "a wrong room proof");
-                }
-                self.proven(now, conn, c_p, c_c);
-            }
-            // Before the proof, nothing else: a connection that tries closes.
-            (Proof::Challenged(_) | Proof::Awaiting | Proof::Answered(..), _) => {
-                self.close(conn, "something else came before the room proof")
-            }
-            (Proof::Proven { .. }, KIND_SIGNAL) => self.on_signal(now, conn, topic, body),
-            (Proof::Proven { .. }, KIND_DATAGRAM) if !body.is_empty() => self.on_datagram(now, ep, conn, body),
-            (Proof::Proven { .. }, _) => self.dropped(conn, 1),
-        }
-    }
-
-    /// `conn` proved the room with challenges `c_p` and `c_c`: signals go under its link key, and this end sends its
-    /// identity proof over it. A standby that fills the last unbound slot closes the weakest other (NB110-2).
-    fn proven(&mut self, now: Instant, conn: ConnId, c_p: [u8; CHALLENGE], c_c: [u8; CHALLENGE]) {
-        let Some(((key, _), c)) = self.room.zip(self.conns.get_mut(&conn)) else { return };
-        let mut transcript = [0u8; 2 * CHALLENGE];
-        transcript[..CHALLENGE].copy_from_slice(&c_p);
-        transcript[CHALLENGE..].copy_from_slice(&c_c);
-        let link = hmac(&key, &[b"pw-ble-k", &transcript]);
-        (c.proof, c.heard) = (Proof::Proven { key: link, tx: 0, rx: 0, transcript }, now);
-        let sig = self.me.sign(&id_message(&transcript));
-        self.signal(conn, INNER_ID, &[&self.me.peer_id().as_bytes()[..], &sig].concat());
+    /// `conn` proved the room: signals go under its link key, and this end sends its identity proof over it. A standby
+    /// that fills the last unbound slot closes the weakest other (NB110-2).
+    fn proven(&mut self, now: Instant, conn: ConnId) {
+        let Some(c) = self.conns.get_mut(&conn) else { return };
+        c.heard = now;
+        c.link.send_identity(&self.me);
         self.out.push_back(Inbound::Proven(conn));
         log::debug!("Bluetooth: conn {} proved the room", conn.0);
         if self.unbound() >= self.limits.unbound {
@@ -831,36 +681,26 @@ impl Ble {
         }
     }
 
-    fn on_signal(&mut self, now: Instant, conn: ConnId, room: Topic, body: &[u8]) {
-        let Some(c) = self.conns.get_mut(&conn) else { return };
-        let fresh_room = c.gen == self.gen;
-        if !fresh_room || body.len() < 8 || !c.signals.take(now, SIGNAL_BURST, SIGNAL_REFILL) {
+    /// A signal its link opened on `conn` (within the connection's budget, and in sequence): a room hello, a message
+    /// for this node's inbox, or the other end's identity proof. A connection proven in another room carries none.
+    fn on_signal(&mut self, conn: ConnId, room: Topic, inner: u8, payload: Vec<u8>) {
+        if self.conns.get(&conn).is_none_or(|c| c.gen != self.gen) {
             return self.dropped(conn, 1);
         }
-        let Proof::Proven { key, rx, .. } = &mut c.proof else { return };
-        let seq = u64::from_le_bytes(body[..8].try_into().expect("8 bytes"));
-        // From the other end: the direction it seals under is the other one.
-        let dir = if c.central { 1u32 } else { 0 };
-        let opened = (seq > *rx).then(|| open(key, dir, seq, &body[8..])).flatten();
-        let Some(plain) = opened.filter(|p| !p.is_empty()) else { return self.dropped(conn, 1) };
-        *rx = seq;
-        let topic = match plain[0] {
+        let topic = match inner {
             INNER_ROOM => room,
             INNER_PEER => Topic::peer(&self.me.peer_id()),
-            INNER_ID => return self.on_id(conn, &plain[1..]),
+            INNER_ID => return self.on_id(conn, &payload),
             _ => return self.dropped(conn, 1),
         };
-        self.out.push_back(Inbound::Signal { topic, payload: plain[1..].to_vec(), conn });
+        self.out.push_back(Inbound::Signal { topic, payload, conn });
     }
 
     /// The other end's identity proof, the one a connection takes: checked as the radio's budget allows.
     fn on_id(&mut self, conn: ConnId, body: &[u8]) {
         let Some(c) = self.conns.get_mut(&conn) else { return };
-        if body.len() != ID_LEN || c.id != Id::Unknown {
-            return self.dropped(conn, 1);
-        }
-        let peer = PeerId(body[..32].try_into().expect("32 bytes"));
-        c.id = Id::Pending(peer, body[32..].try_into().expect("64 bytes"));
+        let Some((peer, sig)) = identity(body).filter(|_| c.id == Id::Unknown) else { return self.dropped(conn, 1) };
+        c.id = Id::Pending(peer, sig);
         self.check_ids();
     }
 
@@ -873,12 +713,11 @@ impl Ble {
         loop {
             let waiting = self.conns.iter().filter(|(_, c)| matches!(c.id, Id::Pending(..)));
             let Some((&conn, c)) = waiting.min_by_key(|(_, c)| (c.opened, c.made)) else { return };
-            let (Id::Pending(peer, sig), Proof::Proven { transcript, .. }) = (c.id, &c.proof) else { return };
-            let message = id_message(transcript);
+            let Id::Pending(peer, sig) = c.id else { return };
             if !self.checks.take(self.now, burst, gap) {
                 return;
             }
-            match peer != self.me.peer_id() && peer.verify(&message, &sig) {
+            match peer != self.me.peer_id() && c.link.verifies(&peer, &sig) {
                 true => self.reaches(conn, peer, false),
                 false => self.close(conn, "a wrong identity proof"),
             }
@@ -921,11 +760,8 @@ impl Ble {
         let id = hs1_id(d);
         match c.bound {
             Some(p) => {
-                if let Some(id) = id.filter(|id| c.last_hs1 != Some(*id)) {
-                    if !c.hs1s.take(now, BOUND_HS1_BURST, BOUND_HS1_REFILL) {
-                        return self.dropped(conn, 1);
-                    }
-                    c.last_hs1 = Some(id);
+                if !c.link.take_bound(now, d) {
+                    return self.dropped(conn, 1);
                 }
                 ep.handle_datagram_from(now, c.hop, &p, d);
             }
@@ -956,8 +792,8 @@ impl Ble {
 
     /// Sends a datagram the endpoint addressed to `hop`; dropped if no proven connection is there.
     pub(crate) fn send_datagram(&mut self, hop: &SocketAddr, payload: &[u8]) {
-        if let Some(&conn) = self.by_hop.get(hop).filter(|c| self.conns.get(c).is_some_and(Conn::proven)) {
-            self.send(conn, &[&[KIND_DATAGRAM], payload]);
+        if let Some(c) = self.by_hop.get(hop).and_then(|c| self.conns.get_mut(c)) {
+            c.link.datagram(payload);
         }
     }
 
@@ -991,41 +827,19 @@ impl Ble {
 
     /// Seals `inner ‖ payload` under `conn`'s link key, as its next signal, and queues it.
     fn signal(&mut self, conn: ConnId, inner: u8, payload: &[u8]) {
-        let Some(c) = self.conns.get_mut(&conn) else { return };
-        let Proof::Proven { key, tx, .. } = &mut c.proof else { return };
-        *tx += 1;
-        let dir = if c.central { 0u32 } else { 1 };
-        let mut plain = Vec::with_capacity(1 + payload.len());
-        plain.push(inner);
-        plain.extend_from_slice(payload);
-        let Some(sealed) = seal(key, dir, *tx, &plain) else { return };
-        let seq = tx.to_le_bytes();
-        self.send(conn, &[&[KIND_SIGNAL], &seq, &sealed]);
-    }
-
-    /// Queues a message, in its chunks, on `conn`: the whole of it, or none if the queue lacks room.
-    fn send(&mut self, conn: ConnId, parts: &[&[u8]]) {
-        let Some(c) = self.conns.get_mut(&conn) else { return };
-        let m = parts.concat();
-        let room = value_len(c.mtu) - 1;
-        if m.len() > MAX_MESSAGE || c.queue.len() + m.len().div_ceil(room) > self.limits.queue {
-            return;
+        if let Some(c) = self.conns.get_mut(&conn) {
+            c.link.signal(inner, payload);
         }
-        let queue = &mut c.queue;
-        c.chunker.split(&m, c.mtu, |v| {
-            queue.push_back(v.to_vec());
-            true
-        });
     }
 
     /// Hands the radio what is queued, until it takes no more.
     pub(crate) fn send_queued(&mut self) {
         for (conn, c) in &mut self.conns {
-            while let Some(v) = c.queue.front() {
+            while let Some(v) = c.link.value() {
                 if !self.radio.send(*conn, v) {
                     break;
                 }
-                c.queue.pop_front();
+                c.link.sent();
             }
         }
     }
@@ -1146,35 +960,15 @@ impl Ble {
 /// How long this end, as the central, holds the advert of a connection that the peripheral closed, or that missed the
 /// deadline: 1 to 4 s at random if no challenge came on it (NB110-7), else `RECONNECT_HOLD`.
 fn hold(c: &Conn) -> Duration {
-    match c.proof {
-        Proof::Awaiting => REFUSED_HOLD + Duration::from_millis(u64::from(OsRng.next_u32() % REFUSED_JITTER_MS)),
-        _ => RECONNECT_HOLD,
+    match c.link.challenged() {
+        false => REFUSED_HOLD + Duration::from_millis(u64::from(OsRng.next_u32() % REFUSED_JITTER_MS)),
+        true => RECONNECT_HOLD,
     }
 }
 
 /// How long the advert of a connection that closed is held, for the log.
 fn held_for(hold: Option<Duration>) -> String {
     hold.map_or_else(String::new, |h| format!("; its advert held {:.1} s", h.as_secs_f32()))
-}
-
-fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
-}
-
-/// The GCM nonce of signal `seq` sealed by the end at direction `dir` (0 the central, 1 the peripheral).
-fn nonce(dir: u32, seq: u64) -> [u8; 12] {
-    let mut n = [0u8; 12];
-    n[..4].copy_from_slice(&dir.to_le_bytes());
-    n[4..].copy_from_slice(&seq.to_le_bytes());
-    n
-}
-
-fn seal(key: &[u8; 32], dir: u32, seq: u64, plain: &[u8]) -> Option<Vec<u8>> {
-    Aes256Gcm::new(key.into()).encrypt(Nonce::from_slice(&nonce(dir, seq)), plain).ok()
-}
-
-fn open(key: &[u8; 32], dir: u32, seq: u64, sealed: &[u8]) -> Option<Vec<u8>> {
-    Aes256Gcm::new(key.into()).decrypt(Nonce::from_slice(&nonce(dir, seq)), sealed).ok()
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -1375,9 +1169,33 @@ mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peerwire_core::ble::{
+        Chunker, Reassembler, ID_LEN, KIND_ANSWER, KIND_CHALLENGE, KIND_DATAGRAM, KIND_PROOF, KIND_SIGNAL,
+    };
     use peerwire_core::{Config, Identity, Lane, Path};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    // The protocol by hand, as `docs/concepts/bluetooth.md` gives it, to talk to a node from a test: apart from the
+    // `Link` the node runs, so a change there that the docs don't make shows here.
+    const MAC: usize = 32;
+
+    fn id_message(transcript: &[u8; 2 * CHALLENGE]) -> Vec<u8> {
+        [&b"pw-ble-id"[..], transcript].concat()
+    }
+
+    /// `plain` sealed as signal `seq` by the end at direction `dir` (0 the central, 1 the peripheral).
+    fn seal(key: &[u8; 32], dir: u32, seq: u64, plain: &[u8]) -> Option<Vec<u8>> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        let nonce = [&dir.to_le_bytes()[..], &seq.to_le_bytes()].concat();
+        aes_gcm::Aes256Gcm::new(key.into()).encrypt(aes_gcm::Nonce::from_slice(&nonce), plain).ok()
+    }
+
+    fn open(key: &[u8; 32], dir: u32, seq: u64, sealed: &[u8]) -> Option<Vec<u8>> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        let nonce = [&dir.to_le_bytes()[..], &seq.to_le_bytes()].concat();
+        aes_gcm::Aes256Gcm::new(key.into()).decrypt(aes_gcm::Nonce::from_slice(&nonce), sealed).ok()
+    }
 
     fn id(n: u8) -> Identity {
         Identity::from_secret_bytes(&[n; 32])
@@ -1403,13 +1221,14 @@ mod tests {
     }
 
     #[test]
-    fn signals_seal_per_direction_and_sequence() {
+    fn signals_seal_as_the_link_seals_them() {
         let key = [7u8; 32];
         let s = seal(&key, 0, 1, b"hello").unwrap();
-        assert_eq!(open(&key, 0, 1, &s).as_deref(), Some(&b"hello"[..]));
-        assert_eq!(open(&key, 1, 1, &s), None, "the other direction's nonce");
-        assert_eq!(open(&key, 0, 2, &s), None, "another seq");
-        assert_eq!(open(&[8u8; 32], 0, 1, &s), None, "another connection's key");
+        assert_eq!(peerwire_core::ble::open(&key, true, 1, &s).as_deref(), Some(&b"hello"[..]));
+        assert_eq!(
+            open(&key, 1, 2, &peerwire_core::ble::seal(&key, false, 2, b"x").unwrap()).as_deref(),
+            Some(&b"x"[..])
+        );
     }
 
     #[test]
@@ -1852,17 +1671,6 @@ mod tests {
             node.poll(t, &mut ep);
         }
         assert_eq!(sessions, [1, 2, 2, 2, 3], "two at once, then one per 2 s");
-    }
-
-    #[test]
-    fn a_bucket_gives_its_burst_then_refills() {
-        let mut b = Bucket::default();
-        let t = Instant::from_millis(1000);
-        assert!((0..4).all(|_| b.take(t, 4, Duration::from_secs(5))));
-        assert!(!b.take(t, 4, Duration::from_secs(5)));
-        assert!(!b.take(t + Duration::from_secs(4), 4, Duration::from_secs(5)));
-        assert!(b.take(t + Duration::from_secs(5), 4, Duration::from_secs(5)));
-        assert!(!b.take(t + Duration::from_secs(5), 4, Duration::from_secs(5)));
     }
 
     /// Who connects turns on random values. Desktops take one central each, so once one has connected to the other,

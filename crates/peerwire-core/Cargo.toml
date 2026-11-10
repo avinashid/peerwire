@@ -28,10 +28,16 @@ rand_chacha = "0.3"
 hmac = { version = "0.12", optional = true }
 sha1 = { version = "0.10", default-features = false, optional = true }
 md-5 = { version = "0.10", default-features = false, optional = true }
+# Bluetooth's connection protocol (feature `ble`, ble/link.rs): the room proof and link key are HMAC-SHA256 under the
+# room's ble key, and signals are sealed with AES-256-GCM, as the `peerwire` crate's traversal seals room hellos.
+sha2 = { version = "0.10", default-features = false, optional = true }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"], optional = true }
 
 [features]
 # The TURN codec (stun/turn.rs), for the `peerwire` crate's TURN client. Off for the FFI (the wasm) and the ESP32 port.
 turn = ["dep:hmac", "dep:sha1", "dep:md-5"]
+# Bluetooth's connection protocol (ble::Link), for the `peerwire` crate's feature `ble` and the C ABI's.
+ble = ["dep:hmac", "dep:sha2", "dep:aes-gcm"]
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
