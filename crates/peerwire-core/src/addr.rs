@@ -46,6 +46,14 @@ pub trait Address: Clone + Eq + Hash + Debug {
     fn radio(&self) -> bool {
         false
     }
+    /// Whether this is a pipe: the peer's datagrams carried over the signaling relays, sealed to it, as a browser's
+    /// `'signaling'` path carries them (`packages/js/src/webrtc.js`). The endpoint treats it as a
+    /// [`radio`](Address::radio) connection, which it is too: only a handshake puts a link there, a link on it
+    /// punches off it, and only [`Endpoint::set_keep_radio`](crate::Endpoint::set_keep_radio) keeps it there. The
+    /// host tells the two apart for its policy. `false` unless the host's address type says otherwise.
+    fn pipe(&self) -> bool {
+        false
+    }
     /// For a host with TURN: `peer` (as the TURN server reports it) reached through this host's allocation on
     /// the server at `server` (where the host sends to it); [`relayed`](Address::relayed). `None`, the default,
     /// for a host without.
