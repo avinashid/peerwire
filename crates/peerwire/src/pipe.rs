@@ -46,6 +46,8 @@ struct Pipe {
     /// When the next batch goes, if datagrams wait.
     due: Option<Instant>,
     used: Instant,
+    /// When it last sent a batch, as a count of batches sent (0: never): the pipe served longest ago goes first.
+    served: u64,
 }
 
 /// The node's pipes, by peer and by the address that names each.
@@ -53,6 +55,8 @@ pub(crate) struct Pipes {
     by_peer: HashMap<PeerId, Pipe>,
     by_addr: HashMap<SocketAddr, PeerId>,
     next: u32,
+    /// Batches sent so far, for `Pipe::served`.
+    sent: u64,
     /// The rate bucket all pipes share, in micro-tokens, and when it was last filled.
     credit: u64,
     filled: Instant,
@@ -64,6 +68,7 @@ impl Default for Pipes {
             by_peer: HashMap::new(),
             by_addr: HashMap::new(),
             next: 0,
+            sent: 0,
             credit: BURST * TOKEN,
             filled: Instant::ZERO,
         }
@@ -89,7 +94,7 @@ impl Pipes {
         }
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(self.next), 1));
         self.by_addr.insert(addr, peer);
-        let pipe = Pipe { addr, q: VecDeque::new(), bytes: 0, due: None, used: now };
+        let pipe = Pipe { addr, q: VecDeque::new(), bytes: 0, due: None, used: now, served: 0 };
         self.by_peer.insert(peer, pipe);
         Some(addr)
     }
@@ -115,14 +120,15 @@ impl Pipes {
         p.due = Some(if full { now } else { p.due.unwrap_or(now + FLUSH) });
     }
 
-    /// The next batch due, if the rate allows one: its peer, and its body to seal to it.
+    /// The next batch due, if the rate allows one: its peer, and its body to seal to it. Of the pipes with one due,
+    /// the one served longest ago goes first, so busy pipes take turns.
     pub(crate) fn take(&mut self, now: Instant) -> Option<(PeerId, String)> {
         let (peer, _) = self
             .by_peer
             .iter()
-            .filter_map(|(k, p)| Some((*k, p.due?)))
-            .filter(|(_, d)| *d <= now)
-            .min_by_key(|(_, d)| *d)?;
+            .filter_map(|(k, p)| Some((*k, (p.served, p.due?))))
+            .filter(|(_, (_, d))| *d <= now)
+            .min_by_key(|(_, key)| *key)?;
         let gained = now.saturating_duration_since(self.filled).as_micros() as u64 * RATE;
         self.credit = (self.credit + gained).min(BURST * TOKEN);
         self.filled = now;
@@ -149,6 +155,8 @@ impl Pipes {
         body.push_str(TAIL);
         p.bytes -= n;
         p.due = (!p.q.is_empty()).then_some(now);
+        self.sent += 1;
+        p.served = self.sent;
         Some((peer, body))
     }
 
@@ -267,6 +275,22 @@ mod tests {
         assert_eq!(sent, BURST, "a burst, across both pipes");
         assert_eq!(pipes.take(t + 200 * MS), None, "under a token");
         assert!(pipes.take(t + 250 * MS).is_some(), "one per 1/RATE s");
+    }
+
+    /// The rate goes to the pipe whose batch has waited longest: two busy pipes take turns, so one peer can't take
+    /// every batch.
+    #[test]
+    fn busy_pipes_take_turns() {
+        let mut pipes = Pipes::default();
+        let t = Instant::ZERO;
+        let (a, b) = (pipes.open(t, peer(1), |_| false).unwrap(), pipes.open(t, peer(2), |_| false).unwrap());
+        for _ in 0..4 {
+            pipes.send(t, &a, vec![1; MAX_DATAGRAM]);
+        }
+        pipes.send(t + MS, &b, vec![2; MAX_DATAGRAM]);
+        pipes.send(t + MS, &b, vec![2; MAX_DATAGRAM]);
+        let order: Vec<u8> = std::iter::from_fn(|| pipes.take(t + MS * 2)).map(|(p, _)| p.0[0]).collect();
+        assert_eq!(order, [1, 2, 1, 2, 1, 1]);
     }
 
     #[test]

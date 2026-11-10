@@ -552,6 +552,35 @@ mod tests {
         json!(["EVENT", "s", ev]).to_string()
     }
 
+    /// NB-126: the biggest pipe batches a node sends, sealed and signed as an event, fit what an ESP32's carrier
+    /// takes from a relay (`Limits::SMALL.message`, 4 KiB, or it closes the socket): 64 small datagrams making
+    /// 1,232 B, and one datagram of 1,232 B. Measured as the board reads it, with the relay's subscription id.
+    #[test]
+    fn the_biggest_pipe_batch_fits_an_esp32s_relay_message() {
+        use crate::pipe::{decode, Pipes, BATCH, FLUSH, MAX_ITEMS};
+        use peerwire_core::{sealed, Identity, Instant as CoreInstant};
+        let (me, to) = (Identity::from_secret_bytes(&[1; 32]), Identity::from_secret_bytes(&[2; 32]).peer_id());
+        let key = SigningKey::from_bytes(&[3; 32]).unwrap();
+        let pubkey = hex(&key.verifying_key().to_bytes());
+        let small = BATCH / MAX_ITEMS;
+        let mut many = vec![small; MAX_ITEMS - 1];
+        many.push(BATCH - small * (MAX_ITEMS - 1));
+        for sizes in [many, vec![BATCH]] {
+            let mut pipes = Pipes::default();
+            let at = pipes.open(CoreInstant::ZERO, to, |_| false).unwrap();
+            for (i, n) in sizes.iter().enumerate() {
+                pipes.send(CoreInstant::ZERO, &at, vec![i as u8; *n]);
+            }
+            let (_, body) = pipes.take(CoreInstant::ZERO + FLUSH).unwrap();
+            assert_eq!(decode(body.as_bytes()).map(|d| d.len()), Some(sizes.len()), "all in one batch");
+            let sealed = sealed::seal(&me, &to, [4; 32], body.as_bytes()).unwrap();
+            let ev = sign_event(&key, &pubkey, 1_800_000_000, &Topic::peer(&to).to_hex(), &b64(&sealed));
+            let frame = json!(["EVENT", "0123456789abcdef", ev]).to_string();
+            println!("{} datagrams, {} B: batch {} B, event as read {} B", sizes.len(), BATCH, body.len(), frame.len());
+            assert!(frame.len() <= Limits::SMALL.message, "{} B", frame.len());
+        }
+    }
+
     #[test]
     fn base64_matches_btoa() {
         for (raw, enc) in [(&b""[..], ""), (b"f", "Zg=="), (b"fo", "Zm8="), (b"foo", "Zm9v"), (b"foob", "Zm9vYg==")] {

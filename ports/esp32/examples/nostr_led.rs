@@ -5,10 +5,12 @@
 //! `id new` too), from a peer in its room. A browser, which can't send UDP, links over the relay itself, a pipe
 //! (`PathKind::Signaling`): the LED page's "Internet" choice (`packages/js/demo/led.html`), from anywhere. A PC links
 //! as it would with any board: `room_chat` from anywhere, `lan_chat` on its LAN. Anyone who knows the room's name can
-//! switch the LED: room.sh names a random one unless told otherwise.
+//! switch the LED, and learns the board's home address from its offers (NB126-1), so the room must be one nobody can
+//! guess: 22 or more of `A-Z a-z 0-9 _ -`, as the chat page asks, such as the random one room.sh names unless told
+//! otherwise. It has no default room, and refuses a shorter name.
 //!
-//! It joins wifi.sh's network (it needs one) and room.sh's room ("esp32" if the flash names none) of the `lan_chat`
-//! app, on the LAN and over `wss://nostr.mom` (one of the browser's default relays). Build it with
+//! It joins wifi.sh's network and room.sh's room (it needs both) of the `lan_chat` app, on the LAN and over
+//! `wss://nostr.mom` (one of the browser's default relays). Build it with
 //! `FEATURES=nostr EXAMPLE=nostr_led ./build.sh`, then write the Wi-Fi and room records with wifi.sh and flash; the LED
 //! is GPIO8, lit low, as on the ESP32-C3 SuperMini (`PW_LED_PIN`, `PW_LED_HIGH` for another board, see `ble_led`).
 
@@ -22,7 +24,7 @@ use peerwire_esp::{free_heap, identity, nostr_thread, Board, NOSTR_RELAY};
 
 #[path = "led/common.rs"]
 mod common;
-use common::{flash_config, send, short, Led, APP, HELP, ROOM};
+use common::{flash_config, send, short, Led, APP, HELP};
 
 const REPORT_EVERY: Duration = Duration::from_secs(30);
 
@@ -36,7 +38,10 @@ fn run() -> anyhow::Result<()> {
     let mut led = Led::new()?;
     led.blink()?;
     let (wifi, room) = flash_config();
-    let room = room.unwrap_or_else(|| ROOM.into());
+    let room = room.ok_or_else(|| anyhow!("no room record: name one with room.sh (a random one by default)"))?;
+    if guessable(&room) {
+        anyhow::bail!("room {room:?} could be guessed: use 22 or more of A-Z a-z 0-9 _ - (room.sh names one)");
+    }
     let (ssid, password) = wifi.ok_or_else(|| anyhow!("no Wi-Fi record: write one with wifi.sh, then flash"))?;
     // Joins, and sets the clock: relays' certificates and room hellos need it.
     let board = Board::connect(&ssid, &password)?;
@@ -104,4 +109,10 @@ fn run() -> anyhow::Result<()> {
         }
         peerwire_esp::idle(&node);
     }
+}
+
+/// Whether others could guess `room`, as the chat page judges it (`packages/js/demo/chat.js`): shorter than 22, or
+/// with a character outside `A-Z a-z 0-9 _ -`.
+fn guessable(room: &str) -> bool {
+    room.len() < 22 || !room.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }

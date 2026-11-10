@@ -1420,12 +1420,14 @@ impl Node {
 }
 
 /// Hands the datagrams of a pipe batch from `from` (a room member: see `Traversal::handle_signal`) to the endpoint,
-/// as from `from`'s pipe ([`Pipes::open`]). Dropped if the batch is malformed, or no pipe is free.
+/// as from `from`'s pipe ([`Pipes::open`]), bound to `from`: a packet there for another peer's link, or a handshake
+/// from anyone else, is dropped (`Stats::rx_wrong_peer`), so a member can't carry others' packets onto its pipe.
+/// Dropped if the batch is malformed, or no pipe is free.
 fn take_batch(pipes: &mut Pipes, ep: &mut Endpoint<Addr>, now: peerwire_core::Instant, from: PeerId, body: &[u8]) {
     let Some(datagrams) = pipe::decode(body) else { return };
     let Some(at) = pipes.open(now, from, |p| ep.is_connected(p)) else { return };
     for d in datagrams {
-        ep.handle_datagram(now, Hop::Pipe(at), &d);
+        ep.handle_datagram_from(now, Hop::Pipe(at), &from, &d);
     }
 }
 

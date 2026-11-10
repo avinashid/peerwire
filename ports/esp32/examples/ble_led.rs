@@ -34,8 +34,10 @@ use peerwire_esp::{clock, config, free_heap, identity, Board, PORT};
 
 #[path = "led/common.rs"]
 mod common;
-use common::{flash_config, send, short, Led, APP, HELP, ROOM};
+use common::{flash_config, send, short, Led, APP, HELP};
 
+/// The room when the flash names none.
+const ROOM: &str = "esp32";
 const REPORT_EVERY: Duration = Duration::from_secs(30);
 /// How long the board tries wifi.sh's network at boot before it goes on over Bluetooth alone.
 const WIFI_WAIT: Duration = Duration::from_secs(20);

@@ -1292,10 +1292,10 @@ impl<A: Address> Traversal<A> {
                 return None;
             }
             let (from, body) = sealed::open(&self.me, payload)?;
-            // A pipe batch (JSON; offers start with their version, 1 to 3): only from a room member, and only while
-            // the host takes them (see `poll_piped`).
+            // A pipe batch (JSON; offers start with their version, 1 to 3): kept for the host only as `takes_pipe`
+            // says, and while it takes them (see `poll_piped`).
             if body.first() == Some(&b'{') {
-                if self.room.is_some() && self.admits(&from) && self.piped.len() < MAX_PIPED {
+                if self.takes_pipe(&from) && self.piped.len() < MAX_PIPED {
                     self.piped.push_back((from, body));
                 }
                 return None;
@@ -1332,6 +1332,18 @@ impl<A: Address> Traversal<A> {
     /// [`handle_signal`](Traversal::handle_signal); past [`MAX_PIPED`] waiting, more are dropped.
     pub(crate) fn poll_piped(&mut self) -> Option<(PeerId, Vec<u8>)> {
         self.piped.pop_front()
+    }
+
+    /// Whether a pipe batch from `from` is taken: only where this node would link with it, from a member of the
+    /// current room in a role it links with (and the host, if it expects one), with [`PathKind::Signaling`] allowed
+    /// (no policy, or one listing it) and the node not relay-only. Not from a peer it merely dialled from an invite.
+    fn takes_pipe(&self, from: &PeerId) -> bool {
+        let Some(room) = &self.room else { return false };
+        let member = self.remotes.get(from).and_then(|r| r.member);
+        let linked =
+            member.is_some_and(|role| allowed(Some(room.role), role) && room.expect.is_none_or(|h| h == *from));
+        let relay_only = matches!(self.privacy, Privacy::RelayOnly { .. });
+        linked && !relay_only && self.policy.as_ref().is_none_or(|p| p.allows(PathKind::Signaling))
     }
 
     /// `body` sealed to `to` for its inbox ([`Topic::peer`]), as an offer is: a pipe batch.
@@ -4255,10 +4267,34 @@ mod tests {
         assert_eq!(got, vec![(member.peer_id(), batch.to_vec()); MAX_PIPED], "the member's, up to the cap");
         assert_eq!(published(&mut t), 0, "no offer answered");
         assert_eq!(dials(&mut ep, Instant::ZERO), vec![]);
+        // Not with a policy that leaves Signaling out, nor relay-only.
+        t.set_policy(Instant::ZERO, &mut ep, Some(Policy::new([PathKind::Direct])));
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
+        assert_eq!(t.poll_piped(), None, "Signaling off");
+        t.set_policy(Instant::ZERO, &mut ep, Some(Policy::new([PathKind::Direct, PathKind::Signaling])));
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
+        assert_eq!(t.poll_piped().map(|(p, _)| p), Some(member.peer_id()), "Signaling listed");
+        t.set_privacy(Instant::ZERO, &mut ep, Privacy::RelayOnly { via: None });
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
+        assert_eq!(t.poll_piped(), None, "relay-only");
+        t.set_privacy(Instant::ZERO, &mut ep, Privacy::Direct);
+        // Nor from a peer only dialled from an invite, a member of no room.
+        let invited = id(7);
+        t.introduce(Instant::ZERO, &ep, invited.peer_id(), None);
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&invited));
+        assert_eq!(t.poll_piped(), None, "invited, not a member");
         // Out of the room, none.
         t.leave_room();
         t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
         assert_eq!(t.poll_piped(), None);
+        // A client that expects one host takes a pipe from that host alone.
+        let (mut t, mut ep) = in_room(Role::Client, Some(id(3).peer_id()), "10.0.0.1:7000".parse().unwrap());
+        for host in [id(3), id(4)] {
+            t.handle_signal(Instant::ZERO, &mut ep, topic, &room_hello(&key, &host.peer_id(), Role::Host, 0));
+            t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&host));
+        }
+        let got: Vec<_> = std::iter::from_fn(|| t.poll_piped()).map(|(p, _)| p).collect();
+        assert_eq!(got, vec![id(3).peer_id()]);
     }
 
     /// The room hellos `t` published, opened: who said it and at what time.
