@@ -6,5 +6,6 @@ export { WebRtcTransport, BroadcastSignaling, withoutHostCandidates, candidateSu
 export { NostrSignaling, DEFAULT_RELAYS, RECONNECT_MS, MAX_RECONNECT_MS } from './nostr.js';
 export { LocalTransport } from './local.js';
 export { BluetoothTransport, BLUETOOTH_WASM, SERVICE_UUID, RX_UUID, TX_UUID } from './bluetooth.js';
+export { RelayTransport, NATIVE_BATCH } from './relay_link.js';
 export { randomRoomId } from './proof.js';
 export { memoryStore } from './store.js';

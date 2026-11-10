@@ -71,10 +71,10 @@ export const DEMOS = [
     how: 'Tabs of one browser.',
   },
   {
-    page: 'led.html', name: 'Bluetooth LED',
-    blurb: 'Web Bluetooth: pick a board running the ble_led example, join its room over Bluetooth alone and ' +
-      'switch its LED.',
-    how: 'Android Chrome and an ESP32-C3 nearby.',
+    page: 'led.html', name: 'Board LED',
+    blurb: "Switch an ESP32 board's LED: over Web Bluetooth when it is near (the ble_led example), or over the " +
+      "room's Nostr relays alone, from anywhere, when it is on Wi-Fi in the room.",
+    how: 'Android Chrome and an ESP32-C3 nearby, or any browser and a board online.',
   },
 ];
 
