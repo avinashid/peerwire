@@ -93,6 +93,19 @@ impl Browser {
         self.ep.connect(now, PIPE, self.node).unwrap();
     }
 
+    /// Sends `datagrams` to the node as one batch from this browser, sealed to the node on its inbox topic.
+    fn send_batch(&mut self, datagrams: &[Vec<u8>]) {
+        if datagrams.is_empty() {
+            return;
+        }
+        let d: Vec<String> = datagrams.iter().map(|d| format!("\"{}\"", b64(d))).collect();
+        let body = format!(r#"{{"kind":"dg","d":[{}]}}"#, d.join(","));
+        let mut seed = [0; 32];
+        OsRng.fill_bytes(&mut seed);
+        let sealed = sealed::seal(&self.me, &self.node, seed, body.as_bytes()).unwrap();
+        self.sig.publish(Topic::peer(&self.node), &sealed);
+    }
+
     fn step(&mut self) {
         let now = self.now();
         while let Some((topic, payload)) = self.sig.poll() {
@@ -117,15 +130,8 @@ impl Browser {
         if self.ep.poll_timeout().is_some_and(|t| t <= now) {
             self.ep.handle_timeout(now);
         }
-        let d: Vec<String> =
-            std::iter::from_fn(|| self.ep.poll_transmit(now)).map(|t| format!("\"{}\"", b64(&t.payload))).collect();
-        if !d.is_empty() {
-            let body = format!(r#"{{"kind":"dg","d":[{}]}}"#, d.join(","));
-            let mut seed = [0; 32];
-            OsRng.fill_bytes(&mut seed);
-            let sealed = sealed::seal(&self.me, &self.node, seed, body.as_bytes()).unwrap();
-            self.sig.publish(Topic::peer(&self.node), &sealed);
-        }
+        let d: Vec<Vec<u8>> = std::iter::from_fn(|| self.ep.poll_transmit(now)).map(|t| t.payload).collect();
+        self.send_batch(&d);
         while let Some(e) = self.ep.poll_event() {
             if let peerwire_core::Event::Message { data, .. } = e {
                 self.got.push(data);
@@ -160,6 +166,16 @@ fn pump(
         std::thread::sleep(Duration::from_millis(5));
     }
     false
+}
+
+/// Says `b`'s hello and links it with `n` over a pipe.
+fn link(n: &mut Node, b: &mut Browser, ev: &mut Vec<Event>) {
+    let (nid, bid) = (n.peer_id(), b.me.peer_id());
+    b.hello();
+    pump(n, b, ev, 1, |_, _, _| false);
+    b.dial();
+    assert!(pump(n, b, ev, 10, |n, b, _| n.status(&bid) == Status::Connected && b.ep.is_connected(&nid)));
+    assert_eq!(n.path_kind(&bid), Some(PathKind::Signaling));
 }
 
 #[test]
@@ -225,4 +241,70 @@ fn a_policy_without_signaling_refuses_pipe_links() {
     b.dial();
     assert!(pump(&mut n, &mut b, &mut ev, 10, |n, _, _| n.status(&bid) == Status::Connected));
     assert_eq!(n.path_kind(&bid), Some(PathKind::Signaling));
+}
+
+/// NB126-T1: a member can't carry another peer's packets onto its own pipe. A links; B, a second member, puts A's
+/// next datagrams in its own batch. The node drops them (`rx_wrong_peer`), and A's link stays on A's pipe.
+#[test]
+fn a_member_cannot_carry_another_peers_datagrams() {
+    let hub = MemoryHub::new();
+    let mut n = node(&hub);
+    let nid = n.peer_id();
+    let mut a = Browser::new(&hub, nid);
+    let aid = a.me.peer_id();
+    let mut ev = vec![];
+    link(&mut n, &mut a, &mut ev);
+    let path = n.path(&aid);
+    // B says its hello, so its batches are taken.
+    let mut b = Browser::new(&hub, nid);
+    b.hello();
+    pump(&mut n, &mut b, &mut ev, 1, |_, _, _| false);
+    // A's next datagrams, fresh to the node, go in B's batch instead of A's.
+    a.ep.send(&nid, Lane::Unreliable, b"via b").unwrap();
+    let now = a.now();
+    let carried: Vec<Vec<u8>> = std::iter::from_fn(|| a.ep.poll_transmit(now)).map(|t| t.payload).collect();
+    assert!(!carried.is_empty());
+    let wrong = n.stats().rx_wrong_peer;
+    b.send_batch(&carried);
+    let dropped = |n: &Node| n.stats().rx_wrong_peer >= wrong + carried.len() as u64;
+    assert!(pump(&mut n, &mut b, &mut ev, 2, |n, _, _| dropped(n)), "B's batch was taken and A's packets dropped");
+    let via_b = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"via b"));
+    assert!(!via_b(&ev), "{ev:?}");
+    assert_eq!((n.status(&aid), n.path(&aid)), (Status::Connected, path), "A's link stays on A's pipe");
+    // And A's own pipe still carries it, both ways.
+    a.ep.send(&nid, Lane::Reliable, b"still here").unwrap();
+    let got = |ev: &[Event]| {
+        ev.iter().any(|e| matches!(e, Event::Message { peer, data, .. } if *peer == aid && data == b"still here"))
+    };
+    assert!(pump(&mut n, &mut a, &mut ev, 10, |_, _, ev| got(ev)), "{ev:?}");
+    n.send(&aid, Lane::Reliable, b"ok").unwrap();
+    assert!(pump(&mut n, &mut a, &mut ev, 10, |_, a, _| a.got.iter().any(|d| d == b"ok")));
+    assert!(!via_b(&ev), "{ev:?}");
+}
+
+/// NB126-3: while batches wait for the pipes' rate, the node's `next_timeout` is when the next token comes, not 0, so
+/// a host loop that sleeps on it doesn't spin.
+#[test]
+fn a_host_sleeps_while_batches_wait_for_the_rate() {
+    let hub = MemoryHub::new();
+    let mut n = node(&hub);
+    let mut b = Browser::new(&hub, n.peer_id());
+    let bid = b.me.peer_id();
+    let mut ev = vec![];
+    link(&mut n, &mut b, &mut ev);
+    // More batches than the burst: most wait for the rate.
+    for _ in 0..20 {
+        n.send(&bid, Lane::Unreliable, &[7; 1000]).unwrap();
+    }
+    let (mut polls, mut zero) = (0, 0);
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        n.poll();
+        polls += 1;
+        let t = n.next_timeout().unwrap_or(Duration::from_millis(5));
+        zero += usize::from(t.is_zero());
+        std::thread::sleep(t.min(Duration::from_millis(5)));
+    }
+    eprintln!("{polls} polls, {zero} with a zero timeout");
+    assert!(zero <= 5, "{zero} of {polls} polls had a zero timeout");
 }

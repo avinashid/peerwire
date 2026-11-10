@@ -160,9 +160,12 @@ impl Pipes {
         Some((peer, body))
     }
 
-    /// When the next batch is due, if any waits.
+    /// When the next batch is due, if any waits: not before the rate has a token for it, so a host that sleeps
+    /// until then doesn't spin while batches wait for the rate (NB126-3).
     pub(crate) fn next_due(&self) -> Option<Instant> {
-        self.by_peer.values().filter_map(|p| p.due).min()
+        let due = self.by_peer.values().filter_map(|p| p.due).min()?;
+        let short = TOKEN.saturating_sub(self.credit).div_ceil(RATE);
+        Some(due.max(self.filled + Duration::from_micros(short)))
     }
 
     #[cfg(test)]
@@ -275,6 +278,28 @@ mod tests {
         assert_eq!(sent, BURST, "a burst, across both pipes");
         assert_eq!(pipes.take(t + 200 * MS), None, "under a token");
         assert!(pipes.take(t + 250 * MS).is_some(), "one per 1/RATE s");
+    }
+
+    /// NB126-3: a batch waiting for the rate is due when the bucket next has a token, not at once, so a host that
+    /// sleeps until `next_due` doesn't spin while it waits.
+    #[test]
+    fn a_batch_waiting_for_the_rate_is_due_with_the_next_token() {
+        let mut pipes = Pipes::default();
+        let t = Instant::ZERO;
+        let at = pipes.open(t, peer(1), |_| false).unwrap();
+        for _ in 0..BURST + 2 {
+            pipes.send(t, &at, vec![1; MAX_DATAGRAM]);
+        }
+        assert_eq!(std::iter::from_fn(|| pipes.take(t)).count() as u64, BURST);
+        let token = Duration::from_micros(TOKEN / RATE);
+        assert_eq!(pipes.next_due(), Some(t + token), "not now: when the next token comes");
+        assert_eq!(pipes.take(t + (token - MS)), None);
+        assert!(pipes.take(t + token).is_some());
+        // Refused part way to a token: due when the rest of it comes.
+        assert_eq!(pipes.take(t + token + 100 * MS), None);
+        assert_eq!(pipes.next_due(), Some(t + token * 2));
+        assert!(pipes.take(t + token * 2).is_some());
+        assert_eq!(pipes.next_due(), None);
     }
 
     /// The rate goes to the pipe whose batch has waited longest: two busy pipes take turns, so one peer can't take
