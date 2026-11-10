@@ -193,7 +193,9 @@ release of each.
 | NB110-16 (Low) | **Fixed** by `7000929` and `3379747`, merged `bf5968d`, before `ble-bluez` was published (the BlueZ driver disconnects only a link it asked BlueZ to make: a device linked already isn't asked to connect, and its link stays when the connect fails or the connection over it ends, unless it lists HID), reviewed 2026-11-07; residuals: a device that links in the moment between the driver's read and its connect counts as the driver's; a connect under way as the adapter goes or the driver is dropped disconnects its device, same section |
 | NB110-I14 (Info) | Accepted: a failed connect's disconnect turns off BlueZ's own reconnection of a device it doesn't trust, until that device is connected again, same section |
 | NB119-1 (Low), NB119-I1, NB119-I2 (Info) | **Fixed** by `2505f70` before NB-119's first part merged (`9d721b1`), so never on main, before any release of `peerwire-esp` kept identities (a board's kept identity is drawn only from the SAR ADC, before Wi-Fi or Bluetooth is set up, or not at all, and an ESP32 BLE node keeps its Bluetooth modem awake; the docs say `id new` doesn't scrub the old key and how each chip can encrypt NVS), reviewed 2026-11-07; residuals: the key is in plain NVS; firmware must load it before it sets up a radio; an ESP32 BLE node draws more current, [Kept identity on the ESP32](#kept-identity-on-the-esp32-nb-119--nb119-1) |
-| NB110d-I1, NB110d-I2 (Info) | Open: a page's `dial()` with no `peer` links with any member the device it picked passes the connection to, which the docs don't say; `pw_ble_timeout`'s unchecked add and the 64-event cap, which the page doesn't reach, [Bluetooth LE in the browser](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1-nb110d-i2) |
+| NB110d-I1, NB110d-I2 (Info) | **Fixed** by `226529e`, on main after NB-110d merged (`9531bfd`), before any release (the docs say a page's `dial()` with no `peer` links with any member the device it picked passes the connection to; the C ABI queues CLOSED past its 64-event cap, and `pw_ble_timeout`'s deadline saturates), reviewed 2026-11-10, [Bluetooth LE in the browser](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1nb110d-i3) |
+| NB110d-I3 (Info) | Open, the owner's call: since `8742653` the LED demo is on the site's demo list, so once the site is deployed, a visitor's Bluetooth grant for a board goes to the shared origin `avinashid.github.io`, same section |
+| NB119-2 (Low), NB119-I3, NB119-I4 (Info) | **Fixed** by `7495937`, `061c23e` and `61c97e6` before NB-119's second part merged (`3859af7`), so never on main, before any release of `peerwire-esp` took the time from a room member (a board restarts when SNTP moves its clock more than 30 s, asks every minute while it holds a member's time, and forgets at the next boot a time marked in RTC memory as a member's; none from 2100 on), reviewed 2026-11-09; residuals: any member can give a wrong time for a boot; the pool server or the path can restart a board at each re-ask, [The clock from a room member](#the-clock-from-a-room-member-nb-119--nb119-2-nb119-i3-nb119-i4) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -3809,10 +3811,13 @@ NB95-I2's residuals (accepted):
   agree within a few seconds would stop one pool server, not the path.
 - A re-ask steps the clock by any amount, with no limit once the clock is set. It
   reaches the relay carrier (each event's `created_at`, a new connection's `since` and
-  TLS's certificate check, as above), not a running Node; the next re-ask a real server
-  answers, 6 hours on, sets it back.
-- The Node's drift is as above: the re-asks don't reach a bound Node; only the first to
-  set a clock unset at boot does, by restarting the board (NB103-I2).
+  TLS's certificate check, as above), and, since NB119-2's fix, a step of more than 30 s
+  restarts the board, whose Node is then bound with the boot's answer
+  ([NB119-2](#the-clock-from-a-room-member-nb-119--nb119-2-nb119-i3-nb119-i4)); the next
+  re-ask a real server answers, 6 hours on, sets it back.
+- The Node's drift is as above: the re-asks reach a bound Node only through a restart,
+  and drift doesn't cause one: a re-ask every 6 hours finds the clock at most 0.2 s off
+  (**theoretical**: 21,600 s at 10 ppm; NB103-I2, NB119-2).
 - Firmware that starts lwIP's SNTP itself (`EspSntp`, `esp_sntp_init`) opens the LAN
   path again.
 
@@ -3874,6 +3879,11 @@ NB103-I2's residuals (accepted):
   between, as when the path drops every answer.
 - The restart drops the board's links and its firmware's state, once; `Board::connect`'s
   docs say the board restarts.
+
+Since NB119-2's fix (`7495937`) the keeper restarts the board on any answer that moves
+the clock more than 30 s, not only on the first to set a clock that was unset as it
+started, so a board can restart for its clock more than once per power-on
+([NB119-2](#the-clock-from-a-room-member-nb-119--nb119-2-nb119-i3-nb119-i4)).
 
 **NB-117 — A silent server hung a board at boot.** Found on our C3, not in a review.
 Each ask reads with the socket's timeout set to what is left of its 2 s, and lwIP counts
@@ -4576,7 +4586,7 @@ a connection no peer is bound to yet (`Endpoint::handle_datagram_unbound`). A Bl
 hop ranks as a relayed address does, last, and isn't in `Policy::default()`. The ESP32's
 NimBLE driver is on main since NB-110c
 ([below](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5)), and the browser's since
-NB-110d ([below](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1-nb110d-i2)); none of it
+NB-110d ([below](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1nb110d-i3)); none of it
 is in a release.
 
 Reviewed on 2026-11-05 and 2026-11-06 in ten passes: security's requirements, BLE-R1…R15
@@ -5010,7 +5020,7 @@ crash it. The fix is BlueZ's: a later release, or a 5.87 build that carries `82a
   a board with no Wi-Fi joins over Bluetooth only with a clock set since power-on
   (NB-093).
 - **Owed from a phone:** R14 at its ATT MTU, with NB-110d's other checks
-  ([below](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1-nb110d-i2)). The ESP32
+  ([below](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1nb110d-i3)). The ESP32
   driver's pairing (R5), random draws (R15), 5 s subscribe deadline, connection cap and
   10 s connect, owed with NB-110c, are
   [below](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5).
@@ -5805,7 +5815,7 @@ good, and the port turns neither on. Fixed in the docs by `2505f70`.
 - **An ESP32 BLE node's modem doesn't sleep**, so it draws more current between events.
   The C3's doesn't by default.
 
-### Bluetooth LE in the browser (NB-110d) — NB110d-I1, NB110d-I2
+### Bluetooth LE in the browser (NB-110d) — NB110d-I1…NB110d-I3
 
 Since NB-110d, `@peerwire/js` has `BluetoothTransport`, a Web Bluetooth central (Chrome
 and Edge; on a phone, Android Chrome) that links a page with a native peer nearby, a
@@ -5820,7 +5830,7 @@ of it is in a release.
 Reviewed on 2026-11-08 by reading `fec76cc`, `09dad07`, `db74f20` and `5fa9ac1`: `Link`
 against the node's code it replaced, the node's diff, the C ABI, `bluetooth.js`,
 `BleLink`, the LED demo, and the new steps in the gate and CI. Nothing was re-run, as
-nothing needed reproducing, and nothing has run from a phone yet.
+nothing needed reproducing, and nothing had run from a phone then (see the residuals).
 
 **What holds.**
 - **The wire is unchanged.** A test pins the bytes the node made before the move: the
@@ -5855,7 +5865,8 @@ nothing needed reproducing, and nothing has run from a phone yet.
   `crypto.getRandomValues`. The page sends a room hello made as Rust's (the room proof
   under the room key, sealed under the hello key) and acts on no signal from the device.
   `BleLink` does nothing once freed, and each timer and write loop stops once its
-  connection ends. The LED demo shows what the board sends with `textContent`.
+  connection ends. The LED demo shows what the board sends with `textContent`, and keeps
+  nothing. Since `8742653` it is on the site's demo list (NB110d-I3).
 - **The module.** `peerwire_ffi_ble.wasm` has no imports, and the gate and CI check that
   and its size (at most 420 KiB) as they do the default module's, which pages that don't
   use Bluetooth still load.
@@ -5871,7 +5882,11 @@ than they had; but at `db74f20` the docs said the page links with the member it 
 Fix: say that without `peer`, `dial()` links with any member the connection reaches, and
 that with it, it links with that one alone.
 
-**Status: open** (Info), reported on NB-110d at `5fa9ac1`.
+**Status: fixed** by `226529e`, on main after NB-110d merged (`9531bfd`) and before any
+release, reviewed 2026-11-10: `bluetooth.md` (Browsers) and `javascript.md` (Trust) now
+say that the member proven needn't be on the device the user picked, and that without
+`peer`, `dial()` links with any member the connection reaches; with it, only with that
+one.
 
 **NB110d-I2 — Two edges of the C ABI (Info).** `pw_ble_timeout` returns the deadline
 plus 1 µs with no check, so with a host clock within 3 s of 2^64 µs the sum overflows:
@@ -5882,18 +5897,166 @@ CLOSED with them; the connection still closes, and `pw_ble_state` says so.
 clock is the page's, so the page reaches neither. Fix: a saturating add, and a CLOSED
 that is always queued.
 
-**Status: open** (Info), reported on NB-110d at `5fa9ac1`.
+**Status: fixed** by `226529e`, on main after NB-110d merged (`9531bfd`) and before any
+release, reviewed 2026-11-10 by reading it. `close()` queues CLOSED even past the cap;
+as a closed connection queues nothing more, that is one event over it at most.
+`pw_ble_timeout` returns the deadline plus 1 µs, saturating and at most `i64::MAX`, so
+never 0 or negative, as `Instant + Duration` saturates too. Two unit tests pin both, and
+the author ran each against the old code, where it fails. A host clock past 2^63 µs,
+about 292,000 years from its zero, gets `i64::MAX`, already past, so the host calls
+again at once until its 3 s are up; no host's clock is near it.
+
+**NB110d-I3 — The LED demo's Bluetooth grant would go to the shared origin (Info).**
+Since `8742653` the site's demo list has the LED demo (`led.html`), so the next deploy
+of the site puts it on `avinashid.github.io`, which every Pages site of the account
+shares
+([The shared origin](#the-docs-and-demos-site-nb-016-nb-067--nb16-1-nb16-2-nb67-1)).
+Once a visitor picks a board there, the browser keeps a grant for it under that origin,
+so any of the account's Pages sites may connect to that board from the visitor's device
+without the picker, while it is in range, and so learn that the visitor is near it. That
+is no more than a device in range can do, and the room proof still needs the room's
+name; but the owner's acceptance of the shared origin covers its storage, scripting and
+service workers, and Net Lab's microphone (NB16-2), not a Bluetooth grant, and the meet
+page stays off the site for the camera's (NB10a-I1). Fix, the owner's call, before the
+next deploy: keep the demo off the site, as the meet page is, and host it on an origin
+of its own; or keep it, with a note on a `*.github.io` host, as Net Lab's button has,
+that the permission is for all of that host. An origin of the site's own fixes it with
+the rest.
+
+**Status: open** (Info), reported on NB-110d at `8742653`.
 
 **Residuals, accepted.**
 - **The grant is the origin's.** Once the user picks a device, the browser keeps a grant
   for it under the page's origin, so a page on that origin may connect to it again
   without the picker, for as long as the grant lasts. That is no more than any device in
   range can do unasked, and the room proof still needs the room's name.
-- **Radio checks owed from a phone:** whether Chrome drops the first challenge (2 s,
-  three tries); the set-up time against an ESP32's 5 s subscribe deadline and the 3 s
-  proof; R14 at the phone's ATT MTU (the page writes values of 20 bytes at any MTU, and
-  a board's notifications may be longer); and whether the picker lists a Linux peer,
-  whose scan response can't carry the service UUID.
+- **From a phone.** On 2026-11-09 a phone (Android Chrome) linked with our own ESP32-C3
+  through the LED demo in several sessions, and the board answered every command, so the
+  set-up fits its 5 s subscribe deadline and the 3 s proof there. Still owed: whether
+  Chrome drops the first challenge (2 s, three tries); R14 at the phone's ATT MTU (the
+  page writes values of 20 bytes at any MTU, and the board's replies were short); and
+  whether the picker lists a Linux peer, whose scan response can't carry the service
+  UUID.
+
+### The clock from a room member (NB-119) — NB119-2, NB119-I3, NB119-I4
+
+Since NB-119's second part (merged `3859af7`), a node whose clock is unset when it is
+bound (before 2023-11-14, `CLOCK_SET_AFTER_MS`) takes the time from the first room hello
+that comes over a Bluetooth connection which proved the room, once
+(`Traversal::handle_radio_signal`), and says hello again at that time;
+`Node::clock_from_peer` gives the time to the firmware. In `peerwire-esp`, `clock::set`
+sets the board's clock from it, and `Board::connect_within` stops trying Wi-Fi after a
+set time (20 s in the examples), so a board with no network goes on over Bluetooth
+alone; the `ble` and `ble_led` examples do both. Before, such a board stayed at 1970,
+and peers with a set clock dropped its hellos (NB-091). A page gives a board its time as
+a native member does (`d0794a5`'s test). None of it is in a release.
+
+Reviewed on 2026-11-09 by reading `d309c6b` and `ef70139` (NB119-2) and the fixes
+`7495937` and `061c23e`, against ESP-IDF v5.5.5's linker scripts, heap layout and
+`settimeofday`, with the author's builds for the ESP32 and the C3 disassembled where
+they touch the mark; and `61c97e6`, the mark's order, on 2026-11-10. Nothing was re-run.
+The power cut, the restart and SNTP at boot were run on our own C3 (below).
+
+**What holds.**
+
+- **Who gives the time.** A room member: the hello's proof must check out under the room
+  key, and it must come sealed under the key of a connection that proved the room. It
+  may be another member's hello, which the one at the far end passes on, at whatever
+  time that member chose. Any member can already make a hello for any `from` and time,
+  as its proof covers the room key alone, so one that sets the clock gains no hello it
+  couldn't make. Only over Bluetooth, and once: over the LAN or Nostr, anyone can replay
+  a member's hello from minutes ago. No time from 2100 on is taken (NB119-I3).
+- **The node's clock** counts on from the hello's time, so its replay guard (60 s) is
+  then the member's clock's.
+- **The mark.** `clock::set` marks the time as a member's in RTC memory (`MEMBER_TIME`,
+  in `.rtc_noinit`, which boot neither loads nor clears and a software restart keeps, as
+  it keeps the clock; on the C3 the heap starts past it), then sets the clock
+  (`61c97e6`), so a reset between the two forgets a clock that was never a member's. An
+  SNTP answer that sets the clock clears the mark. `peerwire_esp::init`, which `run`
+  calls first, as every example and the template do, reads and clears it before any node
+  is bound and, if it was set, sets the clock back to 1970. That is a load and a store,
+  not an atomic read-modify-write, which the ESP32's RTC slow memory may not take:
+  `l32i` and `s32i` in the ESP32 build, `__atomic_load_4` and `__atomic_store_4` in the
+  C3's. A power cut leaves the mark random and the clock at 1970; a random match, 1 in
+  2^32, sets 1970 again.
+- **The keeper.** Once Wi-Fi is up, `clock::keep_in_step` asks every minute while the
+  clock is unset or holds a member's time, and every 6 hours otherwise; an answer that
+  moves the clock more than 30 s, half the window, restarts the board 5 s later, so the
+  node is bound again with SNTP's time. The answer clears the mark first, so the next
+  boot keeps SNTP's time and takes no member's: no loop. The examples start the keeper
+  before they bind the node, and a node takes a member's time only if its clock was
+  unset when it was bound, so the keeper is already asking every minute when one comes.
+
+**NB119-2 — A member's time outlived SNTP and restarts (Low).** At `ef70139` a member's
+time could stay for as long as the board ran, and past its restarts. The keeper
+restarted the board only if the clock was unset as it started (NB103-I2), so on a board
+that joined Wi-Fi with SNTP out, a member's time stayed after SNTP came back. And the
+RTC keeps the clock across a software restart (a panic, the watchdog, `run`'s restart
+after an app error), so the next boot with no SNTP answer found the clock set and bound
+with the member's time. One member whose clock was more than a minute off, by mistake or
+on purpose, so cut the board off from every peer with a right clock: each drops the
+other's hellos. Low: it takes a member, and a board with no SNTP at boot. Fix: restart
+on any answer that moves the clock more than 30 s, and mark a member's time so that the
+next boot forgets it.
+
+**Status: fixed** by `7495937` and `061c23e`, with `61c97e6`, before NB-119's second
+part merged (`3859af7`), so never on main, reviewed 2026-11-09 (`61c97e6` on
+2026-11-10), as above. On 2026-11-10, on our own ESP32-C3 with `ble_led` built from
+`7495937` (`061c23e` and `61c97e6` change how the mark is read and when it is written,
+not these steps) and the laptop's `ble_chat` in the room, after a power cut: with no
+Wi-Fi in range the board gave up on it after 22 s and took the time from the laptop,
+within a second of the laptop's clock; reset from the laptop, it logged 657 ms later
+that it forgot that time, and took it again; reset with Wi-Fi in range, it forgot it,
+SNTP set the clock 9 s after the reset, and it took no member's time after. The restart
+on an answer more than 30 s off was checked by reading: NB103-I2's run on hardware
+restarted a board from the keeper, but not on this condition.
+
+**NB119-I3 — A far time could wrap a board's clock (Info).** At `ef70139` the node took
+any time from 2023-11-14 on, and a hello's time may have 19 digits, up to about 317
+million years on. ESP-IDF v5.5.5's `settimeofday` multiplies the seconds by a million in
+64 bits, so a time more than 2^64 µs, about 584,000 years, past 1970 wraps to another,
+which may read as unset. A member can give any time anyway, so this adds only a time no
+one chose. Fix: take no time from 2100 on.
+
+**Status: fixed** by `7495937` before NB-119's second part merged (`3859af7`), so never
+on main, reviewed 2026-11-09: `take_clock` takes a time only in
+`CLOCK_SET_AFTER_MS..CLOCK_TAKEN_BEFORE_MS`, from 2023-11-14 up to 2100-01-01, excluded,
+and a test sends the bound itself and the largest 19-digit time. `7495937`'s commit
+message calls this NB119-I1, a name this document had already given `id new`
+([above](#kept-identity-on-the-esp32-nb-119--nb119-1)); it is this finding.
+
+**NB119-I4 — A member's time outlived SNTP by up to 6 hours (Info).** At `7495937` the
+keeper asked every 6 hours once the clock read as set, and a member's time reads as set,
+so on a board whose Wi-Fi joined with SNTP out, a member's time could stay up to 6 hours
+after SNTP came back. Fix: ask every minute while the clock holds a member's time.
+
+**Status: fixed** by `061c23e` before NB-119's second part merged (`3859af7`), so never
+on main, reviewed 2026-11-09: once SNTP is back, a member's time stays at most a minute
+and one ask (**theoretical**: 60 s + 30 s), then the board restarts or SNTP's time
+replaces it. A board whose Wi-Fi never joined has no keeper, and keeps a member's time
+until it restarts, as the docs say.
+
+**Residuals, accepted.**
+
+- **A member's time, for a boot.** On a board with no network, any member can set its
+  clock until it restarts, and on Wi-Fi with SNTP out, until SNTP answers. One whose
+  clock is more than a minute off, by mistake or on purpose, cuts the board off from
+  peers with a right clock for that long, and can do so again at each boot where it
+  gives the time first. That exposes nothing: Noise still proves every link, and a hello
+  still needs the room key.
+- **The path can restart a board.** Since the fix, any answer that moves the clock more
+  than 30 s restarts the board, not only the first to set it (NB103-I2), so the pool
+  server asked, or anyone on the path (NB95-I2), can restart a board at each re-ask by
+  answering more than 30 s off: about once every 6 hours once SNTP has set the clock
+  (**theoretical**: one restart per `RESYNC`). The node is then bound with the boot's
+  answer, which the same path controls already. Each restart drops the board's links,
+  for its boot and, if the path drops the boot's asks, 60 s more. Kept on purpose: it
+  also mends a wrong time one pool server gave at boot, which the node used to keep
+  until a reboot.
+- **Firmware that sets the clock itself.** Firmware that takes `Node::clock_from_peer`
+  and sets the clock other than by `clock::set` leaves it unmarked, so the next boot
+  keeps it. And a marked time is forgotten only by firmware that calls
+  `peerwire_esp::init` (or `run`) at boot, as `init`'s docs say to.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
@@ -6679,7 +6842,8 @@ mappings that carry over and are already handled in Peerwire:
   them. A link over Bluetooth proves nothing about distance. On Linux, unless
   `LEAutoSecurity` is false, BlueZ's input plugin acts on a device that serves HID for
   the moment before the driver drops it, and on a central that links to the node's
-  advert (NB110-13).
+  advert (NB110-13). On an ESP32 board with no network, the time the first room member
+  to link over Bluetooth gives, until the board restarts or SNTP answers (NB119-2).
 - The security of the underlying crypto crates is assumed.
 
 ## Review method
