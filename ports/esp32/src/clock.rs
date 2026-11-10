@@ -70,8 +70,10 @@ pub fn is_set() -> bool {
 /// afresh. A late SNTP answer more than 30 s off it restarts the chip ([`keep_in_step`]).
 pub fn set(time: SystemTime) -> io::Result<()> {
     let now = time.duration_since(UNIX_EPOCH).map_err(|_| io::Error::other("a time before 1970"))?;
-    settimeofday(now)?;
+    // Mark first: a reset between the two lines then forgets a clock that was never set, rather than keeping a
+    // member's time unmarked across the restart.
     MEMBER_TIME.store(MEMBER_MARK, Ordering::Relaxed);
+    settimeofday(now)?;
     info!("clock set from a room member: {} s", now.as_secs());
     Ok(())
 }
