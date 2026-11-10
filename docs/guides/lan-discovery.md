@@ -52,7 +52,8 @@ in unicast from anywhere, and on Linux one that isn't on any of the device's net
   public Wi-Fi networks keep clients apart; there a node finds nobody, and you need invites or Nostr instead.
 - **Clocks must agree within a minute.** Hellos and offers carry the sender's clock, and older or newer ones are
   dropped. A `Node` reads the clock when it's bound, so a device with no battery-backed clock (such as an ESP32) must
-  set it first, by SNTP for example; otherwise it and its peers ignore each other.
+  set it first, by SNTP for example; otherwise it and its peers ignore each other. (Over Bluetooth, such a node
+  takes the time from a room member: see [Bluetooth](../concepts/bluetooth.md).)
 - **Browsers can't send UDP.** A browser on the same network finds peers through invites, a
   BroadcastChannel (tabs of one browser) or Nostr. A Rust node and a browser can still share a room if both are on
   the same Nostr relays.

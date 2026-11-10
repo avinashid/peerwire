@@ -3,7 +3,7 @@
 //! the radio, and moves to UDP again once it works.
 use peerwire::ble::{FakeAir, Limits};
 use peerwire::{Config, Event, Lane, Node, PathKind, PeerId, Policy, Privacy, Status};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Polls every node until `done`, keeping their events; false on timeout.
 fn pump(
@@ -170,4 +170,40 @@ fn a_bluetooth_only_node_keeps_its_links_on_the_radio() {
     a.send(&pb, Lane::Reliable, b"still over the radio").unwrap();
     pump(&mut [&mut a, &mut b], &mut ev, 2, |_| false);
     assert!(got(&ev[1], pa, b"still over the radio"));
+}
+
+/// NB-119: a node whose clock is unset (1970: a board with no battery for its clock and no network to set it from)
+/// takes the time from a room member over a Bluetooth connection that proved the room, says hello at that time, and
+/// links over the radio alone with a peer whose clock is set, which drops hellos from 1970.
+#[test]
+fn a_node_with_no_clock_takes_the_time_over_bluetooth_and_links() {
+    let air = FakeAir::new(119);
+    let only = Policy::new([PathKind::Bluetooth]);
+    let radio = air.radio(Limits::SMALL);
+    let mut board = Node::builder()
+        .bluetooth(radio)
+        .policy(only.clone())
+        .stun_servers(Vec::<String>::new())
+        .clock_at(5_000)
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let mut pc = node(&air, Some(only), Config::default());
+    let (pboard, ppc) = (board.peer_id(), pc.peer_id());
+    assert_eq!(board.clock_from_peer(), None);
+    board.join_room("pw-test", "no-clock");
+    pc.join_room("pw-test", "no-clock");
+    let mut ev = Vec::new();
+    let up = |n: &[&mut Node]| {
+        kind(n[0], &ppc) == Some(PathKind::Bluetooth) && kind(n[1], &pboard) == Some(PathKind::Bluetooth)
+    };
+    let started = Instant::now();
+    assert!(pump(&mut [&mut board, &mut pc], &mut ev, 15, up), "{:?} {:?}", kind(&board, &ppc), kind(&pc, &pboard));
+    eprintln!("a node with no clock linked over Bluetooth in {:?}", started.elapsed());
+    let taken = board.clock_from_peer().expect("the time, from the member");
+    let off = taken.duration_since(SystemTime::now()).unwrap_or_else(|e| e.duration());
+    assert!(off < Duration::from_secs(2), "{off:?} off the system clock");
+    assert_eq!(pc.clock_from_peer(), None, "a set clock is never taken");
+    board.send(&ppc, Lane::Reliable, b"from a board with no clock").unwrap();
+    pump(&mut [&mut board, &mut pc], &mut ev, 2, |_| false);
+    assert!(got(&ev[1], pboard, b"from a board with no clock"));
 }

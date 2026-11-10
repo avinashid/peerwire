@@ -34,6 +34,14 @@ and the commit that fixed it.
   (NB-117).
 - `peerwire-esp`: a board joining Wi-Fi no longer logs the network's name or its access points' addresses, which
   would tell where it is.
+- **No Wi-Fi needed over Bluetooth** (NB-119): a node bound with its clock unset (before 2023-11-14, as on a board
+  with no battery for it) takes the time from the first room hello that comes over a Bluetooth connection which
+  proved the room, then says hello at that time (not one in 2100 or later); `Node::clock_from_peer` gives it.
+  `peerwire-esp`: `clock::set` sets the board's clock from it for one boot (`init` sets it back to 1970 at the next
+  unless SNTP set the clock since), a late SNTP answer more than 30 s off the clock restarts the board, whoever set
+  it, `wifi::join_within` and `Board::connect_within` give up on a network that isn't there, and the `ble` and
+  `ble_led` examples try a saved network for 20 s, then go on over Bluetooth alone.
+  `Traversal::handle_radio_signal`, `Traversal::clock_from_peer` and `traversal::CLOCK_SET_AFTER_MS` are new.
 
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 

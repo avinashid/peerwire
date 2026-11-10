@@ -1,10 +1,11 @@
 //! A room member over Bluetooth LE on an ESP32-C3 or ESP32 (NB-110c, docs/concepts/bluetooth.md), with Wi-Fi off.
 //!
-//! A board joins a room over Bluetooth only with its clock set (room hellos must be within a minute of the
-//! receiver's clock). So with wifi.sh's record in the last flash sector, as the mesh example reads it, the board first
-//! joins that Wi-Fi and sets its clock by SNTP, starts NimBLE and logs the heap with both radios on, then turns Wi-Fi
-//! off. It joins room.sh's room ("esp32" if the flash names none) of the `lan_chat` and `room_chat` app, over
-//! Bluetooth alone: a PC nearby running `ble_chat` in that room links with it over the radio.
+//! Room hellos must be within a minute of the receiver's clock, and a board has none of its own. With wifi.sh's
+//! record in the last flash sector, as the mesh example reads it, the board first tries that Wi-Fi for up to 20 s and
+//! sets its clock by SNTP, starts NimBLE and logs the heap with both radios on, then turns Wi-Fi off. With no network,
+//! it takes the time from the first room member that links over Bluetooth. It joins room.sh's room ("esp32" if the
+//! flash names none) of the `lan_chat` and `room_chat` app, over Bluetooth alone: a PC nearby running `ble_chat` in
+//! that room links with it over the radio.
 //!
 //! Built with `PW_KEEP_WIFI` set, it keeps Wi-Fi on and its socket on the board's address, with no signaling: a peer
 //! is still found over Bluetooth only, and a link moves to UDP once that works (the spec's Paths: UDP first), so a PC
@@ -42,6 +43,8 @@ const REPORT_EVERY: Duration = Duration::from_secs(10);
 const LONG: usize = 2000;
 /// Wi-Fi stays on, if wifi.sh named a network: set `PW_KEEP_WIFI` when building.
 const KEEP_WIFI: bool = option_env!("PW_KEEP_WIFI").is_some();
+/// How long the board tries wifi.sh's network at boot before it goes on over Bluetooth alone.
+const WIFI_WAIT: Duration = Duration::from_secs(20);
 
 fn main() {
     peerwire_esp::run(run)
@@ -55,20 +58,21 @@ fn run() -> anyhow::Result<()> {
     let (wifi, room) = flash_config();
     let room = room.unwrap_or_else(|| ROOM.into());
 
-    // Wi-Fi first, for the clock; its radio also makes the chip's random numbers true ones (BLE-R15).
+    // Wi-Fi first if it's there, for the clock; its radio also makes the chip's random numbers true ones (BLE-R15).
     let board = match &wifi {
         Some((ssid, password)) => {
             let modem = Peripherals::take()?.modem;
-            Some(Board::connect_with(modem, EspSystemEventLoop::take()?, ssid, password)?)
+            Board::connect_within(modem, EspSystemEventLoop::take()?, ssid, password, WIFI_WAIT)
+                .inspect_err(|e| warn!("ble: {e:#}; going on over Bluetooth alone"))
+                .ok()
         }
-        None => {
-            // The node's socket needs lwIP, which Wi-Fi would start.
-            sys::esp!(unsafe { sys::esp_netif_init() })?;
-            None
-        }
+        None => None,
     };
-    if !clock::is_set() {
-        warn!("ble: the clock isn't set, so peers drop this board's hellos: wifi.sh names a network to set it from");
+    // The node's socket needs lwIP, which Wi-Fi starts if it ran (a second call does nothing).
+    sys::esp!(unsafe { sys::esp_netif_init() })?;
+    let mut timed = clock::is_set();
+    if !timed {
+        info!("ble: the clock isn't set: the first room member to link gives the time");
     }
     let radio = Nimble::new()?;
     let both = board.as_ref().map(|_| free_heap());
@@ -103,6 +107,12 @@ fn run() -> anyhow::Result<()> {
     let (mut next_send, mut next_report, mut sent, mut reports) = (joined + SEND_EVERY, joined, 0u32, 0u32);
     loop {
         node.poll();
+        if let Some(time) = node.clock_from_peer().filter(|_| !timed) {
+            timed = true;
+            if let Err(e) = clock::set(time) {
+                warn!("ble: the time a room member gave: {e}");
+            }
+        }
         while let Some(event) = node.try_recv_event() {
             match event {
                 Event::Connected { peer, .. } => {

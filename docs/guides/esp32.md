@@ -56,6 +56,8 @@ udp`, with your board's address). With `--features nostr` the board also joins i
 |---|---|
 | `peerwire_esp::run(app)` | Starts ESP-IDF's logger and runs `app`; restarts the chip if it fails |
 | `Board::connect(ssid, password)` | Joins Wi-Fi, sets the clock by SNTP (waiting up to 60 s) and keeps it in step; if it was set late, restarts the board so the node binds with it |
+| `Board::connect_within(modem, sysloop, ssid, password, within)` | The same, giving up on the network after `within`: for firmware that goes on over Bluetooth alone |
+| `clock::set(node.clock_from_peer()?)` | Sets the clock from the time a room member gave the node over Bluetooth, on a board with no network |
 | `board.node()` | A node on the board's address, sized for the chip, with LAN signaling |
 | `board.node_with_nostr(relay)` | The same, with a Nostr relay too (feature `nostr`) |
 | `board.builder()` | The node's builder, to change before binding: an identity of your own, say |
@@ -182,8 +184,9 @@ versions, how to install them, and every result in detail.
   boot: keeping it needs encrypted storage, not done yet. Firmware of your own must keep that order: until Wi-Fi is
   started, ESP-IDF's random numbers are only pseudo-random, so start it, with modem sleep off, before you build a
   `Node`.
-- **Clocks.** A board that can't reach an SNTP server can't link with a PC, since their clocks differ by more than a
-  minute, and can't reach a Nostr relay, whose certificate it can't check.
+- **Clocks.** A board that can't reach an SNTP server can't link with a PC over Wi-Fi, since their clocks differ by
+  more than a minute, and can't reach a Nostr relay, whose certificate it can't check. Over Bluetooth it can: it
+  takes the time from the first room member that links ([Bluetooth](../concepts/bluetooth.md), NB-119).
 - **One relay.** The board uses one Nostr relay, as each costs a thread and a TLS session, so peers elsewhere must use
   that relay too. If it is down, only the LAN is left.
 - **Wi-Fi.** Only 2.4 GHz networks, as on any ESP32. The emulator's numbers above don't include the Wi-Fi driver's

@@ -408,9 +408,19 @@ tests use an in-process pair of fake radios.
     every 30 s; one that falls off the air while there is room for a connection is put back within a second.
   - With Wi-Fi off, every random draw comes after the Bluetooth controller starts (`nimble_port_init`), as NB-063 has
     it for Wi-Fi.
-  - A board with no Wi-Fi has no SNTP, and room hellos must be within a minute of the receiver's clock. So a board
-    joins a room over Bluetooth only with a clock set since power-on (its RTC keeps it across restarts, not power
-    cuts; NB-093).
+  - A board with no Wi-Fi has no SNTP, and room hellos must be within a minute of the receiver's clock. A node whose
+    clock read before 2023-11-14 when it was bound counts it as unset, and takes the time from the first room hello
+    that comes over a connection which proved the room, if its proof checks out and its time is set and before 2100
+    (NB-119). Once, and from no other carrier: there it is sealed under the connection's key, made from fresh
+    challenges both ways, so a member at the other end sent it, now; the hello may be another member's, at whatever
+    time that member chose. The node then says hello again at that time, as peers dropped its hellos from 1970.
+    `Node::clock_from_peer` gives the time, and the port's `clock::set` sets the system clock from it. So a board
+    needs no Wi-Fi: the `ble` and `ble_led` examples try a saved network for 20 s, then go on over Bluetooth alone.
+  - A room member can give a wrong time, and peers then drop the board's hellos until the node is bound again with
+    the right time: for one boot at most (NB119-2). The board restarts when a late SNTP answer moves its clock more
+    than 30 s, half the window; on Wi-Fi it asks every minute while it has a member's time. The RTC would keep a
+    member's time across a restart (NB-093), so the port marks it in RTC memory, and `peerwire_esp::init` sets a
+    marked clock back to 1970 at boot, before the node binds: a restart takes the time afresh.
 - **Browsers (NB-110d):** a central only, `BluetoothTransport` in `@peerwire/js`, which links with a native peer: two
   browsers can't link over Bluetooth.
   - Each connection starts from a user gesture and the device picker, filtered on the service UUID; never
@@ -456,8 +466,8 @@ Building it needs a C compiler for `libdbus` (built from source); running it, `b
 
 From a phone: `packages/js/demo/led.html` links with an ESP32 running `ble_led` (`ports/esp32`) and switches its LED.
 Build the wasm (`packages/js/build.sh`), serve `packages/js` over https, and open the page in Android Chrome (Web
-Bluetooth needs a secure page); `?room=` names the board's room if `room.sh` set one. The board's clock must be set,
-as its log says, or it drops the page's room hello.
+Bluetooth needs a secure page); `?room=` names the board's room if `room.sh` set one. A board with no Wi-Fi takes the
+time from the page's room hello, as its log says, so it needs no network.
 
 ## Not yet
 

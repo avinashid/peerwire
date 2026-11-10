@@ -22,6 +22,29 @@ pub type Wifi = BlockingWifi<EspWifi<'static>>;
 /// can't take full power, so the access point hears their short auth frame but never their association request
 /// (NB-091). Each failed attempt logs ESP-IDF's reason for it.
 pub fn join(modem: Modem<'static>, sysloop: EspSystemEventLoop, ssid: &str, password: &str) -> anyhow::Result<Wifi> {
+    join_until(modem, sysloop, ssid, password, None)
+}
+
+/// [`join`], giving up once `within` has passed with no attempt joined (an attempt under way then still has its 10 s,
+/// and there is always one): for firmware that can go on without the network, over Bluetooth say, when it isn't
+/// there. Wi-Fi is off again when it gives up.
+pub fn join_within(
+    modem: Modem<'static>,
+    sysloop: EspSystemEventLoop,
+    ssid: &str,
+    password: &str,
+    within: Duration,
+) -> anyhow::Result<Wifi> {
+    join_until(modem, sysloop, ssid, password, Some(Instant::now() + within))
+}
+
+fn join_until(
+    modem: Modem<'static>,
+    sysloop: EspSystemEventLoop,
+    ssid: &str,
+    password: &str,
+    until: Option<Instant>,
+) -> anyhow::Result<Wifi> {
     // ESP-IDF's quarter-dBm.
     const TX_POWER: [i8; 4] = [80, 60, 44, 34];
     let nvs = crate::nvs()?;
@@ -60,6 +83,10 @@ pub fn join(modem: Modem<'static>, sysloop: EspSystemEventLoop, ssid: &str, pass
         }
     })?;
     for attempt in 1.. {
+        if attempt > 1 && until.is_some_and(|u| Instant::now() >= u) {
+            let _ = w.stop();
+            return Err(anyhow!("not on the Wi-Fi network after {} attempts", attempt - 1));
+        }
         let power = TX_POWER[(attempt - 1) % TX_POWER.len()];
         let dbm = f32::from(power) / 4.0;
         sys::esp!(unsafe { sys::esp_wifi_set_max_tx_power(power) })?;
