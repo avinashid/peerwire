@@ -281,3 +281,30 @@ fn another_rooms_central_is_closed_after_its_answer() {
     assert!(b.peer.is_none() && !b.connected);
     assert_eq!(board.ble_counts(), (0, 0, 0));
 }
+
+/// NB-119: a board with no clock (1970: no battery, no Wi-Fi) takes the time from the browser's room hello, which
+/// comes over the connection that proved the room, and lets the browser in, as a board with its clock set does.
+#[test]
+fn a_board_with_no_clock_takes_the_browsers_time() {
+    let air = FakeAir::new(23);
+    let builder = Node::builder().bluetooth(air.radio(Limits::SMALL)).stun_servers(Vec::<String>::new());
+    let mut board = builder.clock_at(5_000).bind("127.0.0.1:0").unwrap();
+    board.join_room(APP, ROOM);
+    let mut b = Browser::new(&air, ROOM, true);
+    run(&mut board, &mut b, 2, |_, _| air.advert(0).is_some());
+    b.radio.connect(DeviceId(0));
+    let mut asked = false;
+    let started = Instant::now();
+    run(&mut board, &mut b, 10, |_, b| {
+        if b.connected && !asked {
+            asked = b.send(b"led on") == 0;
+        }
+        b.got.iter().any(|m| m == b"led: on")
+    });
+    assert!(b.got.iter().any(|m| m == b"led: on"), "the board's reply came: {:?}", b.got);
+    eprintln!("a board with no clock linked and answered in {:?}", started.elapsed());
+    let taken = board.clock_from_peer().expect("the browser's time");
+    let off = taken.duration_since(SystemTime::now()).unwrap_or_else(|e| e.duration());
+    assert!(off < Duration::from_secs(2), "{off:?}");
+    assert_eq!(board.path_kind(&PeerId(b.id)), Some(PathKind::Bluetooth));
+}
