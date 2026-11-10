@@ -194,7 +194,7 @@ release of each.
 | NB110-I14 (Info) | Accepted: a failed connect's disconnect turns off BlueZ's own reconnection of a device it doesn't trust, until that device is connected again, same section |
 | NB119-1 (Low), NB119-I1, NB119-I2 (Info) | **Fixed** by `2505f70` before NB-119's first part merged (`9d721b1`), so never on main, before any release of `peerwire-esp` kept identities (a board's kept identity is drawn only from the SAR ADC, before Wi-Fi or Bluetooth is set up, or not at all, and an ESP32 BLE node keeps its Bluetooth modem awake; the docs say `id new` doesn't scrub the old key and how each chip can encrypt NVS), reviewed 2026-11-07; residuals: the key is in plain NVS; firmware must load it before it sets up a radio; an ESP32 BLE node draws more current, [Kept identity on the ESP32](#kept-identity-on-the-esp32-nb-119--nb119-1) |
 | NB110d-I1, NB110d-I2 (Info) | **Fixed** by `226529e`, on main after NB-110d merged (`9531bfd`), before any release (the docs say a page's `dial()` with no `peer` links with any member the device it picked passes the connection to; the C ABI queues CLOSED past its 64-event cap, and `pw_ble_timeout`'s deadline saturates), reviewed 2026-11-10, [Bluetooth LE in the browser](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1nb110d-i3) |
-| NB110d-I3 (Info) | Open, the owner's call: since `8742653` the LED demo is on the site's demo list, so once the site is deployed, a visitor's Bluetooth grant for a board goes to the shared origin `avinashid.github.io`, same section |
+| NB110d-I3 (Info) | Accepted by the repo owner on 2026-11-10, as shipped: the LED demo is on the site's demo list (since `8742653`) with no note on the page, so a visitor's Bluetooth grant for a board goes to the shared origin `avinashid.github.io`, and the account's other Pages sites may connect to that board without the picker while it is in range, same section |
 | NB119-2 (Low), NB119-I3, NB119-I4 (Info) | **Fixed** by `7495937`, `061c23e` and `61c97e6` before NB-119's second part merged (`3859af7`), so never on main, before any release of `peerwire-esp` took the time from a room member (a board restarts when SNTP moves its clock more than 30 s, asks every minute while it holds a member's time, and forgets at the next boot a time marked in RTC memory as a member's; none from 2100 on), reviewed 2026-11-09; residuals: any member can give a wrong time for a boot; the pool server or the path can restart a board at each re-ask, [The clock from a room member](#the-clock-from-a-room-member-nb-119--nb119-2-nb119-i3-nb119-i4) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
@@ -2986,10 +2986,12 @@ any of this account's sites can:
   none today), register a service worker at scope `/` that serves its own JS for every
   `/peerwire/` URL and outlives any fix.
 
-The owner chose to keep the site on `avinashid.github.io`, with no custom domain for
-now (NB-061), so the account's other Pages sites share this origin, and the points above
-are accepted while it stays there. The meet page stays off the site: it joins only with
-the owner's approval and the frame check below.
+The owner chose to keep the site on `avinashid.github.io`, with no custom domain for now
+(NB-061), so the account's other Pages sites share this origin, and the points above are
+accepted while it stays there. So is the LED demo's Bluetooth grant, which the owner
+accepted on 2026-11-10 with no note on the page
+([NB110d-I3](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1nb110d-i3)). The meet page
+stays off the site: it joins only with the owner's approval and the frame check below.
 
 **NB10a-I1 (Info), the camera.** Browsers keep a camera or microphone grant per origin.
 Once the meet page is on the site, a visitor's "allow" there is a grant to
@@ -3031,17 +3033,18 @@ faked `avinashid.github.io` origin (NB71-I2). Residual: like the shared origin, 
 holds only while none of the account's other Pages sites runs third-party scripts or
 user content.
 
-**Fix not taken for now: an origin of the site's own.** A custom subdomain on a
-domain the owner holds is the one choice no other site shares: an organisation's
+**Fix not taken for now: an origin of the site's own.** A custom subdomain on a domain
+the owner holds is the one choice no other site shares: an organisation's
 `<org>.github.io` is still shared by that organisation's other Pages sites. It keeps the
-demos' storage, scripting, service workers and media grants apart from everything else
-the account publishes, and the site needs no change, since its URLs are all relative.
-With a custom domain, verify it in the account's Pages settings and enforce HTTPS, and
-remove its DNS record if the site is ever taken down, so no other Pages site can claim
-it. Accepting the shared origin, as the owner has, holds only while nothing else on the
-account runs third-party scripts or user content, and it doesn't cover the camera
-(NB10a-I1). The owner accepted Net Lab's microphone grant on its own, with a note on the
-button (NB16-2).
+demos' storage, scripting, service workers, and media and Bluetooth grants apart from
+everything else the account publishes, and the site needs no change, since its URLs are
+all relative. With a custom domain, verify it in the account's Pages settings and
+enforce HTTPS, and remove its DNS record if the site is ever taken down, so no other
+Pages site can claim it. Accepting the shared origin, as the owner has, holds only while
+nothing else on the account runs third-party scripts or user content, and it doesn't
+cover the camera (NB10a-I1). The owner accepted Net Lab's microphone grant on its own,
+with a note on the button (NB16-2), and the LED demo's Bluetooth grant with none
+(NB110d-I3).
 
 **Framing (Info; a condition for the meet page).** A `<meta>` policy can't set
 `frame-ancestors`, so any site can frame the demos. For today's pages that is accepted:
@@ -5866,7 +5869,7 @@ nothing needed reproducing, and nothing had run from a phone then (see the resid
   under the room key, sealed under the hello key) and acts on no signal from the device.
   `BleLink` does nothing once freed, and each timer and write loop stops once its
   connection ends. The LED demo shows what the board sends with `textContent`, and keeps
-  nothing. Since `8742653` it is on the site's demo list (NB110d-I3).
+  nothing. Since `8742653` it is on the site's demo list (NB110d-I3, accepted).
 - **The module.** `peerwire_ffi_ble.wasm` has no imports, and the gate and CI check that
   and its size (at most 420 KiB) as they do the default module's, which pages that don't
   use Bluetooth still load.
@@ -5906,7 +5909,7 @@ the author ran each against the old code, where it fails. A host clock past 2^63
 about 292,000 years from its zero, gets `i64::MAX`, already past, so the host calls
 again at once until its 3 s are up; no host's clock is near it.
 
-**NB110d-I3 — The LED demo's Bluetooth grant would go to the shared origin (Info).**
+**NB110d-I3 — The LED demo's Bluetooth grant goes to the shared origin (Info).**
 Since `8742653` the site's demo list has the LED demo (`led.html`), so the next deploy
 of the site puts it on `avinashid.github.io`, which every Pages site of the account
 shares
@@ -5923,7 +5926,12 @@ of its own; or keep it, with a note on a `*.github.io` host, as Net Lab's button
 that the permission is for all of that host. An origin of the site's own fixes it with
 the rest.
 
-**Status: open** (Info), reported on NB-110d at `8742653`.
+**Status: accepted** by the repo owner on 2026-11-10, who kept the LED demo on the site
+as shipped, with no note on the page, so neither fix was taken; reported on NB-110d at
+`8742653`. Unlike Net Lab's microphone button (NB16-2), nothing on the page tells a
+visitor that the grant is for all of `avinashid.github.io`. Residual: like the shared
+origin, it holds only while none of the account's other Pages sites runs third-party
+scripts or user content; an origin of the site's own closes it with the rest.
 
 **Residuals, accepted.**
 - **The grant is the origin's.** Once the user picks a device, the browser keeps a grant
@@ -6835,8 +6843,8 @@ mappings that carry over and are already handled in Peerwire:
   hidden from a relay that correlates tags and timing. Over `LanSignaling` every
   device on the LAN sees what a relay sees, and the sender's IP and MAC addresses.
 - On the docs and demos site, what the account's other Pages sites can do on the shared
-  origin `avinashid.github.io`, a microphone grant given to Net Lab included (accepted
-  by the owner; NB16-2).
+  origin `avinashid.github.io`, a microphone grant given to Net Lab and a Bluetooth
+  grant given to the LED demo included (accepted by the owner; NB16-2, NB110d-I3).
 - With a radio (`ble`, NB-110), what anyone in Bluetooth range sees and can do: that a
   Peerwire peer is near, the sizes and timing of its connections, and jamming or cutting
   them. A link over Bluetooth proves nothing about distance. On Linux, unless
