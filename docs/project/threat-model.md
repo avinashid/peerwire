@@ -198,8 +198,8 @@ release of each.
 | NB119-2 (Low), NB119-I3, NB119-I4 (Info) | **Fixed** by `7495937`, `061c23e` and `61c97e6` before NB-119's second part merged (`3859af7`), so never on main, before any release of `peerwire-esp` took the time from a room member (a board restarts when SNTP moves its clock more than 30 s, asks every minute while it holds a member's time, and forgets at the next boot a time marked in RTC memory as a member's; none from 2100 on), reviewed 2026-11-09; residuals: any member can give a wrong time for a boot; the pool server or the path can restart a board at each re-ask, [The clock from a room member](#the-clock-from-a-room-member-nb-119--nb119-2-nb119-i3-nb119-i4) |
 | NB126-1 (Low) | **Fixed** by `38ceded` and `9160362` before NB-126 merged, so never on main (an LED board on the internet has no default room and won't start in a guessable one; the LED page's internet way has no default room and warns on a guessable name), reviewed 2026-11-10, [Links over the signalling relays](#links-over-the-signalling-relays-to-native-nodes-nb-126--nb126-1nb126-3) |
 | NB126-2 (Low) | Open: one event over 4 KiB on a board's topics closes its relay socket (NB-095's residual), and since NB-126 that cuts a page's link over the relays, its only path to the board; card NB-128, same section |
-| NB126-3 (Low), NB126-T1 (Info) | Open on NB-126 at `38ceded`: while a pipe batch waits for the shared rate, `Node::next_timeout` is 0, so a host that sleeps on it polls in a busy loop; no test binds a pipe's datagrams to its sender, same section |
-| NB126-I1 (Info) | Open on NB-126 at `9160362`: the LED page takes the first native member it hears as the board, and shows any linked member's messages as the board's; two pages dialling each other is accepted for v1, same section |
+| NB126-3 (Low), NB126-T1 (Info) | **Fixed** by `0663176` before NB-126 merged, so never on main (while pipe batches wait for the shared rate, `Node::next_timeout` is when the next token comes, not 0, so a host that sleeps on it doesn't spin; a test binds a pipe's datagrams to its sender), reviewed 2026-11-10, same section |
+| NB126-I1 (Info) | Accepted for v1 by the lead on 2026-11-10: the LED page takes the first native member it hears as the board, and shows any linked member's messages as the board's; two pages dialling each other is accepted too. Pinning the board's PeerId comes in v2 with the roles of client and host, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -6086,7 +6086,8 @@ it with the board's `nostr_led` example. Every node with no policy, or one that 
 Reviewed on 2026-11-10 by reading `38ceded` (Rust and the ESP32 example) and `9160362`
 (JavaScript and the LED page) against the conditions set on the design. A scratch copy
 of `38ceded` ran our own tests to reproduce NB126-3 and one mutant (NB126-T1); nothing
-else was re-run.
+else was re-run. The fix of both, `0663176`, was read the same day; its author ran the
+two mutants.
 
 **What holds.**
 
@@ -6169,7 +6170,15 @@ Repro, our test on `38ceded`: a node linked over a pipe sends 20 unreliable mess
 before the bucket's next token, and a test that `next_timeout()` isn't 0 while batches
 wait for it. With that change the same loop polled 99 times, each after a wait.
 
-**Status: open** (Low), reported on NB-126 at `38ceded`.
+**Status: fixed** by `0663176` before NB-126 merged, so never on main, reviewed
+2026-11-10: no batch is due before the bucket's next token (`Pipes::next_due`). A unit
+test has the next batch after a burst of 8 due 250 ms on, and one refused part way to a
+token due when the rest of it comes; `a_host_sleeps_while_batches_wait_for_the_rate`
+(`crates/peerwire/tests/pipe.rs`) runs the loop above and allows at most 5 polls with a
+zero timeout. Its author's runs: 93 polls in 500 ms, none at zero; with the old
+`next_due`, 49,199, all at zero, and the test fails. On an ESP32 `idle` then sleeps its
+10 ms cap, which ESP-IDF's `usleep` spends in `vTaskDelay` (10 ticks at the port's
+1,000 Hz), so the task yields.
 
 **NB126-T1 — No test binds a pipe to its sender (Info, test gap).** At `38ceded`, a
 mutant that hands pipe datagrams to the endpoint unbound (`handle_datagram`) passed all
@@ -6177,7 +6186,13 @@ mutant that hands pipe datagrams to the endpoint unbound (`handle_datagram`) pas
 puts the first's datagrams in a batch of its own: they are dropped (`rx_wrong_peer`),
 and the first's link stays where it is.
 
-**Status: open** (Info), reported on NB-126 at `38ceded`.
+**Status: fixed** by `0663176` before NB-126 merged, so never on main, reviewed
+2026-11-10: in `a_member_cannot_carry_another_peers_datagrams`
+(`crates/peerwire/tests/pipe.rs`) a second member puts a linked peer's next datagrams,
+which the node hasn't seen, in a batch of its own. The node counts each in
+`rx_wrong_peer` and delivers none, and the linked peer keeps its status and path, its
+pipe still carrying both ways. Its author ran the mutant: the test fails at the
+`rx_wrong_peer` check.
 
 **NB126-I1 — The LED page takes any native member as the board (Info).** Over the
 internet the page dials the first native peer whose hello proves the room, and logs
@@ -6189,8 +6204,11 @@ keeps pages apart, but a member can still join as a host. Fix: let the page pin 
 board's PeerId (as Rust's `expect`), dial it alone and log only its messages as the
 board's.
 
-**Status: open** (Info), reported on NB-126 at `9160362`. Two pages dialling each other
-is accepted for v1, with the change of roles planned.
+**Status: accepted** for v1 by the lead on 2026-11-10: the room name is the board's
+password, so anyone who can join as a host could already read the room. Two pages
+dialling each other is accepted too. In v2, with the page a client and the board a host,
+the page pins the board (`?board=` and its PeerId): it dials that peer alone and logs
+only its messages as the board's.
 
 **Residuals, accepted.**
 
