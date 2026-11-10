@@ -917,7 +917,7 @@ of range.
 |---|---|
 | `dropped` | Datagrams dropped by `loss`. |
 | `congested` | Datagrams dropped because the DataChannel had over 1 MiB queued (`MAX_BUFFERED`) or `send` threw. |
-| `badSignals` | Signals refused: a `from` that isn't a PeerId, an empty message, an offer whose proof fails or whose SDP doesn't apply, a second retry connection within 2 s, an `ice-batch` that isn't a list of at most 32, a pipe batch from a peer not allowed one (or with `pipes` off) or that isn't a list of at most 64 base64 datagrams. |
+| `badSignals` | Signals refused: a `from` that isn't a PeerId, an empty message, an offer whose proof fails or whose SDP doesn't apply, a second retry connection within 2 s, an `ice-batch` that isn't a list of at most 32, a pipe batch from a peer not allowed one (or with `pipes` off) or that isn't a list of 1 to 64 base64 datagrams of 1 to 1232 bytes each (a batch is taken whole or not at all). |
 | `resent` | Offers sent again for want of an answer, and answers sent again for a repeated offer. |
 | `throttled` | Offers, answers and restart asks not sent because the peer's publish budget was spent: 6 at once, then 1 per 5 s per peer. |
 | `restarts` | ICE restarts begun as the dialling side: at most 3 per link a minute. |
@@ -1023,8 +1023,10 @@ a few batches a second. That is slow (a relay trip each way), fine for commands 
   datagrams only from a member whose hello it holds from the last minute: on start, every 20 s, on a relay that opens
   again, and in answer to a peer newly heard (at most one each 2 s).
 - **Peers.** It lists the native peers whose hellos prove the room key (`peers`, and `onPeer(peer, 'seen')`), and takes
-  pipe datagrams only from them and from a peer it dials. A `joinRoom` member's hello (no `meta.nb`) is left to its
-  room. A hello only names a peer: the handshake proves who is at the other end.
+  pipe batches from them alone, each datagram as from its sender only. A `joinRoom` member's hello (no `meta.nb`) is
+  left to its room. A hello only names a peer: the handshake proves who is at the other end.
+- **The room name is the password.** Anyone who knows it can link with the board, and as a member learn its addresses:
+  over the internet, give it one nobody can guess (`randomRoomId()`).
 - **Batches.** To a native peer, a batch carries 1232 bytes of datagrams at most (`NATIVE_BATCH`): a board reads relay
   messages of 4 KB at most, and one such batch makes an event of about 3 KB. From it, up to the pipe's own limits.
 
@@ -1037,7 +1039,7 @@ a few batches a second. That is slow (a relay trip each way), fine for commands 
 | Member | |
 |---|---|
 | `peers` | The native peers heard in the last minute. |
-| `dial(peer)` | Links with `peer` over a pipe: resolves to its PeerId once the handshake is done (at once if the endpoint is linked with it), within 15 s. Rejects with an `Error` whose `code` is `'timeout'` (the peer isn't online, or not in this room), `'failed'` (the endpoint refused the dial) or `'closed'` (`close()`, or `drop(peer)`); with a `TypeError` for a `peer` that isn't a PeerId. |
+| `dial(peer)` | Links with `peer` over a pipe: resolves to its PeerId once the handshake is done (at once if the endpoint is linked with it), within 15 s. Its answers are taken once its hello proves the room key: a peer not heard yet is sent ours, which a native peer answers with its own. Rejects with an `Error` whose `code` is `'timeout'` (the peer isn't online, or not in this room), `'failed'` (the endpoint refused the dial) or `'closed'` (`close()`, or `drop(peer)`); with a `TypeError` for a `peer` that isn't a PeerId. |
 | `has(peer)`, `drop(peer)`, `close()` | The [`Transport`](#transport) methods. `drop` sends the endpoint's goodbye over the pipe at once; `close` sends what waits in the pipes, then leaves the relays. |
 | `signaling` | Its [`NostrSignaling`](#nostrsignaling) (`stats`). |
 
@@ -1173,7 +1175,7 @@ static server (`python3 -m http.server -d packages/js 8000`).
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
 | `demo/netlab.html` | Net Lab, a connection diagnostics page: join a room by name or a private `#key=` link; per peer, ping on the route in use, ICE round trips, WebRTC traffic, restarts and port guesses, the route and candidate pair, the offer/answer exchange and ICE checks with a verdict on which way packets are blocked, and the other side's NAT; this device's public addresses and NAT mapping; the relays' state; chat, an event log and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. |
-| `demo/led.html` | A board's LED, over Bluetooth or the internet: pick an ESP32 running `ble_led` nearby, or find a board on Wi-Fi in the room over its Nostr relays (`RelayTransport`), and switch its LED (`led on`, `led off`, `led toggle`), its answers in a log. `?app=` and `?room=` name the room, `?via=bluetooth` or `?via=internet` the way, `?relays=` the relays. Bluetooth needs Web Bluetooth on an https page (Android Chrome on a phone); the internet, any browser. |
+| `demo/led.html` | A board's LED, over Bluetooth or the internet: pick an ESP32 running `ble_led` nearby, or find a board on Wi-Fi in the room over its Nostr relays (`RelayTransport`), and switch its LED (`led on`, `led off`, `led toggle`), its answers in a log. `?app=` and `?room=` name the room (`esp32` by default over Bluetooth; none over the internet, where a name that can be guessed gets a warning), `?via=bluetooth` or `?via=internet` the way, `?relays=` the relays. Bluetooth needs Web Bluetooth on an https page (Android Chrome on a phone); the internet, any browser. |
 | `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player. `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it. |
 
 Add `?signal=nostr&room=<something only you know>` to a demo page to reach other machines through the default relays

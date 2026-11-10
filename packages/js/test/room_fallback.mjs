@@ -231,8 +231,21 @@ console.log("fallback 'peers' alone and 'off': a blocked pair stays apart");
   }
   if (t.pipeAllowed.size > MAX_PIPE_PEERS || t.pipes.size > MAX_PIPE_PEERS + 1 || t.pipeByPeer.size !== t.pipes.size) fail(`pipes not bounded: allowed ${t.pipeAllowed.size}, pipes ${t.pipes.size}`);
   if (!t.pipeByPeer.has(linked)) fail("an evicted peer's pipe was dropped while its session used it");
+  // NB-126 (J2): a linked peer stays allowed too, so its link over the pipe isn't cut; its batches are still taken.
+  const took = t.piped.received;
+  t.pipeReceive(linked, ['AAAA']);
+  if (!t.pipeAllowed.has(linked) || t.piped.received !== took + 1) fail("a linked peer's pipe batches were refused once 1,000 others came");
+  // With every allowed peer linked, a newcomer isn't allowed.
+  const full = new WebRtcTransport({ ...ep, isConnected: () => true }, sig, { pipes: true, RTCPeerConnection: fakePc('x') });
+  const id = (i) => `e${i.toString(16).padStart(63, '0')}`;
+  for (let i = 0; i <= MAX_PIPE_PEERS; i++) full.allowPipe(id(i));
+  const last = id(MAX_PIPE_PEERS);
+  if (full.pipeAllowed.size !== MAX_PIPE_PEERS || full.pipeAllowed.has(last) || !full.pipeAllowed.has(id(0))) {
+    fail(`every allowed peer linked: ${full.pipeAllowed.size} allowed, the newcomer ${full.pipeAllowed.has(last) ? 'in' : 'out'}`);
+  }
+  full.close();
   t.close();
-  console.log(`1,000 proven peers with a 'dg' each: ${t.pipeAllowed.size} allowed, pipes bounded; a linked peer's pipe kept`);
+  console.log(`1,000 proven peers with a 'dg' each: ${t.pipeAllowed.size} allowed, pipes bounded; a linked peer's pipe kept, and it stays allowed; with all ${MAX_PIPE_PEERS} linked, a newcomer isn't allowed`);
 }
 
 console.log('room_fallback: ok');

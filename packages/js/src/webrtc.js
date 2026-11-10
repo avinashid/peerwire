@@ -54,6 +54,7 @@ export const PIPE_BURST = 12;
 export const PIPE_QUEUE = 128 * 1024;
 export const PIPE_CLOSE_BATCHES = 16;
 const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
+const MAX_DATAGRAM_B64 = 4 * Math.ceil(MAX_DATAGRAM / 3); // base64 of a datagram, padded
 const full = (p, batch) => p.bytes >= batch || p.q.length >= MAX_PIPE_ITEMS; // a pipe's queue fills a batch
 const unflush = (p) => {
   clearTimeout(p.timer?.id);
@@ -1006,15 +1007,20 @@ export class WebRtcTransport {
     return this.seen.get(peer) ?? (l?.pc.remoteDescription ? { mine: l.mine, theirs: l.theirs } : null);
   }
 
-  // Lets `peer` (one that proved the room key) send us datagrams over signalling.
+  // Lets `peer` (one that proved the room key) send us datagrams over signalling. Past MAX_PIPE_PEERS, the peer allowed
+  // longest ago that has no session goes, and its pipe; a peer with one stays allowed, as its link may run over the
+  // pipe, so with every allowed peer linked, the newcomer isn't allowed.
   allowPipe(peer) {
     if (!this.pipesOn || this.pipeAllowed.has(peer)) return;
     this.pipeAllowed.add(peer);
     if (this.pipeAllowed.size <= MAX_PIPE_PEERS) return;
-    const old = this.pipeAllowed.values().next().value;
-    this.pipeAllowed.delete(old);
-    // Its pipe goes too, unless a session uses it: pipes stay bounded by the allowed set and our links.
-    if (!this.ep.isConnected(old)) this.dropPipe(old);
+    for (const old of this.pipeAllowed) {
+      if (old === peer || this.ep.isConnected(old)) continue;
+      this.pipeAllowed.delete(old);
+      this.dropPipe(old);
+      return;
+    }
+    this.pipeAllowed.delete(peer);
   }
 
   isPipe(handle) {
@@ -1110,22 +1116,30 @@ export class WebRtcTransport {
     if (p.q.length) this.pipeFlushSoon(p);
   }
 
+  // A batch from `from`: taken only from a peer allowed one, and only whole: 1 to MAX_PIPE_ITEMS strings, each base64
+  // of 1 to MAX_DATAGRAM bytes (its length bounded before it is decoded). Each datagram goes to the endpoint on
+  // `from`'s own pipe, as from `from` alone, so a peer can't carry another's packets.
   pipeReceive(from, d) {
-    if (!this.pipeAllowed.has(from) || !Array.isArray(d) || d.length > MAX_PIPE_ITEMS) return void this.badSignals++;
+    if (!this.pipeAllowed.has(from) || !Array.isArray(d) || d.length < 1 || d.length > MAX_PIPE_ITEMS) return void this.badSignals++;
     // The peer's own DataChannel opened late and carries its datagrams now: these were
     // sent before, and taking them would move the link back onto the pipe for a while.
     const own = this.links.get(this.byPeer.get(from));
     if (own?.heard && own.dc.readyState === 'open') return void (this.piped.stale += d.length);
-    const h = this.pipe(from);
-    if (h === null) return void this.badSignals++;
+    const got = [];
     for (const s of d) {
-      if (typeof s !== 'string' || s.length > (MAX_DATAGRAM * 4) / 3 + 4) return void this.badSignals++;
+      if (typeof s !== 'string' || s.length > MAX_DATAGRAM_B64) return void this.badSignals++;
       let bytes;
       try {
         bytes = unb64(s);
       } catch {
         return void this.badSignals++;
       }
+      if (bytes.length < 1 || bytes.length > MAX_DATAGRAM) return void this.badSignals++;
+      got.push(bytes);
+    }
+    const h = this.pipe(from);
+    if (h === null) return void this.badSignals++;
+    for (const bytes of got) {
       this.piped.received++;
       this.ep.receive(h, bytes, from);
     }

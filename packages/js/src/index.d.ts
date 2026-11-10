@@ -826,7 +826,8 @@ export declare class WebRtcTransport implements Transport {
    * Signals refused: a `from` that isn't a PeerId or an empty message, an offer whose `offerProof` fails or whose
    * SDP doesn't apply, a retry offer that would make a peer's second new connection within 2 s, an `ice-batch`
    * that isn't a list of at most 32, or one that failed unexpectedly, and a pipe batch from a peer not allowed one
-   * (or with `pipes` off) or that isn't a list of at most 64 base64 datagrams. Answers and
+   * (or with `pipes` off) or that isn't a list of 1 to 64 base64 datagrams of 1 to 1232 bytes each (a batch is taken
+   * whole or not at all). Answers and
    * ICE candidates that don't apply are not counted (copies and races are normal). The WebRTC counterpart of
    * NostrSignaling's `stats.rejected`.
    */
@@ -993,7 +994,9 @@ export type RelayFailure = 'timeout' | 'failed' | 'closed';
  * The room is a native one, as with {@link BluetoothTransport}: the transport says hello as a native member does
  * (`meta.nb`, a proof under the room key) on start, every 20 s, on a relay that opens again and in answer to a peer
  * newly heard (at most one each 2 s), lists the native peers whose hellos prove the room key, and dials one over a
- * pipe alone. Messages are the endpoint's, raw bytes. A hello only names a peer: the handshake proves who it is.
+ * pipe alone, taking pipe batches from those peers alone. Messages are the endpoint's, raw bytes. A hello only names a
+ * peer: the handshake proves who it is. The room name is the board's password: over the internet, use one nobody can
+ * guess ({@link randomRoomId}).
  *
  * ```js
  * const endpoint = (await loadPeerwire(wasmUrl)).endpoint();
@@ -1023,9 +1026,11 @@ export declare class RelayTransport {
   readonly signaling: NostrSignaling;
   /**
    * Links with `peer` over a pipe: resolves to its PeerId once the handshake is done (at once if the endpoint is linked
-   * with it already), within 15 s. Rejects with an Error whose `code` is a {@link RelayFailure}: `'timeout'` (the peer
-   * isn't online, or not in this room), `'failed'` (the endpoint refused the dial), `'closed'` (`close()`, or
-   * `drop(peer)`); with a TypeError for a `peer` that isn't a PeerId. A dial to a peer under way is that one.
+   * with it already), within 15 s. Its answers are taken once its hello proves the room key: a peer not heard yet is
+   * sent our hello, which a native peer answers with its own. Rejects with an Error whose `code` is a
+   * {@link RelayFailure}: `'timeout'` (the peer isn't online, or not in this room), `'failed'` (the endpoint refused
+   * the dial), `'closed'` (`close()`, or `drop(peer)`); with a TypeError for a `peer` that isn't a PeerId. A dial to a
+   * peer under way is that one.
    */
   dial(peer: PeerId): Promise<PeerId>;
   /** Whether `peer` is linked and we have a pipe to it. */

@@ -6,14 +6,16 @@
 //
 // The room is a native one, the Rust node's, not a joinRoom room. As BluetoothTransport does, this says hello as a
 // member of a native room (Rust's traversal.rs `hello`: meta.nb, a proof under the room key), and dials the peer
-// itself. It joins the room's topic on the relays, lists the native peers whose hellos prove the room key, and dials
-// one over a pipe alone. A native peer takes pipe datagrams only from a member whose hello it holds from the last
-// minute, so ours goes on start, every helloEveryMs, on a relay that opens again, and in answer to a peer newly heard
-// (at most one each greetMs). Messages are the endpoint's, raw bytes, as a node sends them.
+// itself. It joins the room's topic on the relays, lists the native peers whose hellos prove the room key, takes pipe
+// batches from them alone (each datagram as from its sender only), and dials one over a pipe alone. A native peer
+// takes pipe datagrams only from a member whose hello it holds from the last minute, so ours goes on start, every
+// helloEveryMs, on a relay that opens again, and in answer to a peer newly heard (at most one each greetMs). Messages
+// are the endpoint's, raw bytes, as a node sends them. Over the internet the room name is the board's password: give
+// it one nobody can guess (randomRoomId()).
 //
-//   const pw = await loadPeerwire();
+//   const pw = await loadPeerwire(wasmUrl);
 //   const endpoint = pw.endpoint();
-//   const link = new RelayTransport(endpoint, { appId: 'peerwire-lan-chat', roomId: 'esp32', onPeer });
+//   const link = new RelayTransport(endpoint, { appId: 'peerwire-lan-chat', roomId: boardRoom, onPeer });
 //   endpoint.onEvent = (e) => e.type === 'message' && show(new TextDecoder().decode(e.data));
 //   async function onPeer(peer, state) {
 //     if (state === 'seen') endpoint.send(await link.dial(peer), 'led on'); // resolves once linked
@@ -141,17 +143,17 @@ export class RelayTransport {
   }
 
   // Links with `peer` over a pipe: resolves to its PeerId once the handshake is done (at once if the endpoint is
-  // linked with it already), within dialMs. Rejects with an Error whose `code` is 'timeout' (not linked in time: the
-  // peer isn't online, or not in this room), 'failed' (the endpoint refused the dial) or 'closed' (the transport
-  // closed, or drop(peer)); a TypeError for a `peer` that isn't a PeerId. A dial to a peer under way is that one.
+  // linked with it already), within dialMs. Its answers are taken once its hello proves the room key: a peer not
+  // heard yet is sent ours, which a native peer answers with its own. Rejects with an Error whose `code` is 'timeout'
+  // (not linked in time: the peer isn't online, or not in this room), 'failed' (the endpoint refused the dial) or
+  // 'closed' (the transport closed, or drop(peer)); a TypeError for a `peer` that isn't a PeerId. A dial to a peer
+  // under way is that one.
   dial(peer) {
     if (!isPeerId(peer)) return Promise.reject(new TypeError('dial: not a peer id (64 lowercase hex characters)'));
     if (this.closed) return Promise.reject(failure('closed', 'the transport is closed'));
     const under = this.dials.get(peer);
     if (under) return under.promise;
     if (this.ep.isConnected(peer)) return Promise.resolve(peer);
-    // Its answers come over the pipe; a peer we haven't heard may not hold a hello of ours yet.
-    this.rtc.allowPipe(peer);
     if (!this.seen.has(peer)) this.greet();
     const h = this.rtc.pipe(peer);
     const d = {};

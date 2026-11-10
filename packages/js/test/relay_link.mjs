@@ -19,6 +19,7 @@ import { loadPeerwire } from '../src/peerwire.js';
 import { RelayTransport, NATIVE_BATCH } from '../src/relay_link.js';
 import { NostrSignaling, roomSealKey, b64, unb64 } from '../src/nostr.js';
 import { RoomProof } from '../src/proof.js';
+import { WebRtcTransport } from '../src/webrtc.js';
 import { startRelay } from './nostr_relay.mjs';
 
 const pw = await loadPeerwire(process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname);
@@ -50,6 +51,8 @@ const NAME = `${APP}/${ROOM}`;
 const RUST_HELLO = /^\{"t":"hello","from":"([0-9a-f]{64})","meta":\{"nb":1,"role":"peer","ts":(\d{1,19}),"p":"[0-9a-f]{64}"\}\}$/;
 // What an ESP32 board's relay socket reads at most (its carrier's Limits::SMALL.message).
 const BOARD_FRAME = 4096;
+// An event as a board's socket reads it: under a subscription id of 64 characters, more than any client's.
+const frame = (ev) => JSON.stringify(['EVENT', 'x'.repeat(64), ev]).length;
 const sha = async (s) => Buffer.from(await crypto.subtle.digest('SHA-256', enc.encode(s))).toString('hex');
 const ROOM_TAG = await sha(`peerwire/room/${NAME}`);
 const sealKey = await roomSealKey(NAME);
@@ -201,9 +204,32 @@ const batches = []; // the datagrams' sizes in each pipe batch a sends
   check(batches.length > 5 && Math.max(...sums) <= NATIVE_BATCH && batches.every((s) => s.length <= 64) && batches.some((s) => s.length > 1),
     `every batch to b carries ${NATIVE_BATCH} bytes of datagrams at most: ${batches.length} batches, the biggest ${Math.max(...sums)} B, up to ${Math.max(...batches.map((s) => s.length))} datagrams`);
   const tag = await sha(`peerwire/peer/${b.id}`);
-  const frames = relays.flatMap((r) => r.events).filter((ev) => tagOf(ev) === tag).map((ev) => JSON.stringify(['EVENT', 'x'.repeat(64), ev]).length);
+  const frames = relays.flatMap((r) => r.events).filter((ev) => tagOf(ev) === tag).map(frame);
   check(frames.length >= batches.length && Math.max(...frames) <= BOARD_FRAME,
     `every event to b fits a ${BOARD_FRAME} B relay frame as a board reads it (a 64-character subscription): the biggest ${Math.max(...frames)} B`);
+}
+
+// 6b. The biggest batches to a native peer, through the relay (J4): 64 datagrams of 19 bytes (1,216 B, each one's
+// base64 padded with two '=', the most per byte), and one of 1,232 B. Junk to b's endpoint, which drops it.
+{
+  const h = a.t.rtc.pipeByPeer.get(b.id);
+  const tag = await sha(`peerwire/peer/${b.id}`);
+  for (const [n, size] of [[64, 19], [1, NATIVE_BATCH]]) {
+    await sleep(1500); // the pipes' budget whole, what was queued sent
+    const marks = relays.map((r) => r.events.length);
+    const from = batches.length;
+    for (let i = 0; i < n; i++) a.ep.onTransmit(h, crypto.getRandomValues(new Uint8Array(size)));
+    const ours = () => batches.slice(from).flat().filter((x) => x === size).length;
+    await until(`${n} x ${size} B sent`, () => ours() >= n);
+    await sleep(300);
+    const sent = batches.slice(from);
+    const sizes = relays.flatMap((r, i) => r.events.slice(marks[i])).filter((ev) => tagOf(ev) === tag).map(frame);
+    const most = Math.max(...sent.map((d) => d.length));
+    check(sent.every((d) => d.length <= 64 && d.reduce((x, y) => x + y, 0) <= NATIVE_BATCH) && most >= Math.min(n, 60) &&
+      sizes.length && Math.max(...sizes) <= BOARD_FRAME,
+    `${n} datagram(s) of ${size} B queued at once go in batches of up to ${most}: the biggest event is ${Math.max(...sizes)} B ` +
+      `as a board reads it, under ${BOARD_FRAME}`);
+  }
 }
 
 // 7. Pipe batches from a peer that said no hello, and an offer.
@@ -223,6 +249,28 @@ const batches = []; // the datagrams' sizes in each pipe batch a sends
   e.close();
 }
 
+// 7b. A batch is taken whole or not at all (J3): 1 to 64 strings, each the base64 of 1 to 1,232 bytes, from a peer
+// allowed one; each datagram goes to the endpoint as from its sender alone.
+{
+  const got = [];
+  const stub = { receive: (h, bytes, from) => got.push([bytes.length, from]), isConnected: () => false, set onTransmit(_) {} };
+  const t = new WebRtcTransport(stub, { onMessage() {}, send() {}, close() {} }, { pipes: true, RTCPeerConnection: null });
+  const p = 'ab'.repeat(32);
+  t.allowPipe(p);
+  const one = b64(Uint8Array.of(7));
+  const most = b64(new Uint8Array(NATIVE_BATCH));
+  const bad = [[], Array(65).fill(one), [one, 7], [one, ''], [one, b64(new Uint8Array(NATIVE_BATCH + 1))], [one, '!!!!'],
+    [one, `${most}AAAA`], 'x', null];
+  for (const d of bad) t.pipeReceive(p, d);
+  const refused = t.badSignals;
+  t.pipeReceive('cd'.repeat(32), [one]); // from a peer not allowed one
+  t.pipeReceive(p, [one, most]);
+  check(refused === bad.length && t.badSignals === bad.length + 1 && JSON.stringify(got) === JSON.stringify([[1, p], [NATIVE_BATCH, p]]),
+    'a batch is taken whole or not at all: none of [], 65 items, a number, an empty datagram, 1,233 B, bad base64, ' +
+    'base64 too long, or from a peer not allowed; 1 B and 1,232 B taken, as from their sender');
+  t.close();
+}
+
 // 8. drop() says goodbye at once; a dial again links.
 {
   b.events.length = 0;
@@ -239,7 +287,8 @@ const batches = []; // the datagrams' sizes in each pipe batch a sends
   const t0 = Date.now();
   const nobody = pw.endpoint(); // a PeerId nobody in the room has
   const lost = await settled(a.t.dial(nobody.id));
-  check(lost?.code === 'timeout' && Date.now() - t0 >= 1400, `a dial nobody answers rejects with 'timeout' after dialMs: ${lost?.code}`);
+  check(lost?.code === 'timeout' && Date.now() - t0 >= 1400 && !a.t.rtc.pipeAllowed.has(nobody.id),
+    `a dial nobody answers rejects with 'timeout' after dialMs (${lost?.code}), and a dial allows no pipe batches from a peer not heard`);
   RelayTransport.dialMs = 15000;
   const bad = await settled(a.t.dial('not a peer'));
   check(bad instanceof TypeError, `dial('not a peer'): ${bad}`);

@@ -6,10 +6,13 @@
 // dials the first native peer whose hello it hears in the room: the board answers each command, so another page in
 // the room would show as a peer that says nothing back.
 //
-// ?app= and ?room= name the room: the board's app is peerwire-lan-chat, and its room esp32 unless room.sh named
-// another. ?via=bluetooth or ?via=internet picks the way (Bluetooth where the browser has it), and ?relays= the relays
-// (comma-separated ws:// or wss:// urls). Bluetooth needs Web Bluetooth (Chrome or Edge; on a phone, Android Chrome)
-// on an https page; the internet way, any browser.
+// ?app= and ?room= name the room: the board's app is peerwire-lan-chat. Over Bluetooth its room is esp32 unless
+// room.sh named another (a stranger would have to be in range). Over the internet the room name is the board's
+// password and there is none by default (NB126-1): one that can be guessed (as chat.js judges it: under 22 of
+// [A-Za-z0-9_-]) gets a warning, as anyone who guesses it can switch the LED and, as a member, learn the board's
+// addresses. ?via=bluetooth or ?via=internet picks the way (Bluetooth where the browser has it), and ?relays= the
+// relays (comma-separated ws:// or wss:// urls). Bluetooth needs Web Bluetooth (Chrome or Edge; on a phone, Android
+// Chrome) on an https page; the internet way, any browser.
 import { loadPeerwire } from '../src/peerwire.js';
 import { BluetoothTransport, BLUETOOTH_WASM } from '../src/bluetooth.js';
 import { RelayTransport } from '../src/relay_link.js';
@@ -18,9 +21,13 @@ import { DEFAULT_RELAYS } from '../src/nostr.js';
 const params = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
 const dec = new TextDecoder();
+const BLE_ROOM = 'esp32'; // ble_led's room
+const GUESSABLE = "This room's name can be guessed: anyone who guesses it can switch this LED, and learn the board's " +
+  'addresses. Give the board a long random room (22 or more letters, digits, - or _).';
+const guessable = (id) => !/^[A-Za-z0-9_-]{22,}$/.test(id);
 $('app').value = params.get('app') ?? 'peerwire-lan-chat';
-$('room').value = params.get('room') ?? 'esp32';
 $('via').value = ['bluetooth', 'internet'].includes(params.get('via')) ? params.get('via') : navigator.bluetooth ? 'bluetooth' : 'internet';
+$('room').value = params.get('room') ?? ($('via').value === 'bluetooth' ? BLE_ROOM : '');
 const relays = params.get('relays')?.split(',').filter(Boolean) ?? DEFAULT_RELAYS;
 // No board heard this long after joining the relays: say so (and go on listening).
 const QUIET_MS = 40000;
@@ -36,6 +43,10 @@ const setLinked = (on) => {
 };
 const showVia = () => {
   const bt = $('via').value === 'bluetooth';
+  // Bluetooth's default room isn't carried over to the internet, where there is none.
+  if (!params.has('room') && !bt && $('room').value === BLE_ROOM) $('room').value = '';
+  if (!params.has('room') && bt && !$('room').value) $('room').value = BLE_ROOM;
+  $('room').placeholder = bt ? BLE_ROOM : "the board's room";
   $('connect').textContent = bt ? 'Connect to the board' : 'Find the board online';
   $('connect').disabled = bt && !navigator.bluetooth;
   if (bt && !navigator.bluetooth) log('This browser has no Web Bluetooth. Use Chrome or Edge (on a phone, Android Chrome) on an https page, or the internet.');
@@ -82,6 +93,8 @@ $('connect').onclick = async () => {
   const mine = run;
   const via = $('via').value;
   const room = { appId: $('app').value, roomId: $('room').value };
+  if (!room.appId || !room.roomId) return void log("name the board's app and room first");
+  if (via === 'internet' && guessable(room.roomId)) log(GUESSABLE);
   let pw;
   try {
     pw = await module(via);
