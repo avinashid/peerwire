@@ -196,6 +196,10 @@ release of each.
 | NB110d-I1, NB110d-I2 (Info) | **Fixed** by `226529e`, on main after NB-110d merged (`9531bfd`), before any release (the docs say a page's `dial()` with no `peer` links with any member the device it picked passes the connection to; the C ABI queues CLOSED past its 64-event cap, and `pw_ble_timeout`'s deadline saturates), reviewed 2026-11-10, [Bluetooth LE in the browser](#bluetooth-le-in-the-browser-nb-110d--nb110d-i1nb110d-i3) |
 | NB110d-I3 (Info) | Accepted by the repo owner on 2026-11-10, as shipped: the LED demo is on the site's demo list (since `8742653`) with no note on the page, so a visitor's Bluetooth grant for a board goes to the shared origin `avinashid.github.io`, and the account's other Pages sites may connect to that board without the picker while it is in range, same section |
 | NB119-2 (Low), NB119-I3, NB119-I4 (Info) | **Fixed** by `7495937`, `061c23e` and `61c97e6` before NB-119's second part merged (`3859af7`), so never on main, before any release of `peerwire-esp` took the time from a room member (a board restarts when SNTP moves its clock more than 30 s, asks every minute while it holds a member's time, and forgets at the next boot a time marked in RTC memory as a member's; none from 2100 on), reviewed 2026-11-09; residuals: any member can give a wrong time for a boot; the pool server or the path can restart a board at each re-ask, [The clock from a room member](#the-clock-from-a-room-member-nb-119--nb119-2-nb119-i3-nb119-i4) |
+| NB126-1 (Low) | **Fixed** by `38ceded` and `9160362` before NB-126 merged, so never on main (an LED board on the internet has no default room and won't start in a guessable one; the LED page's internet way has no default room and warns on a guessable name), reviewed 2026-11-10, [Links over the signalling relays](#links-over-the-signalling-relays-to-native-nodes-nb-126--nb126-1nb126-3) |
+| NB126-2 (Low) | Open: one event over 4 KiB on a board's topics closes its relay socket (NB-095's residual), and since NB-126 that cuts a page's link over the relays, its only path to the board; card NB-128, same section |
+| NB126-3 (Low), NB126-T1 (Info) | Open on NB-126 at `38ceded`: while a pipe batch waits for the shared rate, `Node::next_timeout` is 0, so a host that sleeps on it polls in a busy loop; no test binds a pipe's datagrams to its sender, same section |
+| NB126-I1 (Info) | Open on NB-126 at `9160362`: the LED page takes the first native member it hears as the board, and shows any linked member's messages as the board's; two pages dialling each other is accepted for v1, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -6066,6 +6070,149 @@ until it restarts, as the docs say.
   keeps it. And a marked time is forgotten only by firmware that calls
   `peerwire_esp::init` (or `run`) at boot, as `init`'s docs say to.
 
+### Links over the signalling relays to native nodes (NB-126) — NB126-1…NB126-3
+
+Since NB-126 a Rust node takes a link over its signalling carrier, a *pipe*
+(`PathKind::Signaling`, `crates/peerwire/src/pipe.rs`), from a room member that dials
+it, in the shape a browser's `'signaling'` path already sends (`webrtc.js`): the peer's
+datagrams, 1 to 64 of them in base64 as `{"kind":"dg","d":[…]}`, sealed to the node on
+its inbox topic. A browser can't send UDP, so this is how a page links with a native
+node or an ESP32 board: `RelayTransport` (`packages/js/src/relay_link.js`) says hello as
+a native member does and dials over a pipe alone, and the LED demo's internet way uses
+it with the board's `nostr_led` example. Every node with no policy, or one that lists
+`Signaling`, takes pipes (`Policy::default` doesn't); none does under
+`Privacy::RelayOnly`. A node doesn't dial over one.
+
+Reviewed on 2026-11-10 by reading `38ceded` (Rust and the ESP32 example) and `9160362`
+(JavaScript and the LED page) against the conditions set on the design. A scratch copy
+of `38ceded` ran our own tests to reproduce NB126-3 and one mutant (NB126-T1); nothing
+else was re-run.
+
+**What holds.**
+
+- **Who may send on a pipe.** A batch is opened (an `opened` token, then an X25519, as
+  for an offer) and kept only from a member of the node's current room, in a role it
+  links with, the host it expects if any, with `Signaling` allowed and the node not
+  relay-only (`Traversal::takes_pipe`), before it is parsed. Members are forgotten when
+  the node leaves or joins a room, and a peer only invited counts for none. A page takes
+  batches only from a native peer whose hello passed `checkHello` in its room.
+- **Whose packets.** Each datagram goes to the endpoint bound to the sealed sender
+  (`handle_datagram_from` in Rust, `receive(h, bytes, from)` in JavaScript), so a member
+  can't carry another's handshake or data onto its pipe, nor move another's link there.
+- **The parse.** Exactly `{"kind":"dg","d":[…]}` with 1 to 64 quoted, padded base64
+  strings, each at most 1,644 characters and decoding to 1 to 1,232 bytes; one bad item
+  drops the batch. `pipeReceive` now does the same in every room: before, an empty batch
+  passed, and the items before a bad one were taken. Rust's base64 takes a last
+  character with stray low bits (`AB==` reads as `AA==`), which Noise then authenticates
+  or drops.
+- **Paths.** A pipe's address is `relayed()`, so a late or copied pipe packet never
+  moves a link off UDP, and `radio()`, as a Bluetooth connection's is: a link on it
+  punches to the peer's addresses with `Direct` on and moves when one answers, and stays
+  only under a policy with no direct kind. It is never TURN, offered or decoded from the
+  wire.
+- **Bounds.** At most 64 pipes (4 on an ESP32); past that, the one used longest ago
+  whose peer isn't linked gives way, and with every peer linked a newcomer gets none. A
+  page's 256 allowed peers now keep a linked one the same way, in `joinRoom` rooms too.
+  Out, a node's pipes share 4 batches a second (a burst of 8), the one served longest
+  ago first, each of at most 64 datagrams and 1,232 bytes of them; a pipe queues 16 KiB
+  (4 KiB on an ESP32) and drops its oldest. A page holds its batches to a native peer to
+  1,232 bytes too (`pipeBatch`).
+- **Size on a board.** The biggest batches each side sends were measured sealed and
+  signed, as a board reads the event: from Rust, 3,315 bytes for 64 datagrams making
+  1,232 bytes and 2,839 for one of 1,232; from JavaScript, 3,339 for 64 of 19 bytes and
+  2,887 for one of 1,232. A board takes 4,096.
+- **The hello answer.** A node answers a new member's hello with its own at once, once
+  per member and at most one each 2 s, without moving its own schedule. A member that
+  forges fresh ids gets one answer each 2 s; anyone else can only replay a member's
+  hello from the last minute.
+- **Freshness.** The seal proves who sent a batch, not when (events' signatures and
+  times aren't checked), so a relay can deliver one again later. Its data then fails the
+  replay window, and a copied HS1 makes a half-open handshake that never completes,
+  within the endpoint's caps (on an ESP32, 8 at once and under load 4 from one pipe).
+
+**NB126-1 — A guessable default room on an internet LED (Low).** The design reused the
+Bluetooth LED's room: the page and `ble_led` default to `esp32`. Over the internet,
+anyone on the same public relays who tried the repository's default could switch the LED
+and, as a member, get the board's offers, so its home address. Fix: no default room over
+the internet, and refuse (on the board) or warn of (on the page) a name that can be
+guessed, as the chat demo judges it (CHAT-1).
+
+**Status: fixed** by `38ceded` and `9160362` before NB-126 merged, so never on main,
+reviewed 2026-11-10: `nostr_led` has no default room and won't start in one that isn't
+22 or more of `A-Z a-z 0-9 _ -`, and the page's internet way has no default room and
+warns on such a name. `room.sh`'s random name (`esp32-` and 16 hex digits) passes. Over
+Bluetooth the page and `ble_led` keep `esp32`, as a stranger must be in range. The
+`mesh` example joins `esp32` on the LAN only, and goes on Nostr only in the room
+`room.sh` names (NB-095).
+
+**NB126-2 — One oversize event cuts a board's pipe links (Low).** NB-095's residual
+([Several carriers](#several-carriers-and-the-esp32-on-nostr-nb-095--nb95-1nb95-6)): one
+event over 4 KiB on a topic a board takes closes its relay socket, and a drop within
+30 s keeps the back-off. Every kind-25059 subscriber sees the tags, so anyone can send
+one each time the board reconnects. Before NB-126 that delayed new peers, while links
+went on over UDP; now it cuts a page's link, whose only path is that socket. Fix: read a
+frame over the cap through and drop it unbuffered, keeping the socket.
+
+**Status: open** (Low), reported on NB-126 at `b3f7321`, card NB-128.
+
+**NB126-3 — A pipe waiting for its rate spins the host (Low).** At `38ceded`,
+`Pipes::next_due` gave the earliest batch due and left out the shared bucket. When
+`take` had no token, that time stayed in the past, so `Node::next_timeout` was 0 until
+one came: up to 250 ms a batch, back to back while batches waited. A host that sleeps on
+it, as `room_chat` and the ESP32's `idle` do, polls without a pause; on an ESP32 a sleep
+of 0 calls no `usleep` in ESP-IDF's Rust std, so the main task doesn't yield while it
+lasts. Any burst of more than 8 batches does it, and a linked member can keep it up by
+making the node send more than 4 batches a second, as `nostr_led` answers every message.
+Repro, our test on `38ceded`: a node linked over a pipe sends 20 unreliable messages of
+1,000 bytes, then sleeps `next_timeout()`, at most 5 ms, and polls; `next_timeout()` was
+0, and the node polled 51,199 times in 500 ms, never with a wait. Fix: no batch is due
+before the bucket's next token, and a test that `next_timeout()` isn't 0 while batches
+wait for it. With that change the same loop polled 99 times, each after a wait.
+
+**Status: open** (Low), reported on NB-126 at `38ceded`.
+
+**NB126-T1 — No test binds a pipe to its sender (Info, test gap).** At `38ceded`, a
+mutant that hands pipe datagrams to the endpoint unbound (`handle_datagram`) passed all
+179 of the crate's library tests and the pipe tests. Fix: a test where a second member
+puts the first's datagrams in a batch of its own: they are dropped (`rx_wrong_peer`),
+and the first's link stays where it is.
+
+**Status: open** (Info), reported on NB-126 at `38ceded`.
+
+**NB126-I1 — The LED page takes any native member as the board (Info).** Over the
+internet the page dials the first native peer whose hello proves the room, and logs
+every linked peer's message as the board's (`board: …`, as text). A member can also dial
+the page over its pipe once the page holds its hello. So another LED page in the room,
+as both say `role: 'peer'`, or any member posing as the board, can stand in for it and
+show a wrong state. The planned change of roles (the page a client, the board a host)
+keeps pages apart, but a member can still join as a host. Fix: let the page pin the
+board's PeerId (as Rust's `expect`), dial it alone and log only its messages as the
+board's.
+
+**Status: open** (Info), reported on NB-126 at `9160362`. Two pages dialling each other
+is accepted for v1, with the change of roles planned.
+
+**Residuals, accepted.**
+
+- **The room name is the board's password**, as over Bluetooth and UDP, but from
+  anywhere: anyone who has it can switch the LED and, as a member, learn the board's
+  addresses from its offers.
+- **What relays see.** The size and timing of every batch to and from a node's inbox
+  tag, so when the LED is used and how long a link lasts (its keepalives), as for pages
+  (NB43-I4); each end's relays see its IP address. Any kind-25059 subscriber sees the
+  same, except the addresses.
+- **A stalled pipe.** Past 20 events a second to a node's inbox tag its `opened` budget
+  is spent, so a non-member stalls its pipes as NB64-2 stalls its offers.
+- **Handshake work.** A member can put up to 64 HS1s in a batch (fewer in one a board
+  takes), each costing the node a Diffie-Hellman before the sender is checked; under
+  load a pipe needs no cookie, as only its member sends there. NB43-I2 is the same for
+  pages, and an HS1 over UDP costs as much.
+- **Relay limits.** A linked member can keep a node publishing 4 events a second, which
+  a public relay may answer by limiting or banning the node, so its signalling as a
+  whole.
+- **Relays from a link.** The LED page's `?relays=` (as Net Lab's) points it at relays
+  that whoever wrote the link picks, which then see what any relay sees.
+
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
 `@peerwire/react` (`packages/react`, 0.1.0 published from `dec1554`) wraps a room in
@@ -6406,8 +6553,11 @@ congestion rule for tail losses from NB-086 (`b2ae061`, reviewed 2026-11-03).
     - No cap on signals held while an offer's proof is checked (one async check, so
       the window is short).
 - **Fallback pipes (NB-043).**
-  - `MAX_PIPE_PEERS` 256, evicted oldest first. Since `a283a01` an evicted permission
-    drops its pipe unless a session uses it (NB43-1).
+  - `MAX_PIPE_PEERS` 256. Since `9160362` (NB-126) the permission given longest ago
+    whose peer has no session goes, with its pipe, and with every allowed peer linked a
+    newcomer gets none. Before, the oldest went, its pipe kept while a session used it
+    (`a283a01`, NB43-1), but its batches were no longer taken, so a newcomer could cut a
+    linked peer's pipe link.
   - Outgoing pipes share 6 batches/s (burst 12), in batches of 16 KiB, each through
     one relay, the relays taking turns. Before NB-006i it was 3/s (burst 6), each batch
     through every relay.
@@ -6425,7 +6575,9 @@ congestion rule for tail losses from NB-086 (`b2ae061`, reviewed 2026-11-03).
     - Residual: Nostr publishes are hashed asynchronously, so on `pagehide` the last
       batch never goes out, and a tab closed over a Nostr pipe still times out at the
       peer (30 s).
-  - Incoming batches are capped at 64 items but not rate-limited.
+  - Incoming batches are capped at 64 items but not rate-limited. Since `9160362` one is
+    taken whole or not at all: 1 to 64 items, each decoding to 1 to 1,232 bytes (before,
+    an empty batch passed, and the items before a bad one were taken).
   - Residuals:
     - **NB43-I1:** a relaying member can roam a link onto its own pipe, because a
       direct-to-direct roam needs no path validation. Since Fast lane 2 this reached
@@ -6437,9 +6589,9 @@ congestion rule for tail losses from NB-086 (`b2ae061`, reviewed 2026-11-03).
       left: a party that holds back the peer's newest packet and sends it from its own
       address moves the link there until the peer's next packet moves it back.
       [Latency races](#latency-races-fast-lane-3--fl3-1fl3-3).
-    - **NB43-I2:** an insider holding the room key can churn the pipe permissions,
-      take the shared budget, and send 64 HS1s per batch. Card NB-043b; it supports
-      SEC-4.
+    - **NB43-I2:** an insider holding the room key can churn the pipe permissions, take
+      the shared budget, and send 64 HS1s per batch. Card NB-043b; it supports SEC-4.
+      Since `9160362` the churn no longer cuts a linked peer's pipe link.
     - **NB43-I3:** the Nostr backoff never decayed; fixed in `a283a01`.
     - **NB43-I4:** relays see session-long timing and volume of piped links, and
       every direct member learns that a pair failed WebRTC.
@@ -6839,9 +6991,11 @@ mappings that carry over and are already handled in Peerwire:
 
 - Traffic analysis by a global passive adversary (packet sizes/timing) is not
   addressed.
-- Metadata at the signaling layer (who talks to whom, when) is minimized but not
-  hidden from a relay that correlates tags and timing. Over `LanSignaling` every
-  device on the LAN sees what a relay sees, and the sender's IP and MAC addresses.
+- Metadata at the signaling layer (who talks to whom, when) is minimized but not hidden
+  from a relay that correlates tags and timing. Over `LanSignaling` every device on the
+  LAN sees what a relay sees, and the sender's IP and MAC addresses. Over a pipe
+  (JavaScript's `'signaling'` path, and since NB-126 a native node's) a relay also sees
+  the size and timing of a link's datagrams.
 - On the docs and demos site, what the account's other Pages sites can do on the shared
   origin `avinashid.github.io`, a microphone grant given to Net Lab and a Bluetooth
   grant given to the LED demo included (accepted by the owner; NB16-2, NB110d-I3).
