@@ -444,6 +444,10 @@ tests use an in-process pair of fake radios.
   - A peer sends its challenge as soon as the central subscribes to `tx`, and Chrome drops a notification that comes
     before `startNotifications()` settles: a connection with no challenge 2 s after subscribing is made again, 3
     times in all.
+  - After Bluetooth went off and on, Android Chrome keeps its old connection to the device and hands it back to the
+    next connect, in a few ms (one over the air takes hundreds), and nothing comes over it; connecting again gives the
+    same one back, and the page can't clear it. So a connect that took under 50 ms with no challenge after 2 s fails
+    at once as `'stale'`: reloading the page clears it (NB-127).
   - The room is a native one: the page doesn't join a `joinRoom` room over Bluetooth, and its messages are the
     endpoint's, raw bytes, as a node sends them.
 

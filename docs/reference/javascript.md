@@ -976,14 +976,15 @@ Bluetooth doesn't say the ATT MTU.
 | Member | |
 |---|---|
 | `available()` | Resolves to whether this browser has Web Bluetooth and a radio it can use now. |
-| `dial(peer?)` | Opens the device picker (call it from a click: Web Bluetooth needs a user gesture and an https page), filtered on the service, connects, proves the room and links. Resolves to the member's PeerId once the link is up, within 15 s; with `peer`, only if the device proves it is that one. A connection whose room challenge doesn't come within 2 s is made again, 3 times in all (Chrome drops a notification that comes before `startNotifications()` settles). |
+| `dial(peer?)` | Opens the device picker (call it from a click: Web Bluetooth needs a user gesture and an https page), filtered on the service, connects, proves the room and links. Resolves to the member's PeerId once the link is up, within 15 s; with `peer`, only if the device proves it is that one. A connection whose room challenge doesn't come within 2 s is made again, 3 times in all (Chrome drops a notification that comes before `startNotifications()` settles), unless the connect took under 50 ms: that is a dead connection the browser kept, and `dial` rejects with `'stale'` at once. |
 | `has(peer)`, `drop(peer)`, `close()` | The [`Transport`](#transport) methods. `drop` sends the endpoint's goodbye over the connection, then closes it. |
 
 `dial` rejects with an `Error` whose `code` says why: `'not-available'` (no Web Bluetooth, or Bluetooth is off),
 `'cancelled'` (no device picked), `'not-allowed'` (no user gesture, a page that isn't secure, or a policy),
 `'not-member'` (the device closed the connection on our answer to its room challenge: another room's name),
-`'refused'` (it closed the connection before challenging us: full), `'wrong-peer'`, `'violation'`, `'timeout'`,
-`'failed'` (Web Bluetooth failed) or `'closed'`.
+`'refused'` (it closed the connection before challenging us: full), `'stale'` (the browser gave back a dead
+connection: after Bluetooth went off and on, Android Chrome keeps the old one; reload the page, then dial again),
+`'wrong-peer'`, `'violation'`, `'timeout'`, `'failed'` (Web Bluetooth failed) or `'closed'`.
 
 `BleLink` is the protocol of one connection in the module with Bluetooth, for a host that moves the GATT values
 itself: `push(value)` takes a value and returns its events (`proven`, `peer`, `signal`, `closed`), `values()` gives
@@ -1155,7 +1156,8 @@ Those marked (Chromium) open headless browser tabs on loopback. None touches a p
   doesn't dial a native peer. No relays.
 - `bluetooth.mjs`: `BluetoothTransport` against a peripheral made of the same wasm (`BleLink` as the peripheral, with
   an endpoint) over a fake Web Bluetooth: the link and messages both ways, the room hello as a node takes it, values of
-  20 bytes at most, a challenge Chrome drops got over, `drop()`, and each failure's code. No radio.
+  20 bytes at most, a challenge Chrome drops got over, a dead connection the browser kept (`'stale'` at once),
+  `drop()`, and each failure's code. No radio.
 - `room_proof.mjs`: an attacker that knows only the room topic gets no dial, no answer and, on a link it dials
   itself, nothing but the link proof before it is dropped; the hello proof matches Rust's.
 - `fuzz.mjs`: seeded random and mutated input to the JS parsers (Nostr events and relay messages, hex and peer ids,

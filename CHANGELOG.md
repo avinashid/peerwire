@@ -43,6 +43,15 @@ and the commit that fixed it.
   `ble_led` examples try a saved network for 20 s, then go on over Bluetooth alone.
   `Traversal::handle_radio_signal`, `Traversal::clock_from_peer` and `traversal::CLOCK_SET_AFTER_MS` are new.
 
+## Unreleased: `@peerwire/js`
+
+- **Bluetooth in the browser** (NB-110d, [Bluetooth](docs/concepts/bluetooth.md)): `BluetoothTransport`, a Web
+  Bluetooth central (Chrome and Edge, Android Chrome) that links a page with a native room member nearby, such as a
+  board running `ble_led`, with no network. The protocol is the wasm's: the module with Bluetooth,
+  `peerwire_ffi_ble.wasm` (`BLUETOOTH_WASM`), with `BleLink`. The `led.html` demo switches a board's LED.
+  After Bluetooth went off and on, Android Chrome hands back a dead connection the page can't clear: `dial` then
+  fails at once with `'stale'`, and reloading the page clears it (NB-127).
+
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 
 - **The doctor:** `npx @peerwire/js doctor` (a `bin` in `@peerwire/js`) and the Rust example `doctor`, which

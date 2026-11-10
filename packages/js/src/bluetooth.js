@@ -43,6 +43,11 @@ const INNER_ROOM = 1;
 const CHALLENGE_MS = 2000;
 const TRIES = 3;
 const RETRY_MS = 300;
+// A GATT connect over the air takes hundreds of ms at least (1.8 s on Android). One that resolves faster gave back a
+// connection the browser still holds: after Bluetooth was turned off and on, Android Chrome keeps the old one, which
+// carries nothing. Such a connection with no challenge is 'stale', and connecting again gives the same dead one back
+// (NB-127): only reloading the page clears it.
+const FAST_CONNECT_MS = 50;
 // A dial not linked by then (the GATT connect, the proofs and the handshake) fails.
 const LINK_MS = 15000;
 // A write that fails is tried again this often, this long apart, before the connection is given up.
@@ -110,6 +115,8 @@ export class BluetoothTransport {
   // - 'not-member': the device closed the connection once we answered its room challenge (another room's name), or
   //   its proof was wrong;
   // - 'refused': the device closed the connection before it challenged us (full, say);
+  // - 'stale': the browser gave back a dead connection to the device, as Android Chrome does after Bluetooth was turned
+  //   off and on: reload the page, then dial again;
   // - 'wrong-peer': it proved it is another peer than `peer`, or one we are linked with over another connection;
   // - 'violation': it broke the protocol; 'timeout': not linked within 15 s; 'failed': Web Bluetooth failed;
   //   'closed': the transport was closed.
@@ -175,6 +182,7 @@ class Conn {
     this.up = false;
     this.over = false;
     this.writing = false;
+    this.held = false; // whether connect() gave back a connection the browser held (FAST_CONNECT_MS)
     this.timers = new Set();
   }
 
@@ -194,7 +202,9 @@ class Conn {
     this.onGone = () => this.gone();
     this.device.addEventListener('gattserverdisconnected', this.onGone);
     try {
+      const t0 = performance.now();
       const server = await this.device.gatt.connect();
+      this.held = performance.now() - t0 < FAST_CONNECT_MS;
       const service = await server.getPrimaryService(SERVICE_UUID);
       this.rx = await service.getCharacteristic(RX_UUID);
       this.tx = await service.getCharacteristic(TX_UUID);
@@ -208,7 +218,9 @@ class Conn {
       await this.tx.startNotifications();
       if (this.over) return;
       this.later(CHALLENGE_MS, () => {
-        if (this.link.state() === 'proving') this.end('no-challenge', 'no room challenge came');
+        if (this.link.state() !== 'proving') return;
+        if (this.held) this.end('stale', 'the browser holds a dead connection (Bluetooth went off and on?): reload the page');
+        else this.end('no-challenge', 'no room challenge came');
       });
       this.tick();
     } catch (e) {

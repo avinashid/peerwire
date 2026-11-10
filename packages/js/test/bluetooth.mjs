@@ -7,7 +7,8 @@
 // Checks: the link comes up and carries messages both ways, every value written fits 20 bytes, a dropped challenge is
 // got over by connecting again, drop() says goodbye, and each failure says what it is: 'not-available' (no Web
 // Bluetooth, or off), 'cancelled', 'not-member' (another room's board), 'refused', 'wrong-peer', 'timeout' (a board
-// that never proves the room), and a TypeError for an endpoint of the module without Bluetooth.
+// that never proves the room), 'stale' at once (a dead connection the browser kept, NB-127), and a TypeError for an
+// endpoint of the module without Bluetooth.
 //
 //   node packages/js/test/bluetooth.mjs [path/to/peerwire_ffi_ble.wasm]
 import { loadPeerwire, BleLink } from '../src/peerwire.js';
@@ -39,12 +40,13 @@ const ROOM = `ble-${process.pid}`;
 // The shape Rust's traversal.rs `parse_hello` takes, and nothing else.
 const RUST_HELLO = /^\{"t":"hello","from":"([0-9a-f]{64})","meta":\{"nb":1,"role":"peer","ts":(\d{1,19}),"p":"[0-9a-f]{64}"\}\}$/;
 
-// A board on a fake radio: a peripheral in `room`, with an endpoint of its own. `drop`: its first challenge goes
-// before the central has subscribed, and is lost. `refuse`: it closes each connection before challenging. `silent`:
-// it takes no write.
+// A board on a fake radio: a peripheral in `room`, with an endpoint of its own. A connect takes `connectMs`, as one
+// over the air does. `drop`: its first challenge goes before the central has subscribed, and is lost. `refuse`: it
+// closes each connection before challenging. `silent`: it takes no write. `stale`: the dead connection Android Chrome
+// keeps after Bluetooth went off and on (NB-127): connect() resolves at once and nothing ever comes.
 class Board {
-  constructor(room, { drop = false, refuse = false, silent = false } = {}) {
-    Object.assign(this, { room, drop, refuse, silent });
+  constructor(room, { drop = false, refuse = false, silent = false, stale = false, connectMs = stale ? 0 : 100 } = {}) {
+    Object.assign(this, { room, drop, refuse, silent, stale, connectMs });
     this.ep = pw.endpoint();
     this.id = this.ep.id;
     this.proof = RoomProof.create(`${APP}/${room}`);
@@ -93,6 +95,7 @@ class Board {
       connected: false,
       async connect() {
         board.connects++;
+        if (board.connectMs) await new Promise((r) => setTimeout(r, board.connectMs));
         tx.notifying = false;
         device.gatt.connected = true;
         board.conn = { tx, device };
@@ -108,6 +111,7 @@ class Board {
 
   // The central subscribed: as the ESP32's driver does, the node hears of it now, and challenges it.
   subscribed() {
+    if (this.stale) return;
     if (this.refuse) return setTimeout(() => this.close(), 0);
     this.link = new BleLink(this.ep, { appId: APP, roomId: this.room, central: false, mtu: 23, addr: 1 });
     if (this.drop && this.connects === 1) this.notifyAll(); // before startNotifications() settles: lost
@@ -258,6 +262,16 @@ const codeOf = (p) => p.then(() => 'linked', (e) => e.code ?? `${e.name}: ${e.me
   const late = await codeOf(page(fakeBluetooth(silent)).bt.dial());
   const ms = performance.now() - t0;
   check(late === 'timeout' && ms > 2900 && ms < 5000, `a board that never proves the room: 'timeout' after ${ms.toFixed(0)} ms`);
+  const dead = new Board(ROOM, { stale: true });
+  const t1 = performance.now();
+  const err = await page(fakeBluetooth(dead)).bt.dial().catch((e) => e);
+  const deadMs = performance.now() - t1;
+  check(
+    err?.code === 'stale' && /reload the page/.test(err.message) && dead.connects === 1 && deadMs < 3000,
+    `a dead connection the browser kept: 'stale' after ${deadMs.toFixed(0)} ms, one connect, "${err?.message}"`,
+  );
+  const quick = new Board(ROOM, { connectMs: 0 });
+  check((await codeOf(page(fakeBluetooth(quick)).bt.dial())) === 'linked', 'a connect that is fast alone, with a challenge, links');
   const plain = await loadPeerwire(new URL('../pkg/peerwire_ffi.wasm', import.meta.url));
   let threw = null;
   try {
