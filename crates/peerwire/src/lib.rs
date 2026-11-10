@@ -63,6 +63,7 @@ mod lan;
 mod node;
 #[cfg(feature = "nostr")]
 pub mod nostr;
+mod pipe;
 mod portmap;
 mod signaling;
 pub mod traversal;

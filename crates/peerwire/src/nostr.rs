@@ -8,7 +8,7 @@
 //! [`Signaling`] side never blocks. `wss://` uses rustls with the webpki roots;
 //! `ws://` is plain TCP, for a relay on the LAN or loopback.
 
-use crate::signaling::{hex, Signaling, Topic};
+use crate::signaling::{b64, hex, unb64, Signaling, Topic};
 use k256::schnorr::SigningKey;
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
@@ -531,48 +531,6 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Standard base64 with padding, as `btoa` writes it.
-pub(crate) fn b64(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let n = u32::from(c[0]) << 16 | u32::from(*c.get(1).unwrap_or(&0)) << 8 | u32::from(*c.get(2).unwrap_or(&0));
-        for i in 0..4 {
-            if i <= c.len() {
-                out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-fn unb64(s: &str) -> Option<Vec<u8>> {
-    let s = s.as_bytes();
-    if !s.len().is_multiple_of(4) {
-        return None;
-    }
-    let val = |c: u8| B64.iter().position(|&b| b == c).map(|v| v as u32);
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    for (k, q) in s.chunks(4).enumerate() {
-        let last = k == s.len() / 4 - 1;
-        let pad = q.iter().rev().take_while(|&&c| c == b'=').count();
-        if pad > 2 || (pad > 0 && !last) {
-            return None;
-        }
-        let mut n = 0u32;
-        for &c in &q[..4 - pad] {
-            n = n << 6 | val(c)?;
-        }
-        n <<= 6 * pad as u32;
-        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-        out.extend_from_slice(&bytes[..3 - pad]);
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +550,35 @@ mod tests {
         let ev = json!({"id": id, "pubkey": pubkey, "created_at": created_at, "kind": KIND, "tags": tags,
                         "content": content, "sig": "00"});
         json!(["EVENT", "s", ev]).to_string()
+    }
+
+    /// NB-126: the biggest pipe batches a node sends, sealed and signed as an event, fit what an ESP32's carrier
+    /// takes from a relay (`Limits::SMALL.message`, 4 KiB, or it closes the socket): 64 small datagrams making
+    /// 1,232 B, and one datagram of 1,232 B. Measured as the board reads it, with the relay's subscription id.
+    #[test]
+    fn the_biggest_pipe_batch_fits_an_esp32s_relay_message() {
+        use crate::pipe::{decode, Pipes, BATCH, FLUSH, MAX_ITEMS};
+        use peerwire_core::{sealed, Identity, Instant as CoreInstant};
+        let (me, to) = (Identity::from_secret_bytes(&[1; 32]), Identity::from_secret_bytes(&[2; 32]).peer_id());
+        let key = SigningKey::from_bytes(&[3; 32]).unwrap();
+        let pubkey = hex(&key.verifying_key().to_bytes());
+        let small = BATCH / MAX_ITEMS;
+        let mut many = vec![small; MAX_ITEMS - 1];
+        many.push(BATCH - small * (MAX_ITEMS - 1));
+        for sizes in [many, vec![BATCH]] {
+            let mut pipes = Pipes::default();
+            let at = pipes.open(CoreInstant::ZERO, to, |_| false).unwrap();
+            for (i, n) in sizes.iter().enumerate() {
+                pipes.send(CoreInstant::ZERO, &at, vec![i as u8; *n]);
+            }
+            let (_, body) = pipes.take(CoreInstant::ZERO + FLUSH).unwrap();
+            assert_eq!(decode(body.as_bytes()).map(|d| d.len()), Some(sizes.len()), "all in one batch");
+            let sealed = sealed::seal(&me, &to, [4; 32], body.as_bytes()).unwrap();
+            let ev = sign_event(&key, &pubkey, 1_800_000_000, &Topic::peer(&to).to_hex(), &b64(&sealed));
+            let frame = json!(["EVENT", "0123456789abcdef", ev]).to_string();
+            println!("{} datagrams, {} B: batch {} B, event as read {} B", sizes.len(), BATCH, body.len(), frame.len());
+            assert!(frame.len() <= Limits::SMALL.message, "{} B", frame.len());
+        }
     }
 
     #[test]

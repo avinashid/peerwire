@@ -49,6 +49,12 @@ required-features = ["ble"]
 name = "ble_led"
 required-features = ["ble"]
 
+# The board's LED from anywhere: a browser on mobile data links over the Nostr relay (NB-126):
+# `FEATURES=nostr EXAMPLE=nostr_led ./build.sh`, then wifi.sh; `PW_LED_PIN`, `PW_LED_HIGH` for another board's LED.
+[[example]]
+name = "nostr_led"
+required-features = ["nostr"]
+
 [profile.release]
 opt-level = "s"
 

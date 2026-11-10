@@ -185,6 +185,48 @@ impl Signaling for MultiSignaling {
     }
 }
 
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding, as `btoa` writes it (Nostr content, pipe batches).
+pub(crate) fn b64(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = u32::from(c[0]) << 16 | u32::from(*c.get(1).unwrap_or(&0)) << 8 | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn unb64(s: &str) -> Option<Vec<u8>> {
+    let s = s.as_bytes();
+    if !s.len().is_multiple_of(4) {
+        return None;
+    }
+    let val = |c: u8| B64.iter().position(|&b| b == c).map(|v| v as u32);
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    for (k, q) in s.chunks(4).enumerate() {
+        let last = k == s.len() / 4 - 1;
+        let pad = q.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for &c in &q[..4 - pad] {
+            n = n << 6 | val(c)?;
+        }
+        n <<= 6 * pad as u32;
+        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&bytes[..3 - pad]);
+    }
+    Some(out)
+}
+
 pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }

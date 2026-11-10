@@ -1,7 +1,8 @@
 #[cfg(feature = "ble")]
 use crate::ble::{Ble, Inbound, Radio};
+use crate::pipe::{self, Pipes};
 use crate::portmap::{self, PortMapping, Worker};
-use crate::signaling::Signaling;
+use crate::signaling::{Signaling, Topic};
 use crate::traversal::{Birthday, Failure, Hop, NatType, PathKind, Policy, Privacy, Role, Signal, Traversal};
 #[cfg(feature = "turn")]
 use crate::turn::TurnServer;
@@ -271,6 +272,7 @@ impl Builder {
             sources: None,
             #[cfg(any(test, feature = "testing"))]
             udp_off: false,
+            pipes: Pipes::default(),
             #[cfg(feature = "ble")]
             ble,
         };
@@ -312,6 +314,8 @@ pub struct Node {
     /// The socket's datagrams are dropped both ways, as with the Wi-Fi gone ([`Node::set_udp_off`]).
     #[cfg(any(test, feature = "testing"))]
     udp_off: bool,
+    /// Links over the signaling relays ([`PathKind::Signaling`]).
+    pipes: Pipes,
     /// The Bluetooth side, with a radio ([`Builder::bluetooth`]).
     #[cfg(feature = "ble")]
     ble: Option<Ble>,
@@ -852,6 +856,7 @@ impl Node {
             Path::Direct(Hop::Net(_)) if self.via_birthday(peer) => PathKind::Birthday,
             Path::Direct(Hop::Net(_)) => PathKind::Direct,
             Path::Direct(Hop::Ble(_)) => PathKind::Bluetooth,
+            Path::Direct(Hop::Pipe(_)) => PathKind::Signaling,
             Path::Direct(_) => PathKind::Turn,
         })
     }
@@ -938,6 +943,9 @@ impl Node {
             for _ in 0..MAX_SIGNALS_PER_POLL {
                 let Some((topic, payload)) = sig.poll() else { break };
                 self.trav.handle_signal(now, &mut self.ep, topic, &payload);
+                while let Some((from, body)) = self.trav.poll_piped() {
+                    take_batch(&mut self.pipes, &mut self.ep, now, from, &body);
+                }
             }
         }
         #[cfg(feature = "ble")]
@@ -1003,6 +1011,7 @@ impl Node {
         self.report_dropped();
         self.keep_relay_links(wall);
         self.flush(now);
+        self.flush_pipes(now);
         self.pump_signals();
         #[cfg(feature = "ble")]
         if let Some(b) = self.ble.as_mut() {
@@ -1095,7 +1104,7 @@ impl Node {
     pub fn next_timeout(&self) -> Option<Duration> {
         let wall = Instant::now();
         let now = self.at(wall);
-        let t = [self.ep.poll_timeout(), self.trav.poll_timeout()].into_iter().flatten().min();
+        let t = [self.ep.poll_timeout(), self.trav.poll_timeout(), self.pipes.next_due()].into_iter().flatten().min();
         let t = t.map(|t| t.saturating_duration_since(now));
         let redial = self.relay_peers.iter().filter(|r| self.status(&r.peer) == Status::Disconnected);
         let redial = redial.map(|r| r.retry_at.saturating_duration_since(wall)).min();
@@ -1199,6 +1208,10 @@ impl Node {
                 let _ = at; // never to the socket
                 continue;
             }
+            if let Hop::Pipe(at) = t.dst {
+                self.pipes.send(now, &at, t.payload); // over the signaling relays: flush_pipes
+                continue;
+            }
             #[cfg(any(test, feature = "testing"))]
             if self.udp_off {
                 continue;
@@ -1227,6 +1240,17 @@ impl Node {
         self.trav.admits(peer) && allowed && !(relay_only && direct && self.trav.relay() != Some(*peer))
     }
 
+    /// Sends the pipe batches due ([`Pipes::take`]), each sealed to its peer, on the peer's inbox topic. Dropped
+    /// without a carrier.
+    fn flush_pipes(&mut self, now: peerwire_core::Instant) {
+        let Some(sig) = self.signaling.as_mut() else { return };
+        while let Some((peer, body)) = self.pipes.take(now) {
+            if let Some(sealed) = self.trav.seal_to(&peer, body.as_bytes()) {
+                sig.publish(Topic::peer(&peer), &sealed);
+            }
+        }
+    }
+
     /// Hands the traversal's signaling actions to the carrier (dropped without one).
     fn pump_signals(&mut self) {
         while let Some(s) = self.trav.poll_signal() {
@@ -1251,7 +1275,7 @@ impl Node {
         let (dst, route) = match &t.dst {
             Hop::Net(a) => (a, self.routes.get(a)),
             Hop::Relayed(a) => (a, None),
-            Hop::Turn { .. } | Hop::Ble(_) => return true,
+            Hop::Turn { .. } | Hop::Ble(_) | Hop::Pipe(_) => return true,
         };
         let sock = route.and_then(|id| self.extra.get(id)).map_or(&self.sock, |x| &x.sock);
         match sock.send_to(&t.payload, self.wire_addr(*dst)) {
@@ -1392,6 +1416,18 @@ impl Node {
             }
             Ev::Message { .. } | Ev::PathChanged { .. } | Ev::AddrObserved { .. } => {}
         }
+    }
+}
+
+/// Hands the datagrams of a pipe batch from `from` (a room member: see `Traversal::handle_signal`) to the endpoint,
+/// as from `from`'s pipe ([`Pipes::open`]), bound to `from`: a packet there for another peer's link, or a handshake
+/// from anyone else, is dropped (`Stats::rx_wrong_peer`), so a member can't carry others' packets onto its pipe.
+/// Dropped if the batch is malformed, or no pipe is free.
+fn take_batch(pipes: &mut Pipes, ep: &mut Endpoint<Addr>, now: peerwire_core::Instant, from: PeerId, body: &[u8]) {
+    let Some(datagrams) = pipe::decode(body) else { return };
+    let Some(at) = pipes.open(now, from, |p| ep.is_connected(p)) else { return };
+    for d in datagrams {
+        ep.handle_datagram_from(now, Hop::Pipe(at), &from, &d);
     }
 }
 

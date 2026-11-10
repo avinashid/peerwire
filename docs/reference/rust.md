@@ -266,7 +266,7 @@ Messages and links:
 | `peers(&self) -> impl Iterator<Item = &PeerId>` | Peers with a live link, relay peers left out |
 | `peer_stats(&self, peer: &PeerId) -> Option<PeerStats>` | A link's RTT, path RTT, congestion window, fragments sent and retransmitted; `PeerStats::loss()` estimates loss |
 | `path(&self, peer: &PeerId) -> Option<Path>` | The route the link takes: `Path::Direct(addr)` or `Path::Via(relay)`. The address is where its packets go: a link through TURN shows the peer's address as this node's TURN server relays to it, or the peer's relayed address; `path_kind` says which |
-| `path_kind(&self, peer: &PeerId) -> Option<PathKind>` | The kind of route: `Direct`, `Birthday` (out of a birthday-punch socket, as `via_birthday`), `Peers` or `RelayPeers` (through a peer), `Turn` (through a TURN server, this node's or the peer's), or `Bluetooth` (over a radio connection; its `path` is `Path::Direct` at an address in `0.0.0.0/8`, port 0) |
+| `path_kind(&self, peer: &PeerId) -> Option<PathKind>` | The kind of route: `Direct`, `Birthday` (out of a birthday-punch socket, as `via_birthday`), `Peers` or `RelayPeers` (through a peer), `Turn` (through a TURN server, this node's or the peer's), `Bluetooth` (over a radio connection; its `path` is `Path::Direct` at an address in `0.0.0.0/8`, port 0), or `Signaling` (over the signaling relays, a browser's pipe: `Path::Direct` at an address in `0.0.0.0/8`, port 1) |
 | `set_waker(&mut self, waker: Waker)` | Feature `ble`. A waker the node's radio wakes when something comes over it, for a host that sleeps until `next_timeout` or the socket: it then polls at once, not within 50 ms. `AsyncNode` sets one itself |
 | `via_birthday(&self, peer: &PeerId) -> bool` | Whether the direct link leaves from one of this node's birthday-punch sockets |
 | `birthday_sockets_opened(&self) -> u64` | How many sockets this node has opened for birthday punching |
@@ -434,6 +434,7 @@ works.
 | `RelayPeers` | Through this node's own always-on relay peers (`Node::set_relay_peers`), as you would run your own TURN server. Left out, they aren't linked at all |
 | `Turn` | Through a TURN server: this node's own (`Node::set_turn_servers`, allocated only with this kind in the order), or the peer's, at the relayed address its offers carry |
 | `Bluetooth` | Over a Bluetooth LE connection (feature `ble`), to a peer whose room hellos or offers came over it. Last wherever it is listed: a dial takes it in its last step, and a link on it punches to the peer's addresses and moves off it. Not in the default order, and off under `Privacy::RelayOnly` |
+| `Signaling` | Over the signaling relays: the peer's datagrams sealed to it in the room's carrier, as a browser's `'signaling'` path sends them (a pipe; see [choosing paths](../guides/connection-paths.md)). Slow and rate-limited, a last resort: how a browser, which can't send UDP, links with a native node. The node takes a pipe link from a room member that dials it, and doesn't dial over one itself. A link on it punches to the peer's addresses and moves off it. Not in the default order, and off under `Privacy::RelayOnly` |
 
 How the order is read:
 

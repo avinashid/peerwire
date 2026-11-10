@@ -67,6 +67,10 @@ const HELLO_FIRST: Duration = Duration::from_secs(2);
 const HELLO_MAX: Duration = Duration::from_secs(30);
 /// Least time between two offers to one peer.
 const OFFER_GAP: Duration = Duration::from_secs(2);
+/// Least time between two hellos said in answer to new members' ([`Traversal::answer_hello`]).
+const HELLO_ANSWER_GAP: Duration = Duration::from_secs(2);
+/// Pipe batches opened and waiting for the host ([`Traversal::poll_piped`]); it takes them after each signal.
+const MAX_PIPED: usize = 4;
 /// Offers older or newer than this (by the sender's clock) are dropped.
 const FRESH_MS: u64 = 60_000;
 /// A wall clock before this (2023-11-14, Unix 1,700,000,000 s) was never set: a board with no battery for its clock
@@ -297,6 +301,13 @@ pub enum PathKind {
     /// the order, it leaves the node's UDP socket unused, both ways. Off under [`Privacy::RelayOnly`], and not in
     /// [`Policy::default`].
     Bluetooth,
+    /// Over the signaling relays ([`Builder::signaling`](crate::Builder::signaling)): the peer's datagrams sealed to
+    /// it in the room's carrier, as a browser's `'signaling'` path sends them (a *pipe*, see
+    /// `docs/guides/connection-paths.md`). Slow (a relay's round trip each way) and rate-limited, a last resort: a
+    /// browser, which can't send UDP, links with a native peer this way. The node takes a pipe link from a room member
+    /// that dials it; it doesn't dial over one itself. A link on it punches to the peer's addresses and moves off it,
+    /// as on [`Bluetooth`](Self::Bluetooth). Off under [`Privacy::RelayOnly`], and not in [`Policy::default`].
+    Signaling,
 }
 
 impl PathKind {
@@ -438,10 +449,10 @@ impl std::fmt::Display for Failure {
 
 /// An address as a host with TURN or a radio gives it to the [`Endpoint`]: a network address, a peer reached through
 /// this node's allocation on one of its TURN servers, a peer's relayed address (on the peer's TURN server), sent to
-/// from this node's own socket, or a Bluetooth connection. All but the first are [`relayed`](Address::relayed): a
-/// link on one punches to the peer's network addresses and moves to the first that answers. On the wire each is its
-/// network address, but a Bluetooth connection's, which goes nowhere. More kinds may come, so a `match` on one outside
-/// this crate needs a `_` arm.
+/// from this node's own socket, a Bluetooth connection, or a pipe over the signaling relays. All but the first are
+/// [`relayed`](Address::relayed): a link on one punches to the peer's network addresses and moves to the first that
+/// answers. On the wire each is its network address, but a Bluetooth connection's and a pipe's, which go nowhere. More
+/// kinds may come, so a `match` on one outside this crate needs a `_` arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Hop<A> {
@@ -455,24 +466,32 @@ pub enum Hop<A> {
     /// (`Node` takes one in `0.0.0.0/8`, port 0, per connection). It is never offered, told to a peer or decoded: its
     /// encoding, a tag then the address's, is longer than any address of `A` decodes from.
     Ble(A),
+    /// A pipe to a peer over the signaling relays ([`Address::pipe`], [`PathKind::Signaling`]), named like a
+    /// Bluetooth connection by an address the host picks that no network uses (`Node` takes one in `0.0.0.0/8`, port
+    /// 1, per peer). Never offered, told to a peer or decoded, as `Ble`.
+    Pipe(A),
 }
 
 /// The first byte of a [`Hop::Ble`]'s encoding.
 const RADIO_TAG: u8 = 0xb1;
+/// The first byte of a [`Hop::Pipe`]'s encoding.
+const PIPE_TAG: u8 = 0xb2;
 
 impl<A> Hop<A> {
-    /// The network address: the peer's, for `Turn`; for `Ble`, the one that names the connection.
+    /// The network address: the peer's, for `Turn`; for `Ble` and `Pipe`, the one that names the connection.
     pub fn addr(&self) -> &A {
         match self {
-            Hop::Net(a) | Hop::Relayed(a) | Hop::Turn { peer: a, .. } | Hop::Ble(a) => a,
+            Hop::Net(a) | Hop::Relayed(a) | Hop::Turn { peer: a, .. } | Hop::Ble(a) | Hop::Pipe(a) => a,
         }
     }
 }
 
 impl<A: Address> Address for Hop<A> {
     fn encode(&self, out: &mut Vec<u8>) {
-        if let Hop::Ble(_) = self {
-            out.push(RADIO_TAG);
+        match self {
+            Hop::Ble(_) => out.push(RADIO_TAG),
+            Hop::Pipe(_) => out.push(PIPE_TAG),
+            _ => {}
         }
         self.addr().encode(out)
     }
@@ -487,7 +506,7 @@ impl<A: Address> Address for Hop<A> {
     }
     fn to_socket_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
-            Hop::Ble(_) => None,
+            Hop::Ble(_) | Hop::Pipe(_) => None,
             _ => self.addr().to_socket_addr(),
         }
     }
@@ -498,7 +517,10 @@ impl<A: Address> Address for Hop<A> {
         !matches!(self, Hop::Net(_))
     }
     fn radio(&self) -> bool {
-        matches!(self, Hop::Ble(_))
+        matches!(self, Hop::Ble(_) | Hop::Pipe(_))
+    }
+    fn pipe(&self) -> bool {
+        matches!(self, Hop::Pipe(_))
     }
     fn turn_hop(server: &Self, peer: std::net::SocketAddr) -> Option<Self> {
         let Hop::Net(server) = server else { return None };
@@ -692,6 +714,8 @@ struct Room {
     interval: Duration,
     /// When the last hello went out.
     said: Instant,
+    /// When the last hello in answer to a new member's went out ([`Traversal::answer_hello`]).
+    answered: Option<Instant>,
 }
 
 /// STUN, presence and candidate exchange for one [`Endpoint`]. See the module docs.
@@ -724,6 +748,8 @@ pub struct Traversal<A: Address> {
     offers: Bucket,
     /// Inbox messages opened, proved or not.
     opened: Bucket,
+    /// Pipe batches from room members, opened and not yet taken ([`poll_piped`](Traversal::poll_piped)).
+    piped: VecDeque<(PeerId, Vec<u8>)>,
     privacy: Privacy,
     /// The room Host a relay-only node picked as its relay (with no `via` and no
     /// pinned host): the first it dialled. Kept while that dial or link lasts.
@@ -799,6 +825,7 @@ impl<A: Address> Traversal<A> {
             hellos: Bucket::default(),
             offers: Bucket::default(),
             opened: Bucket::default(),
+            piped: VecDeque::new(),
             privacy: Privacy::Direct,
             picked: None,
             radio_punch_at: Instant::ZERO,
@@ -997,12 +1024,14 @@ impl<A: Address> Traversal<A> {
     /// links those, or not, by [`PathKind::RelayPeers`]). Under [`Privacy::RelayOnly`] any too, but with TURN on under
     /// it (NB-101): then a link to a peer but the relay must hide this node's address, through a relay or one of its
     /// allocations. An address `peer` offered as its relayed one is TURN's, as its link there is once retagged
-    /// (NB99-I1). A Bluetooth connection ([`Address::radio`]) only if the policy lists [`PathKind::Bluetooth`] (any
-    /// with no policy), and never under [`Privacy::RelayOnly`].
+    /// (NB99-I1). A Bluetooth connection ([`Address::radio`]) only if the policy lists [`PathKind::Bluetooth`], and a
+    /// pipe ([`Address::pipe`]) only if it lists [`PathKind::Signaling`] (either with no policy); neither under
+    /// [`Privacy::RelayOnly`].
     pub fn allows(&self, peer: &PeerId, path: &Path<A>) -> bool {
-        if path.direct().is_some_and(Address::radio) {
+        if let Some(a) = path.direct().filter(|a| a.radio()) {
+            let kind = if a.pipe() { PathKind::Signaling } else { PathKind::Bluetooth };
             let relay_only = matches!(self.privacy, Privacy::RelayOnly { .. });
-            return !relay_only && self.policy.as_ref().is_none_or(|p| p.allows(PathKind::Bluetooth));
+            return !relay_only && self.policy.as_ref().is_none_or(|p| p.allows(kind));
         }
         let Some(p) = &self.policy else { return true };
         if self.relay_peers.contains(peer) {
@@ -1115,7 +1144,7 @@ impl<A: Address> Traversal<A> {
         let (key, enc) = (room_key(app_id, room), room_enc_key(app_id, room));
         self.signals.push_back(Signal::Subscribe(topic));
         let (next_hello, interval) = (now + HELLO_FIRST, HELLO_FIRST);
-        self.room = Some(Room { topic, key, enc, role, expect: host, next_hello, interval, said: now });
+        self.room = Some(Room { topic, key, enc, role, expect: host, next_hello, interval, said: now, answered: None });
         self.announce(now);
     }
 
@@ -1250,7 +1279,11 @@ impl<A: Address> Traversal<A> {
                 if from == self.id {
                     return None;
                 }
+                let known = self.remotes.get(&from).is_some_and(|r| r.member.is_some());
                 self.on_hello(now, ep, from, role);
+                if !known && self.remotes.get(&from).is_some_and(|r| r.member.is_some()) {
+                    self.answer_hello(now);
+                }
                 return Some(from);
             }
         } else if topic == self.inbox {
@@ -1259,6 +1292,14 @@ impl<A: Address> Traversal<A> {
                 return None;
             }
             let (from, body) = sealed::open(&self.me, payload)?;
+            // A pipe batch (JSON; offers start with their version, 1 to 3): kept for the host only as `takes_pipe`
+            // says, and while it takes them (see `poll_piped`).
+            if body.first() == Some(&b'{') {
+                if self.takes_pipe(&from) && self.piped.len() < MAX_PIPED {
+                    self.piped.push_back((from, body));
+                }
+                return None;
+            }
             // Room and invite offers end in an HMAC over sender, recipient and body,
             // under the room key or this node's invite key.
             let (body, proof) = match body.first() {
@@ -1284,6 +1325,45 @@ impl<A: Address> Traversal<A> {
             }
         }
         None
+    }
+
+    /// The next pipe batch that came in ([`PathKind::Signaling`]): its sender, a room member, and its body as it
+    /// opened, `{"kind":"dg","d":[…]}` if it is well formed. The host takes them after each
+    /// [`handle_signal`](Traversal::handle_signal); past [`MAX_PIPED`] waiting, more are dropped.
+    pub(crate) fn poll_piped(&mut self) -> Option<(PeerId, Vec<u8>)> {
+        self.piped.pop_front()
+    }
+
+    /// Whether a pipe batch from `from` is taken: only where this node would link with it, from a member of the
+    /// current room in a role it links with (and the host, if it expects one), with [`PathKind::Signaling`] allowed
+    /// (no policy, or one listing it) and the node not relay-only. Not from a peer it merely dialled from an invite.
+    fn takes_pipe(&self, from: &PeerId) -> bool {
+        let Some(room) = &self.room else { return false };
+        let member = self.remotes.get(from).and_then(|r| r.member);
+        let linked =
+            member.is_some_and(|role| allowed(Some(room.role), role) && room.expect.is_none_or(|h| h == *from));
+        let relay_only = matches!(self.privacy, Privacy::RelayOnly { .. });
+        linked && !relay_only && self.policy.as_ref().is_none_or(|p| p.allows(PathKind::Signaling))
+    }
+
+    /// `body` sealed to `to` for its inbox ([`Topic::peer`]), as an offer is: a pipe batch.
+    pub(crate) fn seal_to(&mut self, to: &PeerId, body: &[u8]) -> Option<Vec<u8>> {
+        let mut seed = [0u8; 32];
+        self.rng.fill_bytes(&mut seed);
+        sealed::seal(&self.me, to, seed, body)
+    }
+
+    /// A member new to this node said hello: says ours at once, rather than at the next of its doubling gaps (up to
+    /// [`HELLO_MAX`]), so a peer that dials over a pipe, which a hello names, links in one relay round trip. At most
+    /// one answer every [`HELLO_ANSWER_GAP`], however recent the last hello on schedule: a newcomer missed that one.
+    /// None if one went out at this very instant (on joining, or with a clock just taken from this hello): that one
+    /// answers it.
+    fn answer_hello(&mut self, now: Instant) {
+        let Some(r) = self.room.as_mut() else { return };
+        if r.said != now && r.answered.is_none_or(|t| now - t >= HELLO_ANSWER_GAP) {
+            r.answered = Some(now);
+            self.announce(now);
+        }
     }
 
     /// Links on a radio connection punch to their peers' addresses, if the policy has `Direct` on (or there is none),
@@ -2896,7 +2976,7 @@ mod tests {
         let body = hello(&key, &id(1).peer_id(), Role::Peer, 1_800_000_000_123);
         assert_eq!(std::str::from_utf8(&body), Ok(BODY));
         let sealed = seal_room(&enc, std::array::from_fn(|i| i as u8), &body);
-        assert_eq!(crate::nostr::b64(&sealed), SEALED);
+        assert_eq!(crate::signaling::b64(&sealed), SEALED);
         assert_eq!(open_room(&enc, &sealed).as_deref(), Some(BODY.as_bytes()));
     }
 
@@ -2957,9 +3037,9 @@ mod tests {
             t.handle_signal(now, &mut ep, topic, b);
         }
         assert_eq!((published(&mut t), dials(&mut ep, now), t.room_role(&m)), (0, vec![], None));
-        // The same hello, sealed: answered.
+        // The same hello, sealed: answered, with an offer and our hello.
         t.handle_signal(now, &mut ep, topic, &good);
-        assert_eq!(published(&mut t), 1);
+        assert_eq!(published(&mut t), 2);
     }
 
     #[test]
@@ -3134,10 +3214,11 @@ mod tests {
             while t.poll_signal().is_some() {}
             (t, ep)
         };
+        // Offers alone: our hello in answer to a new member's goes on the room topic.
         let published = |t: &mut Traversal<Hop<SocketAddr>>| -> Vec<Vec<u8>> {
             std::iter::from_fn(|| t.poll_signal())
                 .filter_map(|s| match s {
-                    Signal::Publish(_, p) => Some(p),
+                    Signal::Publish(to, p) if to != topic => Some(p),
                     _ => None,
                 })
                 .collect()
@@ -3373,7 +3454,7 @@ mod tests {
         t.handle_signal(now, &mut ep, topic, &room_hello(&key, &host.peer_id(), Role::Host, 0));
         assert_eq!((dials(&mut ep, now), published(&mut t)), (vec![], 0));
         t.handle_signal(now, &mut ep, topic, &room_hello(&key, &id(3).peer_id(), Role::Host, 0));
-        assert_eq!(published(&mut t), 1);
+        assert_eq!(published(&mut t), 2, "an offer, and our hello in answer");
         assert!(t.admits(&id(3).peer_id()) && !t.admits(&host.peer_id()));
     }
 
@@ -3449,7 +3530,8 @@ mod tests {
             t.handle_signal(t0, &mut ep, topic, &room_hello(&topic.0, &member(n), Role::Peer, 0));
         }
         assert_eq!(published(&mut t), 0);
-        // Real hellos from 100 members: a burst of answers, then none.
+        // Real hellos from 100 members: a burst of answers, then none. (Our hello on joining went out at t0: no
+        // other answers them.)
         for n in 0..100u8 {
             t.handle_signal(t0, &mut ep, topic, &room_hello(&key, &member(n), Role::Peer, 0));
         }
@@ -3474,12 +3556,12 @@ mod tests {
             t.handle_signal(later, &mut ep, inbox, &offer_from(&loud, &me, Some(&key), nonce, Role::Peer, vec![]));
         }
         assert_eq!(published(&mut t), 2);
-        // And the hello budget at one per REFILL.
+        // And the hello budget at one per REFILL: 3 offers, and our hello in answer to the first new member.
         let later = t0 + REFILL * 3;
         for n in 100..150u8 {
             t.handle_signal(later, &mut ep, topic, &room_hello(&key, &member(n), Role::Peer, 0));
         }
-        assert_eq!(published(&mut t), 3);
+        assert_eq!(published(&mut t), 4);
     }
 
     /// NB64-2: inbox messages spend a token before they are opened, so after a burst
@@ -4138,7 +4220,81 @@ mod tests {
         assert_eq!(published(&mut t), 0);
         let ts = FRESH_MS + 1;
         t.handle_signal(late, &mut ep, topic, &room_hello(&key, &id(5).peer_id(), Role::Peer, ts));
-        assert_eq!(published(&mut t), 1);
+        assert_eq!(published(&mut t), 2, "an offer, and our hello in answer to a new member's");
+    }
+
+    /// NB-126: a new member's hello is answered with ours at once, at most one every HELLO_ANSWER_GAP, so a browser
+    /// that dials over a pipe finds the node in one relay round trip. A member already known isn't answered.
+    #[test]
+    fn a_new_members_hello_is_answered_with_ours() {
+        let (key, topic) = (room_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1));
+        let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        let me = id(1).peer_id();
+        let at = |s: u64| Instant::ZERO + Duration::from_secs(s);
+        let hello_at = |t: &mut Traversal<SocketAddr>, ep: &mut Endpoint<SocketAddr>, s: u64, n: u8| {
+            t.handle_signal(at(s), ep, topic, &room_hello(&key, &id(n).peer_id(), Role::Peer, s * 1000));
+            said_hellos(t).into_iter().filter(|(p, _)| *p == me).count()
+        };
+        assert_eq!(hello_at(&mut t, &mut ep, 0, 5), 0, "ours on joining went out this instant: that answers it");
+        assert_eq!(hello_at(&mut t, &mut ep, 1, 6), 1, "a new member, a second after our last hello");
+        assert_eq!(hello_at(&mut t, &mut ep, 2, 7), 0, "another, within the gap");
+        assert_eq!(hello_at(&mut t, &mut ep, 9, 6), 0, "a member already known");
+        assert_eq!(hello_at(&mut t, &mut ep, 9, 8), 1, "a new one past the gap");
+        // A forged hello (another room's key) costs nothing.
+        t.handle_signal(at(20), &mut ep, topic, &room_hello(&topic.0, &id(9).peer_id(), Role::Peer, 20_000));
+        assert_eq!(said_hellos(&mut t), vec![]);
+    }
+
+    /// NB-126: a pipe batch (a sealed JSON body) is kept for the host only from a room member, in a room, up to
+    /// MAX_PIPED waiting; it is never read as an offer, and a stranger's is dropped.
+    #[test]
+    fn pipe_batches_come_only_from_room_members() {
+        let me = id(1).peer_id();
+        let (key, topic, inbox) = (room_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1), Topic::peer(&me));
+        let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        let batch = br#"{"kind":"dg","d":["AA=="]}"#;
+        let (member, stranger) = (id(5), id(6));
+        let from = |who: &Identity| sealed::seal(who, &me, [7; 32], batch).unwrap();
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
+        assert_eq!(t.poll_piped(), None, "not a member yet");
+        t.handle_signal(Instant::ZERO, &mut ep, topic, &room_hello(&key, &member.peer_id(), Role::Peer, 0));
+        while t.poll_signal().is_some() {}
+        for _ in 0..MAX_PIPED + 2 {
+            t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
+            t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&stranger));
+        }
+        let got: Vec<_> = std::iter::from_fn(|| t.poll_piped()).collect();
+        assert_eq!(got, vec![(member.peer_id(), batch.to_vec()); MAX_PIPED], "the member's, up to the cap");
+        assert_eq!(published(&mut t), 0, "no offer answered");
+        assert_eq!(dials(&mut ep, Instant::ZERO), vec![]);
+        // Not with a policy that leaves Signaling out, nor relay-only.
+        t.set_policy(Instant::ZERO, &mut ep, Some(Policy::new([PathKind::Direct])));
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
+        assert_eq!(t.poll_piped(), None, "Signaling off");
+        t.set_policy(Instant::ZERO, &mut ep, Some(Policy::new([PathKind::Direct, PathKind::Signaling])));
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
+        assert_eq!(t.poll_piped().map(|(p, _)| p), Some(member.peer_id()), "Signaling listed");
+        t.set_privacy(Instant::ZERO, &mut ep, Privacy::RelayOnly { via: None });
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
+        assert_eq!(t.poll_piped(), None, "relay-only");
+        t.set_privacy(Instant::ZERO, &mut ep, Privacy::Direct);
+        // Nor from a peer only dialled from an invite, a member of no room.
+        let invited = id(7);
+        t.introduce(Instant::ZERO, &ep, invited.peer_id(), None);
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&invited));
+        assert_eq!(t.poll_piped(), None, "invited, not a member");
+        // Out of the room, none.
+        t.leave_room();
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&member));
+        assert_eq!(t.poll_piped(), None);
+        // A client that expects one host takes a pipe from that host alone.
+        let (mut t, mut ep) = in_room(Role::Client, Some(id(3).peer_id()), "10.0.0.1:7000".parse().unwrap());
+        for host in [id(3), id(4)] {
+            t.handle_signal(Instant::ZERO, &mut ep, topic, &room_hello(&key, &host.peer_id(), Role::Host, 0));
+            t.handle_signal(Instant::ZERO, &mut ep, inbox, &from(&host));
+        }
+        let got: Vec<_> = std::iter::from_fn(|| t.poll_piped()).map(|(p, _)| p).collect();
+        assert_eq!(got, vec![id(3).peer_id()]);
     }
 
     /// The room hellos `t` published, opened: who said it and at what time.

@@ -23,31 +23,24 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::sys;
 use log::{info, warn};
 use peerwire_esp::ble::Nimble;
 use peerwire_esp::console::Console;
-use peerwire_esp::peerwire::{Event, Lane, Node, PeerId};
+use peerwire_esp::peerwire::{Event, Node};
 use peerwire_esp::{clock, config, free_heap, identity, Board, PORT};
 
-/// Where wifi.sh and room.sh write their records: the last sector of a 4 MB flash (see examples/mesh.rs).
-const CFG_ADDR: u32 = 0x3F_F000;
-const WIFI_OFFSET: usize = 0x40;
-const ROOM_OFFSET: usize = 0xC0;
-/// The app of `lan_chat` and `ble_chat` (examples/rust), and the room when the flash names none.
-const APP: &str = "peerwire-lan-chat";
+#[path = "led/common.rs"]
+mod common;
+use common::{flash_config, send, short, Led, APP, HELP};
+
+/// The room when the flash names none.
 const ROOM: &str = "esp32";
-/// The LED's GPIO, `PW_LED_PIN` when building, and whether it's lit when the pin is high, `PW_LED_HIGH`.
-const LED_PIN: Option<&str> = option_env!("PW_LED_PIN");
-const LED_HIGH: bool = option_env!("PW_LED_HIGH").is_some();
-const BLINK: Duration = Duration::from_millis(150);
 const REPORT_EVERY: Duration = Duration::from_secs(30);
 /// How long the board tries wifi.sh's network at boot before it goes on over Bluetooth alone.
 const WIFI_WAIT: Duration = Duration::from_secs(20);
-const HELP: &str = "send `led on`, `led off` or `led toggle`";
 
 fn main() {
     peerwire_esp::run(run)
@@ -57,13 +50,7 @@ fn run() -> anyhow::Result<()> {
     // Before any radio, as a new one is drawn only then.
     let identity = identity::load_or_create()?;
     let mut led = Led::new()?;
-    for _ in 0..3 {
-        led.set(true)?;
-        std::thread::sleep(BLINK);
-        led.set(false)?;
-        std::thread::sleep(BLINK);
-    }
-    info!("led: GPIO{} blinked 3 times, lit when {}", led.pin, if LED_HIGH { "high" } else { "low" });
+    led.blink()?;
     let (wifi, room) = flash_config();
     let room = room.unwrap_or_else(|| ROOM.into());
 
@@ -150,83 +137,4 @@ fn run() -> anyhow::Result<()> {
         }
         peerwire_esp::idle(&node);
     }
-}
-
-/// The LED on one GPIO, driven straight through ESP-IDF's GPIO driver.
-struct Led {
-    pin: i32,
-    on: bool,
-}
-
-impl Led {
-    /// The LED off, on `PW_LED_PIN` or GPIO8.
-    fn new() -> anyhow::Result<Self> {
-        let pin = match LED_PIN {
-            Some(pin) => pin.parse().map_err(|_| anyhow!("PW_LED_PIN {pin:?} isn't a GPIO number"))?,
-            None => 8,
-        };
-        sys::esp!(unsafe { sys::gpio_reset_pin(pin) })?;
-        sys::esp!(unsafe { sys::gpio_set_direction(pin, sys::gpio_mode_t_GPIO_MODE_OUTPUT) })?;
-        let mut led = Self { pin, on: false };
-        led.set(false)?;
-        Ok(led)
-    }
-
-    fn set(&mut self, on: bool) -> anyhow::Result<()> {
-        sys::esp!(unsafe { sys::gpio_set_level(self.pin, u32::from(on == LED_HIGH)) })?;
-        self.on = on;
-        Ok(())
-    }
-
-    /// If `text` is one of the commands (in any case, with spaces around it), carries it out and gives the LED's state.
-    fn command(&mut self, text: &str) -> Option<anyhow::Result<String>> {
-        let on = match text.trim().to_ascii_lowercase().as_str() {
-            "led" => self.on,
-            "led on" => true,
-            "led off" => false,
-            "led toggle" => !self.on,
-            _ => return None,
-        };
-        Some(self.set(on).map(|()| self.state()))
-    }
-
-    fn state(&self) -> String {
-        format!("led: {}", if self.on { "on" } else { "off" })
-    }
-}
-
-fn send(node: &mut Node, peer: &PeerId, data: &[u8]) {
-    if let Err(e) = node.send(peer, Lane::Reliable, data) {
-        warn!("led: send to {}: {e:?}", short(peer));
-    }
-}
-
-fn short(peer: &PeerId) -> String {
-    peer.to_string().chars().take(8).collect()
-}
-
-/// wifi.sh's and room.sh's records from the last flash sector, if they are there.
-fn flash_config() -> (Option<(String, String)>, Option<String>) {
-    let mut b = [0u8; 0x110];
-    let r = unsafe { sys::esp_flash_read(std::ptr::null_mut(), b.as_mut_ptr().cast(), CFG_ADDR, b.len() as u32) };
-    if r != sys::ESP_OK {
-        return (None, None);
-    }
-    (wifi_config(&b[WIFI_OFFSET..]), room_config(&b[ROOM_OFFSET..]))
-}
-
-/// b"PWW", the SSID's length and the SSID, the password's length and the password.
-fn wifi_config(b: &[u8]) -> Option<(String, String)> {
-    let (&len, rest) = b.strip_prefix(b"PWW")?.split_first()?;
-    let ssid = rest.get(..len as usize).filter(|_| (1..=32).contains(&len))?;
-    let (&len, rest) = rest[ssid.len()..].split_first()?;
-    let password = rest.get(..len as usize).filter(|_| len <= 64)?;
-    Some((String::from_utf8(ssid.to_vec()).ok()?, String::from_utf8(password.to_vec()).ok()?))
-}
-
-/// b"PWR", the name's length (1 to 64) and the name.
-fn room_config(b: &[u8]) -> Option<String> {
-    let (&len, rest) = b.strip_prefix(b"PWR")?.split_first()?;
-    let room = rest.get(..len as usize).filter(|_| (1..=64).contains(&len))?;
-    String::from_utf8(room.to_vec()).ok()
 }
