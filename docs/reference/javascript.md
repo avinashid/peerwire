@@ -896,9 +896,11 @@ build your own for relay-only privacy or a custom room.
 | `relay` | `null` | The relay's PeerId, for `'relay-only'`. |
 | `offerProof` | `null` | `{ sign(to), check(from, p) }`: offers carry `p: await sign(to)`, and an offer is answered only if `check(from, p)` holds. |
 | `pipes` | `false` | Lets the transport carry datagrams as signalling messages (a pipe) for peers the room allows. `joinRoom` turns it on for `fallback: 'auto'` and opens the pipes itself (see [Through any NAT](#through-any-nat)). Off, pipe batches that arrive are refused (`badSignals`). |
+| `pipeBatch` | 16384 | The bytes of datagrams a pipe batch carries at most, 1 to 16384; a pipe queues 8 batches' worth. [`RelayTransport`](#relaytransport) uses 1232 (`NATIVE_BATCH`), which a board's relay frame takes. |
 | `RTCPeerConnection` | `globalThis.RTCPeerConnection` | |
 
-**Throws** `Error` for an unknown `privacy`, `TypeError` for `'relay-only'` without a valid `relay`.
+**Throws** `Error` for an unknown `privacy`, `TypeError` for `'relay-only'` without a valid `relay` or a `pipeBatch` out
+of range.
 
 | Member | |
 |---|---|
@@ -915,7 +917,7 @@ build your own for relay-only privacy or a custom room.
 |---|---|
 | `dropped` | Datagrams dropped by `loss`. |
 | `congested` | Datagrams dropped because the DataChannel had over 1 MiB queued (`MAX_BUFFERED`) or `send` threw. |
-| `badSignals` | Signals refused: a `from` that isn't a PeerId, an empty message, an offer whose proof fails or whose SDP doesn't apply, a second retry connection within 2 s, an `ice-batch` that isn't a list of at most 32, a pipe batch from a peer not allowed one (or with `pipes` off) or that isn't a list of at most 64 base64 datagrams. |
+| `badSignals` | Signals refused: a `from` that isn't a PeerId, an empty message, an offer whose proof fails or whose SDP doesn't apply, a second retry connection within 2 s, an `ice-batch` that isn't a list of at most 32, a pipe batch from a peer not allowed one (or with `pipes` off) or that isn't a list of 1 to 64 base64 datagrams of 1 to 1232 bytes each (a batch is taken whole or not at all). |
 | `resent` | Offers sent again for want of an answer, and answers sent again for a repeated offer. |
 | `throttled` | Offers, answers and restart asks not sent because the peer's publish budget was spent: 6 at once, then 1 per 5 s per peer. |
 | `restarts` | ICE restarts begun as the dialling side: at most 3 per link a minute. |
@@ -990,6 +992,56 @@ connection: after Bluetooth went off and on, Android Chrome keeps the old one; r
 itself: `push(value)` takes a value and returns its events (`proven`, `peer`, `signal`, `closed`), `values()` gives
 the values to send, `signal(inner, payload)` and `datagram(bytes)` queue, `timeout()` runs its 3 s deadline, and
 `state()` says where it stands. `index.d.ts` has its contract.
+
+## RelayTransport
+
+```js
+import { loadPeerwire, RelayTransport } from '@peerwire/js';
+
+const pw = await loadPeerwire(new URL('./peerwire_ffi.wasm', import.meta.url));
+const endpoint = pw.endpoint();
+endpoint.onEvent = (e) => {
+  if (e.type === 'message') console.log(new TextDecoder().decode(e.data));
+};
+const link = new RelayTransport(endpoint, {
+  appId: 'peerwire-lan-chat',
+  roomId: 'esp32',
+  onPeer: async (peer, state) => {
+    if (state === 'seen') endpoint.send(await link.dial(peer), 'led on'); // resolves once linked
+  },
+});
+```
+
+Links a page (or Node) with a native room member, a Rust node or a board on Wi-Fi, over the room's Nostr relays alone,
+from anywhere: a browser can't dial a native peer over WebRTC, and a board has no WebRTC. The link's datagrams go as
+signalling messages, on `WebRtcTransport`'s [pipe](#through-any-nat): sealed to the peer, each batch through one relay,
+a few batches a second. That is slow (a relay trip each way), fine for commands and chat, not for streams.
+
+- **A native room.** As with [`BluetoothTransport`](#bluetoothtransport), the room is a Rust node's, not a `joinRoom`
+  room, and messages are the endpoint's, raw bytes: `endpoint.send(peer, data)`, and `message` events. The transport
+  says hello as a native member does (`meta.nb`, its proof under the room key), since a native peer takes pipe
+  datagrams only from a member whose hello it holds from the last minute: on start, every 20 s, on a relay that opens
+  again, and in answer to a peer newly heard (at most one each 2 s).
+- **Peers.** It lists the native peers whose hellos prove the room key (`peers`, and `onPeer(peer, 'seen')`), and takes
+  pipe batches from them alone, each datagram as from its sender only. A `joinRoom` member's hello (no `meta.nb`) is
+  left to its room. A hello only names a peer: the handshake proves who is at the other end.
+- **The room name is the password.** Anyone who knows it can link with the board, and as a member learn its addresses:
+  over the internet, give it one nobody can guess (`randomRoomId()`).
+- **Batches.** To a native peer, a batch carries 1232 bytes of datagrams at most (`NATIVE_BATCH`): a board reads relay
+  messages of 4 KB at most, and one such batch makes an event of about 3 KB. From it, up to the pipe's own limits.
+
+| Option | Default | |
+|---|---|---|
+| `appId`, `roomId` | | The room, as the native peers name it. |
+| `relays` | [`DEFAULT_RELAYS`](#nostrsignaling) | `ws://` or `wss://` urls with no fragment, else a `TypeError` naming one by its index. |
+| `onPeer(peer, state)` | none | `'seen'` when a native peer's hello first proves the room key (again once it went unheard for a minute), `'open'` when a dial links. |
+
+| Member | |
+|---|---|
+| `peers` | The native peers heard in the last minute. |
+| `dial(peer)` | Links with `peer` over a pipe: resolves to its PeerId once the handshake is done (at once if the endpoint is linked with it), within 15 s. Its answers are taken once its hello proves the room key: a peer not heard yet is sent ours, which a native peer answers with its own. Rejects with an `Error` whose `code` is `'timeout'` (the peer isn't online, or not in this room), `'failed'` (the endpoint refused the dial) or `'closed'` (`close()`, or `drop(peer)`); with a `TypeError` for a `peer` that isn't a PeerId. |
+| `has(peer)`, `drop(peer)`, `close()` | The [`Transport`](#transport) methods. `drop` sends the endpoint's goodbye over the pipe at once; `close` sends what waits in the pipes, then leaves the relays. |
+| `signaling` | Its [`NostrSignaling`](#nostrsignaling) (`stats`). |
 
 ## BroadcastSignaling
 
@@ -1108,6 +1160,7 @@ field](../project/field-connectivity.md) explains each result.
 | `src/nostr.js` | `NostrSignaling` over public relays: ephemeral events, a throwaway key per session, payloads sealed to the recipient's PeerId. |
 | `src/local.js` | `LocalTransport`: datagrams over the BroadcastChannel, for Node and tests. |
 | `src/bluetooth.js` | `BluetoothTransport`: a central over Web Bluetooth, linking with a native peer nearby; the protocol is the wasm's (`BleLink` in `src/peerwire.js`). |
+| `src/relay_link.js` | `RelayTransport`: links with a native peer over the room's Nostr relays alone, on `WebRtcTransport`'s pipe. |
 | `src/index.d.ts` | TypeScript types. |
 | `bin/peerwire.js`, `bin/doctor.js` | The `peerwire` command (`npx @peerwire/js doctor`): the network report, in Node. |
 
@@ -1122,7 +1175,7 @@ static server (`python3 -m http.server -d packages/js 8000`).
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
 | `demo/netlab.html` | Net Lab, a connection diagnostics page: join a room by name or a private `#key=` link; per peer, ping on the route in use, ICE round trips, WebRTC traffic, restarts and port guesses, the route and candidate pair, the offer/answer exchange and ICE checks with a verdict on which way packets are blocked, and the other side's NAT; this device's public addresses and NAT mapping; the relays' state; chat, an event log and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. |
-| `demo/led.html` | A board's LED over Bluetooth: pick an ESP32 running `ble_led` and switch its LED (`led on`, `led off`, `led toggle`), its answers in a log. `?app=` and `?room=` name the room. Needs Web Bluetooth on an https page (Android Chrome on a phone). |
+| `demo/led.html` | A board's LED, over Bluetooth or the internet: pick an ESP32 running `ble_led` nearby, or find a board on Wi-Fi in the room over its Nostr relays (`RelayTransport`), and switch its LED (`led on`, `led off`, `led toggle`), its answers in a log. `?app=` and `?room=` name the room (`esp32` by default over Bluetooth; none over the internet, where a name that can be guessed gets a warning), `?via=bluetooth` or `?via=internet` the way, `?relays=` the relays. Bluetooth needs Web Bluetooth on an https page (Android Chrome on a phone); the internet, any browser. |
 | `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player. `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it. |
 
 Add `?signal=nostr&room=<something only you know>` to a demo page to reach other machines through the default relays
@@ -1158,6 +1211,10 @@ Those marked (Chromium) open headless browser tabs on loopback. None touches a p
   an endpoint) over a fake Web Bluetooth: the link and messages both ways, the room hello as a node takes it, values of
   20 bytes at most, a challenge Chrome drops got over, a dead connection the browser kept (`'stale'` at once),
   `drop()`, and each failure's code. No radio.
+- `relay_link.mjs`: `RelayTransport` between bare endpoints over two relays on loopback (`nostr_relay.mjs`, a small
+  NIP-01 relay that also runs on its own): the hello in Rust's shape, when it goes, which hellos list a peer, the dial
+  and messages both ways, batches of 1232 bytes of datagrams at most and events a board's 4 KB frame takes, pipe
+  batches refused from a peer that said no hello, `drop()`, `close()` and each failure's code. No public relays.
 - `room_proof.mjs`: an attacker that knows only the room topic gets no dial, no answer and, on a link it dials
   itself, nothing but the link proof before it is dropped; the hello proof matches Rust's.
 - `fuzz.mjs`: seeded random and mutated input to the JS parsers (Nostr events and relay messages, hex and peer ids,

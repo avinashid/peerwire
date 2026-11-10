@@ -808,6 +808,9 @@ export declare class WebRtcTransport implements Transport {
        * `joinRoom` turns it on for `fallback: 'auto'` and opens the pipes itself. Off, pipe batches that arrive are
        * refused (`badSignals`). */
       pipes?: boolean;
+      /** The bytes of datagrams a pipe batch carries at most, 1 to 16384 (the default), else TypeError; a pipe queues 8
+       * batches' worth. {@link RelayTransport} uses {@link NATIVE_BATCH}. */
+      pipeBatch?: number;
       /** The WebRTC paths allowed: STUN servers go to a connection with `direct`, TURN ones with `turn`, and one
        * without `direct` takes relay candidates alone. Ours follow what `dial` is given; one we answer, these, without
        * TURN when the offer says `turn: false`; with neither, an offer goes unanswered. Default both. */
@@ -823,7 +826,8 @@ export declare class WebRtcTransport implements Transport {
    * Signals refused: a `from` that isn't a PeerId or an empty message, an offer whose `offerProof` fails or whose
    * SDP doesn't apply, a retry offer that would make a peer's second new connection within 2 s, an `ice-batch`
    * that isn't a list of at most 32, or one that failed unexpectedly, and a pipe batch from a peer not allowed one
-   * (or with `pipes` off) or that isn't a list of at most 64 base64 datagrams. Answers and
+   * (or with `pipes` off) or that isn't a list of 1 to 64 base64 datagrams of 1 to 1232 bytes each (a batch is taken
+   * whole or not at all). Answers and
    * ICE candidates that don't apply are not counted (copies and races are normal). The WebRTC counterpart of
    * NostrSignaling's `stats.rejected`.
    */
@@ -972,6 +976,68 @@ export declare class BluetoothTransport {
   /** Ends the link to `peer`: the endpoint's goodbye goes over its connection, which then closes. */
   drop(peer: PeerId): void;
   /** Closes every connection; a dial under way rejects with `'closed'`. */
+  close(): void;
+}
+
+/** The bytes of datagrams a pipe batch to a native peer carries at most (1232): a board reads relay messages of 4 KB at
+ * most, and one such batch makes an event of about 3 KB. */
+export declare const NATIVE_BATCH: number;
+
+/** Why a {@link RelayTransport} dial failed. */
+export type RelayFailure = 'timeout' | 'failed' | 'closed';
+
+/**
+ * Links with a native room member (a Rust node, a board on Wi-Fi) over the room's Nostr relays alone, from anywhere:
+ * the link's datagrams go as signalling messages, on {@link WebRtcTransport}'s pipe, sealed to the peer and each
+ * batch through one relay. Slow (a relay trip each way, a few batches a second): for commands and chat, not streams.
+ *
+ * The room is a native one, as with {@link BluetoothTransport}: the transport says hello as a native member does
+ * (`meta.nb`, a proof under the room key) on start, every 20 s, on a relay that opens again and in answer to a peer
+ * newly heard (at most one each 2 s), lists the native peers whose hellos prove the room key, and dials one over a
+ * pipe alone, taking pipe batches from those peers alone. Messages are the endpoint's, raw bytes. A hello only names a
+ * peer: the handshake proves who it is. The room name is the board's password: over the internet, use one nobody can
+ * guess ({@link randomRoomId}).
+ *
+ * ```js
+ * const endpoint = (await loadPeerwire(wasmUrl)).endpoint();
+ * const link = new RelayTransport(endpoint, { appId: 'peerwire-lan-chat', roomId: 'esp32',
+ *   onPeer: async (peer, state) => state === 'seen' && endpoint.send(await link.dial(peer), 'led on') });
+ * ```
+ *
+ * It has the {@link Transport} methods, but its `dial` resolves to the PeerId once linked.
+ */
+export declare class RelayTransport {
+  /** `endpoint`: any module's, else TypeError, as for a missing `appId` or `roomId`. `relays`: `ws://` or `wss://`
+   * urls with no fragment ({@link DEFAULT_RELAYS} by default), else a TypeError naming one by its index. `onPeer`:
+   * `'seen'` when a native peer's hello first proves the room key (and again once one went unheard for a minute),
+   * `'open'` when a dial links. */
+  constructor(
+    endpoint: Endpoint,
+    options: {
+      appId: string;
+      roomId: string;
+      relays?: string[];
+      onPeer?: ((peer: PeerId, state: 'seen' | 'open') => void) | null;
+    },
+  );
+  /** The native peers heard in the last minute, whose hellos prove the room key. */
+  readonly peers: PeerId[];
+  /** The relays it says hello on and carries the pipes over (`stats`). */
+  readonly signaling: NostrSignaling;
+  /**
+   * Links with `peer` over a pipe: resolves to its PeerId once the handshake is done (at once if the endpoint is linked
+   * with it already), within 15 s. Its answers are taken once its hello proves the room key: a peer not heard yet is
+   * sent our hello, which a native peer answers with its own. Rejects with an Error whose `code` is a
+   * {@link RelayFailure}: `'timeout'` (the peer isn't online, or not in this room), `'failed'` (the endpoint refused
+   * the dial), `'closed'` (`close()`, or `drop(peer)`); with a TypeError for a `peer` that isn't a PeerId. A dial to a
+   * peer under way is that one.
+   */
+  dial(peer: PeerId): Promise<PeerId>;
+  /** Whether `peer` is linked and we have a pipe to it. */
+  has(peer: PeerId): boolean;
+  /** Ends the link to `peer`: the endpoint's goodbye goes over the pipe at once, then the pipe goes. */
+  drop(peer: PeerId): void;
+  /** Sends what waits in the pipes, then leaves the relays; a dial under way rejects with `'closed'`. */
   close(): void;
 }
 

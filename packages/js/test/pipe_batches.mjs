@@ -164,5 +164,49 @@ send(1, 100);
 t.close();
 if (batches(from) !== '1' || out.at(-1)[3] !== false) fail(`close() sent ${batches(from) || 'nothing'}, lossy ${out.at(-1)?.[3]}`);
 console.log(`lossy: ${from} batches went lossy, the last at close() not`);
+
+// A transport made with a smaller pipeBatch (relay_link.js, for a native peer): its batches carry that many bytes of
+// datagrams at most, a datagram that doesn't fit beside others goes in the next, and a pipe queues as many batches as
+// PIPE_QUEUE holds of PIPE_BATCH.
+{
+  for (const bad of [0, 1.5, PIPE_BATCH + 1, '1232']) {
+    let threw = false;
+    try {
+      new WebRtcTransport(ep, sig, { pipes: true, pipeBatch: bad });
+    } catch (e) {
+      threw = e instanceof TypeError;
+    }
+    if (!threw) fail(`pipeBatch ${JSON.stringify(bad)} taken`);
+  }
+  const small = 1232;
+  const t2 = new WebRtcTransport(ep, sig, { pipes: true, pipeBatch: small });
+  const h2 = t2.pipe('cd'.repeat(32));
+  const queue = (n, bytes) => {
+    for (let i = 0; i < n; i++) ep.onTransmit(h2, new Uint8Array(bytes));
+  };
+  await idle();
+  from = out.length;
+  queue(13, 100); // the 13th fills a batch (1300 B): 12 go at once, the 13th PIPE_FLUSH_MS later
+  if (batches(from) !== '12') fail(`with pipeBatch ${small}, 13 datagrams of 100 B went as ${batches(from) || 'nothing'} at once`);
+  await advance(PIPE_FLUSH_MS);
+  if (batches(from) !== '12,1') fail(`then ${batches(from)}`);
+  await idle();
+  from = out.length;
+  queue(1, 1000);
+  queue(1, 300);
+  await advance(PIPE_FLUSH_MS);
+  if (batches(from) !== '1,1' || out.slice(from).some(([, , n]) => n > small)) fail(`1000 B and 300 B went as ${batches(from)}`);
+  await idle();
+  from = out.length;
+  free = now + 500;
+  const dropped = t2.piped.dropped;
+  queue(20, 1000); // 8 batches' worth queue (9856 B): 9 datagrams of 1000 B
+  if (t2.piped.dropped - dropped !== 11) fail(`with signalling busy, ${t2.piped.dropped - dropped} of 20 datagrams of 1000 B dropped, not 11`);
+  free = 0;
+  await advance(2000);
+  if (batches(from) !== '1,1,1,1,1,1,1,1,1') fail(`then ${batches(from)}`);
+  t2.close();
+  console.log(`pipeBatch ${small}: batches of ${small} B of datagrams at most, a queue of 8 of them; 0, 1.5, ${PIPE_BATCH + 1} and a string a TypeError`);
+}
 console.log('pipe batches: all passed');
 process.exit(0);

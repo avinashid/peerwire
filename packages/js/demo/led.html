@@ -2,7 +2,7 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Peerwire: a board's LED over Bluetooth</title>
+<title>Peerwire: a board's LED, over Bluetooth or the internet</title>
 <style>
   :root { color-scheme: dark; --bg: #0f1117; --panel: #181b24; --line: #2a2f3d; --text: #e6e8ee; --dim: #8b91a3; }
   * { box-sizing: border-box; }
@@ -11,7 +11,7 @@
   h1 { font-size: 18px; margin: 0 0 4px; }
   p { margin: 0 0 14px; color: var(--dim); }
   label { display: block; color: var(--dim); font-size: 13px; }
-  input { width: 100%; margin: 2px 0 10px; padding: 8px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+  input, select { width: 100%; margin: 2px 0 10px; padding: 8px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; font: inherit; }
   button { padding: 12px 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; }
   button:disabled { opacity: 0.4; }
   #connect { width: 100%; margin-bottom: 12px; }
@@ -20,8 +20,13 @@
   #log { height: 40vh; overflow: auto; margin: 0; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
 </style>
 <main>
-  <h1>A board's LED over Bluetooth</h1>
-  <p>Links with an ESP32 running <code>ble_led</code> over Bluetooth alone, no network, and switches its LED.</p>
+  <h1>A board's LED</h1>
+  <p>Links with an ESP32 board and switches its LED: over Bluetooth alone when it is near (<code>ble_led</code>), or
+    over the room's Nostr relays alone from anywhere, when it is on Wi-Fi in the room.</p>
+  <label>Via <select id="via">
+    <option value="bluetooth">Bluetooth (the board is near)</option>
+    <option value="internet">Internet (the board is on Wi-Fi)</option>
+  </select></label>
   <label>App <input id="app" autocomplete="off"></label>
   <label>Room <input id="room" autocomplete="off"></label>
   <button id="connect">Connect to the board</button>

@@ -51,6 +51,12 @@ and the commit that fixed it.
   `peerwire_ffi_ble.wasm` (`BLUETOOTH_WASM`), with `BleLink`. The `led.html` demo switches a board's LED.
   After Bluetooth went off and on, Android Chrome hands back a dead connection the page can't clear: `dial` then
   fails at once with `'stale'`, and reloading the page clears it (NB-127).
+- **Native peers over the relays** (NB-126, [RelayTransport](docs/reference/javascript.md#relaytransport)):
+  `RelayTransport` links a page with a native room member (a Rust node, a board on Wi-Fi) over the room's Nostr relays
+  alone, from anywhere: it says hello as a native peer does, lists the native peers whose hellos prove the room key, and
+  dials one over the signalling pipe, with batches of 1232 bytes of datagrams at most (`NATIVE_BATCH`), which a
+  board's 4 KB relay frame takes. `WebRtcTransport` has a `pipeBatch` option for it. The `led.html` demo switches a
+  board's LED over Bluetooth or over the internet.
 
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 

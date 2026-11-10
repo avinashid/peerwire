@@ -43,7 +43,10 @@ export const RTC_SAME_NAT_FALLBACK_MS = 3000;
 // background tab's timers fire once a second), the oldest is dropped. Batches are sent
 // lossy. close() sends what waits as one last batch per pipe, past the budget, for at
 // most PIPE_CLOSE_BATCHES pipes, those that queued last first, and not lossy: nothing
-// can send them again.
+// can send them again. A transport made with a smaller `pipeBatch` (a native peer's
+// relay frame is small, see relay_link.js) holds its batches to that, and its queue to
+// as many of them as PIPE_QUEUE holds of PIPE_BATCH; a datagram bigger than a batch
+// still goes, alone.
 export const PIPE_FLUSH_MS = 40;
 export const PIPE_BATCH = 16 * 1024;
 export const PIPE_RATE = 6;
@@ -51,7 +54,8 @@ export const PIPE_BURST = 12;
 export const PIPE_QUEUE = 128 * 1024;
 export const PIPE_CLOSE_BATCHES = 16;
 const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
-const full = (p) => p.bytes >= PIPE_BATCH || p.q.length >= MAX_PIPE_ITEMS; // a pipe's queue fills a batch
+const MAX_DATAGRAM_B64 = 4 * Math.ceil(MAX_DATAGRAM / 3); // base64 of a datagram, padded
+const full = (p, batch) => p.bytes >= batch || p.q.length >= MAX_PIPE_ITEMS; // a pipe's queue fills a batch
 const unflush = (p) => {
   clearTimeout(p.timer?.id);
   p.timer = null;
@@ -310,7 +314,8 @@ export class WebRtcTransport {
   //   IPv4), or ICE failed. For a retry (see retry()): 'retry-failed' instead, and 'retry'
 //   when the other side asks us, the dialling side, for one.
   // `pipes`: carry datagrams over signalling for peers allowed with allowPipe().
-  // `rtc`: the WebRTC paths allowed, { direct, turn } (both by default). A connection gets the iceServers
+  // `pipeBatch`: the bytes of datagrams a pipe batch carries at most, 1 to PIPE_BATCH (the default).
+  // `rtc`:the WebRTC paths allowed, { direct, turn } (both by default). A connection gets the iceServers
   //   its paths use (STUN with `direct`, TURN with `turn`), and relay candidates alone without `direct`
   //   (see config()). Ours follow what dial() is given; one we answer, `rtc`, without TURN when the offer
   //   says `turn: false` (a dial without TURN: the peer tries TURN later, or not at all).
@@ -319,8 +324,9 @@ export class WebRtcTransport {
   //   'ice-batch-sent', 'ice-batch-received'; detail has candidateSummary counts),
   //   of ICE ('ice-state', 'candidate-error') and 'same-nat' ({ ip, ms }: the peer
   //   has our public IPv4, so the link falls back after `ms`).
-  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, pipes = false, rtc = { direct: true, turn: true }, fallbackMs = RTC_FALLBACK_MS, sameNatFallbackMs = RTC_SAME_NAT_FALLBACK_MS, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
+  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, pipes = false, pipeBatch = PIPE_BATCH, rtc = { direct: true, turn: true }, fallbackMs = RTC_FALLBACK_MS, sameNatFallbackMs = RTC_SAME_NAT_FALLBACK_MS, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
     if (!['direct', 'public-only', 'relay-only'].includes(privacy)) throw new Error(`unknown privacy mode: ${privacy}`);
+    if (!Number.isInteger(pipeBatch) || pipeBatch < 1 || pipeBatch > PIPE_BATCH) throw new TypeError(`pipeBatch: an integer from 1 to ${PIPE_BATCH}`);
     if (privacy === 'relay-only' && !isPeerId(relay)) throw new TypeError("privacy 'relay-only' needs a relay peer id");
     this.ep = endpoint;
     this.Pc = RTCPeerConnection;
@@ -350,6 +356,8 @@ export class WebRtcTransport {
     this.fallbackMs = fallbackMs;
     this.sameNatMs = Math.min(sameNatFallbackMs, fallbackMs);
     this.pipesOn = pipes;
+    this.pipeBatch = pipeBatch;
+    this.pipeQueue = (PIPE_QUEUE / PIPE_BATCH) * pipeBatch;
     this.pipes = new Map(); // handle -> pipe (see pipe())
     this.pipeByPeer = new Map(); // peer hex -> handle
     this.pipeAllowed = new Set(); // peers whose datagrams over signalling we take
@@ -999,15 +1007,20 @@ export class WebRtcTransport {
     return this.seen.get(peer) ?? (l?.pc.remoteDescription ? { mine: l.mine, theirs: l.theirs } : null);
   }
 
-  // Lets `peer` (one that proved the room key) send us datagrams over signalling.
+  // Lets `peer` (one that proved the room key) send us datagrams over signalling. Past MAX_PIPE_PEERS, the peer allowed
+  // longest ago that has no session goes, and its pipe; a peer with one stays allowed, as its link may run over the
+  // pipe, so with every allowed peer linked, the newcomer isn't allowed.
   allowPipe(peer) {
     if (!this.pipesOn || this.pipeAllowed.has(peer)) return;
     this.pipeAllowed.add(peer);
     if (this.pipeAllowed.size <= MAX_PIPE_PEERS) return;
-    const old = this.pipeAllowed.values().next().value;
-    this.pipeAllowed.delete(old);
-    // Its pipe goes too, unless a session uses it: pipes stay bounded by the allowed set and our links.
-    if (!this.ep.isConnected(old)) this.dropPipe(old);
+    for (const old of this.pipeAllowed) {
+      if (old === peer || this.ep.isConnected(old)) continue;
+      this.pipeAllowed.delete(old);
+      this.dropPipe(old);
+      return;
+    }
+    this.pipeAllowed.delete(peer);
   }
 
   isPipe(handle) {
@@ -1030,13 +1043,13 @@ export class WebRtcTransport {
     p.bytes += bytes.length;
     p.queued = ++this.pipeQueued;
     // Like a full UDP buffer: drop the oldest and let congestion control back off.
-    while (p.bytes > PIPE_QUEUE && p.q.length > 1) {
+    while (p.bytes > this.pipeQueue && p.q.length > 1) {
       p.bytes -= p.q.shift()[1];
       this.piped.dropped++;
     }
     // A full batch goes now, if the rate allows, not after PIPE_FLUSH_MS: a background tab
     // fires that timer once a second at most.
-    if (!full(p)) return this.pipeFlushSoon(p);
+    if (!full(p, this.pipeBatch)) return this.pipeFlushSoon(p);
     unflush(p);
     this.pipeFlush(p);
   }
@@ -1082,13 +1095,13 @@ export class WebRtcTransport {
     this.pipeRefilled = now;
     if (this.pipeTokens < 1 && !last) return this.pipeFlushSoon(p, Math.ceil(((1 - this.pipeTokens) * 1000) / PIPE_RATE));
     this.pipeTokens -= 1;
-    while (last && (p.q.length > MAX_PIPE_ITEMS || (p.bytes > PIPE_BATCH && p.q.length > 1))) {
+    while (last && (p.q.length > MAX_PIPE_ITEMS || (p.bytes > this.pipeBatch && p.q.length > 1))) {
       p.bytes -= p.q.shift()[1];
       this.piped.dropped++;
     }
     const d = [];
     let n = 0;
-    while (p.q.length && d.length < MAX_PIPE_ITEMS && (n === 0 || n + p.q[0][1] <= PIPE_BATCH)) {
+    while (p.q.length && d.length < MAX_PIPE_ITEMS && (n === 0 || n + p.q[0][1] <= this.pipeBatch)) {
       const [s, len] = p.q.shift();
       n += len;
       d.push(s);
@@ -1103,22 +1116,30 @@ export class WebRtcTransport {
     if (p.q.length) this.pipeFlushSoon(p);
   }
 
+  // A batch from `from`: taken only from a peer allowed one, and only whole: 1 to MAX_PIPE_ITEMS strings, each base64
+  // of 1 to MAX_DATAGRAM bytes (its length bounded before it is decoded). Each datagram goes to the endpoint on
+  // `from`'s own pipe, as from `from` alone, so a peer can't carry another's packets.
   pipeReceive(from, d) {
-    if (!this.pipeAllowed.has(from) || !Array.isArray(d) || d.length > MAX_PIPE_ITEMS) return void this.badSignals++;
+    if (!this.pipeAllowed.has(from) || !Array.isArray(d) || d.length < 1 || d.length > MAX_PIPE_ITEMS) return void this.badSignals++;
     // The peer's own DataChannel opened late and carries its datagrams now: these were
     // sent before, and taking them would move the link back onto the pipe for a while.
     const own = this.links.get(this.byPeer.get(from));
     if (own?.heard && own.dc.readyState === 'open') return void (this.piped.stale += d.length);
-    const h = this.pipe(from);
-    if (h === null) return void this.badSignals++;
+    const got = [];
     for (const s of d) {
-      if (typeof s !== 'string' || s.length > (MAX_DATAGRAM * 4) / 3 + 4) return void this.badSignals++;
+      if (typeof s !== 'string' || s.length > MAX_DATAGRAM_B64) return void this.badSignals++;
       let bytes;
       try {
         bytes = unb64(s);
       } catch {
         return void this.badSignals++;
       }
+      if (bytes.length < 1 || bytes.length > MAX_DATAGRAM) return void this.badSignals++;
+      got.push(bytes);
+    }
+    const h = this.pipe(from);
+    if (h === null) return void this.badSignals++;
+    for (const bytes of got) {
       this.piped.received++;
       this.ep.receive(h, bytes, from);
     }

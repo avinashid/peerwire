@@ -75,6 +75,7 @@ NODE=(
   "node rust hello|node packages/js/test/rust_hello.mjs"
   "node rust doc|node packages/js/test/rust_doc.mjs"
   "node bluetooth|node packages/js/test/bluetooth.mjs"
+  "node relay link|node packages/js/test/relay_link.mjs"
   "node room proof|node packages/js/test/room_proof.mjs"
   "node pump re-arm|node packages/js/test/pump_rearm.mjs"
   "node endpoint closed|node packages/js/test/endpoint_closed.mjs"
