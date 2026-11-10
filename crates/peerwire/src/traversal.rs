@@ -302,11 +302,11 @@ pub enum PathKind {
     /// [`Policy::default`].
     Bluetooth,
     /// Over the signaling relays ([`Builder::signaling`](crate::Builder::signaling)): the peer's datagrams sealed to
-    /// it in the room's carrier, as a browser's `'signaling'` path sends them (a *pipe*, `docs/concepts/pipes.md`).
-    /// Slow (a relay's round trip each way) and rate-limited, a last resort: a browser, which can't send UDP, links
-    /// with a native peer this way. The node takes a pipe link from a room member that dials it; it doesn't dial over
-    /// one itself. A link on it punches to the peer's addresses and moves off it, as on [`Bluetooth`](Self::Bluetooth).
-    /// Off under [`Privacy::RelayOnly`], and not in [`Policy::default`].
+    /// it in the room's carrier, as a browser's `'signaling'` path sends them (a *pipe*, see
+    /// `docs/guides/connection-paths.md`). Slow (a relay's round trip each way) and rate-limited, a last resort: a
+    /// browser, which can't send UDP, links with a native peer this way. The node takes a pipe link from a room member
+    /// that dials it; it doesn't dial over one itself. A link on it punches to the peer's addresses and moves off it,
+    /// as on [`Bluetooth`](Self::Bluetooth). Off under [`Privacy::RelayOnly`], and not in [`Policy::default`].
     Signaling,
 }
 

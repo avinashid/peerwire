@@ -1404,9 +1404,12 @@ dependencies = [
 name = "peerwire-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ed25519-dalek",
+ "hmac",
  "rand_chacha",
  "rand_core",
+ "sha2",
  "snow",
 ]
 

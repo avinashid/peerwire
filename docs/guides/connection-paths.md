@@ -13,7 +13,7 @@ change both while the app runs.
 | TURN | `'turn'` | `Turn` | your TURN server (coturn, Cloudflare TURN, …): in `iceServers`, or `Node::set_turn_servers` | the server's bandwidth; it sees both addresses |
 | Another peer | `'peers'` | `Peers` | a member linked directly to both | that member's upload, and a detour |
 | Your relay peer | none | `RelayPeers` | your own always-on `peerwire-peer` ([always-on peer](always-on-peer.md)) | its upload, and a detour |
-| Signalling | `'signaling'` | none | the Nostr relays the room meets on, as sealed events | slow and rate-limited: a last resort |
+| Signalling | `'signaling'` | `Signaling` (taken, not dialled) | the Nostr relays the room meets on, as sealed events | slow and rate-limited: a last resort |
 
 In Rust, `Birthday` is the extra punching for symmetric NATs (see [NAT traversal](../concepts/nat-traversal.md));
 in JavaScript it comes with `'direct'` (`birthday: false` turns it off). Rust's TURN client is in the `peerwire`
@@ -138,7 +138,10 @@ way: links stay up, and the node says hello on the new one. `set_policy(None)` g
 - Rust's TURN client speaks UDP only (no `turns:` over TCP or TLS), and doesn't move a TURN link to a relay peer
   (under `Privacy::RelayOnly`, only once its allocation is gone). New credentials for a server make a new
   allocation, at a new relayed address, so its links move or close as when a server is dropped.
-- The `'signaling'` path is JavaScript's; a Rust node uses signalling to meet peers, not to carry a link.
+- A Rust node takes a link over signalling (`Signaling`, a *pipe*) from a room member that dials it, as a browser does
+  to reach a native node it can't send UDP to, but doesn't dial over one: between two Rust nodes it never comes up.
+  It sends at most 4 batches a second, each one datagram of up to 1232 bytes or several smaller ones (a board takes
+  relay messages of 4 KB at most), from 64 pipes at once (4 on an ESP32), and takes them from room members alone.
 - After a link moves off a member, the peer can still send through that member for a while: the core takes relayed
   packets from any member that forwards them.
 - In JavaScript, `privacy` is set when the room is joined; `setPolicy` refuses a different one.

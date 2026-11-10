@@ -8,9 +8,11 @@
 //! ```
 //!
 //! It joins `lan_chat`'s rooms, so `lan_chat kitchen` on the same LAN is in the room too,
-//! and so is the ESP32 port on Wi-Fi, in the room its flash names. Type a line to send it to everyone
-//! in the room. Anyone who guesses the room's name can join it, so pick one others can't
-//! guess.
+//! and so is the ESP32 port on Wi-Fi, in the room its flash names, and a browser on the LED page,
+//! which links over the relays (a pipe). Type a line to send it to everyone in the room. Anyone who
+//! guesses the room's name can join it, so pick one others can't guess. `PW_RELAYS` (relay URLs,
+//! comma-separated) replaces the default relays: `ws://127.0.0.1:7447` for the `nostr_relay`
+//! example, with no internet.
 
 use peerwire::{Event, LanSignaling, Lane, MultiSignaling, Node, NostrSignaling};
 use std::sync::mpsc;
@@ -20,7 +22,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let room = args.next().unwrap_or_else(|| "lobby".into());
     let bind = args.next().unwrap_or_else(|| "0.0.0.0:0".into());
-    let both = MultiSignaling::new(vec![Box::new(LanSignaling::new()?), Box::new(NostrSignaling::default())]);
+    let nostr = match std::env::var("PW_RELAYS") {
+        Ok(urls) => NostrSignaling::new(urls.split(',').map(str::trim).filter(|u| !u.is_empty())),
+        Err(_) => NostrSignaling::default(),
+    };
+    let both = MultiSignaling::new(vec![Box::new(LanSignaling::new()?), Box::new(nostr)]);
     let mut node = Node::builder().signaling(both).bind(bind)?;
     node.join_room("peerwire-lan-chat", &room);
     println!("{} in room {room:?} on {}", node.peer_id(), node.local_addr());
