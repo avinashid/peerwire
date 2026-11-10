@@ -70,6 +70,12 @@ export const DEMOS = [
       'the arrow keys).',
     how: 'Tabs of one browser.',
   },
+  {
+    page: 'led.html', name: 'Bluetooth LED',
+    blurb: 'Web Bluetooth: pick a board running the ble_led example, join its room over Bluetooth alone and ' +
+      'switch its LED.',
+    how: 'Android Chrome and an ESP32-C3 nearby.',
+  },
 ];
 
 // The first site's pages, which links elsewhere may still name, and where each is now.

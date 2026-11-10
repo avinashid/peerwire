@@ -264,8 +264,10 @@ const built = buildSite({ root: ROOT, out });
 const { id, pages, assets, redirects, docs, sizes } = built;
 const read = (p) => fs.readFileSync(path.join(out, p), 'utf8');
 const demos = pages.filter((p) => p.startsWith('demo/'));
-check(demos.sort().join(' ') === 'demo/arena.html demo/chat.html demo/index.html demo/netlab.html demo/poll.html' &&
-  !assets.some((a) => /crew/.test(a)), `the demos are index, chat, poll, arena and netlab, not crew (${demos.join(' ')})`);
+check(demos.sort().join(' ') ===
+  'demo/arena.html demo/chat.html demo/index.html demo/led.html demo/netlab.html demo/poll.html' &&
+  !assets.some((a) => /crew/.test(a)) && assets.some((a) => /peerwire_ffi_ble\.wasm$/.test(a)),
+  `the demos are index, chat, poll, arena, netlab and led (with the Bluetooth module), not crew (${demos.join(' ')})`);
 const index = readIndex(ROOT);
 const listed = index.groups.flatMap((g) => g.items);
 const want = ['docs/index.html', ...listed.map((i) => i.source.replace(/\.md$/, '.html'))];
@@ -373,9 +375,9 @@ check(['js', 'react', 'rust', 'godot'].every((t) => landing.includes(`<input typ
   landing.includes(`<strong>${wasmShown}</strong>`) && landing.includes(`as a ${wasmShown} WebAssembly module`) &&
   sizes.wasm === wasmKb && sizes.gzip < wasmKb && landing.includes('<code>room.doc()</code>') &&
   landing.includes('id="demos"') && (landing.match(/<li class="feature">/g) ?? []).length === 6 &&
-  (landing.match(/<li class="demo">/g) ?? []).length === 5,
+  (landing.match(/<li class="demo">/g) ?? []).length === 6,
   `the landing page: four code tabs, highlighted (one checked), npm install, 6 features, the wasm's measured size ` +
-  `(${wasmKb} KB, shown ${wasmShown}), 5 demos`);
+  `(${wasmKb} KB, shown ${wasmShown}), 6 demos`);
 
 // Docs on a copy of this repo, with a docs/README.md of its own that lists one more page, docs/A.md. What the build
 // reads is copied, since it refuses a symlink there (NB73-I1); the rest, which docs only link to, is symlinks to this
