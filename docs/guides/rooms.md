@@ -86,7 +86,7 @@ messages, and it doesn't have to be trusted.
 
 | Carrier | Where | Reaches |
 |---|---|---|
-| Nostr relays | JS `signaling: 'nostr'`; Rust `NostrSignaling` (feature `nostr`); Godot by default | anyone on the internet. Defaults: `wss://nos.lol`, `wss://relay.primal.net`, `wss://nostr.mom` |
+| Nostr relays | JS `signaling: 'nostr'`; Rust `NostrSignaling` (feature `nostr`); Godot by default | anyone on the internet. Defaults: `wss://relay.primal.net`, `wss://relay.nostr.net`, `wss://nostr.oxtr.dev` |
 | BroadcastChannel | JS `signaling: 'local'` (the default) | tabs of one browser, or one Node process and its workers |
 | LAN multicast | Rust `LanSignaling` | the local network, with no internet: see [LAN discovery](lan-discovery.md) |
 | In-process | Rust `MemoryHub` | nodes in one process, for tests |

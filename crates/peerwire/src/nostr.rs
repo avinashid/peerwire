@@ -25,8 +25,11 @@ use tungstenite::Message;
 
 /// Ephemeral event kind used by Peerwire signaling.
 pub const KIND: u64 = 25059;
-/// Relays [`NostrSignaling::default`] connects to.
-pub const DEFAULT_RELAYS: &[&str] = &["wss://nos.lol", "wss://relay.primal.net", "wss://nostr.mom"];
+/// Relays [`NostrSignaling::default`] connects to: three operators (Primal, nostr.net, 0xtr) on
+/// two networks. Each took and passed on our kind-25059 events and kept a kind-30078 one when
+/// checked on 14 Nov 2026. nos.lol and nostr.mom, the defaults before, now drop our events of
+/// both kinds with no `OK` and pass none on.
+pub const DEFAULT_RELAYS: &[&str] = &["wss://relay.primal.net", "wss://relay.nostr.net", "wss://nostr.oxtr.dev"];
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a relay thread blocks reading before it looks at its queue again.
