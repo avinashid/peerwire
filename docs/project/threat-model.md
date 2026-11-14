@@ -201,8 +201,8 @@ release of each.
 | NB126-3 (Low), NB126-T1 (Info) | **Fixed** by `0663176` before NB-126 merged, so never on main (while pipe batches wait for the shared rate, `Node::next_timeout` is when the next token comes, not 0, so a host that sleeps on it doesn't spin; a test binds a pipe's datagrams to its sender), reviewed 2026-11-10, same section |
 | NB126-I1 (Info) | Accepted for v1 by the lead on 2026-11-10, narrowed by NB-129 (`7e611cb`, `7a50409`): the LED page joins as a client and the board as a host, so the page takes a member that joins as a host, not another page, for the board, and shows its messages as the board's. Pinning the board's PeerId comes in v2, same section |
 | NB129-I1 (Info) | **Fixed** by `37a8ce4`: `RoomProof.checkHello` read the roles `constructor`, `toString`, `valueOf` and `__proto__` as role byte 0, so a member's `peer` hello relabelled with one verified; nothing acted on it, reviewed 2026-11-14, same section |
-| NB132-1 (Low) | Open: in a room, offers from new keys that each plan a punch, with a few hellos, push an invite dial out of the peers a node remembers before it links (a cap of 32, an ESP32's), so its answer is dropped and its link refused; fix: evict no invited peer, [Per-peer state a node keeps](#per-peer-state-a-node-keeps-nb-132--nb132-1-nb132-i1) |
-| NB132-I1 (Info) | Open, proposed for acceptance: about a cap's worth of hellos and offers from new ids pushes out a member whose hello was answered before its handshake completes, and its link is refused; anyone with the room key could already hold joins off by spending the budgets, same section |
+| NB132-1 (Low) | **Fixed** by `96e2f55` before NB-132 merged, so never on main: a node evicts no peer it dialled by invite or reaches over a radio, as no linked one, so offers that plan punches no longer push an invite dial out before it links (a cap of 32, an ESP32's), reviewed 2026-11-14, [Per-peer state a node keeps](#per-peer-state-a-node-keeps-nb-132--nb132-1-nb132-i1) |
+| NB132-I1 (Info) | Accepted for v1 by the lead on 2026-11-14: about a cap's worth of hellos and offers from new ids pushes out a member whose hello was answered before its handshake completes, and its link is refused until its next hello; anyone with the room key could already hold joins off by spending the budgets, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -6340,7 +6340,8 @@ unless it has a cap on how many. A board in a room on the relays lost free heap 
 first links and never got it back (NB-132); `2ba843f` bounds three stores in
 `crates/peerwire`. Reviewed on 2026-11-14 by reading `2ba843f`. A scratch copy ran two
 unit tests of the review's own, to reproduce NB132-1 and NB132-I1, then the fix proposed
-for NB132-1 with the crate's library tests; nothing else was re-run.
+for NB132-1 with the crate's library tests; nothing else was re-run. Its fix, `96e2f55`,
+was read the same day.
 
 **What holds.**
 
@@ -6351,14 +6352,15 @@ for NB132-1 with the crate's library tests; nothing else was re-run.
   `max_links`, from 32 to 1024 (32 on an ESP32's 8 links), after every signal and every
   timeout. Past the cap it trims to 7/8 of it: first the peers not linked with nothing
   under way, least lately active first (the later of `seen_at` and `offered_at`), then
-  those with a dial step, a punch or an invite under way (`ladder`, `plan`, `invited`);
-  a linked peer stays. A `Remote` is 224 bytes inline, 416 before `plan` and `ladder`
-  were boxed (by `size_of` on a 64-bit host, the author's figures). On a PC `max_links`
-  is unlimited by default, so the cap is 1024, and signalling adds at most about 660
-  peers in `FORGET`'s 10 minutes (**theoretical**: a burst of 30 from each of the hello
-  and offer budgets, then one of each every 2 s), so `FORGET` still decides there. By
-  its author's run, `tests/heap_churn.rs` (ignored by default) finds a node's live heap
-  level after about 30 page visits and flat through 781 hellos.
+  those with a dial step or a punch under way (`ladder`, `plan`). A linked peer stays,
+  and since `96e2f55` so does one dialled by invite or reached over a radio (NB132-1). A
+  `Remote` is 224 bytes inline, 416 before `plan` and `ladder` were boxed (by `size_of`
+  on a 64-bit host, the author's figures). On a PC `max_links` is unlimited by default,
+  so the cap is 1024, and signalling adds at most about 660 peers in `FORGET`'s 10
+  minutes (**theoretical**: a burst of 30 from each of the hello and offer budgets, then
+  one of each every 2 s), so `FORGET` still decides there. By its author's run,
+  `tests/heap_churn.rs` (ignored by default) finds a node's live heap level after about
+  30 page visits and flat through 781 hellos.
 - **What an evicted peer loses.** Offer nonces are kept apart, node-wide, for 2 minutes
   (`MAX_NONCES`, 1024), so an evicted sender's offers are still checked for replay, and
   the node-wide hello, offer and inbox budgets stay as they were. What starts over is
@@ -6374,10 +6376,10 @@ for NB132-1 with the crate's library tests; nothing else was re-run.
   to be the event's SHA-256 (`on_relay_message`). Two events with the same 16 bytes take
   about 2^64 hashes of events one writes oneself, and the second is then dropped as a
   copy; matching another's event, which isn't known until it is sent, takes about 2^128.
-  A node remembers 128 ids on an ESP32 and 4096 elsewhere: on a C3 about 8.4 KB for the
-  128, against about 25 KB as strings (**theoretical**: a table of 256 slots of 16
-  bytes, and a queue that grows to 256 slots, as it holds 129 ids before it drops the
-  oldest).
+  A node remembers 128 ids on an ESP32 and 4096 elsewhere: on a C3 about 6.4 KB for the
+  128, against about 25 KB as strings (**theoretical**: a table of 256 slots of 16 bytes
+  and a queue of 128). At `2ba843f` the queue took the 129th id before it dropped the
+  oldest, so it grew to 256 slots, about 8.4 KB; `96e2f55` drops first.
 - **Pipes.** A pipe whose peer isn't linked, with nothing queued and unused for 60 s, is
   closed at the next flush (`Pipes::prune`); before, it lasted until `MAX_PIPES` others
   pushed it out. A batch in or a datagram out counts as use, so a handshake under way
@@ -6407,7 +6409,16 @@ for a peer a radio connection reaches, bounded by the connections held. The revi
 test passed with that change, as did the crate's 180 library tests, the cap's own among
 them.
 
-**Status: open** (Low), reported on NB-132 at `2ba843f`.
+**Status: fixed** by `96e2f55` before NB-132 merged, so never on main, reviewed
+2026-11-14: `cap_remotes` skips a peer dialled by invite (`invited`) or reached over a
+radio as it skips a linked one, and puts last only those with a dial step or a punch
+under way. The review's test is in as
+`an_invite_dial_outlasts_offers_that_plan_punches`: after the burst at most 32 peers are
+remembered, the invite dial is still admitted, and its plain answer is taken. Only
+`Node::connect` sets `invited`, and only `radio_reaches` adds a radio connection, once
+it proved the peer at its other end, at most `MAX_RADIO` a peer and gone when the
+connection closes; both kinds still go after `FORGET`. Its author's runs: the crate's
+183 library tests.
 
 **NB132-I1 — A burst pushes out a member that hasn't linked yet (Info).** A member whose
 hello the node answered, or whose offer it acted on, has no link until its handshake
@@ -6422,10 +6433,10 @@ refill; at their steady rate, one peer a second, 32 take longer than a join. Any
 the room key could already hold off joins by spending those budgets (NB43-I2); this
 cancels one already under way, and the member's next hello brings it back once a token
 is free. No order of eviction tells a member from an attacker's new ids: keeping the
-proof the link needs would mean carrying it in the handshake, a wire change. Proposed:
-accept for v1.
+proof the link needs would mean carrying it in the handshake, a wire change.
 
-**Status: open** (Info), reported on NB-132 at `2ba843f`; proposed for acceptance.
+**Status: accepted** for v1 by the lead on 2026-11-14: the member's next hello brings it
+back, and a fix needs the proof in the handshake, a wire change.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
