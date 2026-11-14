@@ -42,6 +42,9 @@ and the commit that fixed it.
   it, `wifi::join_within` and `Board::connect_within` give up on a network that isn't there, and the `ble` and
   `ble_led` examples try a saved network for 20 s, then go on over Bluetooth alone.
   `Traversal::handle_radio_signal`, `Traversal::clock_from_peer` and `traversal::CLOCK_SET_AFTER_MS` are new.
+- `peerwire-esp`: `NOSTR_RELAY` is `wss://relay.primal.net`, and the `nostr_led` example joins its room over it as a
+  `Role::Host`, so the LED page, a client, links with the board, and two phones' pages don't link with each other
+  (NB-129). nostr.mom, the relay before, took the board's and the pages' signalling events and passed none on.
 
 ## Unreleased: `@peerwire/js`
 
@@ -57,6 +60,9 @@ and the commit that fixed it.
   dials one over the signalling pipe, with batches of 1232 bytes of datagrams at most (`NATIVE_BATCH`), which a
   board's 4 KB relay frame takes. `WebRtcTransport` has a `pipeBatch` option for it. The `led.html` demo switches a
   board's LED over Bluetooth or over the internet.
+  Its `role` option (`'peer'`, the default, `'host'` or `'client'`, as Rust's `Role`) is the role its hello says, and
+  it lists only the native peers that role may link with. The `led.html` demo joins as a client, so a second phone's
+  page links with the board, not with the first phone's page (NB-129).
 
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 
