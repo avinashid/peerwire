@@ -79,7 +79,8 @@ export class RoomProof {
 
   async checkHello(from, meta, now = Date.now()) {
     if (typeof from !== 'string' || !/^[0-9a-f]{64}$/.test(from)) return false;
-    const role = ROLES[meta?.role];
+    // Its own keys only: 'constructor' or 'toString' would MAC as role byte 0, a peer's hello relabelled.
+    const role = Object.hasOwn(ROLES, meta?.role) ? ROLES[meta.role] : undefined;
     const ts = meta?.ts;
     if (role === undefined || !Number.isSafeInteger(ts) || ts < 0 || Math.abs(now - ts) > FRESH_MS) return false;
     return this.check('pw-hello', [id(from), [role], u64le(ts)], meta.p);

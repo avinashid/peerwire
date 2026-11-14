@@ -50,6 +50,8 @@ const bad = [
   ['another room', id, await other.hello(id, 'peer', ts), ts],
   ['another sender', 'cd'.repeat(32), meta, ts],
   ['another role', id, { ...meta, role: 'host' }, ts],
+  // A role that isn't one: Object's own names once read as role byte 0, so a peer's hello passed relabelled.
+  ...['constructor', 'toString', 'valueOf', '__proto__', 'boss'].map((r) => [`role ${r}`, id, { ...meta, role: r }, ts]),
   ['another time', id, { ...meta, ts: ts + 1 }, ts],
   ['no proof', id, { role: 'peer', ts }, ts],
   ['no meta', id, undefined, ts],

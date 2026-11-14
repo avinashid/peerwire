@@ -199,7 +199,8 @@ release of each.
 | NB126-1 (Low) | **Fixed** by `38ceded` and `9160362` before NB-126 merged, so never on main (an LED board on the internet has no default room and won't start in a guessable one; the LED page's internet way has no default room and warns on a guessable name), reviewed 2026-11-10, [Links over the signalling relays](#links-over-the-signalling-relays-to-native-nodes-nb-126--nb126-1nb126-3) |
 | NB126-2 (Low) | Open: one event over 4 KiB on a board's topics closes its relay socket (NB-095's residual), and since NB-126 that cuts a page's link over the relays, its only path to the board; card NB-128, same section |
 | NB126-3 (Low), NB126-T1 (Info) | **Fixed** by `0663176` before NB-126 merged, so never on main (while pipe batches wait for the shared rate, `Node::next_timeout` is when the next token comes, not 0, so a host that sleeps on it doesn't spin; a test binds a pipe's datagrams to its sender), reviewed 2026-11-10, same section |
-| NB126-I1 (Info) | Accepted for v1 by the lead on 2026-11-10: the LED page takes the first native member it hears as the board, and shows any linked member's messages as the board's; two pages dialling each other is accepted too. Pinning the board's PeerId comes in v2 with the roles of client and host, same section |
+| NB126-I1 (Info) | Accepted for v1 by the lead on 2026-11-10, narrowed by NB-129 (`7e611cb`, `7a50409`): the LED page joins as a client and the board as a host, so the page takes a member that joins as a host, not another page, for the board, and shows its messages as the board's. Pinning the board's PeerId comes in v2, same section |
+| NB129-I1 (Info) | **Fixed** by `37a8ce4`: `RoomProof.checkHello` read the roles `constructor`, `toString`, `valueOf` and `__proto__` as role byte 0, so a member's `peer` hello relabelled with one verified; nothing acted on it, reviewed 2026-11-14, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -3519,14 +3520,19 @@ Residuals:
 `MultiSignaling` (`crates/peerwire/src/signaling.rs`) is one carrier over several: it
 subscribes and publishes on each and polls them in turn, so a node on `LanSignaling` and
 `NostrSignaling` has one room with the peers of both. With it the ESP32 firmware on
-Wi-Fi joins the room its flash names over the LAN and the relay `wss://nostr.mom`, with
-STUN on (the default servers, Google's and Cloudflare's); with no room named it stays on
-the LAN, in room `esp32`, with STUN off, as before NB-095 (`d5c2cfb`).
+Wi-Fi joins the room its flash names over the LAN and the relay `NOSTR_RELAY`, with STUN
+on (the default servers, Google's and Cloudflare's); with no room named it stays on the
+LAN, in room `esp32`, with STUN off, as before NB-095 (`d5c2cfb`).
 `examples/rust/room_chat.rs` does the same on a PC. `NostrSignaling` now builds for
 ESP-IDF. There its relay stream owns its one socket, as ESP-IDF can't duplicate one; it
 takes relay messages of up to 4 KiB and keeps 32 received events or 16 KiB of them, 128
 seen ids and 8 queued (`Limits::SMALL`, `0b909e3`); and its relay thread asks for a
-32 KB stack.
+32 KB stack. `NOSTR_RELAY` was `wss://nostr.mom` until NB-129 and is
+`wss://relay.primal.net` since (`a83ab33`), as nostr.mom took the board's and the pages'
+kind-25059 events and passed none on. Its operator sees the board's public address, when
+it is online, its room and inbox tags and the size and timing of its events: the move
+changed which operator that is, not what it sees. Both are among the default relays of
+Rust and JavaScript, whose peers publish to all of them, so nostr.mom still sees theirs.
 
 Reviewed 2026-11-04 by reading `8b089c2`, `027e4cf`, `fa71e65`, `04c20cb` and `6737208`
 against ESP-IDF v5.5.5's pthread and FreeRTOS sources, ring 0.17.14 and tungstenite
@@ -6079,15 +6085,18 @@ datagrams, 1 to 64 of them in base64 as `{"kind":"dg","d":[…]}`, sealed to the
 its inbox topic. A browser can't send UDP, so this is how a page links with a native
 node or an ESP32 board: `RelayTransport` (`packages/js/src/relay_link.js`) says hello as
 a native member does and dials over a pipe alone, and the LED demo's internet way uses
-it with the board's `nostr_led` example. Every node with no policy, or one that lists
-`Signaling`, takes pipes (`Policy::default` doesn't); none does under
+it with the board's `nostr_led` example; since NB-129 the board joins as `Role::Host`
+and the page as a client (`role: 'client'`). Every node with no policy, or one that
+lists `Signaling`, takes pipes (`Policy::default` doesn't); none does under
 `Privacy::RelayOnly`. A node doesn't dial over one.
 
 Reviewed on 2026-11-10 by reading `38ceded` (Rust and the ESP32 example) and `9160362`
 (JavaScript and the LED page) against the conditions set on the design. A scratch copy
 of `38ceded` ran our own tests to reproduce NB126-3 and one mutant (NB126-T1); nothing
 else was re-run. The fix of both, `0663176`, was read the same day; its author ran the
-two mutants.
+two mutants. NB-129 (`a83ab33`, `7e611cb`, `7a50409` and `00314dd`) was read on
+2026-11-14; NB129-I1 was reproduced with a script on loopback, and `room_proof.mjs`
+fails without its fix.
 
 **What holds.**
 
@@ -6096,7 +6105,8 @@ two mutants.
   links with, the host it expects if any, with `Signaling` allowed and the node not
   relay-only (`Traversal::takes_pipe`), before it is parsed. Members are forgotten when
   the node leaves or joins a room, and a peer only invited counts for none. A page takes
-  batches only from a native peer whose hello passed `checkHello` in its room.
+  batches only from a native peer whose hello passed `checkHello` in its room, in a role
+  its own links with (its `role`, as Rust's `allowed()`, since NB-129).
 - **Whose packets.** Each datagram goes to the endpoint bound to the sealed sender
   (`handle_datagram_from` in Rust, `receive(h, bytes, from)` in JavaScript), so a member
   can't carry another's handshake or data onto its pipe, nor move another's link there.
@@ -6205,10 +6215,27 @@ board's PeerId (as Rust's `expect`), dial it alone and log only its messages as 
 board's.
 
 **Status: accepted** for v1 by the lead on 2026-11-10: the room name is the board's
-password, so anyone who can join as a host could already read the room. Two pages
-dialling each other is accepted too. In v2, with the page a client and the board a host,
-the page pins the board (`?board=` and its PeerId): it dials that peer alone and logs
-only its messages as the board's.
+password, so anyone who can join as a host could already read the room. Narrowed by
+NB-129 (`7e611cb`, `7a50409`), reviewed 2026-11-14: the page joins as a client and the
+board as a host, and a page lists, and takes pipe batches from, hosts alone, so another
+page no longer stands in for the board. A member that joins as a host still can, as one
+can for a native `Role::Client` without `expect`. In v2 the page pins the board
+(`?board=` and its PeerId): it dials that peer alone and logs only its messages as the
+board's.
+
+**NB129-I1 — A hello's role read from Object's own names (Info).**
+`RoomProof.checkHello` (`packages/js/src/proof.js`) looked a hello's role up in a plain
+object, so `constructor`, `toString`, `valueOf` and `__proto__` found Object's own
+members, which the MAC read as role byte 0, a peer's. Anyone who saw a member's `peer`
+hello could relabel it with one of them, and it still verified within its 60 s. Nothing
+acted on the role after the check: `RelayTransport` matches it against its own list
+first, `joinRoom` ignores it, and Rust takes only the three names. Repro, on loopback: a
+`peer` hello with `role: 'constructor'` passes `checkHello`. Fix: the object's own keys
+alone.
+
+**Status: fixed** by `37a8ce4`, found in NB-129's review on 2026-11-14: `checkHello`
+takes only `peer`, `host` and `client`, and `room_proof.mjs` checks that five other
+names fail; it fails without the fix.
 
 **Residuals, accepted.**
 
@@ -6228,6 +6255,11 @@ only its messages as the board's.
 - **Relay limits.** A linked member can keep a node publishing 4 events a second, which
   a public relay may answer by limiting or banning the node, so its signalling as a
   whole.
+- **The board as a relay.** As a `Role::Host` the board is what a relay-only member
+  picks as its relay (the first proven host it dials), so it forwards that member's
+  links, as any linked peer could already ask it to (`FWD`): up to 256 KiB/s a peer,
+  with no node-wide limit by default. Relayed packets leave its endpoint at the next
+  poll; to a page they wait in that page's pipe queue (4 KiB on a board).
 - **Relays from a link.** The LED page's `?relays=` (as Net Lab's) points it at relays
   that whoever wrote the link picks, which then see what any relay sees.
 
