@@ -262,6 +262,10 @@ impl NostrSignaling {
                 cmd
             })
             .collect();
+        // On an ESP32 the ids remembered take their whole room now, while the heap is whole: grown as events came,
+        // their table doubled to ~4.4 KB during the first page visits, and each step left a hole (NB-133). The
+        // desktop's 4096 grow as needed.
+        let presize = if SMALL { limits.seen } else { 0 };
         NostrSignaling {
             key,
             pubkey,
@@ -269,8 +273,8 @@ impl NostrSignaling {
             topics: BTreeSet::new(),
             relays,
             inbox,
-            seen: HashSet::new(),
-            seen_order: VecDeque::new(),
+            seen: HashSet::with_capacity(presize),
+            seen_order: VecDeque::with_capacity(presize),
             shared,
             counters: RelayWatch(counters.into()),
             published: 0,
