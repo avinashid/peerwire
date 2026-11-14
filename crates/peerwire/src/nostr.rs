@@ -101,15 +101,15 @@ pub struct RelayStats {
     pub url: String,
     /// Whether a connection to it is open now.
     pub open: bool,
-    /// Events written to it.
+    /// Events written to it. Each is, in time, accepted, rejected or unanswered.
     pub sent: u64,
     /// Events it took (`OK true`).
     pub accepted: u64,
     /// Events it refused (`OK false`).
     pub rejected: u64,
-    /// Events it never answered: no `OK` within 10 s on the connection they went out on. A relay that drops events
-    /// without a word, as two default relays did (NB-130), counts them here, and so does one past its wait queue's
-    /// cap of answers awaited.
+    /// Events it never answered: no `OK` within 10 s on the connection they went out on, or before it closed. A
+    /// relay that drops events without a word, as two default relays did (NB-130), counts them here, and so does one
+    /// past its wait queue's cap of answers awaited. An `OK` that comes later counts as nothing.
     pub unanswered: u64,
 }
 
@@ -693,13 +693,18 @@ fn relay_loop(
 ) {
     let mut req: Option<String> = None;
     let mut queue: VecDeque<(String, u128)> = VecDeque::new();
+    // The events sent on a connection that await an `OK`, oldest first.
+    let mut waiting: VecDeque<(u128, Instant)> = VecDeque::new();
     let mut backoff = Duration::from_secs(1);
     loop {
         if let Ok(mut ws) = connect(&url, limits.message) {
             shared.open.fetch_add(1, Ordering::Relaxed);
             counters.open.store(true, Ordering::Relaxed);
             let opened = Instant::now();
-            let alive = session(&mut ws, &cmds, &out, &shared, &counters, limits, &mut req, &mut queue);
+            let alive = session(&mut ws, &cmds, &out, &shared, &counters, limits, &mut req, &mut queue, &mut waiting);
+            // Those still awaited were never answered on the connection they went out on.
+            counters.unanswered.fetch_add(waiting.len() as _, Ordering::Relaxed);
+            waiting.clear();
             counters.open.store(false, Ordering::Relaxed);
             shared.open.fetch_sub(1, Ordering::Relaxed);
             if !alive {
@@ -744,10 +749,9 @@ fn session(
     limits: Limits,
     req: &mut Option<String>,
     queue: &mut VecDeque<(String, u128)>,
+    waiting: &mut VecDeque<(u128, Instant)>,
 ) -> bool {
     let mut sent_req = false;
-    // The events sent on this connection that await an `OK`, oldest first.
-    let mut waiting: VecDeque<(u128, Instant)> = VecDeque::new();
     loop {
         while waiting.front().is_some_and(|(_, at)| at.elapsed() >= ANSWER_WAIT) {
             waiting.pop_front();
@@ -792,11 +796,12 @@ fn session(
         }
         match ws.read() {
             Ok(Message::Text(t)) => {
+                // Only an answer to an event awaited counts: one that came late was counted unanswered already.
                 if let Some((id, ok)) = ok_reply(&t) {
                     if let Some(i) = waiting.iter().position(|(w, _)| *w == id) {
                         waiting.remove(i);
+                        (if ok { &counters.accepted } else { &counters.rejected }).fetch_add(1, Ordering::Relaxed);
                     }
-                    (if ok { &counters.accepted } else { &counters.rejected }).fetch_add(1, Ordering::Relaxed);
                 }
                 on_relay_message(&t, out, shared, limits.inbox_bytes);
             }
@@ -1425,8 +1430,10 @@ mod tests {
         assert!(held > 0 && broken > 0);
     }
 
-    /// NB-131: each relay's counters. A local relay takes the first event, refuses the second, and never answers the
-    /// third, as nos.lol and nostr.mom did every event (NB-130): one each of accepted, rejected and unanswered.
+    /// NB-131: each relay's counters. A local relay takes the first event, refuses the second, and answers the third
+    /// only after the wait, as if it never had (nos.lol and nostr.mom never did, NB-130): one each of accepted,
+    /// rejected and unanswered, and the late `OK` counts as nothing. It hangs up on the fourth, unanswered too, so
+    /// `sent` is the sum.
     #[test]
     fn relay_stats_count_each_relays_answers_and_silences() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1446,7 +1453,11 @@ mod tests {
                 match n {
                     1 => ws.send(Message::Text(json!(["OK", id, true, ""]).to_string())).unwrap(),
                     2 => ws.send(Message::Text(json!(["OK", id, false, "blocked: no"]).to_string())).unwrap(),
-                    _ => {} // the third: never answered
+                    3 => {
+                        std::thread::sleep(ANSWER_WAIT + Duration::from_millis(200));
+                        ws.send(Message::Text(json!(["OK", id, true, ""]).to_string())).unwrap();
+                    }
+                    _ => break,
                 }
             }
         });
@@ -1464,14 +1475,18 @@ mod tests {
         while carrier.relay_stats()[0] != want && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
+        std::thread::sleep(Duration::from_millis(400)); // the late OK comes
         assert_eq!(carrier.relay_stats(), std::slice::from_ref(&want));
         assert_eq!(carrier.stats().rejected, 1);
-        drop(carrier);
-        // The handle reads on after the carrier is gone, and sees the connection closed.
-        while watch.stats()[0].open && Instant::now() < until {
+        carrier.publish(Topic([3; 32]), b"x");
+        let want = RelayStats { open: false, sent: 4, unanswered: 2, ..want };
+        while carrier.relay_stats()[0] != want && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(watch.stats(), [RelayStats { open: false, ..want }]);
+        assert_eq!(carrier.relay_stats(), std::slice::from_ref(&want));
+        drop(carrier);
+        // The handle reads on after the carrier is gone.
+        assert_eq!(watch.stats(), [want]);
         server.join().unwrap();
     }
 

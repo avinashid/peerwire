@@ -614,7 +614,7 @@ carrier, so nothing links events to the Peerwire identity or to other sessions.
 | `NostrSignaling::new<S: AsRef<str>>(relays: impl IntoIterator<Item = S>) -> NostrSignaling` | Connects to the relays (`wss://host[:port][/path]` or `ws://…`) in the background, one thread each, and reconnects with backoff when one drops: 1 s, doubling up to 30 s (`MAX_BACKOFF`) |
 | `NostrSignaling::default()` | `new` on `peerwire::nostr::DEFAULT_RELAYS`: `wss://relay.primal.net`, `wss://relay.nostr.net`, `wss://nostr.oxtr.dev` |
 | `stats(&self) -> peerwire::nostr::NostrStats` | `relays_open` (connections open now), `published`, `received`, and `rejected` (events a relay refused with `OK false`) |
-| `relay_stats(&self) -> Vec<peerwire::nostr::RelayStats>` | Each relay's, in the order given: `url`, `open`, `sent`, and of those `accepted` (`OK true`), `rejected` (`OK false`) and `unanswered` (no `OK` within 10 s on the connection they went out on: a relay that drops events silently shows here) |
+| `relay_stats(&self) -> Vec<peerwire::nostr::RelayStats>` | Each relay's, in the order given: `url`, `open`, `sent`, and of those `accepted` (`OK true`), `rejected` (`OK false`) and `unanswered` (no `OK` within 10 s on the connection they went out on, or before it closed: a relay that drops events silently shows here; a later `OK` counts as nothing) |
 | `relay_watch(&self) -> peerwire::nostr::RelayWatch` | A cloneable handle whose `stats()` is `relay_stats()`, to keep before the carrier goes into a node (`peerwire-esp`'s `nostr_relays()` reads one) |
 
 `wss://` uses rustls with the webpki roots; `ws://` is plain TCP, for a relay on the LAN or loopback. While a relay
