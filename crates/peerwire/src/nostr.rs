@@ -397,13 +397,15 @@ impl Stream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
     }
 }
 
-/// A relay connection that drops each data frame whose payload is over `max` bytes as it streams in, never holding
-/// it, and the continuation frames of a message it dropped; control frames always pass. One oversize event that
-/// someone sent to our tag then costs a read, not the connection, which before closed and kept a board off the relay
-/// it carries its pipes over (NB-128, NB126-2). Until the handshake's HTTP response ends (its blank line), bytes pass
-/// untouched, and a read stops there, so tungstenite takes no frame bytes with the response before they're judged:
-/// those wait here. tungstenite still checks what passes against the same `max`, so a message fragmented into frames
-/// under it, which only the relay itself can send, still ends the connection.
+/// A relay connection that keeps each data message over `max` bytes from tungstenite, never holding more than `max`
+/// of it. A frame over `max` is dropped as it streams in, with the rest of its message. A message in several frames
+/// is held, up to `max`, and passed on as one frame when its last comes, or dropped from the frame that takes it over.
+/// Control frames always pass, between a message's frames too. One oversize event that someone sent to our tag then
+/// costs a read, not the connection, which before closed and kept a board off the relay it carries its pipes over
+/// (NB-128, NB126-2), however the relay frames it (NB128-1). Until the handshake's HTTP response ends (its blank
+/// line), bytes pass untouched, and a read stops there, so tungstenite takes no frame bytes with the response before
+/// they're judged: those wait here. A data frame that starts a message before the last one ended is an error, as
+/// tungstenite would make it; other framing faults, which only the relay can make, pass on for tungstenite to refuse.
 struct Oversize {
     inner: Box<dyn Stream>,
     max: u64,
@@ -416,8 +418,10 @@ struct Oversize {
     /// The frame header being read, and how much of it has come.
     head: [u8; 14],
     have: usize,
-    /// A message is being dropped: its continuation frames go too.
-    dropping: bool,
+    /// The data message whose last frame hasn't come.
+    msg: Msg,
+    /// That message's payload so far, if it's held: `max` at most.
+    held: Vec<u8>,
 }
 
 /// Where [`Oversize`] is in a frame.
@@ -425,19 +429,35 @@ struct Oversize {
 enum Part {
     /// Reading a header.
     Head,
-    /// Passing a header on, this much of it so far, then a payload this long.
-    Give(usize, u64),
+    /// Passing a header on, this much of it so far, then a payload: this long from the connection, or `held`.
+    Give(usize, Option<u64>),
     /// Passing a payload on, this much left.
     Pass(u64),
     /// Dropping a payload, this much left.
     Skip(u64),
+    /// Reading a payload into `held`, this much left, and whether it's the message's last.
+    Keep(usize, bool),
+    /// Passing `held` on, from here.
+    Release(usize),
+}
+
+/// The data message [`Oversize`] is in the middle of.
+#[derive(Clone, Copy)]
+enum Msg {
+    /// None: the next data frame starts one.
+    Done,
+    /// Over the cap: its frames go until the last.
+    Drop,
+    /// In several frames, within the cap so far, so held: its first header byte, with each frame's reserved bits, and
+    /// whether a frame was masked, which tungstenite refuses from a server, so the frame passed on says so too.
+    Hold(u8, bool),
 }
 
 impl Oversize {
     fn new(inner: Box<dyn Stream>, max: usize) -> Oversize {
-        let part = Part::Head;
-        let (head, early) = ([0; 14], Vec::new());
-        Oversize { inner, max: max as u64, on: false, tail: 0, early, part, head, have: 0, dropping: false }
+        let (part, msg) = (Part::Head, Msg::Done);
+        let (head, early, held) = ([0; 14], Vec::new(), Vec::new());
+        Oversize { inner, max: max as u64, on: false, tail: 0, early, part, head, have: 0, msg, held }
     }
 
     /// Frame bytes: what came with the HTTP response first, then the connection's.
@@ -464,25 +484,68 @@ impl Oversize {
         2 + ext + if self.head[1] & 0x80 != 0 { 4 } else { 0 }
     }
 
-    /// The whole header read: its payload's length, and whether the frame is dropped.
-    fn judge(&mut self) -> (u64, bool) {
+    /// The whole header read: what to do with the frame.
+    fn judge(&mut self) -> io::Result<Part> {
         let len = match self.head[1] & 0x7f {
             126 => u64::from(u16::from_be_bytes([self.head[2], self.head[3]])),
             127 => u64::from_be_bytes(self.head[2..10].try_into().expect("8 bytes")),
             n => u64::from(n),
         };
-        let (fin, opcode) = (self.head[0] & 0x80 != 0, self.head[0] & 0x0f);
-        let drop = match opcode {
-            0 => self.dropping,
-            1..=7 => len > self.max,
-            _ => false, // control frames: ping, pong, close
+        let (fin, opcode, masked) = (self.head[0] & 0x80 != 0, self.head[0] & 0x0f, self.head[1] & 0x80 != 0);
+        let after = |fin| if fin { Msg::Done } else { Msg::Drop };
+        Ok(match (opcode, self.msg) {
+            // Control frames (ping, pong, close), and a continuation with nothing to continue, for tungstenite.
+            (8.., _) | (0, Msg::Done) => Part::Give(0, Some(len)),
+            (_, Msg::Done) if len > self.max => {
+                self.msg = after(fin);
+                Part::Skip(len)
+            }
+            (_, Msg::Done) if fin => Part::Give(0, Some(len)),
+            (_, Msg::Done) => {
+                self.msg = Msg::Hold(self.head[0] & 0x7f, masked);
+                Part::Keep(len as usize, false) // within the cap, so a usize
+            }
+            (0, Msg::Drop) => {
+                self.msg = after(fin);
+                Part::Skip(len)
+            }
+            (0, Msg::Hold(..)) if len > self.max - self.held.len() as u64 => {
+                (self.msg, self.held) = (after(fin), Vec::new());
+                Part::Skip(len)
+            }
+            (0, Msg::Hold(first, was)) => {
+                self.msg = Msg::Hold(first | self.head[0] & 0x70, was || masked);
+                Part::Keep(len as usize, fin) // within the cap, so a usize
+            }
+            _ => return Err(io::Error::new(ErrorKind::InvalidData, "relay: a message began inside another")),
+        })
+    }
+
+    /// Puts the header of the held message, whole in one frame, in `head`.
+    fn held_head(&mut self, first: u8, masked: bool) {
+        let n = self.held.len();
+        let m = if masked { 0x80 } else { 0 };
+        self.head[0] = 0x80 | first;
+        self.have = match n {
+            0..=125 => {
+                self.head[1] = m | n as u8;
+                2
+            }
+            126..=0xffff => {
+                self.head[1] = m | 126;
+                self.head[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+                4
+            }
+            _ => {
+                self.head[1] = m | 127;
+                self.head[2..10].copy_from_slice(&(n as u64).to_be_bytes());
+                10
+            }
         };
-        match opcode {
-            0 if self.dropping => self.dropping = !fin,
-            1..=7 => self.dropping = drop && !fin,
-            _ => {}
+        if masked {
+            self.head[self.have..self.have + 4].fill(0);
+            self.have += 4;
         }
-        (len, drop)
     }
 }
 
@@ -517,28 +580,64 @@ impl Read for Oversize {
                         self.have += n;
                         continue;
                     }
-                    let (len, drop) = self.judge();
-                    self.part = if drop {
+                    self.part = self.judge()?;
+                    if !matches!(self.part, Part::Give(..)) {
                         self.have = 0;
-                        Part::Skip(len)
-                    } else {
-                        Part::Give(0, len)
-                    };
+                    }
                 }
-                Part::Give(given, len) => {
+                Part::Give(given, then) => {
                     let n = (self.have - given).min(buf.len());
                     buf[..n].copy_from_slice(&self.head[given..given + n]);
                     self.part = if given + n < self.have {
-                        Part::Give(given + n, len)
+                        Part::Give(given + n, then)
                     } else {
                         self.have = 0;
-                        if len == 0 {
-                            Part::Head
-                        } else {
-                            Part::Pass(len)
+                        match then {
+                            Some(0) => Part::Head,
+                            Some(len) => Part::Pass(len),
+                            None => Part::Release(0),
                         }
                     };
                     return Ok(n);
+                }
+                Part::Keep(0, last) => {
+                    self.part = Part::Head;
+                    if let (true, Msg::Hold(first, masked)) = (last, self.msg) {
+                        self.msg = Msg::Done;
+                        self.held_head(first, masked);
+                        self.part = Part::Give(0, None);
+                    }
+                }
+                Part::Keep(left, last) => {
+                    let at = self.held.len();
+                    if at + left > self.held.capacity() {
+                        // Doubling, but never past the cap: a board's heap may have no 8 KB block to spare for a
+                        // 4 KiB message (NB-133).
+                        let cap = (at + left).max(2 * self.held.capacity()).min(self.max as usize);
+                        self.held.reserve_exact(cap - at);
+                    }
+                    let mut held = std::mem::take(&mut self.held);
+                    held.resize(at + left, 0);
+                    let got = self.src(&mut held[at..]);
+                    held.truncate(at + got.as_ref().map_or(0, |n| *n));
+                    self.held = held;
+                    let n = got?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    self.part = Part::Keep(left - n, last);
+                }
+                Part::Release(at) => {
+                    let n = (self.held.len() - at).min(buf.len());
+                    buf[..n].copy_from_slice(&self.held[at..at + n]);
+                    self.part = Part::Release(at + n);
+                    if at + n == self.held.len() {
+                        (self.part, self.held) = (Part::Head, Vec::new());
+                    }
+                    // An empty message has no payload to pass: read on.
+                    if n > 0 {
+                        return Ok(n);
+                    }
                 }
                 Part::Pass(left) => {
                     let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
@@ -1006,8 +1105,8 @@ mod tests {
     }
 
     /// NB95-1 and NB-128, with an ESP32's limits: an event of 3.9 KB is taken; a 16 KiB frame, as an event someone
-    /// sent to our tag would be, is dropped as it streams in, and the connection stays, so the next event comes over it.
-    /// Before NB-128 the frame closed the connection, and a relay sending one each time kept the board off it.
+    /// sent to our tag would be, is dropped as it streams in, and the connection stays, so the next event comes over
+    /// it. Before NB-128 the frame closed the connection, and a relay sending one each time kept the board off it.
     #[test]
     fn a_board_drops_large_relay_frames_and_keeps_the_connection() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1096,10 +1195,59 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// NB128-1 (security's repro, inverted): a relay whose WebSocket library writes a long message in pieces (Go's
+    /// gorilla `NextWriter` cuts at its 4 KiB buffer) sends a 16 KiB event someone sent to our tag as four 4 KiB
+    /// frames, a ping among them. Each frame is within the board's cap but the message isn't: it goes, and the next
+    /// message comes over the same connection. A message of exactly the cap in four pieces arrives whole, and so does
+    /// one in pieces past 64 KiB under a host's cap, passed on in the 64-bit length form.
+    #[test]
+    fn a_relay_that_sends_an_oversize_message_in_pieces_keeps_the_connection() {
+        use tungstenite::protocol::frame::coding::{Data, OpCode};
+        use tungstenite::protocol::frame::Frame;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let cases = [(Limits::SMALL, 4096, b'x'), (Limits::SMALL, 1024, b'y'), (Limits::FULL, 17 << 10, b'z')];
+        let server = std::thread::spawn(move || {
+            for (_, piece, fill) in cases {
+                let (s, _) = listener.accept().unwrap();
+                let mut ws = tungstenite::accept(s).unwrap();
+                let frame = |op, fin| Message::Frame(Frame::message(vec![fill; piece], OpCode::Data(op), fin));
+                ws.send(frame(Data::Text, false)).unwrap();
+                ws.send(frame(Data::Continue, false)).unwrap();
+                ws.send(Message::Ping(vec![1])).unwrap();
+                ws.send(frame(Data::Continue, false)).unwrap();
+                ws.send(frame(Data::Continue, true)).unwrap();
+                ws.send(Message::Text("after".into())).unwrap();
+                while ws.read().is_ok() {} // the pong, then until the client goes
+            }
+        });
+        for (limits, piece, fill) in cases {
+            let mut ws = connect(&url, limits.message).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut got: Vec<String> = Vec::new();
+            while got.last().map(String::as_str) != Some("after") {
+                match ws.read() {
+                    Ok(Message::Text(t)) => got.push(t),
+                    Ok(_) => {} // the ping
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+                            && Instant::now() < until => {}
+                    other => panic!("{piece} B pieces: {other:?}"),
+                }
+            }
+            let whole = String::from_utf8(vec![fill; 4 * piece]).unwrap();
+            let want: Vec<&str> = if 4 * piece > limits.message { vec!["after"] } else { vec![&whole, "after"] };
+            assert_eq!(got, want, "{piece} B pieces");
+        }
+        server.join().unwrap();
+    }
+
     /// NB-128: random relay byte streams through `Oversize`, read in random pieces with timeouts between. What comes
     /// out is the HTTP response, with no read going past its end, then exactly the frames that should pass, byte for
-    /// byte: data frames over the cap go with their continuations, and nothing else does (control frames between
-    /// fragments, any length encoding, masked or not, continuations of a message passed whatever their size).
+    /// byte: a message over the cap goes, in one frame or in pieces (NB128-1); one in pieces within it comes as one
+    /// frame, after the control frames sent among its pieces; everything else passes as it came (control frames, any
+    /// length encoding, masked or not, stray continuations). Nothing over the cap is ever held, and a message that
+    /// another begins inside ends the stream with an error.
     #[test]
     fn fuzz_oversize_frames() {
         use peerwire_sim::fuzz::{cases, Rng};
@@ -1158,10 +1306,33 @@ mod tests {
             let (op, len) = (*rng.pick(&[8u8, 9, 10]), rng.below(126));
             frame(rng, true, op, len)
         }
+        // A message in pieces whose payloads came to `payload`, passed on whole: one frame, the shortest length form,
+        // the mask bit with a zero key if a piece had it.
+        fn whole(op: u8, masked: bool, payload: &[u8]) -> Vec<u8> {
+            let (m, n) = (if masked { 0x80 } else { 0 }, payload.len());
+            let mut f = vec![0x80 | op];
+            match n {
+                0..=125 => f.push(m | n as u8),
+                126..=65535 => {
+                    f.push(m | 126);
+                    f.extend_from_slice(&(n as u16).to_be_bytes());
+                }
+                _ => {
+                    f.push(m | 127);
+                    f.extend_from_slice(&(n as u64).to_be_bytes());
+                }
+            }
+            if masked {
+                f.extend_from_slice(&[0; 4]);
+            }
+            f.extend_from_slice(payload);
+            f
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let http = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
         let mut rng = Rng::for_target("nostr_oversize");
+        let (mut held, mut broken) = (0, 0);
         for case in 0..cases(3_000) {
             let max = 1 + rng.below(600);
             let (mut input, mut want) = (http.to_vec(), http.to_vec());
@@ -1172,22 +1343,54 @@ mod tests {
                     want.extend_from_slice(&c);
                     continue;
                 }
+                // A continuation with nothing to continue, whatever its size, is for tungstenite to refuse.
+                if rng.one_in(20) {
+                    let (fin, len) = (rng.one_in(2), rng.below(2 * max));
+                    let f = frame(&mut rng, fin, 0, len);
+                    input.extend_from_slice(&f);
+                    want.extend_from_slice(&f);
+                    continue;
+                }
                 let pieces = if rng.one_in(3) { 2 + rng.below(3) } else { 1 };
                 let op = *rng.pick(&[1u8, 2]);
                 let first = if rng.one_in(3) { max + 1 + rng.below(800) } else { rng.below(max + 1) };
+                let (mut payload, mut masked) = (Vec::new(), false);
                 for k in 0..pieces {
-                    let len = if k == 0 { first } else { rng.below(2 * max) };
+                    let len = match k {
+                        0 => first,
+                        _ if rng.one_in(4) => rng.below(2 * max),
+                        _ => rng.below(max / 2 + 2),
+                    };
                     let f = frame(&mut rng, k + 1 == pieces, if k == 0 { op } else { 0 }, len);
                     input.extend_from_slice(&f);
-                    if first <= max {
+                    if pieces == 1 && first <= max {
                         want.extend_from_slice(&f);
                     }
+                    masked |= f[1] & 0x80 != 0;
+                    payload.extend_from_slice(&f[f.len() - len..]);
                     if k + 1 < pieces && rng.one_in(3) {
                         let c = control(&mut rng);
                         input.extend_from_slice(&c);
                         want.extend_from_slice(&c);
                     }
                 }
+                if pieces > 1 && payload.len() <= max {
+                    want.extend_from_slice(&whole(op, masked, &payload));
+                    held += 1;
+                }
+            }
+            // One case in 10 ends with a message that another begins inside: the connection's over.
+            let breaks = rng.one_in(10);
+            if breaks {
+                let len = if rng.one_in(2) { max + 1 } else { rng.below(max + 1) };
+                input.extend_from_slice(&frame(&mut rng, false, 1, len));
+                if rng.one_in(2) {
+                    let c = control(&mut rng);
+                    input.extend_from_slice(&c);
+                    want.extend_from_slice(&c);
+                }
+                input.extend_from_slice(&frame(&mut rng, true, 1, 3));
+                broken += 1;
             }
             let mock = Mock {
                 data: input,
@@ -1196,22 +1399,30 @@ mod tests {
                 tcp: tcp.try_clone().unwrap(),
             };
             let mut o = Oversize::new(Box::new(mock), max);
-            let (mut out, mut buf, mut was_on) = (Vec::new(), [0u8; 512], false);
+            let (mut out, mut buf, mut was_on, mut ended) = (Vec::new(), [0u8; 512], false, false);
             loop {
                 let k = 1 + rng.below(buf.len());
                 match o.read(&mut buf[..k]) {
                     Ok(0) => break,
                     Ok(n) => out.extend_from_slice(&buf[..n]),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(e) if breaks && e.kind() == ErrorKind::InvalidData => {
+                        ended = true;
+                        break;
+                    }
                     Err(e) => panic!("case {case}: {e}"),
                 }
+                assert!(o.held.capacity() <= max, "case {case}: {} held, cap {max}", o.held.capacity());
                 if o.on && !was_on {
                     assert_eq!(out.len(), http.len(), "case {case}: a read went past the HTTP response");
                     was_on = true;
                 }
             }
+            assert_eq!(ended, breaks, "case {case}");
             assert!(out == want, "case {case}: max {max}, {} bytes out, {} wanted", out.len(), want.len());
         }
+        println!("fuzz oversize: {held} messages in pieces passed whole, {broken} cases ended by a message inside one");
+        assert!(held > 0 && broken > 0);
     }
 
     /// NB-131: each relay's counters. A local relay takes the first event, refuses the second, and never answers the

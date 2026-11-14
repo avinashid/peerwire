@@ -85,9 +85,10 @@ and the commit that fixed it.
   `relay_watch` keeps them readable once the carrier is in a node. `peerwire-esp`: `nostr_relays`, and the
   `nostr_led` example's 30 s report ends with them.
 - **Fix,** `peerwire`: `NostrSignaling` drops a relay message over its size cap (4 KiB on an ESP32, 128 KiB elsewhere)
-  as it streams in, never holding it, and keeps the connection. It closed the connection before, so anyone who knew
-  a board's room could keep it off its relay, and off the pipes that carry pages' links, by sending one oversize
-  event to its tag each time it reconnected (NB-128, NB126-2).
+  as it streams in, in one frame or in pieces, never holding more than the cap of it, and keeps the connection. It
+  closed the connection before, so anyone who knew a board's room could keep it off its relay, and off the pipes
+  that carry pages' links, by sending one oversize event to its tag each time it reconnected (NB-128, NB126-2,
+  NB128-1).
 
 ## Unreleased: `@peerwire/js`
 
