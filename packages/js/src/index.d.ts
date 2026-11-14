@@ -1010,7 +1010,10 @@ export declare class RelayTransport {
   /** `endpoint`: any module's, else TypeError, as for a missing `appId` or `roomId`. `relays`: `ws://` or `wss://`
    * urls with no fragment ({@link DEFAULT_RELAYS} by default), else a TypeError naming one by its index. `onPeer`:
    * `'seen'` when a native peer's hello first proves the room key (and again once one went unheard for a minute),
-   * `'open'` when a dial links. */
+   * `'open'` when a dial links. `role`: Rust's `Role`, said in our hello and proved under the room key: `'peer'` (the
+   * default) links with peers and hosts, `'host'` with peers and clients, `'client'` with hosts alone, else a
+   * TypeError. Only peers in a role ours links with are listed and send us pipe batches: a page that drives a board
+   * says `'client'` to a board that joined as `Role::Host`, so two such pages don't dial each other. */
   constructor(
     endpoint: Endpoint,
     options: {
@@ -1018,9 +1021,10 @@ export declare class RelayTransport {
       roomId: string;
       relays?: string[];
       onPeer?: ((peer: PeerId, state: 'seen' | 'open') => void) | null;
+      role?: 'peer' | 'host' | 'client';
     },
   );
-  /** The native peers heard in the last minute, whose hellos prove the room key. */
+  /** The native peers heard in the last minute, in a role ours links with, whose hellos prove the room key. */
   readonly peers: PeerId[];
   /** The relays it says hello on and carries the pipes over (`stats`). */
   readonly signaling: NostrSignaling;

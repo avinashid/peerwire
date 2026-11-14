@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Names the room a board on Wi-Fi joins (NB-095, NB95-4): b"PWR", the name's length and
 # the name, at 0x3FF0C0 in the last flash sector, where main.rs reads it. With a room the
-# board joins it on the LAN and over the Nostr relay wss://nostr.mom, so `room_chat ROOM`
+# board joins it on the LAN and over the Nostr relay wss://relay.primal.net, so `room_chat ROOM`
 # anywhere on the internet links with it; without one it stays on the LAN, in room
 # "esp32". Anyone who knows the name can join from anywhere, link with the board directly
 # and see its home's public address and LAN address: so the default is a random name. An

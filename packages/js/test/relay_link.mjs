@@ -5,6 +5,9 @@
 //   transports), and at most one each greetMs for many newcomers at once;
 // - a native peer's hello that proves the room key lists it ('seen' once, `peers`); a joinRoom member's (no meta.nb),
 //   a wrong proof, a stale one and another room's don't;
+// - roles (NB-129): a client's hello says 'client' under the room key; it lists hosts alone, not other clients nor
+//   peers, and takes no pipe batch from another client; peers don't list it; two clients each link with a host,
+//   which lists both;
 // - dial() links over the pipe alone and resolves to the PeerId ('open'); messages go both ways, 6 KB and 100 small
 //   ones too; every batch to the peer carries NATIVE_BATCH bytes of datagrams at most, and every event so made fits a
 //   4 KB relay frame as a board reads it;
@@ -112,8 +115,10 @@ async function client() {
   check(threw(() => new RelayTransport(ep, { roomId: 'r' })) && threw(() => new RelayTransport(ep, { appId: 'a', roomId: '' })) &&
     threw(() => new RelayTransport(ep, { appId: 'a', roomId: 'r', relays: ['https://relay.test'] }), /relays\[0\]/) &&
     threw(() => new RelayTransport(ep, { appId: 'a', roomId: 'r', relays: [] })) &&
-    threw(() => new RelayTransport({}, { appId: 'a', roomId: 'r' }), /Endpoint/),
-  "TypeError: no appId or roomId, relays that aren't ws:// or wss:// urls, something that isn't an endpoint");
+    threw(() => new RelayTransport({}, { appId: 'a', roomId: 'r' }), /Endpoint/) &&
+    threw(() => new RelayTransport(ep, { appId: 'a', roomId: 'r', role: 'boss' }), /role/),
+  "TypeError: no appId or roomId, relays that aren't ws:// or wss:// urls, something that isn't an endpoint, a role " +
+    "that isn't 'peer', 'host' or 'client'");
   ep.close();
 }
 
@@ -172,6 +177,46 @@ check(JSON.stringify(a.told) === JSON.stringify([[b.id, 'seen']]) && JSON.string
     "not listed: a joinRoom member's hello (no meta.nb), a wrong proof, a stale one, another room's");
   c.close();
   d.close();
+}
+
+// 5b. Roles (NB-129): pages that drive a board say 'client', and the board joins as Role::Host.
+{
+  const k = node({ role: 'client' });
+  await until("k's hello", async () => (await hellosOf(k.id)).length >= 1);
+  const km = JSON.parse((await hellosOf(k.id))[0]).meta;
+  const h = await client(); // says it is a host
+  const c = await client(); // says it is a client
+  await h.sig.hello({ nb: 1, ...(await proof.hello(h.id, 'host')) });
+  await c.sig.hello({ nb: 1, ...(await proof.hello(c.id, 'client')) });
+  await until('k lists the host', () => k.t.peers.includes(h.id));
+  let hs = null;
+  c.ep.onTransmit = (_addr, bytes) => void (hs ??= bytes);
+  c.ep.connect(1, k.id);
+  await until('c makes a handshake', () => hs);
+  const bad = k.t.rtc.badSignals;
+  await c.sig.send(k.id, { kind: 'dg', d: [b64(hs)] });
+  await until('k refuses it', () => k.t.rtc.badSignals > bad);
+  await sleep(300);
+  check(km.role === 'client' && (await proof.checkHello(k.id, km)) && k.t.peers.join() === h.id &&
+    JSON.stringify(k.told) === JSON.stringify([[h.id, 'seen']]) && !a.t.peers.includes(k.id) && !a.t.peers.includes(c.id) &&
+    a.t.peers.includes(h.id) && !k.t.rtc.pipeByPeer.has(c.id) && !k.ep.isConnected(c.id),
+  "a client's hello says 'client' under the room key; it lists the host alone (not another client, nor peers a and " +
+    "b), peers list the host but not the clients, and a client's pipe batch to a client is refused");
+  // Two clients and a host, as two phones and a board: each client lists the host alone and links with it.
+  const host = node({ role: 'host' });
+  const k2 = node({ role: 'client' });
+  await until('k and k2 list the host', () => k.t.peers.includes(host.id) && k2.t.peers.includes(host.id));
+  const [d1, d2] = await Promise.all([outcome(k.t.dial(host.id)), outcome(k2.t.dial(host.id))]);
+  k.ep.send(host.id, 'led on');
+  k2.ep.send(host.id, 'led toggle');
+  await until('the host gets both', () => host.got.includes('led on') && host.got.includes('led toggle'));
+  check(d1.v === host.id && d2.v === host.id && !k.t.peers.includes(k2.id) && !k2.t.peers.includes(k.id) &&
+    host.t.peers.includes(k.id) && host.t.peers.includes(k2.id) && host.t.peers.includes(a.id),
+  `two clients each link with the host (${d1.v ? 'linked' : d1.e}, ${d2.v ? 'linked' : d2.e}) and ignore each other; ` +
+    'the host lists both clients and the peers');
+  end(k, k2, host);
+  h.close();
+  c.close();
 }
 
 // 6. A dial over the pipe, and messages both ways.

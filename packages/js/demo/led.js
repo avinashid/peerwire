@@ -3,8 +3,8 @@
 // anywhere (a board on Wi-Fi in the room, with the same commands). The page links with the board over Bluetooth alone
 // (bluetooth.js) or over the relays alone (relay_link.js), then sends it `led on`, `led off` or `led toggle` as the
 // board takes them, raw text on the reliable lane; what the board says shows in the log. Over the internet the page
-// dials the first native peer whose hello it hears in the room: the board answers each command, so another page in
-// the room would show as a peer that says nothing back.
+// joins as a client and dials the first host whose hello it hears in the room: the board joins as Role::Host
+// (NB-129), and other pages in the room, clients too, are not dialled, so each phone or laptop links with the board.
 //
 // ?app= and ?room= name the room: the board's app is peerwire-lan-chat. Over Bluetooth its room is esp32 unless
 // room.sh named another (a stranger would have to be in range). Over the internet the room name is the board's
@@ -152,7 +152,7 @@ function online(room, mine) {
       dialling = false;
     }
   };
-  link = new RelayTransport(endpoint, { ...room, relays, onPeer });
+  link = new RelayTransport(endpoint, { ...room, relays, onPeer, role: 'client' });
   log(`listening for the board on ${relays.length} relay(s)…`);
   quiet = setTimeout(() => mine === run && !peer && log('no board heard yet: is it on Wi-Fi, in this room? (still listening)'), QUIET_MS);
 }

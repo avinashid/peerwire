@@ -13,6 +13,11 @@
 // are the endpoint's, raw bytes, as a node sends them. Over the internet the room name is the board's password: give
 // it one nobody can guess (randomRoomId()).
 //
+// `role` is Rust's Role, said in our hello and proved under the room key: 'peer' (the default) links with peers and
+// hosts, 'host' with peers and clients, 'client' with hosts alone. A page that drives a board says 'client' to a board
+// that joined as Role::Host (NB-129): two such pages in the room then don't hear each other as peers, and neither
+// dials the other in place of the board.
+//
 //   const pw = await loadPeerwire(wasmUrl);
 //   const endpoint = pw.endpoint();
 //   const link = new RelayTransport(endpoint, { appId: 'peerwire-lan-chat', roomId: boardRoom, onPeer });
@@ -38,6 +43,10 @@ const SEEN_MS = 60000;
 const MAX_PEERS = 256; // peers listed; past it, the one heard longest ago goes
 // The pipes' clock, as webrtc.js's: a wall clock set back doesn't hold a peer listed.
 const clock = () => performance.now();
+// Rust's Role (traversal.rs) and which of them a member in each links with (its `allowed`).
+const ROLES = ['peer', 'host', 'client'];
+const LINKS = { peer: ['peer', 'host'], host: ['peer', 'client'], client: ['host'] };
+const allowed = (mine, theirs) => LINKS[mine].includes(theirs);
 
 function failure(code, message) {
   return Object.assign(new Error(`relay: ${message}`), { code });
@@ -52,16 +61,19 @@ export class RelayTransport {
 
   // `endpoint`: any module's. `relays`: the room's Nostr relays, DEFAULT_RELAYS by default. `onPeer(peer, state)`:
   // 'seen' when a native peer's hello first proves the room key (and again once one went unheard for a minute),
-  // 'open' when a dial links.
-  constructor(endpoint, { appId, roomId, relays = DEFAULT_RELAYS, onPeer = null } = {}) {
+  // 'open' when a dial links. `role`: 'peer', 'host' or 'client' (see the top): only peers in a role ours links with
+  // are listed, and send us pipe batches.
+  constructor(endpoint, { appId, roomId, relays = DEFAULT_RELAYS, onPeer = null, role = 'peer' } = {}) {
     if (typeof endpoint?.seal !== 'function' || typeof endpoint?.pw?.nostrKeypair !== 'function') {
       throw new TypeError('RelayTransport needs an Endpoint (pw.endpoint())');
     }
     if (typeof appId !== 'string' || typeof roomId !== 'string' || !appId || !roomId) {
       throw new TypeError('RelayTransport needs an appId and a roomId');
     }
+    if (!ROLES.includes(role)) throw new TypeError("RelayTransport's role is 'peer', 'host' or 'client'");
     const name = `${appId}/${roomId}`;
     this.ep = endpoint;
+    this.role = role;
     this.onPeer = onPeer;
     this.closed = false;
     this.seen = new Map(); // peer -> when its newest hello came (clock()), oldest first
@@ -98,7 +110,7 @@ export class RelayTransport {
   async hello() {
     try {
       if (this.closed) return;
-      const meta = await (await this.proof).hello(this.ep.id, 'peer');
+      const meta = await (await this.proof).hello(this.ep.id, this.role);
       if (!this.closed) await this.signaling.hello({ nb: 1, ...meta });
     } catch {
       // lost
@@ -126,10 +138,11 @@ export class RelayTransport {
     }, wait);
   }
 
-  // A room hello from `peer`: a native peer's (meta.nb) that proves the room key is listed, and may send us datagrams
-  // over the pipe. A joinRoom member's (no meta.nb) is left to its room: it links over WebRTC, and takes no bare pipe.
+  // A room hello from `peer`: a native peer's (meta.nb) in a role ours links with, that proves the room key, is listed
+  // and may send us datagrams over the pipe. A joinRoom member's (no meta.nb) is left to its room: it links over
+  // WebRTC, and takes no bare pipe.
   async heard(peer, meta) {
-    if (this.closed || !isPeerId(peer) || peer === this.ep.id || !meta?.nb) return;
+    if (this.closed || !isPeerId(peer) || peer === this.ep.id || !meta?.nb || !allowed(this.role, meta.role)) return;
     if (!(await (await this.proof).checkHello(peer, meta)) || this.closed) return;
     const now = clock();
     const fresh = !(now - (this.seen.get(peer) ?? -Infinity) < SEEN_MS);

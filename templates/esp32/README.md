@@ -45,7 +45,7 @@ must let in UDP from the board, and as `lan_chat`'s port is random, allow it by 
 ## Across the internet
 
 With the `nostr` feature the board also joins its room over the Nostr relay
-`wss://nostr.mom`, so peers anywhere link with it:
+`wss://relay.primal.net` (`peerwire_esp::NOSTR_RELAY`), so peers anywhere link with it:
 
 ```sh
 ./flash.sh --features nostr

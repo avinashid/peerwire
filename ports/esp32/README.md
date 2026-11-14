@@ -216,9 +216,11 @@ in room `esp32` with `lan_chat` on a laptop on the same LAN (on the router's 5 G
 ### Rooms across the internet (NB-095, 4 Nov 2026)
 
 On Wi-Fi, when the flash names a room, the firmware joins it over the LAN and over the
-Nostr relay `wss://nostr.mom` at once (`MultiSignaling`), with STUN on, so peers
+Nostr relay `NOSTR_RELAY` at once (`MultiSignaling`), with STUN on, so peers
 anywhere can join with `room_chat ROOM`. Without one it stays on the LAN, in room
-`esp32`. The same board, in room `esp32` on both (before the name moved to flash), with
+`esp32`. `NOSTR_RELAY` is `wss://relay.primal.net` since 14 Nov 2026: `wss://nostr.mom`, used
+until then, now takes our events and passes none on (NB-129). The same board, in room `esp32`
+on both (before the name moved to flash, over nostr.mom), with
 `room_chat esp32` on the laptop and on a cloud VM with a public address:
 
 | | |
