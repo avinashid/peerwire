@@ -197,10 +197,13 @@ release of each.
 | NB110d-I3 (Info) | Accepted by the repo owner on 2026-11-10, as shipped: the LED demo is on the site's demo list (since `8742653`) with no note on the page, so a visitor's Bluetooth grant for a board goes to the shared origin `avinashid.github.io`, and the account's other Pages sites may connect to that board without the picker while it is in range, same section |
 | NB119-2 (Low), NB119-I3, NB119-I4 (Info) | **Fixed** by `7495937`, `061c23e` and `61c97e6` before NB-119's second part merged (`3859af7`), so never on main, before any release of `peerwire-esp` took the time from a room member (a board restarts when SNTP moves its clock more than 30 s, asks every minute while it holds a member's time, and forgets at the next boot a time marked in RTC memory as a member's; none from 2100 on), reviewed 2026-11-09; residuals: any member can give a wrong time for a boot; the pool server or the path can restart a board at each re-ask, [The clock from a room member](#the-clock-from-a-room-member-nb-119--nb119-2-nb119-i3-nb119-i4) |
 | NB126-1 (Low) | **Fixed** by `38ceded` and `9160362` before NB-126 merged, so never on main (an LED board on the internet has no default room and won't start in a guessable one; the LED page's internet way has no default room and warns on a guessable name), reviewed 2026-11-10, [Links over the signalling relays](#links-over-the-signalling-relays-to-native-nodes-nb-126--nb126-1nb126-3) |
-| NB126-2 (Low) | Open: one event over 4 KiB on a board's topics closes its relay socket (NB-095's residual), and since NB-126 that cuts a page's link over the relays, its only path to the board; card NB-128, same section |
+| NB126-2 (Low) | **Fixed** by `791ae7b` and `db35a13` (NB-128, NB128-1): one event over 4 KiB on a board's topics closed its relay socket (NB-095's residual), and since NB-126 that cut a page's link over the relays, its only path to the board; a message over the cap is now dropped as it streams in, in one frame or in pieces, and the socket kept, reviewed 2026-11-14, same section |
 | NB126-3 (Low), NB126-T1 (Info) | **Fixed** by `0663176` before NB-126 merged, so never on main (while pipe batches wait for the shared rate, `Node::next_timeout` is when the next token comes, not 0, so a host that sleeps on it doesn't spin; a test binds a pipe's datagrams to its sender), reviewed 2026-11-10, same section |
 | NB126-I1 (Info) | Accepted for v1 by the lead on 2026-11-10, narrowed by NB-129 (`7e611cb`, `7a50409`): the LED page joins as a client and the board as a host, so the page takes a member that joins as a host, not another page, for the board, and shows its messages as the board's. Pinning the board's PeerId comes in v2, same section |
 | NB129-I1 (Info) | **Fixed** by `37a8ce4`: `RoomProof.checkHello` read the roles `constructor`, `toString`, `valueOf` and `__proto__` as role byte 0, so a member's `peer` hello relabelled with one verified; nothing acted on it, reviewed 2026-11-14, same section |
+| NB132-1 (Low) | **Fixed** by `96e2f55` before NB-132 merged, so never on main: a node evicts no peer it dialled by invite or reaches over a radio, as no linked one, so offers that plan punches no longer push an invite dial out before it links (a cap of 32, an ESP32's), reviewed 2026-11-14, [Per-peer state a node keeps](#per-peer-state-a-node-keeps-nb-132--nb132-1-nb132-i1) |
+| NB132-I1 (Info) | Accepted for v1 by the lead on 2026-11-14: about a cap's worth of hellos and offers from new ids pushes out a member whose hello was answered before its handshake completes, and its link is refused until its next hello; anyone with the room key could already hold joins off by spending the budgets, same section |
+| NB128-1 (Low) | **Fixed** by `db35a13` before NB-128 merged, so never on main: a relay that wrote a long message as several frames, each within the cap, still closed a board's socket on one oversize event someone sent to its tag, since tungstenite summed the frames; `Oversize` now holds a message in pieces, at most the cap's worth, and passes it on as one frame or drops it, reviewed 2026-11-14, [Relay counters and oversize messages](#relay-counters-and-oversize-messages-nb-131-nb-128--nb128-1) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -3918,7 +3921,9 @@ Residuals (accepted):
   closes the connection (the back-off then allows a handshake every 30 s at most). The
   room topic is in every hello the board publishes, so this needs no room name. The LAN
   and links already made carry on. Skipping a frame over the cap without closing would
-  need a websocket reader that discards it unbuffered.
+  need a websocket reader that discards it unbuffered: NB-128 added one, so since
+  `791ae7b` and `db35a13` (NB128-1) such an event costs a read, however the relay frames
+  it.
 - The Xtensa build (`CHIP=esp32`) compiles ring but has run no TLS: its QEMU pair uses
   the LAN only.
 
@@ -6168,7 +6173,11 @@ one each time the board reconnects. Before NB-126 that delayed new peers, while 
 went on over UDP; now it cuts a page's link, whose only path is that socket. Fix: read a
 frame over the cap through and drop it unbuffered, keeping the socket.
 
-**Status: open** (Low), reported on NB-126 at `b3f7321`, card NB-128.
+**Status: fixed** by `791ae7b` and `db35a13` (NB-128), reviewed 2026-11-14: a message
+over the cap is dropped as it streams in and the socket kept, whether the relay sends it
+as one frame or in pieces
+([NB128-1](#relay-counters-and-oversize-messages-nb-131-nb-128--nb128-1)). Reported on
+NB-126 at `b3f7321`, card NB-128.
 
 **NB126-3 — A pipe waiting for its rate spins the host (Low).** At `38ceded`,
 `Pipes::next_due` gave the earliest batch due and left out the shared bucket. When
@@ -6245,7 +6254,8 @@ names fail; it fails without the fix.
 
 - **The room name is the board's password**, as over Bluetooth and UDP, but from
   anywhere: anyone who has it can switch the LED and, as a member, learn the board's
-  addresses from its offers.
+  addresses from its offers. Since NB-132 what they make the board remember is bounded
+  ([Per-peer state](#per-peer-state-a-node-keeps-nb-132--nb132-1-nb132-i1)).
 - **What relays see.** The size and timing of every batch to and from a node's inbox
   tag, so when the LED is used and how long a link lasts (its keepalives), as for pages
   (NB43-I4); each end's relays see its IP address. Any kind-25059 subscriber sees the
@@ -6313,7 +6323,9 @@ public relay.
   silent the scratch test read 2 open, 5 published, 5 received and 0 rejected: one
   relay's echoes are missing, and nothing says which. Members that share no working
   relay never meet and see no error: an app's own short list does it (the board's one
-  `NOSTR_RELAY`, NB-129). `peerwire doctor` names such a relay `no-echo`.
+  `NOSTR_RELAY`, NB-129). `peerwire doctor` names such a relay `no-echo`, and since
+  NB-131 Rust's `relay_stats` counts each relay's events with no `OK`
+  ([Relay counters](#relay-counters-and-oversize-messages-nb-131-nb-128--nb128-1)).
 - **Relays that filter keys.** offchain.pub refused the probe's event ("pubkey is not in
   our web of trust"). Signalling signs with a fresh key per session in JavaScript and
   per carrier in Rust (a doc's relay copy with one key per doc, NB-006l), so nothing
@@ -6329,6 +6341,203 @@ public relay.
   others'. Retention is unmeasured on those two (12.7 days on relay.primal.net in
   October), and an inbox drop may ask for 7 days. Both stores were best-effort already:
   a relay can serve an old save or none (NB-006l).
+
+### Per-peer state a node keeps (NB-132) — NB132-1, NB132-I1
+
+Each page load is a new PeerId, so whatever a node keeps per peer grows with visits
+unless it has a cap on how many. A board in a room on the relays lost free heap with its
+first links and never got it back (NB-132); `2ba843f` bounds three stores in
+`crates/peerwire`. Reviewed on 2026-11-14 by reading `2ba843f`. A scratch copy ran two
+unit tests of the review's own, to reproduce NB132-1 and NB132-I1, then the fix proposed
+for NB132-1 with the crate's library tests; nothing else was re-run. Its fix, `96e2f55`,
+was read the same day.
+
+**What holds.**
+
+- **Peers remembered.** `Traversal` kept each peer it heard from for 10 minutes
+  (`FORGET`), however many: the author's unit test, run without the cap, remembered 330
+  after ten minutes of hellos from new ids, one a second (a burst of 30 answers, then
+  one each 2 s). `cap_remotes` now keeps at most 4 for each of the endpoint's
+  `max_links`, from 32 to 1024 (32 on an ESP32's 8 links), after every signal and every
+  timeout. Past the cap it trims to 7/8 of it: first the peers not linked with nothing
+  under way, least lately active first (the later of `seen_at` and `offered_at`), then
+  those with a dial step or a punch under way (`ladder`, `plan`). A linked peer stays,
+  and since `96e2f55` so does one dialled by invite or reached over a radio (NB132-1). A
+  `Remote` is 224 bytes inline, 416 before `plan` and `ladder` were boxed (by `size_of`
+  on a 64-bit host, the author's figures). On a PC `max_links` is unlimited by default,
+  so the cap is 1024, and signalling adds at most about 660 peers in `FORGET`'s 10
+  minutes (**theoretical**: a burst of 30 from each of the hello and offer budgets, then
+  one of each every 2 s), so `FORGET` still decides there. By its author's run,
+  `tests/heap_churn.rs` (ignored by default) finds a node's live heap level after about
+  30 page visits and flat through 781 hellos.
+- **What an evicted peer loses.** Offer nonces are kept apart, node-wide, for 2 minutes
+  (`MAX_NONCES`, 1024), so an evicted sender's offers are still checked for replay, and
+  the node-wide hello, offer and inbox budgets stay as they were. What starts over is
+  the peer's own: its offer budget (`SENDER_BURST`), the 2 s before a hello of its is
+  answered again (`OFFER_GAP`) and the 5 minutes between punches planned to it
+  (`BIRTHDAY_COOLDOWN`). A stranger has all three fresh from a new key anyway, within
+  the node-wide budgets and NB44-1's cap on punches to one IP address. Its relayed
+  addresses and TURN permissions go at the next timeout, as after `FORGET`. Its room
+  role and its invite go too, which matters for a peer whose link is still to come
+  (NB132-1, NB132-I1).
+- **Seen event ids.** `NostrSignaling` kept each event id it passed on twice, as
+  64-character strings; it now keeps the first 16 bytes, taken after the id is checked
+  to be the event's SHA-256 (`on_relay_message`). Two events with the same 16 bytes take
+  about 2^64 hashes of events one writes oneself, and the second is then dropped as a
+  copy; matching another's event, which isn't known until it is sent, takes about 2^128.
+  A node remembers 128 ids on an ESP32 and 4096 elsewhere: on a C3 about 6.4 KB for the
+  128, against about 25 KB as strings (**theoretical**: a table of 256 slots of 16 bytes
+  and a queue of 128). At `2ba843f` the queue took the 129th id before it dropped the
+  oldest, so it grew to 256 slots, about 8.4 KB; `96e2f55` drops first.
+- **Pipes.** A pipe whose peer isn't linked, with nothing queued and unused for 60 s, is
+  closed at the next flush (`Pipes::prune`); before, it lasted until `MAX_PIPES` others
+  pushed it out. A batch in or a datagram out counts as use, so a handshake under way
+  keeps its pipe, as a close still queued does. A peer that comes back after that gets a
+  new address, and addresses come round again only after 2^24 pipes.
+- **`Endpoint::config()`** gives the endpoint's settings, read-only; `Config` holds no
+  key.
+
+**NB132-1 — A burst pushes an invite dial out before it links (Low).** In a room,
+`Node::admits` takes a new link only from a peer whose `Remote` says it proved the room
+key (`member`) or that this node dialled it from an invite (`invited`). An invite dial's
+answers skip the node's offer budget, so that they can't be crowded out. `cap_remotes`
+evicts any peer not linked, an invited one among the last. A room member can make enough
+of those last: each offer it sends from a new key that the node acts on plans a punch,
+held for 1 to 1.5 s, when its NAT as the offer claims it pairs with the node's
+(`Symmetric` at any public IPv4 address, to a node STUN found `Cone`), or starts a dial
+step under a policy. Repro, the review's unit test on `2ba843f`: a node in a room as
+`Role::Host`, with `max_links` 8 so a cap of 32, dials an invite, then takes 28 such
+offers and 4 hellos from new ids within 0.8 s. The invited peer's entry is evicted,
+`admits` turns false and its plain answer is dropped; its handshake, if it comes through
+anyway, is refused. Within the budgets' bursts of 30 this reaches a cap of 32, so a
+`max_links` of 8 or less (an ESP32's), and a little more with links up. No shipped
+firmware dials an invite in a room, but a node with relay peers dials them again by
+invite whenever a link drops (`keep_relay_links`). Fix: evict no invited peer, as no
+linked one; only `Node::connect` sets `invited`, so the app bounds them. The same goes
+for a peer a radio connection reaches, bounded by the connections held. The review's
+test passed with that change, as did the crate's 180 library tests, the cap's own among
+them.
+
+**Status: fixed** by `96e2f55` before NB-132 merged, so never on main, reviewed
+2026-11-14: `cap_remotes` skips a peer dialled by invite (`invited`) or reached over a
+radio as it skips a linked one, and puts last only those with a dial step or a punch
+under way. The review's test is in as
+`an_invite_dial_outlasts_offers_that_plan_punches`: after the burst at most 32 peers are
+remembered, the invite dial is still admitted, and its plain answer is taken. Only
+`Node::connect` sets `invited`, and only `radio_reaches` adds a radio connection, once
+it proved the peer at its other end, at most `MAX_RADIO` a peer and gone when the
+connection closes; both kinds still go after `FORGET`. Its author's runs: the crate's
+183 library tests.
+
+**NB132-I1 — A burst pushes out a member that hasn't linked yet (Info).** A member whose
+hello the node answered, or whose offer it acted on, has no link until its handshake
+completes, a relay round trip or more over a pipe. Newer peers past the cap push it out
+like any other, and its handshake is then refused, so NB64-6's "the hello already made
+the dialler a member" fails through such a burst. Repro, the review's unit test on
+`2ba843f`, the same node with 20 earlier visitors remembered: a member is answered at
+100 s, then 29 hellos and 3 offers from new ids come within 3.2 s, and the member's
+entry is evicted and `admits` turns false. Each such cancel takes about a cap's worth of
+hellos and offers within the join, close to both budgets' bursts, which take a minute to
+refill; at their steady rate, one peer a second, 32 take longer than a join. Anyone with
+the room key could already hold off joins by spending those budgets (NB43-I2); this
+cancels one already under way, and the member's next hello brings it back once a token
+is free. No order of eviction tells a member from an attacker's new ids: keeping the
+proof the link needs would mean carrying it in the handshake, a wire change.
+
+**Status: accepted** for v1 by the lead on 2026-11-14: the member's next hello brings it
+back, and a fix needs the proof in the handshake, a wire change.
+
+### Relay counters and oversize messages (NB-131, NB-128) — NB128-1
+
+NB-131 counts what each relay does with the events a node sends it, so a relay that
+drops them without a word shows (NB-130). NB-128 drops a relay message over the size cap
+as it streams in, where one closed the connection, so one oversize event sent to a
+board's tag no longer cuts its pipe links (NB126-2). Reviewed on 2026-11-14 by reading
+`7b8d33c` (NB-131) and `791ae7b` (NB-128). A scratch copy of `791ae7b` ran one loopback
+test of the review's own, to reproduce NB128-1; nothing else was re-run. The fixes,
+`db35a13` (NB128-1) and `b9fa32c` (the counts), were re-checked the same day by reading,
+and a scratch copy of `c8d721a` ran their author's oversize and counter tests with
+overflow checks on.
+
+**What holds.**
+
+- **Each relay's counters (NB-131).** Each relay thread counts the events it sent, those
+  the relay took (`OK true`) or refused (`OK false`), and those with no `OK` within 10 s
+  on the connection they went out on, or before it closed: `RelayStats`, from
+  `NostrSignaling::relay_stats` or a `RelayWatch` kept before the carrier goes into a
+  node, and on a board `peerwire_esp::nostr_relays()`. An `OK` is read only from a text
+  frame of at most 1 KiB that starts `["OK"`, so it costs one more parse of at most
+  1 KiB, and its event is matched by the id's first 16 bytes. Only the relay writes
+  frames on its connection; other publishers' events come inside `EVENT` messages, so no
+  one else can answer for it. At most `Limits::waiting` events await an answer, 32 on an
+  ESP32 and 256 elsewhere, each 16 bytes of id and a time; past that the oldest counts
+  as unanswered. The counters hold counts and the relay's URL, nothing about peers or
+  topics, and the board's 30 s report prints only counts. A relay can make its own
+  counts say what it likes, as it can answer `OK true` and drop the event: they
+  diagnose, they prove nothing. Two counts were loose at `7b8d33c`: an `OK` counted
+  whether or not it matched an event awaited, so one after 10 s counted as both
+  unanswered and taken, and events still awaited when the connection dropped counted as
+  neither. Since `b9fa32c` only an `OK` for an event awaited counts, and those still
+  awaited at the close count as unanswered, so each event sent is in time taken, refused
+  or unanswered.
+- **Oversize messages (NB-128).** `Oversize` sits between the socket, TCP or TLS, and
+  tungstenite, and reads each frame's header (RFC 6455 §5.2). A data frame whose payload
+  is over the cap, 4 KiB on an ESP32 and 128 KiB elsewhere, is read through a 256-byte
+  buffer and dropped, and so are the continuation frames of its message; control frames
+  pass. The review tried the points its author named. A header split across reads or a
+  timeout: the bytes read so far stay in `Oversize`, as does the count of payload left.
+  The handshake: a read ends at the HTTP response's blank line, and frame bytes read
+  with it are judged before tungstenite sees them, once. Lengths of 64 bits are clamped
+  to the buffer before any `usize` use, so a 32-bit board reads them right. Opcodes: the
+  reserved data ones, 3 to 7, are judged by size; a reserved or oversize control frame
+  passes, as does a continuation with no message, and tungstenite then refuses each and
+  closes. Only the relay frames the stream, so each of those is a close it could make
+  anyway. Its author's tests: `fuzz_oversize_frames`, 3,000 random streams against a
+  model, read in random pieces with timeouts between; the NB95-1 board test, which now
+  takes a 16 KiB frame and then the next event on the same connection, one handshake in
+  3.5 s; and a 200 KiB message, an oversize first piece and its continuation, a ping,
+  and a small message in two pieces, read whole. Letting continuations through fails two
+  of them, and no filter at all three.
+- **Messages in pieces (NB128-1, `db35a13`).** A data message in several frames is held
+  in `Oversize`, at most the cap's worth: a piece that would take it over the cap frees
+  what is held and drops the rest of the message, and the buffer grows by doubling but
+  never past the cap. When its last piece comes the message passes on as one frame:
+  final, its first opcode, every piece's reserved bits, the shortest length form, and
+  the mask bit with a zero key if a piece was masked, which tungstenite refuses from a
+  server as it would the piece. Control frames between the pieces pass at once. A read
+  that times out mid-piece keeps what was read, and an empty message in pieces passes as
+  an empty frame. A data frame that begins a message inside another is an error that
+  ends the connection, as tungstenite makes it, and a stray continuation still passes
+  for tungstenite to refuse: only the relay frames the stream, so each is a close it
+  could make anyway. Tests: the review's repro, inverted: a 16 KiB message in four
+  frames of 4,096 bytes, a ping among them, is dropped and the next message comes on the
+  same connection; 4 KiB in four pieces comes whole, and so does 68 KiB under a host's
+  128 KiB cap, in the 64-bit length form. The fuzz model now wants a message in pieces
+  as one frame after the control frames among them, or nothing past the cap, adds stray
+  continuations and streams that end in a message inside another, and checks after each
+  read that no more than the cap is held. Its author's mutants, pieces passed unheld, a
+  held message with no cap and doubling past the cap, each fail a test.
+
+**NB128-1 — A relay that writes a message in pieces still closes the socket (Low).** At
+`791ae7b`, `Oversize` judged each frame alone, so a message whose first frame was within
+the cap passed whole; tungstenite then added up its frames and closed the connection at
+the cap, as before NB-128. Only the relay frames what it sends, but anyone who knows the
+tag chooses how large an event is. On a relay whose WebSocket library writes a long
+message as several frames, each within a board's 4 KiB, NB126-2 stood as it was: Go's
+gorilla websocket does that through `NextWriter`, which `WriteJSON` uses, at its write
+buffer, 4 KiB by default. Whether any default relay does is unknown. Repro, the review's
+loopback test on `791ae7b`: a local relay sends a 16 KiB message as four frames of 4,096
+bytes, then a small one, to a client with an ESP32's cap. The client's read fails with
+`Capacity(MessageTooLong { size: 8192, max_size: 4096 })` and the small message never
+comes. Fix: `Oversize` holds the payload of a message in pieces, at most the cap's
+worth, which tungstenite would hold anyway, and passes it on as one frame when the last
+piece comes within the cap; past the cap it drops what it holds and the rest of the
+message. Control frames between the pieces pass at once.
+
+**Status: fixed** by `db35a13` before NB-128 merged, so never on main, reviewed
+2026-11-14, as the fix above. The review's repro, inverted, is a test: the 16 KiB
+message is dropped and the small one comes on the same connection. Reported on NB-128 at
+`791ae7b`.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
@@ -6729,10 +6938,16 @@ congestion rule for tail losses from NB-086 (`b2ae061`, reviewed 2026-11-03).
     present one event under many ids. Offers are sealed and hellos proven, and
     replays fall under SEC-6, so the cost is duplicate work. Rust checks the id.
 - **Rust Nostr.**
-  - Websocket messages and frames are capped at 128 KiB.
+  - Websocket messages and frames are capped at 128 KiB (4 KiB on an ESP32). Since
+    NB-128 a message over the cap is dropped as it streams in, in one frame or in
+    pieces, and the connection kept; a message in pieces is held, at most the cap's
+    worth, and passed on as one frame (NB128-1).
   - The inbox holds 1024 events, then drops.
-  - 4096 event ids are remembered.
+  - 4096 event ids are remembered (128 on an ESP32), each as its first 16 bytes since
+    NB-132.
   - At most 64 publishes are queued while a relay is down.
+  - At most 256 events (32 on an ESP32) await a relay's `OK`, then the oldest counts as
+    unanswered (NB-131).
 
 **Addresses we give out**
 - **NB-041.** Offers to a relay peer name no links. Residual: under `Direct`, a relay
@@ -7124,8 +7339,8 @@ mappings that carry over and are already handled in Peerwire:
   advert (NB110-13). On an ESP32 board with no network, the time the first room member
   to link over Bluetooth gives, until the board restarts or SNTP answers (NB119-2).
 - Signalling rests on public relays we don't run: one that drops our events without a
-  word hides members that share no other working relay, and only `peerwire doctor` names
-  it ([NB-130](#default-nostr-relays-nb-130)).
+  word hides members that share no other working relay, and only `peerwire doctor` and
+  Rust's `relay_stats` (NB-131) name it ([NB-130](#default-nostr-relays-nb-130)).
 - The security of the underlying crypto crates is assumed.
 
 ## Review method
