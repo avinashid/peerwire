@@ -80,6 +80,10 @@ and the commit that fixed it.
   `Config::max_links` (32 to 1024; 32 on an ESP32), the least lately active first to go, never a linked or invited one.
   `NostrSignaling` keeps the ids it has seen as 16 bytes, not two 64-character strings (~6 KB rather than ~25 KB for
   an ESP32's 128), and a relay pipe whose peer left is closed after 60 s idle. `peerwire-core`: `Endpoint::config`.
+- `peerwire`: `NostrSignaling::relay_stats`, each relay's counters: open, events sent, and of those taken (`OK true`),
+  refused and never answered (no `OK` within 10 s), so a relay that drops events without a word shows (NB-131);
+  `relay_watch` keeps them readable once the carrier is in a node. `peerwire-esp`: `nostr_relays`, and the
+  `nostr_led` example's 30 s report ends with them.
 
 ## Unreleased: `@peerwire/js`
 

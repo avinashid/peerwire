@@ -68,14 +68,19 @@ struct Limits {
     queued: usize,
     /// Event ids remembered to drop the copy each relay delivers.
     seen: usize,
+    /// Events a relay connection awaits an `OK` for ([`RelayStats::unanswered`]); past it, the oldest counts as
+    /// unanswered.
+    waiting: usize,
 }
 
 impl Limits {
-    const FULL: Limits = Limits { message: 128 << 10, inbox: 1024, inbox_bytes: 8 << 20, queued: 64, seen: 4096 };
+    const FULL: Limits =
+        Limits { message: 128 << 10, inbox: 1024, inbox_bytes: 8 << 20, queued: 64, seen: 4096, waiting: 256 };
     /// ESP-IDF's: an ESP32 has about 300 KB of heap, and 80 KB free with two links. A
     /// full inbox took 53 KB of it from the start and the ids remembered about 170 B each
     /// (NB-095); a signal event is at most about 2.3 KB (NB95-1).
-    const SMALL: Limits = Limits { message: 4 << 10, inbox: 32, inbox_bytes: 16 << 10, queued: 8, seen: 128 };
+    const SMALL: Limits =
+        Limits { message: 4 << 10, inbox: 32, inbox_bytes: 16 << 10, queued: 8, seen: 128, waiting: 32 };
 }
 
 /// Counters for a [`NostrSignaling`] carrier.
@@ -87,6 +92,72 @@ pub struct NostrStats {
     pub received: u64,
     /// Events a relay refused (`OK false`).
     pub rejected: u64,
+}
+
+/// One relay's counters since the carrier started ([`NostrSignaling::relay_stats`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayStats {
+    /// The relay's URL, as given.
+    pub url: String,
+    /// Whether a connection to it is open now.
+    pub open: bool,
+    /// Events written to it.
+    pub sent: u64,
+    /// Events it took (`OK true`).
+    pub accepted: u64,
+    /// Events it refused (`OK false`).
+    pub rejected: u64,
+    /// Events it never answered: no `OK` within 10 s on the connection they went out on. A relay that drops events
+    /// without a word, as two default relays did (NB-130), counts them here, and so does one past its wait queue's
+    /// cap of answers awaited.
+    pub unanswered: u64,
+}
+
+/// The relays' counters of a [`NostrSignaling`], to read once the carrier has gone into a node
+/// ([`NostrSignaling::relay_watch`]).
+#[derive(Clone)]
+pub struct RelayWatch(Arc<[Arc<RelayCounters>]>);
+
+impl RelayWatch {
+    /// Each relay's counters, in the order the carrier was given them.
+    pub fn stats(&self) -> Vec<RelayStats> {
+        self.0.iter().map(|c| c.stats()).collect()
+    }
+}
+
+impl std::fmt::Debug for RelayWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.stats()).finish()
+    }
+}
+
+/// How long a relay has to answer an event with an `OK` ([`RelayStats::unanswered`]).
+const ANSWER_WAIT: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(10) };
+
+/// A relay's counters, shared with its thread.
+#[derive(Default)]
+struct RelayCounters {
+    url: String,
+    open: std::sync::atomic::AtomicBool,
+    sent: Counter,
+    accepted: Counter,
+    rejected: Counter,
+    unanswered: Counter,
+}
+
+impl RelayCounters {
+    #[allow(clippy::useless_conversion)] // from u32 where there are no 64-bit atomics
+    fn stats(&self) -> RelayStats {
+        let n = |c: &Counter| u64::from(c.load(Ordering::Relaxed));
+        RelayStats {
+            url: self.url.clone(),
+            open: self.open.load(Ordering::Relaxed),
+            sent: n(&self.sent),
+            accepted: n(&self.accepted),
+            rejected: n(&self.rejected),
+            unanswered: n(&self.unanswered),
+        }
+    }
 }
 
 // The ESP32-C3 has no 64-bit atomics; its counters wrap at 2^32.
@@ -107,7 +178,8 @@ struct Shared {
 enum Cmd {
     /// The subscription to keep open (`None`: none).
     Req(Option<String>),
-    Event(String),
+    /// An event's message, and its id's first 16 bytes, to match the relay's `OK`.
+    Event(String, u128),
 }
 
 struct Incoming {
@@ -138,6 +210,7 @@ pub struct NostrSignaling {
     seen: HashSet<u128>,
     seen_order: VecDeque<u128>,
     shared: Arc<Shared>,
+    counters: RelayWatch,
     published: u64,
     limits: Limits,
 }
@@ -169,16 +242,20 @@ impl NostrSignaling {
         OsRng.fill_bytes(&mut sub);
         let (tx, inbox) = sync_channel(limits.inbox);
         let shared = Arc::new(Shared::default());
+        let mut counters = Vec::new();
         let relays = relays
             .into_iter()
             .map(|url| {
                 let (cmd, rx) = channel();
-                let (url, tx, shared) = (url.as_ref().to_string(), tx.clone(), shared.clone());
+                let url = url.as_ref().to_string();
+                let mine = Arc::new(RelayCounters { url: url.clone(), ..RelayCounters::default() });
+                counters.push(mine.clone());
+                let (tx, shared) = (tx.clone(), shared.clone());
                 let mut thread = std::thread::Builder::new().name("peerwire-nostr".into());
                 if let Some(size) = RELAY_STACK {
                     thread = thread.stack_size(size);
                 }
-                thread.spawn(move || relay_loop(url, rx, tx, shared, limits)).expect("spawn relay thread");
+                thread.spawn(move || relay_loop(url, rx, tx, shared, mine, limits)).expect("spawn relay thread");
                 cmd
             })
             .collect();
@@ -192,6 +269,7 @@ impl NostrSignaling {
             seen: HashSet::new(),
             seen_order: VecDeque::new(),
             shared,
+            counters: RelayWatch(counters.into()),
             published: 0,
             limits,
         }
@@ -206,6 +284,16 @@ impl NostrSignaling {
             received: u64::from(self.shared.received.load(Ordering::Relaxed)),
             rejected: u64::from(self.shared.rejected.load(Ordering::Relaxed)),
         }
+    }
+
+    /// Each relay's counters (open, events sent, taken, refused and never answered), in the order given.
+    pub fn relay_stats(&self) -> Vec<RelayStats> {
+        self.counters.stats()
+    }
+
+    /// A handle on [`relay_stats`](NostrSignaling::relay_stats) that outlives handing the carrier to a node.
+    pub fn relay_watch(&self) -> RelayWatch {
+        self.counters.clone()
     }
 
     fn resubscribe(&mut self) {
@@ -235,9 +323,10 @@ impl Signaling for NostrSignaling {
 
     fn publish(&mut self, topic: Topic, payload: &[u8]) {
         let event = sign_event(&self.key, &self.pubkey, unix_secs(), &topic.to_hex(), &b64(payload));
+        let id = event["id"].as_str().and_then(|id| u128::from_str_radix(id.get(..32)?, 16).ok()).unwrap_or(0);
         let msg = json!(["EVENT", event]).to_string();
         for r in &self.relays {
-            let _ = r.send(Cmd::Event(msg.clone()));
+            let _ = r.send(Cmd::Event(msg.clone(), id));
         }
         self.published += 1;
     }
@@ -311,15 +400,24 @@ impl Stream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
 type Ws = tungstenite::WebSocket<Box<dyn Stream>>;
 
 /// One relay: connect, keep the subscription, forward events both ways, reconnect.
-fn relay_loop(url: String, cmds: Receiver<Cmd>, out: SyncSender<Incoming>, shared: Arc<Shared>, limits: Limits) {
+fn relay_loop(
+    url: String,
+    cmds: Receiver<Cmd>,
+    out: SyncSender<Incoming>,
+    shared: Arc<Shared>,
+    counters: Arc<RelayCounters>,
+    limits: Limits,
+) {
     let mut req: Option<String> = None;
-    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut queue: VecDeque<(String, u128)> = VecDeque::new();
     let mut backoff = Duration::from_secs(1);
     loop {
         if let Ok(mut ws) = connect(&url, limits.message) {
             shared.open.fetch_add(1, Ordering::Relaxed);
+            counters.open.store(true, Ordering::Relaxed);
             let opened = Instant::now();
-            let alive = session(&mut ws, &cmds, &out, &shared, limits, &mut req, &mut queue);
+            let alive = session(&mut ws, &cmds, &out, &shared, &counters, limits, &mut req, &mut queue);
+            counters.open.store(false, Ordering::Relaxed);
             shared.open.fetch_sub(1, Ordering::Relaxed);
             if !alive {
                 let _ = ws.close(None);
@@ -335,7 +433,7 @@ fn relay_loop(url: String, cmds: Receiver<Cmd>, out: SyncSender<Incoming>, share
         while waited < backoff {
             match cmds.recv_timeout(Duration::from_millis(100)) {
                 Ok(Cmd::Req(r)) => req = r,
-                Ok(Cmd::Event(e)) => enqueue(&mut queue, e, limits.queued),
+                Ok(Cmd::Event(e, id)) => enqueue(&mut queue, (e, id), limits.queued),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => waited += Duration::from_millis(100),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
@@ -345,7 +443,7 @@ fn relay_loop(url: String, cmds: Receiver<Cmd>, out: SyncSender<Incoming>, share
 }
 
 /// Queues an event for a relay, dropping the oldest past `max`.
-fn enqueue(queue: &mut VecDeque<String>, event: String, max: usize) {
+fn enqueue(queue: &mut VecDeque<(String, u128)>, event: (String, u128), max: usize) {
     if queue.len() >= max {
         queue.pop_front();
     }
@@ -353,48 +451,72 @@ fn enqueue(queue: &mut VecDeque<String>, event: String, max: usize) {
 }
 
 /// Runs one connection until it drops (`true`) or the carrier is dropped (`false`).
+#[allow(clippy::too_many_arguments)]
 fn session(
     ws: &mut Ws,
     cmds: &Receiver<Cmd>,
     out: &SyncSender<Incoming>,
     shared: &Shared,
+    counters: &RelayCounters,
     limits: Limits,
     req: &mut Option<String>,
-    queue: &mut VecDeque<String>,
+    queue: &mut VecDeque<(String, u128)>,
 ) -> bool {
     let mut sent_req = false;
+    // The events sent on this connection that await an `OK`, oldest first.
+    let mut waiting: VecDeque<(u128, Instant)> = VecDeque::new();
     loop {
-        let mut frames = Vec::new();
+        while waiting.front().is_some_and(|(_, at)| at.elapsed() >= ANSWER_WAIT) {
+            waiting.pop_front();
+            counters.unanswered.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut frames: Vec<(String, Option<u128>)> = Vec::new();
         loop {
             match cmds.try_recv() {
                 Ok(Cmd::Req(r)) => {
                     if r.is_none() && sent_req {
-                        frames.push(json!(["CLOSE", req_sub(req.as_deref())]).to_string());
+                        frames.push((json!(["CLOSE", req_sub(req.as_deref())]).to_string(), None));
                     }
                     *req = r;
                     sent_req = false;
                 }
                 // Capped here too: a relay that stops reading holds the thread in a write
                 // for up to CONNECT_TIMEOUT while publishes pile up (NB95-2).
-                Ok(Cmd::Event(e)) => enqueue(queue, e, limits.queued),
+                Ok(Cmd::Event(e, id)) => enqueue(queue, (e, id), limits.queued),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return false,
             }
         }
         if !sent_req {
             if let Some(r) = req.as_ref() {
-                frames.push(r.clone());
+                frames.push((r.clone(), None));
             }
             sent_req = true;
         }
-        frames.extend(queue.drain(..));
-        for f in frames {
+        frames.extend(queue.drain(..).map(|(e, id)| (e, Some(id))));
+        for (f, id) in frames {
             if ws.send(Message::Text(f)).is_err() {
                 return true;
             }
+            if let Some(id) = id {
+                counters.sent.fetch_add(1, Ordering::Relaxed);
+                if waiting.len() >= limits.waiting {
+                    waiting.pop_front();
+                    counters.unanswered.fetch_add(1, Ordering::Relaxed);
+                }
+                waiting.push_back((id, Instant::now()));
+            }
         }
         match ws.read() {
-            Ok(Message::Text(t)) => on_relay_message(&t, out, shared, limits.inbox_bytes),
+            Ok(Message::Text(t)) => {
+                if let Some((id, ok)) = ok_reply(&t) {
+                    if let Some(i) = waiting.iter().position(|(w, _)| *w == id) {
+                        waiting.remove(i);
+                    }
+                    (if ok { &counters.accepted } else { &counters.rejected }).fetch_add(1, Ordering::Relaxed);
+                }
+                on_relay_message(&t, out, shared, limits.inbox_bytes);
+            }
             Ok(Message::Close(_)) => return true,
             Ok(_) => {}
             Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
@@ -405,6 +527,17 @@ fn session(
             Err(_) => return true,
         }
     }
+}
+
+/// An `OK` reply's event, as its id's first 16 bytes, and whether the relay took it.
+fn ok_reply(text: &str) -> Option<(u128, bool)> {
+    // An `OK` is a short array; anything else is left to `on_relay_message`.
+    if text.len() > 1024 || !text.trim_start().strip_prefix('[')?.trim_start().starts_with("\"OK\"") {
+        return None;
+    }
+    let Ok(Value::Array(m)) = serde_json::from_str::<Value>(text) else { return None };
+    let id = u128::from_str_radix(m.get(1)?.as_str()?.get(..32)?, 16).ok()?;
+    Some((id, m.get(2)?.as_bool()?))
 }
 
 fn req_sub(req: Option<&str>) -> String {
@@ -753,6 +886,56 @@ mod tests {
         };
         assert!(matches!(err, Err(tungstenite::Error::Capacity(_))), "{err:?}");
         drop(ws);
+        server.join().unwrap();
+    }
+
+    /// NB-131: each relay's counters. A local relay takes the first event, refuses the second, and never answers the
+    /// third, as nos.lol and nostr.mom did every event (NB-130): one each of accepted, rejected and unanswered.
+    #[test]
+    fn relay_stats_count_each_relays_answers_and_silences() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut ws = tungstenite::accept(s).unwrap();
+            let mut n = 0;
+            while let Ok(m) = ws.read() {
+                let Ok(Value::Array(m)) = serde_json::from_str::<Value>(m.to_text().unwrap_or("")) else { continue };
+                if m[0] != "EVENT" {
+                    continue;
+                }
+                n += 1;
+                let id = m[1]["id"].clone();
+                match n {
+                    1 => ws.send(Message::Text(json!(["OK", id, true, ""]).to_string())).unwrap(),
+                    2 => ws.send(Message::Text(json!(["OK", id, false, "blocked: no"]).to_string())).unwrap(),
+                    _ => {} // the third: never answered
+                }
+            }
+        });
+        let mut carrier = NostrSignaling::new([&url]);
+        let watch = carrier.relay_watch();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !carrier.relay_stats()[0].open && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for i in 0..3u8 {
+            carrier.publish(Topic([i; 32]), b"x");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let want = RelayStats { url: url.clone(), open: true, sent: 3, accepted: 1, rejected: 1, unanswered: 1 };
+        while carrier.relay_stats()[0] != want && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(carrier.relay_stats(), std::slice::from_ref(&want));
+        assert_eq!(carrier.stats().rejected, 1);
+        drop(carrier);
+        // The handle reads on after the carrier is gone, and sees the connection closed.
+        while watch.stats()[0].open && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(watch.stats(), [RelayStats { open: false, ..want }]);
         server.join().unwrap();
     }
 

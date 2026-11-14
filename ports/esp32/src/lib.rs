@@ -281,7 +281,19 @@ pub fn nostr_signaling(relay: &str) -> anyhow::Result<NostrSignaling> {
     ThreadSpawnConfiguration { name: Some(NOSTR_THREAD), priority: 1, ..Default::default() }.set()?;
     let nostr = NostrSignaling::new([relay]);
     ThreadSpawnConfiguration::default().set()?;
+    let _ = NOSTR_RELAYS.set(nostr.relay_watch());
     Ok(nostr)
+}
+
+/// The counters of the first [`nostr_signaling`] carrier's relays, for [`nostr_relays`].
+#[cfg(feature = "nostr")]
+static NOSTR_RELAYS: std::sync::OnceLock<peerwire::nostr::RelayWatch> = std::sync::OnceLock::new();
+
+/// The first [`nostr_signaling`] carrier's relay: open or not, events sent to it, and of those taken, refused and never
+/// answered (NB-131). Empty before one is made.
+#[cfg(feature = "nostr")]
+pub fn nostr_relays() -> Vec<peerwire::nostr::RelayStats> {
+    NOSTR_RELAYS.get().map(|w| w.stats()).unwrap_or_default()
 }
 
 /// The stack [`nostr_signaling`]'s relay thread has never used, and its priority, while it runs.
