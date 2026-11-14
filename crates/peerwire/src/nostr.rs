@@ -111,7 +111,8 @@ enum Cmd {
 }
 
 struct Incoming {
-    id: String,
+    /// The first 16 bytes of the event's id (its SHA-256, checked), for the seen filter.
+    id: u128,
     pubkey: String,
     tag: String,
     content: String,
@@ -119,7 +120,7 @@ struct Incoming {
 
 impl Incoming {
     fn size(&self) -> usize {
-        self.id.len() + self.pubkey.len() + self.tag.len() + self.content.len()
+        16 + self.pubkey.len() + self.tag.len() + self.content.len()
     }
 }
 
@@ -131,8 +132,11 @@ pub struct NostrSignaling {
     topics: BTreeSet<Topic>,
     relays: Vec<Sender<Cmd>>,
     inbox: Receiver<Incoming>,
-    seen: HashSet<String>,
-    seen_order: VecDeque<String>,
+    /// Event ids passed on, as their first 16 bytes (a `u128`, not the 64-character hex twice: 32 bytes an id where
+    /// two `String`s took ~190, so ~6 KB for the 128 on an ESP32 rather than ~25, NB-132). An id is checked to be the
+    /// event's hash, so a copy that slips through takes ~2^64 tries at events of one's own, and can't target another's.
+    seen: HashSet<u128>,
+    seen_order: VecDeque<u128>,
     shared: Arc<Shared>,
     published: u64,
     limits: Limits,
@@ -242,7 +246,7 @@ impl Signaling for NostrSignaling {
         loop {
             let m = self.inbox.try_recv().ok()?;
             self.shared.inbox_bytes.fetch_sub(m.size(), Ordering::Relaxed);
-            if m.pubkey == self.pubkey || !self.seen.insert(m.id.clone()) {
+            if m.pubkey == self.pubkey || !self.seen.insert(m.id) {
                 continue; // our own, or a copy from another relay
             }
             self.seen_order.push_back(m.id);
@@ -444,9 +448,11 @@ fn on_relay_message(text: &str, out: &SyncSender<Incoming>, shared: &Shared, max
             // event up as many (copies are dropped by id). Signatures aren't checked:
             // offers are sealed and authenticate themselves.
             let ser = json!([0, pubkey, created_at, KIND, tags, content]).to_string();
-            if hex(&Sha256::digest(ser)) != id {
+            let digest: [u8; 32] = Sha256::digest(ser).into();
+            if hex(&digest) != id {
                 return;
             }
+            let id = u128::from_be_bytes(digest[..16].try_into().expect("16 of 32 bytes"));
             shared.received.fetch_add(1, Ordering::Relaxed);
             // A full inbox drops the event, as a relay may.
             let m = Incoming { id, pubkey, tag, content };
@@ -639,7 +645,8 @@ mod tests {
         let ev = sign_event(&key, &pubkey, 1_700_000_000, "t", "c");
         on(&json!(["EVENT", "s", ev]).to_string(), &tx, &shared);
         let m = rx.try_recv().unwrap();
-        assert_eq!((m.id, m.tag.as_str(), m.content.as_str()), (ev["id"].as_str().unwrap().to_string(), "t", "c"));
+        let prefix = u128::from_str_radix(&ev["id"].as_str().unwrap()[..32], 16).unwrap();
+        assert_eq!((m.id, m.tag.as_str(), m.content.as_str()), (prefix, "t", "c"));
         // The same id with other content (a relay replaying it as new): dropped.
         let mut forged = ev.clone();
         forged["content"] = json!("d");
@@ -667,13 +674,13 @@ mod tests {
         on(&relay_event(2, "t", "QQ==", 6), &tx, &shared);
         on(&relay_event(3, "t", "QQ==", 60), &tx, &shared);
         assert_eq!(rx.try_iter().count(), 0);
-        // An ESP32's inbox: 16 KiB, so 5 events of 3,129 B and not the 6th.
+        // An ESP32's inbox: 16 KiB, so 5 events of 3,081 B (the id counted as its 16 bytes kept) and not the 6th.
         let shared = Shared::default();
         let content = "A".repeat(3000);
         for i in 0..10 {
             on_relay_message(&relay_event(i, "t", &content, 0), &tx, &shared, Limits::SMALL.inbox_bytes);
         }
-        assert_eq!(shared.inbox_bytes.load(Ordering::Relaxed), 5 * 3129);
+        assert_eq!(shared.inbox_bytes.load(Ordering::Relaxed), 5 * 3081);
         assert_eq!(rx.try_iter().count(), 5);
     }
 

@@ -111,6 +111,11 @@ const VIA_PER_DIAL: usize = 2;
 const MAX_OBSERVED: usize = 4;
 /// Peers forgotten after this long without news (unless connected).
 const FORGET: Duration = Duration::from_secs(600);
+/// Peers remembered at most ([`Traversal::cap_remotes`]): `REMOTES_PER_LINK` for each of the endpoint's
+/// `max_links`, from `MIN_REMOTES` up to `MAX_REMOTES` (32 on an ESP32's 8 links, 1024 with no cap on links).
+const REMOTES_PER_LINK: usize = 4;
+const MIN_REMOTES: usize = 32;
+const MAX_REMOTES: usize = 1024;
 /// Offer versions: 1 plain (only to peers that dialled us), 2 in a room, with a
 /// room proof, 3 with an invite proof (from a peer dialling us from our invite).
 const OFFER: u8 = 1;
@@ -647,15 +652,16 @@ struct Remote<A> {
     seen_at: Instant,
     /// Its offers acted on.
     offers: Bucket,
-    /// A punch to start then (birthday or lockstep), and when the last one started.
-    plan: Option<(Instant, Plan<A>)>,
+    /// A punch to start then (birthday or lockstep), and when the last one started. Boxed, as is `ladder`: most
+    /// peers remembered never have one, and inline the two made each `Remote` 416 bytes rather than 224 (NB-132).
+    plan: Option<Box<(Instant, Plan<A>)>>,
     plan_at: Option<Instant>,
     /// The addresses in its last offer acted on that this node can dial: a link moved off a relay punches to them.
     addrs: Vec<A>,
     /// The relayed addresses (its TURN allocations') in its last offer acted on.
     relayed: Vec<A>,
     /// A dial to it under a [`Policy`], step by step.
-    ladder: Option<Ladder<A>>,
+    ladder: Option<Box<Ladder<A>>>,
     /// Its link is moving off a path that is off, and is closed if it hasn't by then.
     moving: Option<Instant>,
     /// A dial that moves its link ([`Endpoint::redial`]) is under way: its `ConnectFailed` is this node's own.
@@ -1269,6 +1275,13 @@ impl<A: Address> Traversal<A> {
         topic: Topic,
         payload: &[u8],
     ) -> Option<PeerId> {
+        let from = self.on_signal(now, ep, topic, payload);
+        self.cap_remotes(ep);
+        from
+    }
+
+    /// [`handle_signal`](Traversal::handle_signal)'s work, before the cap on the peers remembered.
+    fn on_signal(&mut self, now: Instant, ep: &mut Endpoint<A>, topic: Topic, payload: &[u8]) -> Option<PeerId> {
         self.sync_keep(ep);
         if let Some(room) = self.room.as_ref().filter(|r| r.topic == topic) {
             // A hello that doesn't open under the room's key (plaintext, another room's, altered) is dropped.
@@ -1600,6 +1613,7 @@ impl<A: Address> Traversal<A> {
             }
         }
         self.remotes.retain(|p, r| now - r.seen_at < FORGET || ep.is_connected(p));
+        self.cap_remotes(ep);
         let remotes = &self.remotes;
         for peers in self.relayed_of.values_mut() {
             peers.retain(|p| remotes.contains_key(p));
@@ -1655,7 +1669,7 @@ impl<A: Address> Traversal<A> {
         let due = |r: &Remote<A>| r.plan.as_ref().is_some_and(|b| b.0 <= now);
         let due: Vec<PeerId> = self.remotes.iter().filter(|(_, r)| due(r)).map(|(p, _)| *p).collect();
         for peer in due {
-            let Some((_, side)) = self.remotes.get_mut(&peer).and_then(|r| r.plan.take()) else { continue };
+            let Some((_, side)) = self.remotes.get_mut(&peer).and_then(|r| r.plan.take()).map(|b| *b) else { continue };
             let direct = matches!(ep.path(&peer), Some(Path::Direct(a)) if !a.relayed());
             // A link kept on its relay (NB-097) takes no punch: none is started, nor counted.
             if direct || relay_only || ep.path(&peer).is_some_and(|p| self.kept(p)) {
@@ -1699,7 +1713,10 @@ impl<A: Address> Traversal<A> {
             match side {
                 Plan::Open(dst) | Plan::Both(dst) => {
                     if both {
-                        r.plan = Some((now + (BIRTHDAY_SPRAY_AFTER - BIRTHDAY_OPEN_AFTER), Plan::Then(dst.clone())));
+                        r.plan = Some(Box::new((
+                            now + (BIRTHDAY_SPRAY_AFTER - BIRTHDAY_OPEN_AFTER),
+                            Plan::Then(dst.clone()),
+                        )));
                     }
                     if let Some(payload) = ep.opener(now, &peer) {
                         let until = now + BIRTHDAY_OPEN_FOR;
@@ -1751,7 +1768,7 @@ impl<A: Address> Traversal<A> {
                 l.next
             }
             None => {
-                r.ladder = Some(Ladder { offer: o.clone(), next: 0, at: now, invite: false });
+                r.ladder = Some(Box::new(Ladder { offer: o.clone(), next: 0, at: now, invite: false }));
                 0
             }
         };
@@ -1797,7 +1814,7 @@ impl<A: Address> Traversal<A> {
         };
         let r = self.remotes.entry(peer).or_default();
         r.seen_at = now;
-        r.ladder = Some(Ladder { offer, next: 0, at: now, invite: true });
+        r.ladder = Some(Box::new(Ladder { offer, next: 0, at: now, invite: true }));
         match self.climb(now, ep, peer) {
             true => Ok(()),
             false => {
@@ -2093,6 +2110,31 @@ impl<A: Address> Traversal<A> {
         matches!(self.privacy, Privacy::RelayOnly { .. }) && listed && self.turn.has_servers()
     }
 
+    /// Keeps the peers remembered to the cap for the endpoint's `max_links` (`REMOTES_PER_LINK` each, within
+    /// `MIN_REMOTES..=MAX_REMOTES`): past it, down to 7/8 of it, the least lately active first, then those mid-dial
+    /// or invited. Linked peers stay. Every page load is a new PeerId, each kept `FORGET` long, so before this a
+    /// stranger who knew the room ran a board's heap down by reloading (NB-132).
+    fn cap_remotes(&mut self, ep: &Endpoint<A>) {
+        let cap = ep.config().max_links.saturating_mul(REMOTES_PER_LINK).clamp(MIN_REMOTES, MAX_REMOTES);
+        if self.remotes.len() <= cap {
+            return;
+        }
+        let excess = self.remotes.len() - (cap - cap / 8);
+        let mut idle: Vec<(bool, Instant, PeerId)> = self
+            .remotes
+            .iter()
+            .filter(|(p, _)| !ep.is_connected(p))
+            .map(|(p, r)| {
+                let busy = r.ladder.is_some() || r.plan.is_some() || r.invited;
+                (busy, r.seen_at.max(r.offered_at.unwrap_or(Instant::ZERO)), *p)
+            })
+            .collect();
+        idle.sort_unstable();
+        for (_, _, p) in idle.into_iter().take(excess) {
+            self.remotes.remove(&p);
+        }
+    }
+
     /// Closes the link to `peer`, on a path the policy turned off, for [`poll_dropped`](Traversal::poll_dropped).
     fn close(&mut self, ep: &mut Endpoint<A>, peer: PeerId) {
         self.hang_up(ep, &peer);
@@ -2159,7 +2201,7 @@ impl<A: Address> Traversal<A> {
             Plan::Spray(_) | Plan::Then(_) => BIRTHDAY_SPRAY_AFTER,
             Plan::Sweep(_) => LOCKSTEP_AFTER,
         };
-        r.plan = Some((now + wait, side));
+        r.plan = Some(Box::new((now + wait, side)));
         Some(base.clone())
     }
 
@@ -3456,6 +3498,39 @@ mod tests {
         t.handle_signal(now, &mut ep, topic, &room_hello(&key, &id(3).peer_id(), Role::Host, 0));
         assert_eq!(published(&mut t), 2, "an offer, and our hello in answer");
         assert!(t.admits(&id(3).peer_id()) && !t.admits(&host.peer_id()));
+    }
+
+    /// NB-132: a peer heard is remembered `FORGET` long, and each page load is a new PeerId, so a stranger who knew
+    /// the room ran a board's heap down by reloading. Ten minutes of hellos from new ids, one a second: the node
+    /// answers more than the cap, and remembers no more than its endpoint's cap (32 for an ESP32's 8 links). A peer
+    /// it was introduced to (an invite dial) outlasts them.
+    #[test]
+    fn hellos_from_new_peer_ids_are_remembered_within_a_cap() {
+        let (key, topic) = (room_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1));
+        let (mut t, _) = in_room(Role::Host, None, "10.0.0.1:7000".parse().unwrap());
+        let mut ep = Endpoint::new(&id(1), Config { max_links: 8, ..Config::default() }, [1; 32]);
+        let invited = id(2).peer_id();
+        t.introduce(Instant::from_millis(500), &ep, invited, None);
+        let (mut answered, mut most) = (0, 0);
+        for i in 0..600u64 {
+            let now = Instant::from_millis(1_000 + i * 1_000);
+            let mut from = [0; 32];
+            from[..8].copy_from_slice(&(i + 1).to_le_bytes());
+            t.handle_signal(
+                now,
+                &mut ep,
+                topic,
+                &room_hello(&key, &PeerId(from), Role::Client, now.as_micros() / 1000),
+            );
+            answered += published(&mut t);
+            if i % 30 == 0 {
+                t.handle_timeout(now, &mut ep);
+            }
+            most = most.max(t.remotes.len());
+        }
+        assert!(answered > 64, "{answered} hellos answered");
+        assert!(most <= 32, "{most} peers remembered at most");
+        assert!(t.remotes.contains_key(&invited), "the invited peer is still remembered");
     }
 
     /// An invite dial still punches from inside a room: the dialled peer's plain

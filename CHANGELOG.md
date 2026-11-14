@@ -49,6 +49,12 @@ and the commit that fixed it.
   `wss://relay.nostr.net` and `wss://nostr.oxtr.dev`, three operators. nos.lol and nostr.mom, two of the three before,
   now drop our events with no `OK` and pass none on, so members who shared only those never found each other
   (NB-130). A node on the old list still meets one on the new over relay.primal.net.
+- **Fix,** `peerwire`: a node's heap no longer grows with every new peer that says hello (NB-132). Each page load is a
+  new PeerId, and a node kept each one heard for 10 minutes, with no cap on how many: 330 after 10 minutes of hellos
+  at the rate it answers, enough to run an ESP32 out of heap. It now keeps at most 4 for each of
+  `Config::max_links` (32 to 1024; 32 on an ESP32), the least lately active first to go, never a linked one.
+  `NostrSignaling` keeps the ids it has seen as 16 bytes, not two 64-character strings (~6 KB rather than ~25 KB for
+  an ESP32's 128), and a relay pipe whose peer left is closed after 60 s idle. `peerwire-core`: `Endpoint::config`.
 
 ## Unreleased: `@peerwire/js`
 

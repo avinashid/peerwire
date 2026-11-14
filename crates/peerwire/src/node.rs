@@ -1243,6 +1243,8 @@ impl Node {
     /// Sends the pipe batches due ([`Pipes::take`]), each sealed to its peer, on the peer's inbox topic. Dropped
     /// without a carrier.
     fn flush_pipes(&mut self, now: peerwire_core::Instant) {
+        let ep = &self.ep;
+        self.pipes.prune(now, |p| ep.is_connected(p));
         let Some(sig) = self.signaling.as_mut() else { return };
         while let Some((peer, body)) = self.pipes.take(now) {
             if let Some(sealed) = self.trav.seal_to(&peer, body.as_bytes()) {
