@@ -619,15 +619,14 @@ impl Read for Oversize {
                         let cap = (at + left).max(2 * self.held.capacity()).min(self.max as usize);
                         self.held.reserve_exact(cap - at);
                     }
-                    let mut held = std::mem::take(&mut self.held);
-                    held.resize(at + left, 0);
-                    let got = self.src(&mut held[at..]);
-                    held.truncate(at + got.as_ref().map_or(0, |n| *n));
-                    self.held = held;
-                    let n = got?;
+                    // Through a scratch, as `Skip` reads: zero-filling `left` in `held` for each read made a message
+                    // read in tiny pieces cost time quadratic in its size (NB-128 review).
+                    let mut scratch = [0u8; 256];
+                    let n = self.src(&mut scratch[..left.min(256)])?;
                     if n == 0 {
                         return Ok(0);
                     }
+                    self.held.extend_from_slice(&scratch[..n]); // within the capacity reserved above
                     self.part = Part::Keep(left - n, last);
                 }
                 Part::Release(at) => {
@@ -1290,9 +1289,11 @@ mod tests {
                 &self.tcp
             }
         }
-        // A frame: its length in the shortest form or a longer one, masked one time in 4, then the payload.
+        // A frame: an RSV bit one time in 16 (only a relay sets one, and tungstenite refuses it), its length in the
+        // shortest form or a longer one, masked one time in 4, then the payload.
         fn frame(rng: &mut Rng, fin: bool, opcode: u8, len: usize) -> Vec<u8> {
-            let (mask, mut f) = (rng.one_in(4), vec![u8::from(fin) << 7 | opcode]);
+            let rsv = if rng.one_in(16) { *rng.pick(&[0x10u8, 0x20, 0x40]) } else { 0 };
+            let (mask, mut f) = (rng.one_in(4), vec![u8::from(fin) << 7 | rsv | opcode]);
             let m = if mask { 0x80 } else { 0 };
             match (len, rng.below(3)) {
                 (0..=125, 0) => f.push(m | len as u8),
@@ -1316,10 +1317,10 @@ mod tests {
             frame(rng, true, op, len)
         }
         // A message in pieces whose payloads came to `payload`, passed on whole: one frame, the shortest length form,
-        // the mask bit with a zero key if a piece had it.
-        fn whole(op: u8, masked: bool, payload: &[u8]) -> Vec<u8> {
+        // every piece's RSV bits, the mask bit with a zero key if a piece had it.
+        fn whole(op: u8, rsv: u8, masked: bool, payload: &[u8]) -> Vec<u8> {
             let (m, n) = (if masked { 0x80 } else { 0 }, payload.len());
-            let mut f = vec![0x80 | op];
+            let mut f = vec![0x80 | rsv | op];
             match n {
                 0..=125 => f.push(m | n as u8),
                 126..=65535 => {
@@ -1363,7 +1364,7 @@ mod tests {
                 let pieces = if rng.one_in(3) { 2 + rng.below(3) } else { 1 };
                 let op = *rng.pick(&[1u8, 2]);
                 let first = if rng.one_in(3) { max + 1 + rng.below(800) } else { rng.below(max + 1) };
-                let (mut payload, mut masked) = (Vec::new(), false);
+                let (mut payload, mut masked, mut rsv) = (Vec::new(), false, 0);
                 for k in 0..pieces {
                     let len = match k {
                         0 => first,
@@ -1375,7 +1376,7 @@ mod tests {
                     if pieces == 1 && first <= max {
                         want.extend_from_slice(&f);
                     }
-                    masked |= f[1] & 0x80 != 0;
+                    (masked, rsv) = (masked || f[1] & 0x80 != 0, rsv | f[0] & 0x70);
                     payload.extend_from_slice(&f[f.len() - len..]);
                     if k + 1 < pieces && rng.one_in(3) {
                         let c = control(&mut rng);
@@ -1384,7 +1385,7 @@ mod tests {
                     }
                 }
                 if pieces > 1 && payload.len() <= max {
-                    want.extend_from_slice(&whole(op, masked, &payload));
+                    want.extend_from_slice(&whole(op, rsv, masked, &payload));
                     held += 1;
                 }
             }
