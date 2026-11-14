@@ -22,13 +22,15 @@ use anyhow::anyhow;
 use log::{info, warn};
 use peerwire_esp::console::Console;
 use peerwire_esp::peerwire::{Event, PathKind, Role};
-use peerwire_esp::{free_heap, identity, nostr_relays, nostr_thread, Board, NOSTR_RELAY};
+use peerwire_esp::{heap, identity, nostr_relays, nostr_thread, Board, NOSTR_RELAY};
 
 #[path = "led/common.rs"]
 mod common;
 use common::{flash_config, send, short, Led, APP, HELP};
 
 const REPORT_EVERY: Duration = Duration::from_secs(30);
+/// A poll that takes longer is logged: the C3's one core does nothing else meanwhile (NB-133).
+const SLOW_POLL: Duration = Duration::from_secs(1);
 
 fn main() {
     peerwire_esp::run(run)
@@ -51,11 +53,15 @@ fn run() -> anyhow::Result<()> {
     let mut node = board.builder_with_nostr(NOSTR_RELAY)?.identity(identity).bind(board.addr())?;
     // A host: pages join as clients, which link with hosts alone, so a second page doesn't dial the first (NB-129).
     node.join_room_as(APP, &room, Role::Host);
-    info!("led: joined {APP}/{room} on the LAN and over {NOSTR_RELAY}, free heap {} B; {HELP}", free_heap());
+    info!("led: joined {APP}/{room} on the LAN and over {NOSTR_RELAY}, {}; {HELP}", heap());
 
     let mut next_report = Instant::now() + REPORT_EVERY;
     loop {
+        let polled = Instant::now();
         node.poll();
+        if polled.elapsed() >= SLOW_POLL {
+            warn!("led: a poll took {} ms, {}", polled.elapsed().as_millis(), heap());
+        }
         while let Some(event) = node.try_recv_event() {
             match event {
                 Event::Connected { peer, .. } => {
@@ -65,7 +71,7 @@ fn run() -> anyhow::Result<()> {
                         Some(PathKind::Turn) => "through TURN",
                         _ => "directly",
                     };
-                    info!("led: {} linked {how}, free heap {} B", short(&peer), free_heap());
+                    info!("led: {} linked {how}, {}", short(&peer), heap());
                     send(&mut node, &peer, format!("{}; {HELP}", led.state()).as_bytes());
                 }
                 Event::Message { peer, data, .. } => {
@@ -112,10 +118,10 @@ fn run() -> anyhow::Result<()> {
             });
             // The USB console loses what the chip prints in the seconds after a reset: say the room again.
             info!(
-                "led: {} linked in {APP}/{room} over {NOSTR_RELAY}, {}, free heap {} B{relay}",
+                "led: {} linked in {APP}/{room} over {NOSTR_RELAY}, {}, {}{relay}",
                 node.peers().count(),
                 led.state(),
-                free_heap()
+                heap()
             );
         }
         peerwire_esp::idle(&node);

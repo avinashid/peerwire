@@ -81,14 +81,35 @@ const IDLE_MAX: Duration = Duration::from_millis(10);
 
 /// Applies ESP-IDF's patches to the Rust runtime and starts its logger, and sets the clock back to 1970 if a room
 /// member gave its time before the restart ([`clock::set`]), so the node takes the time afresh. [`run`] calls it; call
-/// it first if you don't use `run`. A second call does nothing.
+/// it first if you don't use `run`. A second call does nothing. It also has an allocation that fails say what was
+/// free ([`Heap`]) before the abort that follows.
 pub fn init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         sys::link_patches();
         esp_idf_svc::log::EspLogger::initialize_default();
         clock::forget_member_time();
+        unsafe { sys::heap_caps_register_failed_alloc_callback(Some(alloc_failed)) };
     });
+}
+
+/// Says, on the console, which allocation failed and what the heap held: a largest block below the size asked for,
+/// with more than that free, is a fragmented heap rather than a full one (NB-133). It runs in the task that asked,
+/// before Rust aborts, so it allocates nothing and prints through the ROM.
+unsafe extern "C" fn alloc_failed(size: usize, _caps: u32, function: *const std::ffi::c_char) {
+    let h = heap();
+    unsafe {
+        let task = sys::pcTaskGetName(std::ptr::null_mut());
+        sys::esp_rom_printf(
+            c"heap: %s of %u B failed in task %s: free %u B, largest block %u B, low %u B\n".as_ptr(),
+            function,
+            size as u32,
+            task,
+            h.free,
+            h.largest,
+            h.low,
+        );
+    }
 }
 
 /// Runs `app` after [`init`]. If it fails, or returns, this logs why and restarts the chip 5 s later, rather than
@@ -308,10 +329,44 @@ pub fn free_heap() -> u32 {
     unsafe { sys::esp_get_free_heap_size() }
 }
 
-/// Sleeps until `node`'s next timer, or 10 ms at most, so packets that arrive meanwhile wait no longer: call it at the
-/// end of each pass of the loop that polls the node.
+/// The heap, as [`heap`] reads it. Its `Display` is `free heap N B (largest block N B, low N B)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Heap {
+    /// Bytes free now.
+    pub free: u32,
+    /// The largest block free now: the most one allocation can take. A larger one fails however much is free, as an
+    /// 8 KiB one did with ~50 KB free (NB-133).
+    pub largest: u32,
+    /// The least free since boot.
+    pub low: u32,
+}
+
+impl std::fmt::Display for Heap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "free heap {} B (largest block {} B, low {} B)", self.free, self.largest, self.low)
+    }
+}
+
+/// The heap that allocations take from (`MALLOC_CAP_DEFAULT`): free, its largest block and its low point.
+pub fn heap() -> Heap {
+    unsafe {
+        Heap {
+            free: sys::heap_caps_get_free_size(sys::MALLOC_CAP_DEFAULT) as u32,
+            largest: sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_DEFAULT) as u32,
+            low: sys::heap_caps_get_minimum_free_size(sys::MALLOC_CAP_DEFAULT) as u32,
+        }
+    }
+}
+
+/// Blocks until `node`'s next timer, or 10 ms at most, so packets that arrive meanwhile wait no longer: call it at the
+/// end of each pass of the loop that polls the node. It blocks for one tick at least: ESP-IDF busy-waits a sleep
+/// shorter than a tick and doesn't block for one of 0, so a loop whose timers were due as it came round held the
+/// one core of a C3 and starved the idle task until its watchdog barked (NB-133).
 pub fn idle(node: &Node) {
-    std::thread::sleep(node.next_timeout().unwrap_or(IDLE_MAX).min(IDLE_MAX));
+    let wait = node.next_timeout().unwrap_or(IDLE_MAX).min(IDLE_MAX);
+    let tick_us = 1_000_000 / sys::configTICK_RATE_HZ;
+    let ticks = (wait.as_micros() as u32).div_ceil(tick_us).max(1);
+    unsafe { sys::vTaskDelay(ticks) };
 }
 
 // The README's sample is a doc test too (`cargo test --doc` for the chip's target).

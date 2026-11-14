@@ -5,7 +5,9 @@
 # ESP32, as on an ESP32-WROOM-32: Xtensa, Espressif's `esp` toolchain from espup).
 # EXAMPLE and FEATURES pick another example (default mesh, with nostr); one that isn't
 # mesh is written to out/<example>.bin.
-# Usage: [CHIP=chip] [EXAMPLE=name FEATURES=list] ./build.sh [cargo args]
+# BACKTRACE=1 (C3) builds ESP-IDF and the Rust code, std too, with frame pointers, so a panic or an abort prints a
+# backtrace to name with addr2line and the ELF: bigger, slightly slower code, for finding a fault (NB-133).
+# Usage: [CHIP=chip] [EXAMPLE=name FEATURES=list] [BACKTRACE=1] ./build.sh [cargo args]
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -26,7 +28,13 @@ export MCU=$CHIP
 # ESP-IDF and its tools download once to ~/.espressif, shared by every checkout.
 export ESP_IDF_TOOLS_INSTALL_DIR=global
 export "${var}_LINKER=ldproxy"
-export "${var}_RUSTFLAGS=--cfg espidf_time64"
+rustflags="--cfg espidf_time64"
+if [ "${BACKTRACE:-}" = 1 ]; then
+  [ "$CHIP" = esp32c3 ] || { echo "BACKTRACE=1 is for CHIP=esp32c3: the ESP32's Xtensa backtrace needs no frame pointers" >&2; exit 1; }
+  export ESP_IDF_SDKCONFIG_DEFAULTS="${ESP_IDF_SDKCONFIG_DEFAULTS:-sdkconfig.defaults};sdkconfig.backtrace"
+  rustflags="$rustflags -C force-frame-pointers=yes"
+fi
+export "${var}_RUSTFLAGS=$rustflags"
 # ESP-IDF's CMake build runs on ninja: `idf_tools.py install ninja` puts one under ~/.espressif (README.md).
 export ESP_IDF_CMAKE_GENERATOR=Ninja
 ninja_dir=$(dirname "$(ls ~/.espressif/tools/ninja/*/ninja 2>/dev/null | tail -n 1)")
