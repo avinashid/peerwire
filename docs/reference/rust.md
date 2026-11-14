@@ -612,7 +612,7 @@ carrier, so nothing links events to the Peerwire identity or to other sessions.
 | Item | |
 |---|---|
 | `NostrSignaling::new<S: AsRef<str>>(relays: impl IntoIterator<Item = S>) -> NostrSignaling` | Connects to the relays (`wss://host[:port][/path]` or `ws://…`) in the background, one thread each, and reconnects with backoff when one drops: 1 s, doubling up to 30 s (`MAX_BACKOFF`) |
-| `NostrSignaling::default()` | `new` on `peerwire::nostr::DEFAULT_RELAYS`: `wss://nos.lol`, `wss://relay.primal.net`, `wss://nostr.mom` |
+| `NostrSignaling::default()` | `new` on `peerwire::nostr::DEFAULT_RELAYS`: `wss://relay.primal.net`, `wss://relay.nostr.net`, `wss://nostr.oxtr.dev` |
 | `stats(&self) -> peerwire::nostr::NostrStats` | `relays_open` (connections open now), `published`, `received`, and `rejected` (events a relay refused with `OK false`) |
 
 `wss://` uses rustls with the webpki roots; `ws://` is plain TCP, for a relay on the LAN or loopback. While a relay
@@ -625,7 +625,7 @@ From `crates/peerwire/README.md`, whose examples run as doc tests (inside a func
 use peerwire::{Node, NostrSignaling};
 
 let mut node = Node::builder()
-    .signaling(NostrSignaling::new(["wss://nos.lol", "wss://nostr.mom"]))
+    .signaling(NostrSignaling::new(["wss://relay.primal.net", "wss://relay.nostr.net"]))
     .bind("[::]:0")?;
 node.join_room("my-app", "lobby"); // finds and connects the room's peers
 # Ok::<(), std::io::Error>(())

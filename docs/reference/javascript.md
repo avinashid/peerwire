@@ -607,7 +607,7 @@ A [`DocStore`](#docstore) in this process's memory, for Node and tests. Its copi
 
 | Constant | Value | Source |
 |---|---|---|
-| `DEFAULT_RELAYS` | `['wss://nos.lol', 'wss://relay.primal.net', 'wss://nostr.mom']` | `nostr.js` |
+| `DEFAULT_RELAYS` | `['wss://relay.primal.net', 'wss://relay.nostr.net', 'wss://nostr.oxtr.dev']` | `nostr.js` |
 | `DEFAULT_ICE_SERVERS` | `[{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }]` | `room.js` |
 | `RECONNECT_MS` | 1000: a closed relay socket is dialled again after it, doubling | `nostr.js` |
 | `MAX_RECONNECT_MS` | 30000: the longest wait between those dials | `nostr.js` |

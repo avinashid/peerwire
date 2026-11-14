@@ -45,6 +45,10 @@ and the commit that fixed it.
 - `peerwire-esp`: `NOSTR_RELAY` is `wss://relay.primal.net`, and the `nostr_led` example joins its room over it as a
   `Role::Host`, so the LED page, a client, links with the board, and two phones' pages don't link with each other
   (NB-129). nostr.mom, the relay before, took the board's and the pages' signalling events and passed none on.
+- **Fix,** `peerwire`: `nostr::DEFAULT_RELAYS` (and Godot's default relays) are `wss://relay.primal.net`,
+  `wss://relay.nostr.net` and `wss://nostr.oxtr.dev`, three operators. nos.lol and nostr.mom, two of the three before,
+  now drop our events with no `OK` and pass none on, so members who shared only those never found each other
+  (NB-130). A node on the old list still meets one on the new over relay.primal.net.
 
 ## Unreleased: `@peerwire/js`
 
@@ -63,6 +67,9 @@ and the commit that fixed it.
   Its `role` option (`'peer'`, the default, `'host'` or `'client'`, as Rust's `Role`) is the role its hello says, and
   it lists only the native peers that role may link with. The `led.html` demo joins as a client, so a second phone's
   page links with the board, not with the first phone's page (NB-129).
+- **Fix:** `DEFAULT_RELAYS` are `wss://relay.primal.net`, `wss://relay.nostr.net` and `wss://nostr.oxtr.dev`, three
+  operators. nos.lol and nostr.mom, two of the three before, now drop our events (signalling and `openInbox` drops
+  alike) with no `OK` and pass none on (NB-130). A page on 0.3 still meets one on the new list over relay.primal.net.
 
 ## `@peerwire/js` 0.3.1 (2026-11-05)
 

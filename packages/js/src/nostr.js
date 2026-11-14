@@ -27,8 +27,11 @@ const KIND = 25059;
 const MAX_CONTENT = 64 * 1024; // event content we are willing to decode (base64 characters)
 export const MAX_SEEN = 4096; // event ids remembered for de-duplication; the oldest is forgotten first
 const EVENT_ID = /^[0-9a-f]{64}$/; // NIP-01: the event hash in lowercase hex, so `seen` stays ~256 KiB
-// Three: a relay may rate-limit or ban an IP that several devices share (a phone hotspot).
-export const DEFAULT_RELAYS = ['wss://nos.lol', 'wss://relay.primal.net', 'wss://nostr.mom'];
+// Three: a relay may rate-limit or ban an IP that several devices share (a phone hotspot). Three
+// operators (Primal, nostr.net, 0xtr) on two networks; each took and passed on our kind-25059
+// events and kept a kind-30078 one when checked on 14 Nov 2026. nos.lol and nostr.mom, the
+// defaults before, now drop our events of both kinds with no OK and pass none on.
+export const DEFAULT_RELAYS = ['wss://relay.primal.net', 'wss://relay.nostr.net', 'wss://nostr.oxtr.dev'];
 // Each relay connection publishes from a queue of its own, at most RELAY_RATE events a
 // second (a burst of RELAY_BURST_S seconds' worth), so a join's signals and pipe batches
 // aren't refused for a relay's rate limit. Relays don't publish one (NIP-11 has no field

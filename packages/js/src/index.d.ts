@@ -104,7 +104,7 @@ export interface JoinRoomOptions {
   /**
    * How peers find each other.
    * - `'local'` (default): BroadcastChannel; tabs of one browser, or one Node process.
-   * - `'nostr'`: public Nostr relays (`wss://nos.lol`, `wss://relay.primal.net`, `wss://nostr.mom`), across the internet.
+   * - `'nostr'`: public Nostr relays (`wss://relay.primal.net`, `wss://relay.nostr.net`, `wss://nostr.oxtr.dev`), across the internet.
    * - a factory returning your own adapter.
    */
   signaling?: 'local' | 'nostr' | ((ctx: SignalingContext) => SignalingAdapter);

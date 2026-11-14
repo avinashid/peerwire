@@ -47,6 +47,12 @@ strfry 1.1.3 and list NIP-40 (expiration). None publishes a retention policy in 
 - **Traffic.** Four test events in all (60 and 100 KB, two relays), random content, a
   throwaway key, expiring after 2 days, and two reads of the old probes. No rate-limit
   probing: a relay that sees a burst may ban the IP (damus bans this host).
+- **14 Nov 2026 (NB-130).** nos.lol and nostr.mom now drop our events of both kinds
+  (25059 and 30078) with no `OK`, and `DEFAULT_RELAYS` became relay.primal.net,
+  relay.nostr.net and nostr.oxtr.dev. One 45 KB kind-30078 event each, expiring in 1 h,
+  was kept and read back on all three. `max_message_length`: 1 MB, 256 KiB and 128 KiB.
+  offchain.pub refused it ("pubkey is not in our web of trust"), and relay.snort.social
+  keeps events in memory only, so neither is a default.
 
 **Erasure code.** The p0 PoC's pure-TypeScript GF(2^8) code (`erasure.ts`), decoding
 from parity shards (its slowest case), on this host:

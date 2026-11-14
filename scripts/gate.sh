@@ -8,7 +8,7 @@
 #   scripts/gate.sh --strict    clippy with -D warnings, the fuzz tests again in a debug build (overflow checks), and
 #                               CI's Node tests again on CI's Node (22): the lead's one full run on the merged main,
 #                               before a push
-#   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch nos.lol, relay.primal.net, nostr.mom,
+#   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch relay.primal.net, relay.nostr.net, nostr.oxtr.dev,
 #                               public STUN)
 #   scripts/gate.sh --full      run the Rust steps (tests, clippy, fmt, fuzz) even when no Rust changed: they are
 #                               skipped when every file changed since GATE_BASE is JS, docs or another non-Rust path

@@ -61,7 +61,7 @@ the browser tests. A change to docs or comments only needs no run. Each step log
 request. [Testing](docs/project/testing.md) describes what each test covers.
 
 Tests stay local: loopback, the LAN or the simulator. The only outside services they may touch are public STUN
-(Google, Cloudflare) and the Nostr relays `nos.lol`, `relay.primal.net` and `nostr.mom`, in small tests behind
+(Google, Cloudflare) and the Nostr relays `relay.primal.net`, `relay.nostr.net` and `nostr.oxtr.dev`, in small tests behind
 `--nostr`.
 
 ## Repo layout
