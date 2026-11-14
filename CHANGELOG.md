@@ -18,12 +18,26 @@ and the commit that fixed it.
   on, and the connect failed (NB-116). The node and the driver log each connection (at `debug`, and failures at
   `info`), devices named by a hash, never an address. Drivers implement `ble::Radio`; the ESP32's is in
   `peerwire-esp`.
+- `ble::BlueZ` keeps to its own links: it removes from BlueZ the devices it connected to that BlueZ didn't know
+  before, uses no device that lists HID, and closes only the links it asked BlueZ to make, at once if their device
+  lists HID later (NB110-13, NB110-14, NB110-16). Unless `/etc/bluetooth/input.conf` sets `LEAutoSecurity` false,
+  BlueZ asks to pair with a device that serves HID, on the driver's links too, and the driver says so as it starts
+  (at `info`). A central connect waits its turn at most `SETUP` from asking, reports a failure before the next connect
+  may start, and hands the turn on only once the scan has resumed (NB116-2, NB116-3, NB116-4).
 - `peerwire-esp`: feature `ble`, the ESP32's driver, `ble::Nimble`, on ESP-IDF's NimBLE (ESP32-C3 and ESP32): three
   links, a new non-resolvable random address with each advert, and no bonds (a pairing hands over no keys, and its
   connection is closed). The `ble` example is a room member that sets its clock over Wi-Fi, then links over
   Bluetooth alone (NB-110c).
+- `peerwire-esp`: the `ble_led` example, a room member whose LED a peer in the room switches over Bluetooth
+  (`led on`, `led off`, `led toggle`, `led` asks) (NB-125).
 - `peerwire-core`: `ble`, the framing codec every host shares (`Chunker`, `Reassembler`, the service's UUIDs);
   `Endpoint::handle_datagram_unbound`, for a channel no peer is bound to yet; `Address::radio`.
+- `peerwire-ffi`: feature `ble`, the Bluetooth protocol of one connection for a host whose own stack moves the GATT
+  values, such as Web Bluetooth (`pw_ble_new`, `pw_ble_push`, `pw_ble_poll_value`, `pw_ble_poll_event`,
+  `pw_ble_signal`, `pw_ble_timeout` and the rest); the wasm build puts it in a module of its own,
+  `peerwire_ffi_ble.wasm` (NB-110d). A board with no clock takes the time from a browser's room hello over it, as from
+  a native peer's (NB-119). The connection's event queue keeps a `CLOSED` past its limit, and `pw_ble_timeout`'s
+  deadline can't wrap or go negative (NB110d-I2).
 - **Breaking:** `peerwire::Hop` has a new variant, `Ble`, and is `#[non_exhaustive]` from now on, so a `match` on it
   outside the crate needs a `_` arm (the next release of `peerwire` is 0.2; `peerwire-peer` and `peerwire-esp` move
   with it). `Traversal::handle_signal` returns the member a hello or an offer proved (it returned nothing), and
@@ -34,6 +48,10 @@ and the commit that fixed it.
   (NB-117).
 - `peerwire-esp`: a board joining Wi-Fi no longer logs the network's name or its access points' addresses, which
   would tell where it is.
+- `peerwire-esp`: a board keeps its identity across restarts (`identity::load_or_create`, a new one with
+  `identity::renew`), drawn on the chip from the SAR ADC before any radio is set up, and `console::Console` reads
+  commands from its serial console, the USB one on an ESP32-C3 (NB-119). The ESP32's Bluetooth runs without modem
+  sleep.
 - **No Wi-Fi needed over Bluetooth** (NB-119): a node bound with its clock unset (before 2023-11-14, as on a board
   with no battery for it) takes the time from the first room hello that comes over a Bluetooth connection which
   proved the room, then says hello at that time (not one in 2100 or later); `Node::clock_from_peer` gives it.
@@ -42,6 +60,13 @@ and the commit that fixed it.
   it, `wifi::join_within` and `Board::connect_within` give up on a network that isn't there, and the `ble` and
   `ble_led` examples try a saved network for 20 s, then go on over Bluetooth alone.
   `Traversal::handle_radio_signal`, `Traversal::clock_from_peer` and `traversal::CLOCK_SET_AFTER_MS` are new.
+- **Links over the relays** (NB-126): a node takes a link over its signaling relays, a pipe
+  (`PathKind::Signaling`), as a browser carries one, so a page, which can't send UDP, links with a Rust node or a
+  board from anywhere. A node with no policy takes one, and one with a policy only if it lists `PathKind::Signaling`
+  (`Policy::default()` doesn't). It takes a pipe only from a peer whose room hello proved the room. `peerwire-esp`:
+  the `nostr_led` example, the board's LED from anywhere over `NOSTR_RELAY`. `room_chat`: `PW_RELAYS` replaces the
+  default relays. **Fix:** while batches waited for the pipes' rate, `Node::next_timeout` was 0, so a loop sleeping
+  on it spun (NB126-3).
 - `peerwire-esp`: `NOSTR_RELAY` is `wss://relay.primal.net`, and the `nostr_led` example joins its room over it as a
   `Role::Host`, so the LED page, a client, links with the board, and two phones' pages don't link with each other
   (NB-129). nostr.mom, the relay before, took the board's and the pages' signalling events and passed none on.
@@ -49,6 +74,22 @@ and the commit that fixed it.
   `wss://relay.nostr.net` and `wss://nostr.oxtr.dev`, three operators. nos.lol and nostr.mom, two of the three before,
   now drop our events with no `OK` and pass none on, so members who shared only those never found each other
   (NB-130). A node on the old list still meets one on the new over relay.primal.net.
+- **Fix,** `peerwire`: a node's heap no longer grows with every new peer that says hello (NB-132). Each page load is a
+  new PeerId, and a node kept each one heard for 10 minutes, with no cap on how many: 330 after 10 minutes of hellos
+  at the rate it answers, enough to run an ESP32 out of heap. It now keeps at most 4 for each of
+  `Config::max_links` (32 to 1024; 32 on an ESP32), the least lately active first to go, never a linked or invited one.
+  `NostrSignaling` keeps the ids it has seen as 16 bytes, not two 64-character strings (~6 KB rather than ~25 KB for
+  an ESP32's 128), and a relay pipe whose peer left is closed after 60 s idle. `peerwire-core`: `Endpoint::config`.
+- `peerwire`: `NostrSignaling::relay_stats`, each relay's counters: open, events sent, and of those taken (`OK true`),
+  refused and never answered (no `OK` within 10 s or before the connection closed), so a relay that drops events
+  without a word shows (NB-131);
+  `relay_watch` keeps them readable once the carrier is in a node. `peerwire-esp`: `nostr_relays`, and the
+  `nostr_led` example's 30 s report ends with them.
+- **Fix,** `peerwire`: `NostrSignaling` drops a relay message over its size cap (4 KiB on an ESP32, 128 KiB elsewhere)
+  as it streams in, in one frame or in pieces, never holding more than the cap of it, and keeps the connection. It
+  closed the connection before, so anyone who knew a board's room could keep it off its relay, and off the pipes
+  that carry pages' links, by sending one oversize event to its tag each time it reconnected (NB-128, NB126-2,
+  NB128-1).
 
 ## Unreleased: `@peerwire/js`
 

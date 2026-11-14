@@ -68,14 +68,19 @@ struct Limits {
     queued: usize,
     /// Event ids remembered to drop the copy each relay delivers.
     seen: usize,
+    /// Events a relay connection awaits an `OK` for ([`RelayStats::unanswered`]); past it, the oldest counts as
+    /// unanswered.
+    waiting: usize,
 }
 
 impl Limits {
-    const FULL: Limits = Limits { message: 128 << 10, inbox: 1024, inbox_bytes: 8 << 20, queued: 64, seen: 4096 };
+    const FULL: Limits =
+        Limits { message: 128 << 10, inbox: 1024, inbox_bytes: 8 << 20, queued: 64, seen: 4096, waiting: 256 };
     /// ESP-IDF's: an ESP32 has about 300 KB of heap, and 80 KB free with two links. A
     /// full inbox took 53 KB of it from the start and the ids remembered about 170 B each
     /// (NB-095); a signal event is at most about 2.3 KB (NB95-1).
-    const SMALL: Limits = Limits { message: 4 << 10, inbox: 32, inbox_bytes: 16 << 10, queued: 8, seen: 128 };
+    const SMALL: Limits =
+        Limits { message: 4 << 10, inbox: 32, inbox_bytes: 16 << 10, queued: 8, seen: 128, waiting: 32 };
 }
 
 /// Counters for a [`NostrSignaling`] carrier.
@@ -87,6 +92,72 @@ pub struct NostrStats {
     pub received: u64,
     /// Events a relay refused (`OK false`).
     pub rejected: u64,
+}
+
+/// One relay's counters since the carrier started ([`NostrSignaling::relay_stats`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayStats {
+    /// The relay's URL, as given.
+    pub url: String,
+    /// Whether a connection to it is open now.
+    pub open: bool,
+    /// Events written to it. Each is, in time, accepted, rejected or unanswered.
+    pub sent: u64,
+    /// Events it took (`OK true`).
+    pub accepted: u64,
+    /// Events it refused (`OK false`).
+    pub rejected: u64,
+    /// Events it never answered: no `OK` within 10 s on the connection they went out on, or before it closed. A
+    /// relay that drops events without a word, as two default relays did (NB-130), counts them here, and so does one
+    /// past its wait queue's cap of answers awaited. An `OK` that comes later counts as nothing.
+    pub unanswered: u64,
+}
+
+/// The relays' counters of a [`NostrSignaling`], to read once the carrier has gone into a node
+/// ([`NostrSignaling::relay_watch`]).
+#[derive(Clone)]
+pub struct RelayWatch(Arc<[Arc<RelayCounters>]>);
+
+impl RelayWatch {
+    /// Each relay's counters, in the order the carrier was given them.
+    pub fn stats(&self) -> Vec<RelayStats> {
+        self.0.iter().map(|c| c.stats()).collect()
+    }
+}
+
+impl std::fmt::Debug for RelayWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.stats()).finish()
+    }
+}
+
+/// How long a relay has to answer an event with an `OK` ([`RelayStats::unanswered`]).
+const ANSWER_WAIT: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(10) };
+
+/// A relay's counters, shared with its thread.
+#[derive(Default)]
+struct RelayCounters {
+    url: String,
+    open: std::sync::atomic::AtomicBool,
+    sent: Counter,
+    accepted: Counter,
+    rejected: Counter,
+    unanswered: Counter,
+}
+
+impl RelayCounters {
+    #[allow(clippy::useless_conversion)] // from u32 where there are no 64-bit atomics
+    fn stats(&self) -> RelayStats {
+        let n = |c: &Counter| u64::from(c.load(Ordering::Relaxed));
+        RelayStats {
+            url: self.url.clone(),
+            open: self.open.load(Ordering::Relaxed),
+            sent: n(&self.sent),
+            accepted: n(&self.accepted),
+            rejected: n(&self.rejected),
+            unanswered: n(&self.unanswered),
+        }
+    }
 }
 
 // The ESP32-C3 has no 64-bit atomics; its counters wrap at 2^32.
@@ -107,11 +178,13 @@ struct Shared {
 enum Cmd {
     /// The subscription to keep open (`None`: none).
     Req(Option<String>),
-    Event(String),
+    /// An event's message, and its id's first 16 bytes, to match the relay's `OK`.
+    Event(String, u128),
 }
 
 struct Incoming {
-    id: String,
+    /// The first 16 bytes of the event's id (its SHA-256, checked), for the seen filter.
+    id: u128,
     pubkey: String,
     tag: String,
     content: String,
@@ -119,7 +192,7 @@ struct Incoming {
 
 impl Incoming {
     fn size(&self) -> usize {
-        self.id.len() + self.pubkey.len() + self.tag.len() + self.content.len()
+        16 + self.pubkey.len() + self.tag.len() + self.content.len()
     }
 }
 
@@ -131,9 +204,13 @@ pub struct NostrSignaling {
     topics: BTreeSet<Topic>,
     relays: Vec<Sender<Cmd>>,
     inbox: Receiver<Incoming>,
-    seen: HashSet<String>,
-    seen_order: VecDeque<String>,
+    /// Event ids passed on, as their first 16 bytes (a `u128`, not the 64-character hex twice: 32 bytes an id where
+    /// two `String`s took ~190, so ~6 KB for the 128 on an ESP32 rather than ~25, NB-132). An id is checked to be the
+    /// event's hash, so a copy that slips through takes ~2^64 tries at events of one's own, and can't target another's.
+    seen: HashSet<u128>,
+    seen_order: VecDeque<u128>,
     shared: Arc<Shared>,
+    counters: RelayWatch,
     published: u64,
     limits: Limits,
 }
@@ -165,16 +242,20 @@ impl NostrSignaling {
         OsRng.fill_bytes(&mut sub);
         let (tx, inbox) = sync_channel(limits.inbox);
         let shared = Arc::new(Shared::default());
+        let mut counters = Vec::new();
         let relays = relays
             .into_iter()
             .map(|url| {
                 let (cmd, rx) = channel();
-                let (url, tx, shared) = (url.as_ref().to_string(), tx.clone(), shared.clone());
+                let url = url.as_ref().to_string();
+                let mine = Arc::new(RelayCounters { url: url.clone(), ..RelayCounters::default() });
+                counters.push(mine.clone());
+                let (tx, shared) = (tx.clone(), shared.clone());
                 let mut thread = std::thread::Builder::new().name("peerwire-nostr".into());
                 if let Some(size) = RELAY_STACK {
                     thread = thread.stack_size(size);
                 }
-                thread.spawn(move || relay_loop(url, rx, tx, shared, limits)).expect("spawn relay thread");
+                thread.spawn(move || relay_loop(url, rx, tx, shared, mine, limits)).expect("spawn relay thread");
                 cmd
             })
             .collect();
@@ -188,6 +269,7 @@ impl NostrSignaling {
             seen: HashSet::new(),
             seen_order: VecDeque::new(),
             shared,
+            counters: RelayWatch(counters.into()),
             published: 0,
             limits,
         }
@@ -202,6 +284,16 @@ impl NostrSignaling {
             received: u64::from(self.shared.received.load(Ordering::Relaxed)),
             rejected: u64::from(self.shared.rejected.load(Ordering::Relaxed)),
         }
+    }
+
+    /// Each relay's counters (open, events sent, taken, refused and never answered), in the order given.
+    pub fn relay_stats(&self) -> Vec<RelayStats> {
+        self.counters.stats()
+    }
+
+    /// A handle on [`relay_stats`](NostrSignaling::relay_stats) that outlives handing the carrier to a node.
+    pub fn relay_watch(&self) -> RelayWatch {
+        self.counters.clone()
     }
 
     fn resubscribe(&mut self) {
@@ -231,9 +323,10 @@ impl Signaling for NostrSignaling {
 
     fn publish(&mut self, topic: Topic, payload: &[u8]) {
         let event = sign_event(&self.key, &self.pubkey, unix_secs(), &topic.to_hex(), &b64(payload));
+        let id = event["id"].as_str().and_then(|id| u128::from_str_radix(id.get(..32)?, 16).ok()).unwrap_or(0);
         let msg = json!(["EVENT", event]).to_string();
         for r in &self.relays {
-            let _ = r.send(Cmd::Event(msg.clone()));
+            let _ = r.send(Cmd::Event(msg.clone(), id));
         }
         self.published += 1;
     }
@@ -242,14 +335,17 @@ impl Signaling for NostrSignaling {
         loop {
             let m = self.inbox.try_recv().ok()?;
             self.shared.inbox_bytes.fetch_sub(m.size(), Ordering::Relaxed);
-            if m.pubkey == self.pubkey || !self.seen.insert(m.id.clone()) {
+            if m.pubkey == self.pubkey || self.seen.contains(&m.id) {
                 continue; // our own, or a copy from another relay
             }
-            self.seen_order.push_back(m.id);
-            if self.seen_order.len() > self.limits.seen {
-                let old = self.seen_order.pop_front().unwrap();
-                self.seen.remove(&old);
+            // The oldest goes first, so the queue never holds more than `seen` (its buffer would double past it).
+            if self.seen_order.len() >= self.limits.seen {
+                if let Some(old) = self.seen_order.pop_front() {
+                    self.seen.remove(&old);
+                }
             }
+            self.seen.insert(m.id);
+            self.seen_order.push_back(m.id);
             let Some(topic) = Topic::from_hex(&m.tag).filter(|t| self.topics.contains(t)) else { continue };
             if let Some(payload) = unb64(&m.content) {
                 return Some((topic, payload));
@@ -301,18 +397,315 @@ impl Stream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
     }
 }
 
+/// A relay connection that keeps each data message over `max` bytes from tungstenite, never holding more than `max`
+/// of it. A frame over `max` is dropped as it streams in, with the rest of its message. A message in several frames
+/// is held, up to `max`, and passed on as one frame when its last comes, or dropped from the frame that takes it over.
+/// Control frames always pass, between a message's frames too. One oversize event that someone sent to our tag then
+/// costs a read, not the connection, which before closed and kept a board off the relay it carries its pipes over
+/// (NB-128, NB126-2), however the relay frames it (NB128-1). Until the handshake's HTTP response ends (its blank
+/// line), bytes pass untouched, and a read stops there, so tungstenite takes no frame bytes with the response before
+/// they're judged: those wait here. A data frame that starts a message before the last one ended is an error, as
+/// tungstenite would make it; other framing faults, which only the relay can make, pass on for tungstenite to refuse.
+struct Oversize {
+    inner: Box<dyn Stream>,
+    max: u64,
+    /// Frames from here on; until then, the last 4 bytes of the HTTP response.
+    on: bool,
+    tail: u32,
+    /// Bytes read with the end of the HTTP response, which are frames, to judge first.
+    early: Vec<u8>,
+    part: Part,
+    /// The frame header being read, and how much of it has come.
+    head: [u8; 14],
+    have: usize,
+    /// The data message whose last frame hasn't come.
+    msg: Msg,
+    /// That message's payload so far, if it's held: `max` at most.
+    held: Vec<u8>,
+}
+
+/// Where [`Oversize`] is in a frame.
+#[derive(Clone, Copy)]
+enum Part {
+    /// Reading a header.
+    Head,
+    /// Passing a header on, this much of it so far, then a payload: this long from the connection, or `held`.
+    Give(usize, Option<u64>),
+    /// Passing a payload on, this much left.
+    Pass(u64),
+    /// Dropping a payload, this much left.
+    Skip(u64),
+    /// Reading a payload into `held`, this much left, and whether it's the message's last.
+    Keep(usize, bool),
+    /// Passing `held` on, from here.
+    Release(usize),
+}
+
+/// The data message [`Oversize`] is in the middle of.
+#[derive(Clone, Copy)]
+enum Msg {
+    /// None: the next data frame starts one.
+    Done,
+    /// Over the cap: its frames go until the last.
+    Drop,
+    /// In several frames, within the cap so far, so held: its first header byte, with each frame's reserved bits, and
+    /// whether a frame was masked, which tungstenite refuses from a server, so the frame passed on says so too.
+    Hold(u8, bool),
+}
+
+impl Oversize {
+    fn new(inner: Box<dyn Stream>, max: usize) -> Oversize {
+        let (part, msg) = (Part::Head, Msg::Done);
+        let (head, early, held) = ([0; 14], Vec::new(), Vec::new());
+        Oversize { inner, max: max as u64, on: false, tail: 0, early, part, head, have: 0, msg, held }
+    }
+
+    /// Frame bytes: what came with the HTTP response first, then the connection's.
+    fn src(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.early.is_empty() {
+            return self.inner.read(buf);
+        }
+        let n = buf.len().min(self.early.len());
+        buf[..n].copy_from_slice(&self.early[..n]);
+        self.early.drain(..n);
+        Ok(n)
+    }
+
+    /// The length of the header in `head[..have]`: 2 bytes until those say more (RFC 6455 5.2).
+    fn head_len(&self) -> usize {
+        if self.have < 2 {
+            return 2;
+        }
+        let ext = match self.head[1] & 0x7f {
+            126 => 2,
+            127 => 8,
+            _ => 0,
+        };
+        2 + ext + if self.head[1] & 0x80 != 0 { 4 } else { 0 }
+    }
+
+    /// The whole header read: what to do with the frame.
+    fn judge(&mut self) -> io::Result<Part> {
+        let len = match self.head[1] & 0x7f {
+            126 => u64::from(u16::from_be_bytes([self.head[2], self.head[3]])),
+            127 => u64::from_be_bytes(self.head[2..10].try_into().expect("8 bytes")),
+            n => u64::from(n),
+        };
+        let (fin, opcode, masked) = (self.head[0] & 0x80 != 0, self.head[0] & 0x0f, self.head[1] & 0x80 != 0);
+        let after = |fin| if fin { Msg::Done } else { Msg::Drop };
+        Ok(match (opcode, self.msg) {
+            // Control frames (ping, pong, close), and a continuation with nothing to continue, for tungstenite.
+            (8.., _) | (0, Msg::Done) => Part::Give(0, Some(len)),
+            (_, Msg::Done) if len > self.max => {
+                self.msg = after(fin);
+                Part::Skip(len)
+            }
+            (_, Msg::Done) if fin => Part::Give(0, Some(len)),
+            (_, Msg::Done) => {
+                self.msg = Msg::Hold(self.head[0] & 0x7f, masked);
+                Part::Keep(len as usize, false) // within the cap, so a usize
+            }
+            (0, Msg::Drop) => {
+                self.msg = after(fin);
+                Part::Skip(len)
+            }
+            (0, Msg::Hold(..)) if len > self.max - self.held.len() as u64 => {
+                (self.msg, self.held) = (after(fin), Vec::new());
+                Part::Skip(len)
+            }
+            (0, Msg::Hold(first, was)) => {
+                self.msg = Msg::Hold(first | self.head[0] & 0x70, was || masked);
+                Part::Keep(len as usize, fin) // within the cap, so a usize
+            }
+            _ => return Err(io::Error::new(ErrorKind::InvalidData, "relay: a message began inside another")),
+        })
+    }
+
+    /// Puts the header of the held message, whole in one frame, in `head`.
+    fn held_head(&mut self, first: u8, masked: bool) {
+        let n = self.held.len();
+        let m = if masked { 0x80 } else { 0 };
+        self.head[0] = 0x80 | first;
+        self.have = match n {
+            0..=125 => {
+                self.head[1] = m | n as u8;
+                2
+            }
+            126..=0xffff => {
+                self.head[1] = m | 126;
+                self.head[2..4].copy_from_slice(&(n as u16).to_be_bytes());
+                4
+            }
+            _ => {
+                self.head[1] = m | 127;
+                self.head[2..10].copy_from_slice(&(n as u64).to_be_bytes());
+                10
+            }
+        };
+        if masked {
+            self.head[self.have..self.have + 4].fill(0);
+            self.have += 4;
+        }
+    }
+}
+
+impl Read for Oversize {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.on {
+            let n = self.inner.read(buf)?;
+            for i in 0..n {
+                self.tail = self.tail << 8 | u32::from(buf[i]);
+                if self.tail == u32::from_be_bytes(*b"\r\n\r\n") {
+                    self.on = true;
+                    self.early.extend_from_slice(&buf[i + 1..n]);
+                    return Ok(i + 1);
+                }
+            }
+            return Ok(n);
+        }
+        loop {
+            match self.part {
+                Part::Head => {
+                    let need = self.head_len();
+                    if self.have < need {
+                        let mut head = self.head;
+                        let n = self.src(&mut head[self.have..need])?;
+                        self.head = head;
+                        if n == 0 {
+                            return Ok(0);
+                        }
+                        self.have += n;
+                        continue;
+                    }
+                    self.part = self.judge()?;
+                    if !matches!(self.part, Part::Give(..)) {
+                        self.have = 0;
+                    }
+                }
+                Part::Give(given, then) => {
+                    let n = (self.have - given).min(buf.len());
+                    buf[..n].copy_from_slice(&self.head[given..given + n]);
+                    self.part = if given + n < self.have {
+                        Part::Give(given + n, then)
+                    } else {
+                        self.have = 0;
+                        match then {
+                            Some(0) => Part::Head,
+                            Some(len) => Part::Pass(len),
+                            None => Part::Release(0),
+                        }
+                    };
+                    return Ok(n);
+                }
+                Part::Keep(0, last) => {
+                    self.part = Part::Head;
+                    if let (true, Msg::Hold(first, masked)) = (last, self.msg) {
+                        self.msg = Msg::Done;
+                        self.held_head(first, masked);
+                        self.part = Part::Give(0, None);
+                    }
+                }
+                Part::Keep(left, last) => {
+                    let at = self.held.len();
+                    if at + left > self.held.capacity() {
+                        // Doubling, but never past the cap: a board's heap may have no 8 KB block to spare for a
+                        // 4 KiB message (NB-133).
+                        let cap = (at + left).max(2 * self.held.capacity()).min(self.max as usize);
+                        self.held.reserve_exact(cap - at);
+                    }
+                    let mut held = std::mem::take(&mut self.held);
+                    held.resize(at + left, 0);
+                    let got = self.src(&mut held[at..]);
+                    held.truncate(at + got.as_ref().map_or(0, |n| *n));
+                    self.held = held;
+                    let n = got?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    self.part = Part::Keep(left - n, last);
+                }
+                Part::Release(at) => {
+                    let n = (self.held.len() - at).min(buf.len());
+                    buf[..n].copy_from_slice(&self.held[at..at + n]);
+                    self.part = Part::Release(at + n);
+                    if at + n == self.held.len() {
+                        (self.part, self.held) = (Part::Head, Vec::new());
+                    }
+                    // An empty message has no payload to pass: read on.
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                }
+                Part::Pass(left) => {
+                    let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+                    let n = self.src(&mut buf[..want])?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    let left = left - n as u64;
+                    self.part = if left == 0 { Part::Head } else { Part::Pass(left) };
+                    return Ok(n);
+                }
+                Part::Skip(0) => self.part = Part::Head,
+                Part::Skip(left) => {
+                    let mut scratch = [0u8; 256];
+                    let want = scratch.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+                    let n = self.src(&mut scratch[..want])?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    self.part = Part::Skip(left - n as u64);
+                }
+            }
+        }
+    }
+}
+
+impl Write for Oversize {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Stream for Oversize {
+    fn tcp(&self) -> &TcpStream {
+        self.inner.tcp()
+    }
+}
+
 type Ws = tungstenite::WebSocket<Box<dyn Stream>>;
 
 /// One relay: connect, keep the subscription, forward events both ways, reconnect.
-fn relay_loop(url: String, cmds: Receiver<Cmd>, out: SyncSender<Incoming>, shared: Arc<Shared>, limits: Limits) {
+fn relay_loop(
+    url: String,
+    cmds: Receiver<Cmd>,
+    out: SyncSender<Incoming>,
+    shared: Arc<Shared>,
+    counters: Arc<RelayCounters>,
+    limits: Limits,
+) {
     let mut req: Option<String> = None;
-    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut queue: VecDeque<(String, u128)> = VecDeque::new();
+    // The events sent on a connection that await an `OK`, oldest first.
+    let mut waiting: VecDeque<(u128, Instant)> = VecDeque::new();
     let mut backoff = Duration::from_secs(1);
     loop {
         if let Ok(mut ws) = connect(&url, limits.message) {
             shared.open.fetch_add(1, Ordering::Relaxed);
+            counters.open.store(true, Ordering::Relaxed);
             let opened = Instant::now();
-            let alive = session(&mut ws, &cmds, &out, &shared, limits, &mut req, &mut queue);
+            let alive = session(&mut ws, &cmds, &out, &shared, &counters, limits, &mut req, &mut queue, &mut waiting);
+            // Those still awaited were never answered on the connection they went out on.
+            counters.unanswered.fetch_add(waiting.len() as _, Ordering::Relaxed);
+            waiting.clear();
+            counters.open.store(false, Ordering::Relaxed);
             shared.open.fetch_sub(1, Ordering::Relaxed);
             if !alive {
                 let _ = ws.close(None);
@@ -328,7 +721,7 @@ fn relay_loop(url: String, cmds: Receiver<Cmd>, out: SyncSender<Incoming>, share
         while waited < backoff {
             match cmds.recv_timeout(Duration::from_millis(100)) {
                 Ok(Cmd::Req(r)) => req = r,
-                Ok(Cmd::Event(e)) => enqueue(&mut queue, e, limits.queued),
+                Ok(Cmd::Event(e, id)) => enqueue(&mut queue, (e, id), limits.queued),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => waited += Duration::from_millis(100),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
@@ -338,7 +731,7 @@ fn relay_loop(url: String, cmds: Receiver<Cmd>, out: SyncSender<Incoming>, share
 }
 
 /// Queues an event for a relay, dropping the oldest past `max`.
-fn enqueue(queue: &mut VecDeque<String>, event: String, max: usize) {
+fn enqueue(queue: &mut VecDeque<(String, u128)>, event: (String, u128), max: usize) {
     if queue.len() >= max {
         queue.pop_front();
     }
@@ -346,48 +739,72 @@ fn enqueue(queue: &mut VecDeque<String>, event: String, max: usize) {
 }
 
 /// Runs one connection until it drops (`true`) or the carrier is dropped (`false`).
+#[allow(clippy::too_many_arguments)]
 fn session(
     ws: &mut Ws,
     cmds: &Receiver<Cmd>,
     out: &SyncSender<Incoming>,
     shared: &Shared,
+    counters: &RelayCounters,
     limits: Limits,
     req: &mut Option<String>,
-    queue: &mut VecDeque<String>,
+    queue: &mut VecDeque<(String, u128)>,
+    waiting: &mut VecDeque<(u128, Instant)>,
 ) -> bool {
     let mut sent_req = false;
     loop {
-        let mut frames = Vec::new();
+        while waiting.front().is_some_and(|(_, at)| at.elapsed() >= ANSWER_WAIT) {
+            waiting.pop_front();
+            counters.unanswered.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut frames: Vec<(String, Option<u128>)> = Vec::new();
         loop {
             match cmds.try_recv() {
                 Ok(Cmd::Req(r)) => {
                     if r.is_none() && sent_req {
-                        frames.push(json!(["CLOSE", req_sub(req.as_deref())]).to_string());
+                        frames.push((json!(["CLOSE", req_sub(req.as_deref())]).to_string(), None));
                     }
                     *req = r;
                     sent_req = false;
                 }
                 // Capped here too: a relay that stops reading holds the thread in a write
                 // for up to CONNECT_TIMEOUT while publishes pile up (NB95-2).
-                Ok(Cmd::Event(e)) => enqueue(queue, e, limits.queued),
+                Ok(Cmd::Event(e, id)) => enqueue(queue, (e, id), limits.queued),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return false,
             }
         }
         if !sent_req {
             if let Some(r) = req.as_ref() {
-                frames.push(r.clone());
+                frames.push((r.clone(), None));
             }
             sent_req = true;
         }
-        frames.extend(queue.drain(..));
-        for f in frames {
+        frames.extend(queue.drain(..).map(|(e, id)| (e, Some(id))));
+        for (f, id) in frames {
             if ws.send(Message::Text(f)).is_err() {
                 return true;
             }
+            if let Some(id) = id {
+                counters.sent.fetch_add(1, Ordering::Relaxed);
+                if waiting.len() >= limits.waiting {
+                    waiting.pop_front();
+                    counters.unanswered.fetch_add(1, Ordering::Relaxed);
+                }
+                waiting.push_back((id, Instant::now()));
+            }
         }
         match ws.read() {
-            Ok(Message::Text(t)) => on_relay_message(&t, out, shared, limits.inbox_bytes),
+            Ok(Message::Text(t)) => {
+                // Only an answer to an event awaited counts: one that came late was counted unanswered already.
+                if let Some((id, ok)) = ok_reply(&t) {
+                    if let Some(i) = waiting.iter().position(|(w, _)| *w == id) {
+                        waiting.remove(i);
+                        (if ok { &counters.accepted } else { &counters.rejected }).fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                on_relay_message(&t, out, shared, limits.inbox_bytes);
+            }
             Ok(Message::Close(_)) => return true,
             Ok(_) => {}
             Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
@@ -398,6 +815,17 @@ fn session(
             Err(_) => return true,
         }
     }
+}
+
+/// An `OK` reply's event, as its id's first 16 bytes, and whether the relay took it.
+fn ok_reply(text: &str) -> Option<(u128, bool)> {
+    // An `OK` is a short array; anything else is left to `on_relay_message`.
+    if text.len() > 1024 || !text.trim_start().strip_prefix('[')?.trim_start().starts_with("\"OK\"") {
+        return None;
+    }
+    let Ok(Value::Array(m)) = serde_json::from_str::<Value>(text) else { return None };
+    let id = u128::from_str_radix(m.get(1)?.as_str()?.get(..32)?, 16).ok()?;
+    Some((id, m.get(2)?.as_bool()?))
 }
 
 fn req_sub(req: Option<&str>) -> String {
@@ -444,9 +872,11 @@ fn on_relay_message(text: &str, out: &SyncSender<Incoming>, shared: &Shared, max
             // event up as many (copies are dropped by id). Signatures aren't checked:
             // offers are sealed and authenticate themselves.
             let ser = json!([0, pubkey, created_at, KIND, tags, content]).to_string();
-            if hex(&Sha256::digest(ser)) != id {
+            let digest: [u8; 32] = Sha256::digest(ser).into();
+            if hex(&digest) != id {
                 return;
             }
+            let id = u128::from_be_bytes(digest[..16].try_into().expect("16 of 32 bytes"));
             shared.received.fetch_add(1, Ordering::Relaxed);
             // A full inbox drops the event, as a relay may.
             let m = Incoming { id, pubkey, tag, content };
@@ -507,6 +937,7 @@ fn connect(url: &str, max_message: usize) -> io::Result<Ws> {
     } else {
         Box::new(tcp)
     };
+    let stream: Box<dyn Stream> = Box::new(Oversize::new(stream, max_message));
     let config = WebSocketConfig {
         max_message_size: Some(max_message),
         max_frame_size: Some(max_message),
@@ -639,7 +1070,8 @@ mod tests {
         let ev = sign_event(&key, &pubkey, 1_700_000_000, "t", "c");
         on(&json!(["EVENT", "s", ev]).to_string(), &tx, &shared);
         let m = rx.try_recv().unwrap();
-        assert_eq!((m.id, m.tag.as_str(), m.content.as_str()), (ev["id"].as_str().unwrap().to_string(), "t", "c"));
+        let prefix = u128::from_str_radix(&ev["id"].as_str().unwrap()[..32], 16).unwrap();
+        assert_eq!((m.id, m.tag.as_str(), m.content.as_str()), (prefix, "t", "c"));
         // The same id with other content (a relay replaying it as new): dropped.
         let mut forged = ev.clone();
         forged["content"] = json!("d");
@@ -667,26 +1099,27 @@ mod tests {
         on(&relay_event(2, "t", "QQ==", 6), &tx, &shared);
         on(&relay_event(3, "t", "QQ==", 60), &tx, &shared);
         assert_eq!(rx.try_iter().count(), 0);
-        // An ESP32's inbox: 16 KiB, so 5 events of 3,129 B and not the 6th.
+        // An ESP32's inbox: 16 KiB, so 5 events of 3,081 B (the id counted as its 16 bytes kept) and not the 6th.
         let shared = Shared::default();
         let content = "A".repeat(3000);
         for i in 0..10 {
             on_relay_message(&relay_event(i, "t", &content, 0), &tx, &shared, Limits::SMALL.inbox_bytes);
         }
-        assert_eq!(shared.inbox_bytes.load(Ordering::Relaxed), 5 * 3129);
+        assert_eq!(shared.inbox_bytes.load(Ordering::Relaxed), 5 * 3081);
         assert_eq!(rx.try_iter().count(), 5);
     }
 
-    /// NB95-1, with an ESP32's limits: an event of 3.9 KB is taken; a 16 KiB frame closes
-    /// the connection, and the back-off still grows, so a relay that sends one each time
-    /// gets a handshake after 1 s, 2 s, 4 s rather than every second.
+    /// NB95-1 and NB-128, with an ESP32's limits: an event of 3.9 KB is taken; a 16 KiB frame, as an event someone
+    /// sent to our tag would be, is dropped as it streams in, and the connection stays, so the next event comes over
+    /// it. Before NB-128 the frame closed the connection, and a relay sending one each time kept the board off it.
     #[test]
-    fn a_board_refuses_large_relay_frames_and_backs_off() {
+    fn a_board_drops_large_relay_frames_and_keeps_the_connection() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let topic = Topic([5; 32]);
-        let (small, large) = (relay_event(1, &topic.to_hex(), &"A".repeat(3600), 0), "x".repeat(16 << 10));
+        let small = relay_event(1, &topic.to_hex(), &"A".repeat(3600), 0);
+        let (large, later) = ("x".repeat(16 << 10), relay_event(2, &topic.to_hex(), &"A".repeat(3600), 0));
         assert!(small.len() < Limits::SMALL.message);
         let end = Instant::now() + Duration::from_millis(3500);
         let server = std::thread::spawn(move || {
@@ -703,7 +1136,17 @@ mod tests {
                 let _ = ws.read(); // the REQ
                 let _ = ws.send(Message::Text(small.clone()));
                 let _ = ws.send(Message::Text(large.clone()));
-                while ws.read().is_ok() {} // until the client goes
+                let _ = ws.send(Message::Text(later.clone()));
+                // Until the client goes, or the test ends: an idle second is no reason to hang up.
+                loop {
+                    match ws.read() {
+                        Ok(_) => {}
+                        Err(tungstenite::Error::Io(e))
+                            if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+                                && Instant::now() < end => {}
+                        Err(_) => break,
+                    }
+                }
             }
             handshakes
         });
@@ -715,34 +1158,335 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let handshakes = server.join().unwrap();
-        // The same event on each connection: one copy passed on (seen ids).
-        assert_eq!(got, [2700]);
-        assert!((2..=3).contains(&handshakes), "{handshakes} handshakes in 3.5 s");
+        assert_eq!(got, [2700, 2700]);
+        assert_eq!(handshakes, 1, "one connection, kept");
     }
 
-    /// A local server sends one 200 KiB message: the client drops the connection
-    /// instead of buffering it (NB-032(d)).
+    /// NB-032(d) and NB-128: right after the handshake, a local relay sends a 200 KiB message, a message whose first
+    /// frame is over the cap (and its continuation), a ping, and a small message in two frames. The client drops the
+    /// oversize ones as they stream in, holding neither, and reads the small one whole on the same connection.
     #[test]
-    fn oversized_relay_messages_close_the_connection() {
+    fn oversized_relay_messages_are_dropped_and_the_connection_kept() {
+        use tungstenite::protocol::frame::coding::{Data, OpCode};
+        use tungstenite::protocol::frame::Frame;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
             let mut ws = tungstenite::accept(s).unwrap();
-            let _ = ws.send(Message::Text("x".repeat(200 << 10)));
-            let _ = ws.read(); // until the client goes
+            let first = |b: Vec<u8>, fin| Message::Frame(Frame::message(b, OpCode::Data(Data::Text), fin));
+            let more = |b: Vec<u8>, fin| Message::Frame(Frame::message(b, OpCode::Data(Data::Continue), fin));
+            ws.send(Message::Text("x".repeat(200 << 10))).unwrap();
+            ws.send(first(vec![b'y'; 5 << 10], false)).unwrap();
+            ws.send(more(vec![b'y'; 10], true)).unwrap();
+            ws.send(Message::Ping(vec![1, 2])).unwrap();
+            ws.send(first(b"small ".to_vec(), false)).unwrap();
+            ws.send(more(b"one".to_vec(), true)).unwrap();
+            while ws.read().is_ok() {} // the pong, then until the client goes
         });
-        let mut ws = connect(&url, LIMITS.message).unwrap();
-        let err = loop {
+        let mut ws = connect(&url, Limits::SMALL.message).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let got = loop {
             match ws.read() {
-                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    continue
-                }
-                other => break other,
+                Ok(Message::Text(t)) => break t,
+                Ok(_) => {} // the ping
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) && Instant::now() < until => {}
+                other => panic!("{other:?}"),
             }
         };
-        assert!(matches!(err, Err(tungstenite::Error::Capacity(_))), "{err:?}");
+        assert_eq!(got, "small one");
         drop(ws);
+        server.join().unwrap();
+    }
+
+    /// NB128-1 (security's repro, inverted): a relay whose WebSocket library writes a long message in pieces (Go's
+    /// gorilla `NextWriter` cuts at its 4 KiB buffer) sends a 16 KiB event someone sent to our tag as four 4 KiB
+    /// frames, a ping among them. Each frame is within the board's cap but the message isn't: it goes, and the next
+    /// message comes over the same connection. A message of exactly the cap in four pieces arrives whole, and so does
+    /// one in pieces past 64 KiB under a host's cap, passed on in the 64-bit length form.
+    #[test]
+    fn a_relay_that_sends_an_oversize_message_in_pieces_keeps_the_connection() {
+        use tungstenite::protocol::frame::coding::{Data, OpCode};
+        use tungstenite::protocol::frame::Frame;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let cases = [(Limits::SMALL, 4096, b'x'), (Limits::SMALL, 1024, b'y'), (Limits::FULL, 17 << 10, b'z')];
+        let server = std::thread::spawn(move || {
+            for (_, piece, fill) in cases {
+                let (s, _) = listener.accept().unwrap();
+                let mut ws = tungstenite::accept(s).unwrap();
+                let frame = |op, fin| Message::Frame(Frame::message(vec![fill; piece], OpCode::Data(op), fin));
+                ws.send(frame(Data::Text, false)).unwrap();
+                ws.send(frame(Data::Continue, false)).unwrap();
+                ws.send(Message::Ping(vec![1])).unwrap();
+                ws.send(frame(Data::Continue, false)).unwrap();
+                ws.send(frame(Data::Continue, true)).unwrap();
+                ws.send(Message::Text("after".into())).unwrap();
+                while ws.read().is_ok() {} // the pong, then until the client goes
+            }
+        });
+        for (limits, piece, fill) in cases {
+            let mut ws = connect(&url, limits.message).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut got: Vec<String> = Vec::new();
+            while got.last().map(String::as_str) != Some("after") {
+                match ws.read() {
+                    Ok(Message::Text(t)) => got.push(t),
+                    Ok(_) => {} // the ping
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+                            && Instant::now() < until => {}
+                    other => panic!("{piece} B pieces: {other:?}"),
+                }
+            }
+            let whole = String::from_utf8(vec![fill; 4 * piece]).unwrap();
+            let want: Vec<&str> = if 4 * piece > limits.message { vec!["after"] } else { vec![&whole, "after"] };
+            assert_eq!(got, want, "{piece} B pieces");
+        }
+        server.join().unwrap();
+    }
+
+    /// NB-128: random relay byte streams through `Oversize`, read in random pieces with timeouts between. What comes
+    /// out is the HTTP response, with no read going past its end, then exactly the frames that should pass, byte for
+    /// byte: a message over the cap goes, in one frame or in pieces (NB128-1); one in pieces within it comes as one
+    /// frame, after the control frames sent among its pieces; everything else passes as it came (control frames, any
+    /// length encoding, masked or not, stray continuations). Nothing over the cap is ever held, and a message that
+    /// another begins inside ends the stream with an error.
+    #[test]
+    fn fuzz_oversize_frames() {
+        use peerwire_sim::fuzz::{cases, Rng};
+        struct Mock {
+            data: Vec<u8>,
+            at: usize,
+            rng: Rng,
+            tcp: TcpStream,
+        }
+        impl Read for Mock {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.rng.one_in(4) {
+                    return Err(io::Error::from(ErrorKind::WouldBlock));
+                }
+                let n = buf.len().min(self.data.len() - self.at).min(1 + self.rng.below(300));
+                buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+        impl Write for Mock {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Stream for Mock {
+            fn tcp(&self) -> &TcpStream {
+                &self.tcp
+            }
+        }
+        // A frame: its length in the shortest form or a longer one, masked one time in 4, then the payload.
+        fn frame(rng: &mut Rng, fin: bool, opcode: u8, len: usize) -> Vec<u8> {
+            let (mask, mut f) = (rng.one_in(4), vec![u8::from(fin) << 7 | opcode]);
+            let m = if mask { 0x80 } else { 0 };
+            match (len, rng.below(3)) {
+                (0..=125, 0) => f.push(m | len as u8),
+                (0..=65535, 0 | 1) => {
+                    f.push(m | 126);
+                    f.extend_from_slice(&(len as u16).to_be_bytes());
+                }
+                _ => {
+                    f.push(m | 127);
+                    f.extend_from_slice(&(len as u64).to_be_bytes());
+                }
+            }
+            if mask {
+                f.extend_from_slice(&rng.bytes(4));
+            }
+            f.extend_from_slice(&rng.bytes(len));
+            f
+        }
+        fn control(rng: &mut Rng) -> Vec<u8> {
+            let (op, len) = (*rng.pick(&[8u8, 9, 10]), rng.below(126));
+            frame(rng, true, op, len)
+        }
+        // A message in pieces whose payloads came to `payload`, passed on whole: one frame, the shortest length form,
+        // the mask bit with a zero key if a piece had it.
+        fn whole(op: u8, masked: bool, payload: &[u8]) -> Vec<u8> {
+            let (m, n) = (if masked { 0x80 } else { 0 }, payload.len());
+            let mut f = vec![0x80 | op];
+            match n {
+                0..=125 => f.push(m | n as u8),
+                126..=65535 => {
+                    f.push(m | 126);
+                    f.extend_from_slice(&(n as u16).to_be_bytes());
+                }
+                _ => {
+                    f.push(m | 127);
+                    f.extend_from_slice(&(n as u64).to_be_bytes());
+                }
+            }
+            if masked {
+                f.extend_from_slice(&[0; 4]);
+            }
+            f.extend_from_slice(payload);
+            f
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let http = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let mut rng = Rng::for_target("nostr_oversize");
+        let (mut held, mut broken) = (0, 0);
+        for case in 0..cases(3_000) {
+            let max = 1 + rng.below(600);
+            let (mut input, mut want) = (http.to_vec(), http.to_vec());
+            for _ in 0..rng.below(12) {
+                if rng.one_in(5) {
+                    let c = control(&mut rng);
+                    input.extend_from_slice(&c);
+                    want.extend_from_slice(&c);
+                    continue;
+                }
+                // A continuation with nothing to continue, whatever its size, is for tungstenite to refuse.
+                if rng.one_in(20) {
+                    let (fin, len) = (rng.one_in(2), rng.below(2 * max));
+                    let f = frame(&mut rng, fin, 0, len);
+                    input.extend_from_slice(&f);
+                    want.extend_from_slice(&f);
+                    continue;
+                }
+                let pieces = if rng.one_in(3) { 2 + rng.below(3) } else { 1 };
+                let op = *rng.pick(&[1u8, 2]);
+                let first = if rng.one_in(3) { max + 1 + rng.below(800) } else { rng.below(max + 1) };
+                let (mut payload, mut masked) = (Vec::new(), false);
+                for k in 0..pieces {
+                    let len = match k {
+                        0 => first,
+                        _ if rng.one_in(4) => rng.below(2 * max),
+                        _ => rng.below(max / 2 + 2),
+                    };
+                    let f = frame(&mut rng, k + 1 == pieces, if k == 0 { op } else { 0 }, len);
+                    input.extend_from_slice(&f);
+                    if pieces == 1 && first <= max {
+                        want.extend_from_slice(&f);
+                    }
+                    masked |= f[1] & 0x80 != 0;
+                    payload.extend_from_slice(&f[f.len() - len..]);
+                    if k + 1 < pieces && rng.one_in(3) {
+                        let c = control(&mut rng);
+                        input.extend_from_slice(&c);
+                        want.extend_from_slice(&c);
+                    }
+                }
+                if pieces > 1 && payload.len() <= max {
+                    want.extend_from_slice(&whole(op, masked, &payload));
+                    held += 1;
+                }
+            }
+            // One case in 10 ends with a message that another begins inside: the connection's over.
+            let breaks = rng.one_in(10);
+            if breaks {
+                let len = if rng.one_in(2) { max + 1 } else { rng.below(max + 1) };
+                input.extend_from_slice(&frame(&mut rng, false, 1, len));
+                if rng.one_in(2) {
+                    let c = control(&mut rng);
+                    input.extend_from_slice(&c);
+                    want.extend_from_slice(&c);
+                }
+                input.extend_from_slice(&frame(&mut rng, true, 1, 3));
+                broken += 1;
+            }
+            let mock = Mock {
+                data: input,
+                at: 0,
+                rng: Rng::for_target(&format!("read{case}")),
+                tcp: tcp.try_clone().unwrap(),
+            };
+            let mut o = Oversize::new(Box::new(mock), max);
+            let (mut out, mut buf, mut was_on, mut ended) = (Vec::new(), [0u8; 512], false, false);
+            loop {
+                let k = 1 + rng.below(buf.len());
+                match o.read(&mut buf[..k]) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(e) if breaks && e.kind() == ErrorKind::InvalidData => {
+                        ended = true;
+                        break;
+                    }
+                    Err(e) => panic!("case {case}: {e}"),
+                }
+                assert!(o.held.capacity() <= max, "case {case}: {} held, cap {max}", o.held.capacity());
+                if o.on && !was_on {
+                    assert_eq!(out.len(), http.len(), "case {case}: a read went past the HTTP response");
+                    was_on = true;
+                }
+            }
+            assert_eq!(ended, breaks, "case {case}");
+            assert!(out == want, "case {case}: max {max}, {} bytes out, {} wanted", out.len(), want.len());
+        }
+        println!("fuzz oversize: {held} messages in pieces passed whole, {broken} cases ended by a message inside one");
+        assert!(held > 0 && broken > 0);
+    }
+
+    /// NB-131: each relay's counters. A local relay takes the first event, refuses the second, and answers the third
+    /// only after the wait, as if it never had (nos.lol and nostr.mom never did, NB-130): one each of accepted,
+    /// rejected and unanswered, and the late `OK` counts as nothing. It hangs up on the fourth, unanswered too, so
+    /// `sent` is the sum.
+    #[test]
+    fn relay_stats_count_each_relays_answers_and_silences() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut ws = tungstenite::accept(s).unwrap();
+            let mut n = 0;
+            while let Ok(m) = ws.read() {
+                let Ok(Value::Array(m)) = serde_json::from_str::<Value>(m.to_text().unwrap_or("")) else { continue };
+                if m[0] != "EVENT" {
+                    continue;
+                }
+                n += 1;
+                let id = m[1]["id"].clone();
+                match n {
+                    1 => ws.send(Message::Text(json!(["OK", id, true, ""]).to_string())).unwrap(),
+                    2 => ws.send(Message::Text(json!(["OK", id, false, "blocked: no"]).to_string())).unwrap(),
+                    3 => {
+                        std::thread::sleep(ANSWER_WAIT + Duration::from_millis(200));
+                        ws.send(Message::Text(json!(["OK", id, true, ""]).to_string())).unwrap();
+                    }
+                    _ => break,
+                }
+            }
+        });
+        let mut carrier = NostrSignaling::new([&url]);
+        let watch = carrier.relay_watch();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !carrier.relay_stats()[0].open && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for i in 0..3u8 {
+            carrier.publish(Topic([i; 32]), b"x");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let want = RelayStats { url: url.clone(), open: true, sent: 3, accepted: 1, rejected: 1, unanswered: 1 };
+        while carrier.relay_stats()[0] != want && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(400)); // the late OK comes
+        assert_eq!(carrier.relay_stats(), std::slice::from_ref(&want));
+        assert_eq!(carrier.stats().rejected, 1);
+        carrier.publish(Topic([3; 32]), b"x");
+        let want = RelayStats { open: false, sent: 4, unanswered: 2, ..want };
+        while carrier.relay_stats()[0] != want && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(carrier.relay_stats(), std::slice::from_ref(&want));
+        drop(carrier);
+        // The handle reads on after the carrier is gone.
+        assert_eq!(watch.stats(), [want]);
         server.join().unwrap();
     }
 

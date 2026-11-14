@@ -1077,6 +1077,11 @@ impl<A: Address> Endpoint<A> {
         s
     }
 
+    /// The configuration this endpoint was made with.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// Number of sessions in any state (dialing, half-open, live).
     pub fn session_count(&self) -> usize {
         self.sessions.len()

@@ -33,6 +33,8 @@ pub(crate) const QUEUE: usize = if SMALL { 4 << 10 } else { 16 << 10 };
 /// Pipes at once. A new one past this replaces the one used longest ago whose peer isn't linked; with none, the
 /// new peer's batch is dropped.
 pub(crate) const MAX_PIPES: usize = if SMALL { 4 } else { 64 };
+/// A pipe whose peer isn't linked, with nothing waiting, is closed once unused this long ([`Pipes::prune`]).
+pub(crate) const IDLE: Duration = Duration::from_secs(60);
 /// The head and tail of a batch, as `JSON.stringify` writes `{ kind: 'dg', d }`.
 const HEAD: &str = r#"{"kind":"dg","d":["#;
 const TAIL: &str = "]}";
@@ -97,6 +99,21 @@ impl Pipes {
         let pipe = Pipe { addr, q: VecDeque::new(), bytes: 0, due: None, used: now, served: 0 };
         self.by_peer.insert(peer, pipe);
         Some(addr)
+    }
+
+    /// Closes the pipes whose peer isn't `linked`, with nothing waiting, unused [`IDLE`] long. Each page load is a
+    /// new peer, so its pipe was otherwise kept until `MAX_PIPES` others pushed it out (NB-132). One whose link
+    /// just ended keeps what it queued (the close) until sent, and a peer dialling again within `IDLE` keeps its
+    /// address.
+    pub(crate) fn prune(&mut self, now: Instant, linked: impl Fn(&PeerId) -> bool) {
+        let by_addr = &mut self.by_addr;
+        self.by_peer.retain(|peer, p| {
+            let keep = !p.q.is_empty() || now - p.used < IDLE || linked(peer);
+            if !keep {
+                by_addr.remove(&p.addr);
+            }
+            keep
+        });
     }
 
     /// Forgets `peer`'s pipe and what waits on it.

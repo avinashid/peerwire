@@ -106,7 +106,7 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `Event`, `Path` | Type aliases: `peerwire_core::Event<SocketAddr>` and `peerwire_core::Path<SocketAddr>` | `src/lib.rs` |
 | `Signaling`, `Topic`, `MemoryHub`, `MemorySignaling`, `MultiSignaling` | The carrier trait, its topics, the in-process carrier, and several carriers as one | `src/signaling.rs` |
 | `LanSignaling` | A carrier over UDP multicast and broadcast on one LAN | `src/lan.rs` |
-| `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND` and `NostrStats` | `src/nostr.rs` |
+| `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND`, `NostrStats`, `RelayStats` and `RelayWatch` | `src/nostr.rs` |
 | `Privacy`, `Role`, `NatType`, `Failure`, `Side` | Which addresses a node gives out, room roles, the NAT type, why a dial failed | `src/traversal.rs` |
 | `PathKind`, `Policy`, `Hop` | The kinds of path, a connection policy, and the addresses a host with TURN or a radio gives its endpoint (a network address, a peer through this node's TURN allocation, a peer's relayed address, or a Bluetooth connection) | `src/traversal.rs` |
 | `ble` (feature `ble`) | Bluetooth LE: the `Radio` driver trait, `RadioEvent`, `DeviceId`, `ConnId`, `Limits`, the service's UUIDs, and `BlueZ` with `ble-bluez` (`BlueZ::alias`, `BlueZ::names_this_host`) | `src/ble.rs`, `src/bluez.rs` |
@@ -614,6 +614,8 @@ carrier, so nothing links events to the Peerwire identity or to other sessions.
 | `NostrSignaling::new<S: AsRef<str>>(relays: impl IntoIterator<Item = S>) -> NostrSignaling` | Connects to the relays (`wss://host[:port][/path]` or `ws://…`) in the background, one thread each, and reconnects with backoff when one drops: 1 s, doubling up to 30 s (`MAX_BACKOFF`) |
 | `NostrSignaling::default()` | `new` on `peerwire::nostr::DEFAULT_RELAYS`: `wss://relay.primal.net`, `wss://relay.nostr.net`, `wss://nostr.oxtr.dev` |
 | `stats(&self) -> peerwire::nostr::NostrStats` | `relays_open` (connections open now), `published`, `received`, and `rejected` (events a relay refused with `OK false`) |
+| `relay_stats(&self) -> Vec<peerwire::nostr::RelayStats>` | Each relay's, in the order given: `url`, `open`, `sent`, and of those `accepted` (`OK true`), `rejected` (`OK false`) and `unanswered` (no `OK` within 10 s on the connection they went out on, or before it closed: a relay that drops events silently shows here; a later `OK` counts as nothing) |
+| `relay_watch(&self) -> peerwire::nostr::RelayWatch` | A cloneable handle whose `stats()` is `relay_stats()`, to keep before the carrier goes into a node (`peerwire-esp`'s `nostr_relays()` reads one) |
 
 `wss://` uses rustls with the webpki roots; `ws://` is plain TCP, for a relay on the LAN or loopback. While a relay
 is down, up to 64 events wait for it (`MAX_QUEUED`). Up to 1024 received events wait for `poll` (`MAX_INBOX`); past

@@ -22,7 +22,7 @@ use anyhow::anyhow;
 use log::{info, warn};
 use peerwire_esp::console::Console;
 use peerwire_esp::peerwire::{Event, PathKind, Role};
-use peerwire_esp::{free_heap, identity, nostr_thread, Board, NOSTR_RELAY};
+use peerwire_esp::{free_heap, identity, nostr_relays, nostr_thread, Board, NOSTR_RELAY};
 
 #[path = "led/common.rs"]
 mod common;
@@ -101,7 +101,15 @@ fn run() -> anyhow::Result<()> {
         }
         if Instant::now() >= next_report {
             next_report += REPORT_EVERY;
-            let relay = nostr_thread().map_or(String::new(), |(unused, _)| format!(", relay stack unused {unused} B"));
+            let stack = nostr_thread().map_or(String::new(), |(unused, _)| format!(", relay stack unused {unused} B"));
+            // What the relay did with what the board sent (NB-131): a relay that drops events counts them as no OK.
+            let relay = nostr_relays().first().map_or(String::new(), |r| {
+                let open = if r.open { "open" } else { "closed" };
+                format!(
+                    "; relay {open}: sent {}, OK {}, refused {}, no OK {}{stack}",
+                    r.sent, r.accepted, r.rejected, r.unanswered
+                )
+            });
             // The USB console loses what the chip prints in the seconds after a reset: say the room again.
             info!(
                 "led: {} linked in {APP}/{room} over {NOSTR_RELAY}, {}, free heap {} B{relay}",
