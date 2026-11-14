@@ -53,6 +53,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// one a frame over the cap closes does, keeps it, so a sender can't make the carrier
 /// redo the TLS handshake every second (NB95-1).
 const STABLE: Duration = MAX_BACKOFF;
+/// Relay hosts whose TLS sessions are kept to resume. rustls's default makes room for 256 up front: 13.9 KB on a PC,
+/// and several KB of a board's heap for good, for a node that talks to a few relays (NB-133).
+const RESUME_HOSTS: usize = 8;
 
 /// Caps on what a carrier takes and keeps.
 #[derive(Clone, Copy, Debug)]
@@ -955,11 +958,12 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
         .get_or_init(|| {
             let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
             let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let config = rustls::ClientConfig::builder_with_provider(provider)
+            let mut config = rustls::ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .expect("ring supports the default TLS versions")
                 .with_root_certificates(roots)
                 .with_no_client_auth();
+            config.resumption = rustls::client::Resumption::in_memory_sessions(RESUME_HOSTS);
             Arc::new(config)
         })
         .clone()
