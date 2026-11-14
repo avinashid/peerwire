@@ -397,6 +397,190 @@ impl Stream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
     }
 }
 
+/// A relay connection that drops each data frame whose payload is over `max` bytes as it streams in, never holding
+/// it, and the continuation frames of a message it dropped; control frames always pass. One oversize event that
+/// someone sent to our tag then costs a read, not the connection, which before closed and kept a board off the relay
+/// it carries its pipes over (NB-128, NB126-2). Until the handshake's HTTP response ends (its blank line), bytes pass
+/// untouched, and a read stops there, so tungstenite takes no frame bytes with the response before they're judged:
+/// those wait here. tungstenite still checks what passes against the same `max`, so a message fragmented into frames
+/// under it, which only the relay itself can send, still ends the connection.
+struct Oversize {
+    inner: Box<dyn Stream>,
+    max: u64,
+    /// Frames from here on; until then, the last 4 bytes of the HTTP response.
+    on: bool,
+    tail: u32,
+    /// Bytes read with the end of the HTTP response, which are frames, to judge first.
+    early: Vec<u8>,
+    part: Part,
+    /// The frame header being read, and how much of it has come.
+    head: [u8; 14],
+    have: usize,
+    /// A message is being dropped: its continuation frames go too.
+    dropping: bool,
+}
+
+/// Where [`Oversize`] is in a frame.
+#[derive(Clone, Copy)]
+enum Part {
+    /// Reading a header.
+    Head,
+    /// Passing a header on, this much of it so far, then a payload this long.
+    Give(usize, u64),
+    /// Passing a payload on, this much left.
+    Pass(u64),
+    /// Dropping a payload, this much left.
+    Skip(u64),
+}
+
+impl Oversize {
+    fn new(inner: Box<dyn Stream>, max: usize) -> Oversize {
+        let part = Part::Head;
+        let (head, early) = ([0; 14], Vec::new());
+        Oversize { inner, max: max as u64, on: false, tail: 0, early, part, head, have: 0, dropping: false }
+    }
+
+    /// Frame bytes: what came with the HTTP response first, then the connection's.
+    fn src(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.early.is_empty() {
+            return self.inner.read(buf);
+        }
+        let n = buf.len().min(self.early.len());
+        buf[..n].copy_from_slice(&self.early[..n]);
+        self.early.drain(..n);
+        Ok(n)
+    }
+
+    /// The length of the header in `head[..have]`: 2 bytes until those say more (RFC 6455 5.2).
+    fn head_len(&self) -> usize {
+        if self.have < 2 {
+            return 2;
+        }
+        let ext = match self.head[1] & 0x7f {
+            126 => 2,
+            127 => 8,
+            _ => 0,
+        };
+        2 + ext + if self.head[1] & 0x80 != 0 { 4 } else { 0 }
+    }
+
+    /// The whole header read: its payload's length, and whether the frame is dropped.
+    fn judge(&mut self) -> (u64, bool) {
+        let len = match self.head[1] & 0x7f {
+            126 => u64::from(u16::from_be_bytes([self.head[2], self.head[3]])),
+            127 => u64::from_be_bytes(self.head[2..10].try_into().expect("8 bytes")),
+            n => u64::from(n),
+        };
+        let (fin, opcode) = (self.head[0] & 0x80 != 0, self.head[0] & 0x0f);
+        let drop = match opcode {
+            0 => self.dropping,
+            1..=7 => len > self.max,
+            _ => false, // control frames: ping, pong, close
+        };
+        match opcode {
+            0 if self.dropping => self.dropping = !fin,
+            1..=7 => self.dropping = drop && !fin,
+            _ => {}
+        }
+        (len, drop)
+    }
+}
+
+impl Read for Oversize {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.on {
+            let n = self.inner.read(buf)?;
+            for i in 0..n {
+                self.tail = self.tail << 8 | u32::from(buf[i]);
+                if self.tail == u32::from_be_bytes(*b"\r\n\r\n") {
+                    self.on = true;
+                    self.early.extend_from_slice(&buf[i + 1..n]);
+                    return Ok(i + 1);
+                }
+            }
+            return Ok(n);
+        }
+        loop {
+            match self.part {
+                Part::Head => {
+                    let need = self.head_len();
+                    if self.have < need {
+                        let mut head = self.head;
+                        let n = self.src(&mut head[self.have..need])?;
+                        self.head = head;
+                        if n == 0 {
+                            return Ok(0);
+                        }
+                        self.have += n;
+                        continue;
+                    }
+                    let (len, drop) = self.judge();
+                    self.part = if drop {
+                        self.have = 0;
+                        Part::Skip(len)
+                    } else {
+                        Part::Give(0, len)
+                    };
+                }
+                Part::Give(given, len) => {
+                    let n = (self.have - given).min(buf.len());
+                    buf[..n].copy_from_slice(&self.head[given..given + n]);
+                    self.part = if given + n < self.have {
+                        Part::Give(given + n, len)
+                    } else {
+                        self.have = 0;
+                        if len == 0 {
+                            Part::Head
+                        } else {
+                            Part::Pass(len)
+                        }
+                    };
+                    return Ok(n);
+                }
+                Part::Pass(left) => {
+                    let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+                    let n = self.src(&mut buf[..want])?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    let left = left - n as u64;
+                    self.part = if left == 0 { Part::Head } else { Part::Pass(left) };
+                    return Ok(n);
+                }
+                Part::Skip(0) => self.part = Part::Head,
+                Part::Skip(left) => {
+                    let mut scratch = [0u8; 256];
+                    let want = scratch.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+                    let n = self.src(&mut scratch[..want])?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    self.part = Part::Skip(left - n as u64);
+                }
+            }
+        }
+    }
+}
+
+impl Write for Oversize {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Stream for Oversize {
+    fn tcp(&self) -> &TcpStream {
+        self.inner.tcp()
+    }
+}
+
 type Ws = tungstenite::WebSocket<Box<dyn Stream>>;
 
 /// One relay: connect, keep the subscription, forward events both ways, reconnect.
@@ -649,6 +833,7 @@ fn connect(url: &str, max_message: usize) -> io::Result<Ws> {
     } else {
         Box::new(tcp)
     };
+    let stream: Box<dyn Stream> = Box::new(Oversize::new(stream, max_message));
     let config = WebSocketConfig {
         max_message_size: Some(max_message),
         max_frame_size: Some(max_message),
@@ -820,16 +1005,17 @@ mod tests {
         assert_eq!(rx.try_iter().count(), 5);
     }
 
-    /// NB95-1, with an ESP32's limits: an event of 3.9 KB is taken; a 16 KiB frame closes
-    /// the connection, and the back-off still grows, so a relay that sends one each time
-    /// gets a handshake after 1 s, 2 s, 4 s rather than every second.
+    /// NB95-1 and NB-128, with an ESP32's limits: an event of 3.9 KB is taken; a 16 KiB frame, as an event someone
+    /// sent to our tag would be, is dropped as it streams in, and the connection stays, so the next event comes over it.
+    /// Before NB-128 the frame closed the connection, and a relay sending one each time kept the board off it.
     #[test]
-    fn a_board_refuses_large_relay_frames_and_backs_off() {
+    fn a_board_drops_large_relay_frames_and_keeps_the_connection() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let topic = Topic([5; 32]);
-        let (small, large) = (relay_event(1, &topic.to_hex(), &"A".repeat(3600), 0), "x".repeat(16 << 10));
+        let small = relay_event(1, &topic.to_hex(), &"A".repeat(3600), 0);
+        let (large, later) = ("x".repeat(16 << 10), relay_event(2, &topic.to_hex(), &"A".repeat(3600), 0));
         assert!(small.len() < Limits::SMALL.message);
         let end = Instant::now() + Duration::from_millis(3500);
         let server = std::thread::spawn(move || {
@@ -846,7 +1032,17 @@ mod tests {
                 let _ = ws.read(); // the REQ
                 let _ = ws.send(Message::Text(small.clone()));
                 let _ = ws.send(Message::Text(large.clone()));
-                while ws.read().is_ok() {} // until the client goes
+                let _ = ws.send(Message::Text(later.clone()));
+                // Until the client goes, or the test ends: an idle second is no reason to hang up.
+                loop {
+                    match ws.read() {
+                        Ok(_) => {}
+                        Err(tungstenite::Error::Io(e))
+                            if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+                                && Instant::now() < end => {}
+                        Err(_) => break,
+                    }
+                }
             }
             handshakes
         });
@@ -858,35 +1054,164 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let handshakes = server.join().unwrap();
-        // The same event on each connection: one copy passed on (seen ids).
-        assert_eq!(got, [2700]);
-        assert!((2..=3).contains(&handshakes), "{handshakes} handshakes in 3.5 s");
+        assert_eq!(got, [2700, 2700]);
+        assert_eq!(handshakes, 1, "one connection, kept");
     }
 
-    /// A local server sends one 200 KiB message: the client drops the connection
-    /// instead of buffering it (NB-032(d)).
+    /// NB-032(d) and NB-128: right after the handshake, a local relay sends a 200 KiB message, a message whose first
+    /// frame is over the cap (and its continuation), a ping, and a small message in two frames. The client drops the
+    /// oversize ones as they stream in, holding neither, and reads the small one whole on the same connection.
     #[test]
-    fn oversized_relay_messages_close_the_connection() {
+    fn oversized_relay_messages_are_dropped_and_the_connection_kept() {
+        use tungstenite::protocol::frame::coding::{Data, OpCode};
+        use tungstenite::protocol::frame::Frame;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
             let mut ws = tungstenite::accept(s).unwrap();
-            let _ = ws.send(Message::Text("x".repeat(200 << 10)));
-            let _ = ws.read(); // until the client goes
+            let first = |b: Vec<u8>, fin| Message::Frame(Frame::message(b, OpCode::Data(Data::Text), fin));
+            let more = |b: Vec<u8>, fin| Message::Frame(Frame::message(b, OpCode::Data(Data::Continue), fin));
+            ws.send(Message::Text("x".repeat(200 << 10))).unwrap();
+            ws.send(first(vec![b'y'; 5 << 10], false)).unwrap();
+            ws.send(more(vec![b'y'; 10], true)).unwrap();
+            ws.send(Message::Ping(vec![1, 2])).unwrap();
+            ws.send(first(b"small ".to_vec(), false)).unwrap();
+            ws.send(more(b"one".to_vec(), true)).unwrap();
+            while ws.read().is_ok() {} // the pong, then until the client goes
         });
-        let mut ws = connect(&url, LIMITS.message).unwrap();
-        let err = loop {
+        let mut ws = connect(&url, Limits::SMALL.message).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let got = loop {
             match ws.read() {
-                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    continue
-                }
-                other => break other,
+                Ok(Message::Text(t)) => break t,
+                Ok(_) => {} // the ping
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) && Instant::now() < until => {}
+                other => panic!("{other:?}"),
             }
         };
-        assert!(matches!(err, Err(tungstenite::Error::Capacity(_))), "{err:?}");
+        assert_eq!(got, "small one");
         drop(ws);
         server.join().unwrap();
+    }
+
+    /// NB-128: random relay byte streams through `Oversize`, read in random pieces with timeouts between. What comes
+    /// out is the HTTP response, with no read going past its end, then exactly the frames that should pass, byte for
+    /// byte: data frames over the cap go with their continuations, and nothing else does (control frames between
+    /// fragments, any length encoding, masked or not, continuations of a message passed whatever their size).
+    #[test]
+    fn fuzz_oversize_frames() {
+        use peerwire_sim::fuzz::{cases, Rng};
+        struct Mock {
+            data: Vec<u8>,
+            at: usize,
+            rng: Rng,
+            tcp: TcpStream,
+        }
+        impl Read for Mock {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.rng.one_in(4) {
+                    return Err(io::Error::from(ErrorKind::WouldBlock));
+                }
+                let n = buf.len().min(self.data.len() - self.at).min(1 + self.rng.below(300));
+                buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+        impl Write for Mock {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Stream for Mock {
+            fn tcp(&self) -> &TcpStream {
+                &self.tcp
+            }
+        }
+        // A frame: its length in the shortest form or a longer one, masked one time in 4, then the payload.
+        fn frame(rng: &mut Rng, fin: bool, opcode: u8, len: usize) -> Vec<u8> {
+            let (mask, mut f) = (rng.one_in(4), vec![u8::from(fin) << 7 | opcode]);
+            let m = if mask { 0x80 } else { 0 };
+            match (len, rng.below(3)) {
+                (0..=125, 0) => f.push(m | len as u8),
+                (0..=65535, 0 | 1) => {
+                    f.push(m | 126);
+                    f.extend_from_slice(&(len as u16).to_be_bytes());
+                }
+                _ => {
+                    f.push(m | 127);
+                    f.extend_from_slice(&(len as u64).to_be_bytes());
+                }
+            }
+            if mask {
+                f.extend_from_slice(&rng.bytes(4));
+            }
+            f.extend_from_slice(&rng.bytes(len));
+            f
+        }
+        fn control(rng: &mut Rng) -> Vec<u8> {
+            let (op, len) = (*rng.pick(&[8u8, 9, 10]), rng.below(126));
+            frame(rng, true, op, len)
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let http = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let mut rng = Rng::for_target("nostr_oversize");
+        for case in 0..cases(3_000) {
+            let max = 1 + rng.below(600);
+            let (mut input, mut want) = (http.to_vec(), http.to_vec());
+            for _ in 0..rng.below(12) {
+                if rng.one_in(5) {
+                    let c = control(&mut rng);
+                    input.extend_from_slice(&c);
+                    want.extend_from_slice(&c);
+                    continue;
+                }
+                let pieces = if rng.one_in(3) { 2 + rng.below(3) } else { 1 };
+                let op = *rng.pick(&[1u8, 2]);
+                let first = if rng.one_in(3) { max + 1 + rng.below(800) } else { rng.below(max + 1) };
+                for k in 0..pieces {
+                    let len = if k == 0 { first } else { rng.below(2 * max) };
+                    let f = frame(&mut rng, k + 1 == pieces, if k == 0 { op } else { 0 }, len);
+                    input.extend_from_slice(&f);
+                    if first <= max {
+                        want.extend_from_slice(&f);
+                    }
+                    if k + 1 < pieces && rng.one_in(3) {
+                        let c = control(&mut rng);
+                        input.extend_from_slice(&c);
+                        want.extend_from_slice(&c);
+                    }
+                }
+            }
+            let mock = Mock {
+                data: input,
+                at: 0,
+                rng: Rng::for_target(&format!("read{case}")),
+                tcp: tcp.try_clone().unwrap(),
+            };
+            let mut o = Oversize::new(Box::new(mock), max);
+            let (mut out, mut buf, mut was_on) = (Vec::new(), [0u8; 512], false);
+            loop {
+                let k = 1 + rng.below(buf.len());
+                match o.read(&mut buf[..k]) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("case {case}: {e}"),
+                }
+                if o.on && !was_on {
+                    assert_eq!(out.len(), http.len(), "case {case}: a read went past the HTTP response");
+                    was_on = true;
+                }
+            }
+            assert!(out == want, "case {case}: max {max}, {} bytes out, {} wanted", out.len(), want.len());
+        }
     }
 
     /// NB-131: each relay's counters. A local relay takes the first event, refuses the second, and never answers the
