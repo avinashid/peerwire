@@ -77,7 +77,7 @@ and the commit that fixed it.
 - **Fix,** `peerwire`: a node's heap no longer grows with every new peer that says hello (NB-132). Each page load is a
   new PeerId, and a node kept each one heard for 10 minutes, with no cap on how many: 330 after 10 minutes of hellos
   at the rate it answers, enough to run an ESP32 out of heap. It now keeps at most 4 for each of
-  `Config::max_links` (32 to 1024; 32 on an ESP32), the least lately active first to go, never a linked one.
+  `Config::max_links` (32 to 1024; 32 on an ESP32), the least lately active first to go, never a linked or invited one.
   `NostrSignaling` keeps the ids it has seen as 16 bytes, not two 64-character strings (~6 KB rather than ~25 KB for
   an ESP32's 128), and a relay pipe whose peer left is closed after 60 s idle. `peerwire-core`: `Endpoint::config`.
 

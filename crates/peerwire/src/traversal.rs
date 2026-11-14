@@ -2111,8 +2111,8 @@ impl<A: Address> Traversal<A> {
     }
 
     /// Keeps the peers remembered to the cap for the endpoint's `max_links` (`REMOTES_PER_LINK` each, within
-    /// `MIN_REMOTES..=MAX_REMOTES`): past it, down to 7/8 of it, the least lately active first, then those mid-dial
-    /// or invited. Linked peers stay. Every page load is a new PeerId, each kept `FORGET` long, so before this a
+    /// `MIN_REMOTES..=MAX_REMOTES`): past it, down to 7/8 of it, the least lately active first, then those mid-dial.
+    /// Linked peers stay, and so do invited ones and ones reached over a radio. Every page load is a new PeerId, each kept `FORGET` long, so before this a
     /// stranger who knew the room ran a board's heap down by reloading (NB-132).
     fn cap_remotes(&mut self, ep: &Endpoint<A>) {
         let cap = ep.config().max_links.saturating_mul(REMOTES_PER_LINK).clamp(MIN_REMOTES, MAX_REMOTES);
@@ -2123,9 +2123,12 @@ impl<A: Address> Traversal<A> {
         let mut idle: Vec<(bool, Instant, PeerId)> = self
             .remotes
             .iter()
-            .filter(|(p, _)| !ep.is_connected(p))
+            // Linked peers stay, and so do ones we dial by invite or reach over a radio: the app or a proven
+            // connection chose those, and `Node::admits` takes an invite dial's link only while it's remembered
+            // (NB132-1).
+            .filter(|(p, r)| !ep.is_connected(p) && !r.invited && r.radio.is_empty())
             .map(|(p, r)| {
-                let busy = r.ladder.is_some() || r.plan.is_some() || r.invited;
+                let busy = r.ladder.is_some() || r.plan.is_some();
                 (busy, r.seen_at.max(r.offered_at.unwrap_or(Instant::ZERO)), *p)
             })
             .collect();
@@ -3531,6 +3534,58 @@ mod tests {
         assert!(answered > 64, "{answered} hellos answered");
         assert!(most <= 32, "{most} peers remembered at most");
         assert!(t.remotes.contains_key(&invited), "the invited peer is still remembered");
+    }
+
+    /// NB132-1: offers from new keys that each plan a punch (a symmetric NAT at a public address, to a cone node) make
+    /// their peers busy for 1.5 s; 28 of them and 4 hellos within 0.7 s once pushed an invite dial out of the peers
+    /// remembered, so `admits` refused it and its plain answer was dropped. An invited peer is never evicted now.
+    #[test]
+    fn an_invite_dial_outlasts_offers_that_plan_punches() {
+        let (key, topic) = (room_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1));
+        let (mut t, _) = in_room(Role::Host, None, "10.0.0.1:7000".parse().unwrap());
+        let mut ep = Endpoint::new(&id(1), Config { max_links: 8, ..Config::default() }, [1; 32]);
+        t.nat = NatType::Cone; // as STUN found it
+        let (me, invited) = (id(1).peer_id(), id(2).peer_id());
+        t.introduce(Instant::from_millis(1_000), &ep, invited, None);
+        while t.poll_signal().is_some() {}
+        for i in 0..28u8 {
+            let from = id(100 + i);
+            let o: Offer<SocketAddr> = Offer {
+                kind: Proof::Room,
+                reply: false,
+                role: Role::Client,
+                nat: NatType::Symmetric,
+                says_mapping: false,
+                ts: 1_100,
+                nonce: u64::from(i),
+                addrs: vec![format!("198.51.100.{}:4000", i + 1).parse().unwrap()],
+                predict: None,
+                relays: vec![],
+                relayed: Vec::new(),
+            };
+            let mut body = o.encode();
+            body.extend(mac(&key, &[b"pw-offer", from.peer_id().as_bytes(), me.as_bytes(), &body]));
+            let sealed = sealed::seal(&from, &me, [7; 32], &body).unwrap();
+            t.handle_signal(Instant::from_millis(1_100 + u64::from(i) * 20), &mut ep, Topic::peer(&me), &sealed);
+        }
+        for i in 0..4u64 {
+            let mut from = [0xee; 32];
+            from[..8].copy_from_slice(&i.to_le_bytes());
+            let ms = 1_700 + i * 20;
+            t.handle_signal(
+                Instant::from_millis(ms),
+                &mut ep,
+                topic,
+                &room_hello(&key, &PeerId(from), Role::Client, ms),
+            );
+        }
+        while t.poll_signal().is_some() {}
+        assert!(t.remotes.len() <= 32, "{} peers remembered", t.remotes.len());
+        // The invited peer's plain answer to our offer is taken.
+        let plain = proved_offer(&id(2), &me, None, 77, Role::Peer, vec!["198.51.100.200:4000".parse().unwrap()]);
+        let took = t.handle_signal(Instant::from_millis(1_900), &mut ep, Topic::peer(&me), &plain);
+        assert!(t.remotes.contains_key(&invited) && t.admits(&invited), "the invite dial is still admitted");
+        assert_eq!(took, Some(invited));
     }
 
     /// An invite dial still punches from inside a room: the dialled peer's plain

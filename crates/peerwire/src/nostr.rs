@@ -246,14 +246,17 @@ impl Signaling for NostrSignaling {
         loop {
             let m = self.inbox.try_recv().ok()?;
             self.shared.inbox_bytes.fetch_sub(m.size(), Ordering::Relaxed);
-            if m.pubkey == self.pubkey || !self.seen.insert(m.id) {
+            if m.pubkey == self.pubkey || self.seen.contains(&m.id) {
                 continue; // our own, or a copy from another relay
             }
-            self.seen_order.push_back(m.id);
-            if self.seen_order.len() > self.limits.seen {
-                let old = self.seen_order.pop_front().unwrap();
-                self.seen.remove(&old);
+            // The oldest goes first, so the queue never holds more than `seen` (its buffer would double past it).
+            if self.seen_order.len() >= self.limits.seen {
+                if let Some(old) = self.seen_order.pop_front() {
+                    self.seen.remove(&old);
+                }
             }
+            self.seen.insert(m.id);
+            self.seen_order.push_back(m.id);
             let Some(topic) = Topic::from_hex(&m.tag).filter(|t| self.topics.contains(t)) else { continue };
             if let Some(payload) = unb64(&m.content) {
                 return Some((topic, payload));
