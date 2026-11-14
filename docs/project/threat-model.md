@@ -2207,7 +2207,9 @@ and what it took was lost. Before NB-006i the other relays carried a copy of eac
   more than its 1/n. An on-path attacker who drops honest relays' OKs could already
   drop those relays.
 - **NIP-01 relays answer OK within a round trip,** so this needs no wire change. The
-  three default relays answered a hello in 0.2–1.2 s.
+  three default relays then (nos.lol, relay.primal.net and nostr.mom) answered a hello
+  in 0.2–1.2 s. By 2026-11-14 nos.lol and nostr.mom sent no OK at all, the case of
+  NB6J-I3; each default since [NB-130](#default-nostr-relays-nb-130) answers ours.
 - **Tests.**
   - `nostr_bounds` 5d: a socket that never answers loses its turns 5 s after its first
     event and gets them back on an OK; one answering at 4 s keeps them; the order at
@@ -3531,8 +3533,10 @@ seen ids and 8 queued (`Limits::SMALL`, `0b909e3`); and its relay thread asks fo
 `wss://relay.primal.net` since (`a83ab33`), as nostr.mom took the board's and the pages'
 kind-25059 events and passed none on. Its operator sees the board's public address, when
 it is online, its room and inbox tags and the size and timing of its events: the move
-changed which operator that is, not what it sees. Both are among the default relays of
-Rust and JavaScript, whose peers publish to all of them, so nostr.mom still sees theirs.
+changed which operator that is, not what it sees. relay.primal.net is also a default
+relay of Rust and JavaScript, whose peers publish to every relay they list. nostr.mom
+was one until [NB-130](#default-nostr-relays-nb-130), so it still sees the events of
+releases before it.
 
 Reviewed 2026-11-04 by reading `8b089c2`, `027e4cf`, `fa71e65`, `04c20cb` and `6737208`
 against ESP-IDF v5.5.5's pthread and FreeRTOS sources, ring 0.17.14 and tungstenite
@@ -6263,6 +6267,69 @@ names fail; it fails without the fix.
 - **Relays from a link.** The LED page's `?relays=` (as Net Lab's) points it at relays
   that whoever wrote the link picks, which then see what any relay sees.
 
+### Default Nostr relays (NB-130)
+
+`DEFAULT_RELAYS` (`crates/peerwire/src/nostr.rs`, `packages/js/src/nostr.js`) is
+`wss://relay.primal.net`, `wss://relay.nostr.net` and `wss://nostr.oxtr.dev` since
+`1e5ff8a`, in place of nos.lol, relay.primal.net and nostr.mom. Every default takes that
+one list: rooms, `RelayTransport`, `openInbox`, docs kept on the relays, the LED page
+without `?relays=`, both doctors and Godot. A probe on 2026-11-14, one event of each
+kind per relay, found that nos.lol and nostr.mom took our kind-25059 and kind-30078
+events with no `OK` and passed none on; each new default answered `OK`, passed the live
+event on and served the stored one back.
+
+Reviewed 2026-11-14 by reading `1e5ff8a` against `134100c`, with a scratch test on
+loopback (not in the tree): a websocket relay that reads every frame and answers none,
+beside the in-memory relay of `examples/rust/nostr_relay.rs`. Nothing here touched a
+public relay.
+
+- **No claim moves.** The trust table already lets a relay read, drop, reorder, replay
+  or inject any signalling message, and nothing a relay carries is trusted: offers and
+  inbox drops are sealed to their recipient, hellos prove the room, and doc pieces are
+  sealed under the room's key. A new operator gets the view any relay has.
+- **Who sees it.** Each default relay sees the IP address of every node on the defaults,
+  its room and inbox tags (SEC-5) and the size and timing of its events (NB43-I4 for
+  pipes). NB-130 moves that view from the operators of nos.lol and nostr.mom to those of
+  relay.nostr.net and nostr.oxtr.dev; relay.primal.net keeps it. By the probe,
+  relay.primal.net and relay.nostr.net are both behind Cloudflare, which ends their TLS,
+  so sees what they see, and runs one of the two default STUN servers. It could already
+  tie a node's STUN request to its events through relay.primal.net: NB-130 adds a second
+  relay behind it, not a new observer. Earlier releases (`@peerwire/js` 0.3, the 0.1
+  crates) still publish to nos.lol and nostr.mom.
+- **Spread.** Three operators on two networks. Members meet when they list one working
+  relay in common: before NB-130 the defaults had one, relay.primal.net, which is why
+  rooms on the defaults still met. A failure or a block at the one CDN takes two of the
+  three at once, leaving nostr.oxtr.dev, run by one person. A node on an earlier release
+  meets one on the new list over relay.primal.net alone.
+
+**Residuals, accepted.**
+
+- **A silent relay.** One that takes events and never answers drops them all, as the
+  trust table allows; NB-130 shows it happens without malice and without a word. In
+  JavaScript it loses its pipe turns after `SILENT_MS` (NB6J-I3) and still gets every
+  hello and offer. Rust sends every event to every relay. `NostrStats::rejected` counts
+  only `OK false`, and `received` counts each relay's copies, our own echoes included:
+  with every relay silent a node reads `received` 0 after publishing. With one of two
+  silent the scratch test read 2 open, 5 published, 5 received and 0 rejected: one
+  relay's echoes are missing, and nothing says which. Members that share no working
+  relay never meet and see no error: an app's own short list does it (the board's one
+  `NOSTR_RELAY`, NB-129). `peerwire doctor` names such a relay `no-echo`.
+- **Relays that filter keys.** offchain.pub refused the probe's event ("pubkey is not in
+  our web of trust"). Signalling signs with a fresh key per session in JavaScript and
+  per carrier in Rust (a doc's relay copy with one key per doc, NB-006l), so nothing
+  links a node's events across sessions, and a relay that takes only keys it knows never
+  takes ours. Keep the keys fresh: a stable signing key, or one made known to such a
+  relay, would link every session of a node, as SEC-5's tags do. Pick relays by probing
+  them, as NB-130 did.
+- **Stored events.** A doc piece's content is at most 60,116 base64 characters and an
+  inbox drop's at most 22,360 (**theoretical**, from `PIECE_DEFLATED` and
+  `MAX_MESSAGE`), within the new relays' messages (1 MB, 256 KiB and 128 KiB) and
+  strfry's default event limit of 64 KiB. On relay.nostr.net and nostr.oxtr.dev only a
+  45 KB event was tried; a relay that refuses a piece loses its own copy, not the
+  others'. Retention is unmeasured on those two (12.7 days on relay.primal.net in
+  October), and an inbox drop may ask for 7 days. Both stores were best-effort already:
+  a relay can serve an old save or none (NB-006l).
+
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
 `@peerwire/react` (`packages/react`, 0.1.0 published from `dec1554`) wraps a room in
@@ -7056,6 +7123,9 @@ mappings that carry over and are already handled in Peerwire:
   the moment before the driver drops it, and on a central that links to the node's
   advert (NB110-13). On an ESP32 board with no network, the time the first room member
   to link over Bluetooth gives, until the board restarts or SNTP answers (NB119-2).
+- Signalling rests on public relays we don't run: one that drops our events without a
+  word hides members that share no other working relay, and only `peerwire doctor` names
+  it ([NB-130](#default-nostr-relays-nb-130)).
 - The security of the underlying crypto crates is assumed.
 
 ## Review method
