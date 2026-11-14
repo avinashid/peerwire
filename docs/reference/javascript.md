@@ -1025,6 +1025,11 @@ a few batches a second. That is slow (a relay trip each way), fine for commands 
 - **Peers.** It lists the native peers whose hellos prove the room key (`peers`, and `onPeer(peer, 'seen')`), and takes
   pipe batches from them alone, each datagram as from its sender only. A `joinRoom` member's hello (no `meta.nb`) is
   left to its room. A hello only names a peer: the handshake proves who is at the other end.
+- **Roles.** `role` is Rust's `Role`, said in the hello and proved under the room key: `'peer'` (the default) links
+  with peers and hosts, `'host'` with peers and clients, `'client'` with hosts alone. Peers in a role yours doesn't
+  link with are not listed and send you no pipe batch. A page that drives a board says `role: 'client'` to a board that
+  joined as `Role::Host` (`join_room_as`): two such pages in the room then don't hear each other as peers, so neither
+  dials the other in place of the board (`demo/led.html` does so).
 - **The room name is the password.** Anyone who knows it can link with the board, and as a member learn its addresses:
   over the internet, give it one nobody can guess (`randomRoomId()`).
 - **Batches.** To a native peer, a batch carries 1232 bytes of datagrams at most (`NATIVE_BATCH`): a board reads relay
@@ -1214,7 +1219,8 @@ Those marked (Chromium) open headless browser tabs on loopback. None touches a p
 - `relay_link.mjs`: `RelayTransport` between bare endpoints over two relays on loopback (`nostr_relay.mjs`, a small
   NIP-01 relay that also runs on its own): the hello in Rust's shape, when it goes, which hellos list a peer, the dial
   and messages both ways, batches of 1232 bytes of datagrams at most and events a board's 4 KB frame takes, pipe
-  batches refused from a peer that said no hello, `drop()`, `close()` and each failure's code. No public relays.
+  batches refused from a peer that said no hello, roles (a client lists hosts alone and takes no pipe batch from
+  another client), `drop()`, `close()` and each failure's code. No public relays.
 - `room_proof.mjs`: an attacker that knows only the room topic gets no dial, no answer and, on a link it dials
   itself, nothing but the link proof before it is dropped; the hello proof matches Rust's.
 - `fuzz.mjs`: seeded random and mutated input to the JS parsers (Nostr events and relay messages, hex and peer ids,
