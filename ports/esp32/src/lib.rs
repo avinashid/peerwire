@@ -71,7 +71,7 @@ pub const PORT: u16 = 4040;
 
 /// One of [`NostrSignaling`]'s default relays, so PCs on the defaults share it with the board.
 #[cfg(feature = "nostr")]
-pub const NOSTR_RELAY: &str = "wss://nostr.mom";
+pub const NOSTR_RELAY: &str = "wss://relay.primal.net";
 
 /// How long [`Board::connect`] waits for the clock.
 const CLOCK_WAIT: Duration = Duration::from_secs(60);
