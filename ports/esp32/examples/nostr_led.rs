@@ -10,7 +10,9 @@
 //! otherwise. It has no default room, and refuses a shorter name.
 //!
 //! It joins wifi.sh's network and room.sh's room (it needs both) of the `lan_chat` app, on the LAN and over
-//! `wss://nostr.mom` (one of the browser's default relays). Build it with
+//! `wss://relay.primal.net` (one of the browser's default relays; nostr.mom took our events and passed none on, NB-129),
+//! as a `Role::Host`: it links with peers (`room_chat`, `lan_chat`) and clients (the LED page joins as one, so two
+//! phones' pages each link with the board, not with each other). Build it with
 //! `FEATURES=nostr EXAMPLE=nostr_led ./build.sh`, then write the Wi-Fi and room records with wifi.sh and flash; the LED
 //! is GPIO8, lit low, as on the ESP32-C3 SuperMini (`PW_LED_PIN`, `PW_LED_HIGH` for another board, see `ble_led`).
 
@@ -19,7 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::anyhow;
 use log::{info, warn};
 use peerwire_esp::console::Console;
-use peerwire_esp::peerwire::{Event, PathKind};
+use peerwire_esp::peerwire::{Event, PathKind, Role};
 use peerwire_esp::{free_heap, identity, nostr_thread, Board, NOSTR_RELAY};
 
 #[path = "led/common.rs"]
@@ -47,7 +49,8 @@ fn run() -> anyhow::Result<()> {
     let board = Board::connect(&ssid, &password)?;
     let console = Console::start()?;
     let mut node = board.builder_with_nostr(NOSTR_RELAY)?.identity(identity).bind(board.addr())?;
-    node.join_room(APP, &room);
+    // A host: pages join as clients, which link with hosts alone, so a second page doesn't dial the first (NB-129).
+    node.join_room_as(APP, &room, Role::Host);
     info!("led: joined {APP}/{room} on the LAN and over {NOSTR_RELAY}, free heap {} B; {HELP}", free_heap());
 
     let mut next_report = Instant::now() + REPORT_EVERY;
