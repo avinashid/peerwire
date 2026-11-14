@@ -2112,8 +2112,8 @@ impl<A: Address> Traversal<A> {
 
     /// Keeps the peers remembered to the cap for the endpoint's `max_links` (`REMOTES_PER_LINK` each, within
     /// `MIN_REMOTES..=MAX_REMOTES`): past it, down to 7/8 of it, the least lately active first, then those mid-dial.
-    /// Linked peers stay, and so do invited ones and ones reached over a radio. Every page load is a new PeerId, each kept `FORGET` long, so before this a
-    /// stranger who knew the room ran a board's heap down by reloading (NB-132).
+    /// Linked peers stay, and so do invited ones and ones reached over a radio. Every page load is a new PeerId, each
+    /// kept `FORGET` long, so before this a stranger who knew the room ran a board's heap down by reloading (NB-132).
     fn cap_remotes(&mut self, ep: &Endpoint<A>) {
         let cap = ep.config().max_links.saturating_mul(REMOTES_PER_LINK).clamp(MIN_REMOTES, MAX_REMOTES);
         if self.remotes.len() <= cap {
