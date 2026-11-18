@@ -39,6 +39,17 @@ and the commit that fixed it.
   `espnow::EspNow` always sets and Bluetooth's limits don't; over such a radio a connection that closes for a fault of
   its link (a message the room proof doesn't expect, a wrong answer or proof, 32 messages dropped), or that the other
   end closes before the room is proven, holds its advert 1 to 4 s, not 60 s (NB135-8).
+- ESP-NOW, from its security review's fifth round: over a radio whose values anyone in range can forge
+  (`Limits::forgeable`), datagrams are sealed under the link key as signals are (kind 0, `seq`, then AES-256-GCM with
+  the signals' nonce and count: 24 bytes more), and one that doesn't open, or a copy, is dropped before the node sees
+  it and isn't counted towards the connection's 32 drops. So one HS1 forged to each end after the identity proofs no
+  longer takes the connection's slot and the radio's handshake budget and keeps the real handshake out for 10 s, and
+  forged datagrams close nothing (NB135-9). `peerwire-core` has `ble::Link::seal_datagrams`, `Link::seals_datagrams`,
+  `Link::forged`, `ble::SEAL_LEN` and `ble::MAX_SEALED_MESSAGE`, new; Bluetooth's links don't seal, and their wire
+  doesn't change. Over such a radio a connection that misses the room proof's deadline, and a proven one bound to no
+  peer that the other end closes while this node's link to its peer goes nowhere else, hold the advert 1 to 4 s, not
+  60 s, so frames forged with the numbers of the room proof, or 32 forged to the accepter of a standby, no longer keep
+  two boards apart for a minute; a standby closed beside a link elsewhere keeps the minute (NB135-10).
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert

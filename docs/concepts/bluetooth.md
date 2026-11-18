@@ -88,9 +88,11 @@ closing the bound connections a peer makes to it makes that peer connect again e
 member can cost a link more ways than that. Over a radio whose values anyone in range can forge (`Limits::forgeable`,
 [ESP-NOW](espnow.md)'s), so is one whose connection closed for a fault of its link (a message the room proof doesn't
 expect, a wrong answer or proof, 32 messages dropped) or that the other end closed before the room was proven, as one
-forged value can cause either (NB135-8); over Bluetooth, where no third party writes into a connection, those hold
-60 s. Nothing a peer says of its own advert is taken, as a member could name another's to keep two members apart: so
-two peers may make two connections (a full desktop connects back to the peer that filled it, say), and the
+forged value can cause either (NB135-8); and one whose connection missed the room proof's deadline, or was proven and
+bound to no peer when the other end closed it while this peer's link to that peer went nowhere else, as forged frames
+can cause those too (NB135-10). Over Bluetooth, where no third party writes into a connection, those hold 60 s.
+Nothing a peer says of its own advert is taken, as a member could name another's to keep two members apart: so two
+peers may make two connections (a full desktop connects back to the peer that filled it, say), and the
 [second one closes](#binding-a-connection-to-its-peer).
 
 ## Framing
@@ -155,6 +157,14 @@ members it reaches hear of the peer at once, and the hellos on other carriers ke
 stands as it does on any carrier: the hello key, room proofs, freshness and the hello and offer budgets.
 
 A message of another kind, or one that fails its checks, is dropped and counted against the connection.
+
+**Over a radio anyone can write into.** A radio whose values anyone in range can forge (`Limits::forgeable`,
+[ESP-NOW](espnow.md)'s) has its datagrams sealed too (`Link::seal_datagrams`, NB135-9): kind 0, `seq` u64 LE, then
+AES-256-GCM(link key, nonce, datagram), with the signals' nonce and `seq` from the same count as theirs, 24 bytes
+more. A datagram that doesn't open, or whose `seq` isn't above the last taken, is dropped before the peer sees it and
+isn't counted, as anyone in range may have sent it; so a forged HS1 takes no connection's slot nor the radio's budget,
+and forged datagrams close nothing. A message there is 1,257 B at most. Over Bluetooth datagrams go as above, with no
+`seq` or tag.
 
 ## Binding a connection to its peer
 
@@ -280,8 +290,8 @@ pub trait Radio: Send {
     /// The next event, without blocking.
     fn poll(&mut self) -> Option<RadioEvent>;
     /// What it holds at once (connections, unbound ones, centrals, values queued), and whether anyone in range can
-    /// forge a value on a connection (`forgeable`, ESP-NOW's): `Limits::DESKTOP` unless the driver says otherwise; an
-    /// ESP32's says `Limits::SMALL`.
+    /// forge a value on a connection (`forgeable`, ESP-NOW's; a radio over a medium anyone in range can write into
+    /// must set it): `Limits::DESKTOP` unless the driver says otherwise; an ESP32's says `Limits::SMALL`.
     fn limits(&self) -> Limits { Limits::DESKTOP }
     /// A waker to wake each time it queues an event, so a node asleep until its next timer polls at once; a driver
     /// that never wakes it still works, as a node with a radio polls at least every 50 ms. Default: ignored.
