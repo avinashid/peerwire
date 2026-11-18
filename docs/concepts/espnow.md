@@ -126,7 +126,7 @@ peer, for at most 17 peers) isn't used: the node seals what crosses.
 | Frames waiting in the engine for the ether | 256; of them, 4 of no connection and one refusal; more are dropped, and counted |
 | Refusals (a CLOSE for an ACCEPT nobody waits for) | one per 100 ms, one try |
 | Tries of a frame not acknowledged | 4; 2 to an address that never acknowledged one; 1 for a broadcast or a refusal |
-| PROBEs answered per connection | one per 100 ms |
+| PROBEs answered per connection | one per 100 ms, and none while a KEEPALIVE of the connection waits for the air (NB135-I5) |
 
 **Throughput (theoretical):** at 1 Mbit/s a 250-byte frame is on the air for 192 µs of preamble and 8 µs per byte of
 the frame and its ~43 bytes of 802.11 and ESP-NOW headers: 2.5 ms; with its acknowledgement (0.3 ms) and the gaps
@@ -159,7 +159,7 @@ which could jam the channel anyway. What such an attacker can do, frame by frame
 | ACCEPT, after the real one, within 3 s of it | the connection closes, though the room's challenge came on it already, and the node connects again 1 to 4 s later, as the radio reports the close as `Dropped`, which says nothing of the other end (NB135-5): one forged frame for each reconnect, as jamming would cost |
 | ACCEPT, more than 3 s after the first | ignored |
 | CLOSE | nothing, unless the attacker also keeps the other end's answer to the PROBE from arriving (jamming): then a close and a reconnect |
-| PROBE | a KEEPALIVE in answer, one per 100 ms per connection |
+| PROBE | a KEEPALIVE in answer, one per 100 ms per connection, and none while one waits for the air: one waiting at most (NB135-I5) |
 | KEEPALIVE | keeps a connection whose peer left open for as long as it keeps sending: the node closes it once its link times out and no proof of a room member has come over it for 60 s, as over Bluetooth |
 | DATA, in the window | a value for the node, which drops it (sealed, or not the room's); the real frame with its number is dropped as a copy, and the value it is part of, and so is the value being joined if the forged frame says it starts one: a value or two lost, which the reliable lane sends again. The real frames behind it are still taken (NB135-6) |
 | DATA, further off | dropped; 4 in a row (ahead, or more than 64 behind) move the receiver to them, and the sender's next 4 real frames, now far off, move it back: 4 frames lost, which the reliable lane sends again (NB135-1) |

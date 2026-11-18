@@ -41,7 +41,7 @@ pub const ACCEPT_RACE: Duration = Duration::from_secs(3);
 /// (NB135-3).
 const MAX_TX: usize = 256;
 const MAX_LOOSE: usize = 4;
-/// A connection answers PROBEs at most this often.
+/// A connection answers PROBEs at most this often, and only while no KEEPALIVE of its waits for the ether (NB135-I5).
 const PROBE_GAP: Duration = Duration::from_millis(100);
 /// Frames handed to the ether whose verdict hasn't come, at most; one whose verdict hasn't come in this long is taken
 /// as lost, so an ether that drops a verdict can't stop the engine sending.
@@ -330,7 +330,8 @@ impl Engine {
             Frame::Probe { to } => match self.live(now, from, to) {
                 Some(conn) => {
                     let c = &self.conns[&conn];
-                    if c.answered.is_none_or(|t| now.saturating_duration_since(t) >= PROBE_GAP) {
+                    let due = c.answered.is_none_or(|t| now.saturating_duration_since(t) >= PROBE_GAP);
+                    if due && !self.waiting(conn, Kind::Keepalive) {
                         let (mac, theirs) = (c.mac, c.theirs);
                         self.conns.get_mut(&conn).expect("live").answered = Some(now);
                         self.queue(now, mac, Frame::Keepalive { to: theirs }, Some(conn), Kind::Keepalive);
@@ -371,7 +372,7 @@ impl Engine {
         let again = self.conns.iter().find(|(_, c)| !c.central && c.mac == mac && c.theirs == theirs);
         if let Some((&conn, c)) = again {
             let mine = c.mine;
-            if !self.tx.iter().any(|o| o.conn == Some(conn) && o.kind == Kind::Accept) {
+            if !self.waiting(conn, Kind::Accept) {
                 let rx_max = self.max_frame as u16;
                 self.queue(now, mac, Frame::Accept { to: theirs, from: mine, rx_max }, Some(conn), Kind::Accept);
             }
@@ -593,12 +594,14 @@ impl Engine {
             self.close(conn, false);
         }
         for conn in opens {
-            if !self.tx.iter().any(|o| o.conn == Some(conn) && o.kind == Kind::Open) {
+            if !self.waiting(conn, Kind::Open) {
                 self.queue_open(now, conn);
             }
         }
         for (conn, mac, to) in keep {
-            self.queue(now, mac, Frame::Keepalive { to }, Some(conn), Kind::Keepalive);
+            if !self.waiting(conn, Kind::Keepalive) {
+                self.queue(now, mac, Frame::Keepalive { to }, Some(conn), Kind::Keepalive);
+            }
         }
     }
 
@@ -749,6 +752,11 @@ impl Engine {
         self.refused_at = Some(now);
         self.stats.refusals += 1;
         true
+    }
+
+    /// Whether a frame of `kind` of `conn`'s waits for the ether: one of each kind but data at most (`MAX_TX`).
+    fn waiting(&self, conn: ConnId, kind: Kind) -> bool {
+        self.tx.iter().any(|o| o.conn == Some(conn) && o.kind == kind)
     }
 
     /// Drops the frames `conn` has waiting for the ether.
@@ -1417,6 +1425,39 @@ mod tests {
             .peek()
             .map(|(to, f, tries)| (to, frame::parse(f).is_ok_and(|f| matches!(f, Frame::Accept { .. })), tries));
         assert_eq!(accept, Some((X, true, s.first_tries)));
+    }
+
+    /// NB135-I5 (the security review's repro, inverted): PROBEs on a connection opened from an address that never
+    /// acknowledges, one per 100 ms for 3 s while the ether takes nothing, leave one KEEPALIVE waiting, not 30; so
+    /// does a connection's own keepalive timer.
+    #[test]
+    fn sec_probe_answers_wait_one_at_a_time() {
+        let t0 = Instant::now();
+        let mut b = engine(2, V1_FRAME, t0);
+        b.advertise(t0, Some(&ADVERT));
+        let x = [0x02, 0, 0, 0, 7, 1];
+        b.handle(t0, x, &Frame::Open { from: 0x100, rx_max: 250 }.encode());
+        let mine = b.conns.values().next().unwrap().mine;
+        let mut t = t0;
+        for _ in 0..30 {
+            t += ms(100);
+            b.handle(t, x, &Frame::Probe { to: mine }.encode());
+            b.timers(t);
+        }
+        let k: Vec<u8> = b.tx.iter().filter(|o| o.kind == Kind::Keepalive).map(|o| o.tries).collect();
+        assert_eq!(k, [Settings::DEFAULT.first_tries], "one KEEPALIVE waits, with the tries of an address unproven");
+        // Once the ether takes it, the next PROBE is answered.
+        while let Some((_, f, _)) = b.peek() {
+            let keepalive = matches!(frame::parse(f), Ok(Frame::Keepalive { .. }));
+            b.commit(t);
+            b.outcome(false);
+            if keepalive {
+                break;
+            }
+        }
+        t += ms(100);
+        b.handle(t, x, &Frame::Probe { to: mine }.encode());
+        assert_eq!(b.tx.iter().filter(|o| o.kind == Kind::Keepalive).count(), 1);
     }
 
     /// NB135-2: values waiting for a node that doesn't poll are capped in bytes (16 KB), not only in number.
