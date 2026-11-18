@@ -740,7 +740,9 @@ fn pump_ms(nodes: &mut [&mut Node], events: &mut Vec<Vec<Event>>, ms: u64) {
 /// messages, one at a time, with the ids and numbers overheard, each a whole message of the node's framing of kind 0
 /// with a made-up seq and tag. The links drop them all as forged, nothing closes or moves, and every message sent
 /// meanwhile arrives, in order: each forged frame costs the real frame of its number on the air (NB135-6), which the
-/// reliable lane sends again.
+/// reliable lane sends again. Each pair is forged once the round's message has come each way and no real frame waits
+/// on the air, with a number above any the receiver took, a forged one's too: a slow debug build sent nothing new
+/// between two pairs at times, the second took the first's number, and the receiver dropped it as a copy.
 #[test]
 fn sec_forged_datagrams_on_a_live_link_close_nothing() {
     let air = FakeAir::new();
@@ -756,14 +758,21 @@ fn sec_forged_datagrams_on_a_live_link_close_nothing() {
     let opener = other(accepter);
     let msgs: Vec<Vec<u8>> = (0..40).map(|i| format!("message {i}").into_bytes()).collect();
     let mut after = vec![Vec::new(), Vec::new()];
+    let mut forged: HashMap<u64, u32> = HashMap::new();
     for (i, m) in msgs.iter().enumerate() {
         a.send(&pb, Lane::Reliable, m).unwrap();
         b.send(&pa, Lane::Reliable, m).unwrap();
-        pump_ms(&mut [&mut a, &mut b], &mut after, 30);
+        let end = Instant::now() + Duration::from_secs(10);
+        while !(got(&after[1], pa, m) && got(&after[0], pb, m) && air.waiting() == 0) {
+            assert!(Instant::now() < end, "message {i} each way");
+            pump_ms(&mut [&mut a, &mut b], &mut after, 1);
+        }
         for (from, to, id) in [(accepter, opener, opener_id), (opener, accepter, accepter_id)] {
-            // The receiver's next number, and a counter that is neither the last real one nor the next, so the
-            // framing takes it as a whole message.
-            let seq = highest(&air, from, id).unwrap_or(0).wrapping_add(1);
+            // The receiver's next number, past the last forged, and a counter that is neither the last real one
+            // nor the next, so the framing takes it as a whole message.
+            let next = highest(&air, from, id).unwrap_or(0).wrapping_add(1);
+            let seq = forged.get(&id).map_or(next, |f| next.max(f + 1));
+            forged.insert(id, seq);
             let c = (last_counter(&air, from, id) + 10) & 0x3f;
             let value = [&[0xc0 | c, 0][..], &(1_000 + i as u64).to_le_bytes(), &[0x5a; 40]].concat();
             let total = value.len() as u16;
