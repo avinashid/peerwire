@@ -99,9 +99,11 @@ end's MAC address, this end's id), and every frame on it carries the receiver's 
 ESP-NOW's send callback says whether the receiving radio acknowledged a frame, after the radio's own retries; with
 several frames in flight, ESP-IDF says the callbacks may come out of order. So the ESP32 driver puts one frame on the
 air at a time, from a thread of its own, and the next once the callback for the last has come (or 200 ms have
-passed). A unicast frame not acknowledged goes again, 4 times in all; a broadcast once. The engine hears each frame's
-verdict in order (`espnow::TxQueue`): a value's queue slot frees once its last frame is acknowledged, and a connection
-whose frames fail 8 times in a row is gone.
+passed). A unicast frame not acknowledged goes again, 4 times in all on a connection whose other end has acknowledged
+one, and twice to an address that never has (it may be made up: an OPEN to a replayed advert, an ACCEPT to a forged
+OPEN), so a frame to an absent address holds the air for two tries, not four; a broadcast and a refusal go once
+(NB135-3). The engine hears each frame's verdict in order (`espnow::TxQueue`): a value's queue slot frees once its
+last frame is acknowledged, and a connection whose frames fail 8 times in a row is gone.
 
 ESP-NOW sends a unicast frame only to an address in its peer table, of 20 at most: the driver keeps the 16 it sent to
 most lately (`espnow::PeerTable`) and drops the oldest for a new one. ESP-NOW's own encryption (CCMP with a key per
@@ -117,7 +119,9 @@ peer, for at most 17 peers) isn't used: the node seals what crosses.
 | Frames waiting for the air (ESP32) | 32; each one's verdict comes back in order |
 | Frames received waiting for the node (ESP32) | 32; more are dropped, and counted |
 | Adverts and values waiting for the node | 16 and 128; more are dropped, and counted |
-| Refusals (a CLOSE for an ACCEPT nobody waits for) | one per 100 ms |
+| Frames waiting in the engine for the ether | 256; of them, 4 of no connection and one refusal; more are dropped, and counted |
+| Refusals (a CLOSE for an ACCEPT nobody waits for) | one per 100 ms, one try |
+| Tries of a frame not acknowledged | 4; 2 to an address that never acknowledged one; 1 for a broadcast or a refusal |
 | PROBEs answered per connection | one per 100 ms |
 
 **Throughput (theoretical):** at 1 Mbit/s a 250-byte frame is on the air for 192 µs of preamble and 8 µs per byte of
@@ -145,8 +149,8 @@ which could jam the channel anyway. What such an attacker can do, frame by frame
 
 | Forged | At most |
 |---|---|
-| ADVERT | a `Seen` for the node, which checks the room's tag (HMAC), 50 at once and then one per 20 ms; 16 wait for it at most |
-| OPEN, from made-up addresses | fills the 4 connections, and the radio stays silent to the rest; the node closes one that hasn't proven the room within 3 s, and a central's makes way for a new one after 1 s |
+| ADVERT | a `Seen` for the node, which checks the room's tag (HMAC), 50 at once and then one per 20 ms; 16 wait for it at most. A real advert replayed from an absent address draws OPENs for 10 s, two tries each |
+| OPEN, from made-up addresses | fills the 4 connections, and the radio stays silent to the rest; the node closes one that hasn't proven the room within 3 s, and a central's makes way for a new one after 1 s. Each ACCEPT to a made-up address holds the air for two tries (NB135-3) |
 | ACCEPT, before the real one | the opener takes the forged id; when the real ACCEPT comes, with another id and within 3 s, the connection closes, even if forged data came meanwhile (NB135-4), and the node connects again. If the attacker also keeps the real one from arriving (jamming), the opener sends to the forged id, the room proof stalls, and the node closes the connection after 3 s and holds the advert for 60 s |
 | ACCEPT, more than 3 s after the first | ignored |
 | CLOSE | nothing, unless the attacker also keeps the other end's answer to the PROBE from arriving (jamming): then a close and a reconnect |

@@ -4,9 +4,10 @@
 //! Wi-Fi must be started as a station first and stay started for as long as the radio runs: on no network
 //! ([`wifi::start_on_channel`](crate::wifi::start_on_channel)), when every board in the room must be on the same
 //! channel, or on one ([`wifi::join`](crate::wifi::join)), when ESP-NOW follows the network's channel. Frames go out
-//! one at a time from a thread of their own, each tried up to [`TRIES`] times while the receiving radio doesn't
-//! acknowledge it (on top of the radio's own retries), as ESP-NOW's send callback can't be matched to a frame with
-//! several in flight; frames received wait in a queue of [`RX_QUEUE`] for the node, and more are dropped.
+//! one at a time from a thread of their own, each tried as many times as the radio asks while the receiving radio
+//! doesn't acknowledge it (on top of the radio's own retries: `Settings::tries`, fewer to an address that never
+//! acknowledged, NB135-3), as ESP-NOW's send callback can't be matched to a frame with several in flight; frames
+//! received wait in a queue of [`RX_QUEUE`] for the node, and more are dropped.
 //!
 //! ```no_run
 //! use peerwire_esp::espnow;
@@ -42,8 +43,6 @@ use peerwire::espnow::{EspNow, Ether, Mac, PeerTable, Settings, Touch, TxQueue, 
 
 /// Frames waiting to go, or with a verdict the node hasn't taken.
 pub const TX_QUEUE: usize = 32;
-/// Tries of a unicast frame the receiving radio doesn't acknowledge.
-pub const TRIES: u8 = 4;
 /// Frames received waiting for the node.
 pub const RX_QUEUE: usize = 32;
 /// Entries this driver keeps in ESP-NOW's peer table (20 at most, with the broadcast address).
@@ -95,7 +94,7 @@ impl EspNowEther {
             bail!("ESP-NOW is started already");
         }
         let shared = SHARED.get_or_init(|| Shared {
-            tx: Mutex::new(TxQueue::new(TX_QUEUE, TRIES)),
+            tx: Mutex::new(TxQueue::new(TX_QUEUE)),
             more: Condvar::new(),
             rx: Mutex::new(VecDeque::new()),
             waker: Mutex::new(None),
@@ -130,7 +129,7 @@ impl EspNowEther {
 }
 
 impl Ether for EspNowEther {
-    fn send(&mut self, to: Mac, frame: &[u8]) -> bool {
+    fn send(&mut self, to: Mac, frame: &[u8], tries: u8) -> bool {
         if let Touch::Add { evict } = self.peers.touch(to) {
             if let Some(old) = evict {
                 unsafe { sys::esp_now_del_peer(old.as_ptr()) };
@@ -141,7 +140,7 @@ impl Ether for EspNowEther {
                 self.peers.forget(to);
             }
         }
-        let taken = lock(&self.shared.tx).push(to, frame);
+        let taken = lock(&self.shared.tx).push(to, frame, tries);
         if taken {
             self.shared.more.notify_one();
         }

@@ -61,12 +61,17 @@ pub struct Settings {
     /// Frames in a row the radio couldn't deliver (each after the ether's own tries), after which a connection is
     /// taken to be gone.
     pub max_failures: u32,
+    /// Tries the ether gives a frame the receiving radio doesn't acknowledge: on a connection that has had one
+    /// acknowledged, and to an address that hasn't (it may be made up: an OPEN to a replayed advert, an ACCEPT to a
+    /// forged OPEN), so such frames hold the air for less (NB135-3). Broadcasts and refusals get one.
+    pub tries: u8,
+    pub first_tries: u8,
 }
 
 impl Settings {
     /// Four connections (two unbound), eight values queued on each, a new handshake per 5 s, values of up to 512
     /// bytes; an advert every 500 ms; an OPEN every 500 ms for 10 s; a keepalive after 1 s of quiet, gone after 5 s
-    /// heard nothing or 8 frames undelivered in a row.
+    /// heard nothing or 8 frames undelivered in a row; 4 tries of a frame, 2 to an address that never acknowledged.
     pub const DEFAULT: Settings = Settings {
         limits: Limits { connections: 4, unbound: 2, centrals: 4, queue: 8, hs1_gap: Duration::from_secs(5) },
         mtu: 515,
@@ -76,6 +81,8 @@ impl Settings {
         keepalive: Duration::from_secs(1),
         timeout: Duration::from_secs(5),
         max_failures: 8,
+        tries: 4,
+        first_tries: 2,
     };
 }
 
@@ -120,8 +127,9 @@ pub struct Stats {
     pub closed_by_peer: u64,
     pub closed_quiet: u64,
     pub closed_failing: u64,
-    /// Adverts and values the node was too slow to take.
+    /// Adverts and values the node was too slow to take, and frames over the send queue's caps.
     pub events_dropped: u64,
+    pub tx_dropped: u64,
     /// Values the node gave that were empty or too long.
     pub values_refused: u64,
     /// Verdicts with no frame waiting for one, and frames whose verdict never came.
@@ -196,8 +204,8 @@ impl<E: Ether> EspNow<E> {
             self.engine.handle(now, from, &frame);
         }
         self.engine.timers(now);
-        while let Some((to, frame)) = self.engine.peek() {
-            if !self.ether.send(to, frame) {
+        while let Some((to, frame, tries)) = self.engine.peek() {
+            if !self.ether.send(to, frame, tries) {
                 break;
             }
             self.engine.commit(now);

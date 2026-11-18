@@ -107,11 +107,11 @@ impl FakeAir {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A station with address `mac` that takes frames of up to `max_frame` bytes, its unicast frames tried up to 4
-    /// times (as the ESP32's ether tries them).
+    /// A station with address `mac` that takes frames of up to `max_frame` bytes, its unicast frames tried as many
+    /// times as the radio asks.
     pub fn ether(&self, mac: Mac, max_frame: usize) -> FakeEther {
         self.lock().stations.push(Station { mac, inbox: VecDeque::new(), off: false, max_frame });
-        FakeEther { air: self.clone(), me: mac, tx: TxQueue::new(64, 4), max_frame }
+        FakeEther { air: self.clone(), me: mac, tx: TxQueue::new(64), max_frame }
     }
 
     /// Tries lost, and tries that arrive unacknowledged, of every thousand.
@@ -168,8 +168,8 @@ impl FakeEther {
 }
 
 impl Ether for FakeEther {
-    fn send(&mut self, to: Mac, frame: &[u8]) -> bool {
-        if !self.tx.push(to, frame) {
+    fn send(&mut self, to: Mac, frame: &[u8], tries: u8) -> bool {
+        if !self.tx.push(to, frame, tries) {
             return false;
         }
         // The radio is instant here: every try goes, and has its verdict, at once.

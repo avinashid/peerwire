@@ -29,6 +29,11 @@ pub const CLOSE_CHECK: Duration = Duration::from_millis(500);
 /// A second ACCEPT with another id this soon after the first closes the connection (NB135-4): one of the two was
 /// forged, and which can't be told. The node's own time for a connection to prove the room.
 pub const ACCEPT_RACE: Duration = Duration::from_secs(3);
+/// Frames waiting for the ether at most; connection-less ones (a CLOSE for a connection gone, an advert) at most
+/// `MAX_LOOSE` of them, and refusals one. A connection's own are capped by its values, and by one of each other kind
+/// (NB135-3).
+const MAX_TX: usize = 256;
+const MAX_LOOSE: usize = 4;
 /// A connection answers PROBEs at most this often.
 const PROBE_GAP: Duration = Duration::from_millis(100);
 /// Frames handed to the ether whose verdict hasn't come, at most; one whose verdict hasn't come in this long is taken
@@ -90,8 +95,10 @@ struct Conn {
     /// When a frame for this end last came on it, and when one was last queued on it.
     heard: Instant,
     sent: Instant,
-    /// Frames in a row the radio said it couldn't deliver.
+    /// Frames in a row the radio said it couldn't deliver, and whether it has acknowledged one: until it has, the
+    /// address may be made up, and frames to it get fewer tries (NB135-3).
     failures: u32,
+    acked: bool,
     /// When a CLOSE came that the other end hasn't answered the probe of yet; when this end last answered a probe.
     closing: Option<Instant>,
     answered: Option<Instant>,
@@ -108,19 +115,24 @@ impl Conn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Control,
+    /// A CLOSE for an ACCEPT no open waits for: from anyone, so one try, and one waiting at most (NB135-3).
+    Refusal,
     Open,
     Accept,
     Advert,
     Keepalive,
-    Data { end: bool },
+    Data {
+        end: bool,
+    },
 }
 
-/// A frame waiting for the ether.
+/// A frame waiting for the ether, and the tries it gets if the receiving radio doesn't acknowledge it.
 struct Out {
     to: Mac,
     frame: Vec<u8>,
     conn: Option<ConnId>,
     kind: Kind,
+    tries: u8,
 }
 
 /// A frame the ether took, waiting for its verdict.
@@ -239,12 +251,14 @@ impl Engine {
         }
         let room = c.frame - DATA_HEADER;
         let n = value.len().div_ceil(room);
+        let tries = if c.acked { self.settings.tries } else { self.settings.first_tries };
         for (i, payload) in value.chunks(room).enumerate() {
             let last = i + 1 == n;
             let total = value.len() as u16;
             let f = Frame::Data { to: c.theirs, seq: c.tx_seq, first: i == 0, last, total, payload };
             c.tx_seq = c.tx_seq.wrapping_add(1);
-            self.tx.push_back(Out { to: c.mac, frame: f.encode(), conn: Some(conn), kind: Kind::Data { end: last } });
+            let (frame, kind) = (f.encode(), Kind::Data { end: last });
+            self.tx.push_back(Out { to: c.mac, frame, conn: Some(conn), kind, tries });
         }
         c.values += 1;
         c.sent = now;
@@ -374,7 +388,7 @@ impl Engine {
             // An accept for an open given up, or never sent: closed at the other end too.
             self.stats.unknown += 1;
             if self.may_refuse(now) {
-                self.queue(now, mac, Frame::Close { to: theirs }, None, Kind::Control);
+                self.queue(now, mac, Frame::Close { to: theirs }, None, Kind::Refusal);
             }
             return;
         };
@@ -495,7 +509,7 @@ impl Engine {
             c.values = c.values.saturating_sub(1);
         }
         if ok {
-            c.failures = 0;
+            (c.failures, c.acked) = (0, true);
             return;
         }
         c.failures += 1;
@@ -570,11 +584,11 @@ impl Engine {
 
     /// The next frame for the ether, if there is room for one in flight. [`commit`](Self::commit) once the ether took
     /// it; leave it if not, and it is offered again.
-    pub fn peek(&self) -> Option<(Mac, &[u8])> {
+    pub fn peek(&self) -> Option<(Mac, &[u8], u8)> {
         if self.flight.len() >= MAX_FLIGHT {
             return None;
         }
-        self.tx.front().map(|o| (o.to, &o.frame[..]))
+        self.tx.front().map(|o| (o.to, &o.frame[..], o.tries))
     }
 
     /// The ether took the frame [`peek`](Self::peek) gave.
@@ -656,6 +670,7 @@ impl Engine {
             heard: now,
             sent: now,
             failures: 0,
+            acked: false,
             closing: None,
             answered: None,
             values: 0,
@@ -674,11 +689,31 @@ impl Engine {
     }
 
     /// Queues `f` for `to`: a keepalive is due on `conn` only after [`Settings::keepalive`] with nothing queued.
+    ///
+    /// Within the caps (NB135-3): one refusal waiting at most, `MAX_LOOSE` frames of no connection, `MAX_TX` in all;
+    /// what is over goes. A broadcast and a refusal get one try, a frame of a connection that has had one acknowledged
+    /// [`Settings::tries`], and any other, to an address that may be made up, [`Settings::first_tries`].
     fn queue(&mut self, now: Instant, to: Mac, f: Frame, conn: Option<ConnId>, kind: Kind) {
+        let over = match kind {
+            Kind::Refusal => self.tx.iter().any(|o| o.kind == Kind::Refusal),
+            _ if conn.is_none() => self.tx.iter().filter(|o| o.conn.is_none()).count() >= MAX_LOOSE,
+            _ => false,
+        };
+        if over || self.tx.len() >= MAX_TX {
+            self.stats.tx_dropped += 1;
+            return;
+        }
+        let mut tries = self.settings.first_tries;
         if let Some(c) = conn.and_then(|conn| self.conns.get_mut(&conn)) {
             c.sent = now;
+            if c.acked {
+                tries = self.settings.tries;
+            }
         }
-        self.tx.push_back(Out { to, frame: f.encode(), conn, kind });
+        if matches!(kind, Kind::Refusal | Kind::Advert) {
+            tries = 1;
+        }
+        self.tx.push_back(Out { to, frame: f.encode(), conn, kind, tries });
     }
 
     /// Whether a refusal may go now ([`REFUSE_GAP`]).
@@ -754,7 +789,7 @@ mod tests {
                         true => (&mut self.a, &mut self.b, A, B),
                         false => (&mut self.b, &mut self.a, B, A),
                     };
-                    while let Some((dest, f)) = tx.peek() {
+                    while let Some((dest, f, _)) = tx.peek() {
                         let f = f.to_vec();
                         tx.commit(self.t);
                         tx.outcome(true);
@@ -1243,17 +1278,78 @@ mod tests {
     fn an_accept_for_an_open_given_up_is_closed_and_refusals_are_rate_limited() {
         let t = Instant::now();
         let mut a = engine(1, V1_FRAME, t);
+        let mut closes = 0;
         for i in 0..50u64 {
             a.handle(t + ms(i * 10), B, &Frame::Accept { to: 7 + i, from: 9, rx_max: 250 }.encode());
-        }
-        let mut closes = 0;
-        while let Some((to, f)) = a.peek() {
-            assert_eq!((to, frame::parse(f)), (B, Ok(Frame::Close { to: 9 })));
-            a.commit(t);
-            closes += 1;
+            while let Some((to, f, tries)) = a.peek() {
+                assert_eq!((to, frame::parse(f), tries), (B, Ok(Frame::Close { to: 9 }), 1), "one try");
+                a.commit(t);
+                closes += 1;
+            }
         }
         assert_eq!(closes, 5, "one per 100 ms over 500 ms");
         assert_eq!(a.stats().unknown, 50);
+    }
+
+    /// NB135-3 (the security review's repro, inverted): refusals of forged ACCEPTs no longer wait in the engine's
+    /// queue with no cap while the ether takes nothing (its one slot busy with frames no radio acknowledges): one
+    /// waits at most, and the rest go.
+    #[test]
+    fn sec_refusals_dont_pile_up_while_the_ether_is_busy() {
+        let t0 = Instant::now();
+        let mut b = engine(2, V1_FRAME, t0);
+        let mut t = t0;
+        for i in 0..600u64 {
+            t += ms(100);
+            let mac = [0x02, 0, 0, (i >> 16) as u8, (i >> 8) as u8, i as u8];
+            b.handle(t, mac, &Frame::Accept { to: 0x1000 + i, from: 0x2000 + i, rx_max: 250 }.encode());
+            b.timers(t);
+        }
+        assert_eq!(b.tx.len(), 1, "one refusal waits");
+        assert_eq!(b.stats().tx_dropped, 599);
+        // CLOSEs of connections the node closed, with the ether still busy: a few wait, the rest go.
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        p.b.advertise(p.t, Some(&ADVERT));
+        for i in 0..20u64 {
+            p.b.handle(p.t, [0x02, 0, 0, 0, 7, i as u8], &Frame::Open { from: 0x100 + i, rx_max: 250 }.encode());
+            for e in events(&mut p.b) {
+                if let RadioEvent::Connected { conn, .. } = e {
+                    p.b.disconnect(p.t, conn);
+                }
+            }
+        }
+        assert!(p.b.tx.iter().filter(|o| o.conn.is_none()).count() <= MAX_LOOSE);
+        assert!(p.b.tx.len() <= MAX_TX);
+    }
+
+    /// NB135-3: a frame to an address that has never acknowledged one gets `first_tries`, one of a connection that has
+    /// had one acknowledged `tries`, and a broadcast one.
+    #[test]
+    fn frames_to_an_address_that_never_acknowledged_get_fewer_tries() {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        let s = Settings::DEFAULT;
+        p.b.advertise(p.t, Some(&ADVERT));
+        p.later(ms(0));
+        assert_eq!(p.b.peek().map(|(to, _, tries)| (to, tries)), Some((BROADCAST, 1)), "an advert");
+        p.b.commit(p.t);
+        p.b.outcome(true);
+        // A replayed advert from an address that isn't there: OPENs with two tries each.
+        p.a.connect(p.t, device_of(X));
+        assert_eq!(p.a.peek().map(|(to, _, tries)| (to, tries)), Some((X, s.first_tries)));
+        p.a.commit(p.t);
+        p.a.outcome(false);
+        // A real connection: its frames get two tries until one is acknowledged, then four.
+        let (ca, _) = p.link();
+        assert!(p.a.send(p.t, ca, b"one"));
+        assert_eq!(p.a.peek().map(|(_, _, tries)| tries), Some(s.tries), "the ACCEPT's been acknowledged");
+        // An ACCEPT to an OPEN's address, which may be made up: two tries.
+        let mut b = engine(3, V1_FRAME, p.t);
+        b.advertise(p.t, Some(&ADVERT));
+        b.handle(p.t, X, &Frame::Open { from: 5, rx_max: 250 }.encode());
+        let accept = b
+            .peek()
+            .map(|(to, f, tries)| (to, frame::parse(f).is_ok_and(|f| matches!(f, Frame::Accept { .. })), tries));
+        assert_eq!(accept, Some((X, true, s.first_tries)));
     }
 
     #[test]
