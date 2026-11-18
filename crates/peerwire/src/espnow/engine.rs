@@ -26,6 +26,9 @@ const REFUSE_GAP: Duration = Duration::from_millis(100);
 /// A CLOSE is taken only if nothing comes on the connection for this long after the PROBE it sends: a peer that still
 /// has the connection answers at once. So a forged CLOSE, which anyone in range can send, closes nothing.
 pub const CLOSE_CHECK: Duration = Duration::from_millis(500);
+/// A second ACCEPT with another id this soon after the first closes the connection (NB135-4): one of the two was
+/// forged, and which can't be told. The node's own time for a connection to prove the room.
+pub const ACCEPT_RACE: Duration = Duration::from_secs(3);
 /// A connection answers PROBEs at most this often.
 const PROBE_GAP: Duration = Duration::from_millis(100);
 /// Frames handed to the ether whose verdict hasn't come, at most; one whose verdict hasn't come in this long is taken
@@ -78,8 +81,8 @@ struct Conn {
     /// Data frames in a row further than [`WINDOW`] ahead, and behind.
     ahead: u32,
     behind: u32,
-    /// Whether a data frame came on it: before one, a second ACCEPT with another id closes it.
-    took_data: bool,
+    /// When the connection opener took the other end's ACCEPT: for [`ACCEPT_RACE`].
+    accepted: Option<Instant>,
     /// A value whose first frame came and whose last hasn't, and how long its frames say it is.
     partial: Vec<u8>,
     assembling: bool,
@@ -378,12 +381,13 @@ impl Engine {
         let (mtu, max_frame) = (self.settings.mtu, self.max_frame);
         let Some(c) = self.conns.get_mut(&conn) else { return };
         if c.open() {
-            // The same accept again is the other end alive. Another, before any data came, means one of the two was
-            // forged (it won the race, and this end sends to its id), and which can't be told: the connection closes
-            // at once, before the room's challenge comes, and the node connects again. After data came, it is ignored.
+            // The same accept again is the other end alive. Another, within `ACCEPT_RACE` of the first, means one of
+            // the two was forged (it won the race, and this end sends to its id), and which can't be told, whatever
+            // came on the connection meanwhile, as that can be forged too (NB135-4): the connection closes, and the
+            // node connects again. Later, it is ignored.
             if c.theirs == theirs {
                 self.live(now, mac, to);
-            } else if !c.took_data {
+            } else if c.accepted.is_some_and(|t| now.saturating_duration_since(t) < ACCEPT_RACE) {
                 self.stats.accept_conflicts += 1;
                 self.close(conn);
             } else {
@@ -392,6 +396,7 @@ impl Engine {
             return;
         }
         (c.theirs, c.state, c.frame) = (theirs, State::Open, usize::from(rx_max).min(max_frame));
+        c.accepted = Some(now);
         (c.heard, c.sent) = (now, now);
         self.tx.retain(|o| !(o.conn == Some(conn) && o.kind == Kind::Open));
         self.events.push_back(RadioEvent::Connected { conn, device: c.device, mtu });
@@ -409,7 +414,6 @@ impl Engine {
             return;
         }
         let Some(c) = self.conns.get_mut(&conn) else { return };
-        c.took_data = true;
         // Where it falls: the last one again, or behind it within the window (a copy, or a straggler); in the window
         // ahead; or further off, either way, where `RESYNC_AFTER` in a row move this end there. Either way, so frames
         // forged far ahead or far behind lose a connection `RESYNC_AFTER` of its real frames, not all (NB135-1).
@@ -645,7 +649,7 @@ impl Engine {
             rx_last: u32::MAX,
             ahead: 0,
             behind: 0,
-            took_data: false,
+            accepted: None,
             partial: Vec::new(),
             assembling: false,
             total: 0,
@@ -1035,11 +1039,13 @@ mod tests {
             }
         }
         assert_eq!((b_gone, a_gone), (Some(5), Some(9)));
-        // A second accept with another id after data came is ignored: forged, as the data shows the first was real.
+        // A second accept with another id later than `ACCEPT_RACE` after the first is ignored.
         let mut p = Pair::new(V1_FRAME, V1_FRAME);
         let (ca, cb) = p.link();
         let (a_id, _) = ids(&p);
         assert!(p.b.send(p.t, cb, b"data"));
+        p.shuttle();
+        p.later(ACCEPT_RACE);
         p.shuttle();
         p.a.handle(p.t, B, &Frame::Accept { to: a_id, from: 0x1234, rx_max: 250 }.encode());
         assert!(gone(&mut p.a).is_empty());
@@ -1051,6 +1057,35 @@ mod tests {
     /// NB135-1 (the security review's repro, inverted): four forged data frames far ahead move the receiver's place
     /// 2^30 frames on, and the real frames, far behind it now, move it back after four: four values lost, not all.
     /// The same the other way.
+    /// NB135-4 (the security review's repro, inverted): a forged ACCEPT and then a forged DATA frame, both before the
+    /// real ACCEPT, no longer make the real one look like the forgery: a second ACCEPT with another id within
+    /// `ACCEPT_RACE` of the first closes the connection, whatever came on it, and the node connects again.
+    #[test]
+    fn sec_a_forged_accept_and_data_lose_the_race_to_the_real_accept() {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        p.b.advertise(p.t, Some(&ADVERT));
+        p.a.connect(p.t, device_of(B));
+        p.shuttle_with(|from, _, _| from == A);
+        let Some(RadioEvent::Connected { .. }) = p.b.poll_event() else { panic!("b accepted") };
+        let Ok(Frame::Open { from: a_id, .. }) = frame::parse(&p.wire[0].2) else { panic!() };
+        p.a.handle(p.t, B, &Frame::Accept { to: a_id, from: 0x1234, rx_max: 250 }.encode());
+        p.a.handle(
+            p.t,
+            B,
+            &Frame::Data { to: a_id, seq: 0, first: true, last: true, total: 1, payload: &[0] }.encode(),
+        );
+        let Some(RadioEvent::Connected { conn: ca, .. }) = p.a.poll_event() else { panic!("a took the forged one") };
+        let real = p.wire.iter().find(|(from, _, _)| *from == B).map(|w| w.2.clone()).unwrap();
+        p.later(ACCEPT_RACE - ms(1));
+        p.a.handle(p.t, B, &real);
+        assert_eq!(gone(&mut p.a), [RadioEvent::Disconnected { conn: ca }], "the real accept closes it");
+        assert_eq!(p.a.stats().accept_conflicts, 1);
+        let (ca, _) = p.link();
+        assert!(p.a.send(p.t, ca, b"on the next connection"));
+        p.shuttle();
+        assert_eq!(values(&mut p.b), [b"on the next connection".to_vec()]);
+    }
+
     #[test]
     fn sec_four_forged_frames_far_ahead_or_behind_lose_four_real_frames_at_most() {
         for far in [1u32 << 30, (1u32 << 30).wrapping_neg()] {

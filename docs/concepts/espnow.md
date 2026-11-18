@@ -87,9 +87,10 @@ end's MAC address, this end's id), and every frame on it carries the receiver's 
 - **Closing:** the node closes a connection with a CLOSE, and hears nothing more of it. A CLOSE received isn't taken at
   its word: the receiver sends a PROBE and closes only if nothing comes on the connection within 500 ms. The other end
   answers a PROBE with a KEEPALIVE at once, if it still has the connection.
-- **A second ACCEPT:** the opener takes the first ACCEPT. A second one with another id, before any data came on the
-  connection, means one of the two was forged, and which can't be told: the connection closes at once, before the
-  room's challenge, and the node connects again. After data came, one is ignored.
+- **A second ACCEPT:** the opener takes the first ACCEPT. A second one with another id within 3 s of the first (the
+  time a connection has to prove the room) means one of the two was forged, and which can't be told, whatever came on
+  the connection meanwhile, as that may be forged too: the connection closes, and the node connects again (NB135-4).
+  Later, one is ignored.
 
 `espnow::Settings` holds the numbers above (`Settings::DEFAULT`); a board run may change them.
 
@@ -146,8 +147,8 @@ which could jam the channel anyway. What such an attacker can do, frame by frame
 |---|---|
 | ADVERT | a `Seen` for the node, which checks the room's tag (HMAC), 50 at once and then one per 20 ms; 16 wait for it at most |
 | OPEN, from made-up addresses | fills the 4 connections, and the radio stays silent to the rest; the node closes one that hasn't proven the room within 3 s, and a central's makes way for a new one after 1 s |
-| ACCEPT, before the real one | the opener takes the forged id; when the real ACCEPT comes, with another id and before any data, the connection closes at once and the node connects again after its hold for a connection that never carried the room's challenge (1 to 4 s). If the attacker also keeps the real one from arriving (jamming), the opener sends to the forged id, the room proof stalls, and the node closes the connection after 3 s and holds the advert for 60 s |
-| ACCEPT, after data came | ignored |
+| ACCEPT, before the real one | the opener takes the forged id; when the real ACCEPT comes, with another id and within 3 s, the connection closes, even if forged data came meanwhile (NB135-4), and the node connects again. If the attacker also keeps the real one from arriving (jamming), the opener sends to the forged id, the room proof stalls, and the node closes the connection after 3 s and holds the advert for 60 s |
+| ACCEPT, more than 3 s after the first | ignored |
 | CLOSE | nothing, unless the attacker also keeps the other end's answer to the PROBE from arriving (jamming): then a close and a reconnect |
 | PROBE | a KEEPALIVE in answer, one per 100 ms per connection |
 | KEEPALIVE | keeps a connection whose peer left open for as long as it keeps sending: the node closes it once its link times out and no proof of a room member has come over it for 60 s, as over Bluetooth |
@@ -162,9 +163,8 @@ up. So the node has its own check too: when a link times out, the radio connecti
 hold on the advert, and the next link comes over a new connection with new ids (NB135-1). Connections, queues and
 buffers are capped above, and the parser is fuzzed. These are the points for security review:
 
-- the ACCEPT race: a second ACCEPT with another id closes a connection that has carried no data yet, so one forged
-  frame early in a connection costs a reconnect, and one that wins the race with the real one jammed costs the
-  node's 60 s hold;
+- the ACCEPT race: a second ACCEPT with another id within 3 s of the first closes the connection, so one forged
+  early costs a reconnect, and one that wins the race with the real one jammed costs the node's 60 s hold;
 - a CLOSE checked by a PROBE, and the 500 ms;
 - the window of 64 and the resync after 4: one forged frame can lose up to 64 of a connection's frames;
 - forged KEEPALIVEs holding a dead connection open until the node's own standby rule closes it;
