@@ -39,7 +39,7 @@
 
 use super::{
     hs1_id, value_len, Chunker, Reassembler, KIND_ANSWER, KIND_CHALLENGE, KIND_DATAGRAM, KIND_PROOF, KIND_SIGNAL,
-    MAX_MESSAGE,
+    MAX_SEALED_MESSAGE,
 };
 use crate::{Identity, Instant, PeerId};
 use aes_gcm::aead::{Aead, KeyInit};
@@ -54,6 +54,9 @@ pub const CHALLENGE_LEN: usize = 16;
 const MAC_LEN: usize = 32;
 /// An identity proof: the sender's `PeerId` and its Ed25519 signature over the connection's challenges.
 pub const ID_LEN: usize = 32 + 64;
+/// What sealing adds to a signal's or a sealed datagram's contents ([`Link::seal_datagrams`]): its `seq` before them
+/// (8 bytes), and GCM's tag after (16).
+pub const SEAL_LEN: usize = 8 + 16;
 /// An advert's service data: flags, `n`, tag.
 pub const ADVERT_LEN: usize = 9;
 /// The advert's flag for a peer that takes no central now.
@@ -110,7 +113,8 @@ fn id_message(transcript: &[u8; 2 * CHALLENGE_LEN]) -> Vec<u8> {
 }
 
 /// The GCM nonce of signal `seq` sealed by the central (`central`) or the peripheral: 4 bytes of direction (0 from the
-/// central, 1 from the peripheral) and the 8 of `seq`.
+/// central, 1 from the peripheral) and the 8 of `seq`. A sealed datagram ([`Link::seal_datagrams`]) takes its `seq`
+/// from the same count as the signals, so no nonce repeats.
 fn nonce(central: bool, seq: u64) -> [u8; 12] {
     let mut n = [0u8; 12];
     n[..4].copy_from_slice(&u32::from(!central).to_le_bytes());
@@ -241,6 +245,10 @@ pub struct Link {
     drops: u64,
     /// The reassembler's drops already counted in `drops`.
     counted: u64,
+    /// Datagrams go sealed under the link key, as signals do ([`Link::seal_datagrams`]).
+    sealed: bool,
+    /// Sealed datagrams that came and didn't open, or weren't above the last `seq` taken: dropped, not counted.
+    forged: u64,
 }
 
 impl Link {
@@ -274,7 +282,35 @@ impl Link {
             hs1s: Bucket::default(),
             drops: 0,
             counted: 0,
+            sealed: false,
+            forged: 0,
         }
+    }
+
+    /// Seals this end's datagrams under the link key, as its signals are, and takes only sealed ones: for a radio whose
+    /// values anyone in range can forge, such as ESP-NOW's, where a forged datagram on a connection no peer is bound to
+    /// yet took its one HS1 slot and the radio's budget for handshakes, and so kept the real handshake out (NB135-9).
+    /// Both ends must set it as the connection opens; Bluetooth's links don't, and their datagrams go as they are.
+    ///
+    /// A sealed datagram is [`KIND_DATAGRAM`], `seq` (8 bytes, little-endian) and the datagram sealed as signal `seq`
+    /// is ([`seal`]), [`SEAL_LEN`] bytes more than the datagram, with `seq` from the same count as the signals'. One
+    /// that doesn't open, or whose `seq` isn't above the last taken (a forgery, or a copy), is dropped before the host
+    /// sees it, and isn't counted towards [`MAX_DROPS`], so forged ones can't close the connection either:
+    /// [`Link::forged`] counts them.
+    pub fn seal_datagrams(&mut self) {
+        self.sealed = true;
+        self.chunker.max = MAX_SEALED_MESSAGE;
+        self.reassembler.max = MAX_SEALED_MESSAGE;
+    }
+
+    /// Whether this end seals its datagrams ([`Link::seal_datagrams`]).
+    pub fn seals_datagrams(&self) -> bool {
+        self.sealed
+    }
+
+    /// Sealed datagrams dropped as forged or copies ([`Link::seal_datagrams`]), which [`MAX_DROPS`] doesn't count.
+    pub fn forged(&self) -> u64 {
+        self.forged
     }
 
     /// Whether this end is the central.
@@ -309,7 +345,8 @@ impl Link {
 
     /// Takes one GATT value that came at `now`, and runs the room proof as its messages come: an answer or a proof to
     /// send queues. A message that is no use once the room is proven (another kind, an empty datagram, a signal over
-    /// the budget, out of sequence or that doesn't open) is dropped and counted, as are the codec's drops.
+    /// the budget, out of sequence or that doesn't open) is dropped and counted, as are the codec's drops; but a
+    /// sealed datagram that doesn't open, or is out of sequence, is dropped uncounted ([`Link::seal_datagrams`]).
     pub fn push(&mut self, now: Instant, value: &[u8]) -> Input {
         let message = self.reassembler.push(now, value).map(<[u8]>::to_vec);
         let fresh = self.reassembler.dropped() - self.counted;
@@ -350,6 +387,7 @@ impl Link {
                 self.prove(c_p, c_c)
             }
             (State::Proven { .. }, KIND_SIGNAL) => self.on_signal(now, body),
+            (State::Proven { .. }, KIND_DATAGRAM) if self.sealed => self.on_sealed_datagram(body),
             (State::Proven { .. }, KIND_DATAGRAM) if !body.is_empty() => Input::Datagram(body.to_vec()),
             (State::Proven { .. }, _) => self.dropped(),
             // Before the proof, nothing else: a connection that tries closes.
@@ -384,6 +422,24 @@ impl Link {
         Input::Signal(inner, plain)
     }
 
+    /// A sealed datagram from the other end ([`Link::seal_datagrams`]): `seq`, then the datagram sealed as signal
+    /// `seq`. Taken only with a `seq` above the last taken (signals' and datagrams'); one that doesn't open, or a copy,
+    /// is dropped and not counted, as anyone in range may have sent it (NB135-9).
+    fn on_sealed_datagram(&mut self, body: &[u8]) -> Input {
+        let from_central = !self.central;
+        let State::Proven { key, rx, .. } = &mut self.state else { return Input::Nothing };
+        let seq = body.get(..8).map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes"))).filter(|s| *s > *rx);
+        let Some((seq, d)) = seq.and_then(|s| Some((s, open(key, from_central, s, &body[8..])?))) else {
+            self.forged += 1;
+            return Input::Nothing;
+        };
+        if d.is_empty() {
+            return self.dropped();
+        }
+        *rx = seq;
+        Input::Datagram(d)
+    }
+
     fn dropped(&mut self) -> Input {
         match self.count(1) {
             true => Input::Close(Fault::Drops),
@@ -416,18 +472,29 @@ impl Link {
     /// Seals `inner ‖ payload` under the link key, as this end's next signal, and queues it. False before the room is
     /// proven, or with no room in the queue.
     pub fn signal(&mut self, inner: u8, payload: &[u8]) -> bool {
+        self.seal_next(KIND_SIGNAL, &[&[inner][..], payload].concat())
+    }
+
+    /// Seals `plain` under the link key as this end's next `seq`, and queues it as a message of `kind`: `seq`, then
+    /// the sealed bytes. False before the room is proven, or with no room in the queue.
+    fn seal_next(&mut self, kind: u8, plain: &[u8]) -> bool {
         let central = self.central;
         let State::Proven { key, tx, .. } = &mut self.state else { return false };
         *tx += 1;
-        let Some(sealed) = seal(key, central, *tx, &[&[inner][..], payload].concat()) else { return false };
+        let Some(sealed) = seal(key, central, *tx, plain) else { return false };
         let seq = tx.to_le_bytes();
-        self.send(&[&[KIND_SIGNAL], &seq, &sealed])
+        self.send(&[&[kind], &seq, &sealed])
     }
 
-    /// Queues a datagram (one Peerwire packet). False before the room is proven, for an empty one or one over
-    /// [`MAX_MESSAGE`], or with no room in the queue.
+    /// Queues a datagram (one Peerwire packet), sealed if this link seals them ([`Link::seal_datagrams`]). False
+    /// before the room is proven, for an empty one or one over [`MAX_DATAGRAM`](crate::MAX_DATAGRAM), or with no room
+    /// in the queue.
     pub fn datagram(&mut self, d: &[u8]) -> bool {
-        self.proven() && !d.is_empty() && self.send(&[&[KIND_DATAGRAM], d])
+        match self.sealed {
+            _ if !self.proven() || d.is_empty() => false,
+            true => self.seal_next(KIND_DATAGRAM, d),
+            false => self.send(&[&[KIND_DATAGRAM], d]),
+        }
     }
 
     /// Whether to take `datagram` on a connection bound to a peer: an HS1 other than a resend of the last one draws on
@@ -445,7 +512,7 @@ impl Link {
     fn send(&mut self, parts: &[&[u8]]) -> bool {
         let m = parts.concat();
         let room = value_len(self.mtu) - 1;
-        if m.len() > MAX_MESSAGE || self.queue.len() + m.len().div_ceil(room) > self.max_queue {
+        if m.len() > self.chunker.max || self.queue.len() + m.len().div_ceil(room) > self.max_queue {
             return false;
         }
         let queue = &mut self.queue;
@@ -474,7 +541,8 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, Endpoint, Lane};
+    use crate::ble::MAX_MESSAGE;
+    use crate::{Config, Endpoint, Lane, MAX_DATAGRAM};
 
     const T0: Instant = Instant::ZERO;
 
@@ -544,6 +612,68 @@ mod tests {
             "67d134e467abc677c6437b3ead796971b3e61df9e46ef1720ad8ecb8704c1e0a"
         ));
         assert!(p.verifies(&me.peer_id(), &sig.try_into().unwrap()), "an identity proof made before the move");
+        // A datagram goes as it is, with no seq and no tag: only a link that seals its datagrams (ESP-NOW's) adds them.
+        c.sent();
+        assert!(c.datagram(&[0x10, 7, 7]));
+        assert_eq!(c.value().unwrap(), [0xc2, KIND_DATAGRAM, 0x10, 7, 7], "kind 0 and the datagram");
+        assert!(!c.seals_datagrams() && !p.seals_datagrams());
+    }
+
+    /// NB135-9: a link that seals its datagrams (ESP-NOW's) sends each as a signal is sealed, under the link key with
+    /// the signals' count, and takes only those: a plain one, a forged one, a copy or one cut short is dropped before
+    /// the host sees it, and isn't counted towards `MAX_DROPS`, so no number of them closes the connection.
+    #[test]
+    fn sec_a_sealed_link_takes_only_sealed_datagrams_and_counts_no_forged_one() {
+        let (mut c, mut p) = pair(517);
+        c.seal_datagrams();
+        p.seal_datagrams();
+        prove(&mut c, &mut p);
+        let State::Proven { key: link, .. } = p.state else { panic!() };
+        assert_eq!(link[..], hex("2908364657d82870cd5a6096f19fbdab9e15eb7736e94667e2e43376b6134f32"), "the link key");
+        assert!(c.signal(INNER_ROOM, b"hi") && c.datagram(&[0x10, 7, 7]));
+        let sent: Vec<Vec<u8>> = std::iter::from_fn(|| c.value().map(<[u8]>::to_vec).inspect(|_| c.sent())).collect();
+        let sealed = hex("7c03e0eb5b4f2da673aada73525317a99a0c53");
+        assert_eq!(sent[1], [&[0xc2, KIND_DATAGRAM][..], &2u64.to_le_bytes(), &sealed].concat(), "seq 2, next");
+        assert_eq!(sealed.len(), 3 + SEAL_LEN - 8);
+        assert_eq!(open(&link, true, 2, &sealed).as_deref(), Some(&[0x10u8, 7, 7][..]), "sealed as signal 2 is");
+        assert_eq!(p.push(T0, &sent[0]), Input::Signal(INNER_ROOM, b"hi".to_vec()));
+        assert_eq!(p.push(T0, &sent[1]), Input::Datagram(vec![0x10, 7, 7]));
+        let forged = [
+            sent[1][1..].to_vec(),
+            vec![KIND_DATAGRAM, 0x10, 7, 7],
+            [&[KIND_DATAGRAM][..], &9u64.to_le_bytes(), &[0; 19]].concat(),
+            vec![KIND_DATAGRAM, 1, 2, 3],
+            [&[KIND_DATAGRAM][..], &3u64.to_le_bytes(), &seal(&link, false, 3, &[1]).unwrap()].concat(),
+        ];
+        let why = ["a copy", "a plain one", "a wrong tag", "shorter than a seq", "sealed the other way"];
+        for (f, why) in forged.iter().zip(why) {
+            assert_eq!(p.push(T0, &whole(&p, f)), Input::Nothing, "{why}");
+        }
+        assert_eq!((p.forged(), p.drops), (5, 0), "dropped, not counted");
+        for i in 0..2 * MAX_DROPS {
+            let f = [&[KIND_DATAGRAM][..], &(10 + i).to_le_bytes(), &[i as u8; 40]].concat();
+            assert_eq!(p.push(T0, &whole(&p, &f)), Input::Nothing, "no close");
+        }
+        assert_eq!((p.forged(), p.drops), (5 + 2 * MAX_DROPS, 0));
+        // The real ones go on: the next signal and datagram, and the largest datagram, at the smallest MTU too.
+        assert!(c.datagram(&[1; MAX_DATAGRAM]) && !c.datagram(&[1; MAX_DATAGRAM + 1]));
+        c.signal(INNER_ROOM, b"on");
+        let got = carry(&mut c, &mut p, T0);
+        assert_eq!(got, vec![Input::Datagram(vec![1; MAX_DATAGRAM]), Input::Signal(INNER_ROOM, b"on".to_vec())]);
+        let mut c = Link::central(key(), [9; 16], 23, 128, T0);
+        let mut p = Link::peripheral(key(), [3; 16], 23, 128, T0);
+        c.seal_datagrams();
+        p.seal_datagrams();
+        prove(&mut c, &mut p);
+        assert!(c.datagram(&[2; MAX_DATAGRAM]));
+        assert_eq!(c.queued(), (1 + SEAL_LEN + MAX_DATAGRAM).div_ceil(19));
+        assert_eq!(carry(&mut c, &mut p, T0), vec![Input::Datagram(vec![2; MAX_DATAGRAM])]);
+        // Over Bluetooth the largest datagram is the largest message, and a sealed one wouldn't fit.
+        let (mut c, mut p) = pair(517);
+        prove(&mut c, &mut p);
+        assert!(c.datagram(&[3; MAX_DATAGRAM]));
+        assert_eq!(carry(&mut c, &mut p, T0), vec![Input::Datagram(vec![3; MAX_DATAGRAM])]);
+        assert!(!c.send(&[&[KIND_DATAGRAM][..], &[0; MAX_DATAGRAM + SEAL_LEN]]), "over the largest message");
     }
 
     #[test]
@@ -748,6 +878,10 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(1100);
         for round in 0..400 {
             let (mut c, mut p) = pair(23 + (round % 50) as u16);
+            if round % 4 >= 2 {
+                c.seal_datagrams();
+                p.seal_datagrams();
+            }
             if round % 2 == 0 {
                 prove(&mut c, &mut p);
             }

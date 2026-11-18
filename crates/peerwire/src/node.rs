@@ -1151,6 +1151,14 @@ impl Node {
         self.ble.as_ref().map_or((0, 0, 0), Ble::counts)
     }
 
+    /// Sealed datagrams the radio's connections dropped as forged or copies, which close nothing (features `ble` and
+    /// `testing`; NB135-9). Not for apps.
+    #[cfg(all(feature = "ble", any(test, feature = "testing")))]
+    #[doc(hidden)]
+    pub fn ble_forged(&self) -> u64 {
+        self.ble.as_ref().map_or(0, Ble::forged)
+    }
+
     /// Starts noting where the datagrams this node's socket reads come from, forgetting those noted so far: a test's
     /// view of the socket (feature `testing`). Not for apps.
     #[cfg(any(test, feature = "testing"))]

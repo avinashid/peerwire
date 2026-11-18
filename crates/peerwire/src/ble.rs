@@ -16,7 +16,7 @@ use peerwire_core::ble::{
     hs1_id, identity, Bucket, Fault, Input, Link, ADVERT_FULL as FULL, ADVERT_LEN, CHALLENGE_LEN as CHALLENGE,
     INNER_ID, INNER_PEER, INNER_ROOM, PROVE_WITHIN,
 };
-use peerwire_core::{Endpoint, Identity, Instant, PeerId};
+use peerwire_core::{Endpoint, Identity, Instant, Path, PeerId};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use std::collections::{HashMap, VecDeque};
@@ -55,10 +55,14 @@ pub struct Limits {
     /// at four times that rate, as a check costs about a quarter of what answering a handshake does.
     pub hs1_gap: Duration,
     /// Anyone in range can forge a value on a connection, with what it overheard: ESP-NOW's frames aren't
-    /// authenticated (`espnow::EspNow` sets it, whatever its settings say). A connection that closes for a fault of its
-    /// link then holds the advert only 1 to 4 s, not a minute, as one forged value can cause it: a message the room
-    /// proof doesn't expect, a wrong answer or proof, 32 messages dropped once proven; and so does one the other end
-    /// closes before the room is proven (NB135-8). Off for Bluetooth, where no third party writes into a connection.
+    /// authenticated (`espnow::EspNow` sets it, whatever its settings say). Datagrams then go sealed under the link
+    /// key, as signals do, and one that doesn't open is dropped before it takes anything, uncounted (NB135-9). A
+    /// connection that closes for a fault of its link holds the advert only 1 to 4 s, not a minute, as one forged
+    /// value can cause it: a message the room proof doesn't expect, a wrong answer or proof, 32 messages dropped once
+    /// proven; and so does one the other end closes before the room is proven (NB135-8), one that missed the room
+    /// proof's deadline, as frames forged with the numbers of the other end's proof can make it, and a proven one bound
+    /// to no peer that the other end closes while this node has no link to its peer elsewhere (NB135-10). Off for
+    /// Bluetooth, where no third party writes into a connection.
     pub forgeable: bool,
 }
 
@@ -114,7 +118,10 @@ pub trait Radio: Send {
     fn disconnect(&mut self, conn: ConnId);
     /// The next event, without blocking.
     fn poll(&mut self) -> Option<RadioEvent>;
-    /// What it holds at once. [`Limits::DESKTOP`] unless the driver says otherwise.
+    /// What it holds at once. [`Limits::DESKTOP`] unless the driver says otherwise. A radio over a medium anyone in
+    /// range can write into, whose values a third party can forge on a connection (as ESP-NOW's frames), must set
+    /// [`Limits::forgeable`]: the node then seals datagrams too, and holds adverts seconds, not a minute, after the
+    /// closes a forged value can cause.
     fn limits(&self) -> Limits {
         Limits::DESKTOP
     }
@@ -164,7 +171,8 @@ const GRACE: Duration = Duration::from_secs(1);
 const UNBOUND_FOR: Duration = Duration::from_secs(60);
 /// No connect again to an advert whose last connection closed or failed for this long, unless it was bound to a peer
 /// (`REFUSED_HOLD`, NB135-I6), or the radio's values can be forged and it closed for a fault of its link or before the
-/// room was proven (NB135-8).
+/// room was proven (NB135-8), missed the proof's deadline, or was a proven one bound to no peer, closed by the other
+/// end while its peer has no link elsewhere (NB135-10).
 const RECONNECT_HOLD: Duration = Duration::from_secs(60);
 /// No connect again to an advert whose connection closed before its peripheral sent a challenge (it refused this
 /// central, or never challenged) for this long, plus up to `REFUSED_JITTER_MS` at random: an honest peer refuses a
@@ -362,6 +370,8 @@ pub(crate) struct Ble {
     hs1s: Bucket,
     /// Identity proofs checked, across the radio.
     checks: Bucket,
+    /// Sealed datagrams dropped as forged or copies, across the radio ([`Link::forged`]).
+    forged: u64,
     out: VecDeque<Inbound>,
 }
 
@@ -390,6 +400,7 @@ impl Ble {
             adverts: Bucket::default(),
             hs1s: Bucket::default(),
             checks: Bucket::default(),
+            forged: 0,
             out: VecDeque::new(),
         }
     }
@@ -474,8 +485,8 @@ impl Ble {
             }
             RadioEvent::Value { conn, value } => self.on_value(now, ep, conn, &value),
             RadioEvent::Advertising(up) => self.on_air = up,
-            RadioEvent::Disconnected { conn } => self.went(now, conn, false),
-            RadioEvent::Dropped { conn } => self.went(now, conn, true),
+            RadioEvent::Disconnected { conn } => self.went(now, ep, conn, false),
+            RadioEvent::Dropped { conn } => self.went(now, ep, conn, true),
         }
     }
 
@@ -485,11 +496,14 @@ impl Ble {
     /// peer: its link was up over it, so the next one should come soon, over a new connection, whichever end's link
     /// timed out first (NB135-I6). A room member that keeps closing the bound connections this end makes to it makes
     /// this end connect again every 1 to 4 s: that is accepted, as a member can cost a link more ways than that. The
-    /// same before the room is proven on a radio whose values anyone can forge ([`Limits::forgeable`]): one forged
-    /// value makes the other end close it then (NB135-8).
-    fn went(&mut self, now: Instant, conn: ConnId, dropped: bool) {
+    /// same on a radio whose values anyone can forge ([`Limits::forgeable`]) before the room is proven, as one forged
+    /// value makes the other end close it then (NB135-8), and for a proven one bound to no peer while its peer has no
+    /// link elsewhere, as 32 forged values make the other end close it (NB135-10): it was the way to the peer. One
+    /// beside a link that goes elsewhere is a spare, and keeps `hold`, so spares don't churn.
+    fn went(&mut self, now: Instant, ep: &Endpoint<Hop<SocketAddr>>, conn: ConnId, dropped: bool) {
         let Some(c) = self.conns.get(&conn) else { return };
-        let forged = self.limits.forgeable && !c.proven();
+        let spare = c.known().is_some_and(|p| self.linked_beside(ep, conn, p));
+        let forged = self.limits.forgeable && (!c.proven() || (c.bound.is_none() && !spare));
         let hold = if dropped || c.bound.is_some() || forged { refused_hold() } else { hold(c) };
         let held = c.to.zip(c.n).map(|at| (at, hold));
         let how = if dropped { "was dropped by the radio" } else { "went" };
@@ -500,6 +514,16 @@ impl Ble {
         }
         self.forget(conn);
         self.refresh(now);
+    }
+
+    /// Whether `peer`'s link goes over something other than `conn`: the network, another peer, or another radio
+    /// connection still open.
+    fn linked_beside(&self, ep: &Endpoint<Hop<SocketAddr>>, conn: ConnId, peer: PeerId) -> bool {
+        match ep.path(&peer) {
+            None => false,
+            Some(Path::Direct(Hop::Ble(at))) => self.by_hop.get(at).is_some_and(|i| *i != conn),
+            Some(_) => true,
+        }
     }
 
     /// An advert of the service `device` sent: connected to if this node is the one to, and logged if not, once a
@@ -668,10 +692,15 @@ impl Ble {
         OsRng.fill_bytes(&mut challenge);
         let central = device.is_some();
         // The peripheral's link sends its challenge at once; the central's answers the one that comes with its own.
-        let link = match central {
+        let mut link = match central {
             true => Link::central(key, challenge, mtu, self.limits.queue, now),
             false => Link::peripheral(key, challenge, mtu, self.limits.queue, now),
         };
+        // Over a radio anyone can write into, datagrams are sealed as signals are, so a forged one takes no HS1 slot
+        // nor any budget (NB135-9).
+        if self.limits.forgeable {
+            link.seal_datagrams();
+        }
         let c = Conn {
             hop: Hop::Ble(at),
             made: self.next_hop,
@@ -700,7 +729,10 @@ impl Ble {
     /// a room (only connections bound to a peer stay open then), only its closing is acted on.
     fn on_value(&mut self, now: Instant, ep: &mut Endpoint<Hop<SocketAddr>>, conn: ConnId, value: &[u8]) {
         let Some(c) = self.conns.get_mut(&conn) else { return };
-        match (c.link.push(now, value), self.room) {
+        let forged = c.link.forged();
+        let input = c.link.push(now, value);
+        self.forged += c.link.forged() - forged;
+        match (input, self.room) {
             (Input::Close(why), _) => self.fault(conn, why),
             (_, None) | (Input::Nothing, _) => {}
             (Input::Proven, _) => self.proven(now, conn),
@@ -903,16 +935,18 @@ impl Ble {
     }
 
     fn timers(&mut self, now: Instant) {
+        // A connection that missed the proof's deadline holds the advert as `hold` says, or only 1 to 4 s on a radio
+        // whose values anyone can forge: frames forged with the numbers of the other end's proof, each dropped and
+        // counted, make the real ones copies, so the proof never comes (NB135-10).
+        let forgeable = self.limits.forgeable;
         let late: Vec<(ConnId, Duration, &str)> = self
             .conns
             .iter()
-            .filter_map(|(i, c)| {
-                match c.proven() && c.id != Id::Unknown {
-                    false => (now.saturating_duration_since(c.opened) > PROVE_WITHIN).then_some("not proven in time"),
-                    true => (c.bound.is_none() && now.saturating_duration_since(c.heard) > UNBOUND_FOR)
-                        .then_some("bound to no peer, and no member heard over it lately"),
-                }
-                .map(|why| (*i, hold(c), why))
+            .filter_map(|(i, c)| match c.proven() && c.id != Id::Unknown {
+                false => (now.saturating_duration_since(c.opened) > PROVE_WITHIN)
+                    .then(|| (*i, if forgeable { refused_hold() } else { hold(c) }, "not proven in time")),
+                true => (c.bound.is_none() && now.saturating_duration_since(c.heard) > UNBOUND_FOR)
+                    .then(|| (*i, hold(c), "bound to no peer, and no member heard over it lately")),
             })
             .collect();
         for (c, hold, why) in late {
@@ -1012,6 +1046,12 @@ impl Ble {
     pub(crate) fn counts(&self) -> (usize, usize, usize) {
         let proven = self.conns.values().filter(|c| c.proven()).count();
         (self.conns.len(), proven, self.conns.values().filter(|c| c.bound.is_some()).count())
+    }
+
+    /// Sealed datagrams dropped as forged or copies, across the radio (for tests).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn forged(&self) -> u64 {
+        self.forged
     }
 }
 
@@ -2482,33 +2522,50 @@ mod tests {
         assert_eq!(w.air.connects(), made + 1, "with one connect");
     }
 
-    /// How long a node with `limits`, as the central, holds the advert of a connection that closes for a fault of its
-    /// link, or that the peripheral closes before the room is proven, in each way one forged value can cause that
-    /// (NB135-8): a datagram before the room's proof (`Fault::Early`), the peripheral closing it after its challenge,
-    /// and `MAX_DROPS` messages of a kind dropped once proven (`Fault::Drops`), counted by the link and by the node.
-    fn fault_holds(limits: Limits) -> Vec<(&'static str, Duration)> {
+    /// The cases of [`fault_holds`] for NB135-8: one forged value makes the connection close for a fault of its link,
+    /// or the peripheral close it before the room is proven.
+    const FAULTS: [&str; 4] = ["early", "closed after the challenge", "drops", "drops the node counts"];
+    /// And for NB135-10: forged frames make the central miss the proof's deadline, or the peripheral close a proven
+    /// connection bound to no peer (a standby); and that standby again, but with a link to its peer over the network
+    /// beside it (a spare), which keeps the minute.
+    const STANDBYS: [&str; 3] = ["missed the deadline", "a standby closed", "a spare closed"];
+
+    /// How long a node with `limits`, as the central, holds the advert of a connection that closes in each of `cases`:
+    /// a datagram before the room's proof (`Fault::Early`), the peripheral closing it after its challenge, `MAX_DROPS`
+    /// messages of a kind dropped once proven (`Fault::Drops`), counted by the link and by the node; no proof by the
+    /// deadline (`PROVE_WITHIN`), and the peripheral closing a proven connection whose peer proved who it is, with no
+    /// link to that peer, or with one over the network.
+    fn fault_holds(limits: Limits, cases: &[&'static str]) -> Vec<(&'static str, Duration)> {
         use peerwire_core::ble::MAX_DROPS;
         let key = ble_key("app", "room");
-        let cases = ["early", "closed after the challenge", "drops", "drops the node counts"];
         cases
-            .into_iter()
-            .map(|case| {
+            .iter()
+            .map(|&case| {
                 let air = FakeAir::new(23);
                 let t = Instant::from_millis(1);
                 let (mut node, mut ep) = lone(&air, limits, 1, t);
                 let mut yp = air.radio(Limits::DESKTOP);
                 yp.advertise(Some(&advert(&key, u32::MAX, false)));
                 let device = (DeviceId(yp.index() as u64), u32::MAX);
-                if case.starts_with("drops") {
+                let mut at = t;
+                let mut udp = None;
+                if case.starts_with("drops") || case.ends_with("closed") && case != "closed after the challenge" {
                     let (conn, mut tx) = serve(&mut yp, &mut node, &mut ep, t, &id(2));
                     assert_eq!(node.counts(), (1, 1, 0), "{case}: proven");
+                    let known = node.conns.values().next().and_then(Conn::known);
+                    assert_eq!(known, Some(id(2).peer_id()), "{case}: its peer proved who it is");
                     match case {
                         "drops" => {
                             for _ in 0..MAX_DROPS {
                                 tx.split(&[KIND_CHALLENGE; 1 + CHALLENGE], 23, |v| yp.send(conn, v));
                             }
                         }
-                        _ => node.dropped(*node.conns.keys().next().unwrap(), MAX_DROPS),
+                        "drops the node counts" => node.dropped(*node.conns.keys().next().unwrap(), MAX_DROPS),
+                        "a standby closed" => yp.disconnect(conn),
+                        _ => {
+                            udp = Some(linked_over_udp(&mut ep, t));
+                            yp.disconnect(conn);
+                        }
                     }
                 } else {
                     let conn = (0..64)
@@ -2527,21 +2584,47 @@ mod tests {
                         "early" => {
                             tx.split(&[KIND_DATAGRAM, 0], 23, |v| yp.send(conn, v));
                         }
+                        "missed the deadline" => {
+                            at = t + PROVE_WITHIN;
+                            node.poll(at, &mut ep);
+                            assert_eq!(node.counts().0, 1, "{case}: open until the deadline");
+                            at = at + Duration::from_millis(1);
+                        }
                         _ => yp.disconnect(conn),
                     }
                 }
-                node.poll(t, &mut ep);
+                node.poll(at, &mut ep);
                 assert_eq!(node.counts().0, 0, "{case}: closed");
-                (case, node.held[&device] - t)
+                drop(udp);
+                (case, node.held[&device] - at)
             })
             .collect()
     }
 
-    /// NB135-8: over Bluetooth, where no third party writes into a connection, a connection that closes for a fault of
-    /// its link, or that the peripheral closes after its challenge, still holds the advert a minute.
+    /// A link from `ep` (node 1's) to node 2 over the network, as a radio connection's peer may have beside it; node
+    /// 2's endpoint.
+    fn linked_over_udp(ep: &mut Endpoint<Hop<SocketAddr>>, t: Instant) -> Endpoint<Hop<SocketAddr>> {
+        let mut other = Endpoint::new(&id(2), Config::default(), [2; 32]);
+        let (a, b) = (Hop::Net("10.0.0.1:1000".parse().unwrap()), Hop::Net("10.0.0.2:2000".parse().unwrap()));
+        ep.connect(t, b, id(2).peer_id()).unwrap();
+        for _ in 0..8 {
+            while let Some(x) = ep.poll_transmit(t) {
+                other.handle_datagram(t, a, &x.payload);
+            }
+            while let Some(x) = other.poll_transmit(t) {
+                ep.handle_datagram(t, b, &x.payload);
+            }
+        }
+        assert_eq!(ep.path(&id(2).peer_id()), Some(&Path::Direct(b)), "linked over the network");
+        other
+    }
+
+    /// NB135-8, NB135-10: over Bluetooth, where no third party writes into a connection, a connection that closes for
+    /// a fault of its link, that the peripheral closes after its challenge, that misses the proof's deadline, or a
+    /// proven one bound to no peer that the peripheral closes, still holds the advert a minute.
     #[test]
     fn a_link_fault_over_bluetooth_holds_the_advert_a_minute() {
-        let holds = fault_holds(Limits::DESKTOP);
+        let holds = fault_holds(Limits::DESKTOP, &[&FAULTS[..], &STANDBYS[..]].concat());
         assert!(holds.iter().all(|(_, h)| *h == RECONNECT_HOLD), "{holds:?}");
     }
 
@@ -2551,10 +2634,61 @@ mod tests {
     /// 4 s, as after a refusal.
     #[test]
     fn sec_a_link_fault_over_a_forgeable_radio_holds_the_advert_seconds() {
-        let holds = fault_holds(Limits { forgeable: true, ..Limits::DESKTOP });
+        let holds = fault_holds(Limits { forgeable: true, ..Limits::DESKTOP }, &FAULTS);
         let jitter = Duration::from_millis(u64::from(REFUSED_JITTER_MS));
         let seconds = REFUSED_HOLD..REFUSED_HOLD + jitter;
         assert!(holds.iter().all(|(_, h)| seconds.contains(h)), "1 to 4 s: {holds:?}");
+    }
+
+    /// NB135-10 (the security review's finding): over a radio whose values anyone can forge, frames forged with the
+    /// numbers of the peripheral's proof make the central miss the deadline, and 32 forged messages make the
+    /// peripheral close a proven connection that no handshake has bound yet; either way the central held the advert a
+    /// minute. It now holds it 1 to 4 s, unless the connection was a spare beside a link to its peer elsewhere, which
+    /// keeps the minute so that spares don't churn.
+    #[test]
+    fn sec_a_missed_deadline_or_a_closed_standby_over_a_forgeable_radio_holds_the_advert_seconds() {
+        let holds = fault_holds(Limits { forgeable: true, ..Limits::DESKTOP }, &STANDBYS);
+        let jitter = Duration::from_millis(u64::from(REFUSED_JITTER_MS));
+        let seconds = REFUSED_HOLD..REFUSED_HOLD + jitter;
+        let held = |case: &str| holds.iter().find(|(c, _)| *c == case).map(|(_, h)| *h).unwrap();
+        assert!(seconds.contains(&held("missed the deadline")), "1 to 4 s: {holds:?}");
+        assert!(seconds.contains(&held("a standby closed")), "1 to 4 s: {holds:?}");
+        assert_eq!(held("a spare closed"), RECONNECT_HOLD, "a minute beside a link: {holds:?}");
+    }
+
+    /// NB135-9: an HS1 on a proven connection no peer is bound to yet, as a datagram as it is. Whether it took the
+    /// connection's HS1 slot, and the sealed datagrams the node dropped as forged.
+    fn a_plain_hs1(limits: Limits) -> (bool, u64) {
+        let key = ble_key("app", "room");
+        let air = FakeAir::new(23);
+        let t = Instant::from_millis(1);
+        let (mut node, mut ep) = lone(&air, limits, 1, t);
+        let mut yp = air.radio(Limits::DESKTOP);
+        yp.advertise(Some(&advert(&key, u32::MAX, false)));
+        let (conn, mut tx) = serve(&mut yp, &mut node, &mut ep, t, &id(2));
+        let mut dialler = Endpoint::<u32>::new(&id(2), Config::default(), [2; 32]);
+        dialler.connect(t, 1, id(1).peer_id()).unwrap();
+        let hs1 = dialler.poll_transmit(t).unwrap().payload;
+        assert!(hs1_id(&hs1).is_some());
+        tx.split(&[&[KIND_DATAGRAM][..], &hs1].concat(), 23, |v| yp.send(conn, v));
+        node.poll(t, &mut ep);
+        let c = node.conns.values().next().expect("still open");
+        (c.hs1.is_some(), node.forged)
+    }
+
+    /// NB135-9: over Bluetooth a datagram goes as it is, and an HS1 on an unbound connection takes its slot, as ever.
+    #[test]
+    fn an_hs1_over_bluetooth_takes_its_slot_as_before() {
+        assert_eq!(a_plain_hs1(Limits::DESKTOP), (true, 0));
+    }
+
+    /// NB135-9 (the security review's finding): over a radio whose values anyone can forge, a datagram as it is, such
+    /// as an HS1 forged with the ids overheard, took the slot of a connection just proven and the radio's budget, and
+    /// the real handshake was dropped for 10 s. Datagrams there are sealed: one that isn't is dropped by the link,
+    /// uncounted, and takes nothing.
+    #[test]
+    fn sec_a_forged_hs1_over_a_forgeable_radio_takes_no_slot() {
+        assert_eq!(a_plain_hs1(Limits { forgeable: true, ..Limits::DESKTOP }), (false, 1));
     }
 
     /// NB-114: why a node doesn't connect to an advert of its room, which it logs once a `SEEN_FOR` for each advert.

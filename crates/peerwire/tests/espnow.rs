@@ -609,3 +609,274 @@ fn sec_one_forged_message_during_the_proof_to_the_opener_costs_seconds() {
 fn sec_one_forged_message_during_the_proof_to_the_accepter_costs_seconds() {
     one_forged_message_during_the_proof(false);
 }
+
+fn other(m: Mac) -> Mac {
+    if m == A {
+        B
+    } else {
+        A
+    }
+}
+
+/// The highest data number `from` sent to connection id `id`, as tried on the air.
+fn highest(air: &FakeAir, from: Mac, id: u64) -> Option<u32> {
+    air.heard()
+        .iter()
+        .filter(|(f, _, _)| *f == from)
+        .filter_map(|(_, _, x)| match frame::parse(x) {
+            Ok(frame::Frame::Data { to, seq, .. }) if to == id => Some(seq),
+            _ => None,
+        })
+        .max()
+}
+
+/// The counter of the node's framing on the last value `from` sent to connection id `id`.
+fn last_counter(air: &FakeAir, from: Mac, id: u64) -> u8 {
+    let last = air.heard().iter().rev().find_map(|(f, _, x)| match frame::parse(x) {
+        Ok(frame::Frame::Data { to, first: true, payload, .. }) if *f == from && to == id => payload.first().copied(),
+        _ => None,
+    });
+    last.unwrap_or(0) & 0x3f
+}
+
+/// What the security review forged: a datagram as it is that parses as an HS1 (kind, sender index, 32 bytes as its
+/// ephemeral key: 37 bytes, no valid Noise message), whole in one chunk of the node's framing (first, last, a counter
+/// of its own), as a link message.
+fn forged_hs1(n: u8) -> Vec<u8> {
+    let hs1 = [&[0x11u8, n, 0, 0, 0x5e][..], &[n; 32]].concat();
+    [&[0xc0 | (63 - (n & 7)), 0][..], &hs1].concat()
+}
+
+/// A forged HS1 to `to`'s connection `id` as from `from`, 40 numbers past the last `from` sent on it.
+fn inject_hs1(air: &FakeAir, from: Mac, to: Mac, id: u64, n: u8) {
+    let seq = highest(air, from, id).unwrap_or(0).wrapping_add(40);
+    let v = forged_hs1(n);
+    let f = frame::Frame::Data { to: id, seq, first: true, last: true, total: v.len() as u16, payload: &v };
+    air.inject(from, to, &f.encode());
+}
+
+/// NB135-9 (the security review's repros, inverted): the nodes are polled one at a time until each end has sent its
+/// identity proof on the connection, and then one HS1 is forged to each end as from the other, with the ids and
+/// numbers overheard. Each took the slot of a connection no peer was bound to yet, and the radio's budget, so the real
+/// handshake was dropped: linked after 15.5 s, against 63 ms with none; and with one forged pair every 10.05 s, never
+/// in 70 s. Datagrams over ESP-NOW are now sealed under the link key, so the forged ones are dropped, uncounted, and
+/// take nothing: linked within seconds. With `sustain`, a pair goes again 10.05 s after the first, and the link stays.
+/// How long until linked, after the first pair.
+fn forged_hs1s_after_the_proof(room: &str, sustain: bool) -> Option<Duration> {
+    let air = FakeAir::new();
+    let (mut a, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    a.join_room("pw-test", room);
+    b.join_room("pw-test", room);
+    assert!(until_accepted(&mut a, &mut b, &air, 15), "an ACCEPT");
+    let (accepter, opener_id, accepter_id) = overheard(&air).0[0];
+    let opener = other(accepter);
+    let (mut to_acc, mut to_op, mut n) = (false, false, 0u8);
+    let end = Instant::now() + Duration::from_secs(15);
+    while !(to_acc && to_op) && Instant::now() < end {
+        for node in [&mut a, &mut b] {
+            node.poll();
+            if !to_acc && highest(&air, accepter, opener_id).is_some_and(|s| s >= 2) {
+                inject_hs1(&air, opener, accepter, accepter_id, n);
+                (n, to_acc) = (n + 1, true);
+            }
+            if !to_op && highest(&air, opener, accepter_id).is_some_and(|s| s >= 1) {
+                inject_hs1(&air, accepter, opener, opener_id, n);
+                (n, to_op) = (n + 1, true);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(to_acc && to_op, "both ends proven");
+    assert!(!on_radio(&a, &pb) && !on_radio(&b, &pa), "not linked before the forged HS1s");
+    let t = Instant::now();
+    let mut ev = Vec::new();
+    let up = |n: &[&mut Node]| on_radio(n[0], &pb) && on_radio(n[1], &pa);
+    let linked = pump(&mut [&mut a, &mut b], &mut ev, 10, up).then(|| t.elapsed());
+    eprintln!("one forged HS1 each way after the proof: linked after {linked:?}");
+    assert!(a.ble_forged() >= 1 && b.ble_forged() >= 1, "dropped by the links as forged");
+    if sustain && linked.is_some() {
+        let mut after = Vec::new();
+        pump(&mut [&mut a, &mut b], &mut after, 11, |_| t.elapsed() >= Duration::from_millis(10_050));
+        let (forged_a, forged_b) = (a.ble_forged(), b.ble_forged());
+        inject_hs1(&air, opener, accepter, accepter_id, n);
+        inject_hs1(&air, accepter, opener, opener_id, n.wrapping_add(1));
+        pump(&mut [&mut a, &mut b], &mut after, 1, |_| false);
+        let churn = |e: &&Event| matches!(e, Event::Disconnected { .. } | Event::Connected { .. });
+        assert_eq!(after.iter().flatten().filter(churn).count(), 0, "the link stays: {after:?}");
+        assert!(on_radio(&a, &pb) && on_radio(&b, &pa), "still linked");
+        assert!(a.ble_forged() > forged_a && b.ble_forged() > forged_b, "the second pair dropped as forged too");
+    }
+    linked
+}
+
+#[test]
+fn sec_one_forged_hs1_to_each_end_after_the_proof_costs_nothing() {
+    let linked = forged_hs1s_after_the_proof("espnow-r5-hs1", false);
+    assert!(linked.is_some_and(|t| t < Duration::from_secs(3)), "linked within seconds: {linked:?}");
+}
+
+#[test]
+fn sec_forged_hs1s_every_ten_seconds_cost_nothing() {
+    let linked = forged_hs1s_after_the_proof("espnow-r5-hs1-again", true);
+    assert!(linked.is_some_and(|t| t < Duration::from_secs(3)), "linked within seconds: {linked:?}");
+}
+
+/// Polls every node for `ms` milliseconds, keeping their events.
+fn pump_ms(nodes: &mut [&mut Node], events: &mut Vec<Vec<Event>>, ms: u64) {
+    events.resize_with(nodes.len(), Vec::new);
+    let end = Instant::now() + Duration::from_millis(ms);
+    while Instant::now() < end {
+        for (i, n) in nodes.iter_mut().enumerate() {
+            n.poll();
+            events[i].extend(std::iter::from_fn(|| n.try_recv_event()));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// NB135-9, and the call that a sealed datagram that doesn't open isn't counted towards the link's drops: if it were,
+/// 32 forged datagrams would close a proven connection. 40 are forged to each end of a live link while it carries
+/// messages, one at a time, with the ids and numbers overheard, each a whole message of the node's framing of kind 0
+/// with a made-up seq and tag. The links drop them all as forged, nothing closes or moves, and every message sent
+/// meanwhile arrives, in order: each forged frame costs the real frame of its number on the air (NB135-6), which the
+/// reliable lane sends again.
+#[test]
+fn sec_forged_datagrams_on_a_live_link_close_nothing() {
+    let air = FakeAir::new();
+    let (mut a, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    a.join_room("pw-test", "espnow-r5-datagrams");
+    b.join_room("pw-test", "espnow-r5-datagrams");
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    pump(&mut [&mut a, &mut b], &mut ev, 1, |_| false);
+    let accepts = overheard(&air).0;
+    let (accepter, opener_id, accepter_id) = *accepts.last().unwrap();
+    let opener = other(accepter);
+    let msgs: Vec<Vec<u8>> = (0..40).map(|i| format!("message {i}").into_bytes()).collect();
+    let mut after = vec![Vec::new(), Vec::new()];
+    for (i, m) in msgs.iter().enumerate() {
+        a.send(&pb, Lane::Reliable, m).unwrap();
+        b.send(&pa, Lane::Reliable, m).unwrap();
+        pump_ms(&mut [&mut a, &mut b], &mut after, 30);
+        for (from, to, id) in [(accepter, opener, opener_id), (opener, accepter, accepter_id)] {
+            // The receiver's next number, and a counter that is neither the last real one nor the next, so the
+            // framing takes it as a whole message.
+            let seq = highest(&air, from, id).unwrap_or(0).wrapping_add(1);
+            let c = (last_counter(&air, from, id) + 10) & 0x3f;
+            let value = [&[0xc0 | c, 0][..], &(1_000 + i as u64).to_le_bytes(), &[0x5a; 40]].concat();
+            let total = value.len() as u16;
+            let f = frame::Frame::Data { to: id, seq, first: true, last: true, total, payload: &value };
+            air.inject(from, to, &f.encode());
+        }
+    }
+    let all = |ev: &[Event], from: PeerId| msgs.iter().all(|m| got(ev, from, m));
+    let t = Instant::now();
+    while !(all(&after[0], pb) && all(&after[1], pa)) && t.elapsed() < Duration::from_secs(10) {
+        pump(&mut [&mut a, &mut b], &mut after, 1, |_| false);
+    }
+    pump(&mut [&mut a, &mut b], &mut after, 1, |_| false);
+    eprintln!("40 forged datagrams each way: dropped as forged a {} b {}", a.ble_forged(), b.ble_forged());
+    let order = |ev: &[Event], from: PeerId| -> Vec<Vec<u8>> {
+        ev.iter()
+            .filter_map(|e| match e {
+                Event::Message { peer, data, .. } if *peer == from => Some(data.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(order(&after[1], pa), msgs, "every message one way, in order");
+    assert_eq!(order(&after[0], pb), msgs, "and the other");
+    let churn = |e: &&Event| matches!(e, Event::Disconnected { .. } | Event::Connected { .. });
+    assert_eq!(after.iter().flatten().filter(churn).count(), 0, "nothing closed or moved: {after:?}");
+    assert_eq!(overheard(&air).0.len(), accepts.len(), "on the same connection");
+    assert!(a.ble_forged() >= 40 && b.ble_forged() >= 40, "every forged one reached a link and was dropped there");
+}
+
+/// NB135-10 (the security review's repro, inverted): right after the ACCEPT and the room's challenge, `k` data frames
+/// are forged to the opener with the numbers 1 to `k`, each a chunk that is no message (dropped and counted, `k` < 32,
+/// so no close). The accepter's proof, identity proof and hellos then come with numbers already taken and are dropped
+/// as copies, so the opener misses the proof's deadline, and it held the advert a minute: linked again after 63.2 s
+/// with 8. Over ESP-NOW it now holds it 1 to 4 s.
+fn proof_numbers_taken(k: u32) -> (bool, Duration) {
+    let air = FakeAir::new();
+    let (mut a, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    a.join_room("pw-test", &format!("espnow-r5-proof-{k}"));
+    b.join_room("pw-test", &format!("espnow-r5-proof-{k}"));
+    assert!(until_accepted(&mut a, &mut b, &air, 15));
+    let (accepter, opener_id, _) = overheard(&air).0[0];
+    let opener = other(accepter);
+    for seq in 1..=k {
+        let f = frame::Frame::Data { to: opener_id, seq, first: true, last: true, total: 1, payload: &[0x01] };
+        air.inject(accepter, opener, &f.encode());
+    }
+    let t = Instant::now();
+    let mut ev = Vec::new();
+    let linked = pump(&mut [&mut a, &mut b], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa));
+    assert!(overheard(&air).0.len() >= 2, "on a new connection");
+    (linked, t.elapsed())
+}
+
+#[test]
+fn sec_frames_forged_with_the_numbers_of_the_proof_cost_seconds() {
+    for k in [8, 20] {
+        let (linked, took) = proof_numbers_taken(k);
+        eprintln!("{k} frames forged with the proof's numbers: linked {linked} after {took:?}");
+        assert!(linked && took < Duration::from_secs(10), "{k}: linked again within seconds: {took:?}");
+    }
+}
+
+/// NB135-10 (the security review's repro, inverted): 32 messages forged to the accepter of a proven connection that
+/// no handshake has bound yet (a standby), with the ids and numbers overheard, make it close the connection at its drop
+/// limit. The opener held the advert a minute, as for any standby its other end closed: linked again after 60.9 s.
+/// With no link to that peer elsewhere, the connection was the way to it, and it now holds it 1 to 4 s. The handshake's
+/// datagrams are lost on the air until then, as a board's slower handshake (156 ms on a C3) leaves the standby open
+/// longer than `FakeAir`'s.
+#[test]
+fn sec_thirty_two_forged_messages_to_the_accepter_of_a_standby_cost_seconds() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    let air = FakeAir::new();
+    let (mut a, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    let lost = Arc::new(AtomicU32::new(0));
+    let count = lost.clone();
+    air.set_hole(Some(Box::new(move |_, _, f: &[u8]| {
+        // A value that starts a message of the node's framing (its first chunk) of kind 0: a datagram.
+        let starts = |v: &[u8]| v.len() > 1 && v[0] & 0x80 != 0 && v[1] == 0;
+        let datagram =
+            matches!(frame::parse(f), Ok(frame::Frame::Data { first: true, payload, .. }) if starts(payload));
+        if datagram {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        datagram
+    })));
+    a.join_room("pw-test", "espnow-r5-standby");
+    b.join_room("pw-test", "espnow-r5-standby");
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 15, |_| lost.load(Ordering::Relaxed) > 0), "a handshake tried");
+    pump(&mut [&mut a, &mut b], &mut ev, 1, |_| false);
+    assert_eq!((a.ble_counts(), b.ble_counts()), ((1, 1, 0), (1, 1, 0)), "a standby: proven, bound to no peer");
+    assert!(!on_radio(&a, &pb) && !on_radio(&b, &pa), "not linked");
+    let (accepts, last) = overheard(&air);
+    let (accepter, _, accepter_id) = accepts[0];
+    let opener = other(accepter);
+    let base = last.get(&accepter_id).copied().unwrap_or(0);
+    for i in 0..32u32 {
+        // A chunk that is a whole message (first and last, a counter of its own), kind 3, and 16 bytes.
+        let value = [&[0xc0 | ((20 + i) as u8 & 0x3f), 3][..], &[7; 16]].concat();
+        let (seq, total) = (base.wrapping_add(1 + i), value.len() as u16);
+        let f = frame::Frame::Data { to: accepter_id, seq, first: true, last: true, total, payload: &value };
+        air.inject(opener, accepter, &f.encode());
+    }
+    let at = usize::from(accepter == B);
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 2, |n| n[at].ble_counts().0 == 0), "the accepter closed it");
+    air.set_hole(None);
+    let t = Instant::now();
+    let linked = pump(&mut [&mut a, &mut b], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa));
+    eprintln!("32 forged messages to the accepter of a standby: linked {linked} after {:?}", t.elapsed());
+    assert!(linked && t.elapsed() < Duration::from_secs(10), "linked again within seconds: {:?}", t.elapsed());
+    assert!(overheard(&air).0.len() > accepts.len(), "on a new connection");
+}
