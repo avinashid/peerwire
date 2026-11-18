@@ -23,16 +23,26 @@ and the commit that fixed it.
   the connection, whatever came on it (NB135-4); frames to an address that never acknowledged one get 2 tries, a
   refusal 1, and the send queue is capped, one refusal waiting at most (NB135-3); values waiting for the node are
   capped at 16 KB (NB135-2).
+- ESP-NOW, from its security review's second round: a close for a second ACCEPT reaches the node as `Dropped`, and
+  the node connects again 1 to 4 s later, so one forged ACCEPT after the room's challenge no longer keeps two boards
+  apart for a minute (NB135-5); the receiver keeps a bit for each of the 64 numbers behind the highest it took, as an
+  anti-replay window, so one forged data frame costs the real frame of its number, not the next 63, which on an idle
+  link timed the link out (NB135-6); a connection has one KEEPALIVE waiting for the air at most (NB135-I5).
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
-  carries nothing (NB135-1).
+  carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert
+  1 to 4 s, not 60 s, so the link comes back within seconds whichever end timed out first, while a room member that
+  keeps closing them makes its peer connect again every 1 to 4 s (NB135-I6). `RadioEvent::Dropped` is new: a close
+  the radio made for a cause that says nothing of the other end, after which the node connects again 1 to 4 s later
+  (NB135-5); a match on `RadioEvent` with no wildcard needs an arm for it.
 - `peerwire-esp`: feature `espnow`, the ESP32's ether, `espnow::EspNowEther` (`espnow::radio`): frames on the air one
   at a time from a thread of their own, each tried as many times as the radio asks, a send callback taken only for the
   frame on the air with its address (NB135-I1), ESP-NOW's peer table kept to the 16 addresses last sent to, none with
   frames still waiting (NB135-I2), and the receive callback dropping what isn't ours or is over 531 B before any copy,
-  with 16 KB queued at most (NB135-2). `wifi::start_on_channel` starts Wi-Fi on a channel with no network, for ESP-NOW, and
-  `wifi::start_on_channel_as` with `wifi::random_mac` from a random address drawn at boot, as ESP-NOW frames carry
-  the sender's address in the clear; `wifi::connect` joins a network from there. Examples: `espnow_mesh`, boards
+  with 16 KB queued at most (NB135-2), and `espnow::check`'s heap snapshot taken only once `espnow_mesh` arms it.
+  `wifi::start_on_channel` starts Wi-Fi on a channel with no network, for ESP-NOW, and `wifi::start_on_channel_as`
+  with `wifi::random_mac` from a random address drawn at boot, as ESP-NOW frames carry the sender's address in the
+  clear; `wifi::connect` joins a network from there. Examples: `espnow_mesh`, boards
   linking over ESP-NOW alone, and `espnow_probe`, which measures two boards' round trips, loss and frames a second with
   no access point, on the hotspot and with Bluetooth on (NB-135).
 - **Bluetooth LE** (NB-110, [Bluetooth](docs/concepts/bluetooth.md)): `peerwire` feature `ble` (its one dependency

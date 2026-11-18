@@ -82,9 +82,12 @@ stalls its setup holds a connect 12 s at most, and then not again for 60 s. The 
 of a member's advert, which anyone in range can replay, holds only the copy, not the member's own. But one whose
 connection closed before it sent a challenge (it refused the central, or never challenged) is tried again after 1 to
 4 s, at random, so a device that connects on a cycle of its own can't keep a newcomer landing in its grace (see the
-limits). Nothing a peer says of its own advert is taken, as a member could name another's to keep two members apart: so
-two peers may make two connections (a full desktop connects back to the peer that filled it, say), and the [second one
-closes](#binding-a-connection-to-its-peer).
+limits). So is one whose connection was bound to a peer when the radio or the other end closed it: the link was up
+over it, so the next should come soon, whichever end's link timed out first (NB135-I6). A room member that keeps
+closing the bound connections a peer makes to it makes that peer connect again every 1 to 4 s; that is accepted, as a
+member can cost a link more ways than that. Nothing a peer says of its own advert is taken, as a member could name
+another's to keep two members apart: so two peers may make two connections (a full desktop connects back to the peer
+that filled it, say), and the [second one closes](#binding-a-connection-to-its-peer).
 
 ## Framing
 
@@ -170,7 +173,8 @@ closes, at the end that made it. A proven connection bound to no one, such as on
 open while a signal proving a member comes over it at least every 60 s (hellos come every 30 s at most): it is ready
 for the day UDP goes. A connection bound to a peer whose link times out closes, with no hold on the advert, so the
 next link to that peer comes over a new connection rather than one the radio still says is up but that carries
-nothing (NB135-1, on [ESP-NOW](espnow.md)).
+nothing (NB135-1, on [ESP-NOW](espnow.md)); the other end, if it made the connection, holds that advert only 1 to 4 s
+(NB135-I6).
 
 ## Paths: UDP first
 
@@ -284,12 +288,15 @@ pub enum RadioEvent {
     Mtu { conn: ConnId, mtu: u16 },                                  // the ATT MTU changed
     Value { conn: ConnId, value: Vec<u8> },                          // a write to `rx`, or a notification on `tx`
     Disconnected { conn: ConnId },                                   // as soon as its link goes down
+    Dropped { conn: ConnId },                                        // closed by the radio, nothing of the peer's
     Advertising(bool),                                               // whether the advert asked for is on the air
 }
 ```
 
 `DeviceId(u64)` and `ConnId(u32)` are the driver's own numbers. A driver reports `Disconnected` as soon as a link
 goes down, unless the node closed it: till then the node takes it to be up, and doesn't connect to that advert again.
+`Dropped` is a close the radio made itself for a cause that says nothing of the device at the other end (ESP-NOW's,
+for an ACCEPT that may be forged, NB135-5): the node connects to that advert again 1 to 4 s later, not a minute.
 A driver that never sends `Advertising` is taken to advertise as asked. `Builder::bluetooth(radio)` gives a node its
 radio; `Node::poll` drains its events, and `Node::set_waker` (which `AsyncNode` calls itself) hands it a waker.
 Feature `ble-bluez` adds the Linux driver, `BlueZ`; the ESP32's NimBLE driver lives in `peerwire-esp` (NB-110c), and
