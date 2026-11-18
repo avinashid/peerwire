@@ -243,7 +243,8 @@ impl Engine {
     }
 
     /// Opens a connection to `device`: OPEN every [`Settings::open_every`] until it is accepted
-    /// ([`RadioEvent::Connected`]), refused or [`Settings::connect_within`] passes ([`RadioEvent::ConnectFailed`]).
+    /// ([`RadioEvent::Connected`]), refused or [`Settings::connect_within`] passes ([`RadioEvent::ConnectFailed`]),
+    /// or at once if no radio acknowledges the first OPEN (NB135-12).
     ///
     /// The limits don't refuse it: the node counts its own connects, and closes a connection that may be forged to
     /// make room for one (NB135-11), but the radio may hold one it hasn't heard of yet, and a connect failed for that
@@ -570,7 +571,13 @@ impl Engine {
             return;
         }
         c.failures += 1;
-        if c.failures >= max && c.open() {
+        if !c.open() && !c.acked {
+            // An OPEN no radio acknowledged, to an address that never has: none is there to answer it (a made-up
+            // one, or a member's that went), so the connect fails now, where it held a connect of the node's and the
+            // advert's `n` for `connect_within` (NB135-12).
+            self.stats.connects_unacked += 1;
+            self.close(conn, false);
+        } else if c.failures >= max && c.open() {
             self.stats.closed_failing += 1;
             self.close(conn, false);
         }
@@ -1406,11 +1413,11 @@ mod tests {
     #[test]
     fn connects_fail_when_unanswered_or_out_of_room() {
         let mut p = Pair::new(V1_FRAME, V1_FRAME);
-        // B never answers: an OPEN every 500 ms, given up after 10 s.
+        // B's radio acknowledges each OPEN, and B never answers: an OPEN every 500 ms, given up after 10 s.
         p.a.connect(p.t, device_of(B));
         let mut opens = 0;
         for _ in 0..21 {
-            while hand(&mut p.a, p.t, false).is_some() {
+            while hand(&mut p.a, p.t, true).is_some() {
                 opens += 1;
             }
             p.later(ms(500));
@@ -1475,6 +1482,33 @@ mod tests {
         let opened = sent(&mut b).iter().any(|f| matches!(frame::parse(f), Ok(Frame::Open { .. })));
         assert!(opened, "the connect went");
         assert!(gone(&mut b).is_empty(), "with no ConnectFailed");
+    }
+
+    /// NB135-12 (the security review's finding): a connect to a copy of a member's advert sent from a made-up address
+    /// went on for `connect_within`, 10 s, though no radio acknowledged its OPENs, and held a connect of the node's and
+    /// the advert's `n` that long. One whose first OPEN no radio acknowledges (after its tries) now fails at once; one
+    /// whose OPENs a radio acknowledged goes on to the end, as the other end's node may still answer.
+    #[test]
+    fn sec_a_connect_whose_open_no_radio_acknowledges_fails_at_once() {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        p.a.connect(p.t, device_of(X));
+        assert_eq!(hand(&mut p.a, p.t, false).map(|(to, _)| to), Some(X), "one OPEN");
+        assert_eq!(gone(&mut p.a), [RadioEvent::ConnectFailed { device: device_of(X) }], "failed at once");
+        assert_eq!((p.a.stats().connects_unacked, p.a.stats().connections), (1, 0));
+        // Acknowledged once, then not: on until `connect_within`.
+        p.a.connect(p.t, device_of(B));
+        hand(&mut p.a, p.t, true);
+        let mut opens = 1;
+        for _ in 0..21 {
+            p.later(ms(500));
+            while hand(&mut p.a, p.t, false).is_some() {
+                opens += 1;
+            }
+            if !gone(&mut p.a).is_empty() {
+                break;
+            }
+        }
+        assert_eq!((opens, p.a.stats().connects_unacked), (20, 1), "10 s of OPENs once a radio acknowledged one");
     }
 
     #[test]
@@ -1594,6 +1628,7 @@ mod tests {
         p.a.connect(p.t, device_of(X));
         assert_eq!(p.a.peek().map(|(to, _, tries, _)| (to, tries)), Some((X, s.first_tries)));
         hand(&mut p.a, p.t, false);
+        assert_eq!(gone(&mut p.a), [RadioEvent::ConnectFailed { device: device_of(X) }], "given up (NB135-12)");
         // A real connection: its frames get two tries until one is acknowledged, then four.
         let (ca, _) = p.link();
         assert!(p.a.send(p.t, ca, b"one"));

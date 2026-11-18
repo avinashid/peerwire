@@ -1216,3 +1216,70 @@ fn sec_copies_of_an_advert_from_other_addresses_keep_no_pair_apart() {
     assert!(radios.is_some_and(|t| t < Duration::from_secs(3)), "copies from radios: {radios:?}");
     assert!(!o1 && !o2, "no connect to a copy");
 }
+
+/// A member's advert as it was on the air, with an `n` above `above`, from a node at `mac` that joined the room off the
+/// air and is gone: off, so no radio acknowledges a frame to its address. Its node, never polled again.
+fn gone_members_advert(air: &FakeAir, mac: Mac, room: &str, above: u32) -> (Node, Vec<u8>) {
+    let mut z = node(air, mac, V1_FRAME);
+    air.set_off(mac, true);
+    loop {
+        z.join_room("pw-test", room);
+        z.poll();
+        if advert_n(air, mac).expect("its advert") > above {
+            return (z, advert_frame(air, mac).expect("its advert"));
+        }
+    }
+}
+
+/// NB135-12, NB110-11's residual over ESP-NOW: a member's advert is bound to its address, so a copy goes only from
+/// there, and a replay of one from a member that has gone, from its own address, still draws a connect. X's `n` is
+/// below B's, so X is the one to connect, and two such replays, heard first, took both of X's unbound slots: its
+/// connects to them went on for 10 s, and X linked with B only then. No radio acknowledges an OPEN to a gone member's
+/// address, so those connects now fail at once, and X links with B as with none. With `replays` off, the control.
+fn replays_from_gone_members(replays: bool) -> Option<Duration> {
+    const Z1: Mac = [0x02, 0x50, 0x57, 0, 0, 0x1a];
+    const Z2: Mac = [0x02, 0x50, 0x57, 0, 0, 0x1b];
+    let air = FakeAir::new();
+    let (mut x, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (px, pb) = (x.peer_id(), b.peer_id());
+    let room = format!("espnow-r7-gone-{replays}");
+    b.join_room("pw-test", &room);
+    b.poll();
+    let n_b = advert_n(&air, B).expect("B's advert");
+    air.set_off(A, true);
+    let n_x = loop {
+        x.join_room("pw-test", &room);
+        x.poll();
+        let n = advert_n(&air, A).expect("X's advert");
+        if n < n_b {
+            break n;
+        }
+    };
+    let gone = [Z1, Z2].map(|z| (z, gone_members_advert(&air, z, &room, n_x)));
+    air.set_off(A, false);
+    let t = Instant::now();
+    let (mut ev, mut next) = (Vec::new(), t);
+    while t.elapsed() < Duration::from_secs(15) {
+        if replays && Instant::now() >= next {
+            next += Duration::from_millis(100);
+            for (z, (_, advert)) in &gone {
+                air.inject(*z, A, advert);
+            }
+        }
+        poll_all(&mut [&mut x, &mut b], &mut ev);
+        if on_radio(&x, &pb) && on_radio(&b, &px) {
+            return Some(t.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    None
+}
+
+#[test]
+fn sec_a_connect_no_radio_acknowledges_is_given_up_at_once() {
+    let control = replays_from_gone_members(false);
+    let linked = replays_from_gone_members(true);
+    eprintln!("replays of two gone members' adverts: linked after {linked:?}, against {control:?} with none");
+    assert!(control.is_some_and(|t| t < Duration::from_secs(2)), "control: {control:?}");
+    assert!(linked.is_some_and(|t| t < Duration::from_secs(3)), "linked within seconds: {linked:?}");
+}

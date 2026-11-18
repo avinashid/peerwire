@@ -55,7 +55,8 @@ pub struct Settings {
     pub mtu: u16,
     /// How often an advert is broadcast.
     pub advert_every: Duration,
-    /// How often an OPEN goes again while it isn't answered, and how long until a connect is given up.
+    /// How often an OPEN goes again while it isn't answered, and how long until a connect is given up; at once if no
+    /// radio acknowledged its first OPEN (NB135-12).
     pub open_every: Duration,
     pub connect_within: Duration,
     /// A KEEPALIVE goes after this long with nothing sent on a connection, and a connection with nothing heard on it
@@ -132,6 +133,8 @@ pub struct Stats {
     /// sent for accepts no open waits for.
     pub opens_refused: u64,
     pub refusals: u64,
+    /// Connects given up as no radio acknowledged their OPEN: an address no radio has, made up or gone (NB135-12).
+    pub connects_unacked: u64,
     /// CLOSEs whose connection answered the probe that followed (forged, or stale), so stayed open.
     pub closes_denied: u64,
     /// Connections closed by a second ACCEPT with another id within 3 s of the first: one of the two was forged
