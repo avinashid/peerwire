@@ -19,8 +19,9 @@ pub const WINDOW: u32 = 64;
 /// The frames behind the highest one taken, one bit each.
 const _: () = assert!(WINDOW == u64::BITS);
 /// Data frames in a row further than [`WINDOW`] ahead, or further than it behind, after which the receiver takes the
-/// next as its new place: its sender lost more than a window of frames, or frames forged far ahead moved this end on
-/// (NB135-1), and its next frames come from where it really is. One far off is dropped.
+/// next as its new place, with none of the window behind it taken (NB135-7): its sender lost more than a window of
+/// frames, or frames forged far ahead moved this end on (NB135-1), and its next frames come from where it really is.
+/// One far off is dropped.
 pub const RESYNC_AFTER: u32 = 4;
 /// Events queued for the node at most: adverts, and values. Connections coming and going are never dropped.
 const MAX_SEEN_QUEUED: usize = 16;
@@ -467,8 +468,13 @@ impl Engine {
             }
             self.stats.resyncs += 1;
             self.stats.gaps += 1;
-            // Where the sender is now: every frame behind it counts as taken, as one taken before the jump might be.
-            (c.rx_top, c.rx_taken) = (seq, u64::MAX);
+            // Where the sender is now, with none of the window behind it taken, either way (NB135-7). Counting it all as
+            // taken dropped as copies the real frames that land in it, up to a window of them, and copies don't count
+            // towards the resync back: after 4 frames forged just past the window ahead, or 4 forged far ahead and then
+            // 4 just ahead of the sender's real place, which moved this end back there. Ahead, nothing behind the new
+            // place was taken, as the jump is more than a window. A copy of a frame taken before an earlier jump can
+            // be taken again, and the session's anti-replay window drops it.
+            (c.rx_top, c.rx_taken) = (seq, 0);
         } else {
             if d > 1 {
                 self.stats.gaps += 1;
@@ -1223,6 +1229,89 @@ mod tests {
             assert_eq!(got.iter().sum::<usize>(), 60 - (RESYNC_AFTER as usize - 1), "and every one after comes");
             assert_eq!(p.b.stats().resyncs, 2);
             assert!(gone(&mut p.b).is_empty() && gone(&mut p.a).is_empty(), "nothing closes");
+        }
+    }
+
+    /// The numbers of the real values `a` sends after "0" that `b` doesn't take, when `RESYNC_AFTER` data frames
+    /// forged with `b`'s id at each number of `forged`, in turn, come first: `a` then sends 1 to `n`, one at a time.
+    fn real_lost_after(forged: &[u32], n: u32) -> Vec<u32> {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        let (ca, _) = p.link();
+        let (_, b_id) = ids(&p);
+        assert!(p.a.send(p.t, ca, b"0"));
+        p.shuttle();
+        assert_eq!(values(&mut p.b), [b"0".to_vec()]);
+        for &seq in forged {
+            let f = Frame::Data { to: b_id, seq, first: true, last: true, total: 6, payload: b"forged" };
+            for _ in 0..RESYNC_AFTER {
+                p.b.handle(p.t, A, &f.encode());
+            }
+        }
+        let _ = values(&mut p.b);
+        let mut got = Vec::new();
+        for i in 1..=n {
+            assert!(p.a.send(p.t, ca, format!("{i}").as_bytes()));
+            p.shuttle();
+            got.extend(values(&mut p.b));
+        }
+        (1..=n).filter(|i| !got.contains(&format!("{i}").into_bytes())).collect()
+    }
+
+    /// NB135-7 (the security review's repro, inverted): 4 data frames forged just past the window ahead move the
+    /// receiver there with none of the window behind it taken, so the sender's next real frames, which land in it, are
+    /// taken, and only the one with the forged number is dropped, as a copy: not the 64 of the window (65 of the next
+    /// 72 were lost), which on an idle link timed the link out. The same when the receiver is moved back: 4 forged far
+    /// ahead, then 4 just ahead of the sender's real place. Wherever 4 forged frames move it, `RESYNC_AFTER` real
+    /// frames are lost at most: those far off before the window, and the one with the forged number.
+    #[test]
+    fn sec_four_frames_just_past_the_window_cost_the_real_frame_of_their_number() {
+        assert_eq!(real_lost_after(&[WINDOW + 1], WINDOW + 8), [WINDOW + 1]);
+        assert_eq!(real_lost_after(&[1 << 30, WINDOW], WINDOW + 8), [WINDOW]);
+        assert_eq!(real_lost_after(&[WINDOW + RESYNC_AFTER], WINDOW + 8), [1, 2, 3, WINDOW + RESYNC_AFTER]);
+        for k in WINDOW + 1..=2 * WINDOW + 8 {
+            let lost = real_lost_after(&[k], k + 8);
+            assert!(lost.len() <= RESYNC_AFTER as usize, "4 forged at {k}: lost {lost:?}");
+        }
+        for k in 1..=2 * WINDOW + 8 {
+            let lost = real_lost_after(&[1 << 30, k], k + 8);
+            assert!(lost.len() <= RESYNC_AFTER as usize, "4 forged far ahead, then 4 at {k}: lost {lost:?}");
+        }
+    }
+
+    /// A residual, documented (espnow.md's forged frames; the threat model's NB135-1): a forger that keeps sending
+    /// keeps a receiver out of step. After 4 frames forged far ahead move `b` there, one more forged in `b`'s new
+    /// window after every 3 real ones resets the count of real frames far behind, so none of `a`'s is taken while it
+    /// goes on; the node's link times out and comes back on a new connection within seconds (NB135-1, NB135-I6). Once
+    /// it stops, the fourth real frame moves `b` back. The security review's third round; if this fails, the residual
+    /// changed, and the docs should say so.
+    #[test]
+    fn sec_interleaved_forged_frames_keep_a_receiver_at_the_forged_place() {
+        for interleave in [false, true] {
+            let mut p = Pair::new(V1_FRAME, V1_FRAME);
+            let (ca, _) = p.link();
+            let (_, b_id) = ids(&p);
+            let data = |seq: u32| {
+                Frame::Data { to: b_id, seq, first: true, last: true, total: 6, payload: b"forged" }.encode()
+            };
+            let far = 1u32 << 30;
+            for i in 0..RESYNC_AFTER {
+                p.b.handle(p.t, A, &data(far + i));
+            }
+            let _ = values(&mut p.b);
+            let (mut next, mut real) = (far + RESYNC_AFTER, 0);
+            for i in 0..300u32 {
+                assert!(p.a.send(p.t, ca, b"real"));
+                p.shuttle();
+                real += values(&mut p.b).iter().filter(|v| v.as_slice() == b"real").count();
+                if interleave && i % 3 == 2 {
+                    p.b.handle(p.t, A, &data(next));
+                    next += 1;
+                }
+            }
+            match interleave {
+                true => assert_eq!(real, 0, "no real frame taken while the forger goes on"),
+                false => assert_eq!(real, 300 - (RESYNC_AFTER as usize - 1), "3 lost, then all"),
+            }
         }
     }
 

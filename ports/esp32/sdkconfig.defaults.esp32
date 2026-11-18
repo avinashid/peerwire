@@ -1,0 +1,4 @@
+# The original ESP32 (CHIP=esp32), on top of sdkconfig.defaults: ESP-IDF's build reads this file for that chip only.
+# Xtensa's register windows take more stack than the C3's RISC-V: espnow_mesh's main task left 940 B of its 24 KB
+# unused on an ESP32 (NB-139), against 2,460 B on a C3, so the ESP32's main task gets 4 KB more.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=28672

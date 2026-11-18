@@ -17,7 +17,8 @@ and the commit that fixed it.
   copies, stale frames and values missing a part are dropped. A connection is gone after 5 s with nothing heard on it
   or 8 frames in a row undelivered; a CLOSE is taken only if the PROBE it sends goes unanswered, so a forged one closes
   nothing. The timers and limits are in `espnow::Settings`; the engine is sans-IO (`espnow::Engine`), with host and
-  fuzz tests, and `espnow::FakeAir` (feature `testing`) has ESP-NOW in one process for tests. Not yet run on a board.
+  fuzz tests, and `espnow::FakeAir` (feature `testing`) has ESP-NOW in one process for tests.
+  Two boards ran a link over it for 5 minutes, once (NB-139).
 - ESP-NOW, from its security review: four forged data frames far ahead no longer black-hole a link, as 4 frames in a
   row far behind move the receiver back too (NB135-1); a second ACCEPT with another id within 3 s of the first closes
   the connection, whatever came on it (NB135-4); frames to an address that never acknowledged one get 2 tries, a
@@ -28,6 +29,10 @@ and the commit that fixed it.
   apart for a minute (NB135-5); the receiver keeps a bit for each of the 64 numbers behind the highest it took, as an
   anti-replay window, so one forged data frame costs the real frame of its number, not the next 63, which on an idle
   link timed the link out (NB135-6); a connection has one KEEPALIVE waiting for the air at most (NB135-I5).
+- ESP-NOW, from its security review's third round: a resync of a connection's data numbers, either way, counts none
+  of the 64 behind the receiver's new place as taken, so 4 data frames forged just past the window no longer make it
+  drop the sender's next 64 real frames as copies, which on an idle link timed the link out; a forged move costs 4
+  real frames at most (NB135-7).
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert
