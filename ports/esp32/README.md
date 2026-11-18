@@ -287,7 +287,9 @@ FEATURES=ble EXAMPLE=espnow_probe ./build.sh     # the radio measured: round tri
 network on, or 11 (`PW_ESPNOW_CHANNEL`), sends each linked board a numbered message every
 second, and logs an `ESPNOW_MESH report` every 10 s. `espnow_probe` measures two boards
 with no access point, at 54 Mbit/s, with one or both on an access point and with Bluetooth on,
-and prints an `ESPNOW_RESULT` line for each mode and size. Neither has run on a board yet.
+and prints an `ESPNOW_RESULT` line for each mode and size. Both have run on an ESP32-C3 and an
+ESP32: the probe in NB-138, and `espnow_mesh` for 5 minutes in NB-139, built before the
+security review's second round; what they measured is in ESP-NOW's Limits section.
 
 ## What it would take to go further
 
