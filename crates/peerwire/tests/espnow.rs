@@ -1283,3 +1283,101 @@ fn sec_a_connect_no_radio_acknowledges_is_given_up_at_once() {
     assert!(control.is_some_and(|t| t < Duration::from_secs(2)), "control: {control:?}");
     assert!(linked.is_some_and(|t| t < Duration::from_secs(3)), "linked within seconds: {linked:?}");
 }
+
+/// X linked with P and Q over two connections bound to them, its radio hearing them alone (a star: P, Q and any
+/// newcomer hear X alone, as in `two_bound_and_two_forged`), in `room`; and X's radio's stats.
+fn linked_with_two(air: &FakeAir, room: &str) -> ((Node, Watch), Node, Node) {
+    let (mut x, wx) = watched(air, A);
+    let (mut p, mut q) = (node(air, B, V1_FRAME), node(air, C, V1_FRAME));
+    let (px, pp, pq) = (x.peer_id(), p.peer_id(), q.peer_id());
+    air.set_hole(Some(Box::new(|from: Mac, to: Mac, _: &[u8]| from != A && to != A)));
+    let mut ev = Vec::new();
+    x.join_room("pw-test", room);
+    p.join_room("pw-test", room);
+    assert!(pump(&mut [&mut x, &mut p], &mut ev, 15, |n| on_radio(n[0], &pp) && on_radio(n[1], &px)), "X and P");
+    q.join_room("pw-test", room);
+    let bound = |n: &[&mut Node]| on_radio(n[0], &pp) && on_radio(n[0], &pq) && n[0].ble_counts().2 == 2;
+    assert!(pump(&mut [&mut x, &mut p, &mut q], &mut ev, 15, bound), "X linked with P and Q, bound");
+    ((x, wx), p, q)
+}
+
+/// A newcomer at `mac` in `room`, joined off the air until its advert's `n` is below `n_x`, so it is the one to
+/// connect to X; still off.
+fn newcomer_below(air: &FakeAir, mac: Mac, room: &str, n_x: u32) -> Node {
+    let (mut y, _) = watched(air, mac);
+    air.set_off(mac, true);
+    loop {
+        y.join_room("pw-test", room);
+        y.poll();
+        if advert_n(air, mac).expect("its advert") < n_x {
+            return y;
+        }
+    }
+}
+
+/// NB135-13 (the security review's repro, inverted): X is linked with P and Q, bound, and has a connect under way to
+/// Z, a member whose board hung: its radio acknowledges the OPENs, as any radio does, and nothing answers them (the
+/// security review's connect was to a copy of an advert from a made-up address, which NB135-12's fix no longer
+/// takes). An OPEN is forged to X from a made-up address whenever X's radio holds fewer than its 4 connections and
+/// one, the connect under way among them, right after X's poll. X's radio counted the connect under way against its
+/// one over, and X's node didn't: the node took the one over without making way, and the radio was silent to every
+/// OPEN after it. Y, whose `n` is below X's, is the one to connect: its OPENs went unanswered and its connect failed
+/// after 10 s (Y linked after 70.4 s in the review's run). How long until X and Y linked, within `secs`; the OPENs
+/// forged, and those X's radio took none of.
+fn a_newcomer_beside_a_connect_under_way(secs: u64) -> (Option<Duration>, u64, u64) {
+    const Z: Mac = [0x02, 0x50, 0x57, 0, 0, 0x1c];
+    let limits = Settings::DEFAULT.limits;
+    let air = FakeAir::new();
+    let room = "espnow-r7-under-way";
+    let ((mut x, wx), mut p, mut q) = linked_with_two(&air, room);
+    let px = x.peer_id();
+    let n_x = advert_n(&air, A).expect("X's advert");
+    // Z's advert, with an `n` above X's; then Z's radio is on and its node never polled again.
+    let (_z, z_advert) = gone_members_advert(&air, Z, room, n_x);
+    air.set_off(Z, false);
+    let mut y = newcomer_below(&air, D, room, n_x);
+    let py = y.peer_id();
+    let mut k = 0;
+    let mut next_advert = Instant::now();
+    let mut forge = |x: &mut Node, others: &mut [&mut Node], ev: &mut Vec<Vec<Event>>| {
+        if Instant::now() >= next_advert {
+            next_advert += Duration::from_millis(100);
+            air.inject(Z, A, &z_advert); // as Z's radio would, but for its hang
+        }
+        poll_all(&mut [x], ev);
+        for _ in wx.stats().connections..limits.connections + 1 {
+            k += 1;
+            forge_open(&air, A, k);
+        }
+        poll_all(others, ev);
+    };
+    let mut ev = Vec::new();
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        forge(&mut x, &mut [&mut p, &mut q], &mut ev);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(opened_to(&air, A, Z), "a connect to Z under way");
+    eprintln!("before Y: X's node {:?}, its radio {} connections", x.ble_counts(), wx.stats().connections);
+    let refused = wx.stats().opens_refused;
+    air.set_off(D, false);
+    let t = Instant::now();
+    let mut linked = None;
+    while t.elapsed() < Duration::from_secs(secs) {
+        forge(&mut x, &mut [&mut p, &mut q, &mut y], &mut ev);
+        if on_radio(&x, &py) && on_radio(&y, &px) {
+            linked = Some(t.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(forge);
+    (linked, k, wx.stats().opens_refused - refused)
+}
+
+#[test]
+fn sec_a_newcomer_beside_a_connect_under_way_links_within_seconds() {
+    let (linked, k, refused) = a_newcomer_beside_a_connect_under_way(15);
+    eprintln!("Y beside X's connect under way: linked after {linked:?}, {k} OPENs forged, {refused} not taken");
+    assert!(linked.is_some_and(|t| t < Duration::from_secs(5)), "linked within seconds: {linked:?}");
+}

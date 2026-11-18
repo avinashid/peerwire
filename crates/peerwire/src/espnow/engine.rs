@@ -400,10 +400,20 @@ impl Engine {
         // node decides, as a Bluetooth stack leaves it to the node: it closes one that makes way for it, such as one
         // an OPEN forged from a made-up address made, or closes this one (NB135-11). Silent there, the radio kept
         // every newcomer out of a node with two such beside two bound, and the newcomer's connect failed after 10 s and
-        // held the advert a minute. Past that one, silence, until the node has decided.
+        // held the advert a minute. Past that one, silence, until the node has decided. The limits count open
+        // connections, as the node's choice of one to make way does: a connect of the node's own under way counted
+        // here, so beside one the node took the one over with room to spare, closing none, and the radio was silent
+        // to every OPEN after it (NB135-13). The node counts its connects under way itself; twice the limits in all is
+        // the backstop.
         let limits = self.settings.limits;
+        let open = self.conns.values().filter(|c| c.open()).count();
         let centrals = self.conns.values().filter(|c| !c.central).count();
-        if self.advert.is_none() || self.conns.len() > limits.connections || centrals > limits.centrals {
+        let all = self.conns.len();
+        if self.advert.is_none()
+            || open > limits.connections
+            || centrals > limits.centrals
+            || all > 2 * limits.connections
+        {
             self.stats.opens_refused += 1;
             return;
         }
@@ -1509,6 +1519,34 @@ mod tests {
             }
         }
         assert_eq!((opens, p.a.stats().connects_unacked), (20, 1), "10 s of OPENs once a radio acknowledged one");
+    }
+
+    /// NB135-13 (the security review's finding): the radio's one OPEN over its limits counted a connect of the node's
+    /// own under way, which the node's choice of a connection to make way for a central doesn't count: beside one,
+    /// the node took the one over with room to spare and closed none, and the radio was silent to every OPEN after it,
+    /// a newcomer's too, whose connect failed. The limits count open connections now: beside a connect under way, a
+    /// radio holding 4 open takes one more for the node to decide on, and is silent past it.
+    #[test]
+    fn sec_the_one_over_counts_open_connections_not_connects_under_way() {
+        let t = Instant::now();
+        let limits = Settings::DEFAULT.limits;
+        let mut b = engine(2, V1_FRAME, t);
+        b.advertise(t, Some(&ADVERT));
+        // A connect of the node's own, to a radio that acknowledges its OPENs and never answers.
+        b.connect(t, device_of(A));
+        while hand(&mut b, t, true).is_some() {}
+        // An OPEN from a made-up address: whether it was answered.
+        let open = |b: &mut Engine, i: u8| {
+            b.handle(t, [0x02, 0, 0, 0, 7, i], &Frame::Open { from: u64::from(i) + 1, rx_max: 250 }.encode());
+            let sent: Vec<(Mac, Vec<u8>)> = std::iter::from_fn(|| hand(b, t, true)).collect();
+            sent.iter().any(|(_, f)| matches!(frame::parse(f), Ok(Frame::Accept { .. })))
+        };
+        for i in 0..limits.connections as u8 {
+            assert!(open(&mut b, i), "{i}: within the limits, the connect under way beside them");
+        }
+        assert!(open(&mut b, 100), "one over the 4 open, for the node to decide on");
+        assert!(!open(&mut b, 101), "and silence past it, until the node has");
+        assert_eq!(b.stats().connections, limits.connections + 2, "the one over, and the connect under way");
     }
 
     #[test]
