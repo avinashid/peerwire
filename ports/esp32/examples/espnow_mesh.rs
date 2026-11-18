@@ -13,7 +13,12 @@
 //! Each board logs its links, the first and every tenth message from each peer, and every 10 s a report: `ESPNOW_MESH
 //! report ...` with its links, messages sent and received and missed, RTTs, the heap, and what the radio counted.
 //! Build it with `FEATURES=espnow EXAMPLE=espnow_mesh ./build.sh`; the node number is the flash's `PWN` record, as
-//! the mesh example reads it, and only names the board in its messages.
+//! the mesh example reads it, and names the board in its messages.
+//!
+//! Two board checks for the security review (NB-135), on `ESPNOW_CHECK` lines: at boot, five frames to an address no
+//! radio has, and how long ESP-NOW took to give up on each (what one failed try holds the air for); and, 30 s after
+//! the first link, node 1 broadcasts a burst of 128 frames of 531 B while node 2 doesn't poll for 2 s, so node 2's
+//! receive queue fills and it logs its heap then (free and largest block).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -23,6 +28,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::sys;
 use log::{info, warn};
+use peerwire_esp::peerwire::espnow::frame::LONGEST;
 use peerwire_esp::peerwire::espnow::Settings;
 use peerwire_esp::peerwire::{Event, Lane, Node, PathKind, PeerId, Policy};
 use peerwire_esp::{clock, config, espnow, heap, identity, wifi, PORT};
@@ -37,6 +43,11 @@ const CHANNEL: Option<&str> = option_env!("PW_ESPNOW_CHANNEL");
 const FIXED_MAC: bool = option_env!("PW_ESPNOW_FIXED_MAC").is_some();
 const V1_ONLY: bool = option_env!("PW_ESPNOW_V1").is_some();
 const SEND_EVERY: Duration = Duration::from_secs(1);
+/// The board checks: when after the first link node 2 stops polling, for how long, and when node 1 bursts.
+const STALL_AT: Duration = Duration::from_secs(29);
+const STALL_FOR: Duration = Duration::from_secs(2);
+const BURST_AT: Duration = Duration::from_secs(30);
+const BURST: usize = 128;
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 const LONG: usize = 2000;
 
@@ -90,6 +101,7 @@ fn run() -> anyhow::Result<()> {
 
     let radio = espnow::radio(!V1_ONLY, Settings::DEFAULT)?;
     let watch = radio.watch();
+    failed_tries();
     let (version, max_frame) = (radio.ether().version(), radio.max_frame());
     info!(
         "ESPNOW_MESH up channel={channel} heard_ch={} mac={} espnow_ver={version} max_frame={max_frame} {}",
@@ -110,6 +122,7 @@ fn run() -> anyhow::Result<()> {
     info!("ESPNOW_MESH joined {APP}/{room} as {} over ESP-NOW alone, {}", short(&node.peer_id()), heap());
 
     let mut from: HashMap<PeerId, Count> = HashMap::new();
+    let (mut first_link, mut stalled, mut burst, mut full_seen) = (None, false, false, 0);
     let (mut next_send, mut next_report, mut sent) = (joined + SEND_EVERY, joined + REPORT_EVERY, 0u32);
     loop {
         node.poll();
@@ -121,14 +134,17 @@ fn run() -> anyhow::Result<()> {
         }
         while let Some(event) = node.try_recv_event() {
             match event {
-                Event::Connected { peer, .. } => info!(
-                    "ESPNOW_MESH linked {} after_ms={} path={:?} links={} {}",
-                    short(&peer),
-                    joined.elapsed().as_millis(),
-                    node.path_kind(&peer),
-                    node.peers().count(),
-                    heap()
-                ),
+                Event::Connected { peer, .. } => {
+                    first_link.get_or_insert_with(Instant::now);
+                    info!(
+                        "ESPNOW_MESH linked {} after_ms={} path={:?} links={} {}",
+                        short(&peer),
+                        joined.elapsed().as_millis(),
+                        node.path_kind(&peer),
+                        node.peers().count(),
+                        heap()
+                    )
+                }
                 Event::Message { peer, data, .. } => {
                     let n = number(&data);
                     let f = from.entry(peer).or_default();
@@ -153,6 +169,32 @@ fn run() -> anyhow::Result<()> {
                 Event::ConnectFailed { peer } => warn!("ESPNOW_MESH link to {} failed", short(&peer)),
                 _ => {}
             }
+        }
+        // The board checks, once, after the first link: node 2 stops polling while node 1 bursts.
+        if let Some(linked) = first_link {
+            if node_n == 2 && !stalled && linked.elapsed() >= STALL_AT {
+                stalled = true;
+                info!("ESPNOW_CHECK stall {} ms, not polling", STALL_FOR.as_millis());
+                std::thread::sleep(STALL_FOR);
+            }
+            if node_n == 1 && !burst && linked.elapsed() >= BURST_AT {
+                burst = true;
+                let t = Instant::now();
+                let sent = espnow::check::burst(BURST, LONGEST);
+                info!("ESPNOW_CHECK burst sent={sent} of {BURST} len={LONGEST} ms={}", t.elapsed().as_millis());
+            }
+        }
+        if let Some(f) = espnow::check::rx_full().filter(|f| f.count != full_seen) {
+            full_seen = f.count;
+            info!(
+                "ESPNOW_CHECK rx_full count={} frames={} bytes={} free={} largest={} {}",
+                f.count,
+                f.frames,
+                f.bytes,
+                f.free,
+                f.largest,
+                heap()
+            );
         }
         let now = Instant::now();
         if now >= next_send {
@@ -222,6 +264,28 @@ fn report(
         r.closed_failing,
         r.events_dropped,
     );
+}
+
+/// The board check of a failed try: five frames to an address no radio has, each timed until ESP-NOW gives up.
+fn failed_tries() {
+    let mut absent = [0u8; 6];
+    unsafe { sys::esp_fill_random(absent.as_mut_ptr().cast(), absent.len()) };
+    absent[0] = (absent[0] & 0xfc) | 0x02;
+    let mut times = Vec::new();
+    for i in 1..=5 {
+        match espnow::check::failed_try(absent, 250, Duration::from_secs(2)) {
+            Ok((took, acked)) => {
+                info!("ESPNOW_CHECK failed_try i={i} us={} acked={}", took.as_micros(), u8::from(acked));
+                times.push(took.as_micros());
+            }
+            Err(e) => warn!("ESPNOW_CHECK failed_try i={i} error={e:#}"),
+        }
+    }
+    times.sort_unstable();
+    if let (Some(min), Some(max)) = (times.first(), times.last()) {
+        let median = times[times.len() / 2];
+        info!("ESPNOW_CHECK failed_try_summary n={} len=250 min_us={min} median_us={median} max_us={max}", times.len());
+    }
 }
 
 /// The ether's own drops, which the node's radio doesn't see.

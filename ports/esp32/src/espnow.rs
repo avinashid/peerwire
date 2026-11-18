@@ -261,6 +261,9 @@ unsafe extern "C" fn on_recv(info: *const sys::esp_now_recv_info_t, data: *const
     let mut rx = lock(&shared.rx);
     if rx.frames.len() >= RX_QUEUE || rx.bytes + frame.len() > RX_BYTES {
         shared.rx_dropped.fetch_add(1, Relaxed);
+        let (frames, bytes) = (rx.frames.len(), rx.bytes);
+        drop(rx);
+        check::full(frames, bytes);
         return;
     }
     rx.bytes += frame.len();
@@ -277,6 +280,9 @@ unsafe extern "C" fn on_send(info: *const sys::esp_now_send_info_t, status: sys:
     let to = if info.is_null() { std::ptr::null() } else { unsafe { (*info).des_addr.cast_const() } };
     let to: Option<Mac> = (!to.is_null()).then(|| unsafe { *(to as *const Mac) });
     let ok = status == sys::esp_now_send_status_t_ESP_NOW_SEND_SUCCESS;
+    if to.is_some_and(|to| check::sent(to, ok)) {
+        return;
+    }
     let mut q = lock(&shared.tx);
     if to.is_some() && to == q.on_air() {
         q.verdict(ok);
@@ -286,4 +292,118 @@ unsafe extern "C" fn on_send(info: *const sys::esp_now_send_info_t, status: sys:
     drop(q);
     shared.more.notify_one();
     shared.wake();
+}
+
+/// Board checks for NB-135's security review, for the `espnow_mesh` example: how long one failed try holds the air,
+/// and the heap with the receive queue full. Not for apps: they send outside the radio's queue.
+pub mod check {
+    use super::{add_peer, lock, Mac};
+    use esp_idf_svc::sys;
+    use peerwire::espnow::frame::{Frame, LONGEST};
+    use peerwire::espnow::BROADCAST;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// The address a [`failed_try`] sends to, and when its callback came and what it said.
+    static TRY: Mutex<Option<(Mac, Option<(Instant, bool)>)>> = Mutex::new(None);
+    /// The heap the first time the receive queue was full in a second, and how often it was.
+    static FULL: Mutex<Option<RxFull>> = Mutex::new(None);
+
+    /// The receive queue full: how often it was (a snapshot at most once a second), its frames and bytes then, and the
+    /// heap's free bytes and largest block then.
+    #[derive(Clone, Copy, Debug)]
+    pub struct RxFull {
+        pub count: u32,
+        pub frames: usize,
+        pub bytes: usize,
+        pub free: u32,
+        pub largest: u32,
+        at: Instant,
+    }
+
+    /// Puts a frame of `len` bytes to `to`, an address no radio in range has, on the air outside the radio's queue, and
+    /// gives how long ESP-NOW took to report it (after the radio's own retries), and whether it was acknowledged: the
+    /// time one failed try holds the air. ESP-NOW must be started; a frame of the radio's on the air delays it.
+    pub fn failed_try(to: Mac, len: usize, within: Duration) -> anyhow::Result<(Duration, bool)> {
+        add_peer(to)?;
+        *lock(&TRY) = Some((to, None));
+        let frame = vec![0x5a; len.clamp(1, LONGEST)];
+        let start = Instant::now();
+        let r = unsafe { sys::esp_now_send(to.as_ptr(), frame.as_ptr(), frame.len()) };
+        let mut done = None;
+        while r == sys::ESP_OK && done.is_none() && start.elapsed() < within {
+            std::thread::sleep(Duration::from_millis(1));
+            done = lock(&TRY).and_then(|(_, d)| d);
+        }
+        *lock(&TRY) = None;
+        unsafe { sys::esp_now_del_peer(to.as_ptr()) };
+        sys::esp!(r)?;
+        let (at, ok) = done.ok_or_else(|| anyhow::anyhow!("no send callback within {within:?}"))?;
+        Ok((at.saturating_duration_since(start), ok))
+    }
+
+    /// The send callback's word for `to`: taken if a [`failed_try`] waits for it.
+    pub(super) fn sent(to: Mac, ok: bool) -> bool {
+        let mut t = lock(&TRY);
+        match &mut *t {
+            Some((m, done @ None)) if *m == to => {
+                *done = Some((Instant::now(), ok));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The receive queue was full with `frames` and `bytes`: a snapshot of the heap, at most once a second.
+    pub(super) fn full(frames: usize, bytes: usize) {
+        let mut f = lock(&FULL);
+        let count = f.map_or(0, |f| f.count) + 1;
+        if f.is_some_and(|f| f.at.elapsed() < Duration::from_secs(1)) {
+            if let Some(f) = f.as_mut() {
+                f.count = count;
+            }
+            return;
+        }
+        let (free, largest) = unsafe {
+            (sys::esp_get_free_heap_size(), sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_DEFAULT) as u32)
+        };
+        *f = Some(RxFull { count, frames, bytes, free, largest, at: Instant::now() });
+    }
+
+    /// The last [`RxFull`] snapshot, if the receive queue has been full.
+    pub fn rx_full() -> Option<RxFull> {
+        *lock(&FULL)
+    }
+
+    /// Broadcasts `n` frames of `len` bytes (at most the longest the parser takes) that every board's receive path
+    /// queues but no connection takes, outside the radio's queue: a burst to fill a board's receive queue. How many
+    /// ESP-NOW took.
+    pub fn burst(n: usize, len: usize) -> usize {
+        let len = len.clamp(32, LONGEST);
+        let payload = vec![0x5a; len - peerwire::espnow::frame::DATA_HEADER];
+        let total = payload.len() as u16;
+        let mut sent = 0;
+        for i in 0..n {
+            let f = Frame::Data {
+                to: 0x0b75_7257_0000_0000 | i as u64,
+                seq: 0,
+                first: true,
+                last: true,
+                total,
+                payload: &payload,
+            };
+            let f = f.encode();
+            for _ in 0..20 {
+                match unsafe { sys::esp_now_send(BROADCAST.as_ptr(), f.as_ptr(), f.len()) } {
+                    sys::ESP_OK => {
+                        sent += 1;
+                        break;
+                    }
+                    sys::ESP_ERR_ESPNOW_NO_MEM => std::thread::sleep(Duration::from_millis(1)),
+                    _ => break,
+                }
+            }
+        }
+        sent
+    }
 }
