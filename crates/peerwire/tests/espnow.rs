@@ -1456,3 +1456,43 @@ fn sec_forged_opens_that_keep_a_newcomer_out_cost_seconds_once_they_stop() {
     assert!(control.is_some_and(|t| t < Duration::from_secs(3)), "control: {control:?}");
     assert!(linked.is_some_and(|t| t < Duration::from_secs(20)), "within seconds of the forger's end: {linked:?}");
 }
+
+/// NB135-14 (the security review's repro, inverted): 8 data frames are forged to the opener with the numbers of the
+/// accepter's room proof right after the ACCEPT (NB135-10's repro), so the opener's connection doesn't prove the room;
+/// then, 1.2 s on, past its `GRACE`, `opens` OPENs are forged to the opener from made-up addresses. With two, the
+/// second's central made way, and the oldest connection that hadn't proven the room was the opener's own: it closed
+/// holding the accepter's advert a minute (linked again after 61.4 s, against 6.3 s with the 8 frames alone). A forged
+/// central now makes way before a connection of the node's own, which misses its deadline and holds the advert 1 to
+/// 4 s, as does one of its own that makes way. Whether linked again within `secs`, and how long from the first frame.
+fn own_connect_mid_proof_and_forged_opens(opens: u64, secs: u64) -> (bool, Duration) {
+    let air = FakeAir::new();
+    let (mut a, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    let room = format!("espnow-r7-made-way-{opens}");
+    a.join_room("pw-test", &room);
+    b.join_room("pw-test", &room);
+    assert!(until_accepted(&mut a, &mut b, &air, 15), "an ACCEPT");
+    let (accepter, opener_id, _) = overheard(&air).0[0];
+    let opener = other(accepter);
+    for seq in 1..=8 {
+        let f = frame::Frame::Data { to: opener_id, seq, first: true, last: true, total: 1, payload: &[0x01] };
+        air.inject(accepter, opener, &f.encode());
+    }
+    let t = Instant::now();
+    let mut ev = Vec::new();
+    pump_ms(&mut [&mut a, &mut b], &mut ev, 1_200);
+    for k in 0..opens {
+        forge_open(&air, opener, 100 + k);
+    }
+    let linked = pump(&mut [&mut a, &mut b], &mut ev, secs, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa));
+    (linked, t.elapsed())
+}
+
+#[test]
+fn sec_frames_forged_with_the_numbers_of_the_proof_and_two_forged_opens_cost_seconds() {
+    let (l0, t0) = own_connect_mid_proof_and_forged_opens(0, 15);
+    let (l2, t2) = own_connect_mid_proof_and_forged_opens(2, 15);
+    eprintln!("8 proof numbers taken: linked {l0} after {t0:?}; and then 2 forged OPENs: linked {l2} after {t2:?}");
+    assert!(l0 && t0 < Duration::from_secs(10), "the 8 frames alone: {t0:?}");
+    assert!(l2 && t2 < Duration::from_secs(10), "linked again within seconds: {t2:?}");
+}
