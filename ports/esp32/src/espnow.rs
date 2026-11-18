@@ -60,10 +60,11 @@ struct Shared {
     rx: Mutex<Rx>,
     waker: Mutex<Option<Waker>>,
     /// Frames dropped as the receive queue was full, or as not ours (another app's, or too long to be ours); tries
-    /// esp_now_send refused.
+    /// esp_now_send refused; send callbacks for no frame on the air (NB135-I1).
     rx_dropped: AtomicU32,
     not_ours: AtomicU32,
     refused: AtomicU32,
+    stray: AtomicU32,
 }
 
 /// Frames received, waiting for the node, and their bytes.
@@ -111,6 +112,7 @@ impl EspNowEther {
             rx_dropped: AtomicU32::new(0),
             not_ours: AtomicU32::new(0),
             refused: AtomicU32::new(0),
+            stray: AtomicU32::new(0),
         });
         sys::esp!(unsafe { sys::esp_now_init() })?;
         sys::esp!(unsafe { sys::esp_now_register_recv_cb(Some(on_recv)) })?;
@@ -133,8 +135,8 @@ impl EspNowEther {
         self.version
     }
 
-    /// Frames dropped as the receive queue was full, frames dropped as not ours, and tries esp_now_send refused.
-    pub fn dropped(&self) -> (u32, u32, u32) {
+    /// [`dropped`].
+    pub fn dropped(&self) -> (u32, u32, u32, u32) {
         dropped()
     }
 }
@@ -178,10 +180,11 @@ impl Ether for EspNowEther {
     }
 }
 
-/// Since ESP-NOW started: frames dropped as the receive queue was full, frames dropped as not ours, and tries
-/// esp_now_send refused.
-pub fn dropped() -> (u32, u32, u32) {
-    SHARED.get().map_or((0, 0, 0), |s| (s.rx_dropped.load(Relaxed), s.not_ours.load(Relaxed), s.refused.load(Relaxed)))
+/// Since ESP-NOW started: frames dropped as the receive queue was full, frames dropped as not ours, tries
+/// esp_now_send refused, and send callbacks that named no frame on the air.
+pub fn dropped() -> (u32, u32, u32, u32) {
+    let Some(s) = SHARED.get() else { return (0, 0, 0, 0) };
+    (s.rx_dropped.load(Relaxed), s.not_ours.load(Relaxed), s.refused.load(Relaxed), s.stray.load(Relaxed))
 }
 
 /// The radio for a node: [`EspNowEther::start`]`(v2)` under `peerwire::espnow::EspNow`.
@@ -261,10 +264,21 @@ unsafe extern "C" fn on_recv(info: *const sys::esp_now_recv_info_t, data: *const
     shared.wake();
 }
 
-/// ESP-NOW's send callback, on the Wi-Fi task: the verdict on the frame on the air, and the TX thread woken.
-unsafe extern "C" fn on_send(_info: *const sys::esp_now_send_info_t, status: sys::esp_now_send_status_t) {
+/// ESP-NOW's send callback, on the Wi-Fi task: the verdict on the frame on the air, and the TX thread woken. Only a
+/// callback that names the address of the frame on the air is its verdict: a late one, for a try already given up,
+/// or one for a frame sent outside the queue, isn't (NB135-I1).
+unsafe extern "C" fn on_send(info: *const sys::esp_now_send_info_t, status: sys::esp_now_send_status_t) {
     let Some(shared) = SHARED.get() else { return };
-    lock(&shared.tx).verdict(status == sys::esp_now_send_status_t_ESP_NOW_SEND_SUCCESS);
+    let to = if info.is_null() { std::ptr::null() } else { unsafe { (*info).des_addr.cast_const() } };
+    let to: Option<Mac> = (!to.is_null()).then(|| unsafe { *(to as *const Mac) });
+    let ok = status == sys::esp_now_send_status_t_ESP_NOW_SEND_SUCCESS;
+    let mut q = lock(&shared.tx);
+    if to.is_some() && to == q.on_air() {
+        q.verdict(ok);
+    } else {
+        shared.stray.fetch_add(1, Relaxed);
+    }
+    drop(q);
     shared.more.notify_one();
     shared.wake();
 }

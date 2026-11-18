@@ -226,8 +226,8 @@ fn report(
 
 /// The ether's own drops, which the node's radio doesn't see.
 fn radio_drops() -> String {
-    let (rx, not_ours, refused) = espnow::dropped();
-    format!("rx_dropped={rx} not_ours={not_ours} send_refused={refused}")
+    let (rx, not_ours, refused, stray) = espnow::dropped();
+    format!("rx_dropped={rx} not_ours={not_ours} send_refused={refused} stray_callbacks={stray}")
 }
 
 /// The number in "espnow #N from node M".
