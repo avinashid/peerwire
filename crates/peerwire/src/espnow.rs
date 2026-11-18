@@ -41,7 +41,10 @@ pub type Mac = [u8; 6];
 /// The broadcast address: every ESP-NOW radio on the channel hears a frame sent to it.
 pub const BROADCAST: Mac = [0xff; 6];
 
-/// How an [`EspNow`] radio behaves; [`Settings::DEFAULT`] until a board run says otherwise.
+/// How an [`EspNow`] radio behaves; [`Settings::DEFAULT`], which the first board run kept (NB-138: an ESP32-C3 and an
+/// ESP32 on channel 11, ESP-NOW v2 at both ends, at 1 Mbit/s): with Bluetooth off, no frame was lost, and round trips
+/// took 4 to 28 ms (p50, 32 to 1470 B), 84 ms at p99 and 141 ms at most, far inside a 1 s keepalive, a 5 s timeout
+/// and 4 tries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
     /// What the radio holds at once ([`Radio::limits`]).
