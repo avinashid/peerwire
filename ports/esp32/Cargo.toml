@@ -26,6 +26,9 @@ nostr = ["peerwire/nostr", "dep:ring"]
 # Bluetooth LE on ESP-IDF's NimBLE (NB-110): the ble module's radio driver for a Node. ESP-IDF must be built with
 # sdkconfig.ble too: build.sh does it.
 ble = ["dep:esp32-nimble", "peerwire/ble"]
+# ESP-NOW (NB-135): the espnow module's ether for `peerwire::espnow`, a node's radio over ESP-NOW frames between boards
+# on one Wi-Fi channel, with no network and no Bluetooth.
+espnow = ["peerwire/espnow"]
 
 # The port's mesh test: QEMU's emulated chips, or a board on Wi-Fi (run.sh, wifi.sh, room.sh).
 [[example]]
@@ -60,6 +63,11 @@ required-features = ["nostr"]
 [[example]]
 name = "espnow_probe"
 required-features = ["ble"]
+
+# Boards that link with each other over ESP-NOW alone (NB-135): `FEATURES=espnow EXAMPLE=espnow_mesh ./build.sh`.
+[[example]]
+name = "espnow_mesh"
+required-features = ["espnow"]
 
 [profile.release]
 opt-level = "s"

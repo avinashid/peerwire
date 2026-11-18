@@ -64,11 +64,47 @@ fn join_until(
 /// reach boards on the same channel with no access point (NB-135). [`connect`] joins a network later, and the radio
 /// then follows that network's channel.
 pub fn start_on_channel(modem: Modem<'static>, sysloop: EspSystemEventLoop, channel: u8) -> anyhow::Result<Wifi> {
+    start(modem, sysloop, channel, None)
+}
+
+/// [`start_on_channel`] with the station's MAC address `mac` in place of the chip's own, such as a [`random_mac`]:
+/// ESP-NOW frames carry the sender's address in the clear, so a board with the chip's fixed one can be followed from
+/// boot to boot by anyone in range. A network the station joins sees `mac` too.
+pub fn start_on_channel_as(
+    modem: Modem<'static>,
+    sysloop: EspSystemEventLoop,
+    channel: u8,
+    mac: [u8; 6],
+) -> anyhow::Result<Wifi> {
+    start(modem, sysloop, channel, Some(mac))
+}
+
+/// A new random MAC address, locally administered and unicast, for [`start_on_channel_as`]. Drawn like a new identity
+/// ([`identity::load_or_create`](crate::identity::load_or_create)), from the SAR ADC's noise, so call it before Wi-Fi
+/// or Bluetooth is set up: after, it is an error.
+pub fn random_mac() -> anyhow::Result<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    crate::identity::random(&mut mac)?;
+    // Locally administered (bit 1), not a group address (bit 0).
+    mac[0] = (mac[0] & 0xfc) | 0x02;
+    Ok(mac)
+}
+
+fn start(
+    modem: Modem<'static>,
+    sysloop: EspSystemEventLoop,
+    channel: u8,
+    mac: Option<[u8; 6]>,
+) -> anyhow::Result<Wifi> {
     let nvs = crate::nvs()?;
     let mut w = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop)?;
     // An open network's auth method, or ESP-IDF warns that an empty password can't reach a protected one.
     let none = ClientConfiguration { auth_method: AuthMethod::None, ..Default::default() };
     w.set_configuration(&Configuration::Client(none))?;
+    if let Some(mac) = mac {
+        // Only while the station isn't started.
+        sys::esp!(unsafe { sys::esp_wifi_set_mac(sys::wifi_interface_t_WIFI_IF_STA, mac.as_ptr()) })?;
+    }
     quiet();
     w.start()?;
     sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;

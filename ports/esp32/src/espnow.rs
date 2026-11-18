@@ -1,0 +1,249 @@
+//! ESP-NOW (feature `espnow`, NB-135): the ESP32's [`Ether`] for `peerwire::espnow`, so a node links with boards in
+//! range over ESP-NOW frames, with no Wi-Fi network and no Bluetooth (docs/concepts/espnow.md).
+//!
+//! Wi-Fi must be started as a station first and stay started for as long as the radio runs: on no network
+//! ([`wifi::start_on_channel`](crate::wifi::start_on_channel)), when every board in the room must be on the same
+//! channel, or on one ([`wifi::join`](crate::wifi::join)), when ESP-NOW follows the network's channel. Frames go out
+//! one at a time from a thread of their own, each tried up to [`TRIES`] times while the receiving radio doesn't
+//! acknowledge it (on top of the radio's own retries), as ESP-NOW's send callback can't be matched to a frame with
+//! several in flight; frames received wait in a queue of [`RX_QUEUE`] for the node, and more are dropped.
+//!
+//! ```no_run
+//! use peerwire_esp::espnow;
+//! use peerwire_esp::peerwire::espnow::Settings;
+//! use peerwire_esp::peerwire::{Node, PathKind, Policy};
+//!
+//! # fn main() -> anyhow::Result<()> {
+//! let p = esp_idf_svc::hal::peripherals::Peripherals::take()?;
+//! let sysloop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
+//! let _wifi = peerwire_esp::wifi::start_on_channel(p.modem, sysloop, 11)?; // kept for as long as the radio runs
+//! let radio = espnow::radio(true, Settings::DEFAULT)?;
+//! let mut node = Node::builder()
+//!     .config(peerwire_esp::config())
+//!     .policy(Policy::new([PathKind::Bluetooth]))
+//!     .bluetooth(radio)
+//!     .bind("127.0.0.1:4040")?;
+//! node.join_room("my-app", "kitchen"); // links with boards nearby on channel 11
+//! # Ok(())
+//! # }
+//! ```
+
+use std::collections::VecDeque;
+use std::ffi::c_int;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::task::Waker;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail};
+use esp_idf_svc::sys;
+use log::{info, warn};
+use peerwire::espnow::{EspNow, Ether, Mac, PeerTable, Settings, Touch, TxQueue, BROADCAST, V1_FRAME, V2_FRAME};
+
+/// Frames waiting to go, or with a verdict the node hasn't taken.
+pub const TX_QUEUE: usize = 32;
+/// Tries of a unicast frame the receiving radio doesn't acknowledge.
+pub const TRIES: u8 = 4;
+/// Frames received waiting for the node.
+pub const RX_QUEUE: usize = 32;
+/// Entries this driver keeps in ESP-NOW's peer table (20 at most, with the broadcast address).
+pub const PEERS: usize = 16;
+/// A frame with no send callback after this long failed that try.
+const VERDICT_WITHIN: Duration = Duration::from_millis(200);
+const TX_STACK: usize = 4 * 1024;
+
+/// What the callbacks, the TX thread and the node share. ESP-NOW's callbacks take no argument: it is a static.
+struct Shared {
+    tx: Mutex<TxQueue>,
+    /// Wakes the TX thread: a frame queued, or a verdict in.
+    more: Condvar,
+    rx: Mutex<VecDeque<(Mac, Vec<u8>)>>,
+    waker: Mutex<Option<Waker>>,
+    /// Frames dropped as the receive queue was full; tries esp_now_send refused.
+    rx_dropped: AtomicU32,
+    refused: AtomicU32,
+}
+
+static SHARED: OnceLock<Shared> = OnceLock::new();
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Shared {
+    fn wake(&self) {
+        if let Some(w) = &*lock(&self.waker) {
+            w.wake_by_ref();
+        }
+    }
+}
+
+/// ESP-NOW on this chip, as `peerwire::espnow` takes it. One at a time: ESP-NOW has one set of callbacks.
+pub struct EspNowEther {
+    shared: &'static Shared,
+    peers: PeerTable,
+    max_frame: usize,
+    version: u32,
+}
+
+impl EspNowEther {
+    /// Starts ESP-NOW on the started Wi-Fi station, with frames of up to 1470 bytes if `v2` and the chip has ESP-NOW
+    /// v2 (a connection takes the shorter of its two ends'), else 250. Fails if ESP-NOW is started already.
+    pub fn start(v2: bool) -> anyhow::Result<EspNowEther> {
+        if STARTED.swap(true, Relaxed) {
+            bail!("ESP-NOW is started already");
+        }
+        let shared = SHARED.get_or_init(|| Shared {
+            tx: Mutex::new(TxQueue::new(TX_QUEUE, TRIES)),
+            more: Condvar::new(),
+            rx: Mutex::new(VecDeque::new()),
+            waker: Mutex::new(None),
+            rx_dropped: AtomicU32::new(0),
+            refused: AtomicU32::new(0),
+        });
+        sys::esp!(unsafe { sys::esp_now_init() })?;
+        sys::esp!(unsafe { sys::esp_now_register_recv_cb(Some(on_recv)) })?;
+        sys::esp!(unsafe { sys::esp_now_register_send_cb(Some(on_send)) })?;
+        add_peer(BROADCAST)?;
+        let mut version = 0u32;
+        sys::esp!(unsafe { sys::esp_now_get_version(&mut version) })?;
+        let max_frame = if v2 && version >= 2 { V2_FRAME } else { V1_FRAME };
+        std::thread::Builder::new()
+            .name("espnow-tx".into())
+            .stack_size(TX_STACK)
+            .spawn(move || transmit(shared))
+            .map_err(|e| anyhow!("the ESP-NOW thread: {e}"))?;
+        info!("ESP-NOW v{version} up, frames of up to {max_frame} B");
+        Ok(EspNowEther { shared, peers: PeerTable::new(PEERS), max_frame, version })
+    }
+
+    /// ESP-NOW's version on this chip: 1, or 2 with frames of up to 1470 bytes.
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Frames dropped as the receive queue was full, and tries esp_now_send refused.
+    pub fn dropped(&self) -> (u32, u32) {
+        (self.shared.rx_dropped.load(Relaxed), self.shared.refused.load(Relaxed))
+    }
+}
+
+impl Ether for EspNowEther {
+    fn send(&mut self, to: Mac, frame: &[u8]) -> bool {
+        if let Touch::Add { evict } = self.peers.touch(to) {
+            if let Some(old) = evict {
+                unsafe { sys::esp_now_del_peer(old.as_ptr()) };
+            }
+            // A frame to an address ESP-NOW won't take still goes in the queue, and fails there: the engine hears so.
+            if let Err(e) = add_peer(to) {
+                warn!("ESP-NOW: {e}");
+                self.peers.forget(to);
+            }
+        }
+        let taken = lock(&self.shared.tx).push(to, frame);
+        if taken {
+            self.shared.more.notify_one();
+        }
+        taken
+    }
+
+    fn done(&mut self) -> Option<bool> {
+        lock(&self.shared.tx).outcome()
+    }
+
+    fn recv(&mut self) -> Option<(Mac, Vec<u8>)> {
+        lock(&self.shared.rx).pop_front()
+    }
+
+    fn max_frame(&self) -> usize {
+        self.max_frame
+    }
+
+    fn set_waker(&mut self, waker: Waker) {
+        *lock(&self.shared.waker) = Some(waker);
+    }
+}
+
+/// Frames dropped as the receive queue was full, and tries esp_now_send refused, since ESP-NOW started.
+pub fn dropped() -> (u32, u32) {
+    SHARED.get().map_or((0, 0), |s| (s.rx_dropped.load(Relaxed), s.refused.load(Relaxed)))
+}
+
+/// The radio for a node: [`EspNowEther::start`]`(v2)` under `peerwire::espnow::EspNow`.
+pub fn radio(v2: bool, settings: Settings) -> anyhow::Result<EspNow<EspNowEther>> {
+    Ok(EspNow::new(EspNowEther::start(v2)?, settings))
+}
+
+fn add_peer(mac: Mac) -> anyhow::Result<()> {
+    let mut peer: sys::esp_now_peer_info_t = unsafe { std::mem::zeroed() };
+    peer.peer_addr = mac;
+    // 0: whatever channel the station is on, so a peer stays reachable when the station joins a network.
+    peer.channel = 0;
+    peer.ifidx = sys::wifi_interface_t_WIFI_IF_STA;
+    // Unencrypted: the node seals what crosses (and ESP-NOW encrypts for a handful of peers only).
+    peer.encrypt = false;
+    match unsafe { sys::esp_now_add_peer(&peer) } {
+        sys::ESP_OK | sys::ESP_ERR_ESPNOW_EXIST => Ok(()),
+        e => Err(anyhow!("esp_now_add_peer: {e}")),
+    }
+}
+
+/// The TX thread: the next frame on the air once the last has its verdict, and a try with no callback expired.
+fn transmit(shared: &'static Shared) {
+    let mut q = lock(&shared.tx);
+    loop {
+        let now = Instant::now();
+        q.expire(now, VERDICT_WITHIN);
+        let Some((to, frame)) = q.next(now) else {
+            q = shared.more.wait_timeout(q, VERDICT_WITHIN / 2).unwrap_or_else(PoisonError::into_inner).0;
+            continue;
+        };
+        // Not under the lock: the send callback, on the Wi-Fi task, takes it.
+        let frame = frame.to_vec();
+        drop(q);
+        let r = unsafe { sys::esp_now_send(to.as_ptr(), frame.as_ptr(), frame.len()) };
+        q = lock(&shared.tx);
+        if r != sys::ESP_OK {
+            shared.refused.fetch_add(1, Relaxed);
+            q.verdict(false);
+            drop(q);
+            shared.wake();
+            if r == sys::ESP_ERR_ESPNOW_NO_MEM {
+                // ESP-NOW's own queue is full: let the Wi-Fi task drain it.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            q = lock(&shared.tx);
+        }
+    }
+}
+
+/// ESP-NOW's receive callback, on the Wi-Fi task: queues the frame for the node, or drops it if the queue is full.
+unsafe extern "C" fn on_recv(info: *const sys::esp_now_recv_info_t, data: *const u8, len: c_int) {
+    let Some(shared) = SHARED.get() else { return };
+    if info.is_null() || data.is_null() || len <= 0 || len as usize > V2_FRAME {
+        return;
+    }
+    let src = unsafe { (*info).src_addr };
+    if src.is_null() {
+        return;
+    }
+    let from: Mac = unsafe { *(src as *const Mac) };
+    let frame = unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec();
+    let mut rx = lock(&shared.rx);
+    if rx.len() >= RX_QUEUE {
+        shared.rx_dropped.fetch_add(1, Relaxed);
+        return;
+    }
+    rx.push_back((from, frame));
+    drop(rx);
+    shared.wake();
+}
+
+/// ESP-NOW's send callback, on the Wi-Fi task: the verdict on the frame on the air, and the TX thread woken.
+unsafe extern "C" fn on_send(_info: *const sys::esp_now_send_info_t, status: sys::esp_now_send_status_t) {
+    let Some(shared) = SHARED.get() else { return };
+    lock(&shared.tx).verdict(status == sys::esp_now_send_status_t_ESP_NOW_SEND_SUCCESS);
+    shared.more.notify_one();
+    shared.wake();
+}
