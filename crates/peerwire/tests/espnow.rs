@@ -1,7 +1,7 @@
 //! NB-135: rooms over ESP-NOW, on stations in one process (`espnow::FakeAir`). Nodes with no carrier but an ESP-NOW
 //! radio find each other, prove the room and link over it, also when frames are lost or a v1 radio meets a v2 one; a
 //! forged CLOSE, sent with ids overheard on the air, closes nothing.
-use peerwire::espnow::{frame, EspNow, FakeAir, Mac, Settings, BROADCAST, V1_FRAME, V2_FRAME};
+use peerwire::espnow::{frame, EspNow, FakeAir, Mac, Settings, Watch, BROADCAST, V1_FRAME, V2_FRAME};
 use peerwire::{Config, Event, Lane, Node, PathKind, PeerId, Policy, Status};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -221,23 +221,29 @@ fn sec_a_forged_resync_timeline() {
     assert_eq!((sa.connections, sb.connections), (1, 1));
 }
 
+/// A node as [`node`]'s, with quick timers: a keepalive after 500 ms of quiet, and a link gone after 3 s with nothing
+/// heard; and its radio's stats.
+fn quick_node(air: &FakeAir, mac: Mac) -> (Node, Watch) {
+    let radio = EspNow::new(air.ether(mac, V1_FRAME), Settings::DEFAULT);
+    let watch = radio.watch();
+    let quick =
+        Config { idle_timeout: Duration::from_secs(3), keepalive: Duration::from_millis(500), ..Config::default() };
+    let node = Node::builder()
+        .bluetooth(radio)
+        .policy(Policy::new([PathKind::Bluetooth]))
+        .config(quick)
+        .stun_servers(Vec::<String>::new())
+        .bind("127.0.0.1:0")
+        .unwrap();
+    (node, watch)
+}
+
 /// NB135-1: a link whose radio connection carries nothing to one end while the radio still has it up (whatever moved
 /// its numbers) times out there, and that end closes the connection: the link comes back on a new one, with new ids.
 #[test]
 fn sec_a_link_stuck_on_its_radio_connection_comes_back_on_a_new_one() {
     let air = FakeAir::new();
-    let quick =
-        Config { idle_timeout: Duration::from_secs(3), keepalive: Duration::from_millis(500), ..Config::default() };
-    let mk = |mac| {
-        Node::builder()
-            .bluetooth(EspNow::new(air.ether(mac, V1_FRAME), Settings::DEFAULT))
-            .policy(Policy::new([PathKind::Bluetooth]))
-            .config(quick.clone())
-            .stun_servers(Vec::<String>::new())
-            .bind("127.0.0.1:0")
-            .unwrap()
-    };
-    let (mut a, mut b) = (mk(A), mk(B));
+    let ((mut a, _), (mut b, _)) = (quick_node(&air, A), quick_node(&air, B));
     let (pa, pb) = (a.peer_id(), b.peer_id());
     a.join_room("pw-test", "espnow-stuck");
     b.join_room("pw-test", "espnow-stuck");
@@ -328,4 +334,55 @@ fn sec_one_forged_accept_after_the_challenge_costs_seconds() {
     let opened =
         air.heard().iter().filter(|(_, _, f)| matches!(frame::parse(f), Ok(frame::Frame::Accept { .. }))).count();
     assert!(opened >= 2, "on a new connection");
+}
+
+/// NB135-6 (the security review's repros, inverted): one data frame forged 64 numbers ahead, with the ids and numbers
+/// overheard, to one end of an idle link, costs that end the real frame of its number, not the next 63. Those are the
+/// session's keepalives on an idle link, so the link timed out, and came back a minute later if that end was the
+/// accepter. Now nothing times out: with quick timers (a keepalive per 500 ms, gone after 3 s) 63 keepalives lost
+/// would be 31 s.
+fn one_forged_frame_on_an_idle_link(to_accepter: bool) {
+    let air = FakeAir::new();
+    let ((mut a, wa), (mut b, wb)) = (quick_node(&air, A), quick_node(&air, B));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    let room = if to_accepter { "espnow-idle-accepter" } else { "espnow-idle-opener" };
+    a.join_room("pw-test", room);
+    b.join_room("pw-test", room);
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    pump(&mut [&mut a, &mut b], &mut ev, 1, |_| false);
+    let (accepts, last) = overheard(&air);
+    let (accepter, opener_id, accepter_id) = *accepts.last().unwrap();
+    let opener = if accepter == A { B } else { A };
+    let (from, to, id) = if to_accepter { (opener, accepter, accepter_id) } else { (accepter, opener, opener_id) };
+    let seq = last.get(&id).copied().unwrap_or(0).wrapping_add(64);
+    let f = frame::Frame::Data { to: id, seq, first: true, last: true, total: 1, payload: &[0] };
+    let old = |w: &Watch| w.stats().old;
+    let (old_a, old_b) = (old(&wa), old(&wb));
+    air.inject(from, to, &f.encode());
+    let mut after = Vec::new();
+    pump(&mut [&mut a, &mut b], &mut after, 6, |_| false);
+    let churn = |e: &&Event| matches!(e, Event::Disconnected { .. } | Event::Connected { .. });
+    assert_eq!(after.iter().flatten().filter(churn).count(), 0, "no link lost: {after:?}");
+    assert!(on_radio(&a, &pb) && on_radio(&b, &pa));
+    let lost = old(&wa) - old_a + old(&wb) - old_b;
+    eprintln!(
+        "idle link, one forged frame to the {}: real frames dropped as old {lost}",
+        if to_accepter { "accepter" } else { "opener" }
+    );
+    assert!(lost <= 1, "the real frame of the forged one's number at most: {lost}");
+    a.send(&pb, Lane::Reliable, b"after the forged frame").unwrap();
+    b.send(&pa, Lane::Reliable, b"and back").unwrap();
+    pump(&mut [&mut a, &mut b], &mut after, 2, |_| false);
+    assert!(got(&after[1], pa, b"after the forged frame") && got(&after[0], pb, b"and back"));
+}
+
+#[test]
+fn sec_one_forged_frame_to_the_accepter_of_an_idle_link_costs_one_frame() {
+    one_forged_frame_on_an_idle_link(true);
+}
+
+#[test]
+fn sec_one_forged_frame_to_the_opener_of_an_idle_link_costs_one_frame() {
+    one_forged_frame_on_an_idle_link(false);
 }

@@ -108,12 +108,13 @@ pub struct Stats {
     pub malformed: u64,
     /// Frames for no connection of this end's: a stale or forged id, or another address.
     pub unknown: u64,
-    /// Data frames dropped as already taken or behind, and as too far ahead; and how often the receiver took up a
-    /// sender's place anew after frames too far ahead in a row.
+    /// Data frames dropped as already taken or too far behind, and as too far ahead; and how often the receiver took
+    /// up a sender's place anew after frames too far off in a row.
     pub old: u64,
     pub ahead: u64,
     pub resyncs: u64,
-    /// Data frames missed, as the numbers say, and frames of a value whose start was lost.
+    /// Jumps in the numbers taken (frames missed, or still to come), and parts of a value that weren't the next one
+    /// (its start or a part was lost) and so were dropped.
     pub gaps: u64,
     pub orphans: u64,
     /// Opens not taken (not advertising, or no room), and CLOSEs sent for accepts no open waits for.

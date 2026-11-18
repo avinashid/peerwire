@@ -76,11 +76,14 @@ end's MAC address, this end's id), and every frame on it carries the receiver's 
   data frames (three on v1, one on v2), numbered in order, the first and last flagged, each with the value's length.
   The receiver joins them, and drops a value that lost a part or whose parts don't add up to its length; the node's
   framing then drops the message the value was part of, and the reliable lane sends it again.
-- **Numbers:** the receiver takes a data frame up to 64 numbers past the last one it took (the frames between are
-  lost), and drops one it took already or that is behind (a copy: the sender's radio didn't hear the acknowledgement
-  and sent it again). One further off, ahead or more than 64 behind, is dropped, unless 4 come in a row: then the
-  receiver takes up the sender's numbers anew, whether the sender lost more than 64 frames or frames forged far
-  ahead (or behind) moved the receiver there and the real ones are now far behind (or ahead) it (NB135-1).
+- **Numbers:** the receiver takes a data frame up to 64 numbers past the highest one it took, and one up to 64
+  behind it that it hasn't taken yet, once: it keeps a bit for each of the 64 behind, as DTLS's and IPsec's
+  anti-replay windows do (NB135-6). It drops one it took already (a copy: the sender's radio didn't hear the
+  acknowledgement and sent it again). One further off, ahead or more than 64 behind, is dropped, unless 4 come in a
+  row: then the receiver takes up the sender's numbers anew, whether the sender lost more than 64 frames or frames
+  forged far ahead (or behind) moved the receiver there and the real ones are now far behind (or ahead) it (NB135-1).
+  A value's parts are joined in order, each the number after the last part taken; a value's first part starts a new
+  one.
 - **Liveness:** a connection with nothing sent on it for 1 s sends a KEEPALIVE; one with nothing heard on it for 5 s
   is gone (`Disconnected`), and so is one whose last 8 frames the radio couldn't deliver. A connect not accepted within
   10 s fails (`ConnectFailed`), as the node's radio contract asks.
@@ -158,7 +161,7 @@ which could jam the channel anyway. What such an attacker can do, frame by frame
 | CLOSE | nothing, unless the attacker also keeps the other end's answer to the PROBE from arriving (jamming): then a close and a reconnect |
 | PROBE | a KEEPALIVE in answer, one per 100 ms per connection |
 | KEEPALIVE | keeps a connection whose peer left open for as long as it keeps sending: the node closes it once its link times out and no proof of a room member has come over it for 60 s, as over Bluetooth |
-| DATA, in the window | a value for the node, which drops it (sealed, or not the room's), and the next frames, up to 64, dropped as behind it: a lost value or two, which the reliable lane sends again |
+| DATA, in the window | a value for the node, which drops it (sealed, or not the room's); the real frame with its number is dropped as a copy, and the value it is part of, and so is the value being joined if the forged frame says it starts one: a value or two lost, which the reliable lane sends again. The real frames behind it are still taken (NB135-6) |
 | DATA, further off | dropped; 4 in a row (ahead, or more than 64 behind) move the receiver to them, and the sender's next 4 real frames, now far off, move it back: 4 frames lost, which the reliable lane sends again (NB135-1) |
 | DATA cut short, or a part of another value | the value dropped: its parts don't add up to its length |
 | Anything from a group address, of another version or malformed | dropped |

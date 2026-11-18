@@ -11,8 +11,13 @@ use rand_core::{RngCore, SeedableRng};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// A data frame up to this many past the last one taken is taken; the ones between are lost.
+/// A data frame up to this many past the highest one taken is taken, and so is one up to this many behind it that
+/// wasn't taken yet (a straggler, or a real frame a frame forged ahead jumped past), once: so a forged frame in the
+/// window costs a connection the real frame of its number, not the window's (NB135-6), as DTLS's and IPsec's
+/// anti-replay windows do.
 pub const WINDOW: u32 = 64;
+/// The frames behind the highest one taken, one bit each.
+const _: () = assert!(WINDOW == u64::BITS);
 /// Data frames in a row further than [`WINDOW`] ahead, or further than it behind, after which the receiver takes the
 /// next as its new place: its sender lost more than a window of frames, or frames forged far ahead moved this end on
 /// (NB135-1), and its next frames come from where it really is. One far off is dropped.
@@ -82,9 +87,12 @@ struct Conn {
     state: State,
     /// The longest frame this end sends on it: the shorter of the two ends' longest.
     frame: usize,
-    /// The next data frame's number, and the last one taken.
+    /// The next data frame's number; the highest one taken, and which of the [`WINDOW`] behind it were taken (bit
+    /// `i` for `rx_top - 1 - i`); and the number of the next part of the value being joined.
     tx_seq: u32,
-    rx_last: u32,
+    rx_top: u32,
+    rx_taken: u64,
+    rx_next: u32,
     /// Data frames in a row further than [`WINDOW`] ahead, and behind.
     ahead: u32,
     behind: u32,
@@ -433,45 +441,51 @@ impl Engine {
             return;
         }
         let Some(c) = self.conns.get_mut(&conn) else { return };
-        // Where it falls: the last one again, or behind it within the window (a copy, or a straggler); in the window
-        // ahead; or further off, either way, where `RESYNC_AFTER` in a row move this end there. Either way, so frames
-        // forged far ahead or far behind lose a connection `RESYNC_AFTER` of its real frames, not all (NB135-1).
-        let d = seq.wrapping_sub(c.rx_last);
-        let back = d.wrapping_neg();
-        if d == 0 || d > 1 << 31 && back <= WINDOW {
+        // Where it falls against the highest number taken: that one again, or behind it within the window and taken
+        // already (a copy: the sender's radio missed the acknowledgement); behind it within the window and not taken
+        // yet, taken (NB135-6); in the window ahead, taken, the highest now; or further off, either way, where
+        // `RESYNC_AFTER` in a row move this end there, so frames forged far ahead or far behind lose a connection
+        // `RESYNC_AFTER` of its real frames, not all (NB135-1).
+        let d = seq.wrapping_sub(c.rx_top);
+        let (back, behind) = (d.wrapping_neg(), d > 1 << 31);
+        let bit = if behind && back <= WINDOW { 1u64 << (back - 1) } else { 0 };
+        if d == 0 || c.rx_taken & bit != 0 {
             self.stats.old += 1;
             return;
         }
-        if d > 1 << 31 {
-            c.ahead = 0;
-            c.behind += 1;
-            if c.behind < RESYNC_AFTER {
-                self.stats.old += 1;
+        if bit != 0 {
+            c.rx_taken |= bit;
+        } else if behind || d > WINDOW {
+            (c.ahead, c.behind) = if behind { (0, c.behind + 1) } else { (c.ahead + 1, 0) };
+            if c.ahead.max(c.behind) < RESYNC_AFTER {
+                match behind {
+                    true => self.stats.old += 1,
+                    false => self.stats.ahead += 1,
+                }
                 return;
             }
             self.stats.resyncs += 1;
-        } else if d > WINDOW {
-            c.behind = 0;
-            c.ahead += 1;
-            if c.ahead < RESYNC_AFTER {
-                self.stats.ahead += 1;
-                return;
+            self.stats.gaps += 1;
+            // Where the sender is now: every frame behind it counts as taken, as one taken before the jump might be.
+            (c.rx_top, c.rx_taken) = (seq, u64::MAX);
+        } else {
+            if d > 1 {
+                self.stats.gaps += 1;
             }
-            self.stats.resyncs += 1;
+            c.rx_taken = c.rx_taken.checked_shl(d).unwrap_or(0) | 1 << (d - 1);
+            c.rx_top = seq;
         }
         (c.ahead, c.behind) = (0, 0);
-        if d > 1 {
-            self.stats.gaps += 1;
-            c.assembling = false;
-        }
-        c.rx_last = seq;
+        // A value's first part starts it; any other must be the next number after its last part taken, else it is
+        // part of a value whose start or a part was lost, or forged, and the value being joined, if any, waits on.
         if first {
             c.partial.clear();
             (c.assembling, c.total) = (true, total);
-        } else if !c.assembling {
-            self.stats.orphans += 1; // the rest of a value whose start was lost
+        } else if !c.assembling || seq != c.rx_next {
+            self.stats.orphans += 1;
             return;
         }
+        c.rx_next = seq.wrapping_add(1);
         // Every part says the same length, and the parts add up to it: a part cut short or forged can't pass.
         if total != c.total
             || c.partial.len() + payload.len() > total
@@ -669,7 +683,9 @@ impl Engine {
             state,
             frame: V1_FRAME,
             tx_seq: 0,
-            rx_last: u32::MAX,
+            rx_top: u32::MAX,
+            rx_taken: u64::MAX,
+            rx_next: 0,
             ahead: 0,
             behind: 0,
             accepted: None,
@@ -1007,8 +1023,10 @@ mod tests {
         assert_eq!(gone(&mut p.b), [RadioEvent::Disconnected { conn: cb }]);
     }
 
+    /// NB135-6 (the security review's finding, inverted): a data frame forged at the window's edge no longer makes the
+    /// receiver drop the next 63 real frames as behind it; it costs the real frame of its number.
     #[test]
-    fn forged_data_loses_a_window_at_most_and_never_stalls_the_connection() {
+    fn forged_data_costs_the_real_frame_of_its_number_and_never_stalls_the_connection() {
         let mut p = Pair::new(V1_FRAME, V1_FRAME);
         let (ca, _) = p.link();
         let (_, b_id) = ids(&p);
@@ -1019,17 +1037,49 @@ mod tests {
         assert!(p.a.send(p.t, ca, b"0"));
         p.shuttle();
         assert_eq!(values(&mut p.b), [b"0".to_vec()]);
-        // At the window's edge: taken (the node drops it, unproven), and the next frames from a look stale until
-        // a's numbers pass it.
+        // At the window's edge: taken (the node drops it, unproven). The real frames behind it are taken once each,
+        // and the one with its number is dropped as a copy.
         p.b.handle(p.t, A, &data(WINDOW));
         assert_eq!(values(&mut p.b), [b"forged".to_vec()]);
-        let mut got = 0;
-        for i in 0..(WINDOW + 8) {
+        let mut got = Vec::new();
+        for i in 1..(WINDOW + 8) {
             assert!(p.a.send(p.t, ca, format!("{i}").as_bytes()));
             p.shuttle();
-            got += values(&mut p.b).len();
+            got.extend(values(&mut p.b));
         }
-        assert_eq!(got, 8, "the window's frames lost, then all");
+        let lost: Vec<u32> = (1..WINDOW + 8).filter(|i| !got.contains(&format!("{i}").into_bytes())).collect();
+        assert_eq!(lost, [WINDOW], "the real frame the forged one took the number of, and no other");
+        assert_eq!(p.b.stats().old, 1);
+        // A forged part of a value, while a real one is being joined, takes its number, and the real one goes on.
+        assert!(p.a.send(p.t, ca, &value(MAX_VALUE, 8)));
+        let mut held = Vec::new();
+        p.shuttle_with(|_, _, f| {
+            held.push(f.to_vec());
+            false
+        });
+        assert_eq!(held.len(), 3);
+        p.b.handle(p.t, A, &held[0]);
+        let part = Frame::Data { to: b_id, seq: 2 * WINDOW, first: false, last: false, total: 512, payload: &[0; 9] };
+        p.b.handle(p.t, A, &part.encode());
+        p.b.handle(p.t, A, &held[1]);
+        p.b.handle(p.t, A, &held[2]);
+        assert_eq!(values(&mut p.b), [value(MAX_VALUE, 8)]);
+        // Frames that come out of order within the window are taken once each.
+        let mut q = Pair::new(V1_FRAME, V1_FRAME);
+        let (ca, _) = q.link();
+        let mut held = Vec::new();
+        for i in 0..5u8 {
+            assert!(q.a.send(q.t, ca, &[i]));
+            q.shuttle_with(|_, _, f| {
+                held.push(f.to_vec());
+                false
+            });
+        }
+        for i in [4, 0, 2, 2, 1, 4, 3, 0] {
+            q.b.handle(q.t, A, &held[i]);
+        }
+        assert_eq!(values(&mut q.b), [[4], [0], [2], [1], [3]].map(|v| v.to_vec()));
+        assert_eq!(q.b.stats().old, 3);
         // A sender that lost more than a window is taken up again after a few frames.
         let mut q = Pair::new(V1_FRAME, V1_FRAME);
         let (ca, _) = q.link();
