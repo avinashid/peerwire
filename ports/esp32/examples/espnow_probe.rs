@@ -2,7 +2,7 @@
 //! with Bluetooth LE on, measured before ESP-NOW carries Peerwire links.
 //!
 //! Both boards run it. Each starts Wi-Fi as a station on no network (`wifi::start_on_channel`), on the channel it
-//! hears its hotspot on (wifi.sh's record in the last flash sector; channel 11 if it hears none), and broadcasts
+//! hears its access point on (wifi.sh's record in the last flash sector; channel 11 if it hears none), and broadcasts
 //! hellos until it hears the other board's: no addresses are typed in. Node 1 (the `PWN` record, as the mesh example
 //! reads it) initiates and node 2 answers; with no record, the board with the lower MAC initiates. Every frame but a
 //! hello carries the run's group, a random number the initiator draws at boot and gives in its hellos, so two pairs of
@@ -17,10 +17,10 @@
 //!   its receive callback, and `fps` is the frames it got over the time between the first and the last.
 //!
 //! The modes, in order: `a` no access point; `a54` the same at 54 Mbit/s (802.11g) rather than ESP-NOW's default 1;
-//! `b1` the initiator on the hotspot, the responder not; `b2` both on it; `c2` both on it with Bluetooth LE
+//! `b1` the initiator on the access point, the responder not; `b2` both on it; `c2` both on it with Bluetooth LE
 //! advertising and scanning (the port's own NimBLE driver, as a Peerwire node runs it); `c` both off it again, with
-//! Bluetooth still on. A board that can't join stays off the hotspot, and the result lines say which boards were on
-//! it (`ap=initiator/responder`) and which had Bluetooth on (`ble=`).
+//! Bluetooth still on. A board that can't join stays off the access point, and the result lines say which boards were
+//! on it (`ap=initiator/responder`) and which had Bluetooth on (`ble=`).
 //!
 //! It prints one `ESPNOW_RESULT` line per mode and size on the initiator, an `ESPNOW_RX` line per flood on the
 //! responder, and `ESPNOW_DONE` on both at the end:
@@ -53,7 +53,7 @@ use peerwire_esp::wifi::{self, Wifi};
 /// The config sector, as the mesh example reads it: b"PWN" and the node number at +0, wifi.sh's record at +0x40.
 const CFG_ADDR: u32 = 0x3F_F000;
 const WIFI_OFFSET: usize = 0x40;
-/// The channel when the hotspot isn't heard: the hotspot's own on the NB-135 boards.
+/// The channel when the access point isn't heard: the access point's own on the NB-135 boards.
 const DEFAULT_CHANNEL: u8 = 11;
 
 const MAGIC: [u8; 4] = *b"PWE1";
@@ -74,7 +74,7 @@ const FLOOD_MAX: u32 = 16 * 1024;
 /// Frames sent and not yet reported by the send callback, at most.
 const WINDOW: u32 = 16;
 const JOIN_WITHIN: Duration = Duration::from_secs(40);
-/// How long the initiator waits for the responder to take up a mode (it may be joining the hotspot).
+/// How long the initiator waits for the responder to take up a mode (it may be joining the access point).
 const SYNC_WITHIN: Duration = Duration::from_secs(120);
 /// A paired responder that hears nothing from its initiator this long ends.
 const LOST_AFTER: Duration = Duration::from_secs(300);
@@ -105,7 +105,7 @@ struct Mode {
     name: &'static str,
     /// 54 Mbit/s 802.11g to the peer, rather than ESP-NOW's 1 Mbit/s.
     fast: bool,
-    /// On the hotspot: the initiator, the responder.
+    /// On the access point: the initiator, the responder.
     ap: [bool; 2],
     ble: bool,
 }
@@ -360,7 +360,7 @@ unsafe extern "C" fn on_send(info: *const sys::esp_now_send_info_t, status: sys:
 fn add_peer(mac: [u8; 6]) -> anyhow::Result<()> {
     let mut peer: sys::esp_now_peer_info_t = unsafe { std::mem::zeroed() };
     peer.peer_addr = mac;
-    // 0: whatever channel the station is on, so a peer stays reachable when the station joins the hotspot.
+    // 0: whatever channel the station is on, so a peer stays reachable when the station joins the access point.
     peer.channel = 0;
     peer.ifidx = sys::wifi_interface_t_WIFI_IF_STA;
     peer.encrypt = false;
@@ -528,7 +528,7 @@ fn run() -> anyhow::Result<()> {
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
     let mut wifi = wifi::start_on_channel(peripherals.modem, sysloop.clone(), DEFAULT_CHANNEL)?;
-    // The hotspot's channel, so the boards are on it before either joins it. The log doesn't name the network.
+    // The access point's channel, so the boards are on it before either joins it. The log doesn't name the network.
     let hotspot = cfg.wifi.as_ref().and_then(|(ssid, _)| match wifi.scan() {
         Ok(aps) => {
             let best = aps.iter().filter(|ap| ap.ssid == ssid.as_str()).max_by_key(|ap| ap.signal_strength);
@@ -708,7 +708,7 @@ impl Probe {
         }
     }
 
-    /// Makes this board's part of mode `m` so: the rate to the peer, the hotspot, Bluetooth.
+    /// Makes this board's part of mode `m` so: the rate to the peer, the access point, Bluetooth.
     fn apply(&mut self, m: usize) {
         let mode = &MODES[m];
         let side = usize::from(self.role == Role::Responder);
