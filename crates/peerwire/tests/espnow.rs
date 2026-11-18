@@ -164,7 +164,7 @@ fn overheard(air: &FakeAir) -> (Accepts, HashMap<u64, u32>) {
 
 /// NB135-1 (the security review's repro, inverted): someone in range overhears a link's ids and data numbers, then
 /// sends each end four data frames 2^30 numbers ahead, which move each end's place there. The real frames, far behind
-/// it now, move it back after four, so the next message gets through within seconds, with no link lost.
+/// it now, move it back after four, so messages get through each way within seconds, with no link lost.
 #[test]
 fn sec_a_forged_resync_timeline() {
     let air = FakeAir::new();
@@ -200,21 +200,27 @@ fn sec_a_forged_resync_timeline() {
             }
         }
     }
+    // A message each way every second, until one came each way: each end's move back takes 4 real frames from the
+    // other, and an end that sent only acknowledgements could take a while to send 4, longer in a loaded debug run,
+    // where its move back came after the check at times.
     let started = Instant::now();
     let mut after = vec![Vec::new(), Vec::new()];
     let mut got_at = None;
     let mut n = 0u32;
+    let came =
+        |ev: &[Event], from: PeerId| ev.iter().any(|e| matches!(e, Event::Message { peer, .. } if *peer == from));
     while started.elapsed() < Duration::from_secs(30) && got_at.is_none() {
         n += 1;
+        let _ = a.send(&pb, Lane::Reliable, format!("after {n}").as_bytes());
         let _ = b.send(&pa, Lane::Reliable, format!("after {n}").as_bytes());
         pump(&mut [&mut a, &mut b], &mut after, 1, |_| false);
-        if after[0].iter().any(|e| matches!(e, Event::Message { peer, .. } if *peer == pb)) {
+        if came(&after[0], pb) && came(&after[1], pa) {
             got_at = Some(started.elapsed());
         }
     }
     let (sa, sb) = (wa.stats(), wb.stats());
-    eprintln!("first message after the forged resync: {got_at:?}; resyncs a {} b {}", sa.resyncs, sb.resyncs);
-    assert!(got_at.is_some_and(|t| t < Duration::from_secs(5)), "a message within seconds: {got_at:?}");
+    eprintln!("a message each way after the forged resync: {got_at:?}; resyncs a {} b {}", sa.resyncs, sb.resyncs);
+    assert!(got_at.is_some_and(|t| t < Duration::from_secs(5)), "a message each way within seconds: {got_at:?}");
     assert!(sa.resyncs >= 2 && sb.resyncs >= 2, "moved by the forged frames, then back by the real ones");
     let churn = |e: &&Event| matches!(e, Event::Disconnected { .. } | Event::Connected { .. });
     assert_eq!(after.iter().flatten().filter(churn).count(), 0, "no link lost");
@@ -740,7 +746,9 @@ fn pump_ms(nodes: &mut [&mut Node], events: &mut Vec<Vec<Event>>, ms: u64) {
 /// messages, one at a time, with the ids and numbers overheard, each a whole message of the node's framing of kind 0
 /// with a made-up seq and tag. The links drop them all as forged, nothing closes or moves, and every message sent
 /// meanwhile arrives, in order: each forged frame costs the real frame of its number on the air (NB135-6), which the
-/// reliable lane sends again.
+/// reliable lane sends again. Each pair is forged once the round's message has come each way and no real frame waits
+/// on the air, with a number above any the receiver took, a forged one's too: a slow debug build sent nothing new
+/// between two pairs at times, the second took the first's number, and the receiver dropped it as a copy.
 #[test]
 fn sec_forged_datagrams_on_a_live_link_close_nothing() {
     let air = FakeAir::new();
@@ -756,14 +764,21 @@ fn sec_forged_datagrams_on_a_live_link_close_nothing() {
     let opener = other(accepter);
     let msgs: Vec<Vec<u8>> = (0..40).map(|i| format!("message {i}").into_bytes()).collect();
     let mut after = vec![Vec::new(), Vec::new()];
+    let mut forged: HashMap<u64, u32> = HashMap::new();
     for (i, m) in msgs.iter().enumerate() {
         a.send(&pb, Lane::Reliable, m).unwrap();
         b.send(&pa, Lane::Reliable, m).unwrap();
-        pump_ms(&mut [&mut a, &mut b], &mut after, 30);
+        let end = Instant::now() + Duration::from_secs(10);
+        while !(got(&after[1], pa, m) && got(&after[0], pb, m) && air.waiting() == 0) {
+            assert!(Instant::now() < end, "message {i} each way");
+            pump_ms(&mut [&mut a, &mut b], &mut after, 1);
+        }
         for (from, to, id) in [(accepter, opener, opener_id), (opener, accepter, accepter_id)] {
-            // The receiver's next number, and a counter that is neither the last real one nor the next, so the
-            // framing takes it as a whole message.
-            let seq = highest(&air, from, id).unwrap_or(0).wrapping_add(1);
+            // The receiver's next number, past the last forged, and a counter that is neither the last real one
+            // nor the next, so the framing takes it as a whole message.
+            let next = highest(&air, from, id).unwrap_or(0).wrapping_add(1);
+            let seq = forged.get(&id).map_or(next, |f| next.max(f + 1));
+            forged.insert(id, seq);
             let c = (last_counter(&air, from, id) + 10) & 0x3f;
             let value = [&[0xc0 | c, 0][..], &(1_000 + i as u64).to_le_bytes(), &[0x5a; 40]].concat();
             let total = value.len() as u16;
@@ -879,4 +894,186 @@ fn sec_thirty_two_forged_messages_to_the_accepter_of_a_standby_cost_seconds() {
     eprintln!("32 forged messages to the accepter of a standby: linked {linked} after {:?}", t.elapsed());
     assert!(linked && t.elapsed() < Duration::from_secs(10), "linked again within seconds: {:?}", t.elapsed());
     assert!(overheard(&air).0.len() > accepts.len(), "on a new connection");
+}
+
+const D: Mac = [0x02, 0x50, 0x57, 0, 0, 0x0d];
+
+/// A node as [`node`]'s on v1 frames, and its radio's stats.
+fn watched(air: &FakeAir, mac: Mac) -> (Node, Watch) {
+    let radio = EspNow::new(air.ether(mac, V1_FRAME), Settings::DEFAULT);
+    let watch = radio.watch();
+    let node = Node::builder()
+        .bluetooth(radio)
+        .policy(Policy::new([PathKind::Bluetooth]))
+        .stun_servers(Vec::<String>::new())
+        .bind("127.0.0.1:0")
+        .unwrap();
+    (node, watch)
+}
+
+/// The `k`th OPEN forged to `to` from a made-up address, with an id of its own: what anyone in range can send.
+fn forge_open(air: &FakeAir, to: Mac, k: u64) {
+    let from: Mac = [0x02, 0xf0, (k >> 24) as u8, (k >> 16) as u8, (k >> 8) as u8, k as u8];
+    air.inject(from, to, &frame::Frame::Open { from: 0x0f00_0000 + k, rx_max: 250 }.encode());
+}
+
+/// The `n` of the last advert `mac` broadcast.
+fn advert_n(air: &FakeAir, mac: Mac) -> Option<u32> {
+    air.heard().iter().rev().find_map(|(from, _, f)| match frame::parse(f) {
+        Ok(frame::Frame::Advert { data }) if *from == mac && data.len() == 9 => {
+            Some(u32::from_le_bytes([data[1], data[2], data[3], data[4]]))
+        }
+        _ => None,
+    })
+}
+
+/// Polls `nodes` once each, keeping their events.
+fn poll_all(nodes: &mut [&mut Node], events: &mut Vec<Vec<Event>>) {
+    events.resize_with(nodes.len(), Vec::new);
+    for (i, n) in nodes.iter_mut().enumerate() {
+        n.poll();
+        events[i].extend(std::iter::from_fn(|| n.try_recv_event()));
+    }
+}
+
+/// NB135-11 (the security review's repro, inverted): OPENs forged from made-up addresses, one to each board every
+/// `every`, and two to each as it joins. Each makes a connection whose central never proves the room, and two of them
+/// took a board's two unbound slots: they counted against its own connects, so the board whose `n` is the smaller
+/// connected to no one and the other waited for it. One OPEN to each every 1.2 s kept the pair apart for good (70 in
+/// 40 s), where with none it links in 16 to 56 ms. How long until linked, within `secs`, and the OPENs forged. Once
+/// linked, the forger goes on for 3 s, and nothing closes.
+fn forged_opens(every: Duration, secs: u64) -> (Option<Duration>, u64) {
+    let air = FakeAir::new();
+    let (mut a, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    let room = format!("espnow-r6-opens-{}", every.as_millis());
+    let mut k = 0;
+    let mut forge = |to: Mac| {
+        k += 1;
+        forge_open(&air, to, k);
+    };
+    a.join_room("pw-test", &room);
+    forge(A);
+    forge(A);
+    a.poll();
+    b.join_room("pw-test", &room);
+    forge(B);
+    forge(B);
+    let (t, mut next) = (Instant::now(), Instant::now() + every);
+    let (mut ev, mut linked) = (Vec::new(), None);
+    while t.elapsed() < Duration::from_secs(secs) && linked.is_none_or(|l| t.elapsed() < l + Duration::from_secs(3)) {
+        if Instant::now() >= next {
+            forge(A);
+            forge(B);
+            next += every;
+        }
+        poll_all(&mut [&mut a, &mut b], &mut ev);
+        if linked.is_none() && on_radio(&a, &pb) && on_radio(&b, &pa) {
+            linked = Some(t.elapsed());
+            ev.iter_mut().for_each(Vec::clear);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(forge);
+    if linked.is_some() {
+        let churn = |e: &&Event| matches!(e, Event::Disconnected { .. } | Event::Connected { .. });
+        assert_eq!(ev.iter().flatten().filter(churn).count(), 0, "the link stays: {ev:?}");
+        assert!(on_radio(&a, &pb) && on_radio(&b, &pa), "still linked");
+    }
+    (linked, k)
+}
+
+#[test]
+fn sec_forged_opens_every_1200_ms_keep_no_pair_apart() {
+    let (linked, k) = forged_opens(Duration::from_millis(1200), 15);
+    eprintln!("an OPEN forged to each board every 1.2 s: linked after {linked:?}, {k} forged");
+    assert!(linked.is_some_and(|t| t < Duration::from_secs(5)), "linked within seconds: {linked:?}");
+}
+
+/// NB135-11: twice a second, each OPEN just past the half second, so the one forged two before it is past its first
+/// second when it comes and makes way for it: every forged connection is within the second a central's connection had
+/// before it made way for a newcomer, so the board that connected was refused again and again, 1 to 4 s apart.
+#[test]
+fn sec_forged_opens_twice_a_second_keep_no_pair_apart() {
+    let (linked, k) = forged_opens(Duration::from_millis(505), 15);
+    eprintln!("an OPEN forged to each board every 505 ms: linked after {linked:?}, {k} forged");
+    assert!(linked.is_some_and(|t| t < Duration::from_secs(5)), "linked within seconds: {linked:?}");
+}
+
+/// NB135-11 (the security review's finding, from the code): X is linked with P and Q over two connections bound to
+/// them, and OPENs forged from made-up addresses keep its radio's other two connections taken, a new one as soon as one
+/// closes. A newcomer, Y, joins. If Y connects (its `n` the smaller), X's radio stayed silent at its 4 connections
+/// before X's node could close a forged one for Y, so Y's connect failed after 10 s and Y held X's advert a minute; if
+/// X connects, the forged ones counted against its own connects, and it never did. `y_connects` picks which, by
+/// joining Y again, off the air, until its advert's `n` is on that side of X's. How long until X and Y linked, within
+/// 15 s.
+fn two_bound_and_two_forged(y_connects: bool) -> Option<Duration> {
+    let limits = Settings::DEFAULT.limits;
+    let air = FakeAir::new();
+    let (mut x, wx) = watched(&air, A);
+    let (mut p, mut q) = (node(&air, B, V1_FRAME), node(&air, C, V1_FRAME));
+    let (px, pp, pq) = (x.peer_id(), p.peer_id(), q.peer_id());
+    let room = format!("espnow-r6-bound-{y_connects}");
+    // A star: P, Q and Y hear X alone, and X links with one at a time. A node with two connections proving the room at
+    // once, of 2 unbound, closes the other when the first proves (NB110-2's rule, as over Bluetooth on a board), and
+    // holds that advert a minute if it made that one.
+    air.set_hole(Some(Box::new(|from: Mac, to: Mac, _: &[u8]| from != A && to != A)));
+    let mut ev = Vec::new();
+    x.join_room("pw-test", &room);
+    p.join_room("pw-test", &room);
+    assert!(pump(&mut [&mut x, &mut p], &mut ev, 15, |n| on_radio(n[0], &pp) && on_radio(n[1], &px)), "X and P");
+    q.join_room("pw-test", &room);
+    let bound = |n: &[&mut Node]| on_radio(n[0], &pp) && on_radio(n[0], &pq) && n[0].ble_counts().2 == 2;
+    assert!(pump(&mut [&mut x, &mut p, &mut q], &mut ev, 15, bound), "X linked with P and Q, bound");
+    // The forger: an OPEN to X whenever its radio holds fewer than its 4 connections, right after X's poll.
+    let mut k = 0;
+    let mut forge = |x: &mut Node, others: &mut [&mut Node], ev: &mut Vec<Vec<Event>>| {
+        poll_all(&mut [x], ev);
+        if wx.stats().connections < limits.connections {
+            k += 1;
+            forge_open(&air, A, k);
+        }
+        poll_all(others, ev);
+    };
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        forge(&mut x, &mut [&mut p, &mut q], &mut ev);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(x.ble_counts(), (4, 2, 2), "two bound, two forged");
+    let (mut y, _) = watched(&air, D);
+    let py = y.peer_id();
+    air.set_off(D, true);
+    let n_x = advert_n(&air, A).expect("X's advert");
+    loop {
+        y.join_room("pw-test", &room);
+        if (advert_n(&air, D).expect("Y's advert") < n_x) == y_connects {
+            break;
+        }
+    }
+    air.set_off(D, false);
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(15) {
+        forge(&mut x, &mut [&mut p, &mut q, &mut y], &mut ev);
+        if on_radio(&x, &py) && on_radio(&y, &px) {
+            assert_eq!(advert_n(&air, A), Some(n_x), "X's advert stayed");
+            return Some(t.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    None
+}
+
+#[test]
+fn sec_a_newcomer_links_with_a_node_holding_two_bound_and_two_forged_connections_within_seconds() {
+    let linked = two_bound_and_two_forged(true);
+    eprintln!("Y connects to X, with two bound and two forged: linked after {linked:?}");
+    assert!(linked.is_some_and(|t| t < Duration::from_secs(8)), "linked within seconds: {linked:?}");
+}
+
+#[test]
+fn sec_a_node_holding_two_bound_and_two_forged_connections_links_with_a_newcomer_within_seconds() {
+    let linked = two_bound_and_two_forged(false);
+    eprintln!("X, with two bound and two forged, connects to Y: linked after {linked:?}");
+    assert!(linked.is_some_and(|t| t < Duration::from_secs(8)), "linked within seconds: {linked:?}");
 }

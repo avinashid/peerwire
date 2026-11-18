@@ -150,6 +150,12 @@ impl FakeAir {
     pub fn heard(&self) -> Vec<(Mac, Mac, Vec<u8>)> {
         self.lock().heard.iter().cloned().collect()
     }
+
+    /// Frames delivered that no station has taken yet. With none, every frame tried on the air has reached its
+    /// receiver's engine, so a frame forged now comes after all of them.
+    pub fn waiting(&self) -> usize {
+        self.lock().stations.iter().map(|s| s.inbox.len()).sum()
+    }
 }
 
 /// A station on a [`FakeAir`].

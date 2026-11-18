@@ -233,9 +233,13 @@ impl Engine {
 
     /// Opens a connection to `device`: OPEN every [`Settings::open_every`] until it is accepted
     /// ([`RadioEvent::Connected`]), refused or [`Settings::connect_within`] passes ([`RadioEvent::ConnectFailed`]).
+    ///
+    /// The limits don't refuse it: the node counts its own connects, and closes a connection that may be forged to
+    /// make room for one (NB135-11), but the radio may hold one it hasn't heard of yet, and a connect failed for that
+    /// held the advert a minute. Twice the limits, which the node never reaches, is the backstop.
     pub fn connect(&mut self, now: Instant, device: DeviceId) {
         let mac = mac_of(device);
-        if group(mac) || device.0 >> 48 != 0 || self.conns.len() >= self.settings.limits.connections {
+        if group(mac) || device.0 >> 48 != 0 || self.conns.len() > 2 * self.settings.limits.connections {
             self.events.push_back(RadioEvent::ConnectFailed { device });
             return;
         }
@@ -379,12 +383,15 @@ impl Engine {
             }
             return;
         }
-        // Not advertising, or no room: silence, as from a Bluetooth peripheral that takes no connection. A refusal
-        // would be one more frame to forge; the opener gives up after `connect_within`, and the node's adverts say
-        // when it is full.
+        // Not advertising: silence, as from a Bluetooth peripheral that takes no connection. A refusal would be one
+        // more frame to forge; the opener gives up after `connect_within`. At the limits, one more is taken and the
+        // node decides, as a Bluetooth stack leaves it to the node: it closes one that makes way for it, such as one
+        // an OPEN forged from a made-up address made, or closes this one (NB135-11). Silent there, the radio kept
+        // every newcomer out of a node with two such beside two bound, and the newcomer's connect failed after 10 s and
+        // held the advert a minute. Past that one, silence, until the node has decided.
         let limits = self.settings.limits;
         let centrals = self.conns.values().filter(|c| !c.central).count();
-        if self.advert.is_none() || self.conns.len() >= limits.connections || centrals >= limits.centrals {
+        if self.advert.is_none() || self.conns.len() > limits.connections || centrals > limits.centrals {
             self.stats.opens_refused += 1;
             return;
         }
@@ -1330,11 +1337,13 @@ mod tests {
                 answers += 1;
             }
         }
+        // The limits, and one more for the node to decide on (NB135-11); this node never decides.
         let limits = Settings::DEFAULT.limits;
-        assert_eq!(b.stats().connections, limits.connections);
-        assert_eq!(events(&mut b).len(), limits.connections, "one Connected each, no more");
-        assert_eq!(b.stats().opens_refused, 500 - limits.connections as u64);
-        assert_eq!(answers, limits.connections, "an accept each, and silence for the rest");
+        let taken = limits.connections + 1;
+        assert_eq!(b.stats().connections, taken);
+        assert_eq!(events(&mut b).len(), taken, "one Connected each, no more");
+        assert_eq!(b.stats().opens_refused, 500 - taken as u64);
+        assert_eq!(answers, taken, "an accept each, and silence for the rest");
         // Not advertising: no answer at all.
         let mut quiet = engine(3, V1_FRAME, t);
         quiet.handle(t, A, &Frame::Open { from: 1, rx_max: 250 }.encode());
@@ -1371,15 +1380,66 @@ mod tests {
         }
         assert_eq!(opens, 20);
         assert_eq!(events(&mut p.a), [RadioEvent::ConnectFailed { device: device_of(B) }]);
-        // No room, or no such device.
+        // No such device, or past twice the limits: the limits themselves are the node's to keep (NB135-11).
         let mut e = engine(9, V1_FRAME, p.t);
-        for i in 0..Settings::DEFAULT.limits.connections + 1 {
+        for i in 0..2 * Settings::DEFAULT.limits.connections + 2 {
             e.connect(p.t, device_of([2, 0, 0, 0, 1, i as u8]));
         }
         e.connect(p.t, DeviceId(1 << 60));
         e.connect(p.t, device_of(BROADCAST));
         let failed = events(&mut e).iter().filter(|e| matches!(e, RadioEvent::ConnectFailed { .. })).count();
         assert_eq!(failed, 3);
+    }
+
+    /// NB135-11 (the security review's finding): a node with two connections bound to peers and two that OPENs forged
+    /// from made-up addresses made held the radio's 4, and the radio stayed silent to any other OPEN before the node
+    /// could close a forged one for it: a newcomer's connect failed after 10 s, and its node held the advert a minute.
+    /// One OPEN over the limits now reaches the node, which decides; past that one, silence until it has. And a
+    /// connect of the node's own goes whatever the radio holds, as the node counts its own and makes room for it.
+    #[test]
+    fn sec_an_open_over_the_limits_reaches_the_node_and_a_connect_of_its_own_goes() {
+        let t = Instant::now();
+        let limits = Settings::DEFAULT.limits;
+        let mut b = engine(2, V1_FRAME, t);
+        b.advertise(t, Some(&ADVERT));
+        // What went on the air.
+        let sent = |b: &mut Engine| {
+            let mut out = Vec::new();
+            while let Some((_, f, _)) = b.peek() {
+                out.push(f.to_vec());
+                b.commit(t);
+                b.outcome(true);
+            }
+            out
+        };
+        // An OPEN from a made-up address: the connection the node is told of, if it is answered.
+        let open = |b: &mut Engine, i: u8| {
+            b.handle(t, [0x02, 0, 0, 0, 7, i], &Frame::Open { from: u64::from(i) + 1, rx_max: 250 }.encode());
+            let accepted = sent(b).iter().any(|f| matches!(frame::parse(f), Ok(Frame::Accept { .. })));
+            let connected: Vec<ConnId> = events(b)
+                .into_iter()
+                .filter_map(|e| match e {
+                    RadioEvent::Connected { conn, device: None, .. } => Some(conn),
+                    _ => None,
+                })
+                .collect();
+            connected.last().copied().filter(|_| accepted)
+        };
+        let full: Vec<ConnId> = (0..limits.connections as u8).filter_map(|i| open(&mut b, i)).collect();
+        assert_eq!(full.len(), limits.connections, "the limits");
+        let over = open(&mut b, 100).expect("one over them, for the node to decide on");
+        assert_eq!(open(&mut b, 101), None, "and silence past it, until the node has");
+        assert_eq!(b.stats().opens_refused, 1);
+        // The node closes one that makes way (or the newcomer): one more again.
+        b.disconnect(t, full[0]);
+        assert!(open(&mut b, 102).is_some(), "one over the limits again");
+        b.disconnect(t, over);
+        // A connect of the node's own at the limits goes: an OPEN, and no failure.
+        assert_eq!(b.stats().connections, limits.connections);
+        b.connect(t, device_of(A));
+        let opened = sent(&mut b).iter().any(|f| matches!(frame::parse(f), Ok(Frame::Open { .. })));
+        assert!(opened, "the connect went");
+        assert!(gone(&mut b).is_empty(), "with no ConnectFailed");
     }
 
     #[test]
@@ -1634,12 +1694,16 @@ mod tests {
                     }
                 }
                 for e in [&p.a, &p.b] {
-                    assert!(e.conns.len() <= limits.connections);
+                    // One over the limits from OPENs, for the node to decide on; the node's own connects past them
+                    // up to twice the limits (NB135-11).
+                    let centrals = e.conns.values().filter(|c| !c.central).count();
+                    assert!(centrals <= limits.centrals.min(limits.connections) + 1);
+                    assert!(e.conns.len() <= 2 * limits.connections + 1);
                     assert!(e.seen_queued <= MAX_SEEN_QUEUED && e.values_queued <= MAX_VALUES_QUEUED);
                     assert!(e.value_bytes <= MAX_VALUE_BYTES);
                     assert!(e.conns.values().all(|c| c.partial.len() <= MAX_VALUE));
                     assert!(e.flight.len() <= MAX_FLIGHT);
-                    assert!(e.events.len() <= MAX_SEEN_QUEUED + MAX_VALUES_QUEUED + 4 * limits.connections + 4);
+                    assert!(e.events.len() <= MAX_SEEN_QUEUED + MAX_VALUES_QUEUED + 8 * limits.connections + 8);
                 }
                 if rng.one_in(20) {
                     events(&mut p.a);
