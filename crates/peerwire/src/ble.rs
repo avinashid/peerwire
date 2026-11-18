@@ -144,7 +144,8 @@ const ROTATE: Duration = Duration::from_secs(15 * 60);
 const GRACE: Duration = Duration::from_secs(1);
 /// A proven connection bound to no peer stays open while a signal that proves a room member comes over it this often.
 const UNBOUND_FOR: Duration = Duration::from_secs(60);
-/// No connect again to an advert whose last connection closed or failed for this long.
+/// No connect again to an advert whose last connection closed or failed for this long, unless it was bound to a peer
+/// (`REFUSED_HOLD`, NB135-I6).
 const RECONNECT_HOLD: Duration = Duration::from_secs(60);
 /// No connect again to an advert whose connection closed before its peripheral sent a challenge (it refused this
 /// central, or never challenged) for this long, plus up to `REFUSED_JITTER_MS` at random: an honest peer refuses a
@@ -460,10 +461,13 @@ impl Ble {
 
     /// `conn` closed at the radio or at the other end, or the radio `dropped` it ([`RadioEvent::Dropped`]): it is
     /// forgotten, and if this end connected to an advert for it, that advert is held as [`hold`] says, or only
-    /// `REFUSED_HOLD` if the radio dropped it, as that says nothing of the device (NB135-5).
+    /// `REFUSED_HOLD` if the radio dropped it, as that says nothing of the device (NB135-5), or if it was bound to a
+    /// peer: its link was up over it, so the next one should come soon, over a new connection, whichever end's link
+    /// timed out first (NB135-I6). A room member that keeps closing the bound connections this end makes to it makes
+    /// this end connect again every 1 to 4 s: that is accepted, as a member can cost a link more ways than that.
     fn went(&mut self, now: Instant, conn: ConnId, dropped: bool) {
         let Some(c) = self.conns.get(&conn) else { return };
-        let hold = if dropped { refused_hold() } else { hold(c) };
+        let hold = if dropped || c.bound.is_some() { refused_hold() } else { hold(c) };
         let held = c.to.zip(c.n).map(|at| (at, hold));
         let how = if dropped { "was dropped by the radio" } else { "went" };
         log::debug!("Bluetooth: conn {} ({}) {how}{}", conn.0, c.who(), held_for(held.map(|(_, h)| h)));
@@ -981,8 +985,8 @@ impl Ble {
     }
 }
 
-/// How long this end, as the central, holds the advert of a connection that the peripheral closed, or that missed the
-/// deadline: 1 to 4 s at random if no challenge came on it (NB110-7), else `RECONNECT_HOLD`.
+/// How long this end, as the central, holds the advert of a connection bound to no peer that the peripheral closed, or
+/// that missed the deadline: 1 to 4 s at random if no challenge came on it (NB110-7), else `RECONNECT_HOLD`.
 fn hold(c: &Conn) -> Duration {
     match c.link.challenged() {
         false => refused_hold(),
@@ -2407,6 +2411,36 @@ mod tests {
         w.run(59_000);
         assert_eq!(w.air.connects(), made, "no connect during the hold");
         w.run(2_000);
+        assert!(w.linked(0, 1), "linked again after it");
+        assert_eq!(w.air.connects(), made + 1, "with one connect");
+    }
+
+    /// NB135-I6: a connection bound to a peer that the radio drops, or that the other end closes (its link timed out
+    /// there first, say), holds that advert only 1 to 4 s, not `RECONNECT_HOLD`: its link was up over it, so the next
+    /// one should come soon, over a new connection.
+    #[test]
+    fn a_bound_link_the_radio_drops_relinks_within_seconds() {
+        let mut w = Air::new(&[Limits::DESKTOP, Limits::SMALL]);
+        w.set_n(0, 1_000); // the laptop
+        w.set_n(1, 2_000); // the board
+        w.run(3_000);
+        assert!(w.linked(0, 1));
+        w.datagrams = true;
+        let (hop, board_peer) = (w.ids[0][0].1, id(2).peer_id());
+        let now = w.now;
+        w.eps[0].connect(now, hop, board_peer).unwrap();
+        w.run(1_500);
+        assert_eq!(w.b.iter().map(Ble::counts).collect::<Vec<_>>(), vec![(1, 1, 1); 2], "bound both ends");
+        let (board, made) = (DeviceId((w.first + 1) as u64), w.air.connects());
+        w.air.set_off(w.first + 1, true); // the link drops
+        w.air.set_off(w.first + 1, false);
+        let cut = w.now;
+        w.run(10);
+        assert_eq!((w.b[0].conns.len(), w.b[1].conns.len()), (0, 0), "both forgot it at once");
+        let Some(Skip::Held(until)) = w.b[0].skip(w.now, board, 2_000, false) else { panic!("held") };
+        let jitter = Duration::from_millis(u64::from(REFUSED_JITTER_MS));
+        assert!(until >= cut + REFUSED_HOLD && until < cut + REFUSED_HOLD + jitter, "1 to 4 s");
+        w.run(6_000);
         assert!(w.linked(0, 1), "linked again after it");
         assert_eq!(w.air.connects(), made + 1, "with one connect");
     }

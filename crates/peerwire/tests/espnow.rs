@@ -386,3 +386,44 @@ fn sec_one_forged_frame_to_the_accepter_of_an_idle_link_costs_one_frame() {
 fn sec_one_forged_frame_to_the_opener_of_an_idle_link_costs_one_frame() {
     one_forged_frame_on_an_idle_link(false);
 }
+
+/// NB135-I6 (the security review's repro, inverted): data to the end that ACCEPTED goes nowhere, so that end's link
+/// times out first and it closes the connection; the opener hears a close of a connection bound to its peer, and holds
+/// the advert 1 to 4 s, not a minute: the link is back within seconds, on a new connection.
+#[test]
+fn sec_a_link_stuck_at_the_accepter_comes_back_within_seconds() {
+    let air = FakeAir::new();
+    let ((mut a, _), (mut b, _)) = (quick_node(&air, A), quick_node(&air, B));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    a.join_room("pw-test", "espnow-stuck-accepter");
+    b.join_room("pw-test", "espnow-stuck-accepter");
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    let (accepts, _) = overheard(&air);
+    let (_, _, accepter_id) = *accepts.last().unwrap();
+    air.set_hole(Some(Box::new(
+        move |_, _, f: &[u8]| matches!(frame::parse(f), Ok(frame::Frame::Data { to, .. }) if to == accepter_id),
+    )));
+    let started = Instant::now();
+    let mut after = Vec::new();
+    let timed_out = |e: &Event| matches!(e, Event::Disconnected { reason: peerwire::DisconnectReason::Timeout, .. });
+    let (mut n, mut gone_at, mut back) = (0u32, None, None);
+    while started.elapsed() < Duration::from_secs(20) && back.is_none() {
+        n += 1;
+        let _ = a.send(&pb, Lane::Reliable, format!("a {n}").as_bytes());
+        let _ = b.send(&pa, Lane::Reliable, format!("b {n}").as_bytes());
+        pump(&mut [&mut a, &mut b], &mut after, 1, |_| false);
+        let gone = after.iter().flatten().any(timed_out);
+        if gone && gone_at.is_none() {
+            gone_at = Some(started.elapsed());
+        }
+        if gone && on_radio(&a, &pb) && on_radio(&b, &pa) {
+            back = Some(started.elapsed());
+        }
+    }
+    eprintln!("stuck at the accepter: timed out after {gone_at:?}, back after {back:?}");
+    assert!(gone_at.is_some(), "the link timed out at the end that heard nothing");
+    assert!(back.is_some_and(|t| t < Duration::from_secs(12)), "and came back within seconds: {back:?}");
+    let (accepts, _) = overheard(&air);
+    assert!(accepts.iter().any(|(_, _, id)| *id != accepter_id), "on a connection with new ids");
+}

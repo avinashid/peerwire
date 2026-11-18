@@ -169,8 +169,10 @@ which could jam the channel anyway. What such an attacker can do, frame by frame
 For each of these the connection closes, loses frames, or stays as it was, and the node connects again. That is what
 the tests show, frame by frame, not a proof that no mix of frames can stall a connection while the radio still has it
 up. So the node has its own check too: when a link times out, the radio connections bound to its peer close, with no
-hold on the advert, and the next link comes over a new connection with new ids (NB135-1). Connections, queues and
-buffers are capped above, and the parser is fuzzed.
+hold on the advert, and the next link comes over a new connection with new ids (NB135-1); the other end, if it made
+the connection, holds the advert only 1 to 4 s when it hears the close, as it does whenever a bound connection closes
+(NB135-I6), so the link is back within seconds whichever end timed out first. Connections, queues and buffers are
+capped above, and the parser is fuzzed.
 
 The security review of NB-135 (the [threat model](../project/threat-model.md)) found four problems, fixed since, each
 with a test that was its repro:
