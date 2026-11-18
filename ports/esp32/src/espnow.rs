@@ -298,19 +298,22 @@ unsafe extern "C" fn on_send(info: *const sys::esp_now_send_info_t, status: sys:
 }
 
 /// Board checks for NB-135's security review, for the `espnow_mesh` example: how long one failed try holds the air,
-/// and the heap with the receive queue full. Not for apps: they send outside the radio's queue.
+/// and the heap with the receive queue full. Not for apps: they send outside the radio's queue, and the heap check
+/// runs on the Wi-Fi task, so it is off until [`arm_rx_full`].
 pub mod check {
     use super::{add_peer, lock, Mac};
     use esp_idf_svc::sys;
     use peerwire::espnow::frame::{Frame, LONGEST};
     use peerwire::espnow::BROADCAST;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     /// The address a [`failed_try`] sends to, and when its callback came and what it said.
     static TRY: Mutex<Option<(Mac, Option<(Instant, bool)>)>> = Mutex::new(None);
-    /// The heap the first time the receive queue was full in a second, and how often it was.
+    /// The heap the first time the receive queue was full in a second, and how often it was; taken only once armed.
     static FULL: Mutex<Option<RxFull>> = Mutex::new(None);
+    static ARMED: AtomicBool = AtomicBool::new(false);
 
     /// The receive queue full: how often it was (a snapshot at most once a second), its frames and bytes then, and the
     /// heap's free bytes and largest block then.
@@ -357,8 +360,18 @@ pub mod check {
         }
     }
 
-    /// The receive queue was full with `frames` and `bytes`: a snapshot of the heap, at most once a second.
+    /// Arms the receive queue's check ([`rx_full`]): from then on, a full queue takes a snapshot of the heap, at most
+    /// once a second, on the Wi-Fi task. For the `espnow_mesh` board check, not for apps.
+    pub fn arm_rx_full() {
+        ARMED.store(true, Relaxed);
+    }
+
+    /// The receive queue was full with `frames` and `bytes`: a snapshot of the heap, at most once a second, once
+    /// armed; else nothing.
     pub(super) fn full(frames: usize, bytes: usize) {
+        if !ARMED.load(Relaxed) {
+            return;
+        }
         let mut f = lock(&FULL);
         let count = f.map_or(0, |f| f.count) + 1;
         if f.is_some_and(|f| f.at.elapsed() < Duration::from_secs(1)) {
@@ -373,7 +386,7 @@ pub mod check {
         *f = Some(RxFull { count, frames, bytes, free, largest, at: Instant::now() });
     }
 
-    /// The last [`RxFull`] snapshot, if the receive queue has been full.
+    /// The last [`RxFull`] snapshot, if the receive queue has been full since [`arm_rx_full`].
     pub fn rx_full() -> Option<RxFull> {
         *lock(&FULL)
     }

@@ -102,6 +102,7 @@ fn run() -> anyhow::Result<()> {
     let radio = espnow::radio(!V1_ONLY, Settings::DEFAULT)?;
     let watch = radio.watch();
     failed_tries();
+    espnow::check::arm_rx_full();
     let (version, max_frame) = (radio.ether().version(), radio.max_frame());
     info!(
         "ESPNOW_MESH up channel={channel} heard_ch={} mac={} espnow_ver={version} max_frame={max_frame} {}",
