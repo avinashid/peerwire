@@ -118,7 +118,10 @@ pub trait Radio: Send {
     fn disconnect(&mut self, conn: ConnId);
     /// The next event, without blocking.
     fn poll(&mut self) -> Option<RadioEvent>;
-    /// What it holds at once. [`Limits::DESKTOP`] unless the driver says otherwise.
+    /// What it holds at once. [`Limits::DESKTOP`] unless the driver says otherwise. A radio over a medium anyone in
+    /// range can write into, whose values a third party can forge on a connection (as ESP-NOW's frames), must set
+    /// [`Limits::forgeable`]: the node then seals datagrams too, and holds adverts seconds, not a minute, after the
+    /// closes a forged value can cause.
     fn limits(&self) -> Limits {
         Limits::DESKTOP
     }
