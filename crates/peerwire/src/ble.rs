@@ -2582,14 +2582,16 @@ mod tests {
     const FAULTS: [&str; 4] = ["early", "closed after the challenge", "drops", "drops the node counts"];
     /// And for NB135-10: forged frames make the central miss the proof's deadline, or the peripheral close a proven
     /// connection bound to no peer (a standby); and that standby again, but with a link to its peer over the network
-    /// beside it (a spare), which keeps the minute.
-    const STANDBYS: [&str; 3] = ["missed the deadline", "a standby closed", "a spare closed"];
+    /// beside it (a spare), which keeps the minute; and with the link to its peer left on a radio connection that
+    /// closed (NB135-I7's case), which goes nowhere, so the standby was the way to the peer (NB135-I8).
+    const STANDBYS: [&str; 4] =
+        ["missed the deadline", "a standby closed", "a spare closed", "a standby closed beside a link on a gone one"];
 
     /// How long a node with `limits`, as the central, holds the advert of a connection that closes in each of `cases`:
     /// a datagram before the room's proof (`Fault::Early`), the peripheral closing it after its challenge, `MAX_DROPS`
     /// messages of a kind dropped once proven (`Fault::Drops`), counted by the link and by the node; no proof by the
     /// deadline (`PROVE_WITHIN`), and the peripheral closing a proven connection whose peer proved who it is, with no
-    /// link to that peer, or with one over the network.
+    /// link to that peer, with one over the network, or with one left on a radio connection that closed.
     fn fault_holds(limits: Limits, cases: &[&'static str]) -> Vec<(&'static str, Duration)> {
         use peerwire_core::ble::MAX_DROPS;
         let key = ble_key("app", "room");
@@ -2604,7 +2606,7 @@ mod tests {
                 let device = (DeviceId(yp.index() as u64), u32::MAX);
                 let mut at = t;
                 let mut udp = None;
-                if case.starts_with("drops") || case.ends_with("closed") && case != "closed after the challenge" {
+                if case.starts_with("drops") || case.starts_with("a s") {
                     let (conn, mut tx) = serve(&mut yp, &mut node, &mut ep, t, &id(2));
                     assert_eq!(node.counts(), (1, 1, 0), "{case}: proven");
                     let known = node.conns.values().next().and_then(Conn::known);
@@ -2617,8 +2619,15 @@ mod tests {
                         }
                         "drops the node counts" => node.dropped(*node.conns.keys().next().unwrap(), MAX_DROPS),
                         "a standby closed" => yp.disconnect(conn),
+                        "a spare closed" => {
+                            udp = Some(linked_over(&mut ep, t, Hop::Net("10.0.0.2:2000".parse().unwrap())));
+                            yp.disconnect(conn);
+                        }
                         _ => {
-                            udp = Some(linked_over_udp(&mut ep, t));
+                            // A radio connection the node no longer has: none is open at that address.
+                            let gone: SocketAddr = "0.0.0.200:0".parse().unwrap();
+                            assert!(!node.by_hop.contains_key(&gone), "{case}: gone");
+                            udp = Some(linked_over(&mut ep, t, Hop::Ble(gone)));
                             yp.disconnect(conn);
                         }
                     }
@@ -2656,11 +2665,11 @@ mod tests {
             .collect()
     }
 
-    /// A link from `ep` (node 1's) to node 2 over the network, as a radio connection's peer may have beside it; node
-    /// 2's endpoint.
-    fn linked_over_udp(ep: &mut Endpoint<Hop<SocketAddr>>, t: Instant) -> Endpoint<Hop<SocketAddr>> {
+    /// A link from `ep` (node 1's) to node 2 over `b`, as a radio connection's peer may have beside it (over the
+    /// network, or left on a radio connection that closed); node 2's endpoint.
+    fn linked_over(ep: &mut Endpoint<Hop<SocketAddr>>, t: Instant, b: Hop<SocketAddr>) -> Endpoint<Hop<SocketAddr>> {
         let mut other = Endpoint::new(&id(2), Config::default(), [2; 32]);
-        let (a, b) = (Hop::Net("10.0.0.1:1000".parse().unwrap()), Hop::Net("10.0.0.2:2000".parse().unwrap()));
+        let a = Hop::Net("10.0.0.1:1000".parse().unwrap());
         ep.connect(t, b, id(2).peer_id()).unwrap();
         for _ in 0..8 {
             while let Some(x) = ep.poll_transmit(t) {
@@ -2670,7 +2679,7 @@ mod tests {
                 ep.handle_datagram(t, b, &x.payload);
             }
         }
-        assert_eq!(ep.path(&id(2).peer_id()), Some(&Path::Direct(b)), "linked over the network");
+        assert_eq!(ep.path(&id(2).peer_id()), Some(&Path::Direct(b)), "linked over {b:?}");
         other
     }
 
@@ -2709,6 +2718,9 @@ mod tests {
         assert!(seconds.contains(&held("missed the deadline")), "1 to 4 s: {holds:?}");
         assert!(seconds.contains(&held("a standby closed")), "1 to 4 s: {holds:?}");
         assert_eq!(held("a spare closed"), RECONNECT_HOLD, "a minute beside a link: {holds:?}");
+        // NB135-I8: a link left on a radio connection that closed goes nowhere, so the standby was the way.
+        let gone = held("a standby closed beside a link on a gone one");
+        assert!(seconds.contains(&gone), "1 to 4 s beside a link on a gone connection: {holds:?}");
     }
 
     /// NB135-9: an HS1 on a proven connection no peer is bound to yet, as a datagram as it is. Whether it took the
