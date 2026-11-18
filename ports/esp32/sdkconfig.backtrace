@@ -1,0 +1,2 @@
+# BACKTRACE=1 ./build.sh (NB-133): a panic or abort prints the RISC-V backtrace, walked by frame pointer.
+CONFIG_ESP_SYSTEM_USE_FRAME_POINTER=y

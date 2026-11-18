@@ -53,6 +53,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// one a frame over the cap closes does, keeps it, so a sender can't make the carrier
 /// redo the TLS handshake every second (NB95-1).
 const STABLE: Duration = MAX_BACKOFF;
+/// Relay hosts whose TLS sessions are kept to resume. rustls's default makes room for 256 up front: 13.9 KB on a PC,
+/// and several KB of a board's heap for good, for a node that talks to a few relays (NB-133).
+const RESUME_HOSTS: usize = 8;
 
 /// Caps on what a carrier takes and keeps.
 #[derive(Clone, Copy, Debug)]
@@ -204,15 +207,54 @@ pub struct NostrSignaling {
     topics: BTreeSet<Topic>,
     relays: Vec<Sender<Cmd>>,
     inbox: Receiver<Incoming>,
-    /// Event ids passed on, as their first 16 bytes (a `u128`, not the 64-character hex twice: 32 bytes an id where
-    /// two `String`s took ~190, so ~6 KB for the 128 on an ESP32 rather than ~25, NB-132). An id is checked to be the
-    /// event's hash, so a copy that slips through takes ~2^64 tries at events of one's own, and can't target another's.
-    seen: HashSet<u128>,
-    seen_order: VecDeque<u128>,
+    seen: Seen,
     shared: Arc<Shared>,
     counters: RelayWatch,
     published: u64,
-    limits: Limits,
+}
+
+/// Event ids passed on, as their first 16 bytes (a `u128`, not the 64-character hex twice: 32 bytes an id where two
+/// `String`s took ~190, NB-132), the last `max` of them. An id is checked to be the event's hash, so a copy that slips
+/// through takes ~2^64 tries at events of one's own, and can't target another's.
+struct Seen {
+    /// The ids, oldest first. The oldest goes before one more comes, so it never holds more than `max` (its buffer
+    /// would double past it).
+    order: VecDeque<u128>,
+    /// The same ids, to look up, unless `small`.
+    set: HashSet<u128>,
+    max: usize,
+    /// An id is looked up by searching `order`, and `set` stays empty, as on an ESP32: `order` takes its 2 KB for 128
+    /// when the carrier starts and never more. A hash set pre-sized to 128 kept a tombstone for each id that went, and
+    /// after 341–684 new ids, which anyone who knows the room's tag can send, regrew to 512 buckets, ~8.7 KB in one
+    /// block (NB133-1).
+    small: bool,
+}
+
+impl Seen {
+    fn new(max: usize, small: bool) -> Seen {
+        // On an ESP32 the queue takes its whole room now, while the heap is whole, rather than doubling into holes
+        // during the first page visits (NB-133). The desktop's 4096 grow as needed.
+        let order = if small { VecDeque::with_capacity(max) } else { VecDeque::new() };
+        Seen { order, set: HashSet::new(), max, small }
+    }
+
+    /// Remembers `id`, forgetting the oldest past `max`: true if it's new, false for a copy.
+    fn insert(&mut self, id: u128) -> bool {
+        let known = if self.small { self.order.contains(&id) } else { self.set.contains(&id) };
+        if known {
+            return false;
+        }
+        if self.order.len() >= self.max {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        if !self.small {
+            self.set.insert(id);
+        }
+        self.order.push_back(id);
+        true
+    }
 }
 
 impl Default for NostrSignaling {
@@ -266,12 +308,10 @@ impl NostrSignaling {
             topics: BTreeSet::new(),
             relays,
             inbox,
-            seen: HashSet::new(),
-            seen_order: VecDeque::new(),
+            seen: Seen::new(limits.seen, SMALL),
             shared,
             counters: RelayWatch(counters.into()),
             published: 0,
-            limits,
         }
     }
 
@@ -335,17 +375,9 @@ impl Signaling for NostrSignaling {
         loop {
             let m = self.inbox.try_recv().ok()?;
             self.shared.inbox_bytes.fetch_sub(m.size(), Ordering::Relaxed);
-            if m.pubkey == self.pubkey || self.seen.contains(&m.id) {
+            if m.pubkey == self.pubkey || !self.seen.insert(m.id) {
                 continue; // our own, or a copy from another relay
             }
-            // The oldest goes first, so the queue never holds more than `seen` (its buffer would double past it).
-            if self.seen_order.len() >= self.limits.seen {
-                if let Some(old) = self.seen_order.pop_front() {
-                    self.seen.remove(&old);
-                }
-            }
-            self.seen.insert(m.id);
-            self.seen_order.push_back(m.id);
             let Some(topic) = Topic::from_hex(&m.tag).filter(|t| self.topics.contains(t)) else { continue };
             if let Some(payload) = unb64(&m.content) {
                 return Some((topic, payload));
@@ -616,15 +648,14 @@ impl Read for Oversize {
                         let cap = (at + left).max(2 * self.held.capacity()).min(self.max as usize);
                         self.held.reserve_exact(cap - at);
                     }
-                    let mut held = std::mem::take(&mut self.held);
-                    held.resize(at + left, 0);
-                    let got = self.src(&mut held[at..]);
-                    held.truncate(at + got.as_ref().map_or(0, |n| *n));
-                    self.held = held;
-                    let n = got?;
+                    // Through a scratch, as `Skip` reads: zero-filling `left` in `held` for each read made a message
+                    // read in tiny pieces cost time quadratic in its size (NB-128 review).
+                    let mut scratch = [0u8; 256];
+                    let n = self.src(&mut scratch[..left.min(256)])?;
                     if n == 0 {
                         return Ok(0);
                     }
+                    self.held.extend_from_slice(&scratch[..n]); // within the capacity reserved above
                     self.part = Part::Keep(left - n, last);
                 }
                 Part::Release(at) => {
@@ -955,11 +986,12 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
         .get_or_init(|| {
             let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
             let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let config = rustls::ClientConfig::builder_with_provider(provider)
+            let mut config = rustls::ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .expect("ring supports the default TLS versions")
                 .with_root_certificates(roots)
                 .with_no_client_auth();
+            config.resumption = rustls::client::Resumption::in_memory_sessions(RESUME_HOSTS);
             Arc::new(config)
         })
         .clone()
@@ -1107,6 +1139,47 @@ mod tests {
         }
         assert_eq!(shared.inbox_bytes.load(Ordering::Relaxed), 5 * 3081);
         assert_eq!(rx.try_iter().count(), 5);
+    }
+
+    /// NB133-1: an ESP32's seen filter searches its queue of 128 and keeps no hash set, so 2,128 new ids through
+    /// `poll`, as anyone who knows the room's tag can send, leave the queue's buffer as the carrier started with it and
+    /// the set with none (a set pre-sized to 128 regrew to 512 buckets after a few hundred). A copy of any of the last
+    /// 128 is dropped, and an older id taken again. The desktop's set and queue do the same with 4096.
+    #[test]
+    fn the_seen_filter_drops_copies_of_the_last_ids_and_an_esp32s_never_grows() {
+        let topic = Topic([6; 32]);
+        for (limits, small) in [(Limits::SMALL, true), (Limits::FULL, false)] {
+            let mut carrier = NostrSignaling::with_limits(Vec::<&str>::new(), limits);
+            carrier.seen = Seen::new(limits.seen, small); // as `with_limits` makes it on an ESP32, or here
+            carrier.subscribe(topic);
+            let (tx, rx) = sync_channel(1);
+            carrier.inbox = rx;
+            // An event from a relay, through `poll`: whether it's passed on.
+            let deliver = |carrier: &mut NostrSignaling, id: u128| {
+                let m = Incoming { id, pubkey: "ab".repeat(32), tag: topic.to_hex(), content: "QQ==".into() };
+                carrier.shared.inbox_bytes.fetch_add(m.size(), Ordering::Relaxed);
+                tx.send(m).unwrap();
+                carrier.poll().is_some()
+            };
+            let (max, cap) = (limits.seen as u128, carrier.seen.order.capacity());
+            assert!(!small || cap >= limits.seen, "{cap}");
+            let last = max + 2000;
+            for id in 1..=last {
+                assert!(deliver(&mut carrier, id), "{id} is new");
+                if small {
+                    assert_eq!((carrier.seen.order.capacity(), carrier.seen.set.capacity()), (cap, 0), "after {id}");
+                }
+            }
+            assert_eq!(carrier.seen.order.len(), limits.seen);
+            assert_eq!(carrier.seen.set.len(), if small { 0 } else { limits.seen });
+            for id in last + 1 - max..=last {
+                assert!(!deliver(&mut carrier, id), "{id} is a copy");
+            }
+            assert!(deliver(&mut carrier, last - max), "an id from before the last {max} is new again");
+            if small {
+                assert_eq!((carrier.seen.order.capacity(), carrier.seen.set.capacity()), (cap, 0));
+            }
+        }
     }
 
     /// NB95-1 and NB-128, with an ESP32's limits: an event of 3.9 KB is taken; a 16 KiB frame, as an event someone
@@ -1286,9 +1359,11 @@ mod tests {
                 &self.tcp
             }
         }
-        // A frame: its length in the shortest form or a longer one, masked one time in 4, then the payload.
+        // A frame: an RSV bit one time in 16 (only a relay sets one, and tungstenite refuses it), its length in the
+        // shortest form or a longer one, masked one time in 4, then the payload.
         fn frame(rng: &mut Rng, fin: bool, opcode: u8, len: usize) -> Vec<u8> {
-            let (mask, mut f) = (rng.one_in(4), vec![u8::from(fin) << 7 | opcode]);
+            let rsv = if rng.one_in(16) { *rng.pick(&[0x10u8, 0x20, 0x40]) } else { 0 };
+            let (mask, mut f) = (rng.one_in(4), vec![u8::from(fin) << 7 | rsv | opcode]);
             let m = if mask { 0x80 } else { 0 };
             match (len, rng.below(3)) {
                 (0..=125, 0) => f.push(m | len as u8),
@@ -1312,10 +1387,10 @@ mod tests {
             frame(rng, true, op, len)
         }
         // A message in pieces whose payloads came to `payload`, passed on whole: one frame, the shortest length form,
-        // the mask bit with a zero key if a piece had it.
-        fn whole(op: u8, masked: bool, payload: &[u8]) -> Vec<u8> {
+        // every piece's RSV bits, the mask bit with a zero key if a piece had it.
+        fn whole(op: u8, rsv: u8, masked: bool, payload: &[u8]) -> Vec<u8> {
             let (m, n) = (if masked { 0x80 } else { 0 }, payload.len());
-            let mut f = vec![0x80 | op];
+            let mut f = vec![0x80 | rsv | op];
             match n {
                 0..=125 => f.push(m | n as u8),
                 126..=65535 => {
@@ -1359,7 +1434,7 @@ mod tests {
                 let pieces = if rng.one_in(3) { 2 + rng.below(3) } else { 1 };
                 let op = *rng.pick(&[1u8, 2]);
                 let first = if rng.one_in(3) { max + 1 + rng.below(800) } else { rng.below(max + 1) };
-                let (mut payload, mut masked) = (Vec::new(), false);
+                let (mut payload, mut masked, mut rsv) = (Vec::new(), false, 0);
                 for k in 0..pieces {
                     let len = match k {
                         0 => first,
@@ -1371,7 +1446,7 @@ mod tests {
                     if pieces == 1 && first <= max {
                         want.extend_from_slice(&f);
                     }
-                    masked |= f[1] & 0x80 != 0;
+                    (masked, rsv) = (masked || f[1] & 0x80 != 0, rsv | f[0] & 0x70);
                     payload.extend_from_slice(&f[f.len() - len..]);
                     if k + 1 < pieces && rng.one_in(3) {
                         let c = control(&mut rng);
@@ -1380,7 +1455,7 @@ mod tests {
                     }
                 }
                 if pieces > 1 && payload.len() <= max {
-                    want.extend_from_slice(&whole(op, masked, &payload));
+                    want.extend_from_slice(&whole(op, rsv, masked, &payload));
                     held += 1;
                 }
             }

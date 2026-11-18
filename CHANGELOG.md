@@ -90,6 +90,19 @@ and the commit that fixed it.
   closed the connection before, so anyone who knew a board's room could keep it off its relay, and off the pipes
   that carry pages' links, by sending one oversize event to its tag each time it reconnected (NB-128, NB126-2,
   NB128-1).
+- **Fix,** `peerwire-esp`: a board stays up through page churn (NB-133). `idle` blocks for a tick at least, so the idle
+  task runs: ESP-IDF busy-waits a sleep under a tick, and a loop whose timers were due starved it (4 `task_wdt`
+  warnings a run before, none now). `heap()` gives the largest free block and the low since boot too (`Heap`), and a
+  failed allocation logs its size, its task and the heap's free, largest block and low, on every one that fails (not
+  all are fatal). `BACKTRACE=1 ./build.sh` builds with frame pointers, so a panic or an abort prints a backtrace (C3).
+- **Fix,** `peerwire`: less of a board's heap held for good (NB-133). The TLS session resumption cache holds 8 relay
+  hosts (rustls's default, 256, before), and a node remembers 2 departed peers per link, at least 16 (was 4 and 32):
+  16 on a board, 1,024 on a desktop. On an ESP32, `NostrSignaling`'s seen filter is a fixed queue of 128 ids searched
+  in turn: its hash set regrew to 512 buckets (~8.7 KB), which anyone in the room could set off (NB133-1). With these,
+  an ESP32-C3 through 40 page loads in 10 minutes: low since boot 43.3 KB (was 30.6), worst largest block 36.9 KB (was
+  20.5), 17 KB held after forgetting (was ~35), and no aborts.
+- `peerwire`: `NostrSignaling` reads a held relay message through a 256 B scratch, so one read in tiny pieces takes
+  linear time (128 KiB a byte at a time: 2.0 ms, was 92.5 ms) (NB-128).
 
 ## Unreleased: `@peerwire/js`
 
