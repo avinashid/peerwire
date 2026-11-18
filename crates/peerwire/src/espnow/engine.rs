@@ -13,18 +13,29 @@ use std::time::{Duration, Instant};
 
 /// A data frame up to this many past the last one taken is taken; the ones between are lost.
 pub const WINDOW: u32 = 64;
-/// Data frames in a row further ahead than [`WINDOW`], after which the receiver takes the next as its new place: its
-/// sender lost more than a window of frames. One forged far ahead is dropped.
+/// Data frames in a row further than [`WINDOW`] ahead, or further than it behind, after which the receiver takes the
+/// next as its new place: its sender lost more than a window of frames, or frames forged far ahead moved this end on
+/// (NB135-1), and its next frames come from where it really is. One far off is dropped.
 pub const RESYNC_AFTER: u32 = 4;
 /// Events queued for the node at most: adverts, and values. Connections coming and going are never dropped.
 const MAX_SEEN_QUEUED: usize = 16;
+/// Values at most, and their bytes, so a node that doesn't poll holds 16 KB of them at most (NB135-2).
 const MAX_VALUES_QUEUED: usize = 128;
+const MAX_VALUE_BYTES: usize = 16 * 1024;
 /// Refusals (a CLOSE for an accept no open waits for) go at most this often, so a flood of frames from made-up
 /// addresses gets few answers.
 const REFUSE_GAP: Duration = Duration::from_millis(100);
 /// A CLOSE is taken only if nothing comes on the connection for this long after the PROBE it sends: a peer that still
 /// has the connection answers at once. So a forged CLOSE, which anyone in range can send, closes nothing.
 pub const CLOSE_CHECK: Duration = Duration::from_millis(500);
+/// A second ACCEPT with another id this soon after the first closes the connection (NB135-4): one of the two was
+/// forged, and which can't be told. The node's own time for a connection to prove the room.
+pub const ACCEPT_RACE: Duration = Duration::from_secs(3);
+/// Frames waiting for the ether at most; connection-less ones (a CLOSE for a connection gone, an advert) at most
+/// `MAX_LOOSE` of them, and refusals one. A connection's own are capped by its values, and by one of each other kind
+/// (NB135-3).
+const MAX_TX: usize = 256;
+const MAX_LOOSE: usize = 4;
 /// A connection answers PROBEs at most this often.
 const PROBE_GAP: Duration = Duration::from_millis(100);
 /// Frames handed to the ether whose verdict hasn't come, at most; one whose verdict hasn't come in this long is taken
@@ -74,10 +85,11 @@ struct Conn {
     /// The next data frame's number, and the last one taken.
     tx_seq: u32,
     rx_last: u32,
-    /// Data frames in a row further than [`WINDOW`] ahead.
+    /// Data frames in a row further than [`WINDOW`] ahead, and behind.
     ahead: u32,
-    /// Whether a data frame came on it: before one, a second ACCEPT with another id closes it.
-    took_data: bool,
+    behind: u32,
+    /// When the connection opener took the other end's ACCEPT: for [`ACCEPT_RACE`].
+    accepted: Option<Instant>,
     /// A value whose first frame came and whose last hasn't, and how long its frames say it is.
     partial: Vec<u8>,
     assembling: bool,
@@ -85,8 +97,10 @@ struct Conn {
     /// When a frame for this end last came on it, and when one was last queued on it.
     heard: Instant,
     sent: Instant,
-    /// Frames in a row the radio said it couldn't deliver.
+    /// Frames in a row the radio said it couldn't deliver, and whether it has acknowledged one: until it has, the
+    /// address may be made up, and frames to it get fewer tries (NB135-3).
     failures: u32,
+    acked: bool,
     /// When a CLOSE came that the other end hasn't answered the probe of yet; when this end last answered a probe.
     closing: Option<Instant>,
     answered: Option<Instant>,
@@ -103,19 +117,24 @@ impl Conn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Control,
+    /// A CLOSE for an ACCEPT no open waits for: from anyone, so one try, and one waiting at most (NB135-3).
+    Refusal,
     Open,
     Accept,
     Advert,
     Keepalive,
-    Data { end: bool },
+    Data {
+        end: bool,
+    },
 }
 
-/// A frame waiting for the ether.
+/// A frame waiting for the ether, and the tries it gets if the receiving radio doesn't acknowledge it.
 struct Out {
     to: Mac,
     frame: Vec<u8>,
     conn: Option<ConnId>,
     kind: Kind,
+    tries: u8,
 }
 
 /// A frame the ether took, waiting for its verdict.
@@ -141,6 +160,7 @@ pub struct Engine {
     events: VecDeque<RadioEvent>,
     seen_queued: usize,
     values_queued: usize,
+    value_bytes: usize,
     refused_at: Option<Instant>,
     stats: Stats,
 }
@@ -163,6 +183,7 @@ impl Engine {
             events: VecDeque::new(),
             seen_queued: 0,
             values_queued: 0,
+            value_bytes: 0,
             refused_at: None,
             stats: Stats::default(),
         }
@@ -234,12 +255,14 @@ impl Engine {
         }
         let room = c.frame - DATA_HEADER;
         let n = value.len().div_ceil(room);
+        let tries = if c.acked { self.settings.tries } else { self.settings.first_tries };
         for (i, payload) in value.chunks(room).enumerate() {
             let last = i + 1 == n;
             let total = value.len() as u16;
             let f = Frame::Data { to: c.theirs, seq: c.tx_seq, first: i == 0, last, total, payload };
             c.tx_seq = c.tx_seq.wrapping_add(1);
-            self.tx.push_back(Out { to: c.mac, frame: f.encode(), conn: Some(conn), kind: Kind::Data { end: last } });
+            let (frame, kind) = (f.encode(), Kind::Data { end: last });
+            self.tx.push_back(Out { to: c.mac, frame, conn: Some(conn), kind, tries });
         }
         c.values += 1;
         c.sent = now;
@@ -369,19 +392,20 @@ impl Engine {
             // An accept for an open given up, or never sent: closed at the other end too.
             self.stats.unknown += 1;
             if self.may_refuse(now) {
-                self.queue(now, mac, Frame::Close { to: theirs }, None, Kind::Control);
+                self.queue(now, mac, Frame::Close { to: theirs }, None, Kind::Refusal);
             }
             return;
         };
         let (mtu, max_frame) = (self.settings.mtu, self.max_frame);
         let Some(c) = self.conns.get_mut(&conn) else { return };
         if c.open() {
-            // The same accept again is the other end alive. Another, before any data came, means one of the two was
-            // forged (it won the race, and this end sends to its id), and which can't be told: the connection closes
-            // at once, before the room's challenge comes, and the node connects again. After data came, it is ignored.
+            // The same accept again is the other end alive. Another, within `ACCEPT_RACE` of the first, means one of
+            // the two was forged (it won the race, and this end sends to its id), and which can't be told, whatever
+            // came on the connection meanwhile, as that can be forged too (NB135-4): the connection closes, and the
+            // node connects again. Later, it is ignored.
             if c.theirs == theirs {
                 self.live(now, mac, to);
-            } else if !c.took_data {
+            } else if c.accepted.is_some_and(|t| now.saturating_duration_since(t) < ACCEPT_RACE) {
                 self.stats.accept_conflicts += 1;
                 self.close(conn);
             } else {
@@ -390,6 +414,7 @@ impl Engine {
             return;
         }
         (c.theirs, c.state, c.frame) = (theirs, State::Open, usize::from(rx_max).min(max_frame));
+        c.accepted = Some(now);
         (c.heard, c.sent) = (now, now);
         self.tx.retain(|o| !(o.conn == Some(conn) && o.kind == Kind::Open));
         self.events.push_back(RadioEvent::Connected { conn, device: c.device, mtu });
@@ -407,14 +432,25 @@ impl Engine {
             return;
         }
         let Some(c) = self.conns.get_mut(&conn) else { return };
-        c.took_data = true;
-        // Where it falls: the last one again, or behind it; in the window; or further ahead.
+        // Where it falls: the last one again, or behind it within the window (a copy, or a straggler); in the window
+        // ahead; or further off, either way, where `RESYNC_AFTER` in a row move this end there. Either way, so frames
+        // forged far ahead or far behind lose a connection `RESYNC_AFTER` of its real frames, not all (NB135-1).
         let d = seq.wrapping_sub(c.rx_last);
-        if d == 0 || d > 1 << 31 {
+        let back = d.wrapping_neg();
+        if d == 0 || d > 1 << 31 && back <= WINDOW {
             self.stats.old += 1;
             return;
         }
-        if d > WINDOW {
+        if d > 1 << 31 {
+            c.ahead = 0;
+            c.behind += 1;
+            if c.behind < RESYNC_AFTER {
+                self.stats.old += 1;
+                return;
+            }
+            self.stats.resyncs += 1;
+        } else if d > WINDOW {
+            c.behind = 0;
             c.ahead += 1;
             if c.ahead < RESYNC_AFTER {
                 self.stats.ahead += 1;
@@ -422,7 +458,7 @@ impl Engine {
             }
             self.stats.resyncs += 1;
         }
-        c.ahead = 0;
+        (c.ahead, c.behind) = (0, 0);
         if d > 1 {
             self.stats.gaps += 1;
             c.assembling = false;
@@ -451,11 +487,12 @@ impl Engine {
         }
         c.assembling = false;
         let value = std::mem::take(&mut c.partial);
-        if self.values_queued >= MAX_VALUES_QUEUED {
+        if self.values_queued >= MAX_VALUES_QUEUED || self.value_bytes + value.len() > MAX_VALUE_BYTES {
             self.stats.events_dropped += 1;
             return;
         }
         self.values_queued += 1;
+        self.value_bytes += value.len();
         self.stats.values_in += 1;
         self.events.push_back(RadioEvent::Value { conn, value });
     }
@@ -477,7 +514,7 @@ impl Engine {
             c.values = c.values.saturating_sub(1);
         }
         if ok {
-            c.failures = 0;
+            (c.failures, c.acked) = (0, true);
             return;
         }
         c.failures += 1;
@@ -552,11 +589,11 @@ impl Engine {
 
     /// The next frame for the ether, if there is room for one in flight. [`commit`](Self::commit) once the ether took
     /// it; leave it if not, and it is offered again.
-    pub fn peek(&self) -> Option<(Mac, &[u8])> {
+    pub fn peek(&self) -> Option<(Mac, &[u8], u8)> {
         if self.flight.len() >= MAX_FLIGHT {
             return None;
         }
-        self.tx.front().map(|o| (o.to, &o.frame[..]))
+        self.tx.front().map(|o| (o.to, &o.frame[..], o.tries))
     }
 
     /// The ether took the frame [`peek`](Self::peek) gave.
@@ -571,7 +608,10 @@ impl Engine {
         let e = self.events.pop_front()?;
         match e {
             RadioEvent::Seen { .. } => self.seen_queued -= 1,
-            RadioEvent::Value { .. } => self.values_queued -= 1,
+            RadioEvent::Value { ref value, .. } => {
+                self.values_queued -= 1;
+                self.value_bytes -= value.len();
+            }
             _ => {}
         }
         Some(e)
@@ -630,13 +670,15 @@ impl Engine {
             tx_seq: 0,
             rx_last: u32::MAX,
             ahead: 0,
-            took_data: false,
+            behind: 0,
+            accepted: None,
             partial: Vec::new(),
             assembling: false,
             total: 0,
             heard: now,
             sent: now,
             failures: 0,
+            acked: false,
             closing: None,
             answered: None,
             values: 0,
@@ -655,11 +697,31 @@ impl Engine {
     }
 
     /// Queues `f` for `to`: a keepalive is due on `conn` only after [`Settings::keepalive`] with nothing queued.
+    ///
+    /// Within the caps (NB135-3): one refusal waiting at most, `MAX_LOOSE` frames of no connection, `MAX_TX` in all;
+    /// what is over goes. A broadcast and a refusal get one try, a frame of a connection that has had one acknowledged
+    /// [`Settings::tries`], and any other, to an address that may be made up, [`Settings::first_tries`].
     fn queue(&mut self, now: Instant, to: Mac, f: Frame, conn: Option<ConnId>, kind: Kind) {
+        let over = match kind {
+            Kind::Refusal => self.tx.iter().any(|o| o.kind == Kind::Refusal),
+            _ if conn.is_none() => self.tx.iter().filter(|o| o.conn.is_none()).count() >= MAX_LOOSE,
+            _ => false,
+        };
+        if over || self.tx.len() >= MAX_TX {
+            self.stats.tx_dropped += 1;
+            return;
+        }
+        let mut tries = self.settings.first_tries;
         if let Some(c) = conn.and_then(|conn| self.conns.get_mut(&conn)) {
             c.sent = now;
+            if c.acked {
+                tries = self.settings.tries;
+            }
         }
-        self.tx.push_back(Out { to, frame: f.encode(), conn, kind });
+        if matches!(kind, Kind::Refusal | Kind::Advert) {
+            tries = 1;
+        }
+        self.tx.push_back(Out { to, frame: f.encode(), conn, kind, tries });
     }
 
     /// Whether a refusal may go now ([`REFUSE_GAP`]).
@@ -735,7 +797,7 @@ mod tests {
                         true => (&mut self.a, &mut self.b, A, B),
                         false => (&mut self.b, &mut self.a, B, A),
                     };
-                    while let Some((dest, f)) = tx.peek() {
+                    while let Some((dest, f, _)) = tx.peek() {
                         let f = f.to_vec();
                         tx.commit(self.t);
                         tx.outcome(true);
@@ -1020,17 +1082,81 @@ mod tests {
             }
         }
         assert_eq!((b_gone, a_gone), (Some(5), Some(9)));
-        // A second accept with another id after data came is ignored: forged, as the data shows the first was real.
+        // A second accept with another id later than `ACCEPT_RACE` after the first is ignored.
         let mut p = Pair::new(V1_FRAME, V1_FRAME);
         let (ca, cb) = p.link();
         let (a_id, _) = ids(&p);
         assert!(p.b.send(p.t, cb, b"data"));
+        p.shuttle();
+        p.later(ACCEPT_RACE);
         p.shuttle();
         p.a.handle(p.t, B, &Frame::Accept { to: a_id, from: 0x1234, rx_max: 250 }.encode());
         assert!(gone(&mut p.a).is_empty());
         assert!(p.a.send(p.t, ca, b"still up"));
         p.shuttle();
         assert_eq!(values(&mut p.b), [b"still up".to_vec()]);
+    }
+
+    /// NB135-1 (the security review's repro, inverted): four forged data frames far ahead move the receiver's place
+    /// 2^30 frames on, and the real frames, far behind it now, move it back after four: four values lost, not all.
+    /// The same the other way.
+    /// NB135-4 (the security review's repro, inverted): a forged ACCEPT and then a forged DATA frame, both before the
+    /// real ACCEPT, no longer make the real one look like the forgery: a second ACCEPT with another id within
+    /// `ACCEPT_RACE` of the first closes the connection, whatever came on it, and the node connects again.
+    #[test]
+    fn sec_a_forged_accept_and_data_lose_the_race_to_the_real_accept() {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        p.b.advertise(p.t, Some(&ADVERT));
+        p.a.connect(p.t, device_of(B));
+        p.shuttle_with(|from, _, _| from == A);
+        let Some(RadioEvent::Connected { .. }) = p.b.poll_event() else { panic!("b accepted") };
+        let Ok(Frame::Open { from: a_id, .. }) = frame::parse(&p.wire[0].2) else { panic!() };
+        p.a.handle(p.t, B, &Frame::Accept { to: a_id, from: 0x1234, rx_max: 250 }.encode());
+        p.a.handle(
+            p.t,
+            B,
+            &Frame::Data { to: a_id, seq: 0, first: true, last: true, total: 1, payload: &[0] }.encode(),
+        );
+        let Some(RadioEvent::Connected { conn: ca, .. }) = p.a.poll_event() else { panic!("a took the forged one") };
+        let real = p.wire.iter().find(|(from, _, _)| *from == B).map(|w| w.2.clone()).unwrap();
+        p.later(ACCEPT_RACE - ms(1));
+        p.a.handle(p.t, B, &real);
+        assert_eq!(gone(&mut p.a), [RadioEvent::Disconnected { conn: ca }], "the real accept closes it");
+        assert_eq!(p.a.stats().accept_conflicts, 1);
+        let (ca, _) = p.link();
+        assert!(p.a.send(p.t, ca, b"on the next connection"));
+        p.shuttle();
+        assert_eq!(values(&mut p.b), [b"on the next connection".to_vec()]);
+    }
+
+    #[test]
+    fn sec_four_forged_frames_far_ahead_or_behind_lose_four_real_frames_at_most() {
+        for far in [1u32 << 30, (1u32 << 30).wrapping_neg()] {
+            let mut p = Pair::new(V1_FRAME, V1_FRAME);
+            let (ca, _) = p.link();
+            let (_, b_id) = ids(&p);
+            assert!(p.a.send(p.t, ca, b"before"));
+            p.shuttle();
+            assert_eq!(values(&mut p.b), [b"before".to_vec()]);
+            for i in 0..RESYNC_AFTER {
+                let f = Frame::Data { to: b_id, seq: far + i, first: true, last: true, total: 1, payload: &[0] };
+                p.b.handle(p.t, A, &f.encode());
+            }
+            assert_eq!(p.b.stats().resyncs, 1);
+            let _ = values(&mut p.b);
+            let mut got = Vec::new();
+            for _ in 0..60 {
+                let _ = p.a.send(p.t, ca, b"real");
+                p.later(ms(1_000));
+                p.shuttle();
+                got.push(values(&mut p.b).len());
+            }
+            let first = got.iter().position(|n| *n > 0);
+            assert_eq!(first, Some(RESYNC_AFTER as usize - 1), "the fourth real frame moves b back: {got:?}");
+            assert_eq!(got.iter().sum::<usize>(), 60 - (RESYNC_AFTER as usize - 1), "and every one after comes");
+            assert_eq!(p.b.stats().resyncs, 2);
+            assert!(gone(&mut p.b).is_empty() && gone(&mut p.a).is_empty(), "nothing closes");
+        }
     }
 
     #[test]
@@ -1160,17 +1286,93 @@ mod tests {
     fn an_accept_for_an_open_given_up_is_closed_and_refusals_are_rate_limited() {
         let t = Instant::now();
         let mut a = engine(1, V1_FRAME, t);
+        let mut closes = 0;
         for i in 0..50u64 {
             a.handle(t + ms(i * 10), B, &Frame::Accept { to: 7 + i, from: 9, rx_max: 250 }.encode());
-        }
-        let mut closes = 0;
-        while let Some((to, f)) = a.peek() {
-            assert_eq!((to, frame::parse(f)), (B, Ok(Frame::Close { to: 9 })));
-            a.commit(t);
-            closes += 1;
+            while let Some((to, f, tries)) = a.peek() {
+                assert_eq!((to, frame::parse(f), tries), (B, Ok(Frame::Close { to: 9 }), 1), "one try");
+                a.commit(t);
+                closes += 1;
+            }
         }
         assert_eq!(closes, 5, "one per 100 ms over 500 ms");
         assert_eq!(a.stats().unknown, 50);
+    }
+
+    /// NB135-3 (the security review's repro, inverted): refusals of forged ACCEPTs no longer wait in the engine's
+    /// queue with no cap while the ether takes nothing (its one slot busy with frames no radio acknowledges): one
+    /// waits at most, and the rest go.
+    #[test]
+    fn sec_refusals_dont_pile_up_while_the_ether_is_busy() {
+        let t0 = Instant::now();
+        let mut b = engine(2, V1_FRAME, t0);
+        let mut t = t0;
+        for i in 0..600u64 {
+            t += ms(100);
+            let mac = [0x02, 0, 0, (i >> 16) as u8, (i >> 8) as u8, i as u8];
+            b.handle(t, mac, &Frame::Accept { to: 0x1000 + i, from: 0x2000 + i, rx_max: 250 }.encode());
+            b.timers(t);
+        }
+        assert_eq!(b.tx.len(), 1, "one refusal waits");
+        assert_eq!(b.stats().tx_dropped, 599);
+        // CLOSEs of connections the node closed, with the ether still busy: a few wait, the rest go.
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        p.b.advertise(p.t, Some(&ADVERT));
+        for i in 0..20u64 {
+            p.b.handle(p.t, [0x02, 0, 0, 0, 7, i as u8], &Frame::Open { from: 0x100 + i, rx_max: 250 }.encode());
+            for e in events(&mut p.b) {
+                if let RadioEvent::Connected { conn, .. } = e {
+                    p.b.disconnect(p.t, conn);
+                }
+            }
+        }
+        assert!(p.b.tx.iter().filter(|o| o.conn.is_none()).count() <= MAX_LOOSE);
+        assert!(p.b.tx.len() <= MAX_TX);
+    }
+
+    /// NB135-3: a frame to an address that has never acknowledged one gets `first_tries`, one of a connection that has
+    /// had one acknowledged `tries`, and a broadcast one.
+    #[test]
+    fn frames_to_an_address_that_never_acknowledged_get_fewer_tries() {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        let s = Settings::DEFAULT;
+        p.b.advertise(p.t, Some(&ADVERT));
+        p.later(ms(0));
+        assert_eq!(p.b.peek().map(|(to, _, tries)| (to, tries)), Some((BROADCAST, 1)), "an advert");
+        p.b.commit(p.t);
+        p.b.outcome(true);
+        // A replayed advert from an address that isn't there: OPENs with two tries each.
+        p.a.connect(p.t, device_of(X));
+        assert_eq!(p.a.peek().map(|(to, _, tries)| (to, tries)), Some((X, s.first_tries)));
+        p.a.commit(p.t);
+        p.a.outcome(false);
+        // A real connection: its frames get two tries until one is acknowledged, then four.
+        let (ca, _) = p.link();
+        assert!(p.a.send(p.t, ca, b"one"));
+        assert_eq!(p.a.peek().map(|(_, _, tries)| tries), Some(s.tries), "the ACCEPT's been acknowledged");
+        // An ACCEPT to an OPEN's address, which may be made up: two tries.
+        let mut b = engine(3, V1_FRAME, p.t);
+        b.advertise(p.t, Some(&ADVERT));
+        b.handle(p.t, X, &Frame::Open { from: 5, rx_max: 250 }.encode());
+        let accept = b
+            .peek()
+            .map(|(to, f, tries)| (to, frame::parse(f).is_ok_and(|f| matches!(f, Frame::Accept { .. })), tries));
+        assert_eq!(accept, Some((X, true, s.first_tries)));
+    }
+
+    /// NB135-2: values waiting for a node that doesn't poll are capped in bytes (16 KB), not only in number.
+    #[test]
+    fn values_waiting_for_a_node_that_doesnt_poll_are_capped_in_bytes() {
+        let mut p = Pair::new(V2_FRAME, V2_FRAME);
+        let (ca, _) = p.link();
+        for i in 0..40u8 {
+            assert!(p.a.send(p.t, ca, &value(MAX_VALUE, i)));
+            p.shuttle();
+        }
+        assert_eq!(p.b.value_bytes, MAX_VALUE_BYTES, "32 values of 512 bytes");
+        assert_eq!(p.b.stats().events_dropped, 8);
+        assert_eq!(values(&mut p.b).len(), 32);
+        assert_eq!(p.b.value_bytes, 0);
     }
 
     #[test]
@@ -1245,6 +1447,7 @@ mod tests {
                 for e in [&p.a, &p.b] {
                     assert!(e.conns.len() <= limits.connections);
                     assert!(e.seen_queued <= MAX_SEEN_QUEUED && e.values_queued <= MAX_VALUES_QUEUED);
+                    assert!(e.value_bytes <= MAX_VALUE_BYTES);
                     assert!(e.conns.values().all(|c| c.partial.len() <= MAX_VALUE));
                     assert!(e.flight.len() <= MAX_FLIGHT);
                     assert!(e.events.len() <= MAX_SEEN_QUEUED + MAX_VALUES_QUEUED + 4 * limits.connections + 4);

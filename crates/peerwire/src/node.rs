@@ -1054,6 +1054,11 @@ impl Node {
     /// business. Dropped if it is about a peer in `refused` (see `poll_drained`), or one whose link isn't up and
     /// isn't admitted (see `admits`).
     fn take_event(&mut self, now: peerwire_core::Instant, wall: Instant, e: Ev<Addr>, refused: &[PeerId]) {
+        // A link that timed out closes the radio connections bound to its peer: the next one starts afresh (NB135-1).
+        #[cfg(feature = "ble")]
+        if let (Ev::Disconnected { peer, reason: DisconnectReason::Timeout }, Some(b)) = (&e, self.ble.as_mut()) {
+            b.link_timed_out(peer);
+        }
         let unseen = |p: &PeerId| refused.contains(p) || (self.status(p) != Status::Connected && !self.admits(p, &e));
         if about(&e).is_some_and(|p| unseen(&p)) {
             return;

@@ -413,6 +413,17 @@ impl Ble {
         }
     }
 
+    /// `peer`'s link timed out: a connection bound to it carried nothing that kept the link up, so it closes, with no
+    /// hold on the advert, and the next link to the peer comes over a new connection. A connection stuck while its
+    /// radio still says it's up (an ESP-NOW one whose numbers forged frames moved, NB135-1) can't then hold a peer
+    /// off for good.
+    pub(crate) fn link_timed_out(&mut self, peer: &PeerId) {
+        let bound: Vec<ConnId> = self.conns.iter().filter(|(_, c)| c.bound == Some(*peer)).map(|(i, _)| *i).collect();
+        for conn in bound {
+            self.close_for(conn, Duration::ZERO, "its peer's link timed out");
+        }
+    }
+
     /// Handles what the radio reported, and the timers, handing datagrams to `ep`; then sends what is queued.
     pub(crate) fn poll(&mut self, now: Instant, ep: &mut Endpoint<Hop<SocketAddr>>) {
         self.now = now;

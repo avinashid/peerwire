@@ -12,9 +12,10 @@
 //! sans-IO ([`Engine`]), and `FakeAir` (feature `testing`) has ethers in one process for tests.
 //!
 //! Like every carrier, ESP-NOW is untrusted, and its frames aren't authenticated: anyone in range can forge one from
-//! any address. A forged frame can close a connection or lose some of its frames, as jamming the channel would, and
-//! the node connects again; it can't make one hang, hold a connection open past its timeout once the peer is gone, or
-//! grow the state. What crosses a connection is sealed and proven by the node.
+//! any address, with the ids it overheard. The forged frames the design looks at (`docs/concepts/espnow.md`) can close
+//! a connection or lose some of its frames, as jamming the channel would, and the node connects again; and a link that
+//! times out closes the radio connections bound to its peer, so one stuck while its radio says it's up gives way to a
+//! new one (NB135-1). The state stays within its caps, and what crosses a connection is sealed and proven by the node.
 
 mod engine;
 mod ether;
@@ -60,12 +61,17 @@ pub struct Settings {
     /// Frames in a row the radio couldn't deliver (each after the ether's own tries), after which a connection is
     /// taken to be gone.
     pub max_failures: u32,
+    /// Tries the ether gives a frame the receiving radio doesn't acknowledge: on a connection that has had one
+    /// acknowledged, and to an address that hasn't (it may be made up: an OPEN to a replayed advert, an ACCEPT to a
+    /// forged OPEN), so such frames hold the air for less (NB135-3). Broadcasts and refusals get one.
+    pub tries: u8,
+    pub first_tries: u8,
 }
 
 impl Settings {
     /// Four connections (two unbound), eight values queued on each, a new handshake per 5 s, values of up to 512
     /// bytes; an advert every 500 ms; an OPEN every 500 ms for 10 s; a keepalive after 1 s of quiet, gone after 5 s
-    /// heard nothing or 8 frames undelivered in a row.
+    /// heard nothing or 8 frames undelivered in a row; 4 tries of a frame, 2 to an address that never acknowledged.
     pub const DEFAULT: Settings = Settings {
         limits: Limits { connections: 4, unbound: 2, centrals: 4, queue: 8, hs1_gap: Duration::from_secs(5) },
         mtu: 515,
@@ -75,6 +81,8 @@ impl Settings {
         keepalive: Duration::from_secs(1),
         timeout: Duration::from_secs(5),
         max_failures: 8,
+        tries: 4,
+        first_tries: 2,
     };
 }
 
@@ -119,8 +127,9 @@ pub struct Stats {
     pub closed_by_peer: u64,
     pub closed_quiet: u64,
     pub closed_failing: u64,
-    /// Adverts and values the node was too slow to take.
+    /// Adverts and values the node was too slow to take, and frames over the send queue's caps.
     pub events_dropped: u64,
+    pub tx_dropped: u64,
     /// Values the node gave that were empty or too long.
     pub values_refused: u64,
     /// Verdicts with no frame waiting for one, and frames whose verdict never came.
@@ -195,8 +204,8 @@ impl<E: Ether> EspNow<E> {
             self.engine.handle(now, from, &frame);
         }
         self.engine.timers(now);
-        while let Some((to, frame)) = self.engine.peek() {
-            if !self.ether.send(to, frame) {
+        while let Some((to, frame, tries)) = self.engine.peek() {
+            if !self.ether.send(to, frame, tries) {
                 break;
             }
             self.engine.commit(now);

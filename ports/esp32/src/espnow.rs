@@ -4,9 +4,10 @@
 //! Wi-Fi must be started as a station first and stay started for as long as the radio runs: on no network
 //! ([`wifi::start_on_channel`](crate::wifi::start_on_channel)), when every board in the room must be on the same
 //! channel, or on one ([`wifi::join`](crate::wifi::join)), when ESP-NOW follows the network's channel. Frames go out
-//! one at a time from a thread of their own, each tried up to [`TRIES`] times while the receiving radio doesn't
-//! acknowledge it (on top of the radio's own retries), as ESP-NOW's send callback can't be matched to a frame with
-//! several in flight; frames received wait in a queue of [`RX_QUEUE`] for the node, and more are dropped.
+//! one at a time from a thread of their own, each tried as many times as the radio asks while the receiving radio
+//! doesn't acknowledge it (on top of the radio's own retries: `Settings::tries`, fewer to an address that never
+//! acknowledged, NB135-3), as ESP-NOW's send callback can't be matched to a frame with several in flight; frames
+//! received wait in a queue of [`RX_QUEUE`] for the node, and more are dropped.
 //!
 //! ```no_run
 //! use peerwire_esp::espnow;
@@ -14,9 +15,12 @@
 //! use peerwire_esp::peerwire::{Node, PathKind, Policy};
 //!
 //! # fn main() -> anyhow::Result<()> {
+//! // A random address drawn at boot, before any radio, not the chip's own, which anyone in range could follow from boot
+//! // to boot; it lasts the boot (NB135-I3).
+//! let mac = peerwire_esp::wifi::random_mac()?;
 //! let p = esp_idf_svc::hal::peripherals::Peripherals::take()?;
 //! let sysloop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
-//! let _wifi = peerwire_esp::wifi::start_on_channel(p.modem, sysloop, 11)?; // kept for as long as the radio runs
+//! let _wifi = peerwire_esp::wifi::start_on_channel_as(p.modem, sysloop, 11, mac)?; // kept while the radio runs
 //! let radio = espnow::radio(true, Settings::DEFAULT)?;
 //! let mut node = Node::builder()
 //!     .config(peerwire_esp::config())
@@ -38,14 +42,13 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail};
 use esp_idf_svc::sys;
 use log::{info, warn};
-use peerwire::espnow::{EspNow, Ether, Mac, PeerTable, Settings, Touch, TxQueue, BROADCAST, V1_FRAME, V2_FRAME};
+use peerwire::espnow::{frame, EspNow, Ether, Mac, PeerTable, Settings, Touch, TxQueue, BROADCAST, V1_FRAME, V2_FRAME};
 
 /// Frames waiting to go, or with a verdict the node hasn't taken.
 pub const TX_QUEUE: usize = 32;
-/// Tries of a unicast frame the receiving radio doesn't acknowledge.
-pub const TRIES: u8 = 4;
-/// Frames received waiting for the node.
+/// Frames received waiting for the node at most, and their bytes: 16 KB, whoever sends (NB135-2).
 pub const RX_QUEUE: usize = 32;
+pub const RX_BYTES: usize = 16 * 1024;
 /// Entries this driver keeps in ESP-NOW's peer table (20 at most, with the broadcast address).
 pub const PEERS: usize = 16;
 /// A frame with no send callback after this long failed that try.
@@ -57,11 +60,21 @@ struct Shared {
     tx: Mutex<TxQueue>,
     /// Wakes the TX thread: a frame queued, or a verdict in.
     more: Condvar,
-    rx: Mutex<VecDeque<(Mac, Vec<u8>)>>,
+    rx: Mutex<Rx>,
     waker: Mutex<Option<Waker>>,
-    /// Frames dropped as the receive queue was full; tries esp_now_send refused.
+    /// Frames dropped as the receive queue was full, or as not ours (another app's, or too long to be ours); tries
+    /// esp_now_send refused; send callbacks for no frame on the air (NB135-I1).
     rx_dropped: AtomicU32,
+    not_ours: AtomicU32,
     refused: AtomicU32,
+    stray: AtomicU32,
+}
+
+/// Frames received, waiting for the node, and their bytes.
+#[derive(Default)]
+struct Rx {
+    frames: VecDeque<(Mac, Vec<u8>)>,
+    bytes: usize,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -95,12 +108,14 @@ impl EspNowEther {
             bail!("ESP-NOW is started already");
         }
         let shared = SHARED.get_or_init(|| Shared {
-            tx: Mutex::new(TxQueue::new(TX_QUEUE, TRIES)),
+            tx: Mutex::new(TxQueue::new(TX_QUEUE)),
             more: Condvar::new(),
-            rx: Mutex::new(VecDeque::new()),
+            rx: Mutex::new(Rx::default()),
             waker: Mutex::new(None),
             rx_dropped: AtomicU32::new(0),
+            not_ours: AtomicU32::new(0),
             refused: AtomicU32::new(0),
+            stray: AtomicU32::new(0),
         });
         sys::esp!(unsafe { sys::esp_now_init() })?;
         sys::esp!(unsafe { sys::esp_now_register_recv_cb(Some(on_recv)) })?;
@@ -123,15 +138,20 @@ impl EspNowEther {
         self.version
     }
 
-    /// Frames dropped as the receive queue was full, and tries esp_now_send refused.
-    pub fn dropped(&self) -> (u32, u32) {
-        (self.shared.rx_dropped.load(Relaxed), self.shared.refused.load(Relaxed))
+    /// [`dropped`].
+    pub fn dropped(&self) -> (u32, u32, u32, u32) {
+        dropped()
     }
 }
 
 impl Ether for EspNowEther {
-    fn send(&mut self, to: Mac, frame: &[u8]) -> bool {
-        if let Touch::Add { evict } = self.peers.touch(to) {
+    fn send(&mut self, to: Mac, frame: &[u8], tries: u8) -> bool {
+        // Never evicting an address with frames still waiting, whose tries would fail at once (NB135-I2).
+        let touch = {
+            let tx = lock(&self.shared.tx);
+            self.peers.touch_with(to, |m| tx.has(*m))
+        };
+        if let Touch::Add { evict } = touch {
             if let Some(old) = evict {
                 unsafe { sys::esp_now_del_peer(old.as_ptr()) };
             }
@@ -141,7 +161,7 @@ impl Ether for EspNowEther {
                 self.peers.forget(to);
             }
         }
-        let taken = lock(&self.shared.tx).push(to, frame);
+        let taken = lock(&self.shared.tx).push(to, frame, tries);
         if taken {
             self.shared.more.notify_one();
         }
@@ -153,7 +173,10 @@ impl Ether for EspNowEther {
     }
 
     fn recv(&mut self) -> Option<(Mac, Vec<u8>)> {
-        lock(&self.shared.rx).pop_front()
+        let mut rx = lock(&self.shared.rx);
+        let (from, frame) = rx.frames.pop_front()?;
+        rx.bytes -= frame.len();
+        Some((from, frame))
     }
 
     fn max_frame(&self) -> usize {
@@ -165,9 +188,11 @@ impl Ether for EspNowEther {
     }
 }
 
-/// Frames dropped as the receive queue was full, and tries esp_now_send refused, since ESP-NOW started.
-pub fn dropped() -> (u32, u32) {
-    SHARED.get().map_or((0, 0), |s| (s.rx_dropped.load(Relaxed), s.refused.load(Relaxed)))
+/// Since ESP-NOW started: frames dropped as the receive queue was full, frames dropped as not ours, tries
+/// esp_now_send refused, and send callbacks that named no frame on the air.
+pub fn dropped() -> (u32, u32, u32, u32) {
+    let Some(s) = SHARED.get() else { return (0, 0, 0, 0) };
+    (s.rx_dropped.load(Relaxed), s.not_ours.load(Relaxed), s.refused.load(Relaxed), s.stray.load(Relaxed))
 }
 
 /// The radio for a node: [`EspNowEther::start`]`(v2)` under `peerwire::espnow::EspNow`.
@@ -218,32 +243,170 @@ fn transmit(shared: &'static Shared) {
     }
 }
 
-/// ESP-NOW's receive callback, on the Wi-Fi task: queues the frame for the node, or drops it if the queue is full.
+/// ESP-NOW's receive callback, on the Wi-Fi task: queues the frame for the node, or drops it. Anything that isn't
+/// one of ours by its first bytes and length goes before it is copied, and a frame that doesn't fit the queue's
+/// frames or bytes goes too, so anyone in range can make the board hold [`RX_BYTES`] at most (NB135-2).
 unsafe extern "C" fn on_recv(info: *const sys::esp_now_recv_info_t, data: *const u8, len: c_int) {
     let Some(shared) = SHARED.get() else { return };
-    if info.is_null() || data.is_null() || len <= 0 || len as usize > V2_FRAME {
+    if info.is_null() || data.is_null() || len <= 0 {
         return;
     }
     let src = unsafe { (*info).src_addr };
     if src.is_null() {
         return;
     }
-    let from: Mac = unsafe { *(src as *const Mac) };
-    let frame = unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec();
-    let mut rx = lock(&shared.rx);
-    if rx.len() >= RX_QUEUE {
-        shared.rx_dropped.fetch_add(1, Relaxed);
+    let frame = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    if !frame::may_be_ours(frame) {
+        shared.not_ours.fetch_add(1, Relaxed);
         return;
     }
-    rx.push_back((from, frame));
+    let from: Mac = unsafe { *(src as *const Mac) };
+    let mut rx = lock(&shared.rx);
+    if rx.frames.len() >= RX_QUEUE || rx.bytes + frame.len() > RX_BYTES {
+        shared.rx_dropped.fetch_add(1, Relaxed);
+        let (frames, bytes) = (rx.frames.len(), rx.bytes);
+        drop(rx);
+        check::full(frames, bytes);
+        return;
+    }
+    rx.bytes += frame.len();
+    rx.frames.push_back((from, frame.to_vec()));
     drop(rx);
     shared.wake();
 }
 
-/// ESP-NOW's send callback, on the Wi-Fi task: the verdict on the frame on the air, and the TX thread woken.
-unsafe extern "C" fn on_send(_info: *const sys::esp_now_send_info_t, status: sys::esp_now_send_status_t) {
+/// ESP-NOW's send callback, on the Wi-Fi task: the verdict on the frame on the air, and the TX thread woken. Only a
+/// callback that names the address of the frame on the air is its verdict: a late one, for a try already given up,
+/// or one for a frame sent outside the queue, isn't (NB135-I1).
+unsafe extern "C" fn on_send(info: *const sys::esp_now_send_info_t, status: sys::esp_now_send_status_t) {
     let Some(shared) = SHARED.get() else { return };
-    lock(&shared.tx).verdict(status == sys::esp_now_send_status_t_ESP_NOW_SEND_SUCCESS);
+    let to = if info.is_null() { std::ptr::null() } else { unsafe { (*info).des_addr.cast_const() } };
+    let to: Option<Mac> = (!to.is_null()).then(|| unsafe { *(to as *const Mac) });
+    let ok = status == sys::esp_now_send_status_t_ESP_NOW_SEND_SUCCESS;
+    if to.is_some_and(|to| check::sent(to, ok)) {
+        return;
+    }
+    let mut q = lock(&shared.tx);
+    if to.is_some() && to == q.on_air() {
+        q.verdict(ok);
+    } else {
+        shared.stray.fetch_add(1, Relaxed);
+    }
+    drop(q);
     shared.more.notify_one();
     shared.wake();
+}
+
+/// Board checks for NB-135's security review, for the `espnow_mesh` example: how long one failed try holds the air,
+/// and the heap with the receive queue full. Not for apps: they send outside the radio's queue.
+pub mod check {
+    use super::{add_peer, lock, Mac};
+    use esp_idf_svc::sys;
+    use peerwire::espnow::frame::{Frame, LONGEST};
+    use peerwire::espnow::BROADCAST;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// The address a [`failed_try`] sends to, and when its callback came and what it said.
+    static TRY: Mutex<Option<(Mac, Option<(Instant, bool)>)>> = Mutex::new(None);
+    /// The heap the first time the receive queue was full in a second, and how often it was.
+    static FULL: Mutex<Option<RxFull>> = Mutex::new(None);
+
+    /// The receive queue full: how often it was (a snapshot at most once a second), its frames and bytes then, and the
+    /// heap's free bytes and largest block then.
+    #[derive(Clone, Copy, Debug)]
+    pub struct RxFull {
+        pub count: u32,
+        pub frames: usize,
+        pub bytes: usize,
+        pub free: u32,
+        pub largest: u32,
+        at: Instant,
+    }
+
+    /// Puts a frame of `len` bytes to `to`, an address no radio in range has, on the air outside the radio's queue, and
+    /// gives how long ESP-NOW took to report it (after the radio's own retries), and whether it was acknowledged: the
+    /// time one failed try holds the air. ESP-NOW must be started; a frame of the radio's on the air delays it.
+    pub fn failed_try(to: Mac, len: usize, within: Duration) -> anyhow::Result<(Duration, bool)> {
+        add_peer(to)?;
+        *lock(&TRY) = Some((to, None));
+        let frame = vec![0x5a; len.clamp(1, LONGEST)];
+        let start = Instant::now();
+        let r = unsafe { sys::esp_now_send(to.as_ptr(), frame.as_ptr(), frame.len()) };
+        let mut done = None;
+        while r == sys::ESP_OK && done.is_none() && start.elapsed() < within {
+            std::thread::sleep(Duration::from_millis(1));
+            done = lock(&TRY).and_then(|(_, d)| d);
+        }
+        *lock(&TRY) = None;
+        unsafe { sys::esp_now_del_peer(to.as_ptr()) };
+        sys::esp!(r)?;
+        let (at, ok) = done.ok_or_else(|| anyhow::anyhow!("no send callback within {within:?}"))?;
+        Ok((at.saturating_duration_since(start), ok))
+    }
+
+    /// The send callback's word for `to`: taken if a [`failed_try`] waits for it.
+    pub(super) fn sent(to: Mac, ok: bool) -> bool {
+        let mut t = lock(&TRY);
+        match &mut *t {
+            Some((m, done @ None)) if *m == to => {
+                *done = Some((Instant::now(), ok));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The receive queue was full with `frames` and `bytes`: a snapshot of the heap, at most once a second.
+    pub(super) fn full(frames: usize, bytes: usize) {
+        let mut f = lock(&FULL);
+        let count = f.map_or(0, |f| f.count) + 1;
+        if f.is_some_and(|f| f.at.elapsed() < Duration::from_secs(1)) {
+            if let Some(f) = f.as_mut() {
+                f.count = count;
+            }
+            return;
+        }
+        let (free, largest) = unsafe {
+            (sys::esp_get_free_heap_size(), sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_DEFAULT) as u32)
+        };
+        *f = Some(RxFull { count, frames, bytes, free, largest, at: Instant::now() });
+    }
+
+    /// The last [`RxFull`] snapshot, if the receive queue has been full.
+    pub fn rx_full() -> Option<RxFull> {
+        *lock(&FULL)
+    }
+
+    /// Broadcasts `n` frames of `len` bytes (at most the longest the parser takes) that every board's receive path
+    /// queues but no connection takes, outside the radio's queue: a burst to fill a board's receive queue. How many
+    /// ESP-NOW took.
+    pub fn burst(n: usize, len: usize) -> usize {
+        let len = len.clamp(32, LONGEST);
+        let payload = vec![0x5a; len - peerwire::espnow::frame::DATA_HEADER];
+        let total = payload.len() as u16;
+        let mut sent = 0;
+        for i in 0..n {
+            let f = Frame::Data {
+                to: 0x0b75_7257_0000_0000 | i as u64,
+                seq: 0,
+                first: true,
+                last: true,
+                total,
+                payload: &payload,
+            };
+            let f = f.encode();
+            for _ in 0..20 {
+                match unsafe { sys::esp_now_send(BROADCAST.as_ptr(), f.as_ptr(), f.len()) } {
+                    sys::ESP_OK => {
+                        sent += 1;
+                        break;
+                    }
+                    sys::ESP_ERR_ESPNOW_NO_MEM => std::thread::sleep(Duration::from_millis(1)),
+                    _ => break,
+                }
+            }
+        }
+        sent
+    }
 }
