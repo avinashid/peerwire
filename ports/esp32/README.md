@@ -286,7 +286,7 @@ FEATURES=ble EXAMPLE=espnow_probe ./build.sh     # the radio measured: round tri
 `espnow_mesh` joins room.sh's room ("esp32" if none) on the channel it hears wifi.sh's
 network on, or 11 (`PW_ESPNOW_CHANNEL`), sends each linked board a numbered message every
 second, and logs an `ESPNOW_MESH report` every 10 s. `espnow_probe` measures two boards
-with no access point, at 54 Mbit/s, with one or both on the hotspot and with Bluetooth on,
+with no access point, at 54 Mbit/s, with one or both on an access point and with Bluetooth on,
 and prints an `ESPNOW_RESULT` line for each mode and size. Neither has run on a board yet.
 
 ## What it would take to go further

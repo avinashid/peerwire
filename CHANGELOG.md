@@ -57,7 +57,7 @@ and the commit that fixed it.
   with `wifi::random_mac` from a random address drawn at boot, as ESP-NOW frames carry the sender's address in the
   clear; `wifi::connect` joins a network from there. Examples: `espnow_mesh`, boards
   linking over ESP-NOW alone, and `espnow_probe`, which measures two boards' round trips, loss and frames a second with
-  no access point, on the hotspot and with Bluetooth on (NB-135).
+  no access point, on one and with Bluetooth on (NB-135).
 - **Bluetooth LE** (NB-110, [Bluetooth](docs/concepts/bluetooth.md)): `peerwire` feature `ble` (its one dependency
   `log`) gives a node a radio, `Builder::bluetooth`: in a room it advertises, links with the members it hears with no
   network, and ranks the radio below every UDP path (`PathKind::Bluetooth`, not in `Policy::default()`, off under

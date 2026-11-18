@@ -37,7 +37,7 @@ ESP-NOW frames go on the channel the Wi-Fi radio is on, so every board in a room
   network later stay on it, or channel 11 (`PW_ESPNOW_CHANNEL`).
 - **On a network:** the radio follows the access point's channel, and ESP-NOW goes with it (peers are added for "the
   channel the station is on"). Boards on different networks reach each other only if the networks share a channel.
-- **Scans:** a station that scans or joins hops across channels for a few seconds (joining the hotspot took 6.7 and
+- **Scans:** a station that scans or joins hops across channels for a few seconds (joining an access point took 6.7 and
   7.3 s on the NB-138 boards), and frames sent to it meanwhile aren't acknowledged; the radio tries each one 4 times
   and a connection survives 8 lost in a row, so a short scan costs some frames, not the connection.
 - **Interference:** ESP-NOW shares the channel with the networks on it; Bluetooth on the same chip time-shares the
@@ -146,7 +146,7 @@ between (~0.4 ms), about 3.2 ms. One at a time, that is ~310 frames a second, ~7
 one way. At 54 Mbit/s the frames are 20 times shorter, and the waits between them dominate.
 
 **Measured (NB-138):** an ESP32-C3 and an ESP32 on channel 11, ESP-NOW v2 at both ends, 1 Mbit/s, Bluetooth off, with
-no access point, one board on the hotspot, or both. No ping was lost in 3,600 and no frame in 9,482 sent 16 at a
+no access point, one board on an access point, or both. No ping was lost in 3,600 and no frame in 9,482 sent 16 at a
 time. Round trips took 4 ms at 32 B, 7.5 ms at 250 B and 28 ms at 1,470 B (p50), 84 ms at most at p99, 141 ms at
 most. 241 to 305 frames of 250 B went a second (480 to 610 kbit/s), as above, and 57 to 71 of 1,470 B (670 to 840
 kbit/s). With Bluetooth LE advertising and scanning on the same chip, the p90 at 250 B and under grew to 24 to 48 ms
@@ -154,14 +154,14 @@ and 1,470 B round trips to 66 to 76 ms (p50), 1 frame in 120 was lost at 32 B, a
 C3's heap. At 54 Mbit/s (802.11g, per peer) the boards didn't link: the ESP32 heard the C3's first frame, and the C3
 never heard an answer in 120 s.
 
-**A link on boards (NB-139):** `espnow_mesh` on the same C3 and ESP32, on the hotspot's channel 11, built from before
-the review's second round, one run of 5 minutes. The link held throughout, no message was lost once it was up, and the
-node's round trips were 35 to 42 ms. A failed try to an absent address (250 B, 5 each) took 85.7 to 88.7 ms on the C3
-and 99.5 to 105.2 ms on the ESP32, so the driver's 200 ms wait for a send's verdict is ~1.9 times the longest. With the
-ESP32 not polling for 2 s while the C3 broadcast 128 frames of 531 B, its receive queue was full at 32 frames,
+**A link on boards (NB-139):** `espnow_mesh` on the same C3 and ESP32, on an access point's channel, 11, built from
+before the review's second round, one run of 5 minutes. The link held throughout, no message was lost once it was up,
+and the node's round trips were 35 to 42 ms. A failed try to an absent address (250 B, 5 each) took 85.7 to 88.7 ms on
+the C3 and 99.5 to 105.2 ms on the ESP32, so the driver's 200 ms wait for a send's verdict is ~1.9 times the longest.
+With the ESP32 not polling for 2 s while the C3 broadcast 128 frames of 531 B, its receive queue was full at 32 frames,
 13,250 B in all, 84 frames were dropped, its heap's low point was 145,032 B, and the link stayed up. The first link took
-~27 KB of heap: from 182,200 B free once joined to ~155,452 B on the C3, from 185,020 B to ~157,848 B on the ESP32.
-One run on two boards: 4 connections at once haven't run on boards.
+~27 KB of heap: from 182,200 B free once joined to ~155,452 B on the C3, from 185,020 B to ~157,848 B on the ESP32. One
+run on two boards: 4 connections at once haven't run on boards.
 
 ## What a listener on the radio sees
 
