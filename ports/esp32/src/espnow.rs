@@ -15,9 +15,12 @@
 //! use peerwire_esp::peerwire::{Node, PathKind, Policy};
 //!
 //! # fn main() -> anyhow::Result<()> {
+//! // A random address drawn at boot, before any radio, not the chip's own, which anyone in range could follow from boot
+//! // to boot; it lasts the boot (NB135-I3).
+//! let mac = peerwire_esp::wifi::random_mac()?;
 //! let p = esp_idf_svc::hal::peripherals::Peripherals::take()?;
 //! let sysloop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
-//! let _wifi = peerwire_esp::wifi::start_on_channel(p.modem, sysloop, 11)?; // kept for as long as the radio runs
+//! let _wifi = peerwire_esp::wifi::start_on_channel_as(p.modem, sysloop, 11, mac)?; // kept while the radio runs
 //! let radio = espnow::radio(true, Settings::DEFAULT)?;
 //! let mut node = Node::builder()
 //!     .config(peerwire_esp::config())

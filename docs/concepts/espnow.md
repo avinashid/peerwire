@@ -165,14 +165,28 @@ For each of these the connection closes, loses frames, or stays as it was, and t
 the tests show, frame by frame, not a proof that no mix of frames can stall a connection while the radio still has it
 up. So the node has its own check too: when a link times out, the radio connections bound to its peer close, with no
 hold on the advert, and the next link comes over a new connection with new ids (NB135-1). Connections, queues and
-buffers are capped above, and the parser is fuzzed. These are the points for security review:
+buffers are capped above, and the parser is fuzzed.
 
-- the ACCEPT race: a second ACCEPT with another id within 3 s of the first closes the connection, so one forged
-  early costs a reconnect, and one that wins the race with the real one jammed costs the node's 60 s hold;
-- a CLOSE checked by a PROBE, and the 500 ms;
-- the window of 64 and the resync after 4: one forged frame can lose up to 64 of a connection's frames;
-- forged KEEPALIVEs holding a dead connection open until the node's own standby rule closes it;
-- the fixed or per-boot MAC, and what a listener learns from it.
+The security review of NB-135 (the [threat model](../project/threat-model.md)) found four problems, fixed since, each
+with a test that was its repro:
+
+- **NB135-1 (Medium):** four forged DATA frames far ahead, sent each way with ids overheard on the air, moved both
+  ends' numbers so that every real frame after was dropped as old, while keepalives kept the connections up: the link
+  was gone for good. The resync now works both ways, and a link that times out closes its radio connections.
+- **NB135-2 (Low):** a board's receive callback copied any frame heard, up to 1,470 B, before it checked its queue
+  had room: about 47 KB of anyone's frames (**theoretical**). It now drops what isn't ours or is over 531 B before any
+  copy, and caps the queue at 16 KB.
+- **NB135-3 (Low):** frames to addresses that never acknowledge (an ACCEPT to a forged OPEN, an OPEN to a replayed
+  advert, refusals) took 4 tries each of the one slot on the air, and the engine's queue had no cap. They now get 2
+  tries (a refusal 1), the queue is capped, and one refusal waits at most.
+- **NB135-4 (Low):** a forged ACCEPT followed by one forged DATA frame made the real ACCEPT look like the forgery,
+  with no jamming. A second ACCEPT within 3 s of the first now closes the connection whatever came.
+
+What stays, as on any radio: an attacker in range can jam the channel, cut a connection by jamming the answer to a
+PROBE, lose a few frames of a connection per forged frame, and hold a dead connection open with forged KEEPALIVEs
+until the node's own rules close it. **The MAC address is a residual, accepted (NB135-I3):** with `random_mac` a board
+is a new address on each boot, but one address for the whole boot, so a listener can tie a boot's adverts together,
+and a network the board joins sees it too; without it, the chip's own address follows the board for good.
 
 ## The driver
 
