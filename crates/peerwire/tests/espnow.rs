@@ -276,3 +276,56 @@ fn sec_a_link_stuck_on_its_radio_connection_comes_back_on_a_new_one() {
     pump(&mut [&mut a, &mut b], &mut last, 3, |_| false);
     assert!(got(&last[1], pa, b"on the new connection") && got(&last[0], pb, b"and back"));
 }
+
+/// The accepter's first DATA frame (the room's challenge) to the opener, once on the air: (accepter, opener, opener's
+/// id).
+fn challenge_heard(air: &FakeAir) -> Option<(Mac, Mac, u64)> {
+    let heard = air.heard();
+    let (accepter, opener, opener_id) = heard.iter().find_map(|(from, to, f)| match frame::parse(f) {
+        Ok(frame::Frame::Accept { to: id, .. }) => Some((*from, *to, id)),
+        _ => None,
+    })?;
+    let data = heard.iter().any(|(from, _, f)| {
+        *from == accepter && matches!(frame::parse(f), Ok(frame::Frame::Data { to, .. }) if to == opener_id)
+    });
+    data.then_some((accepter, opener, opener_id))
+}
+
+/// NB135-5 (the security review's repro, inverted): one forged ACCEPT with another id, sent after the real ACCEPT and
+/// the room's challenge, within 3 s of the first, closes the connection (NB135-4). The radio reports it dropped, as it
+/// says nothing of the other end, so the opener holds the advert 1 to 4 s, not the minute it holds one whose connection
+/// closed after the challenge: linked again within seconds.
+#[test]
+fn sec_one_forged_accept_after_the_challenge_costs_seconds() {
+    let air = FakeAir::new();
+    let ra = EspNow::new(air.ether(A, V1_FRAME), Settings::DEFAULT);
+    let rb = EspNow::new(air.ether(B, V1_FRAME), Settings::DEFAULT);
+    let (wa, wb) = (ra.watch(), rb.watch());
+    let mk = |r| {
+        Node::builder()
+            .bluetooth(r)
+            .policy(Policy::new([PathKind::Bluetooth]))
+            .stun_servers(Vec::<String>::new())
+            .bind("127.0.0.1:0")
+            .unwrap()
+    };
+    let (mut a, mut b) = (mk(ra), mk(rb));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    a.join_room("pw-test", "espnow-accept-after-challenge");
+    b.join_room("pw-test", "espnow-accept-after-challenge");
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 15, |_| challenge_heard(&air).is_some()), "a challenge");
+    let (accepter, opener, opener_id) = challenge_heard(&air).unwrap();
+    assert!(!on_radio(&a, &pb) && !on_radio(&b, &pa), "not linked yet");
+    air.inject(accepter, opener, &frame::Frame::Accept { to: opener_id, from: 0x5ec0_ffee, rx_max: 250 }.encode());
+    let t = Instant::now();
+    let up = |n: &[&mut Node]| on_radio(n[0], &pb) && on_radio(n[1], &pa);
+    let linked = pump(&mut [&mut a, &mut b], &mut ev, 15, up);
+    let (sa, sb) = (wa.stats(), wb.stats());
+    eprintln!("one forged ACCEPT after the challenge: linked again: {linked} after {:?}", t.elapsed());
+    assert_eq!(sa.accept_conflicts + sb.accept_conflicts, 1, "the forged ACCEPT closed the connection");
+    assert!(linked && t.elapsed() < Duration::from_secs(8), "linked again within seconds: {:?}", t.elapsed());
+    let opened =
+        air.heard().iter().filter(|(_, _, f)| matches!(frame::parse(f), Ok(frame::Frame::Accept { .. }))).count();
+    assert!(opened >= 2, "on a new connection");
+}

@@ -124,6 +124,11 @@ pub enum RadioEvent {
     /// `conn` closed: reported as soon as its link goes down, unless the node closed it ([`Radio::disconnect`]). Till
     /// then the node takes it to be up, and connects to that advert again only after it (NB-114).
     Disconnected { conn: ConnId },
+    /// `conn` closed, as [`Disconnected`](Self::Disconnected), but the radio closed it for a cause that says nothing
+    /// of the device at the other end: an ESP-NOW connection that got a second ACCEPT with another id, one of the two
+    /// forged (NB135-5). The node connects to that advert again 1 to 4 s later, as after a refusal, where after a
+    /// `Disconnected` it may wait a minute.
+    Dropped { conn: ConnId },
     /// Whether the advert asked for is on the air: `false` when it isn't (the stack refused it, or the adapter went),
     /// `true` once it is again. A radio that never says is taken to advertise as asked. While it doesn't, the node
     /// connects to any advert of its room that isn't full, as a peer with no advert does, so that two peers can't
@@ -144,7 +149,7 @@ const RECONNECT_HOLD: Duration = Duration::from_secs(60);
 /// No connect again to an advert whose connection closed before its peripheral sent a challenge (it refused this
 /// central, or never challenged) for this long, plus up to `REFUSED_JITTER_MS` at random: an honest peer refuses a
 /// central only while another's `GRACE` runs, and random, so a device that connects on a cycle of its own can't keep a
-/// newcomer landing in its grace (NB110-7).
+/// newcomer landing in its grace (NB110-7). The same for a connection the radio dropped ([`RadioEvent::Dropped`]).
 const REFUSED_HOLD: Duration = Duration::from_secs(1);
 const REFUSED_JITTER_MS: u32 = 3_000;
 /// A connect the driver hasn't answered by then is given up, as a failed one: a driver gives up its own sooner
@@ -448,18 +453,26 @@ impl Ble {
             }
             RadioEvent::Value { conn, value } => self.on_value(now, ep, conn, &value),
             RadioEvent::Advertising(up) => self.on_air = up,
-            RadioEvent::Disconnected { conn } => {
-                let Some(c) = self.conns.get(&conn) else { return };
-                let held = c.to.zip(c.n).map(|at| (at, hold(c)));
-                log::debug!("Bluetooth: conn {} ({}) went{}", conn.0, c.who(), held_for(held.map(|(_, h)| h)));
-                if let Some((at, hold)) = held {
-                    let t = self.held.entry(at).or_insert(now + hold);
-                    *t = (*t).max(now + hold);
-                }
-                self.forget(conn);
-                self.refresh(now);
-            }
+            RadioEvent::Disconnected { conn } => self.went(now, conn, false),
+            RadioEvent::Dropped { conn } => self.went(now, conn, true),
         }
+    }
+
+    /// `conn` closed at the radio or at the other end, or the radio `dropped` it ([`RadioEvent::Dropped`]): it is
+    /// forgotten, and if this end connected to an advert for it, that advert is held as [`hold`] says, or only
+    /// `REFUSED_HOLD` if the radio dropped it, as that says nothing of the device (NB135-5).
+    fn went(&mut self, now: Instant, conn: ConnId, dropped: bool) {
+        let Some(c) = self.conns.get(&conn) else { return };
+        let hold = if dropped { refused_hold() } else { hold(c) };
+        let held = c.to.zip(c.n).map(|at| (at, hold));
+        let how = if dropped { "was dropped by the radio" } else { "went" };
+        log::debug!("Bluetooth: conn {} ({}) {how}{}", conn.0, c.who(), held_for(held.map(|(_, h)| h)));
+        if let Some((at, hold)) = held {
+            let t = self.held.entry(at).or_insert(now + hold);
+            *t = (*t).max(now + hold);
+        }
+        self.forget(conn);
+        self.refresh(now);
     }
 
     /// An advert of the service `device` sent: connected to if this node is the one to, and logged if not, once a
@@ -972,9 +985,14 @@ impl Ble {
 /// deadline: 1 to 4 s at random if no challenge came on it (NB110-7), else `RECONNECT_HOLD`.
 fn hold(c: &Conn) -> Duration {
     match c.link.challenged() {
-        false => REFUSED_HOLD + Duration::from_millis(u64::from(OsRng.next_u32() % REFUSED_JITTER_MS)),
+        false => refused_hold(),
         true => RECONNECT_HOLD,
     }
+}
+
+/// `REFUSED_HOLD`, plus up to `REFUSED_JITTER_MS` at random: 1 to 4 s.
+fn refused_hold() -> Duration {
+    REFUSED_HOLD + Duration::from_millis(u64::from(OsRng.next_u32() % REFUSED_JITTER_MS))
 }
 
 /// How long the advert of a connection that closed is held, for the log.

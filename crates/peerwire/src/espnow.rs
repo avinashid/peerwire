@@ -121,7 +121,8 @@ pub struct Stats {
     pub refusals: u64,
     /// CLOSEs whose connection answered the probe that followed (forged, or stale), so stayed open.
     pub closes_denied: u64,
-    /// Connections closed by a second ACCEPT with another id before any data came: one of the two was forged.
+    /// Connections closed by a second ACCEPT with another id within 3 s of the first: one of the two was forged
+    /// ([`RadioEvent::Dropped`]).
     pub accept_conflicts: u64,
     /// Connections closed by the other end (a CLOSE, and no answer to the probe), gone quiet, or failing.
     pub closed_by_peer: u64,

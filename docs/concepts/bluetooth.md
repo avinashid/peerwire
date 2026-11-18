@@ -284,12 +284,15 @@ pub enum RadioEvent {
     Mtu { conn: ConnId, mtu: u16 },                                  // the ATT MTU changed
     Value { conn: ConnId, value: Vec<u8> },                          // a write to `rx`, or a notification on `tx`
     Disconnected { conn: ConnId },                                   // as soon as its link goes down
+    Dropped { conn: ConnId },                                        // closed by the radio, nothing of the peer's
     Advertising(bool),                                               // whether the advert asked for is on the air
 }
 ```
 
 `DeviceId(u64)` and `ConnId(u32)` are the driver's own numbers. A driver reports `Disconnected` as soon as a link
 goes down, unless the node closed it: till then the node takes it to be up, and doesn't connect to that advert again.
+`Dropped` is a close the radio made itself for a cause that says nothing of the device at the other end (ESP-NOW's,
+for an ACCEPT that may be forged, NB135-5): the node connects to that advert again 1 to 4 s later, not a minute.
 A driver that never sends `Advertising` is taken to advertise as asked. `Builder::bluetooth(radio)` gives a node its
 radio; `Node::poll` drains its events, and `Node::set_waker` (which `AsyncNode` calls itself) hands it a waker.
 Feature `ble-bluez` adds the Linux driver, `BlueZ`; the ESP32's NimBLE driver lives in `peerwire-esp` (NB-110c), and

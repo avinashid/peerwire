@@ -401,13 +401,14 @@ impl Engine {
         if c.open() {
             // The same accept again is the other end alive. Another, within `ACCEPT_RACE` of the first, means one of
             // the two was forged (it won the race, and this end sends to its id), and which can't be told, whatever
-            // came on the connection meanwhile, as that can be forged too (NB135-4): the connection closes, and the
-            // node connects again. Later, it is ignored.
+            // came on the connection meanwhile, as that can be forged too (NB135-4): the connection closes. The close
+            // says nothing of the other end (`Dropped`), so the node connects again within seconds, though the room's
+            // challenge has mostly come on it by then (NB135-5). Later, it is ignored.
             if c.theirs == theirs {
                 self.live(now, mac, to);
             } else if c.accepted.is_some_and(|t| now.saturating_duration_since(t) < ACCEPT_RACE) {
                 self.stats.accept_conflicts += 1;
-                self.close(conn);
+                self.close(conn, true);
             } else {
                 self.stats.unknown += 1;
             }
@@ -520,7 +521,7 @@ impl Engine {
         c.failures += 1;
         if c.failures >= max && c.open() {
             self.stats.closed_failing += 1;
-            self.close(conn);
+            self.close(conn, false);
         }
     }
 
@@ -567,15 +568,15 @@ impl Engine {
             }
         }
         for conn in gone {
-            self.close(conn);
+            self.close(conn, false);
         }
         for conn in closed {
             self.stats.closed_by_peer += 1;
-            self.close(conn);
+            self.close(conn, false);
         }
         for conn in quiet {
             self.stats.closed_quiet += 1;
-            self.close(conn);
+            self.close(conn, false);
         }
         for conn in opens {
             if !self.tx.iter().any(|o| o.conn == Some(conn) && o.kind == Kind::Open) {
@@ -739,13 +740,15 @@ impl Engine {
         self.tx.retain(|o| o.conn != Some(conn));
     }
 
-    /// `conn` went, as the node hears: [`RadioEvent::Disconnected`], or [`RadioEvent::ConnectFailed`] for an open
-    /// that wasn't accepted.
-    fn close(&mut self, conn: ConnId) {
+    /// `conn` went, as the node hears: [`RadioEvent::Disconnected`], [`RadioEvent::Dropped`] if this end `dropped` it
+    /// for a cause that says nothing of the other end, or [`RadioEvent::ConnectFailed`] for an open that wasn't
+    /// accepted.
+    fn close(&mut self, conn: ConnId, dropped: bool) {
         let Some(c) = self.conns.remove(&conn) else { return };
         self.purge(conn);
         self.events.push_back(match (c.open(), c.device) {
             (false, Some(device)) => RadioEvent::ConnectFailed { device },
+            _ if dropped => RadioEvent::Dropped { conn },
             _ => RadioEvent::Disconnected { conn },
         });
     }
@@ -848,7 +851,12 @@ mod tests {
     fn gone(e: &mut Engine) -> Vec<RadioEvent> {
         events(e)
             .into_iter()
-            .filter(|e| matches!(e, RadioEvent::Disconnected { .. } | RadioEvent::ConnectFailed { .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    RadioEvent::Disconnected { .. } | RadioEvent::Dropped { .. } | RadioEvent::ConnectFailed { .. }
+                )
+            })
             .collect()
     }
 
@@ -1050,10 +1058,11 @@ mod tests {
         let Ok(Frame::Open { from: a_id, .. }) = frame::parse(&p.wire[0].2) else { panic!() };
         p.a.handle(p.t, B, &Frame::Accept { to: a_id, from: 0x1234, rx_max: 250 }.encode());
         let Some(RadioEvent::Connected { conn: ca, .. }) = p.a.poll_event() else { panic!("a took the forged one") };
-        // The real accept: before any data, so the connection closes at once, and the node connects again.
+        // The real accept: within `ACCEPT_RACE`, so the connection closes at once, dropped (it says nothing of B), and
+        // the node connects again.
         let real = p.wire.iter().find(|(from, _, _)| *from == B).map(|w| w.2.clone()).unwrap();
         p.a.handle(p.t, B, &real);
-        assert_eq!(gone(&mut p.a), [RadioEvent::Disconnected { conn: ca }]);
+        assert_eq!(gone(&mut p.a), [RadioEvent::Dropped { conn: ca }]);
         assert_eq!(p.a.stats().accept_conflicts, 1);
         // b's end hears nothing from a's: gone after its timeout.
         for _ in 0..5 {
@@ -1121,7 +1130,7 @@ mod tests {
         let real = p.wire.iter().find(|(from, _, _)| *from == B).map(|w| w.2.clone()).unwrap();
         p.later(ACCEPT_RACE - ms(1));
         p.a.handle(p.t, B, &real);
-        assert_eq!(gone(&mut p.a), [RadioEvent::Disconnected { conn: ca }], "the real accept closes it");
+        assert_eq!(gone(&mut p.a), [RadioEvent::Dropped { conn: ca }], "the real accept closes it");
         assert_eq!(p.a.stats().accept_conflicts, 1);
         let (ca, _) = p.link();
         assert!(p.a.send(p.t, ca, b"on the next connection"));

@@ -89,8 +89,9 @@ end's MAC address, this end's id), and every frame on it carries the receiver's 
   answers a PROBE with a KEEPALIVE at once, if it still has the connection.
 - **A second ACCEPT:** the opener takes the first ACCEPT. A second one with another id within 3 s of the first (the
   time a connection has to prove the room) means one of the two was forged, and which can't be told, whatever came on
-  the connection meanwhile, as that may be forged too: the connection closes, and the node connects again (NB135-4).
-  Later, one is ignored.
+  the connection meanwhile, as that may be forged too: the connection closes (NB135-4). The radio reports it as
+  `Dropped`, not `Disconnected`, as it says nothing of the other end, so the node connects again 1 to 4 s later, as
+  after a refusal, though the room's challenge has mostly come by then (NB135-5). Later, one is ignored.
 
 `espnow::Settings` holds the numbers above (`Settings::DEFAULT`); a board run may change them.
 
@@ -151,7 +152,8 @@ which could jam the channel anyway. What such an attacker can do, frame by frame
 |---|---|
 | ADVERT | a `Seen` for the node, which checks the room's tag (HMAC), 50 at once and then one per 20 ms; 16 wait for it at most. A real advert replayed from an absent address draws OPENs for 10 s, two tries each |
 | OPEN, from made-up addresses | fills the 4 connections, and the radio stays silent to the rest; the node closes one that hasn't proven the room within 3 s, and a central's makes way for a new one after 1 s. Each ACCEPT to a made-up address holds the air for two tries (NB135-3) |
-| ACCEPT, before the real one | the opener takes the forged id; when the real ACCEPT comes, with another id and within 3 s, the connection closes, even if forged data came meanwhile (NB135-4), and the node connects again. If the attacker also keeps the real one from arriving (jamming), the opener sends to the forged id, the room proof stalls, and the node closes the connection after 3 s and holds the advert for 60 s |
+| ACCEPT, before the real one | the opener takes the forged id; when the real ACCEPT comes, with another id and within 3 s, the connection closes, even if forged data came meanwhile (NB135-4), and the node connects again 1 to 4 s later (NB135-5). If the attacker also keeps the real one from arriving (jamming), the opener sends to the forged id, the room proof stalls, and the node closes the connection after 3 s and holds the advert for 60 s |
+| ACCEPT, after the real one, within 3 s of it | the connection closes, though the room's challenge came on it already, and the node connects again 1 to 4 s later, as the radio reports the close as `Dropped`, which says nothing of the other end (NB135-5): one forged frame for each reconnect, as jamming would cost |
 | ACCEPT, more than 3 s after the first | ignored |
 | CLOSE | nothing, unless the attacker also keeps the other end's answer to the PROBE from arriving (jamming): then a close and a reconnect |
 | PROBE | a KEEPALIVE in answer, one per 100 ms per connection |
