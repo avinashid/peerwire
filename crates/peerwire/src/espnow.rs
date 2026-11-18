@@ -276,6 +276,12 @@ impl<E: Ether> Radio for EspNow<E> {
         Limits { forgeable: true, ..self.engine.settings().limits }
     }
 
+    /// The ether's address, which other radios report this one's adverts from ([`device_of`]): the node binds its
+    /// advert's tag to it, so a copy sent from another address isn't taken for it (NB135-12).
+    fn address(&self) -> Option<DeviceId> {
+        Some(device_of(self.ether.mac()))
+    }
+
     fn set_waker(&mut self, waker: Waker) {
         self.ether.set_waker(waker);
     }

@@ -128,6 +128,14 @@ pub trait Radio: Send {
     fn limits(&self) -> Limits {
         Limits::DESKTOP
     }
+    /// The device other radios report this one's adverts from, if it lasts while the node advertises: an ESP-NOW
+    /// radio's address, which a board keeps for the boot. The node then binds its advert's tag to it, and takes an
+    /// advert of its room only from the device its tag names, so a copy anyone in range sends from another address
+    /// isn't one (NB135-12). `None`, the default, for a radio whose adverts each go from a new address, as Bluetooth's
+    /// do: a copy from another device is then taken, and holds only that device's (NB110-10).
+    fn address(&self) -> Option<DeviceId> {
+        None
+    }
     /// Takes a waker to wake whenever it queues an event, so a node asleep until its next timer
     /// ([`Node::set_waker`](crate::Node::set_waker), [`AsyncNode`](crate::AsyncNode)) polls at once. A driver that
     /// never wakes it still works: a node with a radio polls at least every 50 ms.
@@ -342,6 +350,8 @@ pub(crate) enum Inbound {
 pub(crate) struct Ble {
     radio: Box<dyn Radio>,
     limits: Limits,
+    /// The radio's lasting address ([`Radio::address`]), which its adverts' tags are bound to.
+    address: Option<DeviceId>,
     me: Identity,
     /// The time of the last call that brought one.
     now: Instant,
@@ -381,10 +391,11 @@ pub(crate) struct Ble {
 
 impl Ble {
     pub(crate) fn new(radio: Box<dyn Radio>, me: &Identity, now: Instant) -> Ble {
-        let limits = radio.limits();
+        let (limits, address) = (radio.limits(), radio.address());
         Ble {
             radio,
             limits,
+            address,
             me: me.clone(),
             now,
             room: None,
@@ -548,7 +559,7 @@ impl Ble {
                 if self.seen.len() >= MAX_SEEN {
                     self.seen.pop_front();
                 }
-                let ours = advert(&key, n, data[0] & FULL != 0) == data;
+                let ours = advert_from(&key, n, data[0] & FULL != 0, self.address.map(|_| device)) == data;
                 self.seen.push_back(Heard { device, data, at: now, ours, said: None });
                 if !ours {
                     return; // another room's
@@ -1047,7 +1058,7 @@ impl Ble {
             self.n = OsRng.next_u32(); // a new advert, from a new address: a new `n` with it
         }
         self.advertised = Some((self.n, full));
-        self.radio.advertise(Some(&advert(&key, self.n, full)));
+        self.radio.advertise(Some(&advert_from(&key, self.n, full, self.address)));
     }
 
     /// Closes `conn` and forgets it, for `why`.
@@ -1091,6 +1102,18 @@ impl Ble {
     pub(crate) fn forged(&self) -> u64 {
         self.forged
     }
+}
+
+/// The room's advert ([`advert`]) for `n`, full if `full`, sent from `from` if the radio's address lasts
+/// ([`Radio::address`]): its tag is then the first 4 bytes of `HMAC-SHA256(ble key, "pw-ble-adv" ‖ n ‖ from)`, `n`
+/// little-endian and `from` 8 bytes big-endian (an ESP-NOW radio's: two zero bytes and its MAC address), so it holds
+/// only from that address, where the member's radio answers (NB135-12).
+fn advert_from(key: &[u8; 32], n: u32, full: bool, from: Option<DeviceId>) -> [u8; ADVERT_LEN] {
+    let mut a = advert(key, n, full);
+    if let Some(from) = from {
+        a[5..].copy_from_slice(&hmac(key, &[b"pw-ble-adv", &n.to_le_bytes(), &from.0.to_be_bytes()])[..4]);
+    }
+    a
 }
 
 /// How long this end, as the central, holds the advert of a connection bound to no peer that the peripheral closed, or
@@ -2871,6 +2894,102 @@ mod tests {
         assert!(!member.closed(), "the member stays");
         assert_eq!(s.iter_mut().map(Silent::closed).filter(|c| !c).count(), 1, "one newcomer beside it, the last");
         assert!(!s.last_mut().unwrap().closed());
+    }
+
+    /// A radio of the test's whose adverts go from an address that lasts, its own number, as an ESP-NOW radio's do.
+    struct Lasting(FakeRadio);
+
+    impl Radio for Lasting {
+        fn advertise(&mut self, data: Option<&[u8]>) {
+            self.0.advertise(data);
+        }
+
+        fn scan(&mut self, on: bool) {
+            self.0.scan(on);
+        }
+
+        fn connect(&mut self, device: DeviceId) {
+            self.0.connect(device);
+        }
+
+        fn send(&mut self, conn: ConnId, value: &[u8]) -> bool {
+            self.0.send(conn, value)
+        }
+
+        fn disconnect(&mut self, conn: ConnId) {
+            self.0.disconnect(conn);
+        }
+
+        fn poll(&mut self) -> Option<RadioEvent> {
+            self.0.poll()
+        }
+
+        fn limits(&self) -> Limits {
+            self.0.limits()
+        }
+
+        fn address(&self) -> Option<DeviceId> {
+            Some(DeviceId(self.0.index() as u64))
+        }
+    }
+
+    /// A node at radio 0 of `air`, with `radio` on it, whose `n` is 2,000: whether it connects to each of `adverts`,
+    /// heard from the device with it, in turn (each `n` above its own, the first connected to giving way), and what it
+    /// advertises.
+    fn connects_to(
+        air: &FakeAir,
+        radio: Box<dyn Radio>,
+        adverts: &[(DeviceId, [u8; ADVERT_LEN])],
+    ) -> (Vec<bool>, Vec<u8>) {
+        let t = Instant::from_millis(1);
+        let mut node = Ble::new(radio, &id(1), t);
+        node.set_room(t, room());
+        (node.n, node.advertised) = (2_000, None);
+        node.refresh(t);
+        let connects = adverts
+            .iter()
+            .map(|(d, a)| {
+                node.on_seen(t, *d, a);
+                std::mem::take(&mut node.pending).contains_key(d)
+            })
+            .collect();
+        (connects, air.advert(0).expect("an advert"))
+    }
+
+    /// NB135-12 (the security review's finding): anyone in range can copy a member's advert and send it from another
+    /// address over ESP-NOW, at any instant: a node connected to the copy, which no one answered, and skipped the
+    /// member's own as one it was connecting to already, as each connect ran out a copy came again, and the two never
+    /// linked. Over a radio whose address lasts, the node binds its advert's tag to it, and takes an advert only from
+    /// the device its tag names: a copy from another address is another room's.
+    #[test]
+    fn sec_an_advert_over_a_radio_whose_address_lasts_is_taken_only_from_its_address() {
+        let key = ble_key("app", "room");
+        let air = FakeAir::new(23);
+        let lasting = Box::new(Lasting(air.radio(board(true))));
+        let (b, c) = (DeviceId(5), DeviceId(6));
+        let from_b = advert_from(&key, 3_000, false, Some(b));
+        let heard = [(c, from_b), (b, advert(&key, 3_001, false)), (b, from_b)];
+        let (connects, own) = connects_to(&air, lasting, &heard);
+        assert_eq!(connects, [false, false, true], "a copy from another address, or one bound to none, isn't taken");
+        assert_eq!(own, advert_from(&key, 2_000, false, Some(DeviceId(0))), "its own bound to its address");
+        assert_ne!(own, advert(&key, 2_000, false));
+        assert_eq!(advert_from(&key, 2_000, true, Some(DeviceId(0)))[5..], own[5..], "the flag isn't in the tag");
+    }
+
+    /// NB135-12: over Bluetooth, whose adverts each go from a new address, the tag is bound to none, and an advert of
+    /// the room is taken from any device, a copy too, as before.
+    #[test]
+    fn an_advert_over_bluetooth_is_taken_from_any_device_as_before() {
+        let key = ble_key("app", "room");
+        let air = FakeAir::new(23);
+        let radio = Box::new(air.radio(Limits::DESKTOP));
+        let heard = [
+            (DeviceId(6), advert(&key, 3_000, false)),
+            (DeviceId(5), advert_from(&key, 3_001, false, Some(DeviceId(5)))),
+        ];
+        let (connects, own) = connects_to(&air, radio, &heard);
+        assert_eq!(connects, [true, false], "a copy from any device; none bound to an address");
+        assert_eq!(own, advert(&key, 2_000, false));
     }
 
     /// NB-114: why a node doesn't connect to an advert of its room, which it logs once a `SEEN_FOR` for each advert.

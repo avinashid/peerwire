@@ -22,6 +22,9 @@ pub trait Ether: Send {
     fn recv(&mut self) -> Option<(Mac, Vec<u8>)>;
     /// The longest frame this end sends and takes: 250 bytes on ESP-NOW v1, up to 1470 on v2.
     fn max_frame(&self) -> usize;
+    /// The address this end's frames go from, for as long as the radio runs (a board keeps it for the boot,
+    /// NB135-I3): the node binds its advert's tag to it (NB135-12).
+    fn mac(&self) -> Mac;
     /// Takes a waker to wake when a frame comes or a verdict is in.
     fn set_waker(&mut self, waker: Waker) {
         let _ = waker;

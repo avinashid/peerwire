@@ -167,12 +167,6 @@ pub struct FakeEther {
     max_frame: usize,
 }
 
-impl FakeEther {
-    pub fn mac(&self) -> Mac {
-        self.me
-    }
-}
-
 impl Ether for FakeEther {
     fn send(&mut self, to: Mac, frame: &[u8], tries: u8, tag: u32) -> bool {
         if !self.tx.push(to, frame, tries, tag) {
@@ -199,5 +193,9 @@ impl Ether for FakeEther {
 
     fn max_frame(&self) -> usize {
         self.max_frame
+    }
+
+    fn mac(&self) -> Mac {
+        self.me
     }
 }

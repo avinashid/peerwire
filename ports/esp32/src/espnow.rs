@@ -98,6 +98,8 @@ pub struct EspNowEther {
     peers: PeerTable,
     max_frame: usize,
     version: u32,
+    /// The station's address, which ESP-NOW's frames go from.
+    mac: Mac,
 }
 
 impl EspNowEther {
@@ -124,13 +126,17 @@ impl EspNowEther {
         let mut version = 0u32;
         sys::esp!(unsafe { sys::esp_now_get_version(&mut version) })?;
         let max_frame = if v2 && version >= 2 { V2_FRAME } else { V1_FRAME };
+        // The station's address, set before Wi-Fi started (`wifi::start_on_channel_as`) and kept for the boot: the
+        // node binds its advert's tag to it (NB135-12).
+        let mut mac: Mac = [0; 6];
+        sys::esp!(unsafe { sys::esp_wifi_get_mac(sys::wifi_interface_t_WIFI_IF_STA, mac.as_mut_ptr()) })?;
         std::thread::Builder::new()
             .name("espnow-tx".into())
             .stack_size(TX_STACK)
             .spawn(move || transmit(shared))
             .map_err(|e| anyhow!("the ESP-NOW thread: {e}"))?;
         info!("ESP-NOW v{version} up, frames of up to {max_frame} B");
-        Ok(EspNowEther { shared, peers: PeerTable::new(PEERS), max_frame, version })
+        Ok(EspNowEther { shared, peers: PeerTable::new(PEERS), max_frame, version, mac })
     }
 
     /// ESP-NOW's version on this chip: 1, or 2 with frames of up to 1470 bytes.
@@ -183,6 +189,10 @@ impl Ether for EspNowEther {
 
     fn max_frame(&self) -> usize {
         self.max_frame
+    }
+
+    fn mac(&self) -> Mac {
+        self.mac
     }
 
     fn set_waker(&mut self, waker: Waker) {

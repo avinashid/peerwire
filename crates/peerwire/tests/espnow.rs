@@ -1077,3 +1077,142 @@ fn sec_a_node_holding_two_bound_and_two_forged_connections_links_with_a_newcomer
     eprintln!("X, with two bound and two forged, connects to Y: linked after {linked:?}");
     assert!(linked.is_some_and(|t| t < Duration::from_secs(8)), "linked within seconds: {linked:?}");
 }
+
+/// The last advert frame `mac` broadcast, as tried on the air: what anyone in range can copy.
+fn advert_frame(air: &FakeAir, mac: Mac) -> Option<Vec<u8>> {
+    air.heard().into_iter().rev().find_map(|(from, _, f)| {
+        let advert = matches!(frame::parse(&f), Ok(frame::Frame::Advert { .. }));
+        (advert && from == mac).then_some(f)
+    })
+}
+
+/// Whether `from` has tried an OPEN to `to` on the air.
+fn opened_to(air: &FakeAir, from: Mac, to: Mac) -> bool {
+    let open = |x: &[u8]| matches!(frame::parse(x), Ok(frame::Frame::Open { .. }));
+    air.heard().iter().any(|(f, t, x)| *f == from && *t == to && open(x))
+}
+
+/// Someone in range with a copy of a room's advert: it sends it to X from an address of its own, again each round
+/// until X connects to it, and from a new address as X's connect to the last runs out (`connect_within`, 10 s). With
+/// `radios`, each address is a radio of the copier's, which acknowledges frames, as any radio does, and answers none;
+/// else a made-up one, which no radio has.
+struct Copier {
+    copy: Vec<u8>,
+    radios: Option<Vec<peerwire::espnow::FakeEther>>,
+    k: u64,
+    opened_at: Option<Instant>,
+    sent: u32,
+}
+
+impl Copier {
+    fn new(air: &FakeAir, copy: Vec<u8>, radios: bool) -> Copier {
+        let mut c = Copier { copy, radios: radios.then(Vec::new), k: 0, opened_at: None, sent: 0 };
+        c.next(air);
+        c
+    }
+
+    /// The address it sends from now.
+    fn mac(&self) -> Mac {
+        let k = self.k;
+        [0x02, 0xe0, (k >> 24) as u8, (k >> 16) as u8, (k >> 8) as u8, k as u8]
+    }
+
+    /// A new address, and a radio at it if it has radios.
+    fn next(&mut self, air: &FakeAir) {
+        self.k += 1;
+        let mac = self.mac();
+        if let Some(r) = self.radios.as_mut() {
+            r.push(air.ether(mac, V1_FRAME));
+        }
+    }
+
+    fn step(&mut self, air: &FakeAir, x: Mac) {
+        match self.opened_at {
+            None if opened_to(air, x, self.mac()) => self.opened_at = Some(Instant::now()),
+            None => self.send(air, x),
+            Some(at) if at.elapsed() >= Duration::from_millis(9_950) => {
+                self.next(air);
+                self.opened_at = None;
+                self.send(air, x);
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn send(&mut self, air: &FakeAir, x: Mac) {
+        air.inject(self.mac(), x, &self.copy);
+        self.sent += 1;
+    }
+}
+
+/// NB110-11's race over ESP-NOW (the security review's R7-1): X's `n` is below B's, so X is the one to connect. With
+/// `copier` (whether it has radios), someone in range copies B's advert and sends it to X before X hears B's own, and
+/// from a new address as each of X's connects to a copy runs out. How long until X and B link, within `secs`; the
+/// copies sent; and whether X sent an OPEN to any copier's address.
+fn copies_of_an_advert(copier: Option<bool>, secs: u64) -> (Option<Duration>, u32, bool) {
+    let air = FakeAir::new();
+    let (mut x, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (px, pb) = (x.peer_id(), b.peer_id());
+    let room = format!("espnow-r7-copies-{copier:?}");
+    b.join_room("pw-test", &room);
+    b.poll();
+    let n_b = advert_n(&air, B).expect("B's advert");
+    air.set_off(A, true);
+    loop {
+        x.join_room("pw-test", &room);
+        x.poll();
+        if advert_n(&air, A).expect("X's advert") < n_b {
+            break;
+        }
+    }
+    let copy = advert_frame(&air, B).expect("B's advert");
+    let mut copier = copier.map(|radios| Copier::new(&air, copy, radios));
+    air.set_off(A, false);
+    if let Some(c) = copier.as_mut() {
+        c.send(&air, A);
+    }
+    let t = Instant::now();
+    let (mut ex, mut eb) = (Vec::new(), Vec::new());
+    let mut linked = None;
+    while t.elapsed() < Duration::from_secs(secs) {
+        poll_all(&mut [&mut x], &mut ex);
+        if let Some(c) = copier.as_mut() {
+            c.step(&air, A);
+        }
+        poll_all(&mut [&mut b], &mut eb);
+        if on_radio(&x, &pb) && on_radio(&b, &px) {
+            linked = Some(t.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let sent = copier.as_ref().map_or(0, |c| c.sent);
+    let opened = copier.as_ref().is_some_and(|c| {
+        (1..=c.k).any(|k| {
+            let mac = [0x02, 0xe0, (k >> 24) as u8, (k >> 16) as u8, (k >> 8) as u8, k as u8];
+            opened_to(&air, A, mac)
+        })
+    });
+    (linked, sent, opened)
+}
+
+/// NB135-12 (the security review's repro, inverted): a copy of B's advert, sent to X from a made-up address before
+/// B's own, drew X's connect, which no one answered, and X skipped B's adverts as one it was connecting to already; a
+/// copy from a new address as each connect ran out kept X and B apart (not linked in 40 s, 87 copies, against 0.47 s
+/// with none). Over ESP-NOW the advert's tag is now bound to the address it is sent from, so a copy from another one
+/// isn't taken, from a made-up address or from a radio of the copier's, which acknowledges the OPENs: X never connects
+/// to a copy, and links with B as with none.
+#[test]
+fn sec_copies_of_an_advert_from_other_addresses_keep_no_pair_apart() {
+    let (control, _, _) = copies_of_an_advert(None, 15);
+    let (made_up, n1, o1) = copies_of_an_advert(Some(false), 15);
+    let (radios, n2, o2) = copies_of_an_advert(Some(true), 15);
+    eprintln!(
+        "no copy: linked after {control:?}; copies from made-up addresses: linked after {made_up:?}, {n1} sent, an \
+         OPEN to one {o1}; from radios that acknowledge: linked after {radios:?}, {n2} sent, an OPEN to one {o2}"
+    );
+    assert!(control.is_some_and(|t| t < Duration::from_secs(2)), "control: {control:?}");
+    assert!(made_up.is_some_and(|t| t < Duration::from_secs(3)), "copies from made-up addresses: {made_up:?}");
+    assert!(radios.is_some_and(|t| t < Duration::from_secs(3)), "copies from radios: {radios:?}");
+    assert!(!o1 && !o2, "no connect to a copy");
+}
