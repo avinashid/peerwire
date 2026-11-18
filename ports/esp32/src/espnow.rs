@@ -44,7 +44,7 @@ use esp_idf_svc::sys;
 use log::{info, warn};
 use peerwire::espnow::{frame, EspNow, Ether, Mac, PeerTable, Settings, Touch, TxQueue, BROADCAST, V1_FRAME, V2_FRAME};
 
-/// Frames waiting to go, or with a verdict the node hasn't taken.
+/// Frames waiting to go, or with a verdict the node hasn't taken: more than the radio hands over at once (4, NB135-15).
 pub const TX_QUEUE: usize = 32;
 /// Frames received waiting for the node at most, and their bytes: 16 KB, whoever sends (NB135-2).
 pub const RX_QUEUE: usize = 32;
@@ -145,8 +145,10 @@ impl EspNowEther {
 }
 
 impl Ether for EspNowEther {
-    fn send(&mut self, to: Mac, frame: &[u8], tries: u8) -> bool {
-        // Never evicting an address with frames still waiting, whose tries would fail at once (NB135-I2).
+    fn send(&mut self, to: Mac, frame: &[u8], tries: u8, tag: u32) -> bool {
+        // Never evicting an address with frames still waiting, whose tries would fail at once (NB135-I2). The radio
+        // hands over a few frames at a time (NB135-15), so a few addresses wait at most, and the table keeps to PEERS
+        // however many made-up addresses frames go to.
         let touch = {
             let tx = lock(&self.shared.tx);
             self.peers.touch_with(to, |m| tx.has(*m))
@@ -161,14 +163,14 @@ impl Ether for EspNowEther {
                 self.peers.forget(to);
             }
         }
-        let taken = lock(&self.shared.tx).push(to, frame, tries);
+        let taken = lock(&self.shared.tx).push(to, frame, tries, tag);
         if taken {
             self.shared.more.notify_one();
         }
         taken
     }
 
-    fn done(&mut self) -> Option<bool> {
+    fn done(&mut self) -> Option<(u32, bool)> {
         lock(&self.shared.tx).outcome()
     }
 

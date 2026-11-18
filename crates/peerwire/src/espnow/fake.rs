@@ -174,8 +174,8 @@ impl FakeEther {
 }
 
 impl Ether for FakeEther {
-    fn send(&mut self, to: Mac, frame: &[u8], tries: u8) -> bool {
-        if !self.tx.push(to, frame, tries) {
+    fn send(&mut self, to: Mac, frame: &[u8], tries: u8, tag: u32) -> bool {
+        if !self.tx.push(to, frame, tries, tag) {
             return false;
         }
         // The radio is instant here: every try goes, and has its verdict, at once.
@@ -188,7 +188,7 @@ impl Ether for FakeEther {
         true
     }
 
-    fn done(&mut self) -> Option<bool> {
+    fn done(&mut self) -> Option<(u32, bool)> {
         self.tx.outcome()
     }
 

@@ -146,7 +146,8 @@ pub struct Stats {
     pub tx_dropped: u64,
     /// Values the node gave that were empty or too long.
     pub values_refused: u64,
-    /// Verdicts with no frame waiting for one, and frames whose verdict never came.
+    /// Verdicts whose tag names no frame waiting for one (a late verdict, for a frame taken as lost already), and frames
+    /// whose verdict never came (in 5 s, or before a later frame's).
     pub stray_verdicts: u64,
     pub lost_verdicts: u64,
 }
@@ -205,26 +206,34 @@ impl<E: Ether> EspNow<E> {
         &mut self.ether
     }
 
-    /// Moves frames and verdicts between the ether and the engine, runs the timers, and hands the ether what is due.
+    /// Moves frames and verdicts between the ether and the engine, runs the timers, and hands the ether what is due:
+    /// a few frames at a time ([`Engine::peek`]), the next as a verdict frees a slot, so what waits for the air waits
+    /// in the engine, under its caps (NB135-15).
     fn pump(&mut self) {
         let now = Instant::now();
+        self.verdicts();
         // Bounded, so a flood can't hold the node: what is left waits for the next poll.
-        for _ in 0..256 {
-            let Some(ok) = self.ether.done() else { break };
-            self.engine.outcome(ok);
-        }
         for _ in 0..256 {
             let Some((from, frame)) = self.ether.recv() else { break };
             self.engine.handle(now, from, &frame);
         }
         self.engine.timers(now);
-        while let Some((to, frame, tries)) = self.engine.peek() {
-            if !self.ether.send(to, frame, tries) {
+        while let Some((to, frame, tries, tag)) = self.engine.peek() {
+            if !self.ether.send(to, frame, tries, tag) {
                 break;
             }
             self.engine.commit(now);
+            self.verdicts(); // an ether whose verdicts are in at once takes the next at once
         }
         *self.watch.0.lock().unwrap_or_else(PoisonError::into_inner) = self.engine.stats();
+    }
+
+    /// Hands the engine the verdicts the ether has, by their tags; bounded, as above.
+    fn verdicts(&mut self) {
+        for _ in 0..256 {
+            let Some((tag, ok)) = self.ether.done() else { break };
+            self.engine.outcome(tag, ok);
+        }
     }
 }
 
