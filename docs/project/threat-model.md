@@ -204,6 +204,8 @@ release of each.
 | NB132-1 (Low) | **Fixed** by `96e2f55` before NB-132 merged, so never on main: a node evicts no peer it dialled by invite or reaches over a radio, as no linked one, so offers that plan punches no longer push an invite dial out before it links (a cap of 32, an ESP32's), reviewed 2026-11-14, [Per-peer state a node keeps](#per-peer-state-a-node-keeps-nb-132--nb132-1-nb132-i1) |
 | NB132-I1 (Info) | Accepted for v1 by the lead on 2026-11-14: about a cap's worth of hellos and offers from new ids pushes out a member whose hello was answered before its handshake completes, and its link is refused until its next hello; anyone with the room key could already hold joins off by spending the budgets, same section |
 | NB128-1 (Low) | **Fixed** by `db35a13` before NB-128 merged, so never on main: a relay that wrote a long message as several frames, each within the cap, still closed a board's socket on one oversize event someone sent to its tag, since tungstenite summed the frames; `Oversize` now holds a message in pieces, at most the cap's worth, and passes it on as one frame or drops it, reviewed 2026-11-14, [Relay counters and oversize messages](#relay-counters-and-oversize-messages-nb-131-nb-128--nb128-1) |
+| NB133-1 (Low) | **Fixed** by `573de0a` (NB-133, merged `962b1e2`): a board's set of seen event ids, sized for 128, regrew to 512 buckets, one block of about 8.7 KB, under the new ids anyone who knows its tag can send, on a heap that page churn had split; a board now searches its fixed queue of 128 and keeps no set, reviewed 2026-11-18, [A board's heap under page churn](#a-boards-heap-under-page-churn-nb-133--nb133-1-nb133-2) |
+| NB133-2 (Low) | Open: a full TLS record of 16 KiB from the relay, and some over 12 KiB, make rustls's read buffer take one block of 32 KiB on a board while it comes in, beside up to 16 KiB for its plaintext; anyone who knows a board's tag can have the relay send one, and after NB-133's fixes the board's largest free block bottomed at 36,864 bytes, so a little more fragmentation turns one large event into a restart, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -6359,17 +6361,19 @@ was read the same day.
   after ten minutes of hellos from new ids, one a second (a burst of 30 answers, then
   one each 2 s). `cap_remotes` now keeps at most 4 for each of the endpoint's
   `max_links`, from 32 to 1024 (32 on an ESP32's 8 links), after every signal and every
-  timeout. Past the cap it trims to 7/8 of it: first the peers not linked with nothing
-  under way, least lately active first (the later of `seen_at` and `offered_at`), then
-  those with a dial step or a punch under way (`ladder`, `plan`). A linked peer stays,
-  and since `96e2f55` so does one dialled by invite or reached over a radio (NB132-1). A
-  `Remote` is 224 bytes inline, 416 before `plan` and `ladder` were boxed (by `size_of`
-  on a 64-bit host, the author's figures). On a PC `max_links` is unlimited by default,
-  so the cap is 1024, and signalling adds at most about 660 peers in `FORGET`'s 10
-  minutes (**theoretical**: a burst of 30 from each of the hello and offer budgets, then
-  one of each every 2 s), so `FORGET` still decides there. By its author's run,
-  `tests/heap_churn.rs` (ignored by default) finds a node's live heap level after about
-  30 page visits and flat through 781 hellos.
+  timeout; since `c10469b` it is 2 for each, from 16, so 16 on a board
+  ([NB-133](#a-boards-heap-under-page-churn-nb-133--nb133-1-nb133-2)). Past the cap it
+  trims to 7/8 of it: first the peers not linked with nothing under way, least lately
+  active first (the later of `seen_at` and `offered_at`), then those with a dial step or
+  a punch under way (`ladder`, `plan`). A linked peer stays, and since `96e2f55` so does
+  one dialled by invite or reached over a radio (NB132-1). A `Remote` is 224 bytes
+  inline, 416 before `plan` and `ladder` were boxed (by `size_of` on a 64-bit host, the
+  author's figures). On a PC `max_links` is unlimited by default, so the cap is 1024,
+  and signalling adds at most about 660 peers in `FORGET`'s 10 minutes (**theoretical**:
+  a burst of 30 from each of the hello and offer budgets, then one of each every 2 s),
+  so `FORGET` still decides there. By its author's run, `tests/heap_churn.rs` (ignored
+  by default) finds a node's live heap level after about 30 page visits and flat through
+  781 hellos.
 - **What an evicted peer loses.** Offer nonces are kept apart, node-wide, for 2 minutes
   (`MAX_NONCES`, 1024), so an evicted sender's offers are still checked for replay, and
   the node-wide hello, offer and inbox budgets stay as they were. What starts over is
@@ -6388,7 +6392,9 @@ was read the same day.
   A node remembers 128 ids on an ESP32 and 4096 elsewhere: on a C3 about 6.4 KB for the
   128, against about 25 KB as strings (**theoretical**: a table of 256 slots of 16 bytes
   and a queue of 128). At `2ba843f` the queue took the 129th id before it dropped the
-  oldest, so it grew to 256 slots, about 8.4 KB; `96e2f55` drops first.
+  oldest, so it grew to 256 slots, about 8.4 KB; `96e2f55` drops first. Since `573de0a`
+  a board keeps the queue of 128 alone, 2 KB, as the table could still regrow to about
+  8.7 KB ([NB133-1](#a-boards-heap-under-page-churn-nb-133--nb133-1-nb133-2)).
 - **Pipes.** A pipe whose peer isn't linked, with nothing queued and unused for 60 s, is
   closed at the next flush (`Pipes::prune`); before, it lasted until `MAX_PIPES` others
   pushed it out. A batch in or a datagram out counts as use, so a handshake under way
@@ -6516,7 +6522,10 @@ overflow checks on.
   as one frame after the control frames among them, or nothing past the cap, adds stray
   continuations and streams that end in a message inside another, and checks after each
   read that no more than the cap is held. Its author's mutants, pieces passed unheld, a
-  held message with no cap and doubling past the cap, each fail a test.
+  held message with no cap and doubling past the cap, each fail a test. Since `65a3eea`
+  (NB-133) a held piece is read through a 256-byte buffer, as a dropped one is, so a
+  message read in tiny pieces costs time in proportion to its size, and the fuzz model
+  sets a reserved bit one frame in 16, which a mutant that drops them now fails.
 
 **NB128-1 — A relay that writes a message in pieces still closes the socket (Low).** At
 `791ae7b`, `Oversize` judged each frame alone, so a message whose first frame was within
@@ -6538,6 +6547,131 @@ message. Control frames between the pieces pass at once.
 2026-11-14, as the fix above. The review's repro, inverted, is a test: the 16 KiB
 message is dropped and the small one comes on the same connection. Reported on NB-128 at
 `791ae7b`.
+
+### A board's heap under page churn (NB-133) — NB133-1, NB133-2
+
+Each load of the LED page is a new PeerId that says a room hello, links over the relay
+through a pipe and leaves, so anyone who knows a board's room can visit it as often as
+they like. NB-132 capped what a node keeps per peer; NB-133 is what that left on a
+board. In NB-132's board run on 2026-11-14, 20 page loads, an ESP32-C3 restarted when an
+allocation of 8 KiB failed with 48 to 52 KB free, and its task watchdog fired four
+times, each a few seconds after a link. What ran out was the largest free block, not the
+free heap: state kept for minutes split the heap, and a short-lived buffer then found no
+block big enough. `4b85de1` to `93caf8e`, merged `962b1e2`, stop the watchdog, keep less
+for good and report the largest block. Reviewed on 2026-11-18 by reading
+`c8d721a..93caf8e` against ESP-IDF v5.5.5's heap and rustls 0.23.46. Scratch copies ran
+the review's own probes of the seen filter (NB133-1) and of rustls's read buffer
+(NB133-2), and mutants of the fix's tests; nothing else was re-run.
+
+**What holds.**
+
+- **Remembered peers.** A departed page stays in `Traversal`'s map of peers for
+  `FORGET`, 10 minutes, at about 550 bytes of a board's heap (the comment at
+  `REMOTES_PER_LINK`), and it was the map's nodes that split the heap. Since `c10469b` a
+  node remembers 2 peers for each of its endpoint's `max_links`, at least 16 and at most
+  1024, where it was 4 and 32: 16 on an ESP32's 8 links, and 1024 on a PC as before.
+  NB132-1's exemptions stand: a linked peer, one dialled by invite and one reached over
+  a radio stay. The cap's tests now bound it from both sides (`3333cf6`): ten minutes of
+  hellos fill it to exactly 16, and 33 peers offered leave 14 to 16.
+- **NB132-I1 on a board.** With a cap of 16, a member that hasn't linked yet is pushed
+  out by about 16 hellos and offers from new ids within its join, about half a budget's
+  burst of 30, where it took about 32; a real page's dial step or punch under way goes
+  the same way. NB132-I1's reasons for acceptance are unchanged: the member's next hello
+  brings it back, and anyone with the room key could already hold joins off by spending
+  the budgets.
+- **Seen event ids.** A board remembers the last 128 event ids, and anyone who knows its
+  tag chooses how fast new ones come, by sending events. Since `573de0a` a board finds a
+  copy by searching a queue of 128 that is made whole when the carrier starts, 2 KB
+  (**theoretical**: 128 × 16 bytes), and keeps no hash set, so the filter never
+  allocates again (NB133-1). A PC keeps the set beside the queue for its 4096.
+- **TLS.** Since `7125778` rustls keeps sessions to resume for 8 relay hosts, where its
+  default made room for 256 up front. Its read buffer is NB133-2.
+- **Pipes.** A board opens at most 4 pipes (`MAX_PIPES`), and one idle for 60 s is
+  closed (`Pipes::prune`, NB-132), so pages that come and go hold none for long. With 4
+  pages linked a fifth gets none: it waits for a pipe to go, or gives up after its 15 s
+  (NB-136, below).
+- **The watchdog.** `peerwire_esp::idle` slept until the node's next timer, 10 ms at
+  most. ESP-IDF busy-waits a sleep shorter than a tick and doesn't block for one of 0,
+  so while a join's handshakes kept a timer due, the main loop held the C3's one core
+  and starved the idle task until its watchdog fired. Since `4b85de1` it blocks for a
+  tick at least, 1 ms at the firmware's 1000 Hz.
+- **Diagnostics.** `peerwire_esp::heap()` gives the free heap, its largest block and its
+  low since boot, and `nostr_led` prints the three at each link, in its 30 s report and
+  after any poll over 1 s. A failed allocation logs its size, its task and the same
+  three: ESP-IDF calls the hook outside the heap's lock, and it allocates nothing and
+  prints through the ROM, with no key, PeerId or address. It runs on every allocation
+  that fails, C code's that recover included (`93caf8e`), so a line alone is no crash.
+  `BACKTRACE=1 ./build.sh` builds a C3 image with frame pointers, so an abort prints a
+  backtrace; it is opt-in, and the template doesn't use it.
+- **Measured.** On one ESP32-C3 on 2026-11-18, `nostr_led` built from `93caf8e` took 40
+  loads of the LED page in 10 minutes, each in a new browser context; 35 linked, and the
+  other 5 met the pipe cap (NB-136). By its `heap()` lines the low since boot was 43,312
+  bytes and the largest block bottomed at 36,864, and about 17 KB stayed held once the
+  pages were forgotten, with no abort, watchdog or restart. On 2026-11-14 a build with
+  the watchdog fix and 8 TLS hosts, but 32 remembered peers and the old filter, had a
+  low of 30,560 bytes and a largest block of 20,480 through two batches of 20 loads. On
+  a PC `tests/heap_churn.rs` measures the same churn (`--ignored`); by its author's runs
+  its level fell from 39.5–43.0 KB to 36.6–37.3 KB.
+
+**What's left.** NB-136: past the 4-pipe cap a page waits until a closed page's pipe
+goes, or gives up; in the run above every fifth page did. So anyone with the room name
+can keep other pages off a board for as long as they hold 4 pages linked, as NB-126's
+bounds already say of every pipe table. The cap is what bounds the pipes' memory, so a
+fix that frees a pipe sooner, a page's own close or a quiet pipe evicted when the table
+is full, must not let a newcomer cut a linked page's pipe. And NB133-2, below.
+
+**NB133-1 — A board's seen filter regrew to 8.7 KB (Low).** At `9395294` a board's set
+of seen event ids was made with room for 128 when the carrier started, so that it
+wouldn't double into holes during the first visits. It didn't stay that size. In
+hashbrown a removed id leaves a tombstone unless an empty slot lies in its probe group,
+and a tombstone gives no room back for inserts; when that room runs out, the table is
+rehashed in place only if it holds at most half its capacity, and 128 ids are more than
+half of 224. So after enough new ids the set moved to 512 buckets, one block of about
+8.7 KB where it had 4.4 (**theoretical**: 16 bytes and a control byte a bucket, and a
+group of 4 control bytes on a C3: 512 × 17 + 4 and 256 × 17 + 4). Anyone who knows a
+board's tag chooses when, by sending events, on a heap that page churn has already
+split: NB-133's failure. The set on main before it, which grew as it needed, did the
+same. Repro: the review's probe of the filter's code, with hashbrown's groups as on a
+C3, regrew under a stream of new ids, and with room for 256 it never did. Fix: on an
+ESP32, find a copy by searching the queue (2 KB, and 128 compares of 16 bytes an event)
+and keep no set, or size the set for twice the ids.
+
+**Status: fixed** by `573de0a` (NB-133, merged `962b1e2`), reviewed 2026-11-18: a
+board's filter searches its queue of 128, made whole at the start, and its set never
+takes an id, so neither allocates again; the 16-byte prefix, the window and the order of
+eviction are as before.
+`the_seen_filter_drops_copies_of_the_last_ids_and_an_esp32s_never_grows` sends 2,128 new
+ids through `poll` and checks after each that neither buffer changed, then that a copy
+of each of the last 128 is dropped and an older id taken; a PC's filter passes the same
+with 4096. The review's mutants, a board's filter that uses the set or that pushes
+without popping, each fail it. Reported on NB-133 at `9395294`.
+
+**NB133-2 — A large TLS record takes a 32 KiB block of a board's heap (Low).** rustls
+0.23.46 reads TLS records into one buffer. Before each read it makes room for 4 KiB more
+than it holds (`prepare_read`), up to a record's 18,437 bytes at most, and lets all but
+4 KiB go once the buffer is empty. It grows with `Vec::resize`, which at least doubles
+the capacity, so while a record comes in the buffer goes from 4 to 8, 16 and then
+32 KiB, the last if a read starts with more than 12 KiB of the record held
+(**theoretical**: a capacity of `max(2 × capacity, held + 4096)` from 4,096, each time
+`held + 4096` passes it, and no read takes more than 4,096 bytes). So a full record of
+16 KiB always needs one free block of 32 KiB while it comes in, and one over 12 KiB can,
+as the reads fall. Each record's plaintext is then copied out into a block of its own,
+up to 16 KiB. The relay's TLS stack sizes the records, and a large message to the board
+is what makes one large: anyone who knows a board's tag can send it events up to the
+relay's own limit, and NB-128 drops one over 4 KiB only once it is decrypted. Through
+NB-133's 40 page loads the board's largest free block bottomed at 36,864 bytes, so a
+32 KiB block would have fitted, with about 4 KiB to spare; with NB-132's cap it bottomed
+at 20,480, and the 8 KiB that failed in NB-132's run is this buffer's second size.
+Whether the board's relay writes records that large is unknown. Repro: the review's
+probe, a rustls 0.23.46 client fed one 16 KiB record in pieces of a TCP segment's size,
+makes the allocation of 32 KiB the formula gives. Fix: the buffer is rustls's, so either
+the carrier uses rustls's unbuffered client (`UnbufferedClientConnection`) with a buffer
+of 18,437 bytes it takes once when it starts, while the heap is whole, or a patched
+rustls grows the buffer by exactly what it needs (`reserve_exact` before the resize),
+which caps the block at 18,437 bytes; and a board takes no new pipe or link while its
+largest block is below what a record needs, with a margin, so churn can't push it under.
+
+**Status: open** (Low), reported on NB-133 at `962b1e2`.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
@@ -6944,7 +7078,10 @@ congestion rule for tail losses from NB-086 (`b2ae061`, reviewed 2026-11-03).
     worth, and passed on as one frame (NB128-1).
   - The inbox holds 1024 events, then drops.
   - 4096 event ids are remembered (128 on an ESP32), each as its first 16 bytes since
-    NB-132.
+    NB-132; on an ESP32 in a queue of 2 KB searched in turn, with no hash set, since
+    `573de0a` (NB133-1).
+  - rustls keeps sessions for 8 relay hosts (`7125778`). Its read buffer takes a block
+    of 32 KiB for a record of 16 KiB, and can for one over 12 KiB (NB133-2).
   - At most 64 publishes are queued while a relay is down.
   - At most 256 events (32 on an ESP32) await a relay's `OK`, then the oldest counts as
     unanswered (NB-131).
@@ -7373,3 +7510,6 @@ review host, and nothing ran over a radio.
 The BlueZ turn review (NB116-2's fix, 2026-11-07) read the driver against `bluer`'s and
 BlueZ 5.87's sources; NB116-3's reproduction, a test in a copy of the branch, ran on the
 review host before and after its fix, beside a mutant, and nothing ran over a radio.
+The NB-133 review (2026-11-18) read ESP-IDF v5.5.5's heap and rustls 0.23.46's sources;
+probes of the seen filter and of rustls's read buffer, and mutants of the fix's tests,
+ran on the review host, and the board's figures are from its author's runs.
