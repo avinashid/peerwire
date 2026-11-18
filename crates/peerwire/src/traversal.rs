@@ -3506,8 +3506,8 @@ mod tests {
 
     /// NB-132: a peer heard is remembered `FORGET` long, and each page load is a new PeerId, so a stranger who knew
     /// the room ran a board's heap down by reloading. Ten minutes of hellos from new ids, one a second: the node
-    /// answers more than the cap, and remembers no more than its endpoint's cap (16 for an ESP32's 8 links). A peer
-    /// it was introduced to (an invite dial) outlasts them.
+    /// answers more than the cap, and remembers up to its endpoint's cap (16 for an ESP32's 8 links) and no more. A
+    /// peer it was introduced to (an invite dial) outlasts them.
     #[test]
     fn hellos_from_new_peer_ids_are_remembered_within_a_cap() {
         let (key, topic) = (room_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1));
@@ -3533,7 +3533,7 @@ mod tests {
             most = most.max(t.remotes.len());
         }
         assert!(answered > 64, "{answered} hellos answered");
-        assert!(most <= 16, "{most} peers remembered at most");
+        assert_eq!(most, 16, "peers remembered at most: the cap, filled");
         assert!(t.remotes.contains_key(&invited), "the invited peer is still remembered");
     }
 
@@ -3581,7 +3581,8 @@ mod tests {
             );
         }
         while t.poll_signal().is_some() {}
-        assert!(t.remotes.len() <= 16, "{} peers remembered", t.remotes.len());
+        // 33 peers against a cap of 16, which each time it's passed keeps 7/8 of it: 14 to 16.
+        assert!((14..=16).contains(&t.remotes.len()), "{} peers remembered", t.remotes.len());
         // The invited peer's plain answer to our offer is taken.
         let plain = proved_offer(&id(2), &me, None, 77, Role::Peer, vec!["198.51.100.200:4000".parse().unwrap()]);
         let took = t.handle_signal(Instant::from_millis(1_900), &mut ep, Topic::peer(&me), &plain);
