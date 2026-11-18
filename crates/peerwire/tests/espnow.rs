@@ -387,6 +387,60 @@ fn sec_one_forged_frame_to_the_opener_of_an_idle_link_costs_one_frame() {
     one_forged_frame_on_an_idle_link(false);
 }
 
+/// NB135-7 (the security review's repros, inverted): four data frames forged 65 numbers ahead of the last one
+/// overheard, to one end of an idle link, move that end there, and its next 64 real frames, the session's keepalives,
+/// landed behind it and were dropped as copies, so the link timed out (within 6 s with quick timers). The window behind
+/// a new place is now empty, so they are taken, and only the real frame with the forged number is lost.
+fn four_forged_frames_past_the_window_on_an_idle_link(to_accepter: bool) {
+    let air = FakeAir::new();
+    let ((mut a, wa), (mut b, wb)) = (quick_node(&air, A), quick_node(&air, B));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    let room = if to_accepter { "espnow-r3-accepter" } else { "espnow-r3-opener" };
+    a.join_room("pw-test", room);
+    b.join_room("pw-test", room);
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    pump(&mut [&mut a, &mut b], &mut ev, 1, |_| false);
+    let (accepts, last) = overheard(&air);
+    let (accepter, opener_id, accepter_id) = *accepts.last().unwrap();
+    let opener = if accepter == A { B } else { A };
+    let (from, to, id) = if to_accepter { (opener, accepter, accepter_id) } else { (accepter, opener, opener_id) };
+    let seq = last.get(&id).copied().unwrap_or(0).wrapping_add(65);
+    let f = frame::Frame::Data { to: id, seq, first: true, last: true, total: 1, payload: &[0] };
+    let stat = |w: &Watch| (w.stats().old, w.stats().resyncs);
+    let ((old_a, resyncs_a), (old_b, resyncs_b)) = (stat(&wa), stat(&wb));
+    for _ in 0..4 {
+        air.inject(from, to, &f.encode());
+    }
+    let mut after = Vec::new();
+    pump(&mut [&mut a, &mut b], &mut after, 6, |_| false);
+    let churn = |e: &&Event| matches!(e, Event::Disconnected { .. } | Event::Connected { .. });
+    assert_eq!(after.iter().flatten().filter(churn).count(), 0, "no link lost: {after:?}");
+    assert!(on_radio(&a, &pb) && on_radio(&b, &pa));
+    let ((old_a2, resyncs_a2), (old_b2, resyncs_b2)) = (stat(&wa), stat(&wb));
+    let lost = old_a2 - old_a + old_b2 - old_b;
+    eprintln!(
+        "idle link, 4 forged frames at +65 to the {}: real frames dropped as old {lost}",
+        if to_accepter { "accepter" } else { "opener" }
+    );
+    assert_eq!(resyncs_a2 - resyncs_a + resyncs_b2 - resyncs_b, 1, "the forged frames moved that end");
+    assert!(lost <= 1, "the real frame of the forged one's number at most: {lost}");
+    a.send(&pb, Lane::Reliable, b"after the forged frames").unwrap();
+    b.send(&pa, Lane::Reliable, b"and back").unwrap();
+    pump(&mut [&mut a, &mut b], &mut after, 2, |_| false);
+    assert!(got(&after[1], pa, b"after the forged frames") && got(&after[0], pb, b"and back"));
+}
+
+#[test]
+fn sec_four_forged_frames_past_the_window_to_the_accepter_cost_one_frame() {
+    four_forged_frames_past_the_window_on_an_idle_link(true);
+}
+
+#[test]
+fn sec_four_forged_frames_past_the_window_to_the_opener_cost_one_frame() {
+    four_forged_frames_past_the_window_on_an_idle_link(false);
+}
+
 /// NB135-I6 (the security review's repro, inverted): data to the end that ACCEPTED goes nowhere, so that end's link
 /// times out first and it closes the connection; the opener hears a close of a connection bound to its peer, and holds
 /// the advert 1 to 4 s, not a minute: the link is back within seconds, on a new connection.
