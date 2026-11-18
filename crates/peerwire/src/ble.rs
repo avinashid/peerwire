@@ -61,8 +61,11 @@ pub struct Limits {
     /// value can cause it: a message the room proof doesn't expect, a wrong answer or proof, 32 messages dropped once
     /// proven; and so does one the other end closes before the room is proven (NB135-8), one that missed the room
     /// proof's deadline, as frames forged with the numbers of the other end's proof can make it, and a proven one bound
-    /// to no peer that the other end closes while this node has no link to its peer elsewhere (NB135-10). Off for
-    /// Bluetooth, where no third party writes into a connection.
+    /// to no peer that the other end closes while this node has no link to its peer elsewhere (NB135-10). And a
+    /// central's connection that hasn't proven the room, which anyone can open from a made-up address, counts against
+    /// none of the node's own connects, which close the oldest such one if they need its slot, and makes way for a new
+    /// central at any age, not after a second (NB135-11). Off for Bluetooth, where no third party writes into a
+    /// connection.
     pub forgeable: bool,
 }
 
@@ -165,7 +168,8 @@ pub enum RadioEvent {
 /// one to the same peer isn't connected to again for as long, so until it changes.
 const ROTATE: Duration = Duration::from_secs(15 * 60);
 /// A central's connection that hasn't proven the room makes way for a new central once it has had this long (an
-/// honest one needs a round trip), so one that never answers can't keep others out.
+/// honest one needs a round trip), so one that never answers can't keep others out; at any age over a radio whose
+/// values anyone can forge, where OPENs forged twice a second kept every one within it (NB135-11).
 const GRACE: Duration = Duration::from_secs(1);
 /// A proven connection bound to no peer stays open while a signal that proves a room member comes over it this often.
 const UNBOUND_FOR: Duration = Duration::from_secs(60);
@@ -559,6 +563,7 @@ impl Ble {
         self.seen[i].said = skip;
         if skip.is_none() {
             log::debug!("Bluetooth: connecting to {}", tag(device));
+            self.make_room();
             self.pending.insert(device, (n, now));
             self.radio.connect(device);
         }
@@ -607,12 +612,39 @@ impl Ble {
         self.conns.values().filter(|c| c.bound.is_none()).count()
     }
 
+    /// Whether `c` is a central's connection that hasn't proven the room, over a radio whose values anyone can forge
+    /// ([`Limits::forgeable`]): what an OPEN forged from a made-up address makes, at no cost to the forger (NB135-11).
+    /// It counts against none of this node's own connects, and makes way for a newcomer at any age. Never over
+    /// Bluetooth, where a central's connection is a device that connected.
+    fn may_be_forged(&self, c: &Conn) -> bool {
+        self.limits.forgeable && !c.central && !c.proven()
+    }
+
     /// Whether a connection this end makes fits: one more connection, and one more unbound, counting its connects
     /// under way. They count only here: a central is taken, and a proven connection makes way, by the open ones alone,
-    /// as a connect that never completes can't be closed for them (NB110-11).
+    /// as a connect that never completes can't be closed for them (NB110-11). A connection that may be forged
+    /// ([`Ble::may_be_forged`]) doesn't count: two forged OPENs a board kept it from connecting to anyone (NB135-11).
+    /// [`Ble::make_room`] closes one for the connect if the radio needs its slot.
     fn room_out(&self) -> bool {
         let under_way = self.pending.len();
-        self.conns.len() + under_way < self.limits.connections && self.unbound() + under_way < self.limits.unbound
+        let counted = self.conns.values().filter(|c| !self.may_be_forged(c));
+        let (conns, unbound) = counted.fold((0, 0), |(n, u), c| (n + 1, u + usize::from(c.bound.is_none())));
+        conns + under_way < self.limits.connections && unbound + under_way < self.limits.unbound
+    }
+
+    /// Before a connect of this end's: while the connections, or those bound to no peer, have no room for one more,
+    /// the oldest that may be forged ([`Ble::may_be_forged`]) closes, so the radio has the slot and the node stays
+    /// within its limits (NB135-11). Only those: [`Ble::room_out`] counted the rest.
+    fn make_room(&mut self) {
+        let under_way = self.pending.len();
+        while self.conns.len() + under_way >= self.limits.connections
+            || self.unbound() + under_way >= self.limits.unbound
+        {
+            match self.weakest(|_, c| self.may_be_forged(c)) {
+                Some(w) => self.close(w, "made way for a connect of this node's"),
+                None => return,
+            }
+        }
     }
 
     /// Whether this radio takes no central now (its advert says so): it holds all the connections, or all the
@@ -636,24 +668,30 @@ impl Ble {
     }
 
     /// Whether `c` (`conn`) makes way for a newcomer: its peer hasn't proven who it is though it has had `GRACE`, or
-    /// it is a second connection to a peer (NB110-9).
+    /// it is a second connection to a peer (NB110-9). One that may be forged ([`Ble::may_be_forged`]) does at any age:
+    /// OPENs forged twice a second kept every one within its `GRACE`, so a newcomer was always refused (NB135-11).
     fn spare(&self, conn: ConnId, c: &Conn, now: Instant) -> bool {
         match c.known() {
-            None => now.saturating_duration_since(c.opened) >= GRACE,
+            None => self.may_be_forged(c) || now.saturating_duration_since(c.opened) >= GRACE,
             Some(_) => self.second(conn, c),
         }
     }
 
     /// The connection bound to no peer, among those `which` takes, that makes way for a newcomer: one that hasn't
     /// proven the room before one that has, one whose peer hasn't proven who it is before one whose has, then the
-    /// oldest.
+    /// oldest. Those that haven't proven the room have all made the same progress, none (a member answers the
+    /// challenge in a round trip, and is then proven); the oldest has gone longest without, and taking it gives each
+    /// newcomer the most time: a connection outlives as many newcomers as there are others to make way before it, so
+    /// a central mid-proof is closed only if that many come within its round trip. The newest would be closed by the
+    /// next one (NB135-11).
     fn weakest(&self, which: impl Fn(ConnId, &Conn) -> bool) -> Option<ConnId> {
         let open = self.conns.iter().filter(|(i, c)| c.bound.is_none() && which(**i, c));
         open.min_by_key(|(_, c)| (c.proven(), c.known().is_some(), c.opened, c.made)).map(|(i, _)| *i)
     }
 
     /// Makes room for a new central if it can: over a limit, a connection that makes way ([`Ble::spare`]) closes, a
-    /// central's for the limits of connections and centrals (NB110-7, NB110-9). Whether the central is taken.
+    /// central's for the limits of connections and centrals (NB110-7, NB110-9), and one that may be forged at any age
+    /// (NB135-11). Whether the central is taken.
     fn make_way(&mut self, now: Instant) -> bool {
         let centrals = self.conns.values().filter(|c| !c.central).count();
         if self.conns.len() >= self.limits.connections || centrals >= self.limits.centrals {
@@ -1581,22 +1619,39 @@ mod tests {
     impl Rogue {
         /// Connects to radio `to`, which `node` runs, and proves the room. The node's identity proof is in `read`.
         fn prove(air: &FakeAir, to: DeviceId, node: &mut Ble, ep: &mut Endpoint<Hop<SocketAddr>>, t: Instant) -> Rogue {
+            let (mut r, challenge) = Rogue::connect(air, to, node, ep, t);
+            r.answer(&challenge);
+            r
+        }
+
+        /// Connects to radio `to`, which `node` runs, and takes its challenge, not answered yet: mid-proof.
+        fn connect(
+            air: &FakeAir,
+            to: DeviceId,
+            node: &mut Ble,
+            ep: &mut Endpoint<Hop<SocketAddr>>,
+            t: Instant,
+        ) -> (Rogue, Vec<u8>) {
             let mut radio = air.radio(Limits::DESKTOP);
             radio.connect(to);
             let Some(RadioEvent::Connected { conn, .. }) = radio.poll() else { panic!() };
             let (tx, rx) = (Chunker::new(), Reassembler::new());
             let (transcript, link) = ([0; 2 * CHALLENGE], [0; 32]);
             let mut r = Rogue { radio, conn, tx, rx, transcript, link, seq: 0, gone: false };
-            let challenge = r.read(node, ep, t);
+            let mut challenge = r.read(node, ep, t);
             assert_eq!(challenge.len(), 1, "a challenge");
-            let (c_p, c_c) = (&challenge[0][1..], [9u8; CHALLENGE]);
-            assert_eq!((challenge[0][0], c_p.len()), (KIND_CHALLENGE, CHALLENGE));
+            (r, challenge.remove(0))
+        }
+
+        /// Answers the node's `challenge`, which proves the room once the node reads it.
+        fn answer(&mut self, challenge: &[u8]) {
+            let (c_p, c_c) = (&challenge[1..], [9u8; CHALLENGE]);
+            assert_eq!((challenge[0], c_p.len()), (KIND_CHALLENGE, CHALLENGE));
             let key = ble_key("app", "room");
-            r.send(&[&[KIND_ANSWER][..], &c_c, &hmac(&key, &[b"pw-ble-c", c_p, &c_c])].concat());
-            r.transcript[..CHALLENGE].copy_from_slice(c_p);
-            r.transcript[CHALLENGE..].copy_from_slice(&c_c);
-            r.link = hmac(&key, &[b"pw-ble-k", &r.transcript]);
-            r
+            self.send(&[&[KIND_ANSWER][..], &c_c, &hmac(&key, &[b"pw-ble-c", c_p, &c_c])].concat());
+            self.transcript[..CHALLENGE].copy_from_slice(c_p);
+            self.transcript[CHALLENGE..].copy_from_slice(&c_c);
+            self.link = hmac(&key, &[b"pw-ble-k", &self.transcript]);
         }
 
         fn send(&mut self, m: &[u8]) {
@@ -2689,6 +2744,121 @@ mod tests {
     #[test]
     fn sec_a_forged_hs1_over_a_forgeable_radio_takes_no_slot() {
         assert_eq!(a_plain_hs1(Limits { forgeable: true, ..Limits::DESKTOP }), (false, 1));
+    }
+
+    /// A board's limits, as ESP-NOW's defaults: 4 connections, 2 of them unbound, all of them centrals' if need be.
+    fn board(forgeable: bool) -> Limits {
+        Limits { connections: 4, unbound: 2, centrals: 4, forgeable, ..Limits::DESKTOP }
+    }
+
+    /// A central of the test's that never answers the challenge, as an OPEN forged from a made-up address makes over
+    /// ESP-NOW (NB135-11).
+    struct Silent {
+        radio: FakeRadio,
+        gone: bool,
+    }
+
+    impl Silent {
+        /// Connects to `node`, radio 0, which takes it at `at`.
+        fn connect(air: &FakeAir, node: &mut Ble, ep: &mut Endpoint<Hop<SocketAddr>>, at: Instant) -> Silent {
+            let mut radio = air.radio(Limits::DESKTOP);
+            radio.connect(DeviceId(0));
+            node.poll(at, ep);
+            Silent { radio, gone: false }
+        }
+
+        /// Whether the node closed it.
+        fn closed(&mut self) -> bool {
+            while let Some(e) = self.radio.poll() {
+                self.gone |= matches!(e, RadioEvent::Disconnected { .. });
+            }
+            self.gone
+        }
+    }
+
+    /// NB135-11: two centrals that never answer the challenge, at `t` and 10 ms later, take the two unbound slots of
+    /// a node with `limits`. Then, 10 ms later, whether a connect of the node's own to a member's advert goes, and
+    /// whether each of the two closed; and on a node of its own, whether a third such central `GRACE / 2` after the
+    /// first is taken, and whether each of the first two closed for it.
+    fn beside_silent_centrals(limits: Limits) -> ((bool, [bool; 2]), (bool, [bool; 2])) {
+        let key = ble_key("app", "room");
+        let t = Instant::from_millis(1);
+        let ms = Duration::from_millis;
+        let air = FakeAir::new(23);
+        let (mut node, mut ep) = lone(&air, limits, 1, t);
+        let mut s: Vec<Silent> = (0..2).map(|i| Silent::connect(&air, &mut node, &mut ep, t + ms(10 * i))).collect();
+        assert_eq!(node.counts(), (2, 0, 0), "both taken");
+        let mut yp = air.radio(Limits::DESKTOP);
+        yp.advertise(Some(&advert(&key, u32::MAX, false)));
+        let connects = (0..64).any(|_| {
+            node.poll(t + ms(20), &mut ep);
+            std::iter::from_fn(|| yp.poll()).any(|e| matches!(e, RadioEvent::Connected { .. }))
+        });
+        let own = (connects, [s[0].closed(), s[1].closed()]);
+
+        let air = FakeAir::new(23);
+        let (mut node, mut ep) = lone(&air, limits, 1, t);
+        let mut s: Vec<Silent> = (0..2).map(|i| Silent::connect(&air, &mut node, &mut ep, t + ms(10 * i))).collect();
+        let mut newcomer = Silent::connect(&air, &mut node, &mut ep, t + GRACE / 2);
+        let central = (!newcomer.closed(), [s[0].closed(), s[1].closed()]);
+        (own, central)
+    }
+
+    /// NB135-11: over Bluetooth, a central's connection that hasn't proven the room counts against the node's own
+    /// connects, and makes way for a new central only once it has had `GRACE`, as before.
+    #[test]
+    fn centrals_that_never_prove_the_room_over_bluetooth_count_and_make_way_after_a_second_as_before() {
+        let (own, central) = beside_silent_centrals(board(false));
+        assert_eq!(own, (false, [false, false]), "no connect of its own, and neither closed");
+        assert_eq!(central, (false, [false, false]), "the newcomer refused within their grace");
+    }
+
+    /// NB135-11 (the security review's finding): over a radio whose values anyone can forge, two OPENs forged from
+    /// made-up addresses made two connections that never prove the room, which took a board's two unbound slots, and
+    /// they counted against its own connects: it connected to no one. They count against none now, and the oldest
+    /// closes for a connect of its own.
+    #[test]
+    fn sec_centrals_that_never_prove_the_room_over_a_forgeable_radio_take_no_slot_from_a_connect_of_its_own() {
+        let (own, _) = beside_silent_centrals(board(true));
+        assert_eq!(own, (true, [true, false]), "a connect of its own, the oldest closed for it");
+    }
+
+    /// NB135-11 (the security review's finding): those two made way for a new central only once they had had
+    /// `GRACE`, so OPENs forged twice a second, each within it, kept every newcomer out. Over a radio whose values
+    /// anyone can forge, a newcomer takes the oldest's place at any age.
+    #[test]
+    fn sec_centrals_that_never_prove_the_room_over_a_forgeable_radio_make_way_for_a_newcomer_at_any_age() {
+        let (_, central) = beside_silent_centrals(board(true));
+        assert_eq!(central, (true, [true, false]), "the newcomer taken, in the oldest's place");
+    }
+
+    /// NB135-11: which one makes way. Of the centrals that haven't proven the room, none has made progress (a member
+    /// answers the challenge in a round trip, and is proven then), so the oldest goes, having gone longest without:
+    /// a member mid-proof outlives the next newcomer, where newest-first would close it for that one. Once proven, it
+    /// makes way for none of those that follow, which make way for each other.
+    #[test]
+    fn sec_the_oldest_central_that_never_proved_the_room_makes_way_not_a_member_mid_proof() {
+        let t = Instant::from_millis(1);
+        let ms = Duration::from_millis;
+        let air = FakeAir::new(23);
+        let (mut node, mut ep) = lone(&air, board(true), 1, t);
+        let mut s: Vec<Silent> = (0..2).map(|i| Silent::connect(&air, &mut node, &mut ep, t + ms(10 * i))).collect();
+        let (mut member, challenge) = Rogue::connect(&air, DeviceId(0), &mut node, &mut ep, t + ms(20));
+        assert!(s[0].closed() && !s[1].closed(), "the oldest made way for the member");
+        // Another newcomer before the member's answer comes: the oldest goes again, not the member.
+        s.push(Silent::connect(&air, &mut node, &mut ep, t + ms(30)));
+        assert!(s[1].closed() && !s[2].closed() && !member.closed(), "the member mid-proof stays");
+        member.answer(&challenge);
+        member.read(&mut node, &mut ep, t + ms(40));
+        member.prove_id(&id(5), &member.transcript.clone());
+        member.read(&mut node, &mut ep, t + ms(40));
+        assert!(node.conns.values().any(|c| c.known() == Some(id(5).peer_id())), "the member proven");
+        for i in 0..6 {
+            s.push(Silent::connect(&air, &mut node, &mut ep, t + ms(50 + 10 * i)));
+        }
+        assert!(!member.closed(), "the member stays");
+        assert_eq!(s.iter_mut().map(Silent::closed).filter(|c| !c).count(), 1, "one newcomer beside it, the last");
+        assert!(!s.last_mut().unwrap().closed());
     }
 
     /// NB-114: why a node doesn't connect to an advert of its room, which it logs once a `SEEN_FOR` for each advert.
