@@ -85,9 +85,13 @@ connection closed before it sent a challenge (it refused the central, or never c
 limits). So is one whose connection was bound to a peer when the radio or the other end closed it: the link was up
 over it, so the next should come soon, whichever end's link timed out first (NB135-I6). A room member that keeps
 closing the bound connections a peer makes to it makes that peer connect again every 1 to 4 s; that is accepted, as a
-member can cost a link more ways than that. Nothing a peer says of its own advert is taken, as a member could name
-another's to keep two members apart: so two peers may make two connections (a full desktop connects back to the peer
-that filled it, say), and the [second one closes](#binding-a-connection-to-its-peer).
+member can cost a link more ways than that. Over a radio whose values anyone in range can forge (`Limits::forgeable`,
+[ESP-NOW](espnow.md)'s), so is one whose connection closed for a fault of its link (a message the room proof doesn't
+expect, a wrong answer or proof, 32 messages dropped) or that the other end closed before the room was proven, as one
+forged value can cause either (NB135-8); over Bluetooth, where no third party writes into a connection, those hold
+60 s. Nothing a peer says of its own advert is taken, as a member could name another's to keep two members apart: so
+two peers may make two connections (a full desktop connects back to the peer that filled it, say), and the
+[second one closes](#binding-a-connection-to-its-peer).
 
 ## Framing
 
@@ -174,7 +178,9 @@ open while a signal proving a member comes over it at least every 60 s (hellos c
 for the day UDP goes. A connection bound to a peer whose link times out closes, with no hold on the advert, so the
 next link to that peer comes over a new connection rather than one the radio still says is up but that carries
 nothing (NB135-1, on [ESP-NOW](espnow.md)); the other end, if it made the connection, holds that advert only 1 to 4 s
-(NB135-I6).
+(NB135-I6). A link whose connection closes under it can't move onto another by itself, as an unbound connection takes
+no data for it: once a new connection proves its peer, each end dials the link again over it at once (`Replaced`, then
+`Connected`), rather than waiting for it to time out (NB135-I7).
 
 ## Paths: UDP first
 
@@ -273,8 +279,9 @@ pub trait Radio: Send {
     fn disconnect(&mut self, conn: ConnId);
     /// The next event, without blocking.
     fn poll(&mut self) -> Option<RadioEvent>;
-    /// What it holds at once (connections, unbound ones, centrals, values queued): `Limits::DESKTOP` unless the
-    /// driver says otherwise; an ESP32's says `Limits::SMALL`.
+    /// What it holds at once (connections, unbound ones, centrals, values queued), and whether anyone in range can
+    /// forge a value on a connection (`forgeable`, ESP-NOW's): `Limits::DESKTOP` unless the driver says otherwise; an
+    /// ESP32's says `Limits::SMALL`.
     fn limits(&self) -> Limits { Limits::DESKTOP }
     /// A waker to wake each time it queues an event, so a node asleep until its next timer polls at once; a driver
     /// that never wakes it still works, as a node with a radio polls at least every 50 ms. Default: ignored.
