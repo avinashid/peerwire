@@ -28,6 +28,10 @@ and the commit that fixed it.
   apart for a minute (NB135-5); the receiver keeps a bit for each of the 64 numbers behind the highest it took, as an
   anti-replay window, so one forged data frame costs the real frame of its number, not the next 63, which on an idle
   link timed the link out (NB135-6); a connection has one KEEPALIVE waiting for the air at most (NB135-I5).
+- ESP-NOW, from its security review's third round: a resync of a connection's data numbers, either way, counts none
+  of the 64 behind the receiver's new place as taken, so 4 data frames forged just past the window no longer make it
+  drop the sender's next 64 real frames as copies, which on an idle link timed the link out; a forged move costs 4
+  real frames at most (NB135-7).
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert
