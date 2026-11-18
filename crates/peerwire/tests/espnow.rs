@@ -164,7 +164,7 @@ fn overheard(air: &FakeAir) -> (Accepts, HashMap<u64, u32>) {
 
 /// NB135-1 (the security review's repro, inverted): someone in range overhears a link's ids and data numbers, then
 /// sends each end four data frames 2^30 numbers ahead, which move each end's place there. The real frames, far behind
-/// it now, move it back after four, so the next message gets through within seconds, with no link lost.
+/// it now, move it back after four, so messages get through each way within seconds, with no link lost.
 #[test]
 fn sec_a_forged_resync_timeline() {
     let air = FakeAir::new();
@@ -200,21 +200,27 @@ fn sec_a_forged_resync_timeline() {
             }
         }
     }
+    // A message each way every second, until one came each way: each end's move back takes 4 real frames from the
+    // other, and an end that sent only acknowledgements could take a while to send 4, longer in a loaded debug run,
+    // where its move back came after the check at times.
     let started = Instant::now();
     let mut after = vec![Vec::new(), Vec::new()];
     let mut got_at = None;
     let mut n = 0u32;
+    let came =
+        |ev: &[Event], from: PeerId| ev.iter().any(|e| matches!(e, Event::Message { peer, .. } if *peer == from));
     while started.elapsed() < Duration::from_secs(30) && got_at.is_none() {
         n += 1;
+        let _ = a.send(&pb, Lane::Reliable, format!("after {n}").as_bytes());
         let _ = b.send(&pa, Lane::Reliable, format!("after {n}").as_bytes());
         pump(&mut [&mut a, &mut b], &mut after, 1, |_| false);
-        if after[0].iter().any(|e| matches!(e, Event::Message { peer, .. } if *peer == pb)) {
+        if came(&after[0], pb) && came(&after[1], pa) {
             got_at = Some(started.elapsed());
         }
     }
     let (sa, sb) = (wa.stats(), wb.stats());
-    eprintln!("first message after the forged resync: {got_at:?}; resyncs a {} b {}", sa.resyncs, sb.resyncs);
-    assert!(got_at.is_some_and(|t| t < Duration::from_secs(5)), "a message within seconds: {got_at:?}");
+    eprintln!("a message each way after the forged resync: {got_at:?}; resyncs a {} b {}", sa.resyncs, sb.resyncs);
+    assert!(got_at.is_some_and(|t| t < Duration::from_secs(5)), "a message each way within seconds: {got_at:?}");
     assert!(sa.resyncs >= 2 && sb.resyncs >= 2, "moved by the forged frames, then back by the real ones");
     let churn = |e: &&Event| matches!(e, Event::Disconnected { .. } | Event::Connected { .. });
     assert_eq!(after.iter().flatten().filter(churn).count(), 0, "no link lost");
