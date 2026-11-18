@@ -1381,3 +1381,78 @@ fn sec_a_newcomer_beside_a_connect_under_way_links_within_seconds() {
     eprintln!("Y beside X's connect under way: linked after {linked:?}, {k} OPENs forged, {refused} not taken");
     assert!(linked.is_some_and(|t| t < Duration::from_secs(5)), "linked within seconds: {linked:?}");
 }
+
+/// NB135-13 (the security review's repro, as it ran): X is linked with P and Q, bound; a copy of an advert of Y's
+/// whose `n` was above X's is sent to X from a made-up address, and from a new one as each connect to the last runs
+/// out; and an OPEN is forged to X whenever X's radio holds fewer than its 4 connections and one, right after X's
+/// poll. Y, whose `n` is now below X's, is the one to connect; the forger stops `forge_for` after Y comes on the air.
+/// The copy no longer draws a connect (NB135-12), so the forger's OPEN takes the radio's one over each time its node
+/// has decided on the last, ahead of Y's, which go unanswered, and Y's connect fails after 10 s. Y held X's advert a
+/// minute after it (linked after 70.4 s); it holds it 1 to 4 s now, and connects again. How long until X and Y linked,
+/// within `secs`, and the OPENs forged.
+fn a_newcomer_kept_out_by_forged_opens(forge_for: Duration, secs: u64) -> (Option<Duration>, u64) {
+    let limits = Settings::DEFAULT.limits;
+    let air = FakeAir::new();
+    let room = format!("espnow-r7-kept-out-{}", forge_for.as_secs());
+    let ((mut x, wx), mut p, mut q) = linked_with_two(&air, &room);
+    let px = x.peer_id();
+    let n_x = advert_n(&air, A).expect("X's advert");
+    let (mut y, _) = watched(&air, D);
+    let py = y.peer_id();
+    air.set_off(D, true);
+    let mut copy = None;
+    loop {
+        y.join_room("pw-test", &room);
+        y.poll();
+        let n = advert_n(&air, D).expect("Y's advert");
+        if n > n_x && copy.is_none() {
+            copy = advert_frame(&air, D);
+        } else if n < n_x && copy.is_some() {
+            break;
+        }
+    }
+    let mut copier = Copier::new(&air, copy.expect("a copy"), false);
+    let mut k = 0;
+    let mut forge = |x: &mut Node, others: &mut [&mut Node], ev: &mut Vec<Vec<Event>>, on: bool| {
+        poll_all(&mut [x], ev);
+        if on {
+            copier.step(&air, A);
+            for _ in wx.stats().connections..limits.connections + 1 {
+                k += 1;
+                forge_open(&air, A, k);
+            }
+        }
+        poll_all(others, ev);
+    };
+    let mut ev = Vec::new();
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        forge(&mut x, &mut [&mut p, &mut q], &mut ev, true);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    air.set_off(D, false);
+    let t = Instant::now();
+    let mut linked = None;
+    while t.elapsed() < Duration::from_secs(secs) {
+        forge(&mut x, &mut [&mut p, &mut q, &mut y], &mut ev, t.elapsed() < forge_for);
+        if on_radio(&x, &py) && on_radio(&y, &px) {
+            linked = Some(t.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(forge);
+    (linked, k)
+}
+
+#[test]
+fn sec_forged_opens_that_keep_a_newcomer_out_cost_seconds_once_they_stop() {
+    let (control, k0) = a_newcomer_kept_out_by_forged_opens(Duration::ZERO, 20);
+    let (linked, k) = a_newcomer_kept_out_by_forged_opens(Duration::from_secs(15), 40);
+    eprintln!(
+        "forger stops as Y comes: linked after {control:?}, {k0} OPENs forged; forger on for 15 s: linked after \
+         {linked:?}, {k} OPENs forged"
+    );
+    assert!(control.is_some_and(|t| t < Duration::from_secs(3)), "control: {control:?}");
+    assert!(linked.is_some_and(|t| t < Duration::from_secs(20)), "within seconds of the forger's end: {linked:?}");
+}

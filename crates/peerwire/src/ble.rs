@@ -184,7 +184,7 @@ const UNBOUND_FOR: Duration = Duration::from_secs(60);
 /// No connect again to an advert whose last connection closed or failed for this long, unless it was bound to a peer
 /// (`REFUSED_HOLD`, NB135-I6), or the radio's values can be forged and it closed for a fault of its link or before the
 /// room was proven (NB135-8), missed the proof's deadline, or was a proven one bound to no peer, closed by the other
-/// end while its peer has no link elsewhere (NB135-10).
+/// end while its peer has no link elsewhere (NB135-10), or the connect failed (NB135-13).
 const RECONNECT_HOLD: Duration = Duration::from_secs(60);
 /// No connect again to an advert whose connection closed before its peripheral sent a challenge (it refused this
 /// central, or never challenged) for this long, plus up to `REFUSED_JITTER_MS` at random: an honest peer refuses a
@@ -606,15 +606,14 @@ impl Ble {
     }
 
     /// A connect to `device` failed, or was given up: that device's advert isn't connected to again for
-    /// `RECONNECT_HOLD`.
+    /// `RECONNECT_HOLD`, or only 1 to 4 s on a radio whose values anyone can forge ([`Limits::forgeable`]): OPENs forged
+    /// from made-up addresses as fast as the radio takes them keep its one OPEN over its limits taken, so a newcomer's
+    /// go unanswered, and it held the advert a minute after (NB135-13).
     fn failed(&mut self, now: Instant, device: DeviceId) {
         if let Some((n, _)) = self.pending.remove(&device) {
-            log::debug!(
-                "Bluetooth: the connect to {} failed; its advert held {} s",
-                tag(device),
-                RECONNECT_HOLD.as_secs()
-            );
-            self.held.insert((device, n), now + RECONNECT_HOLD);
+            let hold = if self.limits.forgeable { refused_hold() } else { RECONNECT_HOLD };
+            log::debug!("Bluetooth: the connect to {} failed{}", tag(device), held_for(Some(hold)));
+            self.held.insert((device, n), now + hold);
         }
     }
 
@@ -2990,6 +2989,36 @@ mod tests {
         let (connects, own) = connects_to(&air, radio, &heard);
         assert_eq!(connects, [true, false], "a copy from any device; none bound to an address");
         assert_eq!(own, advert(&key, 2_000, false));
+    }
+
+    /// How long a node with `limits` holds the advert of a connect of its own that failed.
+    fn failed_hold(limits: Limits) -> Duration {
+        let key = ble_key("app", "room");
+        let air = FakeAir::new(23);
+        let t = Instant::from_millis(1);
+        let (mut node, mut ep) = lone(&air, limits, 1, t);
+        node.n = 2_000;
+        let d = DeviceId(100);
+        node.on_seen(t, d, &advert(&key, 3_000, false));
+        assert!(node.pending.contains_key(&d), "a connect");
+        node.on_event(t, &mut ep, RadioEvent::ConnectFailed { device: d });
+        node.held[&(d, 3_000)] - t
+    }
+
+    /// NB135-13: over Bluetooth a connect that failed holds the advert a minute, as before.
+    #[test]
+    fn a_failed_connect_over_bluetooth_holds_the_advert_a_minute() {
+        assert_eq!(failed_hold(board(false)), RECONNECT_HOLD);
+    }
+
+    /// NB135-13 (the security review's finding): over a radio whose values anyone can forge, OPENs forged from made-up
+    /// addresses as fast as the radio takes them keep its one OPEN over its limits taken, so a newcomer's go unanswered
+    /// and its connect fails; it then held the advert a minute. It holds it 1 to 4 s now, as after a refusal.
+    #[test]
+    fn sec_a_failed_connect_over_a_forgeable_radio_holds_the_advert_seconds() {
+        let jitter = Duration::from_millis(u64::from(REFUSED_JITTER_MS));
+        let held = failed_hold(board(true));
+        assert!((REFUSED_HOLD..REFUSED_HOLD + jitter).contains(&held), "1 to 4 s: {held:?}");
     }
 
     /// NB-114: why a node doesn't connect to an advert of its room, which it logs once a `SEEN_FOR` for each advert.
