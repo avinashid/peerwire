@@ -81,8 +81,8 @@ const IDLE_MAX: Duration = Duration::from_millis(10);
 
 /// Applies ESP-IDF's patches to the Rust runtime and starts its logger, and sets the clock back to 1970 if a room
 /// member gave its time before the restart ([`clock::set`]), so the node takes the time afresh. [`run`] calls it; call
-/// it first if you don't use `run`. A second call does nothing. It also has an allocation that fails say what was
-/// free ([`Heap`]) before the abort that follows.
+/// it first if you don't use `run`. A second call does nothing. It also has each allocation that fails say what was
+/// free ([`Heap`]): one of Rust's aborts next, but C code gets by without some, so a line alone is no crash.
 pub fn init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -94,8 +94,10 @@ pub fn init() {
 }
 
 /// Says, on the console, which allocation failed and what the heap held: a largest block below the size asked for,
-/// with more than that free, is a fragmented heap rather than a full one (NB-133). It runs in the task that asked,
-/// before Rust aborts, so it allocates nothing and prints through the ROM.
+/// with more than that free, is a fragmented heap rather than a full one (NB-133). ESP-IDF calls it on every failed
+/// allocation, in the task that asked, so it allocates nothing and prints through the ROM. Not every one is fatal:
+/// Rust aborts after one of its own, but C code recovers from some, as lwIP and Wi-Fi do by dropping a buffer they
+/// couldn't get.
 unsafe extern "C" fn alloc_failed(size: usize, _caps: u32, function: *const std::ffi::c_char) {
     let h = heap();
     unsafe {
