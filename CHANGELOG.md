@@ -18,9 +18,19 @@ and the commit that fixed it.
   or 8 frames in a row undelivered; a CLOSE is taken only if the PROBE it sends goes unanswered, so a forged one closes
   nothing. The timers and limits are in `espnow::Settings`; the engine is sans-IO (`espnow::Engine`), with host and
   fuzz tests, and `espnow::FakeAir` (feature `testing`) has ESP-NOW in one process for tests. Not yet run on a board.
+- ESP-NOW, from its security review: four forged data frames far ahead no longer black-hole a link, as 4 frames in a
+  row far behind move the receiver back too (NB135-1); a second ACCEPT with another id within 3 s of the first closes
+  the connection, whatever came on it (NB135-4); frames to an address that never acknowledged one get 2 tries, a
+  refusal 1, and the send queue is capped, one refusal waiting at most (NB135-3); values waiting for the node are
+  capped at 16 KB (NB135-2).
+- `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
+  advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
+  carries nothing (NB135-1).
 - `peerwire-esp`: feature `espnow`, the ESP32's ether, `espnow::EspNowEther` (`espnow::radio`): frames on the air one
-  at a time from a thread of their own, each tried up to 4 times, and ESP-NOW's peer table kept to the 16 addresses
-  last sent to. `wifi::start_on_channel` starts Wi-Fi on a channel with no network, for ESP-NOW, and
+  at a time from a thread of their own, each tried as many times as the radio asks, a send callback taken only for the
+  frame on the air with its address (NB135-I1), ESP-NOW's peer table kept to the 16 addresses last sent to, none with
+  frames still waiting (NB135-I2), and the receive callback dropping what isn't ours or is over 531 B before any copy,
+  with 16 KB queued at most (NB135-2). `wifi::start_on_channel` starts Wi-Fi on a channel with no network, for ESP-NOW, and
   `wifi::start_on_channel_as` with `wifi::random_mac` from a random address drawn at boot, as ESP-NOW frames carry
   the sender's address in the clear; `wifi::connect` joins a network from there. Examples: `espnow_mesh`, boards
   linking over ESP-NOW alone, and `espnow_probe`, which measures two boards' round trips, loss and frames a second with
