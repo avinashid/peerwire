@@ -78,8 +78,9 @@ end's MAC address, this end's id), and every frame on it carries the receiver's 
   framing then drops the message the value was part of, and the reliable lane sends it again.
 - **Numbers:** the receiver takes a data frame up to 64 numbers past the last one it took (the frames between are
   lost), and drops one it took already or that is behind (a copy: the sender's radio didn't hear the acknowledgement
-  and sent it again). One further ahead is dropped, unless 4 come in a row: then the sender lost more than 64 frames,
-  and the receiver takes up its numbers anew.
+  and sent it again). One further off, ahead or more than 64 behind, is dropped, unless 4 come in a row: then the
+  receiver takes up the sender's numbers anew, whether the sender lost more than 64 frames or frames forged far
+  ahead (or behind) moved the receiver there and the real ones are now far behind (or ahead) it (NB135-1).
 - **Liveness:** a connection with nothing sent on it for 1 s sends a KEEPALIVE; one with nothing heard on it for 5 s
   is gone (`Disconnected`), and so is one whose last 8 frames the radio couldn't deliver. A connect not accepted within
   10 s fails (`ConnectFailed`), as the node's radio contract asks.
@@ -151,13 +152,15 @@ which could jam the channel anyway. What such an attacker can do, frame by frame
 | PROBE | a KEEPALIVE in answer, one per 100 ms per connection |
 | KEEPALIVE | keeps a connection whose peer left open for as long as it keeps sending: the node closes it once its link times out and no proof of a room member has come over it for 60 s, as over Bluetooth |
 | DATA, in the window | a value for the node, which drops it (sealed, or not the room's), and the next frames, up to 64, dropped as behind it: a lost value or two, which the reliable lane sends again |
-| DATA, further ahead | dropped; 4 in a row move the receiver to it, as above |
+| DATA, further off | dropped; 4 in a row (ahead, or more than 64 behind) move the receiver to them, and the sender's next 4 real frames, now far off, move it back: 4 frames lost, which the reliable lane sends again (NB135-1) |
 | DATA cut short, or a part of another value | the value dropped: its parts don't add up to its length |
 | Anything from a group address, of another version or malformed | dropped |
 
-In every case the connection closes, loses frames, or stays as it was, and the node connects again; nothing makes one
-hang (each end closes a connection it hears nothing valid on for 5 s), grows the state past its limits (connections,
-queues and buffers are capped above), or crashes the parser (fuzzed). These are the points for security review:
+For each of these the connection closes, loses frames, or stays as it was, and the node connects again. That is what
+the tests show, frame by frame, not a proof that no mix of frames can stall a connection while the radio still has it
+up. So the node has its own check too: when a link times out, the radio connections bound to its peer close, with no
+hold on the advert, and the next link comes over a new connection with new ids (NB135-1). Connections, queues and
+buffers are capped above, and the parser is fuzzed. These are the points for security review:
 
 - the ACCEPT race: a second ACCEPT with another id closes a connection that has carried no data yet, so one forged
   frame early in a connection costs a reconnect, and one that wins the race with the real one jammed costs the

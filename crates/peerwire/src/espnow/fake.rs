@@ -19,12 +19,16 @@ const HEARD: usize = 1024;
 #[doc(hidden)]
 pub struct FakeAir(Arc<Mutex<Air>>);
 
+/// Frames a test makes vanish at the receiver ([`FakeAir::set_hole`]): from, to, the frame.
+type Hole = Box<dyn Fn(Mac, Mac, &[u8]) -> bool + Send>;
+
 struct Air {
     stations: Vec<Station>,
     loss: u32,
     ack_loss: u32,
     rng: u64,
     heard: VecDeque<(Mac, Mac, Vec<u8>)>,
+    hole: Option<Hole>,
 }
 
 struct Station {
@@ -45,6 +49,9 @@ impl Air {
     }
 
     fn deliver(&mut self, from: Mac, i: usize, frame: &[u8]) {
+        if self.hole.as_ref().is_some_and(|h| h(from, self.stations[i].mac, frame)) {
+            return;
+        }
         let s = &mut self.stations[i];
         if frame.len() <= s.max_frame && s.inbox.len() < INBOX {
             s.inbox.push_back((from, frame.to_vec()));
@@ -85,8 +92,14 @@ impl Default for FakeAir {
 
 impl FakeAir {
     pub fn new() -> FakeAir {
-        let air =
-            Air { stations: Vec::new(), loss: 0, ack_loss: 0, rng: 0x9e37_79b9_7f4a_7c15, heard: VecDeque::new() };
+        let air = Air {
+            stations: Vec::new(),
+            loss: 0,
+            ack_loss: 0,
+            rng: 0x9e37_79b9_7f4a_7c15,
+            heard: VecDeque::new(),
+            hole: None,
+        };
         FakeAir(Arc::new(Mutex::new(air)))
     }
 
@@ -105,6 +118,12 @@ impl FakeAir {
     pub fn set_loss(&self, loss: u32, ack_loss: u32) {
         let mut air = self.lock();
         (air.loss, air.ack_loss) = (loss, ack_loss);
+    }
+
+    /// Frames for which `hole` (from, to, frame) says so are acknowledged and lost, as by a receiver that drops them
+    /// itself; `None` stops.
+    pub fn set_hole(&self, hole: Option<Hole>) {
+        self.lock().hole = hole;
     }
 
     /// Turns station `mac` off or on: off, it hears nothing and nothing it sends arrives.

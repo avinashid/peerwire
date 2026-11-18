@@ -12,9 +12,10 @@
 //! sans-IO ([`Engine`]), and `FakeAir` (feature `testing`) has ethers in one process for tests.
 //!
 //! Like every carrier, ESP-NOW is untrusted, and its frames aren't authenticated: anyone in range can forge one from
-//! any address. A forged frame can close a connection or lose some of its frames, as jamming the channel would, and
-//! the node connects again; it can't make one hang, hold a connection open past its timeout once the peer is gone, or
-//! grow the state. What crosses a connection is sealed and proven by the node.
+//! any address, with the ids it overheard. The forged frames the design looks at (`docs/concepts/espnow.md`) can close
+//! a connection or lose some of its frames, as jamming the channel would, and the node connects again; and a link that
+//! times out closes the radio connections bound to its peer, so one stuck while its radio says it's up gives way to a
+//! new one (NB135-1). The state stays within its caps, and what crosses a connection is sealed and proven by the node.
 
 mod engine;
 mod ether;

@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 /// A data frame up to this many past the last one taken is taken; the ones between are lost.
 pub const WINDOW: u32 = 64;
-/// Data frames in a row further ahead than [`WINDOW`], after which the receiver takes the next as its new place: its
-/// sender lost more than a window of frames. One forged far ahead is dropped.
+/// Data frames in a row further than [`WINDOW`] ahead, or further than it behind, after which the receiver takes the
+/// next as its new place: its sender lost more than a window of frames, or frames forged far ahead moved this end on
+/// (NB135-1), and its next frames come from where it really is. One far off is dropped.
 pub const RESYNC_AFTER: u32 = 4;
 /// Events queued for the node at most: adverts, and values. Connections coming and going are never dropped.
 const MAX_SEEN_QUEUED: usize = 16;
@@ -74,8 +75,9 @@ struct Conn {
     /// The next data frame's number, and the last one taken.
     tx_seq: u32,
     rx_last: u32,
-    /// Data frames in a row further than [`WINDOW`] ahead.
+    /// Data frames in a row further than [`WINDOW`] ahead, and behind.
     ahead: u32,
+    behind: u32,
     /// Whether a data frame came on it: before one, a second ACCEPT with another id closes it.
     took_data: bool,
     /// A value whose first frame came and whose last hasn't, and how long its frames say it is.
@@ -408,13 +410,25 @@ impl Engine {
         }
         let Some(c) = self.conns.get_mut(&conn) else { return };
         c.took_data = true;
-        // Where it falls: the last one again, or behind it; in the window; or further ahead.
+        // Where it falls: the last one again, or behind it within the window (a copy, or a straggler); in the window
+        // ahead; or further off, either way, where `RESYNC_AFTER` in a row move this end there. Either way, so frames
+        // forged far ahead or far behind lose a connection `RESYNC_AFTER` of its real frames, not all (NB135-1).
         let d = seq.wrapping_sub(c.rx_last);
-        if d == 0 || d > 1 << 31 {
+        let back = d.wrapping_neg();
+        if d == 0 || d > 1 << 31 && back <= WINDOW {
             self.stats.old += 1;
             return;
         }
-        if d > WINDOW {
+        if d > 1 << 31 {
+            c.ahead = 0;
+            c.behind += 1;
+            if c.behind < RESYNC_AFTER {
+                self.stats.old += 1;
+                return;
+            }
+            self.stats.resyncs += 1;
+        } else if d > WINDOW {
+            c.behind = 0;
             c.ahead += 1;
             if c.ahead < RESYNC_AFTER {
                 self.stats.ahead += 1;
@@ -422,7 +436,7 @@ impl Engine {
             }
             self.stats.resyncs += 1;
         }
-        c.ahead = 0;
+        (c.ahead, c.behind) = (0, 0);
         if d > 1 {
             self.stats.gaps += 1;
             c.assembling = false;
@@ -630,6 +644,7 @@ impl Engine {
             tx_seq: 0,
             rx_last: u32::MAX,
             ahead: 0,
+            behind: 0,
             took_data: false,
             partial: Vec::new(),
             assembling: false,
@@ -1031,6 +1046,39 @@ mod tests {
         assert!(p.a.send(p.t, ca, b"still up"));
         p.shuttle();
         assert_eq!(values(&mut p.b), [b"still up".to_vec()]);
+    }
+
+    /// NB135-1 (the security review's repro, inverted): four forged data frames far ahead move the receiver's place
+    /// 2^30 frames on, and the real frames, far behind it now, move it back after four: four values lost, not all.
+    /// The same the other way.
+    #[test]
+    fn sec_four_forged_frames_far_ahead_or_behind_lose_four_real_frames_at_most() {
+        for far in [1u32 << 30, (1u32 << 30).wrapping_neg()] {
+            let mut p = Pair::new(V1_FRAME, V1_FRAME);
+            let (ca, _) = p.link();
+            let (_, b_id) = ids(&p);
+            assert!(p.a.send(p.t, ca, b"before"));
+            p.shuttle();
+            assert_eq!(values(&mut p.b), [b"before".to_vec()]);
+            for i in 0..RESYNC_AFTER {
+                let f = Frame::Data { to: b_id, seq: far + i, first: true, last: true, total: 1, payload: &[0] };
+                p.b.handle(p.t, A, &f.encode());
+            }
+            assert_eq!(p.b.stats().resyncs, 1);
+            let _ = values(&mut p.b);
+            let mut got = Vec::new();
+            for _ in 0..60 {
+                let _ = p.a.send(p.t, ca, b"real");
+                p.later(ms(1_000));
+                p.shuttle();
+                got.push(values(&mut p.b).len());
+            }
+            let first = got.iter().position(|n| *n > 0);
+            assert_eq!(first, Some(RESYNC_AFTER as usize - 1), "the fourth real frame moves b back: {got:?}");
+            assert_eq!(got.iter().sum::<usize>(), 60 - (RESYNC_AFTER as usize - 1), "and every one after comes");
+            assert_eq!(p.b.stats().resyncs, 2);
+            assert!(gone(&mut p.b).is_empty() && gone(&mut p.a).is_empty(), "nothing closes");
+        }
     }
 
     #[test]

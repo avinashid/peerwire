@@ -168,7 +168,9 @@ place. Two made at once may each be the first at the
 end that made it: then, once the other end's has been proven for 3 s, the one whose central has the larger `PeerId`
 closes, at the end that made it. A proven connection bound to no one, such as one between peers linked over UDP, stays
 open while a signal proving a member comes over it at least every 60 s (hellos come every 30 s at most): it is ready
-for the day UDP goes.
+for the day UDP goes. A connection bound to a peer whose link times out closes, with no hold on the advert, so the
+next link to that peer comes over a new connection rather than one the radio still says is up but that carries
+nothing (NB135-1, on [ESP-NOW](espnow.md)).
 
 ## Paths: UDP first
 
