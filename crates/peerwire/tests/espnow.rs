@@ -481,3 +481,131 @@ fn sec_a_link_stuck_at_the_accepter_comes_back_within_seconds() {
     let (accepts, _) = overheard(&air);
     assert!(accepts.iter().any(|(_, _, id)| *id != accepter_id), "on a connection with new ids");
 }
+
+/// Round 4 (the security review's repros, inverted): 32 data frames forged to one end of a live link (`to_opener`, or
+/// the accepter), with the ids and numbers overheard, each a whole message of the node's framing of a kind a proven
+/// link drops and counts (a challenge): that end closes the connection at its drop limit (`MAX_DROPS`). Default timers,
+/// so a session left idle times out after 30 s. Each end sends a message a second; how long until one got through
+/// each way on a new connection, if within `secs`, and the events meanwhile.
+fn forged_messages_on_a_live_link(to_opener: bool, secs: u64) -> (Option<Duration>, Vec<Event>) {
+    let air = FakeAir::new();
+    let (mut a, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    let room = if to_opener { "espnow-r4-drops-opener" } else { "espnow-r4-drops-accepter" };
+    a.join_room("pw-test", room);
+    b.join_room("pw-test", room);
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    pump(&mut [&mut a, &mut b], &mut ev, 1, |_| false);
+    let (accepts, last) = overheard(&air);
+    let (accepter, opener_id, accepter_id) = *accepts.last().unwrap();
+    let opener = if accepter == A { B } else { A };
+    let (from, to, id) = if to_opener { (accepter, opener, opener_id) } else { (opener, accepter, accepter_id) };
+    let base = last.get(&id).copied().unwrap_or(0);
+    for i in 0..32u32 {
+        // A chunk that is a whole message (first and last, a counter of its own), kind 3, and 16 bytes.
+        let value = [&[0xc0 | ((20 + i) as u8 & 0x3f), 3][..], &[7; 16]].concat();
+        let seq = base.wrapping_add(1 + i);
+        let f = frame::Frame::Data { to: id, seq, first: true, last: true, total: value.len() as u16, payload: &value };
+        air.inject(from, to, &f.encode());
+    }
+    let (t, mut after) = (Instant::now(), Vec::new());
+    let mut k = 0u32;
+    while t.elapsed() < Duration::from_secs(secs) {
+        k += 1;
+        let (to_b, to_a) = (format!("a {k}"), format!("b {k}"));
+        let _ = a.send(&pb, Lane::Reliable, to_b.as_bytes());
+        let _ = b.send(&pa, Lane::Reliable, to_a.as_bytes());
+        let mut e = Vec::new();
+        pump(&mut [&mut a, &mut b], &mut e, 1, |_| false);
+        let through = got(&e[1], pa, to_b.as_bytes()) && got(&e[0], pb, to_a.as_bytes());
+        after.extend(e.into_iter().flatten());
+        if through && overheard(&air).0.len() > accepts.len() {
+            return (Some(t.elapsed()), after);
+        }
+    }
+    (None, after)
+}
+
+/// NB135-I7: 32 forged messages to the accepter of a live link close the connection there. The opener holds that
+/// advert 1 to 4 s (NB135-I6) and connects again, but the session stayed on the closed connection until it timed out
+/// (30 s). Each end now dials it again over the new connection as soon as that proves the peer: back within seconds.
+#[test]
+fn sec_thirty_two_forged_messages_to_the_accepter_of_a_link_cost_seconds() {
+    let (back, after) = forged_messages_on_a_live_link(false, 20);
+    eprintln!("32 forged messages to the accepter: back each way on a new connection after {back:?}");
+    let timed_out = |e: &&Event| matches!(e, Event::Disconnected { reason: peerwire::DisconnectReason::Timeout, .. });
+    assert!(back.is_some_and(|t| t < Duration::from_secs(10)), "back within seconds: {back:?}");
+    assert_eq!(after.iter().filter(timed_out).count(), 0, "with no link timed out: {after:?}");
+}
+
+/// NB135-8 (the security review's repro, inverted): 32 forged messages to the opener of a live link close the
+/// connection there, and the opener held that advert a minute: no radio connection for 60.1 s. Over ESP-NOW, whose
+/// frames anyone can forge, it now holds it 1 to 4 s, and the link moves to the new connection at once (NB135-I7).
+#[test]
+fn sec_thirty_two_forged_messages_to_the_opener_of_a_link_cost_seconds() {
+    let (back, after) = forged_messages_on_a_live_link(true, 20);
+    eprintln!("32 forged messages to the opener: back each way on a new connection after {back:?}");
+    let timed_out = |e: &&Event| matches!(e, Event::Disconnected { reason: peerwire::DisconnectReason::Timeout, .. });
+    assert!(back.is_some_and(|t| t < Duration::from_secs(10)), "back within seconds: {back:?}");
+    assert_eq!(after.iter().filter(timed_out).count(), 0, "with no link timed out: {after:?}");
+}
+
+/// Polls `a`, then `b`, one at a time, until a poll has put an ACCEPT on `air`: the accepter's, which sends the
+/// room's challenge with it, so the opener has heard neither yet.
+fn until_accepted(a: &mut Node, b: &mut Node, air: &FakeAir, secs: u64) -> bool {
+    let accepted = || !overheard(air).0.is_empty();
+    let end = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < end {
+        for n in [&mut *a, &mut *b] {
+            n.poll();
+            if accepted() {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    false
+}
+
+/// NB135-8 (the security review's repros, inverted): one data frame forged as the room's challenge goes on the air,
+/// with the ids overheard, its value a whole message of the node's framing that the room proof doesn't expect (a
+/// datagram of one byte), to the opener or to the accepter. That end closes the connection, and the opener held the
+/// advert a minute, as for any close once the challenge had come: the pair linked again after 60.3 s (sent to the
+/// opener) and 60.7 s (to the accepter), where with no forged frame it links 55 ms after the challenge. Over ESP-NOW,
+/// whose frames anyone can forge, it now holds it 1 to 4 s.
+fn one_forged_message_during_the_proof(to_opener: bool) {
+    let air = FakeAir::new();
+    let (mut a, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    let room = if to_opener { "espnow-r4-proof-opener" } else { "espnow-r4-proof-accepter" };
+    a.join_room("pw-test", room);
+    b.join_room("pw-test", room);
+    assert!(until_accepted(&mut a, &mut b, &air, 15), "an ACCEPT");
+    let (accepter, opener, opener_id) = challenge_heard(&air).expect("the room's challenge, with the ACCEPT");
+    let (_, _, accepter_id) = overheard(&air).0[0];
+    // A chunk that is a whole message (first and last, with the counter the receiver takes next): kind 0, one byte.
+    let (from, to, id, seq, value) = match to_opener {
+        true => (accepter, opener, opener_id, 1, [0xc1u8, 0, 1]),
+        false => (opener, accepter, accepter_id, 0, [0xc0u8, 0, 1]),
+    };
+    let f = frame::Frame::Data { to: id, seq, first: true, last: true, total: 3, payload: &value };
+    air.inject(from, to, &f.encode());
+    let (t, mut ev) = (Instant::now(), Vec::new());
+    let linked = pump(&mut [&mut a, &mut b], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa));
+    let took = t.elapsed();
+    let to_whom = if to_opener { "opener" } else { "accepter" };
+    eprintln!("one forged message during the room proof, to the {to_whom}: linked {linked} after {took:?}");
+    assert!(overheard(&air).0.len() >= 2, "the forged message closed the connection: linked on a new one");
+    assert!(linked && took < Duration::from_secs(8), "linked again within seconds: {took:?}");
+}
+
+#[test]
+fn sec_one_forged_message_during_the_proof_to_the_opener_costs_seconds() {
+    one_forged_message_during_the_proof(true);
+}
+
+#[test]
+fn sec_one_forged_message_during_the_proof_to_the_accepter_costs_seconds() {
+    one_forged_message_during_the_proof(false);
+}

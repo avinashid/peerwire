@@ -33,13 +33,21 @@ and the commit that fixed it.
   of the 64 behind the receiver's new place as taken, so 4 data frames forged just past the window no longer make it
   drop the sender's next 64 real frames as copies, which on an idle link timed the link out; a forged move costs 4
   real frames at most (NB135-7).
+- ESP-NOW, from its security review's fourth round: one forged data frame during the room proof, or 32 on a proven
+  connection, no longer keeps two boards apart for a minute. A radio says whether anyone in range can forge a value on
+  its connections, `ble::Limits::forgeable` (new: a `Limits` written out field by field needs it), which
+  `espnow::EspNow` always sets and Bluetooth's limits don't; over such a radio a connection that closes for a fault of
+  its link (a message the room proof doesn't expect, a wrong answer or proof, 32 messages dropped), or that the other
+  end closes before the room is proven, holds its advert 1 to 4 s, not 60 s (NB135-8).
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert
   1 to 4 s, not 60 s, so the link comes back within seconds whichever end timed out first, while a room member that
-  keeps closing them makes its peer connect again every 1 to 4 s (NB135-I6). `RadioEvent::Dropped` is new: a close
-  the radio made for a cause that says nothing of the other end, after which the node connects again 1 to 4 s later
-  (NB135-5); a match on `RadioEvent` with no wildcard needs an arm for it.
+  keeps closing them makes its peer connect again every 1 to 4 s (NB135-I6); and a link whose radio connection closes
+  under it is dialled again over the next connection proven to reach its peer, at once (`Replaced`, then
+  `Connected`), not left on the closed one until it times out, 30 s on (NB135-I7). `RadioEvent::Dropped` is new: a
+  close the radio made for a cause that says nothing of the other end, after which the node connects again 1 to 4 s
+  later (NB135-5); a match on `RadioEvent` with no wildcard needs an arm for it.
 - `peerwire-esp`: feature `espnow`, the ESP32's ether, `espnow::EspNowEther` (`espnow::radio`): frames on the air one
   at a time from a thread of their own, each tried as many times as the radio asks, a send callback taken only for the
   frame on the air with its address (NB135-I1), ESP-NOW's peer table kept to the 16 addresses last sent to, none with
@@ -49,7 +57,7 @@ and the commit that fixed it.
   with `wifi::random_mac` from a random address drawn at boot, as ESP-NOW frames carry the sender's address in the
   clear; `wifi::connect` joins a network from there. Examples: `espnow_mesh`, boards
   linking over ESP-NOW alone, and `espnow_probe`, which measures two boards' round trips, loss and frames a second with
-  no access point, on the hotspot and with Bluetooth on (NB-135).
+  no access point, on one and with Bluetooth on (NB-135).
 - **Bluetooth LE** (NB-110, [Bluetooth](docs/concepts/bluetooth.md)): `peerwire` feature `ble` (its one dependency
   `log`) gives a node a radio, `Builder::bluetooth`: in a room it advertises, links with the members it hears with no
   network, and ranks the radio below every UDP path (`PathKind::Bluetooth`, not in `Policy::default()`, off under

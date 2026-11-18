@@ -4,7 +4,7 @@
 > This is the design of Peerwire over ESP-NOW (NB-135): boards linking with each other over Espressif's ESP-NOW
 > frames, with no Wi-Fi network and no Bluetooth. The connection logic is the `peerwire` feature `espnow`
 > (`espnow::Engine`, sans-IO, with host and fuzz tests); the ESP32 driver is `peerwire-esp` feature `espnow`, and its
-> `espnow_mesh` example links two boards. The protocol below has had its security review, in three rounds (what it
+> `espnow_mesh` example links two boards. The protocol below has had its security review, in four rounds (what it
 > found is [below](#forged-frames)). The probe (`espnow_probe`, NB-135) measured the radio on two boards first
 > (NB-138, [below](#limits)), and the defaults stand; the same two boards then ran a link for 5 minutes, once, from
 > before the review's second round (NB-139).
@@ -37,7 +37,7 @@ ESP-NOW frames go on the channel the Wi-Fi radio is on, so every board in a room
   network later stay on it, or channel 11 (`PW_ESPNOW_CHANNEL`).
 - **On a network:** the radio follows the access point's channel, and ESP-NOW goes with it (peers are added for "the
   channel the station is on"). Boards on different networks reach each other only if the networks share a channel.
-- **Scans:** a station that scans or joins hops across channels for a few seconds (joining the hotspot took 6.7 and
+- **Scans:** a station that scans or joins hops across channels for a few seconds (joining an access point took 6.7 and
   7.3 s on the NB-138 boards), and frames sent to it meanwhile aren't acknowledged; the radio tries each one 4 times
   and a connection survives 8 lost in a row, so a short scan costs some frames, not the connection.
 - **Interference:** ESP-NOW shares the channel with the networks on it; Bluetooth on the same chip time-shares the
@@ -98,6 +98,15 @@ end's MAC address, this end's id), and every frame on it carries the receiver's 
   the connection meanwhile, as that may be forged too: the connection closes (NB135-4). The radio reports it as
   `Dropped`, not `Disconnected`, as it says nothing of the other end, so the node connects again 1 to 4 s later, as
   after a refusal, though the room's challenge has mostly come by then (NB135-5). Later, one is ignored.
+- **Connecting again:** the end that connected holds the advert of a connection that closed before it connects to it
+  again, as over Bluetooth, but anyone in range can forge a value on an ESP-NOW connection, and the radio says so
+  (`Limits::forgeable`). So it holds it 1 to 4 s, as after a refusal, after any close one forged frame can cause: one
+  for a fault of the connection's link (a message the room proof doesn't expect, a wrong answer or proof, or 32 messages
+  dropped once proven), one the other end made before the room was proven (NB135-8), and one the radio dropped
+  (NB135-5); and after the close of a connection bound to a peer (NB135-I6). It holds none after its link timed out
+  (NB135-1), and a minute otherwise: after a connect that failed, say, or a room proof that stalled for 3 s once the
+  challenge came. A link whose connection closed under it moves to the next connection proven to reach its peer as soon
+  as there is one, with a new handshake, rather than waiting out its session's idle timeout (NB135-I7).
 
 `espnow::Settings` holds the numbers above (`Settings::DEFAULT`); the first board run (NB-138) kept them.
 
@@ -137,7 +146,7 @@ between (~0.4 ms), about 3.2 ms. One at a time, that is ~310 frames a second, ~7
 one way. At 54 Mbit/s the frames are 20 times shorter, and the waits between them dominate.
 
 **Measured (NB-138):** an ESP32-C3 and an ESP32 on channel 11, ESP-NOW v2 at both ends, 1 Mbit/s, Bluetooth off, with
-no access point, one board on the hotspot, or both. No ping was lost in 3,600 and no frame in 9,482 sent 16 at a
+no access point, one board on an access point, or both. No ping was lost in 3,600 and no frame in 9,482 sent 16 at a
 time. Round trips took 4 ms at 32 B, 7.5 ms at 250 B and 28 ms at 1,470 B (p50), 84 ms at most at p99, 141 ms at
 most. 241 to 305 frames of 250 B went a second (480 to 610 kbit/s), as above, and 57 to 71 of 1,470 B (670 to 840
 kbit/s). With Bluetooth LE advertising and scanning on the same chip, the p90 at 250 B and under grew to 24 to 48 ms
@@ -145,14 +154,14 @@ and 1,470 B round trips to 66 to 76 ms (p50), 1 frame in 120 was lost at 32 B, a
 C3's heap. At 54 Mbit/s (802.11g, per peer) the boards didn't link: the ESP32 heard the C3's first frame, and the C3
 never heard an answer in 120 s.
 
-**A link on boards (NB-139):** `espnow_mesh` on the same C3 and ESP32, on the hotspot's channel 11, built from before
-the review's second round, one run of 5 minutes. The link held throughout, no message was lost once it was up, and the
-node's round trips were 35 to 42 ms. A failed try to an absent address (250 B, 5 each) took 85.7 to 88.7 ms on the C3
-and 99.5 to 105.2 ms on the ESP32, so the driver's 200 ms wait for a send's verdict is ~1.9 times the longest. With the
-ESP32 not polling for 2 s while the C3 broadcast 128 frames of 531 B, its receive queue was full at 32 frames,
+**A link on boards (NB-139):** `espnow_mesh` on the same C3 and ESP32, on an access point's channel, 11, built from
+before the review's second round, one run of 5 minutes. The link held throughout, no message was lost once it was up,
+and the node's round trips were 35 to 42 ms. A failed try to an absent address (250 B, 5 each) took 85.7 to 88.7 ms on
+the C3 and 99.5 to 105.2 ms on the ESP32, so the driver's 200 ms wait for a send's verdict is ~1.9 times the longest.
+With the ESP32 not polling for 2 s while the C3 broadcast 128 frames of 531 B, its receive queue was full at 32 frames,
 13,250 B in all, 84 frames were dropped, its heap's low point was 145,032 B, and the link stayed up. The first link took
-~27 KB of heap: from 182,200 B free once joined to ~155,452 B on the C3, from 185,020 B to ~157,848 B on the ESP32.
-One run on two boards: 4 connections at once haven't run on boards.
+~27 KB of heap: from 182,200 B free once joined to ~155,452 B on the C3, from 185,020 B to ~157,848 B on the ESP32. One
+run on two boards: 4 connections at once haven't run on boards.
 
 ## What a listener on the radio sees
 
@@ -182,7 +191,7 @@ which could jam the channel anyway. What such an attacker can do, frame by frame
 | CLOSE | nothing, unless the attacker also keeps the other end's answer to the PROBE from arriving (jamming): then a close and a reconnect |
 | PROBE | a KEEPALIVE in answer, one per 100 ms per connection, and none while one waits for the air: one waiting at most (NB135-I5) |
 | KEEPALIVE | keeps a connection whose peer left open for as long as it keeps sending: the node closes it once its link times out and no proof of a room member has come over it for 60 s, as over Bluetooth |
-| DATA, in the window | a value for the node, which drops it (sealed, or not the room's); the real frame with its number is dropped as a copy, and the value it is part of, and so is the value being joined if the forged frame says it starts one: a value or two lost, which the reliable lane sends again. The real frames behind it are still taken (NB135-6) |
+| DATA, in the window | a value for the node; the real frame with its number is dropped as a copy, and the value it is part of, and so is the value being joined if the forged frame says it starts one: a value or two lost, which the reliable lane sends again. The real frames behind it are still taken (NB135-6). The value can be a whole message of the node's framing, and the connection's link takes it: before the room is proven, any message the proof doesn't expect closes the connection; once proven, one that fails its checks (sealed, or of a kind the link drops) is dropped and counted, and 32 close it. The node connects again 1 to 4 s later, as after any close one forged frame can cause, and a link on the connection moves to the new one at once (NB135-8, NB135-I7): one forged frame, or 32, for each reconnect, as jamming would cost |
 | DATA, further off | dropped; 4 in a row (ahead, or more than 64 behind) move the receiver to the last of them, with none of the 64 numbers behind it taken (NB135-7). The sender's real frames that land within those 64 are taken, and the one with its number is dropped; 4 further off move it back. Either way 4 real frames are lost at most, which the reliable lane sends again (NB135-1). A forger that goes on, one frame in the receiver's window after every 3 real ones, keeps that end out of step: its link times out and comes back on a new connection within seconds (NB135-I6) |
 | DATA cut short, or a part of another value | the value dropped: its parts don't add up to its length |
 | Anything from a group address, of another version or malformed | dropped |
@@ -192,10 +201,11 @@ the tests show, frame by frame, not a proof that no mix of frames can stall a co
 up. So the node has its own check too: when a link times out, the radio connections bound to its peer close, with no
 hold on the advert, and the next link comes over a new connection with new ids (NB135-1); the other end, if it made
 the connection, holds the advert only 1 to 4 s when it hears the close, as it does whenever a bound connection closes
-(NB135-I6), so the link is back within seconds whichever end timed out first. Connections, queues and buffers are
-capped above, and the parser is fuzzed.
+(NB135-I6), so the link is back within seconds whichever end timed out first; so it does after any close one forged
+frame can cause (NB135-8), and a link whose connection closed under it moves to the next one at once (NB135-I7).
+Connections, queues and buffers are capped above, and the parser is fuzzed.
 
-The security review of NB-135 (the [threat model](../project/threat-model.md)) found seven problems in three rounds,
+The security review of NB-135 (the [threat model](../project/threat-model.md)) found eight problems in four rounds,
 fixed since, each with a test that was its repro:
 
 - **NB135-1 (Medium):** four forged DATA frames far ahead, sent each way with ids overheard on the air, moved both
@@ -221,17 +231,27 @@ fixed since, each with a test that was its repro:
   which don't count towards the resync back: on an idle link about 64 s of keepalives, so the link timed out
   (**theoretical**). A resync, either way, now counts none of them as taken: the move costs the real frame of the
   forged number, and 4 real frames at most wherever it lands.
+- **NB135-8 (Low, round 4):** a DATA frame's value can be a whole message of the node's framing, which anyone who
+  overheard the ACCEPT can forge. One that the room proof doesn't expect closes the connection, and so do 32 dropped
+  on a proven one; the end that connected then held the advert a minute, as it did when the other end closed before
+  the proof. So one forged frame during the room proof kept two boards apart for a minute (60.3 and 60.7 s on
+  `FakeAir`, against 55 ms with none), and 32 on a live link did too. The radio now says its values can be forged
+  (`Limits::forgeable`), and the node holds the advert 1 to 4 s after such a close; Bluetooth keeps the minute.
 
-And two smaller ones: a PROBE was answered every 100 ms even with an answer still waiting for the air (NB135-I5: now
-one waits at most), and the end that made a connection held the advert a minute when the other end closed it as its
-link timed out (NB135-I6: a bound connection that closes now holds the advert 1 to 4 s, so a room member that keeps
-closing them makes its peer connect again every 1 to 4 s, which is accepted).
+And three smaller ones: a PROBE was answered every 100 ms even with an answer still waiting for the air (NB135-I5: now
+one waits at most); the end that made a connection held the advert a minute when the other end closed it as its link
+timed out (NB135-I6: a bound connection that closes now holds the advert 1 to 4 s, so a room member that keeps
+closing them makes its peer connect again every 1 to 4 s, which is accepted); and a link whose connection closed
+under it stayed on it until its session timed out, 30 s, so the next connection came within seconds but the link
+didn't (NB135-I7: it is now dialled again over the next connection that proves its peer, at once).
 
 What stays, as on any radio: an attacker in range can jam the channel, cut a connection by jamming the answer to a
 PROBE, and hold a dead connection open with forged KEEPALIVEs until the node's own rules close it. Forged DATA frames
 cost a connection a value or two each (4 frames for the 4 that move its numbers) if the forger then stops; one that
 goes on, one frame for every 3 real ones, keeps the connection's numbers out of step for as long as it does, so the
-link times out and comes back on a new connection within seconds, as jamming would. **The MAC address is a
+link times out and comes back on a new connection within seconds, as jamming would. One forged DATA frame during the
+room proof, or 32 once it is proven, close the connection, and the link is back on a new one within seconds (1.5 to
+6 s on `FakeAir`), as after a cut. **The MAC address is a
 residual, accepted (NB135-I3):** with `random_mac` a board is a new address on each boot, but one address for the
 whole boot, so a listener can tie a boot's adverts together, and a network the board joins sees it too; without it,
 the chip's own address follows the board for good.

@@ -12,8 +12,8 @@ keywords = ["esp32", "esp-idf", "embedded", "p2p", "iot"]
 categories = ["embedded", "network-programming"]
 rust-version = "1.88"
 include = [
-  "/src", "/examples", "/build.rs", "/README.md", "/sdkconfig.defaults", "/sdkconfig.ble", "/LICENSE-MIT",
-  "/LICENSE-APACHE",
+  "/src", "/examples", "/build.rs", "/README.md", "/sdkconfig.defaults", "/sdkconfig.defaults.esp32", "/sdkconfig.ble",
+  "/LICENSE-MIT", "/LICENSE-APACHE",
 ]
 
 # Not a member of the repo's workspace: it builds for the ESP32-C3 and ESP32 only, with their own toolchains (see README.md).

@@ -47,7 +47,8 @@ pub const BROADCAST: Mac = [0xff; 6];
 /// and 4 tries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
-    /// What the radio holds at once ([`Radio::limits`]).
+    /// What the radio holds at once ([`Radio::limits`]). The radio says its values can be forged
+    /// ([`Limits::forgeable`]) whatever this says.
     pub limits: Limits,
     /// The ATT MTU the node is told: it sends values of `mtu - 3` bytes at most (512 at most), which the radio splits
     /// into frames as long as the connection takes.
@@ -76,7 +77,14 @@ impl Settings {
     /// bytes; an advert every 500 ms; an OPEN every 500 ms for 10 s; a keepalive after 1 s of quiet, gone after 5 s
     /// heard nothing or 8 frames undelivered in a row; 4 tries of a frame, 2 to an address that never acknowledged.
     pub const DEFAULT: Settings = Settings {
-        limits: Limits { connections: 4, unbound: 2, centrals: 4, queue: 8, hs1_gap: Duration::from_secs(5) },
+        limits: Limits {
+            connections: 4,
+            unbound: 2,
+            centrals: 4,
+            queue: 8,
+            hs1_gap: Duration::from_secs(5),
+            forgeable: true,
+        },
         mtu: 515,
         advert_every: Duration::from_millis(500),
         open_every: Duration::from_millis(500),
@@ -253,8 +261,9 @@ impl<E: Ether> Radio for EspNow<E> {
         self.engine.poll_event()
     }
 
+    /// The settings' limits, with [`Limits::forgeable`] on: anyone in range can forge an ESP-NOW frame (NB135-8).
     fn limits(&self) -> Limits {
-        self.engine.settings().limits
+        Limits { forgeable: true, ..self.engine.settings().limits }
     }
 
     fn set_waker(&mut self, waker: Waker) {
