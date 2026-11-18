@@ -50,6 +50,15 @@ and the commit that fixed it.
   peer that the other end closes while this node's link to its peer goes nowhere else, hold the advert 1 to 4 s, not
   60 s, so frames forged with the numbers of the room proof, or 32 forged to the accepter of a standby, no longer keep
   two boards apart for a minute; a standby closed beside a link elsewhere keeps the minute (NB135-10).
+- ESP-NOW, from its security review's sixth round: OPENs forged from made-up addresses no longer keep boards from
+  linking (NB135-11). Over a radio whose values anyone in range can forge (`Limits::forgeable`), a central's
+  connection that hasn't proven the room, which such an OPEN makes, counts against none of the node's own connects,
+  which close the oldest such one if they need its slot, and makes way for a new central at any age, the oldest first,
+  not after 1 s; so one OPEN to each of two boards every 1.2 s, or two a second, no longer keeps them apart. And
+  `espnow::Engine` takes one OPEN over its limits and leaves it to the node, which makes way for it or closes it,
+  where it stayed silent, and never fails a connect of the node's own for its limits, so a node holding two bound
+  connections and two forged ones no longer keeps a newcomer out, whose connect failed after 10 s and held the advert
+  a minute. Bluetooth is unchanged.
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert

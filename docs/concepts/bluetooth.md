@@ -230,7 +230,7 @@ puts a link on.
 | Connections bound to no peer | 4; proven ones (standbys) leave one free: one that proves the room into the last closes the weakest other (unproven, then with no proven peer, then the oldest), so standbys can't lock newcomers out | 2 |
 | Time to prove the room and the peer's identity | 3 s, then the connection closes | same |
 | A connect of the peer's own | up within 12 s, or given up as a failed one; the driver fails it within 10 s | same |
-| A central's connection whose peer hasn't proven who it is | makes way, after 1 s, for a new central over the limits; a second one to a peer, at once | same |
+| A central's connection whose peer hasn't proven who it is | makes way, after 1 s, for a new central over the limits; a second one to a peer, at once. Over a radio anyone in range can write into ([ESP-NOW](espnow.md)'s), one that hasn't proven the room makes way at once, the oldest first (NB135-11) | same |
 | A proven connection bound to no peer | open while a signal proves a member at least every 60 s | same |
 | Distinct HS1s on an unbound connection | 1 per 10 s (a half-open handshake's life); its resends pass | same |
 | Distinct HS1s on unbound connections, across the radio | 4 at once, then one per 250 ms | 2, then one per 5 s (a C3 answers one in 156 ms: about 3% of it) |
@@ -246,9 +246,12 @@ counting no central whose peer hasn't proven who it is, nor a second one to a pe
 (one whose peer hasn't proven who it is, once it has had 1 s), so an advert that says it takes a central refuses one
 only within another's first second. A peer's own connects under way count against its own connects alone, never
 against a central or a connection that proves the room, as one that never completes can't make way: a device that
-stalls them can't keep centrals out. Linux takes one central at a time because BlueZ sends a notification to every
-subscribed central (BLE-R8). The addresses naming connections (`Hop::Ble`) aren't
-reused within a process before 2^24 (16.7 million) more connections have been made.
+stalls them can't keep centrals out. Over a radio whose values anyone in range can forge (`Limits::forgeable`,
+[ESP-NOW](espnow.md)'s), where anyone can also open a connection from a made-up address, a central's connection that
+hasn't proven the room counts against none of the peer's own connects, which close the oldest such one if they need
+its slot, and makes way for a new central at any age, the oldest first (NB135-11). Linux takes one central at a time
+because BlueZ sends a notification to every subscribed central (BLE-R8). The addresses naming connections
+(`Hop::Ble`) aren't reused within a process before 2^24 (16.7 million) more connections have been made.
 
 ## What a listener on the radio sees
 
