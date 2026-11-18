@@ -137,8 +137,11 @@ fn a_forged_close_closes_nothing() {
     assert!(got(&after[1], pa, b"after the forged close"));
 }
 
+/// The accepter, the opener's id and the accepter's id of each connection opened.
+type Accepts = Vec<(Mac, u64, u64)>;
+
 /// The connection ids (opener's, accepter's) and the last data number each end took, overheard on `air`.
-fn overheard(air: &FakeAir) -> (Vec<(Mac, u64, u64)>, HashMap<u64, u32>) {
+fn overheard(air: &FakeAir) -> (Accepts, HashMap<u64, u32>) {
     let heard = air.heard();
     let mut last: HashMap<u64, u32> = HashMap::new();
     for (_, _, f) in &heard {
