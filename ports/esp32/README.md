@@ -12,6 +12,8 @@ ESP32 (the chip in the ESP32-WROOM-32 module), under ESP-IDF: the unchanged
   signaling that also broadcasts, for routers that drop multicast.
 - With the `nostr` feature, `Board::node_with_nostr` joins rooms across the internet
   over a Nostr relay too.
+- With the `espnow` feature, `espnow::radio` gives a node a radio over ESP-NOW, so boards
+  in range link with each other with no network and no Bluetooth (NB-135).
 - `identity::load_or_create` keeps the node's identity in NVS across restarts. It's drawn
   on the chip, before Wi-Fi or Bluetooth is set up, and `identity::renew` makes the next
   boot draw a new one.
@@ -264,6 +266,28 @@ on both (before the name moved to flash, over nostr.mom), with
   The relay thread runs at the main task's priority, 1, not ESP-IDF's 5, which on the
   C3's one core could hold off the node's loop. The room is no longer fixed and public, the log
   escapes what members send, and the board forgets the address of a peer that left.
+
+## ESP-NOW (NB-135)
+
+Boards on the same Wi-Fi channel link over Espressif's ESP-NOW frames, with no access
+point: `espnow::radio` is a Bluetooth radio for the node (`Builder::bluetooth`), with
+adverts as broadcasts and connections emulated over unicast frames, so the room proof,
+the Noise handshake and the sealing are the node's own, as over Bluetooth. Wi-Fi must be
+started first, on no network (`wifi::start_on_channel`, or `wifi::start_on_channel_as`
+with `wifi::random_mac`, so the board's address changes at each boot) or on one, whose
+channel ESP-NOW then follows. The design, its limits and what a forged frame can do are
+in [ESP-NOW](https://avinashid.github.io/peerwire/docs/concepts/espnow).
+
+```sh
+FEATURES=espnow EXAMPLE=espnow_mesh ./build.sh   # two or more boards linking over ESP-NOW alone
+FEATURES=ble EXAMPLE=espnow_probe ./build.sh     # the radio measured: round trips, loss, frames a second
+```
+
+`espnow_mesh` joins room.sh's room ("esp32" if none) on the channel it hears wifi.sh's
+network on, or 11 (`PW_ESPNOW_CHANNEL`), sends each linked board a numbered message every
+second, and logs an `ESPNOW_MESH report` every 10 s. `espnow_probe` measures two boards
+with no access point, at 54 Mbit/s, with one or both on the hotspot and with Bluetooth on,
+and prints an `ESPNOW_RESULT` line for each mode and size. Neither has run on a board yet.
 
 ## What it would take to go further
 

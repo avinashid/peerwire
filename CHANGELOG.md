@@ -8,6 +8,23 @@ and the commit that fixed it.
 
 ## Unreleased: Rust crates
 
+- **ESP-NOW** (NB-135, [ESP-NOW](docs/concepts/espnow.md)): `peerwire` feature `espnow` (no dependency of its own)
+  makes a Bluetooth radio of Espressif's ESP-NOW frames, `espnow::EspNow`, for a platform's `espnow::Ether`, so ESP32
+  boards in range link with each other with no network and no Bluetooth, with the room proof, Noise IK and sealing
+  of the node's Bluetooth path unchanged. Adverts go out as broadcasts; connections are emulated with OPEN, ACCEPT,
+  KEEPALIVE, PROBE and CLOSE frames on 64-bit ids each end draws at random; values are split into numbered frames as
+  long as the shorter end takes (250 B, or 1,470 B with ESP-NOW v2 at both ends), each with the value's length, and
+  copies, stale frames and values missing a part are dropped. A connection is gone after 5 s with nothing heard on it
+  or 8 frames in a row undelivered; a CLOSE is taken only if the PROBE it sends goes unanswered, so a forged one closes
+  nothing. The timers and limits are in `espnow::Settings`; the engine is sans-IO (`espnow::Engine`), with host and
+  fuzz tests, and `espnow::FakeAir` (feature `testing`) has ESP-NOW in one process for tests. Not yet run on a board.
+- `peerwire-esp`: feature `espnow`, the ESP32's ether, `espnow::EspNowEther` (`espnow::radio`): frames on the air one
+  at a time from a thread of their own, each tried up to 4 times, and ESP-NOW's peer table kept to the 16 addresses
+  last sent to. `wifi::start_on_channel` starts Wi-Fi on a channel with no network, for ESP-NOW, and
+  `wifi::start_on_channel_as` with `wifi::random_mac` from a random address drawn at boot, as ESP-NOW frames carry
+  the sender's address in the clear; `wifi::connect` joins a network from there. Examples: `espnow_mesh`, boards
+  linking over ESP-NOW alone, and `espnow_probe`, which measures two boards' round trips, loss and frames a second with
+  no access point, on the hotspot and with Bluetooth on (NB-135).
 - **Bluetooth LE** (NB-110, [Bluetooth](docs/concepts/bluetooth.md)): `peerwire` feature `ble` (its one dependency
   `log`) gives a node a radio, `Builder::bluetooth`: in a room it advertises, links with the members it hears with no
   network, and ranks the radio below every UDP path (`PathKind::Bluetooth`, not in `Policy::default()`, off under
