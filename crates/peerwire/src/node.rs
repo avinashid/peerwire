@@ -1044,7 +1044,7 @@ impl Node {
                         b.send_room(conn, &hello);
                     }
                 }
-                Inbound::Identified { peer, via } => self.trav.radio_reaches(now, &self.ep, peer, via),
+                Inbound::Identified { peer, via } => self.trav.radio_reaches(now, &mut self.ep, peer, via),
                 Inbound::Closed(hop) => self.trav.forget_radio(&hop),
             }
         }
