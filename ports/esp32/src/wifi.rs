@@ -1,4 +1,5 @@
-//! Joining a Wi-Fi network as a station, and its signal strength.
+//! Joining a Wi-Fi network as a station, and its signal strength; or a station on a channel of its own and no network,
+//! for ESP-NOW.
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -45,23 +46,92 @@ fn join_until(
     password: &str,
     until: Option<Instant>,
 ) -> anyhow::Result<Wifi> {
-    // ESP-IDF's quarter-dBm.
-    const TX_POWER: [i8; 4] = [80, 60, 44, 34];
     let nvs = crate::nvs()?;
     let mut w = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop.clone())?;
-    w.set_configuration(&Configuration::Client(ClientConfiguration {
+    w.set_configuration(&client(ssid, password)?)?;
+    quiet();
+    w.start()?;
+    sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
+    if let Err(e) = attempts(&mut w, &sysloop, ssid, until) {
+        let _ = w.stop();
+        return Err(e);
+    }
+    w.wait_netif_up()?;
+    Ok(w)
+}
+
+/// Starts Wi-Fi as a station that joins no network, on `channel` (1 to 13), with modem sleep off: what ESP-NOW needs to
+/// reach boards on the same channel with no access point (NB-135). [`connect`] joins a network later, and the radio
+/// then follows that network's channel.
+pub fn start_on_channel(modem: Modem<'static>, sysloop: EspSystemEventLoop, channel: u8) -> anyhow::Result<Wifi> {
+    let nvs = crate::nvs()?;
+    let mut w = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop)?;
+    // An open network's auth method, or ESP-IDF warns that an empty password can't reach a protected one.
+    let none = ClientConfiguration { auth_method: AuthMethod::None, ..Default::default() };
+    w.set_configuration(&Configuration::Client(none))?;
+    quiet();
+    w.start()?;
+    sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
+    set_channel(channel)?;
+    info!("Wi-Fi started on channel {channel}, on no network");
+    Ok(w)
+}
+
+/// Joins the Wi-Fi network `ssid` from a station that [`start_on_channel`] started, as [`join`] does, giving up once
+/// `within` has passed with no attempt joined. Unlike [`join_within`], Wi-Fi stays on when it gives up, on no network:
+/// [`set_channel`] puts it back on its channel. While it joins, the radio scans other channels.
+pub fn connect(
+    w: &mut Wifi,
+    sysloop: &EspSystemEventLoop,
+    ssid: &str,
+    password: &str,
+    within: Duration,
+) -> anyhow::Result<()> {
+    w.set_configuration(&client(ssid, password)?)?;
+    attempts(w, sysloop, ssid, Some(Instant::now() + within))?;
+    w.wait_netif_up()?;
+    Ok(())
+}
+
+/// Moves a started station that is on no network to `channel` (1 to 13). ESP-IDF refuses while it is on one: the
+/// radio is on the network's channel then.
+pub fn set_channel(channel: u8) -> anyhow::Result<()> {
+    if !(1..=13).contains(&channel) {
+        return Err(anyhow!("channel {channel} isn't 1 to 13"));
+    }
+    sys::esp!(unsafe { sys::esp_wifi_set_channel(channel, sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE) })?;
+    Ok(())
+}
+
+/// The channel the radio is on, while Wi-Fi is started.
+pub fn channel() -> Option<u8> {
+    let (mut primary, mut second) = (0, 0);
+    (unsafe { sys::esp_wifi_get_channel(&mut primary, &mut second) } == sys::ESP_OK).then_some(primary)
+}
+
+/// A station's configuration for the network `ssid`.
+fn client(ssid: &str, password: &str) -> anyhow::Result<Configuration> {
+    Ok(Configuration::Client(ClientConfiguration {
         ssid: ssid.try_into().map_err(|_| anyhow!("SSID over 32 bytes"))?,
         password: password.try_into().map_err(|_| anyhow!("password over 64 bytes"))?,
         auth_method: if password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal },
         ..Default::default()
-    }))?;
-    // ESP-IDF's Wi-Fi library logs under its own tag the network's name and its access point's address on each join
-    // (`connected with …, bssid = …`), and those of other networks in range on some failures (NB110c-5). Its lines
-    // from error up only: each failed attempt is logged here, with its reason. Set after ESP-IDF's own start-up
-    // setting, so it holds.
+    }))
+}
+
+/// ESP-IDF's Wi-Fi library logs under its own tag the network's name and its access point's address on each join
+/// (`connected with …, bssid = …`), and those of other networks in range on some failures (NB110c-5). Its lines from
+/// error up only: each failed attempt is logged here, with its reason. Set after ESP-IDF's own start-up setting, so it
+/// holds.
+fn quiet() {
     unsafe { sys::esp_log_level_set(c"wifi".as_ptr(), sys::esp_log_level_t_ESP_LOG_ERROR) };
-    w.start()?;
-    sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
+}
+
+/// Joins `ssid`, which the started station `w` is set up for, retrying until it has, or until `until` has passed with
+/// no attempt joined (an attempt under way then still has its 10 s, and there is always one).
+fn attempts(w: &mut Wifi, sysloop: &EspSystemEventLoop, ssid: &str, until: Option<Instant>) -> anyhow::Result<()> {
+    // ESP-IDF's quarter-dBm.
+    const TX_POWER: [i8; 4] = [80, 60, 44, 34];
     let aps = w.scan()?;
     // The log names neither the network nor its access points: a log people share would tell where the board is.
     let seen: Vec<_> = aps.iter().filter(|ap| ap.ssid == ssid).collect();
@@ -84,7 +154,6 @@ fn join_until(
     })?;
     for attempt in 1.. {
         if attempt > 1 && until.is_some_and(|u| Instant::now() >= u) {
-            let _ = w.stop();
             return Err(anyhow!("not on the Wi-Fi network after {} attempts", attempt - 1));
         }
         let power = TX_POWER[(attempt - 1) % TX_POWER.len()];
@@ -116,8 +185,7 @@ fn join_until(
         let _ = w.wifi_mut().disconnect();
         std::thread::sleep(Duration::from_millis(500));
     }
-    w.wait_netif_up()?;
-    Ok(w)
+    Ok(())
 }
 
 /// The signal strength of the access point this station is joined to, in dBm; `None` when it isn't joined.
