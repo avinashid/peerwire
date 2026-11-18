@@ -74,7 +74,8 @@ fn run() -> anyhow::Result<()> {
     let chip = if cfg!(esp32) { "esp32" } else { "esp32c3" };
     let (node_n, wifi_record, room) = flash_config();
     let room = room.unwrap_or_else(|| ROOM.into());
-    info!("ESPNOW_MESH boot node={node_n} chip={chip} {}", heap());
+    let boot = heap();
+    info!("ESPNOW_MESH boot node={node_n} chip={chip} {boot}");
     // Before any radio: the identity and the address are drawn from the SAR ADC's noise.
     let identity = identity::load_or_create()?;
     let mac = if FIXED_MAC { None } else { Some(wifi::random_mac()?) };
@@ -104,8 +105,11 @@ fn run() -> anyhow::Result<()> {
     failed_tries();
     espnow::check::arm_rx_full();
     let (version, max_frame) = (radio.ether().version(), radio.max_frame());
+    // The boot line's facts again: a C3's USB console attaches seconds after boot, and misses that line.
     info!(
-        "ESPNOW_MESH up channel={channel} heard_ch={} mac={} espnow_ver={version} max_frame={max_frame} {}",
+        "ESPNOW_MESH up node={node_n} chip={chip} boot_free={} channel={channel} heard_ch={} mac={} \
+         espnow_ver={version} max_frame={max_frame} {}",
+        boot.free,
         heard.map_or(0, i32::from),
         if FIXED_MAC { "chip" } else { "random" },
         heap()
