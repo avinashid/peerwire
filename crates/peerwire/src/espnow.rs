@@ -128,7 +128,8 @@ pub struct Stats {
     /// (its start or a part was lost) and so were dropped.
     pub gaps: u64,
     pub orphans: u64,
-    /// Opens not taken (not advertising, or no room), and CLOSEs sent for accepts no open waits for.
+    /// Opens not taken (not advertising, or one over the limits already, which the node hasn't decided on), and CLOSEs
+    /// sent for accepts no open waits for.
     pub opens_refused: u64,
     pub refusals: u64,
     /// CLOSEs whose connection answered the probe that followed (forged, or stale), so stayed open.
