@@ -17,6 +17,15 @@ pub const MAX_ADVERT: usize = 31;
 pub const DATA_HEADER: usize = 19;
 /// The longest value a data frame is part of: GATT's longest attribute value, which the node's chunks never pass.
 pub const MAX_VALUE: usize = 512;
+/// The longest frame [`parse`] takes: a data frame of a whole 512-byte value. A platform's receive path drops any
+/// longer one, and any that doesn't start with our magic and version, before it copies or queues it (NB135-2).
+pub const LONGEST: usize = DATA_HEADER + MAX_VALUE;
+
+/// Whether `b` may be one of our frames, by its first bytes and its length alone: what a platform's receive callback
+/// checks before it copies a frame (NB135-2). Every frame [`parse`] takes passes.
+pub fn may_be_ours(b: &[u8]) -> bool {
+    b.len() > HEADER && b.len() <= LONGEST && b[..2] == MAGIC && b[2] == VERSION
+}
 
 const HEADER: usize = 4;
 const ADVERT: u8 = 1;
@@ -238,6 +247,12 @@ mod tests {
         let data =
             Frame::Data { to: 5, seq: 0, first: true, last: true, total: 300, payload: &[0; V1_FRAME - DATA_HEADER] };
         assert_eq!(data.len(), V1_FRAME, "a full v1 data frame");
+        let whole = Frame::Data { to: 5, seq: 0, first: true, last: true, total: 512, payload: &[0; MAX_VALUE] };
+        assert_eq!((whole.len(), may_be_ours(&whole.encode())), (LONGEST, true), "the longest frame parse takes");
+        let mut longer = whole.encode();
+        longer.push(0);
+        assert!(!may_be_ours(&longer) && parse(&longer).is_err());
+        assert!(!may_be_ours(b"PW\x02\x01x") && !may_be_ours(b"XW\x01\x01x") && !may_be_ours(b"PW\x01\x01"));
     }
 
     #[test]
@@ -302,6 +317,7 @@ mod tests {
                 if let Ok(f) = parse(b) {
                     parsed += 1;
                     assert_eq!(f.encode(), b, "{f:?} isn't canonical");
+                    assert!(may_be_ours(b), "the receive path's filter passes {f:?}");
                 }
             },
         );

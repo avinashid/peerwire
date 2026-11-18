@@ -39,12 +39,13 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail};
 use esp_idf_svc::sys;
 use log::{info, warn};
-use peerwire::espnow::{EspNow, Ether, Mac, PeerTable, Settings, Touch, TxQueue, BROADCAST, V1_FRAME, V2_FRAME};
+use peerwire::espnow::{frame, EspNow, Ether, Mac, PeerTable, Settings, Touch, TxQueue, BROADCAST, V1_FRAME, V2_FRAME};
 
 /// Frames waiting to go, or with a verdict the node hasn't taken.
 pub const TX_QUEUE: usize = 32;
-/// Frames received waiting for the node.
+/// Frames received waiting for the node at most, and their bytes: 16 KB, whoever sends (NB135-2).
 pub const RX_QUEUE: usize = 32;
+pub const RX_BYTES: usize = 16 * 1024;
 /// Entries this driver keeps in ESP-NOW's peer table (20 at most, with the broadcast address).
 pub const PEERS: usize = 16;
 /// A frame with no send callback after this long failed that try.
@@ -56,11 +57,20 @@ struct Shared {
     tx: Mutex<TxQueue>,
     /// Wakes the TX thread: a frame queued, or a verdict in.
     more: Condvar,
-    rx: Mutex<VecDeque<(Mac, Vec<u8>)>>,
+    rx: Mutex<Rx>,
     waker: Mutex<Option<Waker>>,
-    /// Frames dropped as the receive queue was full; tries esp_now_send refused.
+    /// Frames dropped as the receive queue was full, or as not ours (another app's, or too long to be ours); tries
+    /// esp_now_send refused.
     rx_dropped: AtomicU32,
+    not_ours: AtomicU32,
     refused: AtomicU32,
+}
+
+/// Frames received, waiting for the node, and their bytes.
+#[derive(Default)]
+struct Rx {
+    frames: VecDeque<(Mac, Vec<u8>)>,
+    bytes: usize,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -96,9 +106,10 @@ impl EspNowEther {
         let shared = SHARED.get_or_init(|| Shared {
             tx: Mutex::new(TxQueue::new(TX_QUEUE)),
             more: Condvar::new(),
-            rx: Mutex::new(VecDeque::new()),
+            rx: Mutex::new(Rx::default()),
             waker: Mutex::new(None),
             rx_dropped: AtomicU32::new(0),
+            not_ours: AtomicU32::new(0),
             refused: AtomicU32::new(0),
         });
         sys::esp!(unsafe { sys::esp_now_init() })?;
@@ -122,9 +133,9 @@ impl EspNowEther {
         self.version
     }
 
-    /// Frames dropped as the receive queue was full, and tries esp_now_send refused.
-    pub fn dropped(&self) -> (u32, u32) {
-        (self.shared.rx_dropped.load(Relaxed), self.shared.refused.load(Relaxed))
+    /// Frames dropped as the receive queue was full, frames dropped as not ours, and tries esp_now_send refused.
+    pub fn dropped(&self) -> (u32, u32, u32) {
+        dropped()
     }
 }
 
@@ -152,7 +163,10 @@ impl Ether for EspNowEther {
     }
 
     fn recv(&mut self) -> Option<(Mac, Vec<u8>)> {
-        lock(&self.shared.rx).pop_front()
+        let mut rx = lock(&self.shared.rx);
+        let (from, frame) = rx.frames.pop_front()?;
+        rx.bytes -= frame.len();
+        Some((from, frame))
     }
 
     fn max_frame(&self) -> usize {
@@ -164,9 +178,10 @@ impl Ether for EspNowEther {
     }
 }
 
-/// Frames dropped as the receive queue was full, and tries esp_now_send refused, since ESP-NOW started.
-pub fn dropped() -> (u32, u32) {
-    SHARED.get().map_or((0, 0), |s| (s.rx_dropped.load(Relaxed), s.refused.load(Relaxed)))
+/// Since ESP-NOW started: frames dropped as the receive queue was full, frames dropped as not ours, and tries
+/// esp_now_send refused.
+pub fn dropped() -> (u32, u32, u32) {
+    SHARED.get().map_or((0, 0, 0), |s| (s.rx_dropped.load(Relaxed), s.not_ours.load(Relaxed), s.refused.load(Relaxed)))
 }
 
 /// The radio for a node: [`EspNowEther::start`]`(v2)` under `peerwire::espnow::EspNow`.
@@ -217,24 +232,31 @@ fn transmit(shared: &'static Shared) {
     }
 }
 
-/// ESP-NOW's receive callback, on the Wi-Fi task: queues the frame for the node, or drops it if the queue is full.
+/// ESP-NOW's receive callback, on the Wi-Fi task: queues the frame for the node, or drops it. Anything that isn't
+/// one of ours by its first bytes and length goes before it is copied, and a frame that doesn't fit the queue's
+/// frames or bytes goes too, so anyone in range can make the board hold [`RX_BYTES`] at most (NB135-2).
 unsafe extern "C" fn on_recv(info: *const sys::esp_now_recv_info_t, data: *const u8, len: c_int) {
     let Some(shared) = SHARED.get() else { return };
-    if info.is_null() || data.is_null() || len <= 0 || len as usize > V2_FRAME {
+    if info.is_null() || data.is_null() || len <= 0 {
         return;
     }
     let src = unsafe { (*info).src_addr };
     if src.is_null() {
         return;
     }
+    let frame = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    if !frame::may_be_ours(frame) {
+        shared.not_ours.fetch_add(1, Relaxed);
+        return;
+    }
     let from: Mac = unsafe { *(src as *const Mac) };
-    let frame = unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec();
     let mut rx = lock(&shared.rx);
-    if rx.len() >= RX_QUEUE {
+    if rx.frames.len() >= RX_QUEUE || rx.bytes + frame.len() > RX_BYTES {
         shared.rx_dropped.fetch_add(1, Relaxed);
         return;
     }
-    rx.push_back((from, frame));
+    rx.bytes += frame.len();
+    rx.frames.push_back((from, frame.to_vec()));
     drop(rx);
     shared.wake();
 }

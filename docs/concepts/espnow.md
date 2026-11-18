@@ -117,8 +117,8 @@ peer, for at most 17 peers) isn't used: the node seals what crosses.
 | Values queued per connection | 8; then the node keeps its own until the radio takes them |
 | Distinct HS1s on unbound connections, across the radio | 2, then one per 5 s, as on a board's Bluetooth |
 | Frames waiting for the air (ESP32) | 32; each one's verdict comes back in order |
-| Frames received waiting for the node (ESP32) | 32; more are dropped, and counted |
-| Adverts and values waiting for the node | 16 and 128; more are dropped, and counted |
+| Frames received waiting for the node (ESP32) | 32 and 16 KB; more are dropped, and counted. A frame that isn't ours by its first bytes (`PW`, version 1) or is over 531 B (the longest the parser takes) is dropped before it is copied (NB135-2) |
+| Adverts and values waiting for the node | 16, and 128 values of 16 KB in all; more are dropped, and counted (NB135-2) |
 | Frames waiting in the engine for the ether | 256; of them, 4 of no connection and one refusal; more are dropped, and counted |
 | Refusals (a CLOSE for an ACCEPT nobody waits for) | one per 100 ms, one try |
 | Tries of a frame not acknowledged | 4; 2 to an address that never acknowledged one; 1 for a broadcast or a refusal |

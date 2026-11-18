@@ -19,7 +19,9 @@ pub const WINDOW: u32 = 64;
 pub const RESYNC_AFTER: u32 = 4;
 /// Events queued for the node at most: adverts, and values. Connections coming and going are never dropped.
 const MAX_SEEN_QUEUED: usize = 16;
+/// Values at most, and their bytes, so a node that doesn't poll holds 16 KB of them at most (NB135-2).
 const MAX_VALUES_QUEUED: usize = 128;
+const MAX_VALUE_BYTES: usize = 16 * 1024;
 /// Refusals (a CLOSE for an accept no open waits for) go at most this often, so a flood of frames from made-up
 /// addresses gets few answers.
 const REFUSE_GAP: Duration = Duration::from_millis(100);
@@ -158,6 +160,7 @@ pub struct Engine {
     events: VecDeque<RadioEvent>,
     seen_queued: usize,
     values_queued: usize,
+    value_bytes: usize,
     refused_at: Option<Instant>,
     stats: Stats,
 }
@@ -180,6 +183,7 @@ impl Engine {
             events: VecDeque::new(),
             seen_queued: 0,
             values_queued: 0,
+            value_bytes: 0,
             refused_at: None,
             stats: Stats::default(),
         }
@@ -483,11 +487,12 @@ impl Engine {
         }
         c.assembling = false;
         let value = std::mem::take(&mut c.partial);
-        if self.values_queued >= MAX_VALUES_QUEUED {
+        if self.values_queued >= MAX_VALUES_QUEUED || self.value_bytes + value.len() > MAX_VALUE_BYTES {
             self.stats.events_dropped += 1;
             return;
         }
         self.values_queued += 1;
+        self.value_bytes += value.len();
         self.stats.values_in += 1;
         self.events.push_back(RadioEvent::Value { conn, value });
     }
@@ -603,7 +608,10 @@ impl Engine {
         let e = self.events.pop_front()?;
         match e {
             RadioEvent::Seen { .. } => self.seen_queued -= 1,
-            RadioEvent::Value { .. } => self.values_queued -= 1,
+            RadioEvent::Value { ref value, .. } => {
+                self.values_queued -= 1;
+                self.value_bytes -= value.len();
+            }
             _ => {}
         }
         Some(e)
@@ -1352,6 +1360,21 @@ mod tests {
         assert_eq!(accept, Some((X, true, s.first_tries)));
     }
 
+    /// NB135-2: values waiting for a node that doesn't poll are capped in bytes (16 KB), not only in number.
+    #[test]
+    fn values_waiting_for_a_node_that_doesnt_poll_are_capped_in_bytes() {
+        let mut p = Pair::new(V2_FRAME, V2_FRAME);
+        let (ca, _) = p.link();
+        for i in 0..40u8 {
+            assert!(p.a.send(p.t, ca, &value(MAX_VALUE, i)));
+            p.shuttle();
+        }
+        assert_eq!(p.b.value_bytes, MAX_VALUE_BYTES, "32 values of 512 bytes");
+        assert_eq!(p.b.stats().events_dropped, 8);
+        assert_eq!(values(&mut p.b).len(), 32);
+        assert_eq!(p.b.value_bytes, 0);
+    }
+
     #[test]
     fn adverts_go_while_advertising_and_are_heard_while_scanning() {
         let mut p = Pair::new(V1_FRAME, V1_FRAME);
@@ -1424,6 +1447,7 @@ mod tests {
                 for e in [&p.a, &p.b] {
                     assert!(e.conns.len() <= limits.connections);
                     assert!(e.seen_queued <= MAX_SEEN_QUEUED && e.values_queued <= MAX_VALUES_QUEUED);
+                    assert!(e.value_bytes <= MAX_VALUE_BYTES);
                     assert!(e.conns.values().all(|c| c.partial.len() <= MAX_VALUE));
                     assert!(e.flight.len() <= MAX_FLIGHT);
                     assert!(e.events.len() <= MAX_SEEN_QUEUED + MAX_VALUES_QUEUED + 4 * limits.connections + 4);
