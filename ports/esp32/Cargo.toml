@@ -55,6 +55,12 @@ required-features = ["ble"]
 name = "nostr_led"
 required-features = ["nostr"]
 
+# ESP-NOW between two boards (NB-135): round trips, loss and frames a second with no access point, on one, and with
+# Bluetooth on: `FEATURES=ble EXAMPLE=espnow_probe ./build.sh`.
+[[example]]
+name = "espnow_probe"
+required-features = ["ble"]
+
 [profile.release]
 opt-level = "s"
 
