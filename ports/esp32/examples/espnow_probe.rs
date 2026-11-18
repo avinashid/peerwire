@@ -4,8 +4,9 @@
 //! Both boards run it. Each starts Wi-Fi as a station on no network (`wifi::start_on_channel`), on the channel it
 //! hears its hotspot on (wifi.sh's record in the last flash sector; channel 11 if it hears none), and broadcasts
 //! hellos until it hears the other board's: no addresses are typed in. Node 1 (the `PWN` record, as the mesh example
-//! reads it) initiates and node 2 answers; with no record, the board with the lower MAC initiates. Hellos and every
-//! other frame carry a group, a hash of room.sh's room, so two pairs of boards nearby keep apart.
+//! reads it) initiates and node 2 answers; with no record, the board with the lower MAC initiates. Every frame but a
+//! hello carries the run's group, a random number the initiator draws at boot and gives in its hellos, so two pairs of
+//! boards nearby keep apart, and nothing a listener could test a room's name against goes on the air (NB135-I4).
 //!
 //! In each mode the initiator measures, at 32, 128, 250 and (ESP-NOW v2 on both boards) 1470 B:
 //!
@@ -49,11 +50,9 @@ use peerwire_esp::heap;
 use peerwire_esp::peerwire::ble::{Radio, RadioEvent};
 use peerwire_esp::wifi::{self, Wifi};
 
-/// The config sector, as the mesh example reads it: b"PWN" and the node number at +0, wifi.sh's record at +0x40 and
-/// room.sh's at +0xC0.
+/// The config sector, as the mesh example reads it: b"PWN" and the node number at +0, wifi.sh's record at +0x40.
 const CFG_ADDR: u32 = 0x3F_F000;
 const WIFI_OFFSET: usize = 0x40;
-const ROOM_OFFSET: usize = 0xC0;
 /// The channel when the hotspot isn't heard: the hotspot's own on the NB-135 boards.
 const DEFAULT_CHANNEL: u8 = 11;
 
@@ -178,9 +177,13 @@ fn frame(kind: u8, mode: u8, group: u32, seq: u32, size: usize) -> Vec<u8> {
     f
 }
 
-/// The header of `data` if it is one of our frames in `group`.
+/// The header of `data` if it is one of our frames in `group`, or a hello (which carries group 0, and its sender's
+/// group in its body).
 fn parse(data: &[u8], group: u32) -> Option<Header> {
-    if data.len() < MIN_FRAME || data[..4] != MAGIC || data[6..10] != group.to_le_bytes() {
+    if data.len() < MIN_FRAME || data[..4] != MAGIC {
+        return None;
+    }
+    if data[6..10] != group.to_le_bytes() && !(data[4] == HELLO && data[6..10] == [0; 4]) {
         return None;
     }
     Some(Header { kind: data[4], mode: data[5], seq: u32::from_le_bytes(data[10..14].try_into().ok()?) })
@@ -201,11 +204,6 @@ fn pct(sorted: &[u32], p: usize) -> i64 {
     }
     let rank = (p * sorted.len()).div_ceil(100).max(1);
     i64::from(sorted[rank - 1])
-}
-
-/// FNV-1a: the group of a room's name.
-fn fnv(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(0x811c_9dc5, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
 }
 
 /// A frame from the radio, as the receive callback queues it for the main task.
@@ -400,21 +398,20 @@ fn tx_power() -> f32 {
     f32::from(p) / 4.0
 }
 
-/// What the last flash sector says: the node number, wifi.sh's network and room.sh's room.
+/// What the last flash sector says: the node number and wifi.sh's network.
 struct Config {
     node: Option<u8>,
     wifi: Option<(String, String)>,
-    room: Option<String>,
 }
 
 fn config() -> Config {
     let mut b = [0u8; 0x110];
     let r = unsafe { sys::esp_flash_read(std::ptr::null_mut(), b.as_mut_ptr().cast(), CFG_ADDR, b.len() as u32) };
     if r != sys::ESP_OK {
-        return Config { node: None, wifi: None, room: None };
+        return Config { node: None, wifi: None };
     }
     let node = (b[..3] == *b"PWN" && (1..=16).contains(&b[3])).then_some(b[3]);
-    Config { node, wifi: wifi_config(&b[WIFI_OFFSET..]), room: room_config(&b[ROOM_OFFSET..]) }
+    Config { node, wifi: wifi_config(&b[WIFI_OFFSET..]) }
 }
 
 /// wifi.sh's record: b"PWW", the SSID's length and the SSID, the password's length and the password.
@@ -424,13 +421,6 @@ fn wifi_config(b: &[u8]) -> Option<(String, String)> {
     let (&len, rest) = rest[ssid.len()..].split_first()?;
     let password = rest.get(..len as usize).filter(|_| len <= 64)?;
     Some((String::from_utf8(ssid.to_vec()).ok()?, String::from_utf8(password.to_vec()).ok()?))
-}
-
-/// room.sh's record: b"PWR", the name's length (1 to 64) and the name.
-fn room_config(b: &[u8]) -> Option<String> {
-    let (&len, rest) = b.strip_prefix(b"PWR")?.split_first()?;
-    let room = rest.get(..len as usize).filter(|_| (1..=64).contains(&len))?;
-    String::from_utf8(room.to_vec()).ok()
 }
 
 /// The frame codec and the percentiles, checked on the chip before any radio (so QEMU runs it too).
@@ -514,14 +504,20 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let chip = if cfg!(esp32) { "esp32" } else { "esp32c3" };
     let cfg = config();
-    let group = cfg.room.as_deref().map_or(0, |r| fnv(r.as_bytes()));
+    // The run's group: this board's own, or the initiator's once it hears its hello.
+    let group = loop {
+        let g = unsafe { sys::esp_random() };
+        if g != 0 {
+            break g;
+        }
+    };
     let cfg_role = match cfg.node {
         Some(1) => Some(Role::Initiator),
         Some(_) => Some(Role::Responder),
         None => None,
     };
     info!(
-        "ESPNOW_BOOT chip={chip} node={} role={} wifi_record={} group={group:08x} {}",
+        "ESPNOW_BOOT chip={chip} node={} role={} wifi_record={} {}",
         cfg.node.unwrap_or(0),
         cfg_role.map_or("by-mac", Role::name),
         if cfg.wifi.is_some() { "yes" } else { "no" },
@@ -614,13 +610,26 @@ impl Probe {
         frame(kind, self.mode as u8, self.group, self.seq, size)
     }
 
+    /// A hello: group 0 in its header, so any board takes it, and this board's group in its body.
     fn hello(&mut self, to: [u8; 6]) {
         let mut f = self.frame(HELLO, MIN_FRAME);
         let role = if self.peer.is_some() || self.cfg_role.is_some() { Some(self.role) } else { None };
         (f[HEADER], f[HEADER + 1], f[HEADER + 2], f[HEADER + 3]) =
             (Role::code(role), self.node, self.version, self.state());
         put_u32(&mut f, HEADER + 4, self.tag);
+        put_u32(&mut f, HEADER + 8, self.group);
+        put_u32(&mut f, 6, 0);
         let _ = send(&to, &f);
+    }
+
+    /// Takes the initiator's group from its hello.
+    fn take_group(&mut self, hello: &[u8]) {
+        let group = get_u32(hello, HEADER + 8);
+        if group != 0 && group != self.group {
+            self.group = group;
+            GROUP.store(group, Relaxed);
+            info!("ESPNOW_GROUP {group:08x}, the initiator's");
+        }
     }
 
     /// The next frame queued before `until`.
@@ -689,6 +698,9 @@ impl Probe {
                 (None, None) => Role::Responder,
             };
             self.role = role;
+            if role == Role::Responder {
+                self.take_group(&rx.data);
+            }
             self.adopt(rx.from, get_u32(&rx.data, HEADER + 4), rx.data[HEADER + 2]);
             self.hello(rx.from);
             info!("ESPNOW_ROLE {} after {} ms", role.name(), start.elapsed().as_millis());
@@ -839,6 +851,8 @@ impl Probe {
             if Instant::now() >= next {
                 next = Instant::now() + Duration::from_millis(250);
                 if let Some(peer) = self.peer {
+                    // The group, again: the responder takes nothing else until it has it.
+                    self.hello(peer.mac);
                     if m > 0 {
                         let mut f = self.frame(PHASE, MIN_FRAME);
                         f[HEADER] = m as u8;
@@ -1060,6 +1074,10 @@ impl Probe {
                     if Role::from_code(rx.data[HEADER]) == Some(Role::Responder) {
                         warn!("ESPNOW_CONFLICT another responder at ..:{}", mac_tail(&rx.from));
                         continue;
+                    }
+                    // Another pair's initiator nearby doesn't move this board to its group.
+                    if self.peer.is_none() || from_peer {
+                        self.take_group(&rx.data);
                     }
                     let tag = get_u32(&rx.data, HEADER + 4);
                     // Tag 0: taken up from a ping, before its hello.
