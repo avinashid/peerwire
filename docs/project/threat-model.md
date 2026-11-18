@@ -37,7 +37,7 @@ Status: pre-1.0, no external audit. See [SECURITY.md](../../SECURITY.md).
 | Signaling relay (Nostr, BroadcastChannel) | No | May read, drop, reorder, replay or inject any signaling message. Cannot forge a sealed payload or impersonate a PeerId. |
 | The LAN, for `LanSignaling` | No | Every device on the link, and every program on the machine, hears each frame and can send its own, with no relay to pace it. The same limits as a relay: cannot open or forge a sealed payload. See [LAN signalling](#lan-signalling-lansignaling-nb-064--nb64-1nb64-6). |
 | Devices in Bluetooth range, for a node with a radio (`ble`, NB-110) | No | Hear every advert and can follow any connection, as nothing is paired; may connect, replay adverts, relay between two connections, jam or cut a link. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [Bluetooth LE](#bluetooth-le-nb-110-nb-112--nb110-1nb110-12-nb112-1), [on the ESP32](#bluetooth-le-on-the-esp32-nb-110c--nb110c-1nb110c-5), [BlueZ connects](#bluez-connects-and-the-scan-nb-116--nb116-1nb116-4) and [devices the BlueZ driver connects to](#devices-the-bluez-driver-connects-to-nb110-13--nb110-13nb110-16). |
-| Devices in radio range on a board's Wi-Fi channel, for a node with the ESP-NOW radio (`espnow`, NB-135) | No | Hear every frame with its sender's MAC address and a connection's ids and numbers; may send any frame from any address, replay adverts, jam. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [ESP-NOW](#esp-now-nb-135--nb135-1nb135-7). |
+| Devices in radio range on a board's Wi-Fi channel, for a node with the ESP-NOW radio (`espnow`, NB-135) | No | Hear every frame with its sender's MAC address and a connection's ids and numbers; may send any frame from any address, replay adverts, jam. Cannot prove the room without its name, open a sealed signal or forge a Noise packet. See [ESP-NOW](#esp-now-nb-135--nb135-1nb135-8). |
 | Peer relay (`FWD`/`RELAYED`) | No | Sees only ciphertext; rate-limited; forwards only to already-connected peers. |
 | NAT / on-path network | No | Noise authenticates the endpoints; cannot MITM. Can drop/delay. |
 | A TURN server the app lists (`iceServers`; in Rust `turn_servers`, NB-099) | Partially | The app's choice, not ours. Sees our address, the peers' addresses, sizes and timing, never a payload; can drop or delay; picks the relayed address we offer. Under `Privacy::RelayOnly` with `Turn` in the policy (NB-101) the peers see its relayed address instead of ours. See [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) and [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1). |
@@ -210,13 +210,15 @@ release of each.
 | NB128-1 (Low) | **Fixed** by `db35a13` before NB-128 merged, so never on main: a relay that wrote a long message as several frames, each within the cap, still closed a board's socket on one oversize event someone sent to its tag, since tungstenite summed the frames; `Oversize` now holds a message in pieces, at most the cap's worth, and passes it on as one frame or drops it, reviewed 2026-11-14, [Relay counters and oversize messages](#relay-counters-and-oversize-messages-nb-131-nb-128--nb128-1) |
 | NB133-1 (Low) | **Fixed** by `573de0a` (NB-133, merged `962b1e2`): a board's set of seen event ids, sized for 128, regrew to 512 buckets, one block of about 8.7 KB, under the new ids anyone who knows its tag can send, on a heap that page churn had split; a board now searches its fixed queue of 128 and keeps no set, reviewed 2026-11-18, [A board's heap under page churn](#a-boards-heap-under-page-churn-nb-133--nb133-1-nb133-2) |
 | NB133-2 (Low) | Open: a full TLS record of 16 KiB from the relay, and some over 12 KiB, make rustls's read buffer take one block of 32 KiB on a board while it comes in, beside up to 16 KiB for its plaintext; anyone who knows a board's tag can have the relay send one, and after NB-133's fixes the board's largest free block bottomed at 36,864 bytes, so a little more fragmentation turns one large event into a restart, same section |
-| NB135-1 (Medium) | **Fixed** by `b3c6b30` before NB-135 merged, so never on main: four data frames forged with a connection's overheard ids, 2^30 numbers ahead, moved its receiver past every real frame to come, and the node kept the radio connection, so the link stayed cut; the receiver now moves back after 4 real frames far off either way, and a link that times out closes the radio connections bound to its peer, reviewed 2026-11-18, [ESP-NOW](#esp-now-nb-135--nb135-1nb135-7) |
+| NB135-1 (Medium) | **Fixed** by `b3c6b30` before NB-135 merged, so never on main: four data frames forged with a connection's overheard ids, 2^30 numbers ahead, moved its receiver past every real frame to come, and the node kept the radio connection, so the link stayed cut; the receiver now moves back after 4 real frames far off either way, and a link that times out closes the radio connections bound to its peer, reviewed 2026-11-18, [ESP-NOW](#esp-now-nb-135--nb135-1nb135-8) |
 | NB135-2, NB135-3, NB135-4 (Low) | **Fixed** by `d801a7b`, `98ae614` and `de46e82` before NB-135 merged, so never on main: the receive callback drops what can't be ours before any copy and holds 16 KB at most; frames to an address that never acknowledged get 2 tries, a refusal 1, and the engine's queue is capped; a second ACCEPT within 3 s of the first closes the connection whatever came, reviewed 2026-11-18, same section |
 | NB135-5, NB135-6 (Low) | **Fixed** by `8d22cdb` and `f524b0c` before NB-135 merged, so never on main: one forged ACCEPT after the room's challenge cost the opener the 60 s hold, so one a minute kept two boards apart; one forged data frame 64 ahead dropped the next 63 real frames and timed out an idle link; the node now connects again 1 to 4 s after such a close, and a receiver takes each of the 64 numbers behind the highest once, reviewed 2026-11-19, same section |
-| NB135-7 (Low) | Open: four data frames forged just past the window move the receiver there, and the resync counts the 64 numbers behind as taken, so the sender's next 64 real frames are dropped as copies, which on an idle link times it out; reported on NB-140 at `f18e649`, same section |
+| NB135-7 (Low) | **Fixed** by `241b3b0` before NB-135 merged, so never on main: four data frames forged just past the window moved the receiver there and counted the 64 numbers behind as taken, so the sender's next 64 real frames were dropped as copies, which on an idle link timed it out; a resync now counts none of them, reviewed 2026-11-19, same section |
+| NB135-8 (Low) | Open: one forged data frame carrying a message of the node's framing during the room proof, or 32 on a live link, makes the node close the connection and hold the advert 60 s, so one a minute keeps a pair off the radio; reported on NB-141 at `d12d56e`, same section |
 | NB135-I1, NB135-I2, NB135-I4 (Info) | **Fixed** by `a9bd9f8`, `8180579` and `303cab6` before NB-135 merged, so never on main: a send verdict is taken only for the frame on the air with its address; the peer table keeps addresses with frames waiting; `espnow_probe` draws a random group, reviewed 2026-11-18, same section |
 | NB135-I3 (Info) | Accepted for v1 by the lead on 2026-11-18: a random MAC lasts the boot, tying its adverts together; the port's example of the radio draws one (`37f3f45`), same section |
 | NB135-I5, NB135-I6 (Info) | **Fixed** by `2261418` and `0c2723d` before NB-135 merged, so never on main: a connection has one answer to PROBEs waiting at most; a bound connection that closes holds its advert 1 to 4 s, whichever end timed out, a cost the lead accepted for v1 on 2026-11-19, reviewed 2026-11-19, same section |
+| NB135-I7 (Info) | Open: a bound radio connection that closes under a live session leaves the session on it until it times out, 30 s by default, though the radio connects again within seconds; reported on NB-141 at `d12d56e`, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -6684,7 +6686,7 @@ largest block is below what a record needs, with a margin, so churn can't push i
 
 **Status: open** (Low), reported on NB-133 at `962b1e2`.
 
-### ESP-NOW (NB-135) — NB135-1…NB135-7
+### ESP-NOW (NB-135) — NB135-1…NB135-8
 
 NB-135 puts a radio of another kind under the node's Bluetooth path: `peerwire` feature
 `espnow` makes a `ble::Radio` of Espressif's ESP-NOW frames, so ESP32 boards on one
@@ -6697,12 +6699,15 @@ unchanged: the room advert and its proof, Noise IK, sealed signals and datagrams
 and `wifi::random_mac`. Reviewed on 2026-11-18 by reading `962b1e2..6382fdf`
 (`pz/NB-135`, not merged) against the node's Bluetooth path. A scratch copy ran the
 review's own tests of the engine and of two nodes on `espnow::FakeAir` (NB135-1,
-NB135-3, NB135-4); no board has run the radio yet (NB-138, NB-139), so its timings below
-are **theoretical**. Re-checked the same day by reading the fixes, `6382fdf..0263102`; a
-scratch copy of `0263102` ran the re-check's tests of the engine and of two nodes
-(NB135-5, NB135-6, NB135-I5, NB135-I6). Re-checked again on 2026-11-19 by reading
-`0263102..f18e649`; a scratch copy of `f18e649` ran the third round's tests of the
-engine and of two nodes (NB135-7).
+NB135-3, NB135-4); no board had run the radio then, so the timings computed below are
+**theoretical**; one run on two boards has since given the board checks (NB-139).
+Re-checked the same day by reading the fixes, `6382fdf..0263102`; a scratch copy of
+`0263102` ran the re-check's tests of the engine and of two nodes (NB135-5, NB135-6,
+NB135-I5, NB135-I6). Re-checked again on 2026-11-19 by reading `0263102..f18e649`; a
+scratch copy of `f18e649` ran the third round's tests of the engine and of two nodes
+(NB135-7). Re-checked a fourth time on 2026-11-19 by reading `f18e649..d12d56e`; a
+scratch copy of `d12d56e` ran the fourth round's tests of two nodes (NB135-8, NB135-I7),
+and two changes to the resync's line against the engine's tests (NB135-7).
 
 **Who is in range.** Anyone in radio range of a board on its channel hears every ESP-NOW
 frame, with its sender's MAC address, a connection's ids and numbers, sizes and timing,
@@ -6712,7 +6717,7 @@ out stale frames and anyone not listening, not a listener. Such a device can't p
 room, open a sealed signal or forge a Noise packet, and it can jam the channel, so the
 radio's task is narrower: a forged frame may cost a reconnect or some frames, as jamming
 would, but mustn't hang a link, grow a board's memory or cost the board more than the
-frame. NB135-1 to NB135-7 are where it did.
+frame. NB135-1 to NB135-8 are where it did.
 
 **What holds.**
 
@@ -6737,11 +6742,13 @@ frame. NB135-1 to NB135-7 are where it did.
   took, and one up to 64 behind that it hasn't taken, once each, as DTLS's anti-replay
   window does, so a forged frame in the window costs the real frame with its number and
   the value it is part of (NB135-6). One further ahead, or more than 64 behind, is
-  dropped, and 4 in a row move the receiver to them, from where the sender's next 4 real
-  frames move it back (NB135-1), unless the 4 land just past the window (NB135-7). Real
-  frames replayed from further back move it the same way, and the value of the fourth
-  reaches the node as a copy, where the session's replay window drops a sealed packet it
-  has seen.
+  dropped, and 4 in a row move the receiver to the last of them, with none of the 64
+  behind it taken (NB135-7), so wherever they land the sender's real frames cost 4 at
+  most before it is back in step (NB135-1). A move lets a copy of a frame taken before
+  it be taken again. The numbers authenticate nothing, so a forger could resend an
+  overheard value under a fresh number in the window anyway; above the radio the room
+  proof's state and the signals' rising numbers drop a replayed message, and the
+  session's replay window a sealed packet it has seen.
 - **KEEPALIVE.** Forged ones keep open a connection whose peer has gone until the node's
   own rule closes it, as over Bluetooth: one bound to no peer, once no member's proof
   has come over it for 60 s (`UNBOUND_FOR`).
@@ -6771,11 +6778,18 @@ within a boot it ties together the adverts whose `n` and tag change every 15 min
 and a network the board joins sees it (NB135-I3). The adverts say what they say over
 Bluetooth; a connection shows its ids, sizes and timing, not its contents.
 
-**Board checks owed (NB-138, NB-139).** How long a try to an address that never
-acknowledges takes (NB135-3); the free heap and largest block of a board linked over
-ESP-NOW, and with its receive queue full (NB135-2). `03b9d5a` makes the `espnow_mesh`
-example log both, on `ESPNOW_CHECK` lines, for NB-139's run (`db08c33` arms the heap
-check there alone, as it runs on the Wi-Fi task); until a board runs it they stay owed.
+**Board checks (NB-139).** How long a try to an address that never acknowledges takes
+(NB135-3); the free heap and largest block of a board with its receive queue full
+(NB135-2). `03b9d5a` makes the `espnow_mesh` example log both on `ESPNOW_CHECK` lines
+(`db08c33` arms the heap check there alone, as it runs on the Wi-Fi task): built for two
+boards as the [ESP-NOW](../concepts/espnow.md) page shows, each sends five frames to an
+address no radio has at boot, and 30 s after the first link node 1 broadcasts 128 frames
+of 531 bytes while node 2 doesn't poll for 2 s. One 5-minute run on one ESP32-C3 and one
+ESP32, built from before the review's second round, so one pair of boards once: a failed
+try took 85.7 to 88.7 ms on the C3 and 99.5 to 105.2 ms on the ESP32, about 2.5 times
+the 37 ms NB135-3 assumed; the ESP32's full receive queue held 32 frames, 13,250 bytes,
+its heap's low point was 145,032 bytes with a largest free block of 110,592, and the
+link stayed up. Four connections at once, and the fixes since, haven't run on boards.
 
 **NB135-1 — Four forged data frames each way black-hole a link (Medium).** At `6382fdf`
 a receiver takes a data frame up to 64 numbers past the last one, drops one behind it as
@@ -6833,8 +6847,8 @@ room before the copy; and bound both queues in bytes.
 version or is over 531 bytes (`frame::may_be_ours`) before any copy, and one that
 doesn't fit the queue's 32 frames and 16 KB, so a full queue holds 16 KB at most; the
 engine's values for the node are capped at 16 KB too. `fuzz_frames` checks that every
-frame that parses passes the filter. The heap of a board with its receive queue full is
-still owed (above).
+frame that parses passes the filter. On a board the full queue held 13,250 bytes, with
+145,032 free (NB-139, above).
 
 **NB135-3 — Frames to addresses that never answer can hold the board's one sender
 (Low).** The ESP32's ether puts one frame on the air at a time and tries a unicast frame
@@ -6861,7 +6875,13 @@ frame to an address that has never acknowledged one once or twice.
 (the radio's own acknowledgement), 2 before, and a refusal or a broadcast 1; the
 engine's queue holds 256 frames at most, 4 of no connection and one refusal. The
 review's repro, inverted, is a test: one refusal waits and the rest go. The answers to
-forged PROBEs aren't capped per connection (NB135-I5).
+forged PROBEs weren't capped per connection (NB135-I5). A failed try took about 0.1 s on
+NB-139's boards, not 37 ms (above), so what a forger can queue ahead of a real frame
+holds the air about 3.3 s at most (**theoretical**: beside one real connection, 3 opened
+from made-up addresses, each with an ACCEPT, the challenge, a KEEPALIVE and a PROBE
+waiting, 2 tries each, and 4 frames of no connection, a refusal with 1 try and 3 with 2,
+at 105 ms a try), under the 5 s with nothing heard after which a connection closes:
+links slow, and stay up.
 
 **NB135-4 — A forged ACCEPT and one data frame beat the real ACCEPT with no jamming
 (Low).** An opener takes the first ACCEPT for its OPEN; a second with another id before
@@ -6932,8 +6952,8 @@ value's assembly then follows the next frame expected, not the highest taken.
 took and takes each once, and joins a value's parts by the number of the next part,
 apart from the highest taken, so a forged frame in the window costs the real frame with
 its number and the value it is part of. The re-check's repros, inverted, are tests: one
-forged frame to either end of an idle link loses no link. A resync still counts the 64
-numbers behind its frame as taken (NB135-7).
+forged frame to either end of an idle link loses no link. At `f524b0c` a resync still
+counted the 64 numbers behind its frame as taken (NB135-7).
 
 **NB135-7 — Four forged frames just past the window time out an idle link (Low).** Found
 in the third round, reading `f524b0c`'s resync beside its bitmap. After 4 data frames in
@@ -6958,7 +6978,38 @@ of two nodes still passed. A copy of a frame taken before an earlier jump can th
 taken again, as after any resync, and the session's replay window drops a sealed packet
 it has seen.
 
-**Status: open** (Low), reported on NB-140 at `f18e649`.
+**Status: fixed** by `241b3b0` before NB-135 merged, so never on main, reviewed
+2026-11-19: a resync, either way, counts none of the 64 numbers behind its frame as
+taken, so a forged move costs at most 4 real frames wherever it lands. The round's
+repros, inverted, are tests, one of which tries every place from 65 to 136 ahead, and
+from 1 to 136 after a move back. Counting the 64 as taken after a move back alone fails
+it, as the fourth round tried, and so does the old line. A copy of a frame taken before
+a move can be taken again, as the window's bullet above says.
+
+**NB135-8 — One forged message during the room proof keeps a pair apart for 60 s
+(Low).** Found in the fourth round, reading what the node does with a forged data
+frame's value; it was there at `6382fdf`, where this review held that the node just
+drops one. A value is a chunk of the node's Bluetooth framing, and a forged chunk can be
+a whole message. The connection's link closes on a message the room proof doesn't
+expect, or a wrong answer or proof, and on a proven link after 32 messages it drops
+(`MAX_DROPS`). The node closes such a connection holding its advert for 60 s
+(`RECONNECT_HOLD`) at the end that connected to it, and that end holds it as long when
+the other closes before the proof; only the end with the smaller advert number connects,
+so the pair has no connection over the radio for a minute. Over Bluetooth a third party
+can't easily put values into a connection; over ESP-NOW anyone in range who overhears an
+ACCEPT can. It is NB135-5's lever again, through the link: one frame a minute keeps two
+boards from linking over the radio, and 32 cut a live link for as long. Repro: the
+fourth round's tests of two nodes on `espnow::FakeAir` with the node's default timers.
+One forged data frame, a whole message of a kind the proof doesn't expect, to either end
+once the challenge is on the air: the pair links again only after the hold, where with
+no forged frame it links at once. 32 forged messages to the end that connected, on a
+live link: no radio connection for the hold. Fix: over a radio whose frames anyone can
+forge, a close for a fault of the link holds the advert only 1 to 4 s, as NB135-5's
+`Dropped` does, both when this end closes and when the other closes before the proof;
+Bluetooth keeps the minute. The ESP-NOW page's row for forged data in the window says
+the node drops the value, and should change with it.
+
+**Status: open** (Low), reported on NB-141 at `d12d56e`.
 
 **NB135-I1 — A late send verdict is taken for the next frame (Info).** The ether takes a
 frame with no send callback within 200 ms as a failed try and puts the next on the air,
@@ -7039,9 +7090,24 @@ end, holds that advert only 1 to 4 s, so the link comes back within seconds whic
 end timed out, over Bluetooth too, as the code is the node's. The re-check's repro,
 inverted, is a test. Its cost is **accepted** for v1 by the lead on 2026-11-19: a room
 member that keeps closing the bound connections a peer makes to it makes that peer
-connect again every 1 to 4 s. Anyone else closes a bound connection only by jamming, by
-NB135-5's race, after which the hold is 1 to 4 s already, or by putting it out of step
-until its link times out (NB135-7).
+connect again every 1 to 4 s. Anyone else closes a bound connection by jamming, by
+putting it out of step until its link times out, or with 32 forged messages (NB135-8);
+while its session is alive, the link then waits for the session to time out (NB135-I7).
+
+**NB135-I7 — A bound connection that closes under a live session holds the link until
+the session times out (Info).** When a radio connection closes, the node drops it from
+the traversal's radio paths, but the session keeps its path over it until the session's
+idle timeout, 30 s by default (`Config`), though the radio connects again within seconds
+(NB135-I6). So whatever closes a bound connection while its session is alive costs the
+link about that timeout: NB135-8's 32 messages to the end that accepted, a forged CLOSE
+with the PROBE's answer jammed, or, over Bluetooth, a connection the radio drops. Repro:
+the fourth round's test of two nodes, 32 forged messages to the accepter of a live link:
+the radio connected again within seconds, and the link came back when the session timed
+out. Fix, for the lead to weigh: end the session's path when the bound connection under
+it closes, so the next proven connection carries a new handshake at once; or say in the
+docs that a link comes back within seconds once it has timed out.
+
+**Status: open** (Info), reported on NB-141 at `d12d56e`.
 
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
@@ -7849,9 +7915,9 @@ mappings that carry over and are already handled in Peerwire:
   channel sees and can do: the board's MAC address, the chip's own unless a random one
   is drawn at boot, which then ties a boot's adverts together (NB135-I3, accepted); the
   ids, sizes and timing of its connections; and jamming or cutting them: a frame for
-  each reconnect keeps a pair off the radio (NB135-5), 4 now and then time out an idle
-  link (NB135-7, open), and one for every 3 real frames keeps one direction out of step
-  while they go on. A link over ESP-NOW proves nothing about distance either.
+  each reconnect keeps a pair off the radio (NB135-5), one a minute while NB135-8 is
+  open, and one for every 3 real frames keeps one direction out of step while they go
+  on. A link over ESP-NOW proves nothing about distance either.
 - Signalling rests on public relays we don't run: one that drops our events without a
   word hides members that share no other working relay, and only `peerwire doctor` and
   Rust's `relay_stats` (NB-131) name it ([NB-130](#default-nostr-relays-nb-130)).
