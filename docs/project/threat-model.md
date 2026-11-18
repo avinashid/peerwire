@@ -7149,17 +7149,18 @@ to other peers, its radio is full: it stays silent to the next OPEN before the n
 make way, so the opener's connect fails after 10 s and holds the advert a minute (read
 from the code, not run). None of this takes jamming or an overheard id, only the boards'
 addresses from their adverts. Repro: the sixth round's test of two nodes on
-`espnow::FakeAir` with the node's default timers, a debug build: an OPEN from a new
-made-up address to each board every 1.2 s, 70 in all, and the pair hasn't linked after
-40 s, where with none it links in 56 ms. Fix: over a radio whose values can be forged, a
-connection a central made that hasn't proven the room shouldn't keep this end from
-connecting: count only proven ones against the unbound slots when connecting, and close
-the weakest of the others if the radio needs the room. Have the radio leave the choice
-to the node when it is full (take the OPEN, and let the node make way or close it), or
-hold a failed connect 1 to 4 s. A forger who keeps both slots under 1 s old, with two
-OPENs a second, still keeps out a central that connects to the board, so let a newcomer
-displace one that hasn't proven the room however young: keeping it out then takes OPENs
-faster than a room proof's round trip, which holds the air as jamming does.
+`espnow::FakeAir` with the node's default timers, in a debug build and in the gate's: an
+OPEN from a new made-up address to each board every 1.2 s, 70 in all, and the pair
+hasn't linked after 40 s, where with none it links in 16 to 56 ms. Fix: over a radio
+whose values can be forged, a connection a central made that hasn't proven the room
+shouldn't keep this end from connecting: count only proven ones against the unbound
+slots when connecting, and close the weakest of the others if the radio needs the room.
+Have the radio leave the choice to the node when it is full (take the OPEN, and let the
+node make way or close it), or hold a failed connect 1 to 4 s. A forger who keeps both
+slots under 1 s old, with two OPENs a second, still keeps out a central that connects to
+the board, so let a newcomer displace one that hasn't proven the room however young:
+keeping it out then takes OPENs faster than a room proof's round trip, which holds the
+air as jamming does.
 
 **Status: open** (Low), reported on NB-144 at `8bd4a0f`.
 
