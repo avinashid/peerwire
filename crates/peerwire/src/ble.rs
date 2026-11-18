@@ -55,10 +55,12 @@ pub struct Limits {
     /// at four times that rate, as a check costs about a quarter of what answering a handshake does.
     pub hs1_gap: Duration,
     /// Anyone in range can forge a value on a connection, with what it overheard: ESP-NOW's frames aren't
-    /// authenticated (`espnow::EspNow` sets it, whatever its settings say). A connection that closes for a fault of its
-    /// link then holds the advert only 1 to 4 s, not a minute, as one forged value can cause it: a message the room
-    /// proof doesn't expect, a wrong answer or proof, 32 messages dropped once proven; and so does one the other end
-    /// closes before the room is proven (NB135-8). Off for Bluetooth, where no third party writes into a connection.
+    /// authenticated (`espnow::EspNow` sets it, whatever its settings say). Datagrams then go sealed under the link
+    /// key, as signals do, and one that doesn't open is dropped before it takes anything, uncounted (NB135-9). A
+    /// connection that closes for a fault of its link holds the advert only 1 to 4 s, not a minute, as one forged
+    /// value can cause it: a message the room proof doesn't expect, a wrong answer or proof, 32 messages dropped once
+    /// proven; and so does one the other end closes before the room is proven (NB135-8). Off for Bluetooth, where no
+    /// third party writes into a connection.
     pub forgeable: bool,
 }
 
@@ -362,6 +364,8 @@ pub(crate) struct Ble {
     hs1s: Bucket,
     /// Identity proofs checked, across the radio.
     checks: Bucket,
+    /// Sealed datagrams dropped as forged or copies, across the radio ([`Link::forged`]).
+    forged: u64,
     out: VecDeque<Inbound>,
 }
 
@@ -390,6 +394,7 @@ impl Ble {
             adverts: Bucket::default(),
             hs1s: Bucket::default(),
             checks: Bucket::default(),
+            forged: 0,
             out: VecDeque::new(),
         }
     }
@@ -668,10 +673,15 @@ impl Ble {
         OsRng.fill_bytes(&mut challenge);
         let central = device.is_some();
         // The peripheral's link sends its challenge at once; the central's answers the one that comes with its own.
-        let link = match central {
+        let mut link = match central {
             true => Link::central(key, challenge, mtu, self.limits.queue, now),
             false => Link::peripheral(key, challenge, mtu, self.limits.queue, now),
         };
+        // Over a radio anyone can write into, datagrams are sealed as signals are, so a forged one takes no HS1 slot
+        // nor any budget (NB135-9).
+        if self.limits.forgeable {
+            link.seal_datagrams();
+        }
         let c = Conn {
             hop: Hop::Ble(at),
             made: self.next_hop,
@@ -700,7 +710,10 @@ impl Ble {
     /// a room (only connections bound to a peer stay open then), only its closing is acted on.
     fn on_value(&mut self, now: Instant, ep: &mut Endpoint<Hop<SocketAddr>>, conn: ConnId, value: &[u8]) {
         let Some(c) = self.conns.get_mut(&conn) else { return };
-        match (c.link.push(now, value), self.room) {
+        let forged = c.link.forged();
+        let input = c.link.push(now, value);
+        self.forged += c.link.forged() - forged;
+        match (input, self.room) {
             (Input::Close(why), _) => self.fault(conn, why),
             (_, None) | (Input::Nothing, _) => {}
             (Input::Proven, _) => self.proven(now, conn),
@@ -1012,6 +1025,12 @@ impl Ble {
     pub(crate) fn counts(&self) -> (usize, usize, usize) {
         let proven = self.conns.values().filter(|c| c.proven()).count();
         (self.conns.len(), proven, self.conns.values().filter(|c| c.bound.is_some()).count())
+    }
+
+    /// Sealed datagrams dropped as forged or copies, across the radio (for tests).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn forged(&self) -> u64 {
+        self.forged
     }
 }
 
@@ -2555,6 +2574,41 @@ mod tests {
         let jitter = Duration::from_millis(u64::from(REFUSED_JITTER_MS));
         let seconds = REFUSED_HOLD..REFUSED_HOLD + jitter;
         assert!(holds.iter().all(|(_, h)| seconds.contains(h)), "1 to 4 s: {holds:?}");
+    }
+
+    /// NB135-9: an HS1 on a proven connection no peer is bound to yet, as a datagram as it is. Whether it took the
+    /// connection's HS1 slot, and the sealed datagrams the node dropped as forged.
+    fn a_plain_hs1(limits: Limits) -> (bool, u64) {
+        let key = ble_key("app", "room");
+        let air = FakeAir::new(23);
+        let t = Instant::from_millis(1);
+        let (mut node, mut ep) = lone(&air, limits, 1, t);
+        let mut yp = air.radio(Limits::DESKTOP);
+        yp.advertise(Some(&advert(&key, u32::MAX, false)));
+        let (conn, mut tx) = serve(&mut yp, &mut node, &mut ep, t, &id(2));
+        let mut dialler = Endpoint::<u32>::new(&id(2), Config::default(), [2; 32]);
+        dialler.connect(t, 1, id(1).peer_id()).unwrap();
+        let hs1 = dialler.poll_transmit(t).unwrap().payload;
+        assert!(hs1_id(&hs1).is_some());
+        tx.split(&[&[KIND_DATAGRAM][..], &hs1].concat(), 23, |v| yp.send(conn, v));
+        node.poll(t, &mut ep);
+        let c = node.conns.values().next().expect("still open");
+        (c.hs1.is_some(), node.forged)
+    }
+
+    /// NB135-9: over Bluetooth a datagram goes as it is, and an HS1 on an unbound connection takes its slot, as ever.
+    #[test]
+    fn an_hs1_over_bluetooth_takes_its_slot_as_before() {
+        assert_eq!(a_plain_hs1(Limits::DESKTOP), (true, 0));
+    }
+
+    /// NB135-9 (the security review's finding): over a radio whose values anyone can forge, a datagram as it is, such
+    /// as an HS1 forged with the ids overheard, took the slot of a connection just proven and the radio's budget, and
+    /// the real handshake was dropped for 10 s. Datagrams there are sealed: one that isn't is dropped by the link,
+    /// uncounted, and takes nothing.
+    #[test]
+    fn sec_a_forged_hs1_over_a_forgeable_radio_takes_no_slot() {
+        assert_eq!(a_plain_hs1(Limits { forgeable: true, ..Limits::DESKTOP }), (false, 1));
     }
 
     /// NB-114: why a node doesn't connect to an advert of its room, which it logs once a `SEEN_FOR` for each advert.
