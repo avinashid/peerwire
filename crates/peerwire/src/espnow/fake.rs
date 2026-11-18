@@ -16,6 +16,7 @@ const HEARD: usize = 1024;
 /// and tries again, as a real one does) and `ack_loss` arrive but go unacknowledged (so the receiver gets the try
 /// again). Frames can be overheard ([`heard`](FakeAir::heard)) and forged ([`inject`](FakeAir::inject)).
 #[derive(Clone)]
+#[doc(hidden)]
 pub struct FakeAir(Arc<Mutex<Air>>);
 
 struct Air {
@@ -133,6 +134,7 @@ impl FakeAir {
 }
 
 /// A station on a [`FakeAir`].
+#[doc(hidden)]
 pub struct FakeEther {
     air: FakeAir,
     me: Mac,

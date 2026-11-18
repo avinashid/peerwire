@@ -9,7 +9,7 @@
 //! [`PathKind::Bluetooth`](crate::PathKind::Bluetooth) below every UDP path.
 //!
 //! A platform gives the radio its ESP-NOW as an [`Ether`]; `peerwire-esp` has the ESP32's. The connection logic is
-//! sans-IO ([`Engine`]), and [`FakeAir`] (feature `testing`) has ethers in one process for tests.
+//! sans-IO ([`Engine`]), and `FakeAir` (feature `testing`) has ethers in one process for tests.
 //!
 //! Like every carrier, ESP-NOW is untrusted, and its frames aren't authenticated: anyone in range can forge one from
 //! any address. A forged frame can close a connection or lose some of its frames, as jamming the channel would, and
@@ -22,7 +22,7 @@ mod ether;
 mod fake;
 pub mod frame;
 
-pub use engine::{device_of, mac_of, Engine, MAX_VALUE, RESYNC_AFTER, WINDOW};
+pub use engine::{device_of, mac_of, Engine, CLOSE_CHECK, MAX_VALUE, RESYNC_AFTER, WINDOW};
 pub use ether::{Ether, PeerTable, Touch, TxQueue};
 #[cfg(any(test, feature = "testing"))]
 pub use fake::{FakeAir, FakeEther};
@@ -30,6 +30,7 @@ pub use frame::{V1_FRAME, V2_FRAME};
 
 use crate::ble::{ConnId, DeviceId, Limits, Radio, RadioEvent};
 use rand_core::{OsRng, RngCore};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
@@ -112,6 +113,8 @@ pub struct Stats {
     pub refusals: u64,
     /// CLOSEs whose connection answered the probe that followed (forged, or stale), so stayed open.
     pub closes_denied: u64,
+    /// Connections closed by a second ACCEPT with another id before any data came: one of the two was forged.
+    pub accept_conflicts: u64,
     /// Connections closed by the other end (a CLOSE, and no answer to the probe), gone quiet, or failing.
     pub closed_by_peer: u64,
     pub closed_quiet: u64,
@@ -129,6 +132,17 @@ pub struct Stats {
 pub struct EspNow<E: Ether> {
     engine: Engine,
     ether: E,
+    watch: Watch,
+}
+
+/// A radio's [`Stats`] as of its last poll, readable once the node owns the radio ([`EspNow::watch`]).
+#[derive(Clone, Debug, Default)]
+pub struct Watch(Arc<Mutex<Stats>>);
+
+impl Watch {
+    pub fn stats(&self) -> Stats {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl<E: Ether> EspNow<E> {
@@ -143,11 +157,16 @@ impl<E: Ether> EspNow<E> {
     /// peer's.
     pub fn with_seed(ether: E, settings: Settings, seed: [u8; 32]) -> EspNow<E> {
         let engine = Engine::new(settings, ether.max_frame(), seed, Instant::now());
-        EspNow { engine, ether }
+        EspNow { engine, ether, watch: Watch::default() }
     }
 
     pub fn stats(&self) -> Stats {
         self.engine.stats()
+    }
+
+    /// The radio's stats from wherever the node is: take it before the node takes the radio.
+    pub fn watch(&self) -> Watch {
+        self.watch.clone()
     }
 
     /// The longest frame this end sends and takes.
@@ -182,6 +201,7 @@ impl<E: Ether> EspNow<E> {
             }
             self.engine.commit(now);
         }
+        *self.watch.0.lock().unwrap_or_else(PoisonError::into_inner) = self.engine.stats();
     }
 }
 

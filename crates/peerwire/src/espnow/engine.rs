@@ -76,6 +76,8 @@ struct Conn {
     rx_last: u32,
     /// Data frames in a row further than [`WINDOW`] ahead.
     ahead: u32,
+    /// Whether a data frame came on it: before one, a second ACCEPT with another id closes it.
+    took_data: bool,
     /// A value whose first frame came and whose last hasn't, and how long its frames say it is.
     partial: Vec<u8>,
     assembling: bool,
@@ -374,9 +376,14 @@ impl Engine {
         let (mtu, max_frame) = (self.settings.mtu, self.max_frame);
         let Some(c) = self.conns.get_mut(&conn) else { return };
         if c.open() {
-            // The same accept again is the other end alive; another is forged or stale, and ignored.
+            // The same accept again is the other end alive. Another, before any data came, means one of the two was
+            // forged (it won the race, and this end sends to its id), and which can't be told: the connection closes
+            // at once, before the room's challenge comes, and the node connects again. After data came, it is ignored.
             if c.theirs == theirs {
                 self.live(now, mac, to);
+            } else if !c.took_data {
+                self.stats.accept_conflicts += 1;
+                self.close(conn);
             } else {
                 self.stats.unknown += 1;
             }
@@ -400,6 +407,7 @@ impl Engine {
             return;
         }
         let Some(c) = self.conns.get_mut(&conn) else { return };
+        c.took_data = true;
         // Where it falls: the last one again, or behind it; in the window; or further ahead.
         let d = seq.wrapping_sub(c.rx_last);
         if d == 0 || d > 1 << 31 {
@@ -622,6 +630,7 @@ impl Engine {
             tx_seq: 0,
             rx_last: u32::MAX,
             ahead: 0,
+            took_data: false,
             partial: Vec::new(),
             assembling: false,
             total: 0,
@@ -969,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forged_accept_ends_within_two_timeouts() {
+    fn a_forged_accept_that_wins_the_race_closes_the_connection_when_the_real_one_comes() {
         let mut p = Pair::new(V1_FRAME, V1_FRAME);
         p.b.advertise(p.t, Some(&ADVERT));
         p.a.connect(p.t, device_of(B));
@@ -979,25 +988,49 @@ mod tests {
         let Ok(Frame::Open { from: a_id, .. }) = frame::parse(&p.wire[0].2) else { panic!() };
         p.a.handle(p.t, B, &Frame::Accept { to: a_id, from: 0x1234, rx_max: 250 }.encode());
         let Some(RadioEvent::Connected { conn: ca, .. }) = p.a.poll_event() else { panic!("a took the forged one") };
+        // The real accept: before any data, so the connection closes at once, and the node connects again.
         let real = p.wire.iter().find(|(from, _, _)| *from == B).map(|w| w.2.clone()).unwrap();
         p.a.handle(p.t, B, &real);
-        assert!(events(&mut p.a).is_empty(), "the real accept comes too late, and is ignored");
-        assert!(p.a.send(p.t, ca, b"lost"));
-        p.shuttle();
-        assert!(values(&mut p.b).is_empty(), "a sends to the forged id");
+        assert_eq!(gone(&mut p.a), [RadioEvent::Disconnected { conn: ca }]);
+        assert_eq!(p.a.stats().accept_conflicts, 1);
+        // b's end hears nothing from a's: gone after its timeout.
+        for _ in 0..5 {
+            p.later(ms(1_000));
+            p.shuttle();
+        }
+        assert_eq!(gone(&mut p.b), [RadioEvent::Disconnected { conn: cb }]);
+        // If the real accept never comes (jammed), a sends to the forged id: b hears nothing valid and closes after
+        // its timeout, and a, which heard b's keepalives till then, a timeout after the last.
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        p.b.advertise(p.t, Some(&ADVERT));
+        p.a.connect(p.t, device_of(B));
+        p.shuttle_with(|from, _, _| from == A);
+        let Some(RadioEvent::Connected { conn: cb, .. }) = p.b.poll_event() else { panic!() };
+        let Ok(Frame::Open { from: a_id, .. }) = frame::parse(&p.wire[0].2) else { panic!() };
+        p.a.handle(p.t, B, &Frame::Accept { to: a_id, from: 0x1234, rx_max: 250 }.encode());
+        let Some(RadioEvent::Connected { conn: ca, .. }) = p.a.poll_event() else { panic!() };
         let (mut a_gone, mut b_gone) = (None, None);
         for s in 1..=12 {
             p.later(ms(1_000));
-            p.shuttle();
+            p.shuttle_with(|from, _, f| from == A || !matches!(frame::parse(f), Ok(Frame::Accept { .. })));
             for (e, at, conn) in [(&mut p.a, &mut a_gone, ca), (&mut p.b, &mut b_gone, cb)] {
                 if gone(e).contains(&RadioEvent::Disconnected { conn }) {
                     *at = Some(s);
                 }
             }
         }
-        // b hears nothing valid from a, and closes after its timeout; a heard b's keepalives till then, and closes a
-        // timeout after the last.
         assert_eq!((b_gone, a_gone), (Some(5), Some(9)));
+        // A second accept with another id after data came is ignored: forged, as the data shows the first was real.
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        let (ca, cb) = p.link();
+        let (a_id, _) = ids(&p);
+        assert!(p.b.send(p.t, cb, b"data"));
+        p.shuttle();
+        p.a.handle(p.t, B, &Frame::Accept { to: a_id, from: 0x1234, rx_max: 250 }.encode());
+        assert!(gone(&mut p.a).is_empty());
+        assert!(p.a.send(p.t, ca, b"still up"));
+        p.shuttle();
+        assert_eq!(values(&mut p.b), [b"still up".to_vec()]);
     }
 
     #[test]
