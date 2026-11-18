@@ -17,7 +17,8 @@ and the commit that fixed it.
   copies, stale frames and values missing a part are dropped. A connection is gone after 5 s with nothing heard on it
   or 8 frames in a row undelivered; a CLOSE is taken only if the PROBE it sends goes unanswered, so a forged one closes
   nothing. The timers and limits are in `espnow::Settings`; the engine is sans-IO (`espnow::Engine`), with host and
-  fuzz tests, and `espnow::FakeAir` (feature `testing`) has ESP-NOW in one process for tests. Not yet run on a board.
+  fuzz tests, and `espnow::FakeAir` (feature `testing`) has ESP-NOW in one process for tests.
+  Two boards ran a link over it for 5 minutes, once (NB-139).
 - ESP-NOW, from its security review: four forged data frames far ahead no longer black-hole a link, as 4 frames in a
   row far behind move the receiver back too (NB135-1); a second ACCEPT with another id within 3 s of the first closes
   the connection, whatever came on it (NB135-4); frames to an address that never acknowledged one get 2 tries, a

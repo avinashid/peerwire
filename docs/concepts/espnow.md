@@ -5,8 +5,9 @@
 > frames, with no Wi-Fi network and no Bluetooth. The connection logic is the `peerwire` feature `espnow`
 > (`espnow::Engine`, sans-IO, with host and fuzz tests); the ESP32 driver is `peerwire-esp` feature `espnow`, and its
 > `espnow_mesh` example links two boards. The protocol below has had its security review, in three rounds (what it
-> found is [below](#forged-frames)), but no board has run it yet. The probe (`espnow_probe`, NB-135) measured the
-> radio on two boards first (NB-138, [below](#limits)), and the defaults stand.
+> found is [below](#forged-frames)). The probe (`espnow_probe`, NB-135) measured the radio on two boards first
+> (NB-138, [below](#limits)), and the defaults stand; the same two boards then ran a link for 5 minutes, once, from
+> before the review's second round (NB-139).
 
 Boards near each other link over ESP-NOW when they share no network: two ESP32 boards in a field, say, or a board
 whose Wi-Fi network is down. ESP-NOW is a connectionless link layer of Espressif's: the chip's Wi-Fi radio sends a
@@ -144,6 +145,15 @@ and 1,470 B round trips to 66 to 76 ms (p50), 1 frame in 120 was lost at 32 B, a
 C3's heap. At 54 Mbit/s (802.11g, per peer) the boards didn't link: the ESP32 heard the C3's first frame, and the C3
 never heard an answer in 120 s.
 
+**A link on boards (NB-139):** `espnow_mesh` on the same C3 and ESP32, on the hotspot's channel 11, built from before
+the review's second round, one run of 5 minutes. The link held throughout, no message was lost once it was up, and the
+node's round trips were 35 to 42 ms. A failed try to an absent address (250 B, 5 each) took 85.7 to 88.7 ms on the C3
+and 99.5 to 105.2 ms on the ESP32, so the driver's 200 ms wait for a send's verdict is ~1.9 times the longest. With the
+ESP32 not polling for 2 s while the C3 broadcast 128 frames of 531 B, its receive queue was full at 32 frames,
+13,250 B in all, 84 frames were dropped, its heap's low point was 145,032 B, and the link stayed up. The first link took
+~27 KB of heap: from 182,200 B free once joined to ~155,452 B on the C3, from 185,020 B to ~157,848 B on the ESP32.
+One run on two boards: 4 connections at once haven't run on boards.
+
 ## What a listener on the radio sees
 
 - **The address:** every ESP-NOW frame carries its sender's MAC address in the clear. The chip's own (Espressif's
@@ -250,5 +260,6 @@ CHIP=esp32 FEATURES=espnow EXAMPLE=espnow_mesh ./build.sh
 - **The rate:** frames go at ESP-NOW's default 1 Mbit/s, which carried 670 to 840 kbit/s on the NB-138 boards. At 54
   Mbit/s per peer (`esp_now_set_peer_rate_config`) they didn't link; a faster rate needs a way back to 1 Mbit/s, as
   a rate one end can't hear leaves a connection silent until it times out.
-- **A link on boards:** the probe kept the frame size, the rate and the timers (NB-138); `espnow_mesh` on boards is
-  to show the heap per link, the receive queue full, and the time a failed try holds the air.
+- **More on boards:** the probe kept the frame size, the rate and the timers (NB-138), and one run of `espnow_mesh`
+  showed a link's heap, the receive queue full and the time a failed try holds the air (NB-139), from before the
+  review's second round; 4 connections at once, and the fixes since, haven't run on boards.
