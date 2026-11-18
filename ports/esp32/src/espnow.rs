@@ -143,7 +143,12 @@ impl EspNowEther {
 
 impl Ether for EspNowEther {
     fn send(&mut self, to: Mac, frame: &[u8], tries: u8) -> bool {
-        if let Touch::Add { evict } = self.peers.touch(to) {
+        // Never evicting an address with frames still waiting, whose tries would fail at once (NB135-I2).
+        let touch = {
+            let tx = lock(&self.shared.tx);
+            self.peers.touch_with(to, |m| tx.has(*m))
+        };
+        if let Touch::Add { evict } = touch {
             if let Some(old) = evict {
                 unsafe { sys::esp_now_del_peer(old.as_ptr()) };
             }

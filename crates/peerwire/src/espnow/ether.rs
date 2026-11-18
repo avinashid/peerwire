@@ -142,6 +142,13 @@ impl PeerTable {
 
     /// `mac` is about to be sent to: in the table already, or what to add and evict.
     pub fn touch(&mut self, mac: Mac) -> Touch {
+        self.touch_with(mac, |_| false)
+    }
+
+    /// [`touch`](Self::touch), never evicting an address `busy` says still has frames waiting, whose tries would
+    /// then fail at once (NB135-I2): the least lately used of the others goes. With none of them, nothing goes, and
+    /// the table holds one more than its size (ESP-NOW's own holds 20).
+    pub fn touch_with(&mut self, mac: Mac, busy: impl Fn(&Mac) -> bool) -> Touch {
         if mac == BROADCAST {
             return Touch::Present;
         }
@@ -150,7 +157,8 @@ impl PeerTable {
             self.macs.push(m);
             return Touch::Present;
         }
-        let evict = (self.macs.len() >= self.cap).then(|| self.macs.remove(0));
+        let idle = self.macs.iter().position(|m| !busy(m));
+        let evict = idle.filter(|_| self.macs.len() >= self.cap).map(|i| self.macs.remove(i));
         self.macs.push(mac);
         Touch::Add { evict }
     }
@@ -229,5 +237,10 @@ mod tests {
         assert_eq!(p.len(), 2);
         p.forget(c);
         assert_eq!(p.touch(B), Touch::Add { evict: None });
+        // NB135-I2: an address with frames waiting stays; the next least lately used goes, or none.
+        let d = [2, 0, 0, 0, 0, 4];
+        assert_eq!(p.touch_with(d, |m| *m == A), Touch::Add { evict: Some(B) }, "A is busy: B goes");
+        assert_eq!(p.touch_with(c, |_| true), Touch::Add { evict: None }, "all busy: none goes");
+        assert_eq!(p.len(), 3);
     }
 }

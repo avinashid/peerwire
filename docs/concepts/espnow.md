@@ -106,7 +106,7 @@ OPEN), so a frame to an absent address holds the air for two tries, not four; a 
 last frame is acknowledged, and a connection whose frames fail 8 times in a row is gone.
 
 ESP-NOW sends a unicast frame only to an address in its peer table, of 20 at most: the driver keeps the 16 it sent to
-most lately (`espnow::PeerTable`) and drops the oldest for a new one. ESP-NOW's own encryption (CCMP with a key per
+most lately (`espnow::PeerTable`) and drops the oldest with no frame waiting for a new one (NB135-I2). ESP-NOW's own encryption (CCMP with a key per
 peer, for at most 17 peers) isn't used: the node seals what crosses.
 
 ## Limits
