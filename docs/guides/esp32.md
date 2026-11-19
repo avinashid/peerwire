@@ -189,6 +189,11 @@ versions, how to install them, and every result in detail.
   takes the time from the first room member that links ([Bluetooth](../concepts/bluetooth.md), NB-119).
 - **One relay.** The board uses one Nostr relay, as each costs a thread and a TLS session, so peers elsewhere must use
   that relay too. If it is down, only the LAN is left.
+- **Four pages at once.** Over the relay a board links with 4 pages at once (pipes, `PathKind::Signaling`): each costs
+  it 3 to 5 KB of heap, and with 4 linked its largest free block bottomed at 36.9 KB (NB-133), little more than the
+  32 KiB a 16 KiB TLS record can take. A fifth page's dial is held, and links as soon as one of the 4 leaves, or once
+  a page closed without a goodbye has been silent for 20 s; a page that is there is never pushed out, so while 4 stay
+  open a fifth gives up after its 15 s (NB-136). The LED page says goodbye when it stops.
 - **Wi-Fi.** Only 2.4 GHz networks, as on any ESP32. The emulator's numbers above don't include the Wi-Fi driver's
   heap; the board's do.
 - **Other chips.** The ESP32-S3 should build the same way with Espressif's Rust fork, but hasn't been tried.

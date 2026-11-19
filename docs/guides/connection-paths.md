@@ -141,7 +141,9 @@ way: links stay up, and the node says hello on the new one. `set_policy(None)` g
 - A Rust node takes a link over signalling (`Signaling`, a *pipe*) from a room member that dials it, as a browser does
   to reach a native node it can't send UDP to, but doesn't dial over one: between two Rust nodes it never comes up.
   It sends at most 4 batches a second, each one datagram of up to 1232 bytes or several smaller ones (a board takes
-  relay messages of 4 KB at most), from 64 pipes at once (4 on an ESP32), and takes them from room members alone.
+  relay messages of 4 KB at most), from 64 pipes at once (4 on an ESP32), and takes them from room members alone. Past
+  that, a newcomer's dial waits, and gets the first pipe that frees: one whose link ended, or whose peer has said
+  nothing for 20 s while the node missed nothing; a linked peer heard from lately keeps its pipe.
 - After a link moves off a member, the peer can still send through that member for a while: the core takes relayed
   packets from any member that forwards them.
 - In JavaScript, `privacy` is set when the room is joined; `setPolicy` refuses a different one.
