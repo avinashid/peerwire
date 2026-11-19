@@ -41,6 +41,8 @@ const ROOM: &str = "esp32";
 const SEND_EVERY: Duration = Duration::from_secs(5);
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 const LONG: usize = 2000;
+// Within the board's cap with a radio, 4 KiB (NB-142).
+const _: () = assert!(LONG <= peerwire_esp::MAX_MESSAGE);
 /// Wi-Fi stays on, if wifi.sh named a network: set `PW_KEEP_WIFI` when building.
 const KEEP_WIFI: bool = option_env!("PW_KEEP_WIFI").is_some();
 /// How long the board tries wifi.sh's network at boot before it goes on over Bluetooth alone.

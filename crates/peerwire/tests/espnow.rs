@@ -115,6 +115,58 @@ fn an_espnow_link_is_of_espnow_s_own_kind() {
     assert!(closed && ev2[0].iter().any(off), "{:?}", ev2[0]);
 }
 
+/// `peerwire_esp::config()` on a board with a radio (feature `ble` or `espnow`): 4 KiB messages and an 8 KiB send
+/// buffer (NB-142).
+fn board_config() -> Config {
+    let (max_message, max_send_buffer) = (4 * 1024, 8 * 1024);
+    Config { max_message, max_send_buffer, max_links: 8, max_pending_handshakes: 8, ..Config::default() }
+}
+
+/// NB-142: a board's caps with a radio carry its largest message over ESP-NOW, two of them queued at once, and refuse a
+/// larger one at the sender; a peer with larger caps that sends the board a larger one has its link closed there, and
+/// the message never arrives.
+#[test]
+fn a_board_s_radio_caps_carry_its_largest_message() {
+    let air = FakeAir::new();
+    let with = |mac: Mac, config: Config| {
+        let radio = EspNow::new(air.ether(mac, V2_FRAME), Settings::DEFAULT);
+        let builder = Node::builder().config(config).bluetooth(radio).policy(Policy::new([PathKind::EspNow]));
+        builder.stun_servers(Vec::<String>::new()).bind("127.0.0.1:0").unwrap()
+    };
+    let (mut board, mut peer) = (with(A, board_config()), with(B, board_config()));
+    let (pa, pb) = (board.peer_id(), peer.peer_id());
+    board.join_room("pw-test", "espnow-caps");
+    peer.join_room("pw-test", "espnow-caps");
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut board, &mut peer], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    let (largest, second) = (vec![7u8; 4 * 1024], vec![8u8; 4 * 1024]);
+    assert!(matches!(board.send(&pb, Lane::Reliable, &[0; 4 * 1024 + 1]), Err(peerwire::SendError::TooLarge)));
+    board.send(&pb, Lane::Reliable, &largest).unwrap();
+    board.send(&pb, Lane::Reliable, &second).unwrap();
+    assert!(board.send(&pb, Lane::Reliable, b"x").is_err(), "8 KiB queued: the buffer is full");
+    let mut ev = Vec::new();
+    pump(&mut [&mut board, &mut peer], &mut ev, 5, |_| false);
+    assert!(got(&ev[1], pa, &largest) && got(&ev[1], pa, &second), "two messages of 4 KiB over ESP-NOW");
+    drop((board, peer));
+
+    // A peer whose caps are the defaults' sends the board a message over its 4 KiB: the board closes the link.
+    let (mut board, mut peer) = (with(C, board_config()), with([0x02, 0x50, 0x57, 0, 0, 0x0d], Config::default()));
+    let (pa, pb) = (board.peer_id(), peer.peer_id());
+    board.join_room("pw-test", "espnow-caps-over");
+    peer.join_room("pw-test", "espnow-caps-over");
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut board, &mut peer], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    let over = vec![9u8; 4 * 1024 + 1];
+    peer.send(&pa, Lane::Reliable, &over).unwrap();
+    let mut ev = Vec::new();
+    let violation = |e: &Event| {
+        matches!(e, Event::Disconnected { peer, reason: peerwire::DisconnectReason::ProtocolViolation } if *peer == pb)
+    };
+    let closed = pump(&mut [&mut board, &mut peer], &mut ev, 10, |n| n[0].status(&pb) != Status::Connected);
+    assert!(closed && ev[0].iter().any(violation), "{:?}", ev[0]);
+    assert!(!got(&ev[0], pb, &over));
+}
+
 #[test]
 fn a_link_carries_its_messages_through_lost_frames() {
     let air = FakeAir::new();

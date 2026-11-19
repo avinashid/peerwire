@@ -84,6 +84,11 @@ and the commit that fixed it.
   `[PathKind::Bluetooth]` must now list `EspNow`: with `Bluetooth` alone its radio carries no link, and the node logs a
   warning. `Traversal::radio_kind` and `Traversal::set_radio_kind` are new. `PathKind` is `#[non_exhaustive]`, so a
   `match` on it has a `_` arm already and no code breaks; neither radio kind is in a published crate yet.
+- `peerwire-esp` (NB-142): with a radio (feature `ble` or `espnow`), `config()` caps messages at 4 KiB and the send
+  buffer at 8 KiB, not 16 and 32 KiB: Bluetooth takes ~76 KB of a C3's heap, and a C3 with Bluetooth and ESP-NOW and 4
+  links could have had 5 to 15 KB left at the larger caps. `RADIO`, `MAX_MESSAGE` and `MAX_SEND_BUFFER` are new. A
+  peer that sends such a board a larger message has its link closed, as with any cap; the published 0.1.1 has neither
+  feature, so its caps don't change.
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert

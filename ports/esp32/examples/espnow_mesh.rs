@@ -50,6 +50,8 @@ const BURST_AT: Duration = Duration::from_secs(30);
 const BURST: usize = 128;
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 const LONG: usize = 2000;
+// Within the board's cap with a radio, 4 KiB (NB-142).
+const _: () = assert!(LONG <= peerwire_esp::MAX_MESSAGE);
 
 /// What came from one peer: the first and the highest message numbers, and how many messages.
 #[derive(Default)]

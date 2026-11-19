@@ -81,7 +81,9 @@ one room. No node knows another's
 key or address beforehand: they hear each other's room hellos and link. Linked
 nodes send each other a numbered reliable message every second. `Config` caps memory for a chip
 with ~250 KB of free heap: 16 KiB messages, a 32 KiB send buffer and 8 links
-(the defaults allow 1 MiB). Every 10 s each node logs free heap, the lowest free
+(the defaults allow 1 MiB); with a radio (feature `ble` or `espnow`), whose stack takes
+the heap, 4 KiB messages and an 8 KiB send buffer (`peerwire_esp::RADIO`, NB-142), so
+the peers of such a board send it 4 KiB at most. Every 10 s each node logs free heap, the lowest free
 heap so far, unused main-task stack and its links' RTTs.
 
 On a board's Wi-Fi it sets its clock by SNTP before binding the `Node`. Room hellos and
@@ -313,7 +315,10 @@ security review's second round; what they measured is in ESP-NOW's Limits sectio
   session; peers elsewhere must use that relay too. If it is down, only the LAN is left.
 - **Memory caps.** With heavy traffic each link holds its send and reassembly buffers.
   For many links on a plain ESP32-C3, lower `max_message` and `max_send_buffer`
-  further. An ESP32-S3 with PSRAM (the Arduino Nano ESP32) has room to spare.
+  further. An ESP32-S3 with PSRAM (the Arduino Nano ESP32) has room to spare. Neither
+  cap bounds what a linked peer can make a board hold out of order: the reliable lane's
+  receive window is 4,096 fragments of 1,100 B on every node (NB86-I1 in the threat
+  model), far past a board's heap, so a room member can still exhaust it.
 - **ESP32-S3** should build like the ESP32 with Espressif's Rust fork; not tried.
 
 ## Building
