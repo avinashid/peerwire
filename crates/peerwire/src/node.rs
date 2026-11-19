@@ -1044,7 +1044,7 @@ impl Node {
                         b.send_room(conn, &hello);
                     }
                 }
-                Inbound::Identified { peer, via } => self.trav.radio_reaches(now, &self.ep, peer, via),
+                Inbound::Identified { peer, via } => self.trav.radio_reaches(now, &mut self.ep, peer, via),
                 Inbound::Closed(hop) => self.trav.forget_radio(&hop),
             }
         }
@@ -1054,6 +1054,11 @@ impl Node {
     /// business. Dropped if it is about a peer in `refused` (see `poll_drained`), or one whose link isn't up and
     /// isn't admitted (see `admits`).
     fn take_event(&mut self, now: peerwire_core::Instant, wall: Instant, e: Ev<Addr>, refused: &[PeerId]) {
+        // A link that timed out closes the radio connections bound to its peer: the next one starts afresh (NB135-1).
+        #[cfg(feature = "ble")]
+        if let (Ev::Disconnected { peer, reason: DisconnectReason::Timeout }, Some(b)) = (&e, self.ble.as_mut()) {
+            b.link_timed_out(peer);
+        }
         let unseen = |p: &PeerId| refused.contains(p) || (self.status(p) != Status::Connected && !self.admits(p, &e));
         if about(&e).is_some_and(|p| unseen(&p)) {
             return;
@@ -1144,6 +1149,14 @@ impl Node {
     #[doc(hidden)]
     pub fn ble_counts(&self) -> (usize, usize, usize) {
         self.ble.as_ref().map_or((0, 0, 0), Ble::counts)
+    }
+
+    /// Sealed datagrams the radio's connections dropped as forged or copies, which close nothing (features `ble` and
+    /// `testing`; NB135-9). Not for apps.
+    #[cfg(all(feature = "ble", any(test, feature = "testing")))]
+    #[doc(hidden)]
+    pub fn ble_forged(&self) -> u64 {
+        self.ble.as_ref().map_or(0, Ble::forged)
     }
 
     /// Starts noting where the datagrams this node's socket reads come from, forgetting those noted so far: a test's

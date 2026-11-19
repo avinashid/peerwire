@@ -14,9 +14,9 @@ categories = ["network-programming", "game-development", "asynchronous"]
 include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [package.metadata.docs.rs]
-# The async host, Nostr signaling and the Bluetooth transport as well as the default TURN client; not `testing`,
-# which is for bindings, nor `ble-bluez`, which would build libdbus there.
-features = ["tokio", "nostr", "ble"]
+# The async host, Nostr signaling, the Bluetooth transport and its ESP-NOW radio as well as the default TURN client;
+# not `testing`, which is for bindings, nor `ble-bluez`, which would build libdbus there.
+features = ["tokio", "nostr", "ble", "espnow"]
 
 [dependencies]
 peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
@@ -68,6 +68,9 @@ nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:s
 # which logs its connections through `log`. Off by default; `ble-bluez` adds the Linux driver.
 ble = ["dep:log", "peerwire-core/ble"]
 ble-bluez = ["ble", "dep:bluer", "dep:dbus", "dep:futures", "dep:tokio"]
+# ESP-NOW (docs/concepts/espnow.md): a Bluetooth radio over Espressif's ESP-NOW frames, for a platform that gives it
+# its ESP-NOW (`espnow::Ether`); `peerwire-esp` gives the ESP32's. No dependency of its own.
+espnow = ["ble"]
 # Test hooks (Builder::port_mapping_at, a fake gateway's address; Node::note_sources, where the socket's datagrams
 # came from; ble::FakeAir, radios in one process). Not for apps.
 testing = []
@@ -79,7 +82,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docs_samples)"] }
 [dev-dependencies]
 peerwire-core = { path = "../peerwire-core" }
 # Tests and examples cover the async host and Nostr signaling too, and tests use the test hooks (Node::sources).
-peerwire = { path = ".", features = ["tokio", "nostr", "testing", "ble"] }
+peerwire = { path = ".", features = ["tokio", "nostr", "testing", "ble", "espnow"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
 # The fuzz harness (peerwire_sim::fuzz); a dev-only cycle, the harness deals in bytes.
 peerwire-sim = { path = "../peerwire-sim" }

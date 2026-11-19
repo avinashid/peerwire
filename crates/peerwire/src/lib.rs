@@ -59,6 +59,8 @@ mod async_node;
 pub mod ble;
 #[cfg(feature = "ble-bluez")]
 mod bluez;
+#[cfg(feature = "espnow")]
+pub mod espnow;
 mod lan;
 mod node;
 #[cfg(feature = "nostr")]

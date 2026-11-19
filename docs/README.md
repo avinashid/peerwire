@@ -38,6 +38,8 @@ New here? Start with the [introduction](getting-started/introduction.md), then t
 - [Protocol](concepts/protocol.md): identity, the handshake, the wire format, lanes and invites.
 - [Bluetooth](concepts/bluetooth.md): links over Bluetooth LE between peers with no network, and how they rank
   against UDP (a design, not yet run on a radio).
+- [ESP-NOW](concepts/espnow.md): ESP32 boards linking over Espressif's ESP-NOW frames with no network, as a Bluetooth
+  radio: connections emulated, what a forged frame can do, and what two boards measured (NB-138, NB-139).
 - [Security model](concepts/security-model.md): who can see what, and what nobody in the path can do.
 - [Scaling](concepts/scaling.md): islands and super-peers for rooms bigger than a mesh.
 

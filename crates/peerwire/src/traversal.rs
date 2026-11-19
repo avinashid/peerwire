@@ -1397,17 +1397,28 @@ impl<A: Address> Traversal<A> {
     /// Radio connection `via` ([`Address::radio`]), such as a Bluetooth one, which carries signals and datagrams
     /// alike, proved on the connection itself that `peer` is at its other end (Bluetooth's identity proof): a dial to
     /// `peer` goes over it from now on, beside its addresses ([`PathKind::Bluetooth`]), and a member with no link is
-    /// offered to again at once, over it too. No offer of this node's ever names it.
-    pub fn radio_reaches(&mut self, now: Instant, ep: &Endpoint<A>, peer: PeerId, via: A) {
+    /// offered to again at once, over it too. A link to `peer` still on a radio connection that closed since (forgotten,
+    /// so no longer listed) is dialled again over the ones listed now ([`Endpoint::redial`]: `Replaced`, then
+    /// `Connected`), as its packets can't move onto a connection that isn't bound to it, rather than waiting out its idle
+    /// timeout there (NB135-I7). No offer of this node's ever names it.
+    pub fn radio_reaches(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: PeerId, via: A) {
         if !via.radio() || peer == self.id {
             return;
         }
         let r = self.remotes.entry(peer).or_default();
+        let gone = |a: &A| a.radio() && *a != via && !r.radio.contains(a);
+        let stranded = matches!(ep.path(&peer), Some(Path::Direct(a)) if gone(a));
         r.radio.retain(|a| *a != via);
         r.radio.insert(0, via);
         r.radio.truncate(MAX_RADIO);
         if r.member.is_some() && !ep.is_connected(&peer) {
             self.offer(now, ep, peer, true, true);
+        }
+        let targets = self.radio_targets(&peer);
+        if stranded && !targets.is_empty() && ep.redial(now, peer, &targets).is_ok() {
+            if let Some(r) = self.remotes.get_mut(&peer) {
+                r.redial = true;
+            }
         }
     }
 
@@ -1827,8 +1838,8 @@ impl<A: Address> Traversal<A> {
         }
     }
 
-    /// Whether a dial that moves `peer`'s link off a path the policy turned off ([`Endpoint::redial`]) is under
-    /// way: its `ConnectFailed` is this node's own, not the app's.
+    /// Whether a dial that moves `peer`'s link ([`Endpoint::redial`]) is under way, off a path the policy turned off
+    /// or a radio connection that closed: its `ConnectFailed` is this node's own, not the app's.
     pub fn redialing(&self, peer: &PeerId) -> bool {
         self.remotes.get(peer).is_some_and(|r| r.redial)
     }
@@ -3282,9 +3293,9 @@ mod tests {
         let (_, body) = sealed::open(&b, &offers[0]).unwrap();
         let o = Offer::<Hop<SocketAddr>>::decode(&body[..body.len() - PROOF_LEN]).unwrap();
         assert_eq!(o.addrs, vec![Hop::Net(local)], "the offer names no radio");
-        t.radio_reaches(now, &ep, pc, Hop::Net(there));
+        t.radio_reaches(now, &mut ep, pc, Hop::Net(there));
         assert!(t.radio_targets(&pc).is_empty(), "not a radio");
-        t.radio_reaches(now, &ep, pb, ble);
+        t.radio_reaches(now, &mut ep, pb, ble);
         assert_eq!(t.radio_targets(&pb), vec![Path::Direct(ble)]);
         assert_eq!(published(&mut t).len(), 1, "a member with no link is offered to again");
         let offer = offer_from(&b, &me, Some(&key), 1, Role::Peer, vec![there]);
@@ -3300,7 +3311,7 @@ mod tests {
         let orders = [(vec![PathKind::Direct, PathKind::Bluetooth], true), (vec![PathKind::Direct], false)];
         for (order, over_radio) in orders {
             let (mut t, mut ep) = new(Some(Policy::new(order)));
-            t.radio_reaches(now, &ep, pb, ble);
+            t.radio_reaches(now, &mut ep, pb, ble);
             let offer = offer_from(&b, &me, Some(&key), 2, Role::Peer, vec![there]);
             assert_eq!(t.handle_signal(now, &mut ep, inbox, &offer), Some(pb));
             let sent: Vec<_> = std::iter::from_fn(|| ep.poll_transmit(now)).map(|x| x.dst).collect();
@@ -3332,10 +3343,10 @@ mod tests {
             let mut t = [0, 1].map(|i| {
                 Traversal::new(&id(i + 1), [i + 3; 32], 1_700_000_000_000, vec![Hop::Net(udp[usize::from(i)])], vec![])
             });
-            let e = [0, 1].map(|i| Endpoint::new(&id(i + 1), config.clone(), [i + 1; 32]));
+            let mut e = [0, 1].map(|i| Endpoint::new(&id(i + 1), config.clone(), [i + 1; 32]));
             for (i, t) in t.iter_mut().enumerate() {
                 t.join_room(now, ROOM.0, ROOM.1, Role::Peer, None);
-                t.radio_reaches(now, &e[i], id(2 - i as u8).peer_id(), radio[i]);
+                t.radio_reaches(now, &mut e[i], id(2 - i as u8).peer_id(), radio[i]);
             }
             OnAir { t, e, now, udp, radio, events: [Vec::new(), Vec::new()] }
         }
@@ -3458,6 +3469,34 @@ mod tests {
         assert!(w.paths().iter().all(on_radio), "{:?}", w.paths());
         assert_eq!(w.count(|e| matches!(e, Event::Connected { .. })), connected, "no reconnect");
         assert_eq!(w.count(|e| matches!(e, Event::PathChanged { .. })), moved, "no move");
+    }
+
+    /// NB135-I7: a link on a radio connection that closes under it stays there, as its packets can't move onto another
+    /// connection; once a new connection proves its peer, each end dials the link again over it at once (they cross,
+    /// and one dial wins), and the link is back within a second, not once it would have timed out (30 s).
+    #[test]
+    fn a_link_on_a_radio_connection_that_closed_moves_to_the_next_at_once() {
+        use peerwire_core::DisconnectReason::{Replaced, Timeout};
+        let mut w = OnAir::new(Config::default());
+        w.run(12_000, |_| false);
+        assert!(w.paths().iter().all(on_radio), "{:?}", w.paths());
+        let old = w.radio;
+        for (t, hop) in w.t.iter_mut().zip(&old) {
+            t.forget_radio(hop);
+        }
+        let next = [Hop::Ble("0.0.0.3:0".parse().unwrap()), Hop::Ble("0.0.0.4:0".parse().unwrap())];
+        w.radio = next; // what goes to the old connection goes nowhere now
+        w.run(2_000, |_| false);
+        assert_eq!(w.paths(), old.map(|h| Some(Path::Direct(h))), "nothing moves by itself");
+        let replaced = w.count(|e| matches!(e, Event::Disconnected { reason: Replaced, .. }));
+        for (i, hop) in next.iter().enumerate() {
+            let now = w.now;
+            w.t[i].radio_reaches(now, &mut w.e[i], id(2 - i as u8).peer_id(), *hop);
+        }
+        w.run(1_000, |_| false);
+        assert_eq!(w.paths(), next.map(|h| Some(Path::Direct(h))), "moved within a second");
+        assert_eq!(w.count(|e| matches!(e, Event::Disconnected { reason: Replaced, .. })), replaced + 2, "at each end");
+        assert_eq!(w.count(|e| matches!(e, Event::Disconnected { reason: Timeout, .. })), 0);
     }
 
     /// NB-031: knowing the room topic (what relays see) is not enough to be linked

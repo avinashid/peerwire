@@ -34,7 +34,7 @@ mod link;
 #[cfg(feature = "ble")]
 pub use link::{
     advert, ble_key, identity, open, seal, Bucket, Fault, Input, Link, ADVERT_FULL, ADVERT_LEN, CHALLENGE_LEN, ID_LEN,
-    INNER_ID, INNER_PEER, INNER_ROOM, MAX_DROPS, PROVE_WITHIN,
+    INNER_ID, INNER_PEER, INNER_ROOM, MAX_DROPS, PROVE_WITHIN, SEAL_LEN,
 };
 
 /// The GATT service a peer serves, as a 128-bit UUID: `1c3eea41-c2be-493c-ab0b-7707ad2dbed6`.
@@ -57,6 +57,10 @@ pub const KIND_PROOF: u8 = 5;
 
 /// The largest message: a kind byte and a datagram.
 pub const MAX_MESSAGE: usize = 1 + MAX_DATAGRAM;
+/// The largest message on a link that seals its datagrams ([`Link::seal_datagrams`](link::Link::seal_datagrams),
+/// ESP-NOW's): a kind byte and a sealed datagram, [`SEAL_LEN`] longer than the datagram.
+#[cfg(feature = "ble")]
+pub const MAX_SEALED_MESSAGE: usize = MAX_MESSAGE + SEAL_LEN;
 /// The smallest ATT MTU, which every link starts with.
 pub const MIN_ATT_MTU: u16 = 23;
 /// The longest attribute value GATT allows.
@@ -83,10 +87,18 @@ pub fn value_len(mtu: u16) -> usize {
 }
 
 /// Splits messages into chunks for one connection, in one direction.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Chunker {
     /// The next chunk's counter.
     next: u8,
+    /// The largest message it splits: [`MAX_MESSAGE`], more on a link that seals its datagrams.
+    max: usize,
+}
+
+impl Default for Chunker {
+    fn default() -> Chunker {
+        Chunker { next: 0, max: MAX_MESSAGE }
+    }
 }
 
 impl Chunker {
@@ -96,10 +108,10 @@ impl Chunker {
 
     /// Hands `send` the chunks of `message` for a link with ATT MTU `mtu`, in order, each a GATT value of at most
     /// [`value_len`]`(mtu)` bytes, and stops at the first it can't send (`false`): the rest of a message is no use
-    /// without it. Whether all went; nothing goes for an empty message or one over [`MAX_MESSAGE`]. Chunks of one
-    /// message must go out before the next message's.
+    /// without it. Whether all went; nothing goes for an empty message or one over [`MAX_MESSAGE`] (on a link that
+    /// seals its datagrams, its own largest). Chunks of one message must go out before the next message's.
     pub fn split(&mut self, message: &[u8], mtu: u16, mut send: impl FnMut(&[u8]) -> bool) -> bool {
-        if message.is_empty() || message.len() > MAX_MESSAGE {
+        if message.is_empty() || message.len() > self.max {
             return false;
         }
         let room = value_len(mtu) - 1;
@@ -120,8 +132,9 @@ impl Chunker {
 }
 
 /// Puts messages back together from one connection's chunks, in one direction. It holds at most one message being
-/// assembled, of at most [`MAX_MESSAGE`] bytes, in one buffer it keeps.
-#[derive(Debug, Default)]
+/// assembled, of at most [`MAX_MESSAGE`] bytes (on a link that seals its datagrams, its own largest), in one buffer it
+/// keeps.
+#[derive(Debug)]
 pub struct Reassembler {
     buf: Vec<u8>,
     /// The counter the next chunk of the open message must have; `None` with no message open.
@@ -135,6 +148,23 @@ pub struct Reassembler {
     /// The buffer holds a message handed out by the last `push`.
     done: bool,
     dropped: u64,
+    /// The largest message it takes: [`MAX_MESSAGE`], more on a link that seals its datagrams.
+    max: usize,
+}
+
+impl Default for Reassembler {
+    fn default() -> Reassembler {
+        Reassembler {
+            buf: Vec::new(),
+            next: None,
+            at: Instant::ZERO,
+            held: 0,
+            last: None,
+            done: false,
+            dropped: 0,
+            max: MAX_MESSAGE,
+        }
+    }
 }
 
 impl Reassembler {
@@ -175,13 +205,13 @@ impl Reassembler {
             self.dropped += 1;
             return None;
         }
-        if self.buf.len() + data.len() > MAX_MESSAGE {
+        if self.buf.len() + data.len() > self.max {
             self.drop_open();
             self.dropped += 1;
             return None;
         }
-        if self.buf.capacity() < MAX_MESSAGE {
-            self.buf.reserve_exact(MAX_MESSAGE - self.buf.len());
+        if self.buf.capacity() < self.max {
+            self.buf.reserve_exact(self.max - self.buf.len());
         }
         self.buf.extend_from_slice(data);
         (self.next, self.at, self.held, self.last) = (Some((counter + 1) & COUNTER), now, self.held + 1, Some(counter));

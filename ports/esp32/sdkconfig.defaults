@@ -1,5 +1,6 @@
 # The node's loop runs on the main task: the handshake's curve math and the
 # Node's buffers want more than the default 3 KB. The report logs the high-water mark.
+# sdkconfig.defaults.esp32 gives the ESP32's 4 KB more (NB-139).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096

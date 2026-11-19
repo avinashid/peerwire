@@ -58,6 +58,8 @@ use peerwire::{MultiSignaling, NostrSignaling, Signaling};
 pub mod ble;
 pub mod clock;
 pub mod console;
+#[cfg(feature = "espnow")]
+pub mod espnow;
 pub mod identity;
 mod ntp;
 pub mod wifi;

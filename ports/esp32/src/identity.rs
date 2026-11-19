@@ -64,7 +64,7 @@ fn store() -> anyhow::Result<EspDefaultNvs> {
 
 /// Fills `buf` with true random numbers from the SAR ADC's noise, which ESP-IDF documents for before any radio is set
 /// up, and which then mustn't be turned on: once one is, an error.
-fn random(buf: &mut [u8]) -> anyhow::Result<()> {
+pub(crate) fn random(buf: &mut [u8]) -> anyhow::Result<()> {
     if radio_set_up() {
         bail!("no identity is kept yet, and a radio is set up: load the identity before starting Wi-Fi or Bluetooth");
     }
