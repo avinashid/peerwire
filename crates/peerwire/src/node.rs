@@ -205,10 +205,12 @@ impl Builder {
         self
     }
 
-    /// A Bluetooth LE radio (feature `ble`): while in a room, the node advertises and links with the members it hears
-    /// over it, with no network, ranking it below every UDP path ([`PathKind::Bluetooth`]); see the
-    /// [`ble`](crate::ble) module and `docs/concepts/bluetooth.md`. Under [`Privacy::RelayOnly`] the radio stays off.
-    /// Default: none.
+    /// A Bluetooth LE radio (feature `ble`), or another the node drives as one, such as ESP-NOW's
+    /// (`espnow::EspNow`): while in a room, the node advertises and links with the members it hears over it, with no
+    /// network, ranking it below every UDP path, under the kind the radio names ([`Radio::kind`]:
+    /// [`PathKind::Bluetooth`], or [`PathKind::EspNow`]), which a [policy](Builder::policy) must list for links over
+    /// it; see the [`ble`](crate::ble) module and `docs/concepts/bluetooth.md`. Under [`Privacy::RelayOnly`] the radio
+    /// stays off. Default: none.
     #[cfg(feature = "ble")]
     pub fn bluetooth(mut self, radio: impl Radio + 'static) -> Self {
         self.radio = Some(Box::new(radio));
@@ -238,6 +240,11 @@ impl Builder {
         let unix_ms = self.clock_at.unwrap_or_else(system);
         let (local_addrs, stun) = (local_addresses(local).into_iter().map(Hop::Net).collect(), net(stun));
         let mut trav = Traversal::new(&identity, seed, unix_ms, local_addrs, stun);
+        #[cfg(feature = "ble")]
+        if let Some(r) = self.radio.as_ref() {
+            trav.set_radio_kind(r.kind());
+            warn_radio_off(self.policy.as_ref(), trav.radio_kind());
+        }
         trav.set_privacy(peerwire_core::Instant::ZERO, &mut ep, self.privacy);
         trav.set_policy(peerwire_core::Instant::ZERO, &mut ep, self.policy);
         #[cfg(feature = "turn")]
@@ -514,6 +521,10 @@ impl Node {
             return Err(Error::InvalidPolicy);
         }
         let now = self.now();
+        #[cfg(feature = "ble")]
+        if self.ble.is_some() {
+            warn_radio_off(policy.as_ref(), self.trav.radio_kind());
+        }
         self.trav.set_policy(now, &mut self.ep, policy);
         if !self.relay_peers_on() {
             let own = self.trav.relay();
@@ -848,14 +859,15 @@ impl Node {
 
     /// The kind of route a connected peer's link takes ([`PathKind`]): `Direct`, `Birthday` (out of one of this
     /// node's birthday punch sockets, [`via_birthday`](Node::via_birthday)), `Peers` or `RelayPeers` (through
-    /// another peer), or `Turn` (through a TURN server: this node's own, or the peer's relayed address).
+    /// another peer), `Turn` (through a TURN server: this node's own, or the peer's relayed address), `Bluetooth` or
+    /// `EspNow` (over the radio, as it names its kind), or `Signaling` (a pipe over the signaling relays).
     pub fn path_kind(&self, peer: &PeerId) -> Option<PathKind> {
         Some(match self.ep.path(peer)? {
             Path::Via(r) if self.is_relay_peer(r) => PathKind::RelayPeers,
             Path::Via(_) => PathKind::Peers,
             Path::Direct(Hop::Net(_)) if self.via_birthday(peer) => PathKind::Birthday,
             Path::Direct(Hop::Net(_)) => PathKind::Direct,
-            Path::Direct(Hop::Ble(_)) => PathKind::Bluetooth,
+            Path::Direct(Hop::Ble(_)) => self.trav.radio_kind(),
             Path::Direct(Hop::Pipe(_)) => PathKind::Signaling,
             Path::Direct(_) => PathKind::Turn,
         })
@@ -1186,11 +1198,11 @@ impl Node {
         self.at(Instant::now())
     }
 
-    /// Whether the policy allows Bluetooth links alone ([`PathKind::Bluetooth`]), none of which go over UDP: then the
-    /// socket is left alone both ways, so a peer that dials or punches to it hears nothing and links over the radio,
-    /// rather than linking on UDP only to have the policy close it.
+    /// Whether the policy allows radio links alone ([`PathKind::Bluetooth`], [`PathKind::EspNow`]), none of which go
+    /// over UDP: then the socket is left alone both ways, so a peer that dials or punches to it hears nothing and links
+    /// over the radio, rather than linking on UDP only to have the policy close it.
     fn radio_only(&self) -> bool {
-        self.trav.policy().is_some_and(|p| p.order == [PathKind::Bluetooth])
+        self.trav.policy().is_some_and(|p| p.order.iter().all(|k| k.is_radio()))
     }
 
     fn at(&self, now: Instant) -> peerwire_core::Instant {
@@ -1455,6 +1467,15 @@ fn about<A>(e: &Ev<A>) -> Option<PeerId> {
         | Ev::PathChanged { peer, .. } => Some(*peer),
         Ev::AddrObserved { by, .. } => Some(*by),
         Ev::ConnectFailed { .. } => None,
+    }
+}
+
+/// Logs a policy that lists a radio kind but not the one this node's radio says it is (`kind`): no link goes over the
+/// radio then, as on an ESP-NOW node whose policy lists `Bluetooth` alone (NB-142).
+#[cfg(feature = "ble")]
+fn warn_radio_off(policy: Option<&Policy>, kind: PathKind) {
+    if let Some(p) = policy.filter(|p| p.order.iter().any(|k| k.is_radio()) && !p.allows(kind)) {
+        log::warn!("the policy {:?} leaves out the radio's kind, {kind:?}: no link goes over the radio", p.order);
     }
 }
 

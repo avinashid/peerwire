@@ -194,8 +194,8 @@ const LOCKSTEP_AFTER: Duration = Duration::from_millis(1000);
 /// A link that [`Traversal::set_policy`] moves off a path that is now off gets this long to move (core punches for
 /// `punch_duration`, 5 s by default), then is closed.
 const MOVE_WAIT: Duration = Duration::from_secs(6);
-/// Every [`PathKind::bit`]: a dial step with no policy.
-const ALL_KINDS: u8 = 0b11_1111;
+/// Every [`PathKind::bit`] but `Signaling`'s (the node takes a pipe link, never dials one): a dial step with no policy.
+const ALL_KINDS: u8 = 0b1011_1111;
 
 /// What STUN says about this node's NAT.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -304,8 +304,9 @@ pub enum PathKind {
     /// whose room hellos or offers came over it (`docs/concepts/bluetooth.md`). Last wherever it is listed: a dial
     /// takes it in its last step, and a link on it punches to the peer's addresses and moves off it, unless the
     /// order has neither `Direct` nor `Birthday`: then it stays, punching to nothing and answering no punch. Alone in
-    /// the order, it leaves the node's UDP socket unused, both ways. Off under [`Privacy::RelayOnly`], and not in
-    /// [`Policy::default`].
+    /// the order (or with [`EspNow`](Self::EspNow) alone), it leaves the node's UDP socket unused, both ways. Off under
+    /// [`Privacy::RelayOnly`], and not in [`Policy::default`]. Only a radio that says it is Bluetooth
+    /// ([`ble::Radio::kind`](crate::ble::Radio::kind), the default) carries links of this kind.
     Bluetooth,
     /// Over the signaling relays ([`Builder::signaling`](crate::Builder::signaling)): the peer's datagrams sealed to
     /// it in the room's carrier, as a browser's `'signaling'` path sends them (a *pipe*, see
@@ -314,13 +315,29 @@ pub enum PathKind {
     /// that dials it; it doesn't dial over one itself. A link on it punches to the peer's addresses and moves off it,
     /// as on [`Bluetooth`](Self::Bluetooth). Off under [`Privacy::RelayOnly`], and not in [`Policy::default`].
     Signaling,
+    /// Over an ESP-NOW connection (feature `espnow`, `espnow::EspNow` given to
+    /// [`Builder::bluetooth`](crate::Builder::bluetooth)) to a peer whose room hellos or offers came over it
+    /// (`docs/concepts/espnow.md`): a radio as [`Bluetooth`](Self::Bluetooth) is, ranked and dialled as it is, under a
+    /// kind of its own, which the radio names ([`ble::Radio::kind`](crate::ble::Radio::kind)). A node has one radio, so
+    /// a policy that lists `Bluetooth` but not `EspNow` keeps an ESP-NOW node's links off it. Off under
+    /// [`Privacy::RelayOnly`], and not in [`Policy::default`].
+    EspNow,
 }
 
 impl PathKind {
     fn bit(self) -> u8 {
         1 << self as u8
     }
+
+    /// Whether a link of this kind goes over a radio connection ([`Hop::Ble`]): [`Bluetooth`](Self::Bluetooth) or
+    /// [`EspNow`](Self::EspNow).
+    pub(crate) fn is_radio(self) -> bool {
+        matches!(self, PathKind::Bluetooth | PathKind::EspNow)
+    }
 }
+
+// Every kind has a bit of a `u8`: a ninth needs a wider mask.
+const _: () = assert!((PathKind::EspNow as u8) < 8);
 
 /// Which paths a node's links may take, in the order it prefers them ([`Node::set_policy`](crate::Node::set_policy)).
 /// A node with none takes every path, as [`Node`](crate::Node) always has: a dial tries the direct and relayed
@@ -389,18 +406,19 @@ impl Policy {
     }
 
     /// The steps of a dial, as bits of [`PathKind::bit`]: each kind in order, `Direct` and `Birthday` side by side
-    /// together, and `Bluetooth` last wherever it is listed.
+    /// together, and the radio kinds (`Bluetooth`, `EspNow`) last wherever they are listed, in one step.
     fn steps(&self) -> Vec<u8> {
         let direct = PathKind::Direct.bit() | PathKind::Birthday.bit();
         let mut steps: Vec<u8> = Vec::new();
-        for k in self.order.iter().filter(|k| **k != PathKind::Bluetooth) {
+        for k in self.order.iter().filter(|k| !k.is_radio()) {
             match steps.last_mut() {
                 Some(last) if *last & direct != 0 && k.bit() & direct != 0 => *last |= k.bit(),
                 _ => steps.push(k.bit()),
             }
         }
-        if self.allows(PathKind::Bluetooth) {
-            steps.push(PathKind::Bluetooth.bit());
+        let radio = self.order.iter().filter(|k| k.is_radio()).fold(0, |bits, k| bits | k.bit());
+        if radio != 0 {
+            steps.push(radio);
         }
         steps
     }
@@ -468,9 +486,10 @@ pub enum Hop<A> {
         peer: A,
     },
     Relayed(A),
-    /// A Bluetooth LE connection ([`Address::radio`]), named by an address the host picks that no network uses
-    /// (`Node` takes one in `0.0.0.0/8`, port 0, per connection). It is never offered, told to a peer or decoded: its
-    /// encoding, a tag then the address's, is longer than any address of `A` decodes from.
+    /// A radio connection ([`Address::radio`]): Bluetooth LE's, or ESP-NOW's ([`PathKind::EspNow`]), named by an
+    /// address the host picks that no network uses (`Node` takes one in `0.0.0.0/8`, port 0, per connection). It is
+    /// never offered, told to a peer or decoded: its encoding, a tag then the address's, is longer than any address of
+    /// `A` decodes from.
     Ble(A),
     /// A pipe to a peer over the signaling relays ([`Address::pipe`], [`PathKind::Signaling`]), named like a
     /// Bluetooth connection by an address the host picks that no network uses (`Node` takes one in `0.0.0.0/8`, port
@@ -670,7 +689,7 @@ struct Remote<A> {
     /// Its link is moving under [`Privacy::RelayOnly`] ([`Traversal::hide`]): closed if the move fails or is late.
     hide: bool,
     /// The radio connections proven to reach it, newest first, at most `MAX_RADIO`: a dial to it goes over them too
-    /// ([`PathKind::Bluetooth`]). Never offered.
+    /// ([`PathKind::Bluetooth`] or [`PathKind::EspNow`], [`Traversal::radio_kind`]). Never offered.
     radio: Vec<A>,
 }
 
@@ -763,6 +782,8 @@ pub struct Traversal<A: Address> {
     picked: Option<PeerId>,
     /// When links on radio connections next punch to their peers' addresses (`RADIO_PUNCH`).
     radio_punch_at: Instant,
+    /// The kind of path a link on a radio connection takes ([`Traversal::set_radio_kind`]).
+    radio_kind: PathKind,
     /// Whoever holds this, from our invite, may ask us to dial back.
     invite_key: [u8; 32],
     /// Always-on peers kept linked as relays: named first in offers, tried first as vias.
@@ -836,6 +857,7 @@ impl<A: Address> Traversal<A> {
             privacy: Privacy::Direct,
             picked: None,
             radio_punch_at: Instant::ZERO,
+            radio_kind: PathKind::Bluetooth,
             invite_key,
             relay_peers: Vec::new(),
             planned: Bucket::default(),
@@ -969,6 +991,22 @@ impl<A: Address> Traversal<A> {
         self.policy.as_ref()
     }
 
+    /// The kind of path a link on a radio connection ([`Address::radio`] but a pipe) takes: [`PathKind::Bluetooth`]
+    /// unless set.
+    pub fn radio_kind(&self) -> PathKind {
+        self.radio_kind
+    }
+
+    /// Sets the kind of path links on this node's radio connections take, as the radio names it
+    /// ([`ble::Radio::kind`](crate::ble::Radio::kind)): [`PathKind::Bluetooth`] or [`PathKind::EspNow`]. The policy
+    /// then allows them, and a dial takes them in its last step, only if it lists that kind. Any other kind leaves it
+    /// as it was. Set it before the node has radio connections.
+    pub fn set_radio_kind(&mut self, kind: PathKind) {
+        if kind.is_radio() {
+            self.radio_kind = kind;
+        }
+    }
+
     /// Sets the paths links may take (`None`: every one, as before policies), for new dials at once; dials under
     /// way take their next steps by it, from its first. A link on a path it turns off moves: one through a relay
     /// punches to the peer's addresses if `Direct` is on and offers again, so the peer punches too (and a planned
@@ -1031,12 +1069,13 @@ impl<A: Address> Traversal<A> {
     /// links those, or not, by [`PathKind::RelayPeers`]). Under [`Privacy::RelayOnly`] any too, but with TURN on under
     /// it (NB-101): then a link to a peer but the relay must hide this node's address, through a relay or one of its
     /// allocations. An address `peer` offered as its relayed one is TURN's, as its link there is once retagged
-    /// (NB99-I1). A Bluetooth connection ([`Address::radio`]) only if the policy lists [`PathKind::Bluetooth`], and a
-    /// pipe ([`Address::pipe`]) only if it lists [`PathKind::Signaling`] (either with no policy); neither under
+    /// (NB99-I1). A radio connection ([`Address::radio`]) only if the policy lists the radio's kind
+    /// ([`radio_kind`](Traversal::radio_kind): [`PathKind::Bluetooth`] or [`PathKind::EspNow`]), and a pipe
+    /// ([`Address::pipe`]) only if it lists [`PathKind::Signaling`] (either with no policy); neither under
     /// [`Privacy::RelayOnly`].
     pub fn allows(&self, peer: &PeerId, path: &Path<A>) -> bool {
         if let Some(a) = path.direct().filter(|a| a.radio()) {
-            let kind = if a.pipe() { PathKind::Signaling } else { PathKind::Bluetooth };
+            let kind = if a.pipe() { PathKind::Signaling } else { self.radio_kind };
             let relay_only = matches!(self.privacy, Privacy::RelayOnly { .. });
             return !relay_only && self.policy.as_ref().is_none_or(|p| p.allows(kind));
         }
@@ -1396,11 +1435,11 @@ impl<A: Address> Traversal<A> {
 
     /// Radio connection `via` ([`Address::radio`]), such as a Bluetooth one, which carries signals and datagrams
     /// alike, proved on the connection itself that `peer` is at its other end (Bluetooth's identity proof): a dial to
-    /// `peer` goes over it from now on, beside its addresses ([`PathKind::Bluetooth`]), and a member with no link is
-    /// offered to again at once, over it too. A link to `peer` still on a radio connection that closed since (forgotten,
-    /// so no longer listed) is dialled again over the ones listed now ([`Endpoint::redial`]: `Replaced`, then
-    /// `Connected`), as its packets can't move onto a connection that isn't bound to it, rather than waiting out its idle
-    /// timeout there (NB135-I7). No offer of this node's ever names it.
+    /// `peer` goes over it from now on, beside its addresses ([`radio_kind`](Traversal::radio_kind)), and a member
+    /// with no link is offered to again at once, over it too. A link to `peer` still on a radio connection that closed
+    /// since (forgotten, so no longer listed) is dialled again over the ones listed now ([`Endpoint::redial`]:
+    /// `Replaced`, then `Connected`), as its packets can't move onto a connection that isn't bound to it, rather than
+    /// waiting out its idle timeout there (NB135-I7). No offer of this node's ever names it.
     pub fn radio_reaches(&mut self, now: Instant, ep: &mut Endpoint<A>, peer: PeerId, via: A) {
         if !via.radio() || peer == self.id {
             return;
@@ -1429,11 +1468,11 @@ impl<A: Address> Traversal<A> {
         }
     }
 
-    /// The radio connections `peer` is dialled over: those its signals came over, unless the policy has
-    /// [`PathKind::Bluetooth`] off or this node is relay-only.
+    /// The radio connections `peer` is dialled over: those its signals came over, unless the policy has the radio's
+    /// kind ([`radio_kind`](Traversal::radio_kind)) off or this node is relay-only.
     fn radio_targets(&self, peer: &PeerId) -> Vec<Path<A>> {
         let off = matches!(self.privacy, Privacy::RelayOnly { .. })
-            || self.policy.as_ref().is_some_and(|p| !p.allows(PathKind::Bluetooth));
+            || self.policy.as_ref().is_some_and(|p| !p.allows(self.radio_kind));
         match self.remotes.get(peer) {
             Some(r) if !off => r.radio.iter().cloned().map(Path::Direct).collect(),
             _ => Vec::new(),
@@ -1939,7 +1978,7 @@ impl<A: Address> Traversal<A> {
                 }
             }
         }
-        if step & PathKind::Bluetooth.bit() != 0 {
+        if step & self.radio_kind.bit() != 0 {
             targets.extend(self.radio_targets(&peer));
         }
         if targets.is_empty() {
@@ -3249,6 +3288,49 @@ mod tests {
         assert!(!t.allows(&peer, &ble), "relay-only, with no policy too");
     }
 
+    /// NB-142: ESP-NOW is a radio kind of its own. A node whose radio says it is ESP-NOW (`set_radio_kind`) allows
+    /// links on its radio connections under a policy that lists `EspNow`, not one that lists `Bluetooth` alone, and a
+    /// Bluetooth radio's the other way round; the radio kinds come last in a dial, in one step, wherever they are
+    /// listed; and a kind that is no radio's leaves the radio's as it was.
+    #[test]
+    fn espnow_is_a_radio_kind_of_its_own() {
+        assert!(!Policy::default().allows(PathKind::EspNow));
+        let p = Policy::new([PathKind::EspNow, PathKind::Direct, PathKind::Bluetooth, PathKind::Peers]);
+        assert!(p.is_valid() && !Policy::new([PathKind::EspNow, PathKind::EspNow]).is_valid());
+        let radios = PathKind::EspNow.bit() | PathKind::Bluetooth.bit();
+        assert_eq!(p.steps(), vec![PathKind::Direct.bit(), PathKind::Peers.bit(), radios]);
+        assert_eq!(Policy::new([PathKind::EspNow]).steps(), vec![PathKind::EspNow.bit()]);
+        assert_eq!(ALL_KINDS & PathKind::EspNow.bit(), PathKind::EspNow.bit(), "dialled with no policy");
+        assert_eq!(ALL_KINDS & PathKind::Signaling.bit(), 0, "never dialled");
+        let ble = Path::Direct(Hop::Ble("0.0.0.1:0".parse().unwrap()));
+        let peer = id(2).peer_id();
+        let now = Instant::from_millis(1);
+        for kind in [PathKind::Bluetooth, PathKind::EspNow] {
+            let mut t: Traversal<Hop<SocketAddr>> = Traversal::new(&id(1), [5; 32], 0, vec![], vec![]);
+            let mut ep = Endpoint::new(&id(1), Config::default(), [9; 32]);
+            assert_eq!(t.radio_kind(), PathKind::Bluetooth, "the default");
+            t.set_radio_kind(kind);
+            t.set_radio_kind(PathKind::Direct);
+            assert_eq!(t.radio_kind(), kind, "Direct is no radio's kind");
+            assert!(t.allows(&peer, &ble), "no policy");
+            let orders = [
+                vec![PathKind::Bluetooth],
+                vec![PathKind::Direct, PathKind::Bluetooth],
+                vec![PathKind::EspNow],
+                vec![PathKind::Direct, PathKind::EspNow],
+                vec![PathKind::Bluetooth, PathKind::EspNow],
+                vec![PathKind::Direct],
+            ];
+            for order in orders {
+                let allowed = order.contains(&kind);
+                t.set_policy(now, &mut ep, Some(Policy::new(order.clone())));
+                assert_eq!(t.allows(&peer, &ble), allowed, "{kind:?} radio under {order:?}");
+            }
+            t.set_privacy(now, &mut ep, Privacy::RelayOnly { via: None });
+            assert!(!t.allows(&peer, &ble), "relay-only");
+        }
+    }
+
     /// NB-110 (NB110-6): only a radio connection proven to reach a peer (`radio_reaches`) is a path it is dialled on,
     /// beside its addresses: a hello or an offer proves who sent it, not who is at the other end of what carried it.
     /// A `via` that is no radio's is ignored; a member with no link is offered to again at once; this node's offers
@@ -3306,11 +3388,28 @@ mod tests {
         t.forget_radio(&ble);
         assert!(t.radio_targets(&pb).is_empty());
 
-        // Under a policy, a peer the radio reaches is dialled there last, after `fallback`; with `Bluetooth` off,
-        // never.
-        let orders = [(vec![PathKind::Direct, PathKind::Bluetooth], true), (vec![PathKind::Direct], false)];
-        for (order, over_radio) in orders {
+        // With no policy, an ESP-NOW radio's connection is dialled at once too (NB-142).
+        let (mut t, mut ep) = new(None);
+        t.set_radio_kind(PathKind::EspNow);
+        t.radio_reaches(now, &mut ep, pb, ble);
+        let offer = offer_from(&b, &me, Some(&key), 2, Role::Peer, vec![there]);
+        assert_eq!(t.handle_signal(now, &mut ep, inbox, &offer), Some(pb));
+        let sent: Vec<_> = std::iter::from_fn(|| ep.poll_transmit(now)).map(|x| x.dst).collect();
+        assert!(sent.contains(&Hop::Net(there)) && sent.contains(&ble), "{sent:?}");
+
+        // Under a policy, a peer the radio reaches is dialled there last, after `fallback`; with the radio's kind off,
+        // never: an ESP-NOW radio's connections need `EspNow` in it, not `Bluetooth`, and a Bluetooth radio's the
+        // other way round (NB-142).
+        let orders = [
+            (PathKind::Bluetooth, vec![PathKind::Direct, PathKind::Bluetooth], true),
+            (PathKind::Bluetooth, vec![PathKind::Direct], false),
+            (PathKind::Bluetooth, vec![PathKind::Direct, PathKind::EspNow], false),
+            (PathKind::EspNow, vec![PathKind::Direct, PathKind::EspNow], true),
+            (PathKind::EspNow, vec![PathKind::Direct, PathKind::Bluetooth], false),
+        ];
+        for (kind, order, over_radio) in orders {
             let (mut t, mut ep) = new(Some(Policy::new(order)));
+            t.set_radio_kind(kind);
             t.radio_reaches(now, &mut ep, pb, ble);
             let offer = offer_from(&b, &me, Some(&key), 2, Role::Peer, vec![there]);
             assert_eq!(t.handle_signal(now, &mut ep, inbox, &offer), Some(pb));

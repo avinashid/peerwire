@@ -77,6 +77,13 @@ and the commit that fixed it.
   acknowledged at that verdict even if an ACCEPT came first (`Disconnected`, counted in `Stats::connects_unacked`), so
   an ACCEPT forged from a gone member's address with the OPEN's overheard id no longer holds one of a board's unbound
   slots until the room proof's deadline (NB135-16).
+- **`PathKind::EspNow`** (NB-142): a link over ESP-NOW is of a kind of its own, no longer `PathKind::Bluetooth`. A radio
+  names its kind, `ble::Radio::kind` (new, default `Bluetooth`), and `espnow::EspNow` says `EspNow`: `Node::path_kind`
+  reports it, and a `Policy` must list it for links over the radio, ranked last as `Bluetooth` is; a policy of radio
+  kinds alone leaves the UDP socket unused, as `[Bluetooth]` did. An ESP-NOW node whose policy was
+  `[PathKind::Bluetooth]` must now list `EspNow`: with `Bluetooth` alone its radio carries no link, and the node logs a
+  warning. `Traversal::radio_kind` and `Traversal::set_radio_kind` are new. `PathKind` is `#[non_exhaustive]`, so a
+  `match` on it has a `_` arm already and no code breaks; neither radio kind is in a published crate yet.
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert

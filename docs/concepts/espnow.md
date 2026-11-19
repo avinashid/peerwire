@@ -15,7 +15,10 @@ frame of up to 250 bytes (1,470 with ESP-NOW v2 at both ends) to a MAC address, 
 acknowledges, or to every radio on the channel, with no access point and no association. Peerwire makes a Bluetooth
 radio of it (`ble::Radio`): adverts go out as broadcasts and connections are emulated over unicast frames, so
 everything a node does over Bluetooth runs unchanged on top: the room advert and its proof, Noise IK, sealed signals
-and datagrams, identity proofs, and the path's rank, below every UDP path (`PathKind::Bluetooth`).
+and datagrams, identity proofs, and the path's rank, below every UDP path. The path is of its own kind,
+`PathKind::EspNow` (NB-142), as the radio names it (`ble::Radio::kind`): `Node::path_kind` says so, and a policy must
+list it for links over ESP-NOW (`Policy::new([PathKind::EspNow])` for ESP-NOW alone); one that lists `Bluetooth`
+alone keeps them off, and the node logs a warning.
 
 | | ESP-NOW | Bluetooth LE (NimBLE on the same boards) |
 |---|---|---|
@@ -405,8 +408,8 @@ CHIP=esp32 FEATURES=espnow EXAMPLE=espnow_mesh ./build.sh
 
 ## Not yet
 
-- **Several radios at once:** a node has one radio, so a board links over Bluetooth or over ESP-NOW. Both, and a path
-  kind of ESP-NOW's own (`PathKind::EspNow`), need the core to take several.
+- **Several radios at once:** a node has one radio, so a board links over Bluetooth or over ESP-NOW. Both need the
+  core to take several; the path kinds are apart already (`PathKind::Bluetooth`, `PathKind::EspNow`).
 - **Values over 512 bytes:** the node's framing keeps GATT's 512, so a v2 frame carries one value at most.
 - **The rate:** frames go at ESP-NOW's default 1 Mbit/s, which carried 670 to 840 kbit/s on the NB-138 boards. At 54
   Mbit/s per peer (`esp_now_set_peer_rate_config`) they didn't link; a faster rate needs a way back to 1 Mbit/s, as

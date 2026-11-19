@@ -4,7 +4,7 @@
 //! Each board starts Wi-Fi as a station on no network, from a MAC address drawn at random at boot (`PW_ESPNOW_FIXED_MAC`
 //! when building keeps the chip's own), on the channel it hears wifi.sh's network on, or channel 11
 //! (`PW_ESPNOW_CHANNEL`), and joins room.sh's room ("esp32" if the flash names none) of the `lan_chat` app with
-//! ESP-NOW as its only path (`PathKind::Bluetooth`): its adverts go out as ESP-NOW broadcasts, and the node proves the
+//! ESP-NOW as its only path (`PathKind::EspNow`): its adverts go out as ESP-NOW broadcasts, and the node proves the
 //! room, does the Noise handshake and seals everything as over Bluetooth. A board with no clock takes the time from
 //! the first room member that links. Frames are 1470 B where both boards have ESP-NOW v2, else 250 B
 //! (`PW_ESPNOW_V1` keeps them to 250 B).
@@ -119,7 +119,7 @@ fn run() -> anyhow::Result<()> {
         .identity(identity)
         .config(config())
         .stun_servers(Vec::<String>::new())
-        .policy(Policy::new([PathKind::Bluetooth]))
+        .policy(Policy::new([PathKind::EspNow]))
         .bluetooth(radio)
         .bind(SocketAddr::from(([127, 0, 0, 1], PORT)))?;
     node.join_room(APP, &room);

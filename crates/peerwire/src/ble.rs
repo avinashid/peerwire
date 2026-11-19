@@ -10,7 +10,7 @@
 //! listener on the radio sees adverts that change every 15 minutes, sizes and timing, not who is in the room.
 
 use crate::signaling::Topic;
-use crate::traversal::Hop;
+use crate::traversal::{Hop, PathKind};
 use hmac::{Hmac, Mac};
 use peerwire_core::ble::{
     hs1_id, identity, Bucket, Fault, Input, Link, ADVERT_FULL as FULL, ADVERT_LEN, CHALLENGE_LEN as CHALLENGE,
@@ -137,6 +137,13 @@ pub trait Radio: Send {
     /// do: a copy from another device is then taken, and holds only that device's (NB110-10).
     fn address(&self) -> Option<DeviceId> {
         None
+    }
+    /// The kind of path the node's links over this radio take, which [`Node::path_kind`](crate::Node::path_kind)
+    /// reports and a [`Policy`](crate::Policy) must list for them: [`PathKind::Bluetooth`], the default, or
+    /// [`PathKind::EspNow`] for `espnow::EspNow`. Any other kind is taken as `Bluetooth`. Asked once, as the node is
+    /// built.
+    fn kind(&self) -> PathKind {
+        PathKind::Bluetooth
     }
     /// Takes a waker to wake whenever it queues an event, so a node asleep until its next timer
     /// ([`Node::set_waker`](crate::Node::set_waker), [`AsyncNode`](crate::AsyncNode)) polls at once. A driver that

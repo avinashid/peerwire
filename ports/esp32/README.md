@@ -272,7 +272,9 @@ on both (before the name moved to flash, over nostr.mom), with
 Boards on the same Wi-Fi channel link over Espressif's ESP-NOW frames, with no access
 point: `espnow::radio` is a Bluetooth radio for the node (`Builder::bluetooth`), with
 adverts as broadcasts and connections emulated over unicast frames, so the room proof,
-the Noise handshake and the sealing are the node's own, as over Bluetooth. Wi-Fi must be
+the Noise handshake and the sealing are the node's own, as over Bluetooth. Its links are
+of their own kind, `PathKind::EspNow` (NB-142), which a policy must list, as
+`Policy::new([PathKind::EspNow])` does for links over ESP-NOW alone. Wi-Fi must be
 started first, on no network (`wifi::start_on_channel`, or `wifi::start_on_channel_as`
 with `wifi::random_mac`, so the board's address changes at each boot) or on one, whose
 channel ESP-NOW then follows. The design, its limits and what a forged frame can do are
