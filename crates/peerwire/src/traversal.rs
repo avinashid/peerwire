@@ -776,6 +776,9 @@ pub struct Traversal<A: Address> {
     opened: Bucket,
     /// Pipe batches from room members, opened and not yet taken ([`poll_piped`](Traversal::poll_piped)).
     piped: VecDeque<(PeerId, Vec<u8>)>,
+    /// When the inbox last dropped a message unread, its budget spent, or a batch past `MAX_PIPED`
+    /// ([`inbox_missed_at`](Traversal::inbox_missed_at)).
+    inbox_missed: Option<Instant>,
     privacy: Privacy,
     /// The room Host a relay-only node picked as its relay (with no `via` and no
     /// pinned host): the first it dialled. Kept while that dial or link lasts.
@@ -854,6 +857,7 @@ impl<A: Address> Traversal<A> {
             offers: Bucket::default(),
             opened: Bucket::default(),
             piped: VecDeque::new(),
+            inbox_missed: None,
             privacy: Privacy::Direct,
             picked: None,
             radio_punch_at: Instant::ZERO,
@@ -1342,14 +1346,18 @@ impl<A: Address> Traversal<A> {
         } else if topic == self.inbox {
             // Spent before the open, the costly part, so a flood of junk waits like the rest.
             if !self.opened.take(now, INBOX_BURST, INBOX_REFILL) {
+                self.inbox_missed = Some(now);
                 return None;
             }
             let (from, body) = sealed::open(&self.me, payload)?;
             // A pipe batch (JSON; offers start with their version, 1 to 3): kept for the host only as `takes_pipe`
             // says, and while it takes them (see `poll_piped`).
             if body.first() == Some(&b'{') {
-                if self.takes_pipe(&from) && self.piped.len() < MAX_PIPED {
-                    self.piped.push_back((from, body));
+                if self.takes_pipe(&from) {
+                    match self.piped.len() < MAX_PIPED {
+                        true => self.piped.push_back((from, body)),
+                        false => self.inbox_missed = Some(now),
+                    }
                 }
                 return None;
             }
@@ -1387,10 +1395,16 @@ impl<A: Address> Traversal<A> {
         self.piped.pop_front()
     }
 
+    /// When this node's inbox last dropped a message unread: its budget for opening them was spent, or a pipe batch
+    /// came past [`MAX_PIPED`] waiting. A pipe whose peer said nothing since is no sign the peer has gone (NB-136).
+    pub(crate) fn inbox_missed_at(&self) -> Option<Instant> {
+        self.inbox_missed
+    }
+
     /// Whether a pipe batch from `from` is taken: only where this node would link with it, from a member of the
     /// current room in a role it links with (and the host, if it expects one), with [`PathKind::Signaling`] allowed
     /// (no policy, or one listing it) and the node not relay-only. Not from a peer it merely dialled from an invite.
-    fn takes_pipe(&self, from: &PeerId) -> bool {
+    pub(crate) fn takes_pipe(&self, from: &PeerId) -> bool {
         let Some(room) = &self.room else { return false };
         let member = self.remotes.get(from).and_then(|r| r.member);
         let linked =

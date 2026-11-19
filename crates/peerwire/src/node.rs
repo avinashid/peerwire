@@ -959,7 +959,9 @@ impl Node {
                     take_batch(&mut self.pipes, &mut self.ep, now, from, &body);
                 }
             }
+            self.pipes.missed(now, sig.missed(), self.trav.inbox_missed_at());
         }
+        self.admit_held(now, wall);
         #[cfg(feature = "ble")]
         self.poll_ble(now);
         if self.ep.poll_timeout().is_some_and(|t| t <= now) {
@@ -1156,6 +1158,14 @@ impl Node {
         self.udp_off = off;
     }
 
+    /// Sets the most pipes open at once, as on an ESP32 (4) where the default is 64: a test's (feature `testing`).
+    /// Not for apps.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn set_max_pipes(&mut self, max: usize) {
+        self.pipes.set_max(max);
+    }
+
     /// The radio's connections: open, proven and bound to a peer (features `ble` and `testing`). Not for apps.
     #[cfg(all(feature = "ble", any(test, feature = "testing")))]
     #[doc(hidden)]
@@ -1274,6 +1284,28 @@ impl Node {
         while let Some((peer, body)) = self.pipes.take(now) {
             if let Some(sealed) = self.trav.seal_to(&peer, body.as_bytes()) {
                 sig.publish(Topic::peer(&peer), &sealed);
+            }
+        }
+    }
+
+    /// Lets in the newcomers' batches held while every pipe was taken ([`Pipes::admit`]) as pipes free, each handed
+    /// to the endpoint as [`take_batch`] would. A link whose pipe one takes, its peer quiet for [`pipe::quiet`] while
+    /// the node missed nothing, ends as timed out: dropped from the core with nothing sent, and reported so (NB-136).
+    fn admit_held(&mut self, now: peerwire_core::Instant, wall: Instant) {
+        let quiet = pipe::quiet(self.ep.config());
+        loop {
+            let (ep, trav) = (&self.ep, &self.trav);
+            let heard = |p: &PeerId| ep.is_connected(p).then(|| ep.last_heard(p).unwrap_or(now));
+            let Some(a) = self.pipes.admit(now, quiet, |p| trav.takes_pipe(p), heard) else { break };
+            if let Some((peer, silent)) = a.gone {
+                #[cfg(any(feature = "ble", feature = "nostr"))]
+                log::info!("pipes: a peer silent for {} s gave its pipe to a newcomer", silent.as_secs());
+                let _ = silent;
+                self.ep.abandon(&peer);
+                self.take_event(now, wall, Ev::Disconnected { peer, reason: DisconnectReason::Timeout }, &[]);
+            }
+            for d in &a.datagrams {
+                self.ep.handle_datagram_from(now, Hop::Pipe(a.addr), &a.peer, d);
             }
         }
     }
@@ -1449,10 +1481,18 @@ impl Node {
 /// Hands the datagrams of a pipe batch from `from` (a room member: see `Traversal::handle_signal`) to the endpoint,
 /// as from `from`'s pipe ([`Pipes::open`]), bound to `from`: a packet there for another peer's link, or a handshake
 /// from anyone else, is dropped (`Stats::rx_wrong_peer`), so a member can't carry others' packets onto its pipe.
-/// Dropped if the batch is malformed, or no pipe is free.
+/// Dropped if the batch is malformed; held if every pipe is taken by a linked peer (`Node::admit_held`).
 fn take_batch(pipes: &mut Pipes, ep: &mut Endpoint<Addr>, now: peerwire_core::Instant, from: PeerId, body: &[u8]) {
     let Some(datagrams) = pipe::decode(body) else { return };
-    let Some(at) = pipes.open(now, from, |p| ep.is_connected(p)) else { return };
+    let Some(at) = pipes.open(now, from, |p| ep.is_connected(p)) else {
+        let again = pipes.hold(now, from, datagrams);
+        #[cfg(any(feature = "ble", feature = "nostr"))]
+        if !again {
+            log::info!("pipes: all taken by linked peers; a newcomer's batch is held");
+        }
+        let _ = again;
+        return;
+    };
     for d in datagrams {
         ep.handle_datagram_from(now, Hop::Pipe(at), &from, &d);
     }

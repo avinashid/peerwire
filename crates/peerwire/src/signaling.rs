@@ -65,6 +65,12 @@ pub trait Signaling: Send {
     fn publish(&mut self, topic: Topic, payload: &[u8]);
     /// The next message that arrived, if any.
     fn poll(&mut self) -> Option<(Topic, Vec<u8>)>;
+    /// A count that goes up whenever this carrier may have lost a message on its way to [`poll`](Signaling::poll),
+    /// as far as it can tell: one dropped for a full inbox, say, or sent while a connection was down. A node takes a
+    /// pipe's silence as a sign its peer has gone only while this stands still (NB-136). The default: 0, never.
+    fn missed(&self) -> u64 {
+        0
+    }
 }
 
 /// An in-process signaling hub, for tests and for peers in one process.
@@ -182,6 +188,11 @@ impl Signaling for MultiSignaling {
             }
         }
         None
+    }
+
+    /// The carriers' together.
+    fn missed(&self) -> u64 {
+        self.carriers.iter().fold(0, |n, c| n.wrapping_add(c.missed()))
     }
 }
 

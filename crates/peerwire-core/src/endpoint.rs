@@ -1135,6 +1135,15 @@ impl<A: Address> Endpoint<A> {
         }
     }
 
+    /// When the link to a connected peer last took a packet from it that authenticated and was new, not a replay:
+    /// data, a keepalive, an answer to one. `Config::idle_timeout` after it, the link times out.
+    pub fn last_heard(&self, peer: &PeerId) -> Option<Instant> {
+        match &self.sessions.get(self.peers.get(peer)?)?.state {
+            State::Live(l) => Some(l.last_recv),
+            State::Dialing(_) => None,
+        }
+    }
+
     /// Round-trip time over the path the link to a connected peer is on, measured
     /// since it moved there: by the handshake, acknowledgements of data sent over it
     /// and latency probes. Unlike [`rtt`](Endpoint::rtt), it starts afresh on each path.
@@ -5512,5 +5521,41 @@ mod tests {
         assert!(s.punch.is_some() && s.race.is_none());
         assert!(s.candidates.contains(&Tr(2 | TR)) && !s.candidates.contains(&Tr(2)), "{:?}", s.candidates);
         assert!(tr_events(&mut eps[0]).is_empty());
+    }
+
+    /// NB-136: `last_heard` is when the link last took a packet of the peer's that authenticated and was new. A copy
+    /// of one, or a packet that doesn't open, leaves it where it was; a peer not linked has none.
+    #[test]
+    fn last_heard_moves_only_on_a_new_authenticated_packet() {
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b) = (ids[0].peer_id(), ids[1].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().enumerate().map(|(i, id)| Endpoint::new(id, Config::default(), [i as u8; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        assert_eq!(eps[1].last_heard(&a), None);
+        eps[0].connect(t, 2, b).unwrap();
+        route(&mut eps, &mut t, 300, None);
+        let linked = eps[1].last_heard(&a).expect("linked");
+        assert!(linked <= t);
+        // Silence: it stays (the keepalive is 10 s off).
+        route(&mut eps, &mut t, 2000, None);
+        assert_eq!(eps[1].last_heard(&a), Some(linked));
+        t = t + Duration::from_millis(10);
+        eps[0].send(&b, Lane::Reliable, b"hi").unwrap();
+        let data: Vec<_> = std::iter::from_fn(|| eps[0].poll_transmit(t)).map(|tx| tx.payload).collect();
+        assert!(!data.is_empty());
+        for d in &data {
+            eps[1].handle_datagram(t, 1, d);
+        }
+        assert_eq!(eps[1].last_heard(&a), Some(t), "data heard");
+        let later = t + Duration::from_millis(500);
+        for d in &data {
+            eps[1].handle_datagram(later, 1, d); // a copy
+            let mut junk = d.clone();
+            *junk.last_mut().unwrap() ^= 1; // fails its tag
+            eps[1].handle_datagram(later, 1, &junk);
+        }
+        assert_eq!(eps[1].last_heard(&a), Some(t), "copies and forgeries leave it");
+        assert_eq!(eps[1].last_heard(&ids[1].peer_id()), None);
     }
 }

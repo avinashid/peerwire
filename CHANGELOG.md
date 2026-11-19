@@ -210,6 +210,14 @@ and the commit that fixed it.
   20.5), 17 KB held after forgetting (was ~35), and no aborts.
 - `peerwire`: `NostrSignaling` reads a held relay message through a 256 B scratch, so one read in tiny pieces takes
   linear time (128 KiB a byte at a time: 2.0 ms, was 92.5 ms) (NB-128).
+- **Fix,** `peerwire`: a board's fifth page links once a pipe frees, rather than giving up (NB-136). With every pipe
+  taken by a linked peer (4 on an ESP32), a newcomer's batch is held, its last one, for 10 s, rather than dropped, and
+  let in as soon as a pipe frees: a link that ended, or one whose peer has gone quiet, heard nothing from for halfway
+  from `keepalive` to `idle_timeout` (20 s by default) while the node missed nothing sent to it (its inbox dropped
+  nothing unread, and the carrier counted nothing lost). That link ends as `Timeout`. A linked peer heard from lately
+  never gives way, and a pipe with a handshake under way keeps it for 5 s. `Endpoint::last_heard` gives when a link
+  last took a new authenticated packet, and `Signaling::missed` (0 by default; `NostrSignaling` counts events dropped
+  for a full inbox and its time without a relay) what a carrier may have lost.
 
 ## Unreleased: `@peerwire/js`
 
@@ -228,6 +236,9 @@ and the commit that fixed it.
   Its `role` option (`'peer'`, the default, `'host'` or `'client'`, as Rust's `Role`) is the role its hello says, and
   it lists only the native peers that role may link with. The `led.html` demo joins as a client, so a second phone's
   page links with the board, not with the first phone's page (NB-129).
+- The `led.html` demo says goodbye to the board when it stops or the page goes (best effort on `pagehide`), so the board
+  frees its place for the next page at once, and says the board may be busy when it heard one that didn't answer
+  (NB-136).
 - **Fix:** `DEFAULT_RELAYS` are `wss://relay.primal.net`, `wss://relay.nostr.net` and `wss://nostr.oxtr.dev`, three
   operators. nos.lol and nostr.mom, two of the three before, now drop our events (signalling and `openInbox` drops
   alike) with no `OK` and pass none on (NB-130). A page on 0.3 still meets one on the new list over relay.primal.net.
