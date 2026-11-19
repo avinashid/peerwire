@@ -290,8 +290,11 @@ FEATURES=ble EXAMPLE=espnow_probe ./build.sh     # the radio measured: round tri
 `espnow_mesh` joins room.sh's room ("esp32" if none) on the channel it hears wifi.sh's
 network on, or 11 (`PW_ESPNOW_CHANNEL`), sends each linked board a numbered message every
 second, and logs an `ESPNOW_MESH report` every 10 s. `espnow_probe` measures two boards
-with no access point, at 54 Mbit/s, with one or both on an access point and with Bluetooth on,
-and prints an `ESPNOW_RESULT` line for each mode and size. Both have run on an ESP32-C3 and an
+with no access point, at 11 Mbit/s (802.11b) and at 6, 24 and 54 Mbit/s (802.11g), with one or
+both on an access point and with Bluetooth on, and prints an `ESPNOW_RESULT` line for each mode
+and size, and for each rate mode `ESPNOW_RATE_COUNTS` lines on both boards (frames sent,
+acknowledged and received, by the rate they came at), which say where one that doesn't sync
+fails (NB-142). Both have run on an ESP32-C3 and an
 ESP32: the probe in NB-138, and `espnow_mesh` for 5 minutes in NB-139, built before the
 security review's second round; what they measured is in ESP-NOW's Limits section.
 

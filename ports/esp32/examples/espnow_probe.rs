@@ -16,20 +16,39 @@
 //! - a flood: 2 s of frames one way, up to 16 not yet acknowledged by the radio at once; the responder counts them in
 //!   its receive callback, and `fps` is the frames it got over the time between the first and the last.
 //!
-//! The modes, in order: `a` no access point; `a54` the same at 54 Mbit/s (802.11g) rather than ESP-NOW's default 1;
+//! The modes, in order: `a` no access point; `a11`, `a6`, `a24` and `a54`, the rate modes, the same with both boards
+//! sending to each other at 11 Mbit/s (802.11b), then 6, 24 and 54 Mbit/s (802.11g), rather than ESP-NOW's default 1;
 //! `b1` the initiator on the access point, the responder not; `b2` both on it; `c2` both on it with Bluetooth LE
 //! advertising and scanning (the port's own NimBLE driver, as a Peerwire node runs it); `c` both off it again, with
 //! Bluetooth still on. A board that can't join stays off the access point, and the result lines say which boards were
 //! on it (`ap=initiator/responder`) and which had Bluetooth on (`ble=`).
 //!
+//! The initiator starts a mode with `PHASE` frames (the mode's number) and pings until the responder answers a ping in
+//! the mode, and gives up on it after 120 s (a board may be joining the access point), a rate mode after 30 s. In a
+//! rate mode the pings and their answers go at the mode's rate, so an answer shows the rate works both ways, and the
+//! `PHASE`s and the responder's `PACK`s go at the default rate too, broadcast (the broadcast entry keeps that rate):
+//! both boards take the mode up even when the rate fails one way, and their counts show which way. The modes after go
+//! at the default rate again.
+//!
 //! It prints one `ESPNOW_RESULT` line per mode and size on the initiator, an `ESPNOW_RX` line per flood on the
-//! responder, and `ESPNOW_DONE` on both at the end:
+//! responder, an `ESPNOW_RATE_COUNTS` line on both every 5 s while a rate mode waits and once as it ends, and
+//! `ESPNOW_DONE` on both at the end:
 //!
 //! ```text
 //! ESPNOW_RESULT mode=a ch=11 size=250 n=300 ok=300 loss=0.00% p50_us=.. p90_us=.. p99_us=.. max_us=.. cb_p50_us=..
 //!   cb_p99_us=.. fps=.. kbps=.. flood_sent=.. flood_rcvd=.. flood_loss=..% tx_fail=.. nomem=.. dup=.. ooo=..
 //!   rssi=.. peer_rssi=.. ap=1/0 ble=0/0 txp=.. heap=..
+//! ESPNOW_RATE_COUNTS mode=a54 role=initiator rate=54M at=wait secs=5 synced=0 sent=.. tx_ok=.. tx_fail=..
+//!   send_err=.. rcvd=.. rx_rates=1M:..,54M:.. rssi=.. sync_sent=.. sync_heard=..
 //! ```
+//!
+//! `ESPNOW_RATE_COUNTS` counts on this board from when it took the mode up (`at=end` the whole mode, measurements
+//! too): `sent` the unicast frames ESP-NOW took, `tx_ok` and `tx_fail` its verdicts on them (ok: the peer's radio
+//! acknowledged the frame), `send_err` the frames it refused; `rcvd` the frames from the peer, `rx_rates` them by the
+//! rate they came at (the receive callback's `rx_ctrl`; `ht` for 802.11n) and `rssi` their mean; `sync_sent` and
+//! `sync_heard` the mode's handshake, both copies: the initiator's `PHASE`s and the `PACK`s it heard, the responder's
+//! `PACK`s and the `PHASE`s it heard. `synced` (the initiator's line only) is 1 once the responder answered a ping in
+//! the mode. The responder's `at=wait` lines stop when the `PHASE`s do: the initiator sends them until it is answered.
 //!
 //! Build it with `FEATURES=ble EXAMPLE=espnow_probe ./build.sh` (`CHIP=esp32` for the original ESP32): Bluetooth
 //! needs ESP-IDF built with NimBLE. The NB-135 kit writes the config sector and runs both boards.
@@ -76,6 +95,10 @@ const WINDOW: u32 = 16;
 const JOIN_WITHIN: Duration = Duration::from_secs(40);
 /// How long the initiator waits for the responder to take up a mode (it may be joining the access point).
 const SYNC_WITHIN: Duration = Duration::from_secs(120);
+/// The same in a rate mode, which joins nothing: one whose rate fails gives up soon, and the run goes on.
+const RATE_SYNC_WITHIN: Duration = Duration::from_secs(30);
+/// Between a rate mode's `at=wait` counts.
+const COUNTS_EVERY: Duration = Duration::from_secs(5);
 /// A paired responder that hears nothing from its initiator this long ends.
 const LOST_AFTER: Duration = Duration::from_secs(300);
 const HELLO_EVERY: Duration = Duration::from_millis(300);
@@ -103,21 +126,65 @@ const BLE_ON: u8 = 2;
 /// What one mode asks of the boards.
 struct Mode {
     name: &'static str,
-    /// 54 Mbit/s 802.11g to the peer, rather than ESP-NOW's 1 Mbit/s.
-    fast: bool,
+    /// The rate to the peer in a rate mode, rather than ESP-NOW's default 1 Mbit/s.
+    rate: Option<Rate>,
     /// On the access point: the initiator, the responder.
     ap: [bool; 2],
     ble: bool,
 }
 
-const MODES: [Mode; 6] = [
-    Mode { name: "a", fast: false, ap: [false, false], ble: false },
-    Mode { name: "a54", fast: true, ap: [false, false], ble: false },
-    Mode { name: "b1", fast: false, ap: [true, false], ble: false },
-    Mode { name: "b2", fast: false, ap: [true, true], ble: false },
-    Mode { name: "c2", fast: false, ap: [true, true], ble: true },
-    Mode { name: "c", fast: false, ap: [false, false], ble: true },
+impl Mode {
+    /// How long the initiator waits for the responder to take the mode up.
+    fn sync_within(&self) -> Duration {
+        if self.rate.is_some() {
+            RATE_SYNC_WITHIN
+        } else {
+            SYNC_WITHIN
+        }
+    }
+}
+
+/// A rate to the peer: the PHY mode and the rate's code.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Rate {
+    phy: sys::wifi_phy_mode_t,
+    code: sys::wifi_phy_rate_t,
+}
+
+const B11: Rate = Rate { phy: sys::wifi_phy_mode_t_WIFI_PHY_MODE_11B, code: sys::wifi_phy_rate_t_WIFI_PHY_RATE_11M_L };
+const G6: Rate = Rate { phy: sys::wifi_phy_mode_t_WIFI_PHY_MODE_11G, code: sys::wifi_phy_rate_t_WIFI_PHY_RATE_6M };
+const G24: Rate = Rate { phy: sys::wifi_phy_mode_t_WIFI_PHY_MODE_11G, code: sys::wifi_phy_rate_t_WIFI_PHY_RATE_24M };
+const G54: Rate = Rate { phy: sys::wifi_phy_mode_t_WIFI_PHY_MODE_11G, code: sys::wifi_phy_rate_t_WIFI_PHY_RATE_54M };
+
+/// The rate modes go lowest risk first: 802.11b's 11 Mbit/s, then 802.11g's (OFDM) 6, 24 and 54.
+const MODES: [Mode; 9] = [
+    Mode { name: "a", rate: None, ap: [false, false], ble: false },
+    Mode { name: "a11", rate: Some(B11), ap: [false, false], ble: false },
+    Mode { name: "a6", rate: Some(G6), ap: [false, false], ble: false },
+    Mode { name: "a24", rate: Some(G24), ap: [false, false], ble: false },
+    Mode { name: "a54", rate: Some(G54), ap: [false, false], ble: false },
+    Mode { name: "b1", rate: None, ap: [true, false], ble: false },
+    Mode { name: "b2", rate: None, ap: [true, true], ble: false },
+    Mode { name: "c2", rate: None, ap: [true, true], ble: true },
+    Mode { name: "c", rate: None, ap: [false, false], ble: true },
 ];
+
+/// The rates by their codes, `wifi_phy_rate_t`'s, which `rx_ctrl` gives an 802.11b or g frame's in too (`s`: 802.11b's
+/// short preamble); the selftest checks the ones the modes use against the bindings.
+const RATE_NAMES: [&str; 16] =
+    ["1M", "2M", "5.5M", "11M", "r4", "2Ms", "5.5Ms", "11Ms", "48M", "24M", "12M", "6M", "54M", "36M", "18M", "9M"];
+/// [`RX_RATE`]'s slot for frames not 802.11b or g; the others are by rate code, the 5 bits `rx_ctrl` gives.
+const HT: usize = 32;
+const RATE_SLOTS: usize = HT + 1;
+
+/// A rate's name by its code, or [`RX_RATE`]'s slot.
+fn rate_name(slot: usize) -> String {
+    match RATE_NAMES.get(slot) {
+        Some(name) => (*name).to_string(),
+        None if slot == HT => "ht".to_string(),
+        None => format!("r{slot}"),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
@@ -224,6 +291,64 @@ static FOREIGN: AtomicU32 = AtomicU32::new(0);
 static TX_OK: AtomicU32 = AtomicU32::new(0);
 static TX_FAIL: AtomicU32 = AtomicU32::new(0);
 static COUNTS: Counts = Counts::new();
+/// Unicast frames ESP-NOW took, and frames it refused (to any address), for the rate modes' counts.
+static SENT: AtomicU32 = AtomicU32::new(0);
+static SEND_ERR: AtomicU32 = AtomicU32::new(0);
+/// The peer's MAC address, its last four bytes (0 before there is one), and the frames from it, counted in the receive
+/// callback with their RSSI's sum and by the rate they came at, for the rate modes' counts.
+static PEER_TAIL: AtomicU32 = AtomicU32::new(0);
+static RX_PEER: AtomicU32 = AtomicU32::new(0);
+static RX_RSSI: AtomicI32 = AtomicI32::new(0);
+static RX_RATE: [AtomicU32; RATE_SLOTS] = [const { AtomicU32::new(0) }; RATE_SLOTS];
+
+fn tail(mac: &[u8; 6]) -> u32 {
+    u32::from_le_bytes([mac[2], mac[3], mac[4], mac[5]])
+}
+
+/// The counters a rate mode's counts are made of, at one time.
+struct Totals {
+    sent: u32,
+    send_err: u32,
+    tx_ok: u32,
+    tx_fail: u32,
+    rcvd: u32,
+    rssi: i32,
+    rates: [u32; RATE_SLOTS],
+}
+
+impl Totals {
+    fn now() -> Totals {
+        Totals {
+            sent: SENT.load(Relaxed),
+            send_err: SEND_ERR.load(Relaxed),
+            tx_ok: TX_OK.load(Relaxed),
+            tx_fail: TX_FAIL.load(Relaxed),
+            rcvd: RX_PEER.load(Relaxed),
+            rssi: RX_RSSI.load(Relaxed),
+            rates: std::array::from_fn(|i| RX_RATE[i].load(Relaxed)),
+        }
+    }
+}
+
+/// A rate mode's counts on this board, from when it took the mode up.
+struct Tally {
+    start: Instant,
+    /// When the next `at=wait` line is due.
+    next: Instant,
+    base: Totals,
+    sync_sent: u32,
+    sync_heard: u32,
+    /// The initiator: the responder hasn't answered a ping in the mode yet. The responder: a `PHASE` came since the
+    /// last `at=wait` line (the initiator sends them until it is answered).
+    waiting: bool,
+}
+
+impl Tally {
+    fn new() -> Tally {
+        let start = Instant::now();
+        Tally { start, next: start + COUNTS_EVERY, base: Totals::now(), sync_sent: 0, sync_heard: 0, waiting: true }
+    }
+}
 
 /// A flood's frames, counted in the receive callback, so the count is the radio's and not the main task's. Only the
 /// Wi-Fi task writes it; the main task reads it once the flood's end has come through the queue after its frames. The
@@ -315,8 +440,8 @@ impl Counts {
     }
 }
 
-/// ESP-NOW's receive callback, on the Wi-Fi task: counts flood frames, and queues our other frames for the main task
-/// (dropping them when the queue is full) without blocking.
+/// ESP-NOW's receive callback, on the Wi-Fi task: counts the peer's frames and flood frames, and queues our other
+/// frames for the main task (dropping them when the queue is full) without blocking.
 unsafe extern "C" fn on_recv(info: *const sys::esp_now_recv_info_t, data: *const u8, len: c_int) {
     let at = unsafe { sys::esp_timer_get_time() };
     if info.is_null() || data.is_null() || len <= 0 {
@@ -331,12 +456,23 @@ unsafe extern "C" fn on_recv(info: *const sys::esp_now_recv_info_t, data: *const
         FOREIGN.fetch_add(1, Relaxed);
         return;
     };
-    let rssi = if info.rx_ctrl.is_null() { 0 } else { unsafe { (*info.rx_ctrl).rssi() as i8 } };
+    let ctrl = if info.rx_ctrl.is_null() { None } else { Some(unsafe { &*info.rx_ctrl }) };
+    let rssi = ctrl.map_or(0, |c| c.rssi() as i8);
+    let from = unsafe { *(info.src_addr as *const [u8; 6]) };
+    let peer = PEER_TAIL.load(Relaxed);
+    if peer != 0 && tail(&from) == peer {
+        RX_PEER.fetch_add(1, Relaxed);
+        RX_RSSI.fetch_add(i32::from(rssi), Relaxed);
+        if let Some(c) = ctrl {
+            // sig_mode 0: 802.11b or g, whose rate `rate` gives.
+            let slot = if c.sig_mode() == 0 { (c.rate() & 31) as usize } else { HT };
+            RX_RATE[slot].fetch_add(1, Relaxed);
+        }
+    }
     if h.kind == FLOOD {
         COUNTS.count(data[HEADER], h.seq, data.len(), at, rssi);
         return;
     }
-    let from = unsafe { *(info.src_addr as *const [u8; 6]) };
     if let Some(tx) = RX.get() {
         if tx.try_send(Rx { from, at, rssi, data: data.to_vec() }).is_err() {
             RX_DROPPED.fetch_add(1, Relaxed);
@@ -373,8 +509,16 @@ fn add_peer(mac: [u8; 6]) -> anyhow::Result<()> {
 /// Sends `frame` to `to`; ESP-IDF's error if it didn't take it.
 fn send(to: &[u8; 6], frame: &[u8]) -> Result<(), sys::esp_err_t> {
     match unsafe { sys::esp_now_send(to.as_ptr(), frame.as_ptr(), frame.len()) } {
-        sys::ESP_OK => Ok(()),
-        e => Err(e),
+        sys::ESP_OK => {
+            if *to != BROADCAST {
+                SENT.fetch_add(1, Relaxed);
+            }
+            Ok(())
+        }
+        e => {
+            SEND_ERR.fetch_add(1, Relaxed);
+            Err(e)
+        }
     }
 }
 
@@ -437,6 +581,15 @@ fn selftest() -> anyhow::Result<()> {
     let sorted: Vec<u32> = (1..=200).collect();
     ensure!(pct(&sorted, 50) == 100 && pct(&sorted, 99) == 198 && pct(&sorted, 100) == 200, "percentiles");
     ensure!(pct(&[], 50) == -1 && pct(&[7], 99) == 7, "percentiles of 0 and 1");
+    for (code, name) in [
+        (sys::wifi_phy_rate_t_WIFI_PHY_RATE_1M_L, "1M"),
+        (B11.code, "11M"),
+        (G6.code, "6M"),
+        (G24.code, "24M"),
+        (G54.code, "54M"),
+    ] {
+        ensure!(rate_name(code as usize) == name, "rate {code} named {}, not {name}", rate_name(code as usize));
+    }
     info!("ESPNOW_SELFTEST ok");
     Ok(())
 }
@@ -490,7 +643,10 @@ struct Probe {
     peer: Option<Peer>,
     mode: usize,
     on_ap: bool,
-    fast: bool,
+    /// The rate to the peer, `None` for ESP-NOW's default.
+    rate: Option<Rate>,
+    /// The counts of the rate mode this board is in.
+    tally: Option<Tally>,
     ble: Option<Nimble>,
     ble_seen: u32,
     seq: u32,
@@ -582,7 +738,8 @@ fn run() -> anyhow::Result<()> {
         peer: None,
         mode: 0,
         on_ap: false,
-        fast: false,
+        rate: None,
+        tally: None,
         ble: None,
         ble_seen: 0,
         seq: 0,
@@ -653,6 +810,7 @@ impl Probe {
             warn!("ESPNOW_PEER {e}");
             return;
         }
+        PEER_TAIL.store(tail(&mac), Relaxed);
         let known = self.peer.is_some_and(|p| p.mac == mac && p.tag == tag);
         if !known {
             let again = self.peer.is_some_and(|p| p.mac == mac);
@@ -708,14 +866,66 @@ impl Probe {
         }
     }
 
+    /// This board's `ESPNOW_RATE_COUNTS` line for the rate mode it is in, of `t`: `at` is `wait` or `end`.
+    fn rate_counts(&self, t: &Tally, at: &str) {
+        let (now, base) = (Totals::now(), &t.base);
+        let rcvd = now.rcvd.wrapping_sub(base.rcvd);
+        let rates: Vec<String> = (0..RATE_SLOTS)
+            .filter_map(|i| {
+                let n = now.rates[i].wrapping_sub(base.rates[i]);
+                (n > 0).then(|| format!("{}:{n}", rate_name(i)))
+            })
+            .collect();
+        let synced = match self.role {
+            Role::Initiator => format!(" synced={}", u8::from(!t.waiting)),
+            Role::Responder => String::new(),
+        };
+        info!(
+            "ESPNOW_RATE_COUNTS mode={} role={} rate={} at={at} secs={}{synced} sent={} tx_ok={} tx_fail={} \
+             send_err={} rcvd={rcvd} rx_rates={} rssi={} sync_sent={} sync_heard={}",
+            MODES[self.mode].name,
+            self.role.name(),
+            MODES[self.mode].rate.map_or_else(|| "default".to_string(), |r| rate_name(r.code as usize)),
+            t.start.elapsed().as_secs(),
+            now.sent.wrapping_sub(base.sent),
+            now.tx_ok.wrapping_sub(base.tx_ok),
+            now.tx_fail.wrapping_sub(base.tx_fail),
+            now.send_err.wrapping_sub(base.send_err),
+            if rates.is_empty() { "none".to_string() } else { rates.join(",") },
+            now.rssi.wrapping_sub(base.rssi) / rcvd.max(1) as i32,
+            t.sync_sent,
+            t.sync_heard
+        );
+    }
+
+    /// In a rate mode, an `at=wait` line every [`COUNTS_EVERY`] while this board waits for the other.
+    fn wait_counts(&mut self) {
+        let responder = self.role == Role::Responder;
+        let Some(t) = self.tally.as_mut().filter(|t| Instant::now() >= t.next) else { return };
+        t.next = Instant::now() + COUNTS_EVERY;
+        let waiting = t.waiting;
+        t.waiting &= !responder;
+        if let (true, Some(t)) = (waiting, &self.tally) {
+            self.rate_counts(t, "wait");
+        }
+    }
+
+    /// The rate mode's `at=end` line, once, as this board leaves the mode (or the run ends in it).
+    fn end_counts(&mut self) {
+        if let Some(t) = self.tally.take() {
+            self.rate_counts(&t, "end");
+        }
+    }
+
     /// Makes this board's part of mode `m` so: the rate to the peer, the access point, Bluetooth.
     fn apply(&mut self, m: usize) {
+        self.end_counts();
         let mode = &MODES[m];
         let side = usize::from(self.role == Role::Responder);
-        if mode.fast != self.fast {
+        if mode.rate != self.rate {
             if let Some(peer) = self.peer {
-                self.fast = mode.fast;
-                if let Err(e) = set_rate(peer.mac, mode.fast) {
+                self.rate = mode.rate;
+                if let Err(e) = set_rate(peer.mac, mode.rate) {
                     warn!("ESPNOW_RATE {e}");
                 }
             }
@@ -777,6 +987,7 @@ impl Probe {
             }
         }
         self.mode = m;
+        self.tally = mode.rate.map(|_| Tally::new());
     }
 
     // The initiator.
@@ -784,16 +995,17 @@ impl Probe {
     fn initiate(&mut self) -> anyhow::Result<()> {
         let started = Instant::now();
         let (mut results, mut skipped) = (0, 0);
-        for m in 0..MODES.len() {
-            let name = MODES[m].name;
+        for (m, mode) in MODES.iter().enumerate() {
+            let name = mode.name;
             info!("ESPNOW_MODE {name}: starting");
             self.apply(m);
             let Some(peer_state) = self.sync(m) else {
-                warn!("ESPNOW_MODE {name}: the responder didn't answer in {} s", SYNC_WITHIN.as_secs());
+                warn!("ESPNOW_MODE {name}: the responder didn't answer in {} s", mode.sync_within().as_secs());
                 for size in SIZES {
                     info!("ESPNOW_RESULT mode={name} size={size} skipped=no_sync");
                     skipped += 1;
                 }
+                self.end_counts();
                 continue;
             };
             for size in SIZES {
@@ -808,6 +1020,7 @@ impl Probe {
                 self.result(name, size, &pings, &flood, peer_state);
                 results += 1;
             }
+            self.end_counts();
         }
         // The responder ends too.
         let until = Instant::now() + Duration::from_secs(3);
@@ -843,11 +1056,18 @@ impl Probe {
 
     /// Pings until the responder answers in mode `m`, telling it the mode while it doesn't. The responder's state,
     /// or `None` if it didn't answer in time.
+    ///
+    /// In a rate mode the pings, the answer and the unicast `PHASE` go at the mode's rate (this board has taken it
+    /// up), so an answer shows the rate works both ways. A copy of the `PHASE` goes at the default rate too, broadcast,
+    /// so the responder takes the mode up even when the rate fails this way, and answers it at the default rate as
+    /// well: `sync_heard` then says it did. A mode the responder never answers in ends here, and the next one, at the
+    /// default rate again, reaches it as it did before.
     fn sync(&mut self, m: usize) -> Option<u8> {
         let start = Instant::now();
         let mut next = start;
-        while start.elapsed() < SYNC_WITHIN {
+        while start.elapsed() < MODES[m].sync_within() {
             self.drain_ble();
+            self.wait_counts();
             if Instant::now() >= next {
                 next = Instant::now() + Duration::from_millis(250);
                 if let Some(peer) = self.peer {
@@ -856,7 +1076,13 @@ impl Probe {
                     if m > 0 {
                         let mut f = self.frame(PHASE, MIN_FRAME);
                         f[HEADER] = m as u8;
-                        let _ = send(&peer.mac, &f);
+                        let mut sent = u32::from(send(&peer.mac, &f).is_ok());
+                        if MODES[m].rate.is_some() {
+                            sent += u32::from(send(&BROADCAST, &f).is_ok());
+                        }
+                        if let Some(t) = &mut self.tally {
+                            t.sync_sent += sent;
+                        }
                     }
                     let f = self.frame(PING, MIN_FRAME);
                     let _ = send(&peer.mac, &f);
@@ -864,7 +1090,15 @@ impl Probe {
             }
             let Some(rx) = self.wait(next) else { continue };
             match parse(&rx.data, self.group) {
+                Some(h) if h.kind == PACK && usize::from(rx.data[HEADER]) == m => {
+                    if let Some(t) = &mut self.tally {
+                        t.sync_heard += 1;
+                    }
+                }
                 Some(h) if h.kind == PONG && usize::from(h.mode) == m => {
+                    if let Some(t) = &mut self.tally {
+                        t.waiting = false;
+                    }
                     let state = rx.data[HEADER];
                     info!(
                         "ESPNOW_MODE {}: in step after {} ms, responder ap={} ble={}",
@@ -1050,6 +1284,7 @@ impl Probe {
         let mut logged = None;
         loop {
             self.drain_ble();
+            self.wait_counts();
             let now = Instant::now();
             // Hellos until the initiator is heard, and again whenever it goes quiet.
             if now >= next_hello && (self.peer.is_none() || heard.elapsed() >= QUIET) && !done {
@@ -1057,6 +1292,7 @@ impl Probe {
                 next_hello = now + HELLO_EVERY;
             }
             if self.peer.is_some() && !done && heard.elapsed() >= LOST_AFTER {
+                self.end_counts();
                 info!(
                     "ESPNOW_DONE role=responder status=lost quiet_s={} rx_dropped={} foreign={} {}",
                     heard.elapsed().as_secs(),
@@ -1134,18 +1370,29 @@ impl Probe {
                     let m = usize::from(rx.data[HEADER]);
                     let mut f = self.frame(PACK, MIN_FRAME);
                     f[HEADER] = m as u8;
-                    let _ = send(&rx.from, &f);
+                    // The first answer goes at the rate this board is at before it takes the mode up, the later ones
+                    // at the mode's. A rate mode's go at the default rate too, broadcast, so the initiator hears this
+                    // board took the mode up even when the rate fails this way: both boards then count the same mode.
+                    let mut sent = u32::from(send(&rx.from, &f).is_ok());
+                    if MODES.get(m).is_some_and(|mode| mode.rate.is_some()) {
+                        sent += u32::from(send(&BROADCAST, &f).is_ok());
+                    }
                     if m > self.mode && m < MODES.len() {
+                        self.end_counts();
                         info!("ESPNOW_MODE {}: starting", MODES[m].name);
                         self.apply(m);
                         info!("ESPNOW_MODE {}: ready, {}", MODES[m].name, heap());
                         heard = Instant::now();
+                    }
+                    if let Some(t) = self.tally.as_mut().filter(|_| m == self.mode) {
+                        (t.sync_sent, t.sync_heard, t.waiting) = (t.sync_sent + sent, t.sync_heard + 1, true);
                     }
                 }
                 DONE => {
                     let f = self.frame(DACK, MIN_FRAME);
                     let _ = send(&rx.from, &f);
                     if !done {
+                        self.end_counts();
                         info!(
                             "ESPNOW_DONE role=responder status=ok rx_dropped={} foreign={} {}",
                             RX_DROPPED.load(Relaxed),
@@ -1161,14 +1408,16 @@ impl Probe {
     }
 }
 
-/// 54 Mbit/s 802.11g to `peer`, or back to ESP-NOW's default rate (a peer entry made anew has it).
-fn set_rate(peer: [u8; 6], fast: bool) -> anyhow::Result<()> {
-    if fast {
-        let mut rate: sys::esp_now_rate_config_t = unsafe { std::mem::zeroed() };
-        rate.phymode = sys::wifi_phy_mode_t_WIFI_PHY_MODE_11G;
-        rate.rate = sys::wifi_phy_rate_t_WIFI_PHY_RATE_54M;
-        sys::esp!(unsafe { sys::esp_now_set_peer_rate_config(peer.as_ptr(), &mut rate) })?;
-        info!("ESPNOW_RATE 54 Mbit/s 802.11g to ..:{}", mac_tail(&peer));
+/// `rate` to `peer`, or back to ESP-NOW's default rate (a peer entry made anew has it) for `None`. Only the peer's
+/// entry changes: broadcasts keep the default rate.
+fn set_rate(peer: [u8; 6], rate: Option<Rate>) -> anyhow::Result<()> {
+    if let Some(r) = rate {
+        // ersu and dcm, 802.11ax's, stay off.
+        let mut config: sys::esp_now_rate_config_t = unsafe { std::mem::zeroed() };
+        (config.phymode, config.rate) = (r.phy, r.code);
+        sys::esp!(unsafe { sys::esp_now_set_peer_rate_config(peer.as_ptr(), &mut config) })?;
+        let std = if r.phy == sys::wifi_phy_mode_t_WIFI_PHY_MODE_11B { "b" } else { "g" };
+        info!("ESPNOW_RATE {} 802.11{std} to ..:{}", rate_name(r.code as usize), mac_tail(&peer));
     } else {
         sys::esp!(unsafe { sys::esp_now_del_peer(peer.as_ptr()) })?;
         add_peer(peer)?;

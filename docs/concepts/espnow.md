@@ -423,7 +423,10 @@ CHIP=esp32 FEATURES=espnow EXAMPLE=espnow_mesh ./build.sh
 - **Values over 512 bytes:** the node's framing keeps GATT's 512, so a v2 frame carries one value at most.
 - **The rate:** frames go at ESP-NOW's default 1 Mbit/s, which carried 670 to 840 kbit/s on the NB-138 boards. At 54
   Mbit/s per peer (`esp_now_set_peer_rate_config`) they didn't link; a faster rate needs a way back to 1 Mbit/s, as
-  a rate one end can't hear leaves a connection silent until it times out.
+  a rate one end can't hear leaves a connection silent until it times out. The probe now tries 11 Mbit/s (802.11b)
+  and 6, 24 and 54 Mbit/s (802.11g) in turn, each given up after 30 s, with its mode change also broadcast at 1
+  Mbit/s and counts on both boards of the frames sent, acknowledged and received by rate (`ESPNOW_RATE_COUNTS`), to
+  show where one fails (NB-142); it hasn't run on boards yet.
 - **More on boards:** the probe kept the frame size, the rate and the timers (NB-138), and one run of `espnow_mesh`
   showed a link's heap, the receive queue full and the time a failed try holds the air (NB-139), from before the
   review's second round; 4 connections at once, and the fixes since, haven't run on boards.
