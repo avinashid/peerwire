@@ -12,6 +12,7 @@
 //   waits for it instead). And one that closes once A has sent the whole file, while B still writes it: B finishes
 //   alone, and A learns it was delivered when they link again.
 // - Cancel by the receiver (nothing saved on disk) and by the sender (the download fails).
+// - A peer that leaves the room: what it was offered ends at once.
 // - A hostile peer: offers with a path in the name, a bad size, a flood of offers, an oversized control message,
 //   pieces for a transfer not accepted, out of order, and with a bad hash.
 //
@@ -365,6 +366,13 @@ async function checks(ctx) {
   const md = await memDl;
   check(await shaFile(await md.path()) === sha(directBuf), 'once the retry linked them directly, the file went, its SHA-256 matching (kept in memory, then saved)');
   check(await d.evaluate(() => window.share.stats.piecesTaken) === Math.ceil(directBuf.length / (512 * 1024)), 'D took exactly the file\'s pieces, all over the direct link');
+
+  // A peer that leaves the room (its page closed) won't come back as itself: what it was offered ends at once.
+  await offer(a, [{ name: 'gone.bin', mimeType: 'application/octet-stream', buffer: randomBytes(1000) }], D);
+  await d.waitForFunction(() => [...window.share.incoming.values()].some((t) => t.name === 'gone.bin'), null, WAIT);
+  await d.evaluate(() => window.share.room.leave());
+  await waitState(a, 'out', 'gone.bin', 'cancelled');
+  check(/left the room/.test(await row(a, 'out', 'gone.bin').locator('.state').textContent()), 'an offer to a peer that left the room ends at once, and says so');
 
   if (process.argv[2] && !process.argv[2].startsWith('--')) await a.screenshot({ path: path.join(process.argv[2], 'share.png') });
 }

@@ -12,11 +12,12 @@
 // signalling relays, another member or TURN. While a peer's route is anything else its transfers wait, and the page
 // says why. A direct link that closes ends its session in the room (room.js rtcClosed), so the pieces it had in flight
 // go nowhere; the peer comes back on a new link (direct or not), and the receiver says how many pieces it has written,
-// so the sender goes on from there, once the link is direct.
+// so the sender goes on from there, once the link is direct. A peer that leaves the room (its page closed or reloaded)
+// comes back as a new peer, if at all: its transfers end.
 //
 // Saving, in this order: the File System Access API (showSaveFilePicker, then a writable stream: Chrome and Edge on a
-// computer), else a download streamed through the service worker sw.js, else in memory as a Blob, for files up to
-// BLOB_MAX only. A file goes to disk (or the download completes) only once its whole SHA-256 matches; otherwise it is
+// computer), else a download streamed through the service worker sw.js (not in WebKit: see pickMode), else in memory
+// as a Blob, for files up to BLOB_MAX only. A file goes to disk (or the download completes) only once its whole SHA-256 matches; otherwise it is
 // dropped.
 //
 // Whatever members send is untrusted: names and types are cleaned and shown as text only (textContent), offers and
@@ -157,10 +158,13 @@ async function registerWorker() {
     return null;
   }
 }
+// WebKit (Safari, and every browser on iOS) doesn't reliably start a download a service worker streams into a frame,
+// and a stream nobody reads would stall the transfer: there, files are kept in memory unless ?save=download.
+const webkit = /AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg|Android/.test(navigator.userAgent);
 async function pickMode() {
   const canDisk = typeof globalThis.showSaveFilePicker === 'function';
   const reg = await sw;
-  saveMode = forced ?? (canDisk ? 'disk' : reg?.active ? 'download' : 'memory');
+  saveMode = forced ?? (canDisk ? 'disk' : reg?.active && !webkit ? 'download' : 'memory');
   $('save-mode').textContent = {
     disk: 'Files you accept are written straight to disk, where you choose, as they arrive.',
     download: 'Files you accept stream into your downloads as they arrive.',
@@ -321,9 +325,9 @@ function listen(r) {
     names.set(peer, cleanNick(presence?.name) || guest(peer));
     renderAll();
   });
-  r.on('peer-leave', (peer) => {
+  r.on('peer-leave', (peer, reason) => {
     if (r !== room) return;
-    left(peer);
+    left(peer, reason);
     renderAll();
   });
   r.on('message', (data, peer, info) => {
@@ -686,9 +690,16 @@ function abortIn(t, state, note) {
 
 // ----- peers coming and going -----
 
-function left(peer) {
+// A peer whose link dropped may come back with the same id; one that left the room (closed or reloaded its page)
+// comes back, if at all, as a new peer, so its transfers end now.
+function left(peer, reason) {
   const now = Date.now();
-  for (const t of [...outgoing.values(), ...incoming.values()]) if (t.peer === peer && live(t)) t.gone ??= now;
+  for (const t of [...outgoing.values(), ...incoming.values()]) {
+    if (t.peer !== peer || !live(t)) continue;
+    if (reason !== 'left') t.gone ??= now;
+    else if (t.dir === 'out') finish(t, 'cancelled', `${nameOf(peer)} left the room`);
+    else abortIn(t, 'cancelled', `${nameOf(peer)} left the room`);
+  }
 }
 
 function rejoined(peer) {
