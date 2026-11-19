@@ -809,8 +809,8 @@ impl Engine {
         true
     }
 
-    /// The connection and kind of each frame not on the air yet: waiting here, or with the ether, whose verdict hasn't
-    /// come. The caps count both, so an ether that holds frames doesn't take them out of the caps (NB135-15).
+    /// The connection and kind of each frame whose verdict hasn't come: waiting here, or with the ether, waiting there
+    /// or on the air. The caps count both, so an ether that holds frames doesn't take them out of the caps (NB135-15).
     fn held(&self) -> impl Iterator<Item = (Option<ConnId>, Kind)> + '_ {
         self.tx.iter().map(|o| (o.conn, o.kind)).chain(self.flight.iter().map(|s| (s.conn, s.kind)))
     }
