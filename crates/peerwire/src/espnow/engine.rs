@@ -245,7 +245,8 @@ impl Engine {
 
     /// Opens a connection to `device`: OPEN every [`Settings::open_every`] until it is accepted
     /// ([`RadioEvent::Connected`]), refused or [`Settings::connect_within`] passes ([`RadioEvent::ConnectFailed`]),
-    /// or at once if no radio acknowledges the first OPEN (NB135-12).
+    /// or at once if no radio acknowledges the first OPEN (NB135-12): then `Disconnected` if an ACCEPT came before
+    /// that verdict, as one forged from the address can (NB135-16).
     ///
     /// The limits don't refuse it: the node counts its own connects, and closes a connection that may be forged to
     /// make room for one (NB135-11), but the radio may hold one it hasn't heard of yet, and a connect failed for that

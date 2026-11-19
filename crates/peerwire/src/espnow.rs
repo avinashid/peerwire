@@ -56,7 +56,7 @@ pub struct Settings {
     /// How often an advert is broadcast.
     pub advert_every: Duration,
     /// How often an OPEN goes again while it isn't answered, and how long until a connect is given up; at once if no
-    /// radio acknowledged its first OPEN (NB135-12).
+    /// radio acknowledged its first OPEN, even if an ACCEPT came before that verdict (NB135-12, NB135-16).
     pub open_every: Duration,
     pub connect_within: Duration,
     /// A KEEPALIVE goes after this long with nothing sent on a connection, and a connection with nothing heard on it
