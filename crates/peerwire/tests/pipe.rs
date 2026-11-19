@@ -486,3 +486,36 @@ fn sec_a_flood_on_the_inbox_doesnt_make_a_page_that_is_there_look_gone() {
     assert!(pages[..4].iter().all(|p| n.status(&id(p)) == Status::Connected));
     assert_eq!(n.status(&newcomer), Status::Disconnected);
 }
+
+/// NB-136: the board run's churn on a 4-pipe node, its times scaled by `QUIET` / 20 s (0.225): a page loads every
+/// 1.5 s (6.5 s on the board), links, sends a command, and is closed 0.6 s after it linked with no goodbye, as
+/// visits.mjs's are, and gives up 3.4 s after it dials (the LED page's 15 s). Before NB-136 every fifth one met four
+/// closed pages still linked and was refused until the first timed out; now each links at its first try.
+#[test]
+fn page_visits_in_a_row_each_link_past_the_pipe_cap() {
+    let hub = MemoryHub::new();
+    let mut n = board(&hub);
+    let nid = n.peer_id();
+    let mut ev = vec![];
+    let window = QUIET.mul_f64(15.0 / 20.0);
+    let mut took = vec![];
+    for i in 0..12 {
+        let start = Instant::now();
+        let mut pages = Vec::new();
+        let page = arrive(&mut n, &hub, &mut pages, &mut ev);
+        let dialled = Instant::now();
+        let linked = run(&mut n, &mut pages, &mut ev, window.as_secs_f64(), || {}, |n, p, _| {
+            n.status(&page) == Status::Connected && p[0].ep.is_connected(&nid)
+        });
+        took.push(linked.then(|| dialled.elapsed().as_millis()));
+        assert!(linked, "visit {}: not linked in {window:?}; so far {took:?}", i + 1);
+        pages[0].ep.send(&nid, Lane::Reliable, b"led toggle").unwrap();
+        run(&mut n, &mut pages, &mut ev, 0.6, || {}, |_, _, _| false);
+        drop(pages); // closed, with no goodbye
+        let left = Duration::from_millis(1500).saturating_sub(start.elapsed());
+        run(&mut n, &mut [], &mut ev, left.as_secs_f64(), || {}, |_, _, _| false);
+    }
+    eprintln!("each visit linked this many ms after its dial: {took:?}");
+    let timed_out = left(&ev).iter().filter(|(_, r)| *r == DisconnectReason::Timeout).count();
+    assert!(timed_out >= 8, "the closed pages' links ended as timed out: {timed_out}");
+}
