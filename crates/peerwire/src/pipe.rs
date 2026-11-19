@@ -35,12 +35,12 @@ pub(crate) const RATE: u64 = 4;
 pub(crate) const BURST: u64 = 8;
 /// Bytes waiting on one pipe.
 pub(crate) const QUEUE: usize = if SMALL { 4 << 10 } else { 16 << 10 };
-/// Pipes at once. A new one past this replaces the one used longest ago whose peer isn't linked, if not used within
+/// Pipes at once. A new one past this replaces the one used longest ago whose peer isn't linked, if not dialled within
 /// [`GRACE`]; with none, the new peer's batch is held ([`Pipes::hold`]). Each linked page costs a board 3 to 5 KB of
 /// heap, and with 4 linked its largest free block bottomed at 36,864 B (NB-133's run): a 16 KiB TLS record takes a
 /// block of 32 KiB while it comes in (NB133-2), so a fifth would leave too little. 4 there (NB-136).
 pub(crate) const MAX_PIPES: usize = if SMALL { 4 } else { 64 };
-/// A pipe whose peer hasn't linked over it, used this lately, doesn't give way to a newcomer: a handshake is under
+/// A pipe whose peer hasn't linked over it, dialled this lately, doesn't give way to a newcomer: a handshake is under
 /// way on it, its answer a relay's round trip or two off. Two newcomers took each other's pipe before either linked
 /// (NB-136). One whose link has ended gives way at once.
 const GRACE: Duration = Duration::from_secs(5);
@@ -76,13 +76,16 @@ struct Pipe {
     served: u64,
     /// Its peer was linked when last seen ([`Pipes::prune`]), since its last batch that came while it wasn't.
     linked: bool,
+    /// When it was made, or its peer, linked over it before, dialled again: [`GRACE`] counts from here, not from its
+    /// last batch, which anyone who saw it can post again (the seal proves who sent a batch, not when) (NB136-1).
+    since: Instant,
 }
 
 impl Pipe {
     /// Whether it gives way to a newcomer, its peer not linked: unless a handshake may be under way on it, its peer
-    /// never linked over it since its last dial and the pipe used within [`GRACE`].
+    /// never linked over it since its last dial and that dial's first batch within [`GRACE`].
     fn spare(&self, now: Instant) -> bool {
-        self.linked || now.saturating_duration_since(self.used) >= GRACE
+        self.linked || now.saturating_duration_since(self.since) >= GRACE
     }
 }
 
@@ -224,7 +227,9 @@ impl Pipes {
         if let Some(p) = self.by_peer.get_mut(&peer) {
             p.used = now;
             // From a peer not linked: a dial, perhaps again.
-            p.linked &= linked(&peer);
+            if p.linked && !linked(&peer) {
+                (p.linked, p.since) = (false, now);
+            }
             return Some(p.addr);
         }
         if self.by_peer.len() >= self.max {
@@ -241,7 +246,8 @@ impl Pipes {
         }
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(self.next), 1));
         self.by_addr.insert(addr, peer);
-        let pipe = Pipe { addr, q: VecDeque::new(), bytes: 0, due: None, used: now, served: 0, linked: false };
+        let pipe =
+            Pipe { addr, q: VecDeque::new(), bytes: 0, due: None, used: now, served: 0, linked: false, since: now };
         self.by_peer.insert(peer, pipe);
         Some(addr)
     }
@@ -685,8 +691,9 @@ mod tests {
     }
 
     /// NB-136: two newcomers held while every pipe was taken don't take each other's pipe before either has linked:
-    /// a pipe whose peer hasn't linked over it, used within `GRACE`, has a handshake under way and doesn't give way.
-    /// Past `GRACE` unused it does, and one whose link has ended does at once.
+    /// a pipe whose peer hasn't linked over it, dialled within `GRACE`, has a handshake under way and doesn't give way.
+    /// Past `GRACE` from its dial it does, though its batches came since (NB136-1), and one whose link has ended does
+    /// at once.
     #[test]
     fn a_handshake_under_way_keeps_its_pipe_and_a_link_that_ended_gives_way_at_once() {
         let t = Instant::ZERO + S;
@@ -698,12 +705,14 @@ mod tests {
         let a = pipes.admit(t, QUIET, |_| true, |p| linked(p).then_some(t)).unwrap();
         assert_eq!(a.peer, peer(9));
         assert!(pipes.admit(t, QUIET, |_| true, |p| linked(p).then_some(t)).is_none());
-        // 10 dials again within GRACE: still no room, by `open` either.
         let soon = t + (GRACE - MS);
+        // 9's batch again, or a copy of it: GRACE still counts from its dial.
+        assert_eq!(pipes.open(soon, peer(9), linked), Some(a.addr));
+        // 10 dials again within GRACE: still no room, by `open` either.
         assert_eq!(pipes.open(soon, peer(10), linked), None);
         pipes.hold(soon, peer(10), vec![vec![1]]);
         assert!(pipes.admit(soon, QUIET, |_| true, |p| linked(p).then_some(soon)).is_none());
-        // 9 never answered: GRACE after its pipe's last use, 10 takes it.
+        // 9 never answered: GRACE after its dial, 10 takes it.
         let a = pipes.admit(t + GRACE, QUIET, |_| true, |p| linked(p).then_some(t + GRACE)).unwrap();
         assert_eq!(a.peer, peer(10));
         assert!(!pipes.by_peer.contains_key(&peer(9)));

@@ -561,3 +561,62 @@ fn page_visits_in_a_row_each_link_past_the_pipe_cap() {
     let timed_out = left(&ev).iter().filter(|(_, r)| *r == DisconnectReason::Timeout).count();
     assert!(timed_out >= 8, "the closed pages' links ended as timed out: {timed_out}");
 }
+
+/// NB136-1: an outsider who reads a node's inbox topic, as anyone can on a public relay, and posts copies of the
+/// batches it saw (the seal proves who sent a batch, not when) can't keep the pipes that free from a newcomer. Four
+/// pages link and close with no goodbye; the outsider posts each page's first batch again every 2 s, from before their
+/// links time out; a newcomer then dials, and must link.
+#[test]
+fn sec_copied_batches_dont_keep_freed_pipes_from_a_newcomer() {
+    for attack in [false, true] {
+        let hub = MemoryHub::new();
+        let mut n = board(&hub);
+        let nid = n.peer_id();
+        let mut ev = vec![];
+        let mut spy = hub.connect();
+        spy.subscribe(Topic::peer(&nid));
+        let mut pages: Vec<Browser> = Vec::new();
+        let mut copies: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..4 {
+            let mut b = Browser::with(&hub, nid, short());
+            // Its own handshake keys: browsers made by `Browser::with` share a seed, so their HS1s would match.
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            b.ep = Endpoint::new(&b.me, short(), seed);
+            b.hello();
+            pages.push(b);
+            run(&mut n, &mut pages, &mut ev, 0.3, |_| {}, |_, _, _| false);
+            while spy.poll().is_some() {}
+            let b = pages.last_mut().unwrap();
+            b.dial();
+            b.step(); // its first batch, the HS1
+            let mut got: Vec<Vec<u8>> = std::iter::from_fn(|| spy.poll()).map(|(_, p)| p).collect();
+            assert_eq!(got.len(), 1);
+            copies.push(got.pop().unwrap());
+            let p = id(pages.last().unwrap());
+            assert!(run(&mut n, &mut pages, &mut ev, 10.0, |_| {}, |n, _, _| n.status(&p) == Status::Connected));
+        }
+        let ids: Vec<PeerId> = pages.iter().map(id).collect();
+        pages.clear(); // all four close, with no goodbye
+        let mut last = Instant::now() - Duration::from_secs(10);
+        let mut posted = 0usize;
+        let mut copy = |_: &mut [Browser]| {
+            if attack && last.elapsed() >= Duration::from_secs(2) {
+                last = Instant::now();
+                for c in &copies {
+                    spy.publish(Topic::peer(&nid), c);
+                    posted += 1;
+                }
+            }
+        };
+        let gone = (IDLE + Duration::from_secs(1)).as_secs_f64();
+        run(&mut n, &mut pages, &mut ev, gone, &mut copy, |_, _, _| false);
+        assert!(ids.iter().all(|p| n.status(p) == Status::Disconnected), "their links timed out");
+        let fresh = arrive(&mut n, &hub, &mut pages, &mut ev);
+        let started = Instant::now();
+        let ok = |n: &Node, _: &[Browser], _: &[Event]| n.status(&fresh) == Status::Connected;
+        let linked = run(&mut n, &mut pages, &mut ev, 15.0, &mut copy, ok);
+        eprintln!("attack {attack}: {posted} copies posted; newcomer linked {linked} after {:?}", started.elapsed());
+        assert!(linked, "attack {attack}: the newcomer never got a pipe");
+    }
+}
