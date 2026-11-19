@@ -176,6 +176,9 @@ struct Shared {
     rejected: Counter,
     /// The inbox's bytes, against `Limits::inbox_bytes`.
     inbox_bytes: AtomicUsize,
+    /// Goes up when an event may have been lost on its way in ([`Signaling::missed`]): one dropped for a full inbox,
+    /// a relay connection that closed or didn't open, and each 100 ms of waiting to connect again.
+    missed: Counter,
 }
 
 enum Cmd {
@@ -383,6 +386,11 @@ impl Signaling for NostrSignaling {
                 return Some((topic, payload));
             }
         }
+    }
+
+    #[allow(clippy::useless_conversion)] // from u32 where there are no 64-bit atomics
+    fn missed(&self) -> u64 {
+        u64::from(self.shared.missed.load(Ordering::Relaxed))
     }
 }
 
@@ -747,13 +755,18 @@ fn relay_loop(
                 backoff = Duration::from_secs(1);
             }
         }
+        // Closed, or not opened: what the relay passes on meanwhile is lost.
+        shared.missed.fetch_add(1, Ordering::Relaxed);
         // Wait out the backoff, still taking commands (and leaving if the carrier is gone).
         let mut waited = Duration::ZERO;
         while waited < backoff {
             match cmds.recv_timeout(Duration::from_millis(100)) {
                 Ok(Cmd::Req(r)) => req = r,
                 Ok(Cmd::Event(e, id)) => enqueue(&mut queue, (e, id), limits.queued),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => waited += Duration::from_millis(100),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    waited += Duration::from_millis(100);
+                    shared.missed.fetch_add(1, Ordering::Relaxed);
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
@@ -916,6 +929,7 @@ fn on_relay_message(text: &str, out: &SyncSender<Incoming>, shared: &Shared, max
                 || out.try_send(m).is_err()
             {
                 shared.inbox_bytes.fetch_sub(size, Ordering::Relaxed);
+                shared.missed.fetch_add(1, Ordering::Relaxed);
             }
         }
         Some("OK") if m.get(2) == Some(&Value::Bool(false)) => {
@@ -1139,6 +1153,26 @@ mod tests {
         }
         assert_eq!(shared.inbox_bytes.load(Ordering::Relaxed), 5 * 3081);
         assert_eq!(rx.try_iter().count(), 5);
+        // The 5 dropped for a full inbox count as missed (NB-136); those dropped as malformed above, never queued,
+        // don't.
+        assert_eq!(shared.missed.load(Ordering::Relaxed), 5);
+    }
+
+    /// NB-136: a carrier whose relay isn't open counts what it may be missing ([`Signaling::missed`]), on and on while
+    /// it waits to connect again, so a node takes no silence meanwhile as a sign a peer has gone.
+    #[test]
+    fn a_relay_that_is_down_counts_as_missing_events() {
+        let carrier = NostrSignaling::new(["ws://127.0.0.1:9"]); // the discard port: nothing answers
+        let start = Instant::now();
+        let mut last = carrier.missed();
+        let mut rises = 0;
+        while start.elapsed() < Duration::from_millis(1500) && rises < 3 {
+            std::thread::sleep(Duration::from_millis(50));
+            let now = carrier.missed();
+            rises += usize::from(now > last);
+            last = now;
+        }
+        assert!(rises >= 3, "missed rose {rises} times in 1.5 s, at {last}");
     }
 
     /// NB133-1: an ESP32's seen filter searches its queue of 128 and keeps no hash set, so 2,128 new ids through
