@@ -82,7 +82,7 @@ pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]
 pub use nostr::NostrSignaling;
 pub use peerwire_core::{
-    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, Stats,
+    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, Stats, HELD_FRAGMENT,
     MAX_UNRELIABLE, MAX_URGENT,
 };
 pub use portmap::{MapProtocol, PortMapping};
