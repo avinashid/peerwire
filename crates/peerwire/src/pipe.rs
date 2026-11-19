@@ -212,11 +212,6 @@ impl Pipes {
         Some(Admitted { peer: h.peer, addr, datagrams: h.datagrams, gone })
     }
 
-    /// The most pipes at once.
-    pub(crate) fn max(&self) -> usize {
-        self.max
-    }
-
     /// Sets the most pipes at once, [`MAX_PIPES`] by default: a test's.
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn set_max(&mut self, max: usize) {

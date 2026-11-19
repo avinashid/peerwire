@@ -41,8 +41,8 @@ k256 = { version = "0.13", optional = true, default-features = false, features =
 serde_json = { version = "1", optional = true }
 # The Linux Bluetooth driver (feature `ble-bluez`): BlueZ over D-Bus. `dbus` only to build libdbus from source
 # (`vendored`), as a host may have no libdbus headers or pkg-config; futures for bluer's streams (already its own).
-# log (feature `ble`) for the radio's connections, and what fails and is tried again (already bluer's and
-# tungstenite's).
+# log (features `ble` and `nostr`) for the radio's connections, what fails and is tried again, and pipes held or
+# given up (already bluer's and tungstenite's).
 bluer = { version = "0.17", optional = true, default-features = false, features = ["bluetoothd"] }
 dbus = { version = "0.9", optional = true, features = ["vendored"] }
 futures = { version = "0.3", optional = true, default-features = false, features = ["std"] }
@@ -63,7 +63,7 @@ socket2 = { version = "0.6", features = ["all"] }
 default = ["turn"]
 turn = ["peerwire-core/turn"]
 tokio = ["dep:tokio"]
-nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:serde_json"]
+nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:serde_json", "dep:log"]
 # Bluetooth LE (docs/concepts/bluetooth.md): the radio driver trait and the node's side of it (Builder::bluetooth),
 # which logs its connections through `log`. Off by default; `ble-bluez` adds the Linux driver.
 ble = ["dep:log", "peerwire-core/ble"]

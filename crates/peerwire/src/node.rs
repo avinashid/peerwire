@@ -1286,7 +1286,9 @@ impl Node {
             let heard = |p: &PeerId| ep.is_connected(p).then(|| ep.last_heard(p).unwrap_or(now));
             let Some(a) = self.pipes.admit(now, quiet, |p| trav.takes_pipe(p), heard) else { break };
             if let Some((peer, silent)) = a.gone {
+                #[cfg(any(feature = "ble", feature = "nostr"))]
                 log::info!("pipes: a peer silent for {} s gave its pipe to a newcomer", silent.as_secs());
+                let _ = silent;
                 self.ep.abandon(&peer);
                 self.take_event(now, wall, Ev::Disconnected { peer, reason: DisconnectReason::Timeout }, &[]);
             }
@@ -1471,9 +1473,12 @@ impl Node {
 fn take_batch(pipes: &mut Pipes, ep: &mut Endpoint<Addr>, now: peerwire_core::Instant, from: PeerId, body: &[u8]) {
     let Some(datagrams) = pipe::decode(body) else { return };
     let Some(at) = pipes.open(now, from, |p| ep.is_connected(p)) else {
-        if !pipes.hold(now, from, datagrams) {
-            log::info!("pipes: all {} taken by linked peers; a newcomer's batch is held", pipes.max());
+        let again = pipes.hold(now, from, datagrams);
+        #[cfg(any(feature = "ble", feature = "nostr"))]
+        if !again {
+            log::info!("pipes: all taken by linked peers; a newcomer's batch is held");
         }
+        let _ = again;
         return;
     };
     for d in datagrams {
