@@ -37,14 +37,14 @@ fn node(air: &FakeAir, mac: Mac, max_frame: usize) -> Node {
     let radio = EspNow::new(air.ether(mac, max_frame), Settings::DEFAULT);
     Node::builder()
         .bluetooth(radio)
-        .policy(Policy::new([PathKind::Bluetooth]))
+        .policy(Policy::new([PathKind::EspNow]))
         .stun_servers(Vec::<String>::new())
         .bind("127.0.0.1:0")
         .unwrap()
 }
 
 fn on_radio(n: &Node, p: &PeerId) -> bool {
-    n.status(p) == Status::Connected && n.path_kind(p) == Some(PathKind::Bluetooth)
+    n.status(p) == Status::Connected && n.path_kind(p) == Some(PathKind::EspNow)
 }
 
 fn got(events: &[Event], from: PeerId, data: &[u8]) -> bool {
@@ -75,6 +75,92 @@ fn a_room_links_over_espnow_alone_v1_with_v2() {
     assert!(got(&ev[0], pb, b"back over ESP-NOW"));
     assert!(air.heard().iter().all(|(from, to, f)| *from == C || *to == BROADCAST || f.len() <= V1_FRAME), "v1 frames");
     assert_eq!(stranger.peers().count(), 0, "another room's node never links");
+}
+
+/// NB-142: a link over ESP-NOW is of ESP-NOW's own kind, as `Node::path_kind` says, not Bluetooth's, and a policy must
+/// list `EspNow` for it: nodes whose policy lists `Bluetooth` alone, as ESP-NOW's did before, never link over the
+/// radio, and a linked node whose policy drops `EspNow` closes its link (`PathOff`).
+#[test]
+fn an_espnow_link_is_of_espnow_s_own_kind() {
+    let air = FakeAir::new();
+    let (mut a, mut b) = (node(&air, A, V2_FRAME), node(&air, B, V2_FRAME));
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    a.join_room("pw-test", "espnow-kind");
+    b.join_room("pw-test", "espnow-kind");
+    let mut ev = Vec::new();
+    let started = Instant::now();
+    assert!(pump(&mut [&mut a, &mut b], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    let took = started.elapsed();
+    assert_eq!((a.path_kind(&pb), b.path_kind(&pa)), (Some(PathKind::EspNow), Some(PathKind::EspNow)));
+
+    let bluetooth_only = |mac: Mac| {
+        let radio = EspNow::new(air.ether(mac, V2_FRAME), Settings::DEFAULT);
+        let builder = Node::builder().bluetooth(radio).policy(Policy::new([PathKind::Bluetooth]));
+        builder.stun_servers(Vec::<String>::new()).bind("127.0.0.1:0").unwrap()
+    };
+    let (mut x, mut y) = (bluetooth_only(C), bluetooth_only([0x02, 0x50, 0x57, 0, 0, 0x0d]));
+    x.join_room("pw-test", "espnow-kind-off");
+    y.join_room("pw-test", "espnow-kind-off");
+    let mut ev_off = Vec::new();
+    let wait = (took * 3).as_secs().clamp(5, 15);
+    let linked = pump(&mut [&mut x, &mut y], &mut ev_off, wait, |n| n[0].peers().count() + n[1].peers().count() > 0);
+    assert!(!linked, "no link over ESP-NOW under [Bluetooth] in {wait} s (a link took {took:?} under [EspNow])");
+
+    a.set_policy(Policy::new([PathKind::Bluetooth])).unwrap();
+    let off = |e: &Event| matches!(e, Event::Disconnected { peer, reason: peerwire::DisconnectReason::PathOff } if *peer == pb);
+    let mut ev2 = Vec::new();
+    let closed = pump(&mut [&mut a, &mut b], &mut ev2, 10, |n| n[0].peers().count() == 0);
+    assert!(closed && ev2[0].iter().any(off), "{:?}", ev2[0]);
+}
+
+/// `peerwire_esp::config()` on a board with a radio (feature `ble` or `espnow`): 4 KiB messages and an 8 KiB send
+/// buffer (NB-142).
+fn board_config() -> Config {
+    let (max_message, max_send_buffer) = (4 * 1024, 8 * 1024);
+    Config { max_message, max_send_buffer, max_links: 8, max_pending_handshakes: 8, ..Config::default() }
+}
+
+/// NB-142: a board's caps with a radio carry its largest message over ESP-NOW, two of them queued at once, and refuse a
+/// larger one at the sender; a peer with larger caps that sends the board a larger one has its link closed there, and
+/// the message never arrives.
+#[test]
+fn a_board_s_radio_caps_carry_its_largest_message() {
+    let air = FakeAir::new();
+    let with = |mac: Mac, config: Config| {
+        let radio = EspNow::new(air.ether(mac, V2_FRAME), Settings::DEFAULT);
+        let builder = Node::builder().config(config).bluetooth(radio).policy(Policy::new([PathKind::EspNow]));
+        builder.stun_servers(Vec::<String>::new()).bind("127.0.0.1:0").unwrap()
+    };
+    let (mut board, mut peer) = (with(A, board_config()), with(B, board_config()));
+    let (pa, pb) = (board.peer_id(), peer.peer_id());
+    board.join_room("pw-test", "espnow-caps");
+    peer.join_room("pw-test", "espnow-caps");
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut board, &mut peer], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    let (largest, second) = (vec![7u8; 4 * 1024], vec![8u8; 4 * 1024]);
+    assert!(matches!(board.send(&pb, Lane::Reliable, &[0; 4 * 1024 + 1]), Err(peerwire::SendError::TooLarge)));
+    board.send(&pb, Lane::Reliable, &largest).unwrap();
+    board.send(&pb, Lane::Reliable, &second).unwrap();
+    assert!(board.send(&pb, Lane::Reliable, b"x").is_err(), "8 KiB queued: the buffer is full");
+    let mut ev = Vec::new();
+    pump(&mut [&mut board, &mut peer], &mut ev, 5, |_| false);
+    assert!(got(&ev[1], pa, &largest) && got(&ev[1], pa, &second), "two messages of 4 KiB over ESP-NOW");
+    drop((board, peer));
+
+    // A peer whose caps are the defaults' sends the board a message over its 4 KiB: the board closes the link.
+    let (mut board, mut peer) = (with(C, board_config()), with([0x02, 0x50, 0x57, 0, 0, 0x0d], Config::default()));
+    let (pa, pb) = (board.peer_id(), peer.peer_id());
+    board.join_room("pw-test", "espnow-caps-over");
+    peer.join_room("pw-test", "espnow-caps-over");
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut board, &mut peer], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pa)), "linked");
+    let over = vec![9u8; 4 * 1024 + 1];
+    peer.send(&pa, Lane::Reliable, &over).unwrap();
+    let mut ev = Vec::new();
+    let violation = |e: &Event| matches!(e, Event::Disconnected { peer, reason: peerwire::DisconnectReason::ProtocolViolation } if *peer == pb);
+    let closed = pump(&mut [&mut board, &mut peer], &mut ev, 10, |n| n[0].status(&pb) != Status::Connected);
+    assert!(closed && ev[0].iter().any(violation), "{:?}", ev[0]);
+    assert!(!got(&ev[0], pb, &over));
 }
 
 #[test]
@@ -174,7 +260,7 @@ fn sec_a_forged_resync_timeline() {
     let mk = |r| {
         Node::builder()
             .bluetooth(r)
-            .policy(Policy::new([PathKind::Bluetooth]))
+            .policy(Policy::new([PathKind::EspNow]))
             .stun_servers(Vec::<String>::new())
             .bind("127.0.0.1:0")
             .unwrap()
@@ -236,7 +322,7 @@ fn quick_node(air: &FakeAir, mac: Mac) -> (Node, Watch) {
         Config { idle_timeout: Duration::from_secs(3), keepalive: Duration::from_millis(500), ..Config::default() };
     let node = Node::builder()
         .bluetooth(radio)
-        .policy(Policy::new([PathKind::Bluetooth]))
+        .policy(Policy::new([PathKind::EspNow]))
         .config(quick)
         .stun_servers(Vec::<String>::new())
         .bind("127.0.0.1:0")
@@ -316,7 +402,7 @@ fn sec_one_forged_accept_after_the_challenge_costs_seconds() {
     let mk = |r| {
         Node::builder()
             .bluetooth(r)
-            .policy(Policy::new([PathKind::Bluetooth]))
+            .policy(Policy::new([PathKind::EspNow]))
             .stun_servers(Vec::<String>::new())
             .bind("127.0.0.1:0")
             .unwrap()
@@ -904,7 +990,7 @@ fn watched(air: &FakeAir, mac: Mac) -> (Node, Watch) {
     let watch = radio.watch();
     let node = Node::builder()
         .bluetooth(radio)
-        .policy(Policy::new([PathKind::Bluetooth]))
+        .policy(Policy::new([PathKind::EspNow]))
         .stun_servers(Vec::<String>::new())
         .bind("127.0.0.1:0")
         .unwrap();

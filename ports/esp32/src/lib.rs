@@ -264,12 +264,28 @@ impl Board {
     }
 }
 
+/// Whether this build has a radio for the node (feature `ble` or `espnow`), whose stack and buffers take the heap that
+/// [`config`]'s smaller caps leave it (NB-142).
+pub const RADIO: bool = cfg!(any(feature = "ble", feature = "espnow"));
+
+/// The largest message [`config`] sends or takes: 16 KiB, or 4 KiB with a [`RADIO`].
+pub const MAX_MESSAGE: usize = if RADIO { 4 * 1024 } else { 16 * 1024 };
+
+/// [`config`]'s send buffer per link, for the reliable lane and for the urgent one each: 32 KiB, or 8 KiB with a
+/// [`RADIO`].
+pub const MAX_SEND_BUFFER: usize = if RADIO { 8 * 1024 } else { 32 * 1024 };
+
 /// Caps sized for a chip with ~250 KB of free heap: 16 KiB messages, a 32 KiB send buffer, 8 links and 8 handshakes
 /// at once. The defaults allow 1 MiB messages and buffers.
+///
+/// With a radio ([`RADIO`]: feature `ble` or `espnow`), 4 KiB messages and an 8 KiB send buffer: Bluetooth took
+/// ~76 KB of a C3's heap (NB-138), and a C3 with Bluetooth and ESP-NOW and 4 links might have had only 5 to 15 KB left
+/// at the larger caps (NB-142). A peer that sends this node a larger message has its link closed, as with any cap: give
+/// the peers of a board with a radio messages of 4 KiB at most.
 pub fn config() -> Config {
     Config {
-        max_message: 16 * 1024,
-        max_send_buffer: 32 * 1024,
+        max_message: MAX_MESSAGE,
+        max_send_buffer: MAX_SEND_BUFFER,
         max_links: 8,
         max_pending_handshakes: 8,
         ..Config::default()

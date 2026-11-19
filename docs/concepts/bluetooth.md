@@ -229,7 +229,9 @@ puts a link on.
   there get no answer, and the peer links over the radio. Under `Privacy::RelayOnly` no link goes over Bluetooth,
   which would announce the device within radio range; `PublicOnly` allows it, as no IP address goes over the radio.
 - **What the app sees.** A link on Bluetooth reports `Path::Direct` at an address in `0.0.0.0/8` with port 0, which no
-  network uses, one per connection; `Node::path_kind` says `PathKind::Bluetooth`.
+  network uses, one per connection; `Node::path_kind` says `PathKind::Bluetooth`. A radio that isn't Bluetooth says
+  its own kind (`ble::Radio::kind`): ESP-NOW's links are `PathKind::EspNow` ([ESP-NOW](espnow.md)), ranked as above
+  but under that kind, which a policy must list for them.
 
 ## Limits
 

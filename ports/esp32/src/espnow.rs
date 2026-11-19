@@ -24,7 +24,7 @@
 //! let radio = espnow::radio(true, Settings::DEFAULT)?;
 //! let mut node = Node::builder()
 //!     .config(peerwire_esp::config())
-//!     .policy(Policy::new([PathKind::Bluetooth]))
+//!     .policy(Policy::new([PathKind::EspNow]))
 //!     .bluetooth(radio)
 //!     .bind("127.0.0.1:4040")?;
 //! node.join_room("my-app", "kitchen"); // links with boards nearby on channel 11

@@ -5,8 +5,9 @@
 //! radio, or broadcast, with no connection. [`EspNow`] makes the radio a node needs of that: adverts go out as
 //! broadcasts, and a connection is emulated with OPEN, ACCEPT, KEEPALIVE and CLOSE frames, on ids each end draws at
 //! random, with GATT values split into frames and numbered so duplicates and stale frames are dropped. Everything on
-//! top is the node's Bluetooth path, unchanged: the room proof, Noise IK, sealed signals and datagrams, and
-//! [`PathKind::Bluetooth`](crate::PathKind::Bluetooth) below every UDP path.
+//! top is the node's Bluetooth path, unchanged: the room proof, Noise IK, sealed signals and datagrams, and the rank
+//! below every UDP path, under a kind of its own, [`PathKind::EspNow`](crate::PathKind::EspNow), which a policy must
+//! list for links over it.
 //!
 //! A platform gives the radio its ESP-NOW as an [`Ether`]; `peerwire-esp` has the ESP32's. The connection logic is
 //! sans-IO ([`Engine`]), and `FakeAir` (feature `testing`) has ethers in one process for tests.
@@ -30,6 +31,7 @@ pub use fake::{FakeAir, FakeEther};
 pub use frame::{V1_FRAME, V2_FRAME};
 
 use crate::ble::{ConnId, DeviceId, Limits, Radio, RadioEvent};
+use crate::PathKind;
 use rand_core::{OsRng, RngCore};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Waker;
@@ -284,6 +286,11 @@ impl<E: Ether> Radio for EspNow<E> {
     /// advert's tag to it, so a copy sent from another address isn't taken for it (NB135-12).
     fn address(&self) -> Option<DeviceId> {
         Some(device_of(self.ether.mac()))
+    }
+
+    /// [`PathKind::EspNow`]: links over it are reported, and ranked by a policy, as ESP-NOW's, not Bluetooth's.
+    fn kind(&self) -> PathKind {
+        PathKind::EspNow
     }
 
     fn set_waker(&mut self, waker: Waker) {

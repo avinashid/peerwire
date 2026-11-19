@@ -81,7 +81,9 @@ one room. No node knows another's
 key or address beforehand: they hear each other's room hellos and link. Linked
 nodes send each other a numbered reliable message every second. `Config` caps memory for a chip
 with ~250 KB of free heap: 16 KiB messages, a 32 KiB send buffer and 8 links
-(the defaults allow 1 MiB). Every 10 s each node logs free heap, the lowest free
+(the defaults allow 1 MiB); with a radio (feature `ble` or `espnow`), whose stack takes
+the heap, 4 KiB messages and an 8 KiB send buffer (`peerwire_esp::RADIO`, NB-142), so
+the peers of such a board send it 4 KiB at most. Every 10 s each node logs free heap, the lowest free
 heap so far, unused main-task stack and its links' RTTs.
 
 On a board's Wi-Fi it sets its clock by SNTP before binding the `Node`. Room hellos and
@@ -272,7 +274,9 @@ on both (before the name moved to flash, over nostr.mom), with
 Boards on the same Wi-Fi channel link over Espressif's ESP-NOW frames, with no access
 point: `espnow::radio` is a Bluetooth radio for the node (`Builder::bluetooth`), with
 adverts as broadcasts and connections emulated over unicast frames, so the room proof,
-the Noise handshake and the sealing are the node's own, as over Bluetooth. Wi-Fi must be
+the Noise handshake and the sealing are the node's own, as over Bluetooth. Its links are
+of their own kind, `PathKind::EspNow` (NB-142), which a policy must list, as
+`Policy::new([PathKind::EspNow])` does for links over ESP-NOW alone. Wi-Fi must be
 started first, on no network (`wifi::start_on_channel`, or `wifi::start_on_channel_as`
 with `wifi::random_mac`, so the board's address changes at each boot) or on one, whose
 channel ESP-NOW then follows. The design, its limits and what a forged frame can do are
@@ -286,8 +290,11 @@ FEATURES=ble EXAMPLE=espnow_probe ./build.sh     # the radio measured: round tri
 `espnow_mesh` joins room.sh's room ("esp32" if none) on the channel it hears wifi.sh's
 network on, or 11 (`PW_ESPNOW_CHANNEL`), sends each linked board a numbered message every
 second, and logs an `ESPNOW_MESH report` every 10 s. `espnow_probe` measures two boards
-with no access point, at 54 Mbit/s, with one or both on an access point and with Bluetooth on,
-and prints an `ESPNOW_RESULT` line for each mode and size. Both have run on an ESP32-C3 and an
+with no access point, at 11 Mbit/s (802.11b) and at 6, 24 and 54 Mbit/s (802.11g), with one or
+both on an access point and with Bluetooth on, and prints an `ESPNOW_RESULT` line for each mode
+and size, and for each rate mode `ESPNOW_RATE_COUNTS` lines on both boards (frames sent,
+acknowledged and received, by the rate they came at), which say where one that doesn't sync
+fails (NB-142). Both have run on an ESP32-C3 and an
 ESP32: the probe in NB-138, and `espnow_mesh` for 5 minutes in NB-139, built before the
 security review's second round; what they measured is in ESP-NOW's Limits section.
 
@@ -311,7 +318,10 @@ security review's second round; what they measured is in ESP-NOW's Limits sectio
   session; peers elsewhere must use that relay too. If it is down, only the LAN is left.
 - **Memory caps.** With heavy traffic each link holds its send and reassembly buffers.
   For many links on a plain ESP32-C3, lower `max_message` and `max_send_buffer`
-  further. An ESP32-S3 with PSRAM (the Arduino Nano ESP32) has room to spare.
+  further. An ESP32-S3 with PSRAM (the Arduino Nano ESP32) has room to spare. Neither
+  cap bounds what a linked peer can make a board hold out of order: the reliable lane's
+  receive window is 4,096 fragments of 1,100 B on every node (NB86-I1 in the threat
+  model), far past a board's heap, so a room member can still exhaust it.
 - **ESP32-S3** should build like the ESP32 with Espressif's Rust fork; not tried.
 
 ## Building

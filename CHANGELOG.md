@@ -77,6 +77,25 @@ and the commit that fixed it.
   acknowledged at that verdict even if an ACCEPT came first (`Disconnected`, counted in `Stats::connects_unacked`), so
   an ACCEPT forged from a gone member's address with the OPEN's overheard id no longer holds one of a board's unbound
   slots until the room proof's deadline (NB135-16).
+- **`PathKind::EspNow`** (NB-142): a link over ESP-NOW is of a kind of its own, no longer `PathKind::Bluetooth`. A radio
+  names its kind, `ble::Radio::kind` (new, default `Bluetooth`), and `espnow::EspNow` says `EspNow`: `Node::path_kind`
+  reports it, and a `Policy` must list it for links over the radio, ranked last as `Bluetooth` is; a policy of radio
+  kinds alone leaves the UDP socket unused, as `[Bluetooth]` did. An ESP-NOW node whose policy was
+  `[PathKind::Bluetooth]` must now list `EspNow`: with `Bluetooth` alone its radio carries no link, and the node logs a
+  warning. `Traversal::radio_kind` and `Traversal::set_radio_kind` are new. `PathKind` is `#[non_exhaustive]`, so a
+  `match` on it has a `_` arm already and no code breaks; neither radio kind is in a published crate yet.
+- `peerwire-esp` (NB-142): with a radio (feature `ble` or `espnow`), `config()` caps messages at 4 KiB and the send
+  buffer at 8 KiB, not 16 and 32 KiB: Bluetooth takes ~76 KB of a C3's heap, and a C3 with Bluetooth and ESP-NOW and 4
+  links could have had 5 to 15 KB left at the larger caps. `RADIO`, `MAX_MESSAGE` and `MAX_SEND_BUFFER` are new. A
+  peer that sends such a board a larger message has its link closed, as with any cap; the published 0.1.1 has neither
+  feature, so its caps don't change.
+- `peerwire-esp` (NB-142): ESP-IDF's Wi-Fi lines are quiet before a configuration is set, as setting one logged the
+  password's length (`OWE is enabled, but ... password length is N`) before they were; and once joined, the transmit
+  power the join was made at is set again and logged, with what it read before and after and the country's limit (not
+  the country), as an ESP32 read 14.75 dBm once joined where 20 dBm was set (NB-138). `wifi::tx_power` is new.
+  `espnow_mesh` logs `ESPNOW_RTT` (each link's smoothed, lowest and path RTT) and `ESPNOW_LOOP` (the main loop's poll,
+  work and idle times) with every report, and its idle takes turns, a minute each, between `peerwire_esp::idle` and
+  one the radio wakes (`PW_ESPNOW_WAKE`), so a board run shows where a round trip's 35 to 42 ms go.
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert

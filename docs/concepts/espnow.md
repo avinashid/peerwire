@@ -15,7 +15,10 @@ frame of up to 250 bytes (1,470 with ESP-NOW v2 at both ends) to a MAC address, 
 acknowledges, or to every radio on the channel, with no access point and no association. Peerwire makes a Bluetooth
 radio of it (`ble::Radio`): adverts go out as broadcasts and connections are emulated over unicast frames, so
 everything a node does over Bluetooth runs unchanged on top: the room advert and its proof, Noise IK, sealed signals
-and datagrams, identity proofs, and the path's rank, below every UDP path (`PathKind::Bluetooth`).
+and datagrams, identity proofs, and the path's rank, below every UDP path. The path is of its own kind,
+`PathKind::EspNow` (NB-142), as the radio names it (`ble::Radio::kind`): `Node::path_kind` says so, and a policy must
+list it for links over ESP-NOW (`Policy::new([PathKind::EspNow])` for ESP-NOW alone); one that lists `Bluetooth`
+alone keeps them off, and the node logs a warning.
 
 | | ESP-NOW | Bluetooth LE (NimBLE on the same boards) |
 |---|---|---|
@@ -214,6 +217,16 @@ With the ESP32 not polling for 2 s while the C3 broadcast 128 frames of 531 B, i
 ~27 KB of heap: from 182,200 B free once joined to ~155,452 B on the C3, from 185,020 B to ~157,848 B on the ESP32. One
 run on two boards: 4 connections at once haven't run on boards.
 
+**Where a round trip goes (NB-142, not run on boards yet):** against ~4 ms for a raw ping of 32 B, the node's round
+trips were 35 to 42 ms. What the code says, **theoretical**: the example's loop sleeps up to 10 ms
+(`peerwire_esp::idle`) and nothing wakes it for a frame, so each end's half of a round trip waits 0 to 10 ms for its
+next pass (10 ms on average for both); the radio hands the driver 4 frames at a time and learns of their verdicts only
+when it is polled, so a datagram of more than 4 frames waits a pass too; every fifth message is 2,000 B, five frames of
+up to 531 B, ~5 ms each at 1 Mbit/s one at a time (~28 ms), which the smoothed RTT takes in; and a report line at
+115200 baud holds the loop for tens of ms. `espnow_mesh` now logs each link's smoothed and lowest RTT
+(`ESPNOW_RTT`) and the loop's times (`ESPNOW_LOOP`), and takes turns a minute each with an idle the radio wakes
+(`Node::set_waker`), so the next run tells these apart.
+
 ## What a listener on the radio sees
 
 - **The address:** every ESP-NOW frame carries its sender's MAC address in the clear. The chip's own (Espressif's
@@ -405,12 +418,15 @@ CHIP=esp32 FEATURES=espnow EXAMPLE=espnow_mesh ./build.sh
 
 ## Not yet
 
-- **Several radios at once:** a node has one radio, so a board links over Bluetooth or over ESP-NOW. Both, and a path
-  kind of ESP-NOW's own (`PathKind::EspNow`), need the core to take several.
+- **Several radios at once:** a node has one radio, so a board links over Bluetooth or over ESP-NOW. Both need the
+  core to take several; the path kinds are apart already (`PathKind::Bluetooth`, `PathKind::EspNow`).
 - **Values over 512 bytes:** the node's framing keeps GATT's 512, so a v2 frame carries one value at most.
 - **The rate:** frames go at ESP-NOW's default 1 Mbit/s, which carried 670 to 840 kbit/s on the NB-138 boards. At 54
   Mbit/s per peer (`esp_now_set_peer_rate_config`) they didn't link; a faster rate needs a way back to 1 Mbit/s, as
-  a rate one end can't hear leaves a connection silent until it times out.
+  a rate one end can't hear leaves a connection silent until it times out. The probe now tries 11 Mbit/s (802.11b)
+  and 6, 24 and 54 Mbit/s (802.11g) in turn, each given up after 30 s, with its mode change also broadcast at 1
+  Mbit/s and counts on both boards of the frames sent, acknowledged and received by rate (`ESPNOW_RATE_COUNTS`), to
+  show where one fails (NB-142); it hasn't run on boards yet.
 - **More on boards:** the probe kept the frame size, the rate and the timers (NB-138), and one run of `espnow_mesh`
   showed a link's heap, the receive queue full and the time a failed try holds the air (NB-139), from before the
   review's second round; 4 connections at once, and the fixes since, haven't run on boards.

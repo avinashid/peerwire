@@ -109,7 +109,7 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `LanSignaling` | A carrier over UDP multicast and broadcast on one LAN | `src/lan.rs` |
 | `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND`, `NostrStats`, `RelayStats` and `RelayWatch` | `src/nostr.rs` |
 | `Privacy`, `Role`, `NatType`, `Failure`, `Side` | Which addresses a node gives out, room roles, the NAT type, why a dial failed | `src/traversal.rs` |
-| `PathKind`, `Policy`, `Hop` | The kinds of path, a connection policy, and the addresses a host with TURN or a radio gives its endpoint (a network address, a peer through this node's TURN allocation, a peer's relayed address, or a Bluetooth connection) | `src/traversal.rs` |
+| `PathKind`, `Policy`, `Hop` | The kinds of path, a connection policy, and the addresses a host with TURN or a radio gives its endpoint (a network address, a peer through this node's TURN allocation, a peer's relayed address, or a radio connection, Bluetooth's or ESP-NOW's) | `src/traversal.rs` |
 | `ble` (feature `ble`) | Bluetooth LE: the `Radio` driver trait, `RadioEvent`, `DeviceId`, `ConnId`, `Limits`, the service's UUIDs, and `BlueZ` with `ble-bluez` (`BlueZ::alias`, `BlueZ::names_this_host`) | `src/ble.rs`, `src/bluez.rs` |
 | `TurnServer` (feature `turn`) | A TURN server and the credentials for it | `src/turn.rs` |
 | `PortMapping`, `MapProtocol` | Where router port mapping stands | `src/portmap.rs` |
@@ -267,7 +267,7 @@ Messages and links:
 | `peers(&self) -> impl Iterator<Item = &PeerId>` | Peers with a live link, relay peers left out |
 | `peer_stats(&self, peer: &PeerId) -> Option<PeerStats>` | A link's RTT, path RTT, congestion window, fragments sent and retransmitted; `PeerStats::loss()` estimates loss |
 | `path(&self, peer: &PeerId) -> Option<Path>` | The route the link takes: `Path::Direct(addr)` or `Path::Via(relay)`. The address is where its packets go: a link through TURN shows the peer's address as this node's TURN server relays to it, or the peer's relayed address; `path_kind` says which |
-| `path_kind(&self, peer: &PeerId) -> Option<PathKind>` | The kind of route: `Direct`, `Birthday` (out of a birthday-punch socket, as `via_birthday`), `Peers` or `RelayPeers` (through a peer), `Turn` (through a TURN server, this node's or the peer's), `Bluetooth` (over a radio connection; its `path` is `Path::Direct` at an address in `0.0.0.0/8`, port 0), or `Signaling` (over the signaling relays, a browser's pipe: `Path::Direct` at an address in `0.0.0.0/8`, port 1) |
+| `path_kind(&self, peer: &PeerId) -> Option<PathKind>` | The kind of route: `Direct`, `Birthday` (out of a birthday-punch socket, as `via_birthday`), `Peers` or `RelayPeers` (through a peer), `Turn` (through a TURN server, this node's or the peer's), `Bluetooth` or `EspNow` (over a radio connection, as the radio names its kind, `ble::Radio::kind`; its `path` is `Path::Direct` at an address in `0.0.0.0/8`, port 0), or `Signaling` (over the signaling relays, a browser's pipe: `Path::Direct` at an address in `0.0.0.0/8`, port 1) |
 | `set_waker(&mut self, waker: Waker)` | Feature `ble`. A waker the node's radio wakes when something comes over it, for a host that sleeps until `next_timeout` or the socket: it then polls at once, not within 50 ms. `AsyncNode` sets one itself |
 | `via_birthday(&self, peer: &PeerId) -> bool` | Whether the direct link leaves from one of this node's birthday-punch sockets |
 | `birthday_sockets_opened(&self) -> u64` | How many sockets this node has opened for birthday punching |
@@ -302,7 +302,7 @@ Options for a `Node`, from `Node::builder()`. Each takes `self` and returns the 
 | `relay_peers` | `impl IntoIterator<Item = S>`, `S: Into<String>` | None | Invites of always-on peers to keep linked as relays (see `Node::set_relay_peers`) |
 | `policy` | `Policy` | None: every path, as before policies | Which paths links may take, and in what order (see [Policy](#policy) and `Node::set_policy`) |
 | `turn_servers` | `impl IntoIterator<Item = TurnServer>` | none | Feature `turn`. This node's own TURN servers, as `Node::set_turn_servers` takes them, resolved in `bind`; used only with `PathKind::Turn` in the policy |
-| `bluetooth` | `impl ble::Radio + 'static` | None | Feature `ble`. A Bluetooth LE radio (`ble::BlueZ` on Linux): in a room, the node advertises, links with the members it hears over it, with no network, and ranks it below every UDP path (`PathKind::Bluetooth`). Off under `Privacy::RelayOnly`. See [Bluetooth](../concepts/bluetooth.md) |
+| `bluetooth` | `impl ble::Radio + 'static` | None | Feature `ble`. A Bluetooth LE radio (`ble::BlueZ` on Linux), or ESP-NOW's (`espnow::EspNow`, feature `espnow`): in a room, the node advertises, links with the members it hears over it, with no network, and ranks it below every UDP path, under the kind the radio names (`ble::Radio::kind`: `PathKind::Bluetooth`, or `PathKind::EspNow`), which a policy must list. Off under `Privacy::RelayOnly`. See [Bluetooth](../concepts/bluetooth.md) and [ESP-NOW](../concepts/espnow.md) |
 
 `bind(self, addr: impl ToSocketAddrs) -> io::Result<Node>` binds the socket as `Node::bind` describes. It fails with
 `ErrorKind::InvalidInput` if a relay peer is not an invite, or if the policy is not valid (`Policy::is_valid`).
@@ -436,6 +436,7 @@ works.
 | `Turn` | Through a TURN server: this node's own (`Node::set_turn_servers`, allocated only with this kind in the order), or the peer's, at the relayed address its offers carry |
 | `Bluetooth` | Over a Bluetooth LE connection (feature `ble`), to a peer whose room hellos or offers came over it. Last wherever it is listed: a dial takes it in its last step, and a link on it punches to the peer's addresses and moves off it. Not in the default order, and off under `Privacy::RelayOnly` |
 | `Signaling` | Over the signaling relays: the peer's datagrams sealed to it in the room's carrier, as a browser's `'signaling'` path sends them (a pipe; see [choosing paths](../guides/connection-paths.md)). Slow and rate-limited, a last resort: how a browser, which can't send UDP, links with a native node. The node takes a pipe link from a room member that dials it, and doesn't dial over one itself. A link on it punches to the peer's addresses and moves off it. Not in the default order, and off under `Privacy::RelayOnly` |
+| `EspNow` | Over an ESP-NOW connection (feature `espnow`: `espnow::EspNow` as the node's radio), to a peer whose room hellos or offers came over it; see [ESP-NOW](../concepts/espnow.md). Ranked and dialled as `Bluetooth` is, last wherever it is listed, under a kind of its own, which the radio names (`ble::Radio::kind`): an ESP-NOW node's policy must list `EspNow`, not `Bluetooth`, for links over its radio. Not in the default order, and off under `Privacy::RelayOnly` |
 
 How the order is read:
 

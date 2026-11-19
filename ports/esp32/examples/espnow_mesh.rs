@@ -4,7 +4,7 @@
 //! Each board starts Wi-Fi as a station on no network, from a MAC address drawn at random at boot (`PW_ESPNOW_FIXED_MAC`
 //! when building keeps the chip's own), on the channel it hears wifi.sh's network on, or channel 11
 //! (`PW_ESPNOW_CHANNEL`), and joins room.sh's room ("esp32" if the flash names none) of the `lan_chat` app with
-//! ESP-NOW as its only path (`PathKind::Bluetooth`): its adverts go out as ESP-NOW broadcasts, and the node proves the
+//! ESP-NOW as its only path (`PathKind::EspNow`): its adverts go out as ESP-NOW broadcasts, and the node proves the
 //! room, does the Noise handshake and seals everything as over Bluetooth. A board with no clock takes the time from
 //! the first room member that links. Frames are 1470 B where both boards have ESP-NOW v2, else 250 B
 //! (`PW_ESPNOW_V1` keeps them to 250 B).
@@ -19,13 +19,26 @@
 //! radio has, and how long ESP-NOW took to give up on each (what one failed try holds the air for); and, 30 s after
 //! the first link, node 1 broadcasts a burst of 128 frames of 531 B while node 2 doesn't poll for 2 s, so node 2's
 //! receive queue fills and it logs its heap then (free and largest block).
+//!
+//! Where a round trip's time goes (NB-142): every report comes with an `ESPNOW_RTT` line, each link's smoothed RTT,
+//! the lowest it has seen and its path's (`srtt_us`, `min_us`, `path_us`), fragments sent and sent again; and an
+//! `ESPNOW_LOOP` line, the main loop's passes since the last report and how long they polled the node (`poll_`),
+//! handled its events and sends, logging included (`work_`), and idled (`idle_`, with `over_max_us` an idle's overrun
+//! of what it asked for and `woken` the idles a frame cut short), and how long the last report's lines took to log
+//! (`report_us`: the console is 115200 baud). The loop's idle takes turns, a minute each from the first link: as
+//! `peerwire_esp::idle` (10 ms at most, and a frame that comes meanwhile waits for its end), then woken by the radio
+//! as soon as a frame or a send's verdict comes, after one tick at least; both lines say how many of the passes since
+//! the last report the radio could wake (`wake_passes=those/all`), and `PW_ESPNOW_WAKE=0` or `=1` when building keeps
+//! one throughout. Node 2's 2 s stall shows in one report's `work_max_us`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::task::notification::Notification;
 use esp_idf_svc::sys;
 use log::{info, warn};
 use peerwire_esp::peerwire::espnow::frame::LONGEST;
@@ -50,6 +63,47 @@ const BURST_AT: Duration = Duration::from_secs(30);
 const BURST: usize = 128;
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 const LONG: usize = 2000;
+// Within the board's cap with a radio, 4 KiB (NB-142).
+const _: () = assert!(LONG <= peerwire_esp::MAX_MESSAGE);
+/// The loop's idle: `PW_ESPNOW_WAKE=0` as `peerwire_esp::idle` throughout, `=1` woken by the radio throughout, and by
+/// default each in turn for `WAKE_TURN` from the first link.
+const WAKE: Option<&str> = option_env!("PW_ESPNOW_WAKE");
+const WAKE_TURN: Duration = Duration::from_secs(60);
+/// The longest idle, as `peerwire_esp::idle`'s.
+const IDLE_MAX: Duration = Duration::from_millis(10);
+
+/// The most and the sum of some durations, in microseconds.
+#[derive(Clone, Copy, Default)]
+struct Span {
+    total_us: u64,
+    max_us: u64,
+}
+
+impl Span {
+    fn add(&mut self, d: Duration) {
+        let us = d.as_micros() as u64;
+        self.total_us += us;
+        self.max_us = self.max_us.max(us);
+    }
+
+    fn avg_us(&self, n: u32) -> u64 {
+        self.total_us / u64::from(n.max(1))
+    }
+}
+
+/// The main loop's passes since the last report, for `ESPNOW_LOOP`.
+#[derive(Default)]
+struct Passes {
+    n: u32,
+    poll: Span,
+    work: Span,
+    idle: Span,
+    /// How much longer an idle took than it asked for.
+    over: Span,
+    /// Passes whose idle the radio could wake (`wake=1`), and idles it cut short.
+    waking: u32,
+    woken: u32,
+}
 
 /// What came from one peer: the first and the highest message numbers, and how many messages.
 #[derive(Default)]
@@ -119,18 +173,26 @@ fn run() -> anyhow::Result<()> {
         .identity(identity)
         .config(config())
         .stun_servers(Vec::<String>::new())
-        .policy(Policy::new([PathKind::Bluetooth]))
+        .policy(Policy::new([PathKind::EspNow]))
         .bluetooth(radio)
         .bind(SocketAddr::from(([127, 0, 0, 1], PORT)))?;
     node.join_room(APP, &room);
     let joined = Instant::now();
     info!("ESPNOW_MESH joined {APP}/{room} as {} over ESP-NOW alone, {}", short(&node.peer_id()), heap());
 
+    // The radio wakes this task when a frame or a send's verdict comes; only a `wake=1` idle waits for it.
+    let notification = Notification::new();
+    node.set_waker(Waker::from(notification.notifier()));
+
     let mut from: HashMap<PeerId, Count> = HashMap::new();
     let (mut first_link, mut stalled, mut burst, mut full_seen) = (None, false, false, 0);
     let (mut next_send, mut next_report, mut sent) = (joined + SEND_EVERY, joined + REPORT_EVERY, 0u32);
+    let (mut passes, mut report_us) = (Passes::default(), 0);
     loop {
+        let pass = Instant::now();
         node.poll();
+        let polled = Instant::now();
+        passes.poll.add(polled - pass);
         if let Some(time) = node.clock_from_peer().filter(|_| !timed) {
             timed = true;
             if let Err(e) = clock::set(time) {
@@ -218,10 +280,86 @@ fn run() -> anyhow::Result<()> {
         }
         if now >= next_report {
             next_report += REPORT_EVERY;
+            let t = Instant::now();
             report(&node, node_n, sent, &from, &watch.stats(), &radio_drops());
+            rtts(&node, node_n, &passes);
+            loops(node_n, &passes, report_us);
+            report_us = t.elapsed().as_micros() as u64;
+            passes = Passes::default();
         }
-        peerwire_esp::idle(&node);
+        passes.work.add(polled.elapsed());
+        let wake = woken(first_link);
+        let (asked, took, cut) = idle(&node, &notification, wake);
+        passes.idle.add(took);
+        passes.over.add(took.saturating_sub(asked));
+        passes.n += 1;
+        passes.waking += u32::from(wake);
+        passes.woken += u32::from(cut);
     }
+}
+
+/// Whether the loop's idle is woken by the radio now: as `PW_ESPNOW_WAKE` says, or in turns of `WAKE_TURN` from the
+/// first link, the first not.
+fn woken(first_link: Option<Instant>) -> bool {
+    match WAKE {
+        Some("0") => false,
+        Some("1") => true,
+        _ => first_link.is_some_and(|t| (t.elapsed().as_secs() / WAKE_TURN.as_secs()) % 2 == 1),
+    }
+}
+
+/// Idles as `peerwire_esp::idle` does, or, with `wake`, also until the radio has something (`notification`), after one
+/// tick at least, so the loop never holds the core (NB-133). What it asked for, how long it took, and whether the radio
+/// cut it short.
+fn idle(node: &Node, notification: &Notification, wake: bool) -> (Duration, Duration, bool) {
+    let tick_us = 1_000_000 / sys::configTICK_RATE_HZ;
+    let wait = node.next_timeout().unwrap_or(IDLE_MAX).min(IDLE_MAX);
+    let ticks = (wait.as_micros() as u32).div_ceil(tick_us).max(1);
+    let asked = Duration::from_micros(u64::from(ticks * tick_us));
+    let start = Instant::now();
+    let cut = if wake {
+        unsafe { sys::vTaskDelay(1) };
+        ticks > 1 && notification.wait(ticks - 1).is_some()
+    } else {
+        peerwire_esp::idle(node);
+        false
+    };
+    (asked, start.elapsed(), cut)
+}
+
+/// The `ESPNOW_RTT` line: each link's smoothed RTT, the lowest it has seen and its path's, in µs, and its fragments
+/// sent and sent again; `wake_passes`, how many of the passes since the last report the radio could wake.
+fn rtts(node: &Node, n: u8, p: &Passes) {
+    let us = |d: Option<Duration>| d.map_or("?".into(), |d| d.as_micros().to_string());
+    let links: Vec<String> = node
+        .peers()
+        .map(|peer| {
+            let s = node.peer_stats(peer).unwrap_or_default();
+            let (srtt, min, path) = (us(s.rtt), us(s.min_rtt), us(s.path_rtt));
+            let (sent, rtx) = (s.fragments_sent, s.retransmits);
+            format!("{}:srtt_us={srtt}:min_us={min}:path_us={path}:sent={sent}:rtx={rtx}", short(peer))
+        })
+        .collect();
+    info!("ESPNOW_RTT node={n} wake_passes={}/{} links={} [{}]", p.waking, p.n, links.len(), links.join(" "));
+}
+
+/// The `ESPNOW_LOOP` line: the passes since the last report, how long they polled, worked and idled, and how long the
+/// last report's lines took to log.
+fn loops(n: u8, p: &Passes, report_us: u64) {
+    info!(
+        "ESPNOW_LOOP node={n} wake_passes={}/{} poll_avg_us={} poll_max_us={} work_avg_us={} work_max_us={} \
+         idle_avg_us={} idle_max_us={} over_max_us={} woken={} report_us={report_us}",
+        p.waking,
+        p.n,
+        p.poll.avg_us(p.n),
+        p.poll.max_us,
+        p.work.avg_us(p.n),
+        p.work.max_us,
+        p.idle.avg_us(p.n),
+        p.idle.max_us,
+        p.over.max_us,
+        p.woken,
+    );
 }
 
 /// The 10 s report: links and their RTTs, messages, heap and stack, and the radio's counts.
