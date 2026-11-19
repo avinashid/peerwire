@@ -226,6 +226,8 @@ release of each.
 | NB135-I8 (Info) | **Fixed** by `fb1983a` before NB-135 merged, so never on main: the node's test of the holds closes a standby beside a link left on a radio connection that closed, which takes 1 to 4 s, reviewed 2026-11-19, same section |
 | NB142-1 (Low) | Open: a room member linked to a board can make it hold about 4.6 MB a link of fragments out of order, which NB86-I1 accepts on every node, where a board has tens of KB free, so a few dozen fragments behind one held back restart it, and a PC with the default caps can come close by accident; NB-142's 4 KiB cap leaves it as it was. Fix: a byte budget for what a lane holds out of order, set small on a board, [ESP-NOW's path kind and a board's caps](#esp-nows-path-kind-and-a-boards-caps-nb-142--nb142-1) |
 | NB142-I1 (Info) | **Fixed** by `5f3187b` (NB-142), reviewed 2026-11-19: the Wi-Fi library's tag is quiet before the station's configuration is set, as setting one logged the length of the network's password, same section |
+| NB136-1 (Low) | **Fixed** by `44c46bc` before NB-136 merged, so never on main: a pipe whose peer isn't linked kept off newcomers for 5 s after its last batch, and anyone who reads a board's tag on a relay can post a batch it saw again under a key of its own, so copies every few seconds kept every pipe the board freed and newcomers gave up; the 5 s now count from the pipe's dial, so a copy holds a freed pipe 5 s once at most, reviewed 2026-11-19, [A newcomer past the pipe cap](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1) |
+| NB136-I1 (Info) | Accepted for v1 by the lead on 2026-11-19: while a newcomer waits, a page whose events its relay drops, or its carrier loses without counting it, is taken for gone after 20 s, where its link timed out at 30 s, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -6153,12 +6155,14 @@ fails without its fix.
   only under a policy with no direct kind. It is never TURN, offered or decoded from the
   wire.
 - **Bounds.** At most 64 pipes (4 on an ESP32); past that, the one used longest ago
-  whose peer isn't linked gives way, and with every peer linked a newcomer gets none. A
-  page's 256 allowed peers now keep a linked one the same way, in `joinRoom` rooms too.
-  Out, a node's pipes share 4 batches a second (a burst of 8), the one served longest
-  ago first, each of at most 64 datagrams and 1,232 bytes of them; a pipe queues 16 KiB
-  (4 KiB on an ESP32) and drops its oldest. A page holds its batches to a native peer to
-  1,232 bytes too (`pipeBatch`).
+  whose peer isn't linked gives way, and with every peer linked a newcomer gets none;
+  since NB-136 its batch is held until a pipe frees
+  ([NB-136](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1)). A page's 256 allowed peers
+  now keep a linked one the same way, in `joinRoom` rooms too. Out, a node's pipes share
+  4 batches a second (a burst of 8), the one served longest ago first, each of at most
+  64 datagrams and 1,232 bytes of them; a pipe queues 16 KiB (4 KiB on an ESP32) and
+  drops its oldest. A page holds its batches to a native peer to 1,232 bytes too
+  (`pipeBatch`).
 - **Size on a board.** The biggest batches each side sends were measured sealed and
   signed, as a board reads the event: from Rust, 3,315 bytes for 64 datagrams making
   1,232 bytes and 2,839 for one of 1,232; from JavaScript, 3,339 for 64 of 19 bytes and
@@ -6171,6 +6175,8 @@ fails without its fix.
   times aren't checked), so a relay can deliver one again later. Its data then fails the
   replay window, and a copied HS1 makes a half-open handshake that never completes,
   within the endpoint's caps (on an ESP32, 8 at once and under load 4 from one pipe).
+  Since NB-136 a copy can also hold a pipe whose link just ended from newcomers, 5 s
+  once at most ([NB136-1](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1), fixed).
 
 **NB126-1 — A guessable default room on an internet LED (Low).** The design reused the
 Bluetooth LED's room: the page and `ble_led` default to `esp32`. Over the internet,
@@ -6608,8 +6614,9 @@ the review's own probes of the seen filter (NB133-1) and of rustls's read buffer
   default made room for 256 up front. Its read buffer is NB133-2.
 - **Pipes.** A board opens at most 4 pipes (`MAX_PIPES`), and one idle for 60 s is
   closed (`Pipes::prune`, NB-132), so pages that come and go hold none for long. With 4
-  pages linked a fifth gets none: it waits for a pipe to go, or gives up after its 15 s
-  (NB-136, below).
+  pages linked a fifth gets none; since NB-136 its dial is held until a pipe frees,
+  which a page that closed with no goodbye does once quiet for 20 s
+  ([NB-136](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1)).
 - **The watchdog.** `peerwire_esp::idle` slept until the node's next timer, 10 ms at
   most. ESP-IDF busy-waits a sleep shorter than a tick and doesn't block for one of 0,
   so while a join's handshakes kept a timer due, the main loop held the C3's one core
@@ -6638,7 +6645,8 @@ goes, or gives up; in the run above every fifth page did. So anyone with the roo
 can keep other pages off a board for as long as they hold 4 pages linked, as NB-126's
 bounds already say of every pipe table. The cap is what bounds the pipes' memory, so a
 fix that frees a pipe sooner, a page's own close or a quiet pipe evicted when the table
-is full, must not let a newcomer cut a linked page's pipe. And NB133-2, below.
+is full, must not let a newcomer cut a linked page's pipe; NB-136 doesn't
+([below](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1)). And NB133-2, below.
 
 **NB133-1 — A board's seen filter regrew to 8.7 KB (Low).** At `9395294` a board's set
 of seen event ids was made with room for 128 when the carrier started, so that it
@@ -7609,6 +7617,113 @@ Fix: the tag first.
 the tag before the configuration, and the open configuration of a station on no network
 is set after it too.
 
+### A newcomer past the pipe cap (NB-136) — NB136-1
+
+A board takes 4 pipes at once (`MAX_PIPES`, NB-133), and before NB-136 a page that
+closed with no goodbye kept its pipe until its link timed out, 30 s, while a fifth
+page's batches were dropped. `0f12cd6` holds a newcomer's batch while every pipe's peer
+is linked, and lets it in as soon as a pipe frees: a link that ended, or one whose peer
+has said nothing for 20 s while the node missed nothing sent to it. The cap stays at 4.
+`54c2a9c` adds `Endpoint::last_heard`, `5a9761b` adds `Signaling::missed` (0 by default,
+counted by `NostrSignaling`), and `7e5d1e0` has the LED page say goodbye when it stops
+or the page goes. Reviewed on 2026-11-19 by reading `40e841a..5aa4e01` (`pz/NB-136`, not
+merged). A scratch copy of `5aa4e01` ran one test of the review's own in
+`tests/pipe.rs`, with and without its fix (NB136-1), and with the fix the pipe tests
+beside it; nothing else was re-run. Its fix, `5aa4e01..03ff5fd`, was read the same day,
+with nothing re-run.
+
+**What holds.**
+
+- **Heard.** `Endpoint::last_heard` is the link's `last_recv`, which moves only once a
+  packet has passed the link's replay window and opened under its key: a copy, a forgery
+  or a handshake moves nothing, and a link that isn't up has none
+  (`last_heard_moves_only_on_a_new_authenticated_packet`).
+- **Missed.** Silence counts from the later of when the peer was last heard and when the
+  node last may have missed a batch: its inbox's budget spent or more than 4 batches
+  waiting (`Traversal::inbox_missed_at`), or a move of the carrier's count
+  (`Signaling::missed`). `NostrSignaling` counts an event dropped for a full inbox, a
+  connection that closed or didn't open, and each 100 ms of waiting to connect again;
+  `MultiSignaling` adds up its carriers'. Past those, a member's batch is dropped only
+  if it doesn't open or parse, which no one else can cause, and no peer can move a
+  linked page out of `takes_pipe`: a hello or offer in a role the node doesn't link with
+  is ignored, and a linked peer is never forgotten. The node reads up to 256 signals a
+  poll, more than a board's carrier holds, before it lets anyone in. So a flood can hold
+  newcomers off, as NB-126's stalled pipe does, but can't make a page that is there look
+  gone (`sec_a_flood_on_the_inbox_doesnt_make_a_page_that_is_there_look_gone`).
+- **Who is held.** Only a batch `takes_pipe` passed, from a member: at most 2 newcomers,
+  each its last batch alone, cut to its first 1,232 bytes of datagrams (one at least),
+  for 10 s after it; `takes_pipe` is asked again when it is let in. Let in, it goes to
+  the endpoint bound to its sender, as any batch does.
+- **A late HS1.** A held batch is at most 10 s old. Its HS1 makes a half-open handshake
+  (on a board 8 at once, and under load 4 from one pipe), which completes only if the
+  member still dials with it, as NB-126's copies do. A session from it becomes the link
+  only once data comes, so it replaces no live link, and a newcomer that has a pipe by
+  then gets its own.
+- **No live page is cut.** A pipe goes to a held newcomer from a peer not linked first:
+  one whose link ended, at once, or one dialled 5 s ago or more (`GRACE`, counted from
+  its dial since NB136-1's fix). Only then from the linked peer heard from longest ago,
+  once 20 s (halfway from `keepalive` to `idle_timeout`) have passed since then and
+  since the node last may have missed something; its link is dropped with nothing sent
+  and reported as `Timeout`. A page that is there sends at least each `keepalive`, 10 s,
+  and once it has been quiet that long the node asks it each second, so such a page left
+  10 of the node's pings unanswered, 10 s before its link would have timed out
+  (`sec_newcomers_cannot_cut_a_linked_page_that_is_there`,
+  `sec_a_linked_peer_heard_lately_never_gives_way`).
+- **Members.** Anyone with the room name can keep the pipes busy with new ids, each
+  dialling within 5 s, as it could by linking 4 pages: NB-126's bar.
+- **The rest.** The new log lines name no peer. `led.js` says goodbye on stop and on
+  `pagehide`, as far as the page has time to, and writes its busy line with
+  `textContent`. `log` now comes with feature `nostr` too.
+
+**What's left.** Anyone who makes the board miss something every 20 s, a burst past the
+inbox's budget say, keeps the quiet rule off: a page closed with no goodbye then keeps
+its pipe until its link times out, as before NB-136. NB-126's stalled pipe still holds
+newcomers off.
+
+**NB136-1 — Copied batches keep a board's freed pipes from newcomers (Low).** A pipe
+whose peer isn't linked gives way to a newcomer only once it has gone 5 s without a
+batch (`GRACE`, `Pipe::spare`). A batch is sealed to the board, which proves who sent it
+but not when, and the board checks a relay event's id, not its key or signature, so
+anyone who reads the board's tag on a relay can post a batch it saw again, under a key
+of its own, and the board takes it as the member's (NB-126's freshness). Each copy
+renews its pipe's grace, so copies of 4 members' batches every few seconds keep every
+pipe the board frees: newcomers are held and give up. Before NB-136 a newcomer's batch
+took such a pipe at once. A copy works while the board still remembers its member
+(`FORGET`, up to 10 minutes), and every newcomer's batches are more to copy. It takes
+about one event a second (**theoretical**: 4 pipes, one copy each every 5 s), well under
+the 20 a second NB-126's stalled pipe needs, and pages already linked keep their links.
+Reproduction: in the harness of `tests/pipe.rs`, 4 pages linked and closed with no
+goodbye while an outsider subscribed to the board's tag posted each page's first batch
+again every 2 s; a newcomer that linked at once without the copies never linked while
+they went on. Fix: count the grace from when the pipe was made, or from its peer's first
+batch after its link ended, not from its last batch, so a copy holds a freed pipe 5 s at
+most; and a test like the reproduction
+(`sec_copied_batches_dont_keep_freed_pipes_from_a_newcomer`). A time inside the batch,
+as offers carry, would refuse copies outright, a change at both ends.
+
+**Status: fixed** by `44c46bc` before NB-136 merged, so never on main, reviewed
+2026-11-19: `Pipe::since` is set when a pipe is made, and again only by the first batch
+from a peer whose link over it ended, and `Pipe::spare` counts `GRACE` from it, so a
+copy holds a freed pipe 5 s once at most. The reproduction is now
+`sec_copied_batches_dont_keep_freed_pipes_from_a_newcomer`, and the unit test of a
+handshake under way posts a copy within `GRACE` without a clock to wait on; with `spare`
+back on the last batch both fail (the lead's run, and the unit test by reading).
+Reported on NB-149 at `5aa4e01`.
+
+**NB136-I1 — Lost events make a page look gone 10 s sooner (Info).** The quiet rule
+trusts the carrier to count what it loses. `NostrSignaling` doesn't count a relay that
+drops a page's events (its limit per address or key, say), a subscription the relay ends
+(`CLOSED`, which it doesn't read), a connection that died without a close (it has no
+ping, so it notices when a write fails), nor what was published while a connection was
+opening, after its count last moved; nor does a carrier of an app's own that keeps the
+default `missed`. While a newcomer waits, such a page is taken for gone after 20 s,
+where its link timed out at 30 s. The relay could end it at 30 s anyway by dropping it
+all, and no one else can make a page's events go missing uncounted; a page cut while
+there dials again. Hardening, if wanted: count one more when a connection opens and on a
+`CLOSED`, and subscribe again on the latter.
+
+**Status: accepted** for v1 by the lead on 2026-11-19, as NB-136's stated leftover.
+
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
 `@peerwire/react` (`packages/react`, 0.1.0 published from `dec1554`) wraps a room in
@@ -8424,7 +8539,9 @@ mappings that carry over and are already handled in Peerwire:
   distance either.
 - Signalling rests on public relays we don't run: one that drops our events without a
   word hides members that share no other working relay, and only `peerwire doctor` and
-  Rust's `relay_stats` (NB-131) name it ([NB-130](#default-nostr-relays-nb-130)).
+  Rust's `relay_stats` (NB-131) name it ([NB-130](#default-nostr-relays-nb-130)); on a
+  board whose pipes are all taken, a page whose events it drops is taken for gone 10 s
+  sooner ([NB136-I1](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1)).
 - The security of the underlying crypto crates is assumed.
 
 ## Review method
