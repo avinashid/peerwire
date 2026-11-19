@@ -497,7 +497,10 @@ impl RelSend {
             st.lo_sends = 0;
             if let Some(lo) = lo {
                 let Stream { inflight, by_due, .. } = st;
-                for (&s, f) in inflight.range_mut(lo..=lo.saturating_add(SACK_BITS)) {
+                // The fragments lo..=lo + SACK_BITS: lo is the first in flight,
+                // and no seq is u32::MAX (push_message). Ranged up to, as fast
+                // retransmit's loop is: a RangeInclusive costs the wasm 640 B.
+                for (&s, f) in inflight.range_mut(..lo.saturating_add(SACK_BITS + 1)) {
                     let due = f.due.min(now.max(f.sent_at + self.rto));
                     if f.tries > DROPPED_AFTER && due < f.due {
                         by_due.remove(&(f.due, s));
