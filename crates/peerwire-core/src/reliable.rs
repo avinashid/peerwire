@@ -842,8 +842,15 @@ impl RelRecv {
         while let Some((fin, d)) = self.buf.remove(&self.next) {
             self.out_of_order -= HELD_OVERHEAD + d.len();
             self.next = self.next.checked_add(1).ok_or(())?;
-            if self.assembling.len() + d.len() > max_message {
+            let len = self.assembling.len() + d.len();
+            if len > max_message {
                 return Err(());
+            }
+            // Doubled as Vec grows, but never past max_message (NB150-1): Vec's
+            // own doubling, from sizes the peer picks, reserves up to twice it.
+            if len > self.assembling.capacity() {
+                let cap = (2 * self.assembling.capacity()).max(len).min(max_message);
+                self.assembling.reserve_exact(cap - self.assembling.len());
             }
             self.assembling.extend_from_slice(&d);
             if fin {
@@ -1609,6 +1616,42 @@ mod tests {
             assert_eq!(got, Ok(Took::Taken));
         }
         assert_eq!((rx.buf.len(), rx.out_of_order), (RECV_WINDOW as usize - 1, DEFAULT_OUT_OF_ORDER));
+    }
+
+    /// NB150-1: a message partly assembled reserves at most `max_message`,
+    /// however its sender sizes the fragments. Vec's doubling alone, filled to
+    /// 4,094 B and then one byte more, reserved 8,188 B at a board's 4 KiB cap.
+    /// A message of full fragments still grows by doubling, and one past the
+    /// cap still breaks the protocol.
+    #[test]
+    fn a_message_assembled_reserves_at_most_max_message() {
+        const MAX: usize = 4 << 10;
+        let (mut rx, mut out) = (RelRecv::new(RECV_WINDOW), Vec::new());
+        for (seq, len) in [1000, 1047, 1000, 1047, 1].into_iter().enumerate() {
+            rx.on_fragment(seq as u32, false, &vec![0; len], MAX, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
+            let cap = rx.assembling.capacity();
+            assert!(cap <= MAX, "fragment {seq}: {cap} B reserved for {} B", rx.assembling.len());
+        }
+        rx.on_fragment(5, true, &[0], MAX, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
+        assert_eq!((out.len(), out[0].len()), (1, MAX));
+        assert!(out[0].capacity() <= MAX);
+        for seq in 6..9 {
+            rx.on_fragment(seq, false, &[0; FRAGMENT], MAX, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
+        }
+        assert!(rx.on_fragment(9, true, &[0; MAX - 3 * FRAGMENT + 1], MAX, DEFAULT_OUT_OF_ORDER, &mut out).is_err());
+        // At the default 1 MiB, a message of 954 fragments reserves 11 times,
+        // the last time up to the cap, not past it.
+        let (max, mut rx) = (1 << 20, RelRecv::new(RECV_WINDOW));
+        let (mut seq, mut grown, mut cap) = (0, 0, 0);
+        while rx.assembling.len() < max {
+            let len = FRAGMENT.min(max - rx.assembling.len());
+            rx.on_fragment(seq, false, &vec![0; len], max, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
+            if rx.assembling.capacity() != cap {
+                (grown, cap) = (grown + 1, rx.assembling.capacity());
+            }
+            seq += 1;
+        }
+        assert_eq!((seq, grown, cap), (954, 11, max));
     }
 
     #[test]
