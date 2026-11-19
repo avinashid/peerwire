@@ -50,7 +50,7 @@ use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys;
 use log::{error, info, warn};
-use peerwire::{Builder, Config, LanSignaling, Node};
+use peerwire::{Builder, Config, LanSignaling, Node, HELD_FRAGMENT};
 #[cfg(feature = "nostr")]
 use peerwire::{MultiSignaling, NostrSignaling, Signaling};
 
@@ -275,6 +275,17 @@ pub const MAX_MESSAGE: usize = if RADIO { 4 * 1024 } else { 16 * 1024 };
 /// [`RADIO`].
 pub const MAX_SEND_BUFFER: usize = if RADIO { 8 * 1024 } else { 32 * 1024 };
 
+/// What [`config`] lets each link's reliable lane, and its urgent one, hold out of order, past a fragment still
+/// missing: 4 full fragments, 4,656 B (NB-150). The defaults hold up to 4,095, so a linked peer could make one link
+/// hold 4.5 MB, where a C3's free heap had fallen to 43,312 B (NB-133) and a radio leaves less (NB142-1). Four is the
+/// sender's smallest window, so a sender backed off to it never sends past what a hole leaves room for, and it is a
+/// whole 4 KiB message, so the rest of one whose first fragment was lost waits. Over Bluetooth or ESP-NOW a fragment is
+/// the same 1,100 B or less, split into the radio's frames below the node: the radio's frame size doesn't change it.
+/// A peer can then make a link hold at most twice this and twice [`MAX_MESSAGE`] partly assembled: 17,504 B with a
+/// [`RADIO`], 42,080 B without. Fragments past it are dropped and their sender sends them again; a lossy link to such a
+/// board is slower, not broken.
+pub const MAX_OUT_OF_ORDER: usize = 4 * HELD_FRAGMENT;
+
 /// Caps sized for a chip with ~250 KB of free heap: 16 KiB messages, a 32 KiB send buffer, 8 links and 8 handshakes
 /// at once. The defaults allow 1 MiB messages and buffers.
 ///
@@ -282,10 +293,13 @@ pub const MAX_SEND_BUFFER: usize = if RADIO { 8 * 1024 } else { 32 * 1024 };
 /// ~76 KB of a C3's heap (NB-138), and a C3 with Bluetooth and ESP-NOW and 4 links might have had only 5 to 15 KB left
 /// at the larger caps (NB-142). A peer that sends this node a larger message has its link closed, as with any cap: give
 /// the peers of a board with a radio messages of 4 KiB at most.
+///
+/// Either way each lane of a link holds at most [`MAX_OUT_OF_ORDER`] (4 full fragments) out of order.
 pub fn config() -> Config {
     Config {
         max_message: MAX_MESSAGE,
         max_send_buffer: MAX_SEND_BUFFER,
+        max_out_of_order: MAX_OUT_OF_ORDER,
         max_links: 8,
         max_pending_handshakes: 8,
         ..Config::default()
