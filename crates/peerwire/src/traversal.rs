@@ -3489,9 +3489,9 @@ mod tests {
         w.run(2_000, |_| false);
         assert_eq!(w.paths(), old.map(|h| Some(Path::Direct(h))), "nothing moves by itself");
         let replaced = w.count(|e| matches!(e, Event::Disconnected { reason: Replaced, .. }));
-        for i in 0..2 {
+        for (i, hop) in next.iter().enumerate() {
             let now = w.now;
-            w.t[i].radio_reaches(now, &mut w.e[i], id(2 - i as u8).peer_id(), next[i]);
+            w.t[i].radio_reaches(now, &mut w.e[i], id(2 - i as u8).peer_id(), *hop);
         }
         w.run(1_000, |_| false);
         assert_eq!(w.paths(), next.map(|h| Some(Path::Direct(h))), "moved within a second");
