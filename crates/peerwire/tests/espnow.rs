@@ -1496,3 +1496,93 @@ fn sec_frames_forged_with_the_numbers_of_the_proof_and_two_forged_opens_cost_sec
     assert!(l0 && t0 < Duration::from_secs(10), "the 8 frames alone: {t0:?}");
     assert!(l2 && t2 < Duration::from_secs(10), "linked again within seconds: {t2:?}");
 }
+
+/// NB135-16 (b), the security review's repro, accepted for v1: a member's advert is bound to its address, and a connect
+/// whose OPEN no radio acknowledges fails at once (NB135-12). But a radio at a gone member's address acknowledges the
+/// OPENs to it, as any radio does for its own address, and answers none, so a connect to a replay of that member's
+/// advert goes on for `connect_within`, 10 s. X's `n` is below B's, so X is the one to connect. A forger with 4 gone
+/// members' adverts (each `n` above X's) and a radio at each of their addresses replays them to X whenever fewer than
+/// two of X's connects to them are under way, for `forge_for`: X's two connects go to them, and X and B stay apart
+/// while it goes on (not linked in the 30 s the review's forger ran) and link as it stops. How long until X and B
+/// linked, within `secs`; the replays sent, and X's connects to them.
+fn replays_from_gone_members_with_radios_at_their_addresses(
+    forge_for: Duration,
+    secs: u64,
+) -> (Option<Duration>, u32, u32) {
+    use std::sync::{Arc, Mutex};
+    let air = FakeAir::new();
+    let (mut x, mut b) = (node(&air, A, V1_FRAME), node(&air, B, V1_FRAME));
+    let (px, pb) = (x.peer_id(), b.peer_id());
+    let room = format!("espnow-r8-radios-{}", forge_for.as_secs());
+    b.join_room("pw-test", &room);
+    b.poll();
+    let n_b = advert_n(&air, B).expect("B's advert");
+    air.set_off(A, true);
+    let n_x = loop {
+        x.join_room("pw-test", &room);
+        x.poll();
+        let n = advert_n(&air, A).expect("X's advert");
+        if n < n_b {
+            break n;
+        }
+    };
+    let zs: Vec<Mac> = (0..4).map(|i| [0x02, 0x50, 0x57, 0, 1, i]).collect();
+    let gone: Vec<(Mac, (Node, Vec<u8>))> = zs.iter().map(|&z| (z, gone_members_advert(&air, z, &room, n_x))).collect();
+    for z in &zs {
+        air.set_off(*z, false); // a radio of the forger's at the address: it acknowledges, and answers nothing
+    }
+    // X's OPENs to those addresses, as they go on the air.
+    let log = Arc::new(Mutex::new(Vec::<(Mac, Instant)>::new()));
+    let (l, watched) = (log.clone(), zs.clone());
+    air.set_hole(Some(Box::new(move |from: Mac, to: Mac, f: &[u8]| {
+        if from == A && watched.contains(&to) && matches!(frame::parse(f), Ok(frame::Frame::Open { .. })) {
+            l.lock().unwrap().push((to, Instant::now()));
+        }
+        false
+    })));
+    air.set_off(A, false);
+    // When X's connect to each address began, and its last OPEN to it.
+    let (mut start, mut last) = (HashMap::<Mac, Instant>::new(), HashMap::<Mac, Instant>::new());
+    let (mut sent, mut connects) = (0u32, 0u32);
+    let (mut ex, mut eb) = (Vec::new(), Vec::new());
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(secs) {
+        poll_all(&mut [&mut x], &mut ex);
+        for (z, at) in std::mem::take(&mut *log.lock().unwrap()) {
+            if last.get(&z).is_none_or(|l| at.saturating_duration_since(*l) > Duration::from_secs(1)) {
+                start.insert(z, at);
+                connects += 1;
+            }
+            last.insert(z, at);
+        }
+        if t.elapsed() < forge_for {
+            let busy = |z: &Mac| start.get(z).is_some_and(|s| s.elapsed() < Duration::from_millis(9_950));
+            if zs.iter().filter(|z| busy(z)).count() < 2 {
+                for (z, (_, advert)) in gone.iter().filter(|(z, _)| !busy(z)) {
+                    air.inject(*z, A, advert);
+                    sent += 1;
+                }
+            }
+        }
+        poll_all(&mut [&mut b], &mut eb);
+        if on_radio(&x, &pb) && on_radio(&b, &px) {
+            return (Some(t.elapsed()), sent, connects);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    (None, sent, connects)
+}
+
+#[test]
+fn sec_replays_from_gone_members_with_radios_at_their_addresses_cost_seconds_once_they_stop() {
+    let forge_for = Duration::from_secs(10);
+    let (control, _, _) = replays_from_gone_members_with_radios_at_their_addresses(Duration::ZERO, 15);
+    let (linked, sent, connects) = replays_from_gone_members_with_radios_at_their_addresses(forge_for, 25);
+    eprintln!(
+        "no replays: linked after {control:?}; replays for {forge_for:?}: linked after {linked:?}, {sent} sent, \
+         {connects} connects to them"
+    );
+    assert!(control.is_some_and(|t| t < Duration::from_secs(2)), "control: {control:?}");
+    let within = forge_for + Duration::from_secs(5);
+    assert!(linked.is_some_and(|t| t < within), "within seconds of the forger's end: {linked:?}");
+}

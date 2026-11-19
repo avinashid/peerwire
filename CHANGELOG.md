@@ -73,6 +73,10 @@ and the commit that fixed it.
   (NB135-15). `espnow::Ether::send` takes a tag for each frame, and `Ether::done`, `TxQueue::push` and
   `TxQueue::outcome` carry it, so a verdict is matched to its own frame, never to the next one's after one comes late.
   Bluetooth is unchanged.
+- ESP-NOW, from its security review's eighth round: `espnow::Engine` gives up a connect whose OPEN no radio
+  acknowledged at that verdict even if an ACCEPT came first (`Disconnected`, counted in `Stats::connects_unacked`), so
+  an ACCEPT forged from a gone member's address with the OPEN's overheard id no longer holds one of a board's unbound
+  slots until the room proof's deadline (NB135-16).
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert
