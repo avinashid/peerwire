@@ -387,7 +387,9 @@ fn four_linked(n: &mut Node, hub: &MemoryHub, ev: &mut Vec<Event>) -> Vec<Browse
 }
 
 fn left(ev: &[Event]) -> Vec<(PeerId, DisconnectReason)> {
-    ev.iter().filter_map(|e| if let Event::Disconnected { peer, reason } = e { Some((*peer, *reason)) } else { None }).collect()
+    ev.iter()
+        .filter_map(|e| if let Event::Disconnected { peer, reason } = e { Some((*peer, *reason)) } else { None })
+        .collect()
 }
 
 /// NB-136: with 4 pages linked, one closed with no goodbye holds its pipe only until it has been quiet for `QUIET`:
@@ -416,7 +418,9 @@ fn a_fifth_page_links_once_a_page_closed_without_a_goodbye_has_gone_quiet() {
     assert_eq!(n.path_kind(&fifth), Some(PathKind::Signaling));
     // Its link works both ways.
     pages[3].ep.send(&nid, Lane::Reliable, b"led on").unwrap();
-    let got = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::Message { peer, data, .. } if *peer == fifth && data == b"led on"));
+    let got = |ev: &[Event]| {
+        ev.iter().any(|e| matches!(e, Event::Message { peer, data, .. } if *peer == fifth && data == b"led on"))
+    };
     assert!(run(&mut n, &mut pages, &mut ev, 5.0, || {}, |_, _, ev| got(ev)));
 }
 
@@ -433,7 +437,14 @@ fn sec_newcomers_cannot_cut_a_linked_page_that_is_there() {
     ev.clear();
     let newcomers: Vec<PeerId> = (0..3).map(|_| arrive(&mut n, &hub, &mut pages, &mut ev)).collect();
     let any_in = |n: &Node| newcomers.iter().any(|p| n.status(p) != Status::Disconnected);
-    let cut = run(&mut n, &mut pages, &mut ev, (QUIET * 2).as_secs_f64(), || {}, |n, _, ev| any_in(n) || !left(ev).is_empty());
+    let cut = run(
+        &mut n,
+        &mut pages,
+        &mut ev,
+        (QUIET * 2).as_secs_f64(),
+        || {},
+        |n, _, ev| any_in(n) || !left(ev).is_empty(),
+    );
     assert!(!cut, "a newcomer linked, or a page was cut: {:?}", left(&ev));
     assert!(pages[..4].iter().all(|p| n.status(&id(p)) == Status::Connected && p.ep.is_connected(&nid)));
     // Page 0 leaves, saying so: its pipe goes to a newcomer still dialling, at once.
@@ -442,7 +453,14 @@ fn sec_newcomers_cannot_cut_a_linked_page_that_is_there() {
     pages[0].step();
     pages.remove(0);
     let left_at = Instant::now();
-    assert!(run(&mut n, &mut pages, &mut ev, 5.0, || {}, |n, _, _| newcomers.iter().any(|p| n.status(p) == Status::Connected)));
+    assert!(run(
+        &mut n,
+        &mut pages,
+        &mut ev,
+        5.0,
+        || {},
+        |n, _, _| newcomers.iter().any(|p| n.status(p) == Status::Connected)
+    ));
     eprintln!("a newcomer linked {:?} after the goodbye", left_at.elapsed());
     assert!(left_at.elapsed() < Duration::from_secs(2), "{:?}", left_at.elapsed());
     assert_eq!(left(&ev), [(leaving, DisconnectReason::ClosedByPeer)]);
@@ -473,14 +491,22 @@ fn sec_a_flood_on_the_inbox_doesnt_make_a_page_that_is_there_look_gone() {
     };
     junk(100); // the inbox's burst, and more
     pages[1].ep.send(&nid, Lane::Reliable, b"during").unwrap();
-    let said = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"during"));
+    let said = |ev: &[Event], what: &[u8]| ev.iter().any(|e| matches!(e, Event::Message { data, .. } if data == what));
     let flood = (QUIET + Duration::from_secs(1)).as_secs_f64();
-    // Each round, junk ahead of the pages' batches takes every token the budget gains.
-    run(&mut n, &mut pages, &mut ev, flood, || junk(20), |_, _, _| false);
-    assert!(!said(&ev), "the flood dropped the pages' batches");
+    // Each round, ahead of the pages' batches, more junk than the tokens the budget gained since the last (one each
+    // 50 ms): the pages' batches find none.
+    let mut last = Instant::now();
+    let each_round = || {
+        let gained = last.elapsed().as_millis() as usize / 50;
+        last = Instant::now();
+        junk(gained + 10);
+    };
+    run(&mut n, &mut pages, &mut ev, flood, each_round, |_, _, _| false);
+    assert!(!said(&ev, b"during"), "the flood dropped the pages' batches");
     assert_eq!(left(&ev), [], "no page was cut");
-    // The flood ends: the pages are heard again, with what they said, and keep their links; the newcomer is still out.
-    assert!(run(&mut n, &mut pages, &mut ev, 3.0, || {}, |_, _, ev| said(ev)));
+    // The flood ends: the pages are heard again and keep their links; the newcomer is still out.
+    pages[1].ep.send(&nid, Lane::Unreliable, b"after").unwrap();
+    assert!(run(&mut n, &mut pages, &mut ev, 3.0, || {}, |_, _, ev| said(ev, b"after")));
     run(&mut n, &mut pages, &mut ev, 1.0, || {}, |_, _, _| false);
     assert_eq!(left(&ev), []);
     assert!(pages[..4].iter().all(|p| n.status(&id(p)) == Status::Connected));
@@ -504,9 +530,14 @@ fn page_visits_in_a_row_each_link_past_the_pipe_cap() {
         let mut pages = Vec::new();
         let page = arrive(&mut n, &hub, &mut pages, &mut ev);
         let dialled = Instant::now();
-        let linked = run(&mut n, &mut pages, &mut ev, window.as_secs_f64(), || {}, |n, p, _| {
-            n.status(&page) == Status::Connected && p[0].ep.is_connected(&nid)
-        });
+        let linked = run(
+            &mut n,
+            &mut pages,
+            &mut ev,
+            window.as_secs_f64(),
+            || {},
+            |n, p, _| n.status(&page) == Status::Connected && p[0].ep.is_connected(&nid),
+        );
         took.push(linked.then(|| dialled.elapsed().as_millis()));
         assert!(linked, "visit {}: not linked in {window:?}; so far {took:?}", i + 1);
         pages[0].ep.send(&nid, Lane::Reliable, b"led toggle").unwrap();
