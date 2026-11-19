@@ -1,6 +1,7 @@
 // Serves the JS package (the demos and what they import) for hosting them
 // somewhere other than this machine; `/` opens Net Lab (demo/netlab.html), the
-// connection diagnostics page, and demo/crew.html is the Crew game. It is only a
+// connection diagnostics page, demo/crew.html is the Crew game, and a directory's
+// URL serves its index.html (demo/share/ is Peerwire Share). It is only a
 // file server: peers link peer to peer, and when WebRTC can't link two of them,
 // joinRoom falls back on its own (through another peer, else over the Nostr
 // relays). No dependencies.
@@ -28,7 +29,8 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(302, { location: start + url.search });
     return res.end();
   }
-  const rel = path.normalize(decodeURIComponent(url.pathname));
+  // A directory's index.html: /share/ opens /share/index.html.
+  const rel = path.normalize(decodeURIComponent(url.pathname.endsWith('/') ? `${url.pathname}index.html` : url.pathname));
   const file = path.join(root, rel);
   const type = TYPES[path.extname(file)];
   if (req.method !== 'GET' || !file.startsWith(root + path.sep) || !type || rel.includes(`${path.sep}.`)) {
