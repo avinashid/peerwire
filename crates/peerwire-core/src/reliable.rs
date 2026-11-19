@@ -13,8 +13,20 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// a game frame), as in QUIC's max_ack_delay. Loss is mostly repaired by fast
 /// retransmit, so this only delays recovery of the last packets in a burst.
 const ACK_DELAY: Duration = Duration::from_millis(25);
-/// A fragment unacknowledged after this many sends means the link is dead.
+/// The lowest fragment unacknowledged, sent this many times more since it
+/// became the lowest, means the link is dead. Only the lowest counts: a
+/// receiver always takes the fragment it expects next, but may drop those
+/// past it for its out-of-order budget (`Config::max_out_of_order`) however
+/// often, while the link still delivers.
 const MAX_TRIES: u32 = 16;
+/// Sends past which a fragment unacknowledged while the cumulative ACK moves
+/// is taken as dropped by a receiver short of memory rather than lost again
+/// (NB-150): it drops its back-off when the ACK moves, and once the lowest it
+/// backs off by its sends as the lowest alone. Five losses of one fragment in a
+/// row are rare (p⁵: 3 · 10⁻⁷ at 5% loss), and a congested queue's back-off
+/// doesn't meet them in the simulator's benchmarks (3 did, behind `cc_fair`'s
+/// 1 ms buffer): below it timers are as they were.
+const DROPPED_AFTER: u32 = 5;
 /// The reliable stream's receive window: fragments are buffered from the next
 /// expected one up to this many ahead, and the sender keeps the span of its
 /// fragments in flight under it, so none is sent only to be dropped. It bounds
@@ -95,6 +107,8 @@ struct Fragment {
     first_sent: Instant,
     sent_at: Instant,
     due: Instant,
+    /// Sends so far: the back-off, and Karn's rule. Not the link's failure,
+    /// which is `Stream::lo_sends`.
     tries: u32,
     /// Already scheduled for fast retransmit in this round.
     fast: bool,
@@ -137,6 +151,10 @@ pub struct RecoveryStats {
     /// the cumulative ACK moved.
     pub deferred: u64,
     pub rearmed: u64,
+    /// Timers of fragments sent more than DROPPED_AFTER (5) times brought
+    /// forward when the cumulative ACK moved, to an RTO after their latest
+    /// send: the link delivers, so they don't wait out their back-off (NB-150).
+    pub restarted: u64,
 }
 
 /// Index of the reliable and the urgent stream in `RelSend::streams`.
@@ -158,6 +176,9 @@ struct Stream {
     /// Fragments whose timer was put off for being beyond the SACK bitmap's
     /// reach (see `write_stream`); some may since have been acknowledged.
     deferred: BTreeSet<u32>,
+    /// Sends of the lowest fragment in flight since it became the lowest, the
+    /// first one not counted: past MAX_TRIES the link is dead.
+    lo_sends: u32,
     buffered: usize,
     /// Wire bytes of one copy of each fragment in flight (data and frame header).
     inflight_bytes: usize,
@@ -180,6 +201,7 @@ impl Stream {
             by_due: BTreeSet::new(),
             by_dup: BTreeSet::new(),
             deferred: BTreeSet::new(),
+            lo_sends: 0,
             buffered: 0,
             inflight_bytes: 0,
             probe_at: None,
@@ -463,6 +485,29 @@ impl RelSend {
                 lo.is_some_and(|lo| s - lo > SACK_BITS)
             });
         }
+        // The cumulative ACK moved, so the link delivers: fragments within the
+        // bitmap's reach sent more than DROPPED_AFTER times drop their back-off
+        // and are due an RTO after their latest send. A receiver short of memory
+        // drops what it can't hold past a hole (`Config::max_out_of_order`), so
+        // a fragment may go unacknowledged many times while the hole below it is
+        // repaired, and doubling its timer each time would leave the link
+        // crawling once the hole is filled (NB-150). While nothing moves, every
+        // copy still backs off.
+        if lo != base {
+            st.lo_sends = 0;
+            if let Some(lo) = lo {
+                let Stream { inflight, by_due, .. } = st;
+                for (&s, f) in inflight.range_mut(lo..=lo.saturating_add(SACK_BITS)) {
+                    let due = f.due.min(now.max(f.sent_at + self.rto));
+                    if f.tries > DROPPED_AFTER && due < f.due {
+                        by_due.remove(&(f.due, s));
+                        by_due.insert((due, s));
+                        f.due = due;
+                        self.recovery.restarted += 1;
+                    }
+                }
+            }
+        }
         let mut queued_too_long = false;
         if let Some((_, r)) = sample {
             self.update_rtt(r);
@@ -618,11 +663,21 @@ impl RelSend {
             }
             wire::put_reliable(out, seq, f.fin, &f.data, urgent);
             f.tries += 1;
-            if f.tries > MAX_TRIES {
-                self.failed = true;
+            // The lowest fragment, sent more than DROPPED_AFTER times before
+            // it became the lowest, backs off by its sends as the lowest: those
+            // before were likely dropped by a receiver short of memory.
+            let mut sends = f.tries;
+            if seq == lo {
+                st.lo_sends += 1;
+                if f.tries - st.lo_sends > DROPPED_AFTER {
+                    sends = st.lo_sends + 1;
+                }
+                if st.lo_sends >= MAX_TRIES {
+                    self.failed = true;
+                }
             }
             f.sent_at = now;
-            let backoff = self.rto.saturating_mul(1 << (f.tries - 1).min(8)).min(MAX_BACKOFF);
+            let backoff = self.rto.saturating_mul(1 << (sends - 1).min(8)).min(MAX_BACKOFF);
             st.by_due.remove(&(f.due, seq));
             f.due = now + backoff;
             st.by_due.insert((f.due, seq));
@@ -1189,6 +1244,94 @@ mod tests {
         assert!(tx.failed);
         assert!(resent.iter().all(|&s| s == 0), "{resent:?}");
         assert_eq!(resent.len() as u32, MAX_TRIES - 1, "0 went twice in hole_at_zero");
+    }
+
+    /// NB-150: only the lowest fragment's sends since it became the lowest fail
+    /// the link, as a receiver always takes the one it expects next: 1, sent 15
+    /// times beside 0, has 16 sends of its own once 0 is acknowledged. More than
+    /// DROPPED_AFTER of them before, so its timer drops its back-off as the ACK
+    /// moves, and it backs off by its sends as the lowest alone.
+    #[test]
+    fn the_lowest_fragment_fails_the_link_by_its_own_sends() {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        for i in 0..2u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        assert_eq!(seqs(drain(&mut tx, Instant::ZERO)), vec![0, 1]);
+        let mut t = Instant::ZERO;
+        while tx.streams[REL].inflight[&1].tries < 15 {
+            t = tx.next_due().unwrap();
+            drain(&mut tx, t);
+        }
+        assert!(!tx.failed);
+        assert_eq!(tx.streams[REL].lo_sends, 14);
+        tx.on_ack(t + Duration::from_millis(100), 1, 0, false);
+        assert_eq!(tx.streams[REL].lo_sends, 0);
+        let f = &tx.streams[REL].inflight[&1];
+        assert_eq!(f.due, f.sent_at + tx.rto, "its timer dropped its back-off");
+        while tx.streams[REL].lo_sends == 0 {
+            t = tx.next_due().unwrap();
+            drain(&mut tx, t); // a tail probe, then the resend
+        }
+        assert_eq!(tx.streams[REL].inflight[&1].due, t + tx.rto * 2);
+        while !tx.failed {
+            t = tx.next_due().unwrap();
+            drain(&mut tx, t);
+        }
+        let st = &tx.streams[REL];
+        assert_eq!((st.lo_sends, st.inflight[&1].tries), (MAX_TRIES, 15 + MAX_TRIES));
+    }
+
+    /// NB-150: a receiver that holds 4 full fragments out of order, behind a
+    /// path that turns every burst round, holds a burst's top 4 and drops the
+    /// rest until its lowest lands: one fragment a round at worst. The ones it
+    /// drops go out far more than MAX_TRIES times, yet the link doesn't fail,
+    /// and all 40 arrive in about 16 s, where timers doubling to 10 s took over
+    /// a minute: past DROPPED_AFTER sends, the cumulative ACK's moves restart
+    /// them.
+    #[test]
+    fn drops_past_a_receivers_budget_neither_fail_nor_stall_the_link() {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        tx.cwnd = 40.0;
+        for i in 0..40u8 {
+            tx.push_message(&[i; 1000], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        let mut rx = RelRecv::new(RECV_WINDOW);
+        let one_way = Duration::from_millis(50);
+        type Burst = Vec<(u32, bool, Vec<u8>)>;
+        let mut to_rx: VecDeque<(Instant, Burst)> = VecDeque::new();
+        let mut to_tx: VecDeque<(Instant, u32, u64)> = VecDeque::new();
+        let (mut delivered, mut dropped, mut most_tries) = (Vec::new(), 0, 0);
+        let mut now = Instant::ZERO;
+        while delivered.len() < 40 && now < Instant::from_millis(60_000) {
+            let mut burst = drain_window(&mut tx, now, 1024);
+            if !burst.is_empty() {
+                burst.reverse();
+                to_rx.push_back((now + one_way, burst));
+            }
+            assert!(!tx.failed, "failed at {now:?}");
+            most_tries = tx.streams[REL].inflight.values().map(|f| f.tries).fold(most_tries, u32::max);
+            while to_rx.front().is_some_and(|(at, _)| *at <= now) {
+                for (seq, fin, data) in to_rx.pop_front().unwrap().1 {
+                    let took = rx.on_fragment(seq, fin, &data, 1 << 20, 4 * HELD_FRAGMENT, &mut delivered);
+                    dropped += (took == Ok(Took::OverBudget)) as u32;
+                }
+                let (cum, bits) = rx.ack();
+                to_tx.push_back((now + one_way, cum, bits));
+            }
+            while to_tx.front().is_some_and(|(at, ..)| *at <= now) {
+                let (_, cum, bits) = to_tx.pop_front().unwrap();
+                tx.on_ack(now, cum, bits, false);
+            }
+            now = now + Duration::from_millis(1);
+        }
+        let want: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 1000]).collect();
+        assert_eq!(delivered, want);
+        assert!(most_tries > MAX_TRIES && dropped > 100, "{most_tries} sends, {dropped} dropped");
+        assert!(tx.recovery.restarted > 0);
+        assert!(now < Instant::from_millis(30_000), "{now:?}");
     }
 
     /// One cut per round trip, but a timeout in one cut for random loss deepens
