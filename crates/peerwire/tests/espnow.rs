@@ -2,7 +2,7 @@
 //! radio find each other, prove the room and link over it, also when frames are lost or a v1 radio meets a v2 one; a
 //! forged CLOSE, sent with ids overheard on the air, closes nothing.
 use peerwire::espnow::{frame, EspNow, FakeAir, Mac, Settings, Watch, BROADCAST, V1_FRAME, V2_FRAME};
-use peerwire::{Config, Event, Lane, Node, PathKind, PeerId, Policy, Status};
+use peerwire::{Config, Event, Lane, Node, PathKind, PeerId, Policy, Status, HELD_FRAGMENT};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -114,10 +114,17 @@ fn an_espnow_link_is_of_espnow_s_own_kind() {
 }
 
 /// `peerwire_esp::config()` on a board with a radio (feature `ble` or `espnow`): 4 KiB messages and an 8 KiB send
-/// buffer (NB-142).
+/// buffer (NB-142), and 4 full fragments held out of order (NB-150).
 fn board_config() -> Config {
-    let (max_message, max_send_buffer) = (4 * 1024, 8 * 1024);
-    Config { max_message, max_send_buffer, max_links: 8, max_pending_handshakes: 8, ..Config::default() }
+    let (max_message, max_send_buffer, max_out_of_order) = (4 * 1024, 8 * 1024, 4 * HELD_FRAGMENT);
+    Config {
+        max_message,
+        max_send_buffer,
+        max_out_of_order,
+        max_links: 8,
+        max_pending_handshakes: 8,
+        ..Config::default()
+    }
 }
 
 /// NB-142: a board's caps with a radio carry its largest message over ESP-NOW, two of them queued at once, and refuse a
@@ -161,6 +168,59 @@ fn a_board_s_radio_caps_carry_its_largest_message() {
     let closed = pump(&mut [&mut board, &mut peer], &mut ev, 10, |n| n[0].status(&pb) != Status::Connected);
     assert!(closed && ev[0].iter().any(violation), "{:?}", ev[0]);
     assert!(!got(&ev[0], pb, &over));
+}
+
+/// NB-150: a PC on the defaults sends a board with a radio's caps, 4 full fragments out of order included, its
+/// largest messages on both lanes over ESP-NOW frames of which 30% of tries are lost (the radio tries a frame 4 times,
+/// and a datagram is 5 frames of 250 B: about 4% of datagrams lost). What the board can't hold past a hole it drops,
+/// and the PC sends again: every message arrives, each lane in order, and the link stays up. At 40% the radio
+/// connection closes after its 32nd value lost to a missing frame (`ble::MAX_DROPS`), with the default cap too.
+#[test]
+fn a_board_s_out_of_order_cap_carries_a_lossy_radio_link() {
+    let air = FakeAir::new();
+    let with = |mac: Mac, config: Config| {
+        let radio = EspNow::new(air.ether(mac, V1_FRAME), Settings::DEFAULT);
+        let builder = Node::builder().config(config).bluetooth(radio).policy(Policy::new([PathKind::EspNow]));
+        builder.stun_servers(Vec::<String>::new()).bind("127.0.0.1:0").unwrap()
+    };
+    let (mut pc, mut board) = (with(A, Config::default()), with(B, board_config()));
+    let (pp, pb) = (pc.peer_id(), board.peer_id());
+    pc.join_room("pw-test", "espnow-cap");
+    board.join_room("pw-test", "espnow-cap");
+    let mut ev = Vec::new();
+    assert!(pump(&mut [&mut pc, &mut board], &mut ev, 15, |n| on_radio(n[0], &pb) && on_radio(n[1], &pp)), "linked");
+    air.set_loss(300, 20);
+    let reliable: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i; 4 * 1024]).collect();
+    let urgent: Vec<Vec<u8>> = (0..16u8).map(|i| vec![0x80 | i; 1024]).collect();
+    for (r, u) in reliable.iter().zip(&urgent) {
+        pc.send(&pb, Lane::Reliable, r).unwrap();
+        pc.send(&pb, Lane::Urgent, u).unwrap();
+    }
+    let lane = |ev: &[Event], len: usize| -> Vec<Vec<u8>> {
+        let from_pc = |e: &Event| match e {
+            Event::Message { peer, data, .. } if *peer == pp && data.len() == len => Some(data.clone()),
+            _ => None,
+        };
+        ev.iter().filter_map(from_pc).collect()
+    };
+    let (mut ev, started) = (vec![Vec::new(), Vec::new()], Instant::now());
+    let done = |ev: &Vec<Vec<Event>>| lane(&ev[1], 4 * 1024).len() == 16 && lane(&ev[1], 1024).len() == 16;
+    while !done(&ev) && started.elapsed() < Duration::from_secs(60) {
+        pump(&mut [&mut pc, &mut board], &mut ev, 1, |_| false);
+    }
+    let firsts = |l: Vec<Vec<u8>>| l.iter().map(|m| m[0]).collect::<Vec<u8>>();
+    let (r, u) = (firsts(lane(&ev[1], 4 * 1024)), firsts(lane(&ev[1], 1024)));
+    assert!(done(&ev), "in {:?} the board got {r:?} and {u:?}", started.elapsed());
+    assert_eq!(lane(&ev[1], 4 * 1024), reliable, "the reliable lane, whole and in order");
+    assert_eq!(lane(&ev[1], 1024), urgent, "the urgent lane, whole and in order");
+    assert!(on_radio(&pc, &pb) && on_radio(&board, &pp), "still linked");
+    let gone = ev.iter().flatten().find(|e| matches!(e, Event::Disconnected { .. }));
+    assert!(gone.is_none(), "the link stayed up: {gone:?}");
+    let dropped = board.stats().rx_out_of_order_dropped;
+    eprintln!(
+        "32 messages through 30% lost tries in {:?}; the board dropped {dropped} past its cap",
+        started.elapsed()
+    );
 }
 
 #[test]
