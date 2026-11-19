@@ -108,6 +108,96 @@ fn reliable_lane_exact_and_ordered_under_loss() {
     assert!(st.retransmits > 0 && st.rx_replayed > 0);
 }
 
+/// NB-150: a board's caps with a radio (`peerwire_esp::config()`: 4 KiB messages, an 8 KiB send buffer, 4 full
+/// fragments held out of order) linked with a PC on the defaults, over paths that lose, copy or reorder. The PC's
+/// window is far wider than what the board holds past a hole, so the board drops fragments the PC can't tell from lost
+/// ones. Every message still arrives once and in order, both ways and on both lanes, and the link stays up. Before the
+/// sender counted only the lowest fragment's sends towards failing a link and dropped its timers' back-off when the
+/// cumulative ACK moved, reordering alone failed the link on seed 14 and took 93 s on seed 8, where they take 6.7 and 8.7 s.
+#[test]
+fn a_board_s_out_of_order_budget_still_delivers_everything() {
+    let ms = Duration::from_millis;
+    let reorder = NetConfig { latency: ms(20), jitter: ms(10), loss: 0.0, duplicate: 0.02, in_order: false };
+    for (net, seed, within) in [
+        (NetConfig { latency: ms(30), jitter: ms(30), loss: 0.10, duplicate: 0.05, in_order: false }, 11, 40.0),
+        (reorder.clone(), 14, 20.0),
+        (reorder, 8, 20.0),
+        (NetConfig { latency: ms(20), jitter: ms(10), loss: 0.20, duplicate: 0.0, in_order: true }, 15, 60.0),
+    ] {
+        let (secs, dropped) = board_and_pc(net.clone(), seed);
+        println!("board budget: seed {seed}, loss {}: {secs:.2} s virtual, board dropped {dropped}", net.loss);
+        assert!(dropped > 0, "seed {seed}: the budget was never reached");
+        assert!(secs < within, "seed {seed}: {secs:.1} s");
+    }
+}
+
+/// Runs `a_board_s_out_of_order_budget_still_delivers_everything` on `net`: the virtual time it took, and the
+/// fragments the board dropped past its budget.
+fn board_and_pc(net: NetConfig, seed: u64) -> (f64, u64) {
+    let board = Config {
+        max_message: 4 << 10,
+        max_send_buffer: 8 << 10,
+        max_links: 8,
+        max_pending_handshakes: 8,
+        max_out_of_order: 4 * peerwire_core::HELD_FRAGMENT,
+        ..Config::default()
+    };
+    let mut sim = Sim::new(net, seed);
+    sim.add_node(Config::default());
+    sim.add_node(board.clone());
+    sim.connect(0, 1).unwrap();
+    assert!(sim.run_until(Duration::from_secs(20), |s| connected(s, 0, 1)), "never connected");
+    let start = sim.now;
+    let mut rng = ChaCha20Rng::seed_from_u64(seed + 1);
+    // Per direction, what is left to send, last first; and what was sent and got, per lane.
+    let total = [400, 150];
+    let mut queued: [Vec<(Lane, Vec<u8>)>; 2] = [Vec::new(), Vec::new()];
+    for from in 0..2 {
+        for k in 0..total[from] as u32 {
+            let lane = if rng.next_u32() % 5 == 0 { Lane::Urgent } else { Lane::Reliable };
+            let len = match k % 5 {
+                0 => board.max_message - 5,
+                1 => 0,
+                _ => (rng.next_u32() % 1500) as usize,
+            };
+            let mut m = vec![0u8; len];
+            rng.fill_bytes(&mut m);
+            m.extend_from_slice(&k.to_le_bytes());
+            m.push((lane == Lane::Urgent) as u8); // urgent messages arrive as Lane::Reliable
+            queued[from].push((lane, m));
+        }
+        queued[from].reverse();
+    }
+    let mut sent: [[Vec<Vec<u8>>; 2]; 2] = Default::default();
+    let mut got: [[Vec<Vec<u8>>; 2]; 2] = Default::default();
+    let done = sim.run_until(Duration::from_secs(300), |s| {
+        for from in 0..2 {
+            while let Some((lane, m)) = queued[from].last() {
+                if s.send(from, 1 - from, *lane, m).is_err() {
+                    break; // the board's send buffer is full
+                }
+                let (_, m) = queued[from].pop().unwrap();
+                sent[from][*m.last().unwrap() as usize].push(m);
+            }
+            for e in link_events(s, 1 - from) {
+                match e {
+                    Event::Message { data, .. } => got[from][*data.last().unwrap() as usize].push(data),
+                    e @ Event::Disconnected { .. } => panic!("seed {seed}: {} saw {e:?}", 1 - from),
+                    _ => {}
+                }
+            }
+        }
+        (0..2).all(|from| got[from][0].len() + got[from][1].len() == total[from])
+    });
+    let counts = got.each_ref().map(|g| g.each_ref().map(Vec::len));
+    assert!(done, "seed {seed}: got {counts:?} of {total:?} (PC to board, board to PC; reliable, urgent)");
+    assert_eq!(got, sent, "seed {seed}");
+    assert!(connected(&sim, 0, 1));
+    assert_eq!(sim.nodes[0].endpoint.stats().rx_out_of_order_dropped, 0, "the PC's default never binds");
+    let secs = (sim.now.as_micros() - start.as_micros()) as f64 / 1e6;
+    (secs, sim.nodes[1].endpoint.stats().rx_out_of_order_dropped)
+}
+
 #[test]
 fn unreliable_lane_at_most_once() {
     let net = NetConfig { loss: 0.10, duplicate: 0.10, jitter: Duration::from_millis(30), ..Default::default() };
