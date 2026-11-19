@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Peerwire Share</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1117; --panel: #181b24; --raised: #1f2330; --line: #2a2f3d; --text: #e6e8ee; --dim: #8b91a3;
+    --accent: #3e6ae1; --accent-hi: #5b84f0; --green: #46a758; --amber: #e2a336; --red: #e5484d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  button, input, select { font: inherit; color: var(--text); }
+  button { cursor: pointer; background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 7px 12px; white-space: nowrap; }
+  button:hover:not(:disabled) { border-color: var(--dim); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: var(--accent-hi); border-color: var(--accent-hi); }
+  button.danger { color: #ffb4b6; }
+  input, select { background: #10131b; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; min-width: 0; }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .dim { color: var(--dim); }
+  .warn { color: var(--amber); }
+  .hidden { display: none !important; }
+
+  #app { max-width: 1180px; margin: 0 auto; min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); padding-top: max(12px, env(safe-area-inset-top)); }
+  .mark { width: 30px; height: 30px; border-radius: 9px; flex: none; background: linear-gradient(135deg, #3e6ae1, #2a9d8f); position: relative; }
+  .mark::before { content: ''; position: absolute; left: 8px; right: 8px; top: 14px; height: 3px; border-radius: 2px; background: #fff; }
+  .mark::after { content: ''; position: absolute; right: 7px; top: 10px; border: 5px solid transparent; border-left: 7px solid #fff; border-right: 0; }
+  .title { flex: 1; min-width: 0; }
+  h1 { font-size: 17px; margin: 0; line-height: 1.2; }
+  #where { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 14px; padding: 14px 16px; align-items: start; }
+  section, aside { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px; }
+  .card h2 { font-size: 12px; margin: 0 0 8px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; display: flex; justify-content: space-between; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input { flex: 1; }
+  .hint { font-size: 12.5px; margin: 8px 0 0; color: var(--dim); }
+
+  #status { padding: 8px 12px; border-radius: 10px; background: var(--raised); font-size: 13px; display: flex; gap: 10px; align-items: center; }
+  #status.error { background: #3a1517; border: 1px solid var(--red); }
+  .spinner { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--dim); border-top-color: transparent; animation: spin .8s linear infinite; flex: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #drop { border: 2px dashed var(--line); border-radius: 14px; padding: 18px; text-align: center; background: var(--panel); transition: border-color .15s, background .15s; }
+  #drop.over { border-color: var(--accent); background: #1a2140; }
+  #drop p { margin: 0 0 10px; color: var(--dim); }
+  #drop label.pick { display: inline-block; cursor: pointer; background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 7px 14px; }
+  #picked { list-style: none; margin: 12px 0 0; padding: 0; text-align: left; display: flex; flex-direction: column; gap: 4px; }
+  #picked li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: center; font-size: 13.5px; }
+  #picked .name, .xfer .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; unicode-bidi: isolate; }
+  #picked button { padding: 1px 8px; }
+  #send-row { margin-top: 12px; justify-content: center; flex-wrap: wrap; }
+
+  #transfers { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+  .xfer { background: var(--raised); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; display: grid; gap: 6px; }
+  .xfer .top { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: baseline; }
+  .xfer .dir { font-weight: 700; color: var(--accent-hi); }
+  .xfer.in .dir { color: var(--green); }
+  .xfer .size { font-size: 12.5px; color: var(--dim); }
+  .xfer .state { font-size: 13px; color: var(--dim); overflow-wrap: anywhere; }
+  .xfer .state.warn { color: var(--amber); }
+  .xfer .state.bad { color: var(--red); }
+  .xfer .state.ok { color: var(--green); }
+  .bar { height: 6px; border-radius: 3px; background: #10131b; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .xfer.in .bar i { background: var(--green); }
+  .xfer .foot { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; font-size: 12.5px; color: var(--dim); }
+  .xfer .actions { display: flex; gap: 6px; }
+  .xfer .actions button { padding: 4px 10px; }
+  .xfer .hash { font: 11.5px ui-monospace, monospace; color: var(--dim); overflow-wrap: anywhere; }
+  .xfer a { color: var(--accent-hi); }
+
+  #qr { display: block; width: 168px; height: 168px; margin: 12px auto 4px; background: #fff; border-radius: 10px; }
+  #qr:not([viewBox]) { visibility: hidden; }
+  #code { font: 13px ui-monospace, monospace; }
+  #peers { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .peer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+  .peer .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; unicode-bidi: isolate; }
+  .peer .route { font-size: 12.5px; color: var(--dim); }
+  .pill { font-size: 11.5px; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--line); color: var(--dim); font-weight: 600; }
+  .pill.direct { color: var(--green); border-color: #2d5a35; }
+  .pill.relay, .pill.punched { color: var(--amber); border-color: #6a5124; }
+  #direct-hint { margin-top: 10px; padding: 8px 10px; border-radius: 10px; background: #2a2112; border: 1px solid #6a5124; font-size: 12.5px; }
+  #direct-hint button { margin-top: 6px; }
+
+  .overlay { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(8, 9, 13, .86); padding: 16px; z-index: 20; }
+  .welcome { width: min(440px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 22px; box-shadow: 0 20px 60px #000a; }
+  .welcome h1 { font-size: 21px; margin-bottom: 6px; }
+  .welcome p { color: var(--dim); margin: 0 0 16px; }
+  .welcome label { display: block; font-size: 12.5px; color: var(--dim); margin: 0 0 6px; }
+  .welcome input { width: 100%; }
+  .welcome .row { margin-top: 14px; }
+  .welcome .row button { flex: 1; padding: 10px; }
+  .or { display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 12.5px; margin: 16px 0 10px; }
+  .or::before, .or::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+
+  @media (max-width: 760px) {
+    main { grid-template-columns: minmax(0, 1fr); padding: 10px; }
+    aside { order: -1; }
+  }
+</style>
+<div id="app">
+  <header>
+    <div class="mark" aria-hidden="true"></div>
+    <div class="title">
+      <h1>Peerwire Share</h1>
+      <div id="where" class="dim">files peer to peer, over direct links only</div>
+    </div>
+    <button id="new" title="Start a new private room">New room</button>
+  </header>
+  <main>
+    <section>
+      <div id="status" class="hidden"></div>
+      <div id="drop">
+        <p>Drop files here, or</p>
+        <label class="pick">Choose files<input id="pick" type="file" multiple hidden></label>
+        <ul id="picked"></ul>
+        <div id="send-row" class="row hidden">
+          <label for="to" class="dim">Send to</label>
+          <select id="to"></select>
+          <button id="send" class="primary">Send</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2><span>Transfers</span><span id="xfer-count"></span></h2>
+        <ul id="transfers"></ul>
+        <p id="no-transfers" class="hint">Files you send or are offered show here. Each goes in pieces with a SHA-256 check, straight from one browser to the other, and never through the signalling relays.</p>
+      </div>
+    </section>
+    <aside>
+      <div class="card">
+        <h2>Invite</h2>
+        <div class="row"><input id="link" readonly aria-label="Invite link"><button id="copy">Copy</button></div>
+        <p class="hint">Room code <span id="code"></span></p>
+        <div class="row hidden" id="share-row" style="margin-top:8px"><button id="share" style="flex:1">Share…</button></div>
+        <svg id="qr" role="img" aria-label="QR code of the invite link"><path id="qr-path" fill="#000"></path></svg>
+        <p class="hint">Anyone with this link or code can join: it is the room’s only key.</p>
+      </div>
+      <div class="card">
+        <h2><span>Peers</span><span id="peer-count"></span></h2>
+        <ul id="peers"></ul>
+        <p id="alone" class="hint">No one else is here yet: send the invite link.</p>
+        <div id="direct-hint" class="hidden">
+          <div>Files go only over a <b>direct</b> link, never through the relays. A peer marked “via relay” waits until the browsers link directly. On a phone’s hotspot that needs the microphone allowed on <b>both</b> devices (it is closed at once).</div>
+          <button id="mic">Use microphone</button> <span id="mic-state" class="dim"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>You</h2>
+        <div class="row"><input id="me" maxlength="32" aria-label="Your nickname" placeholder="your nickname"></div>
+        <p id="save-mode" class="hint"></p>
+      </div>
+    </aside>
+  </main>
+</div>
+<div id="welcome" class="overlay hidden">
+  <form class="welcome" id="welcome-form">
+    <h1>Peerwire Share</h1>
+    <p>Send files of any size from one browser to another, peer to peer and end-to-end encrypted: no upload, no account, no server of ours.</p>
+    <p id="welcome-warn" class="warn hidden"></p>
+    <div class="row"><button id="go" class="primary">Start a new room</button></div>
+    <div class="or">or join one</div>
+    <div class="row" style="margin-top:0"><input id="join-code" placeholder="room code or invite link" aria-label="Room code or invite link"><button id="join-go" type="button">Join</button></div>
+  </form>
+</div>
+<script type="module" src="share.js"></script>
+</html>
