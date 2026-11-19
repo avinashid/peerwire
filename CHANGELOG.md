@@ -258,6 +258,11 @@ and the commit that fixed it.
 - The `led.html` demo says goodbye to the board when it stops or the page goes (best effort on `pagehide`), so the board
   frees its place for the next page at once, and says the board may be busy when it heard one that didn't answer
   (NB-136).
+- **Share demo** (NB-156): `demo/share/` sends files of any size between members of a room. A file the receiver
+  accepts goes in 512 KiB pieces over the reliable lane, at most 8 in flight per peer, each with its SHA-256 and the
+  whole file's checked, and is written as it arrives (`showSaveFilePicker`'s writable stream, else a download streamed
+  by a service worker, else in memory up to 256 MB). Pieces go only over a peer's own DataChannel, never through the
+  signalling relays, a member or TURN, and a transfer whose link drops goes on from the last piece written.
 - **Fix:** `DEFAULT_RELAYS` are `wss://relay.primal.net`, `wss://relay.nostr.net` and `wss://nostr.oxtr.dev`, three
   operators. nos.lol and nostr.mom, two of the three before, now drop our events (signalling and `openInbox` drops
   alike) with no `OK` and pass none on (NB-130). A page on 0.3 still meets one on the new list over relay.primal.net.

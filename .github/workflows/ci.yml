@@ -99,6 +99,7 @@ jobs:
       - run: node packages/js/test/doctor.mjs
       - run: node packages/js/test/late_ice.mjs
       - run: node packages/js/test/birthday.mjs
+      - run: node packages/js/test/share.mjs
       - name: '@peerwire/react: install, build, types'
         working-directory: packages/react
         run: npm ci --no-audit --no-fund && npm run build && npm run typecheck

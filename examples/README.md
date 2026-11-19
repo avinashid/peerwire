@@ -70,6 +70,7 @@ python3 -m http.server -d packages/js 8000 --bind 127.0.0.1   # then open http:/
 | [poll.html](../packages/js/demo/poll.html) | a pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys | tabs of one browser |
 | [arena.html](../packages/js/demo/arena.html) | super-peer lockstep: `?role=super` in one tab, players in others, arrow keys move | tabs of one browser; `?signal=nostr` for **public** relays |
 | [netlab.html](../packages/js/demo/netlab.html) | Net Lab, connection diagnostics: ping, loss, routes, ICE candidate pairs and NAT estimates, per peer | **public** Nostr relays; `?signal=local` for tabs of one browser |
+| [share/](../packages/js/demo/share/index.html) | Peerwire Share: files of any size between members, in pieces with SHA-256 checks, written to disk as they arrive, resumed after a dropped link, over direct links only | **public** Nostr relays; `?signal=local` for tabs of one browser |
 | [crew.html](../packages/js/demo/crew.html) | Crew, a small Among Us-like game with an authoritative host that relays for every player | **public** Nostr relays; `?signal=local` for tabs of one browser |
 
 `node packages/js/demo/crew-server.mjs [port] [host]` serves the same files for hosting Net Lab and Crew elsewhere
