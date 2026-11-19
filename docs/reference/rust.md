@@ -113,7 +113,7 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `ble` (feature `ble`) | Bluetooth LE: the `Radio` driver trait, `RadioEvent`, `DeviceId`, `ConnId`, `Limits`, the service's UUIDs, and `BlueZ` with `ble-bluez` (`BlueZ::alias`, `BlueZ::names_this_host`) | `src/ble.rs`, `src/bluez.rs` |
 | `TurnServer` (feature `turn`) | A TURN server and the credentials for it | `src/turn.rs` |
 | `PortMapping`, `MapProtocol` | Where router port mapping stands | `src/portmap.rs` |
-| `Config`, `ConnectError`, `DisconnectReason`, `Identity`, `Invite`, `Lane`, `PeerId`, `PeerStats`, `SendError`, `Stats`, `MAX_UNRELIABLE`, `MAX_URGENT` | Re-exported from `peerwire-core` | `crates/peerwire-core/src` |
+| `Config`, `ConnectError`, `DisconnectReason`, `Identity`, `Invite`, `Lane`, `PeerId`, `PeerStats`, `SendError`, `Stats`, `HELD_FRAGMENT`, `MAX_UNRELIABLE`, `MAX_URGENT` | Re-exported from `peerwire-core` | `crates/peerwire-core/src` |
 | `traversal` (module) | The sans-IO NAT traversal layer (`Traversal`) that `Node` drives; the simulator drives it too | `src/traversal.rs` |
 
 ### Example: Node
@@ -334,6 +334,7 @@ node.join_room("my-app", "kitchen"); // links with every node in "kitchen" on th
 | `max_links` | `usize::MAX` | Cap on announced links; links this node dials itself are not capped |
 | `max_message` | 1 MiB (`1 << 20`) | Largest `Reliable` message, sent or received; a peer that sends a larger one is dropped |
 | `max_send_buffer` | 4 MiB (`4 << 20`) | Per-link bytes queued or unacknowledged, for `Reliable` and for `Urgent` each |
+| `max_out_of_order` | 4,766,580 B (4,095 × `HELD_FRAGMENT`) | Per-link bytes held out of order, past a fragment still missing, for `Reliable` and for `Urgent` each: each fragment counts its data and 64 B, so a full one counts `HELD_FRAGMENT` (1,164 B). One past it is dropped unacknowledged and sent again (`Stats::rx_out_of_order_dropped`); below 64 full fragments' worth, nothing more than 64 past the missing one is held. The default is what the receive window already bounds, so it never binds; a board sets 4 full fragments (`peerwire_esp::MAX_OUT_OF_ORDER`) |
 | `reliable_window` | 1024 | Reliable fragments in flight per link. Up to 4096 (the receive window) suits a long, fast link, if the peer runs this version: older peers take only 1024 ahead. Past about 3,800, also raise `max_send_buffer` to at least 4096 × 1100 B (≈ 4.3 MiB): it counts unacknowledged bytes too, and its default 4 MiB holds 3,813 full fragments |
 | `unreliable_queue` | 256 | Unreliable messages queued per link; the oldest is dropped when full |
 | `relay` | `true` | Forward packets between linked peers that ask (peer relay) |

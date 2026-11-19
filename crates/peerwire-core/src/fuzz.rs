@@ -12,7 +12,7 @@ use crate::ble::{self, Chunker, Reassembler, MAX_MESSAGE};
 use crate::endpoint::{Config, DisconnectReason, Endpoint, Event, Lane, SendError};
 use crate::identity::{Identity, PeerId};
 use crate::invite::Invite;
-use crate::reliable::{MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW};
+use crate::reliable::{HELD_FRAGMENT, MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW};
 use crate::time::Instant;
 use crate::wire::{self, Frame, Packet, FRAGMENT, MAX_DATAGRAM, MAX_PLAINTEXT, MAX_RELAYED_PACKET};
 use crate::{sealed, stun};
@@ -762,6 +762,108 @@ fn hostile_peer_pins_bounded_receive_memory() {
         net.deliver();
         assert!(net.events.iter().any(|(n, e)| *n == a && dropped(e)), "urgent {urgent}");
     }
+}
+
+#[test]
+fn hostile_peer_holds_at_most_the_out_of_order_budget() {
+    // NB142-1, NB-150: the reproduction above at a board's caps with a radio
+    // (`peerwire_esp::config()`: 4 KiB messages, 4 full fragments out of order).
+    // M partly assembles a message on each stream, holds the next sequence
+    // number back, and sends every one the receive window takes after it, and
+    // one more. Without the budget A held 4,573,800 B and kept the link; with it,
+    // the message and 4 fragments per stream, and the link stays up. The
+    // held-back fragment then delivers what was held, and what was dropped is
+    // taken when it comes again, in order. Small fragments fill the budget by
+    // their entries too.
+    let keys = identities(2);
+    let ids: Vec<PeerId> = keys.iter().map(Identity::peer_id).collect();
+    let (a, m) = (0, 1);
+    let board = Config {
+        max_message: 4 << 10,
+        max_send_buffer: 8 << 10,
+        max_links: 8,
+        max_pending_handshakes: 8,
+        max_out_of_order: 4 * HELD_FRAGMENT,
+        ..Config::default()
+    };
+    let mut net = Net::new(&keys);
+    net.nodes[a].1 = Endpoint::new(&keys[a], board.clone(), [1; 32]);
+    net.nodes[m].1.connect(net.now, Net::addr(a), ids[a]).unwrap();
+    net.settle();
+    assert!(net.connected(a, m, &ids));
+    net.events.clear();
+    let send = |net: &mut Net, urgent: bool, seq: u32, fin: bool, len: usize| {
+        let mut pt = Vec::new();
+        wire::put_reliable(&mut pt, seq, fin, &vec![seq as u8; len], urgent);
+        let pkt = net.nodes[m].1.seal_raw(&ids[a], &pt).unwrap();
+        net.nodes[a].1.handle_datagram(net.now, Net::addr(m), &pkt);
+    };
+    let received = |net: &mut Net| {
+        net.deliver();
+        let got: Vec<usize> = net
+            .events
+            .drain(..)
+            .filter_map(|(n, e)| match e {
+                Event::Message { data, .. } if n == a => Some(data.len()),
+                Event::Disconnected { .. } => panic!("{n} lost the link: {e:?}"),
+                _ => None,
+            })
+            .collect();
+        assert!(got.iter().all(|&l| l <= board.max_message));
+        got.len()
+    };
+    let assembled = (board.max_message / FRAGMENT) as u32; // 3 fragments, 3,300 B
+    let held = 4u32;
+    let streams = [(0, false, RECV_WINDOW), (1, true, URGENT_RECV_WINDOW)];
+    let mut pinned = 0;
+    for (u, urgent, window) in streams {
+        for seq in 0..assembled {
+            send(&mut net, urgent, seq, false, FRAGMENT);
+        }
+        for seq in assembled + 1..=assembled + window {
+            send(&mut net, urgent, seq, true, FRAGMENT);
+        }
+        let got = net.nodes[a].1.rx_held(&ids[m]).unwrap()[u];
+        assert_eq!(got, (assembled + held) as usize * FRAGMENT, "stream {u}");
+        assert!(got <= board.max_message + board.max_out_of_order);
+        pinned += got;
+    }
+    println!("receive memory a peer can pin per link at a board's budget: {pinned} B");
+    assert_eq!(pinned, 15_400);
+    let over = |window: u32| u64::from(window - 1 - held);
+    let dropped = net.nodes[a].1.stats().rx_out_of_order_dropped;
+    assert_eq!(dropped, over(RECV_WINDOW) + over(URGENT_RECV_WINDOW));
+    assert_eq!(received(&mut net), 0);
+    assert!(net.connected(a, m, &ids));
+    for (_, urgent, window) in streams {
+        // The held-back fragment ends the message at max_message: it and the 4
+        // held arrive. Then the rest, sent again, is taken in order.
+        send(&mut net, urgent, assembled, true, board.max_message - assembled as usize * FRAGMENT);
+        assert_eq!(received(&mut net), 1 + held as usize);
+        for seq in assembled + held + 1..assembled + window {
+            send(&mut net, urgent, seq, true, FRAGMENT);
+        }
+        assert_eq!(received(&mut net) as u64, over(window));
+    }
+    assert_eq!(net.nodes[a].1.rx_held(&ids[m]).unwrap(), [0, 0]);
+    // Fragments of 10 B, behind another one held back: 62 of 74 B each fill
+    // either stream's budget.
+    for (_, urgent, window) in streams {
+        let next = assembled + window;
+        for seq in next + 1..next + window {
+            send(&mut net, urgent, seq, true, 10);
+        }
+    }
+    let small = (board.max_out_of_order / (64 + 10)) as u64;
+    assert_eq!(small, 62);
+    let more = net.nodes[a].1.stats().rx_out_of_order_dropped - dropped;
+    assert_eq!(more, u64::from(RECV_WINDOW - 1) - small + u64::from(URGENT_RECV_WINDOW - 1) - small);
+    for (_, urgent, window) in streams {
+        send(&mut net, urgent, assembled + window, true, 10);
+    }
+    assert_eq!(received(&mut net) as u64, 2 * (1 + small));
+    assert_eq!(net.nodes[a].1.rx_held(&ids[m]).unwrap(), [0, 0]);
+    assert!(net.connected(a, m, &ids));
 }
 
 #[test]

@@ -83,7 +83,9 @@ Times in the emulator aren't radio times: eight QEMU instances share four host c
 emulator and its virtual hub. `Config` is set for a chip with ~250 KB of free heap: 16 KiB messages, a 32 KiB send
 buffer and at most 8 links. With a radio (feature `ble` or `espnow`), whose stack takes ~76 KB of a C3's heap, it is
 4 KiB messages and an 8 KiB send buffer (`peerwire_esp::RADIO`, `MAX_MESSAGE`, `MAX_SEND_BUFFER`; NB-142): a peer that
-sends such a board a larger message has its link closed, so its peers send 4 KiB at most.
+sends such a board a larger message has its link closed, so its peers send 4 KiB at most. Either way, each lane of a link
+holds at most 4 full fragments out of order, past one still missing (`MAX_OUT_OF_ORDER`, 4,656 B; NB-150), where the
+defaults hold 4.5 MB: a peer drops the rest and sends it again, so a lossy link to a board is slower, not broken.
 
 The original ESP32 (Xtensa, as on an ESP32-WROOM-32) builds from the same code with no changes. Measured on
 2 November 2026, same emulator and host:

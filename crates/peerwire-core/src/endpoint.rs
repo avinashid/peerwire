@@ -1,7 +1,9 @@
 use crate::addr::{Address, Path};
 use crate::crypto::{self, ReplayWindow};
 use crate::identity::{Identity, PeerId};
-use crate::reliable::{PushError, RecoveryStats, RelRecv, RelSend, MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW};
+use crate::reliable::{
+    PushError, RecoveryStats, RelRecv, RelSend, Took, DEFAULT_OUT_OF_ORDER, MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW,
+};
 use crate::time::Instant;
 use crate::wire::{
     self, Cookie, Frame, Packet, FWD_OVERHEAD, MAX_DATAGRAM, MAX_PLAINTEXT, MAX_RELAYED_PACKET, MAX_UNRELIABLE,
@@ -118,6 +120,18 @@ pub struct Config {
     /// (≈ 4.3 MiB): it counts unacknowledged bytes too, and its default 4 MiB
     /// holds 3,813 full fragments.
     pub reliable_window: usize,
+    /// Per-link cap on what the `Reliable` lane holds out of order, and the
+    /// `Urgent` lane each: fragments that arrived past one still missing, which
+    /// wait for it. Each counts its data and 64 B for its entry, so a full
+    /// fragment counts [`HELD_FRAGMENT`](crate::HELD_FRAGMENT) (1,164 B). One that
+    /// would go past the cap is dropped unacknowledged, as one past the receive
+    /// window is, and its sender sends it again as it would a lost one; the next
+    /// fragment due is always taken. The default, 4,766,580 B (4,095 full
+    /// fragments), is what the receive window already bounds, so it never binds.
+    /// A node with little memory sets a few fragments: `peerwire_esp::config()`
+    /// sets 4 (NB-150). Messages partly assembled count against `max_message`
+    /// instead.
+    pub max_out_of_order: usize,
     /// Unreliable messages queued per link; the oldest is dropped when full.
     pub unreliable_queue: usize,
     /// Forward packets between connected peers that ask us to (FWD frames).
@@ -169,6 +183,7 @@ impl Default for Config {
             max_message: 1 << 20,
             max_send_buffer: 4 << 20,
             reliable_window: 1024,
+            max_out_of_order: DEFAULT_OUT_OF_ORDER,
             unreliable_queue: 256,
             relay: true,
             relay_rate: 256 << 10,
@@ -357,6 +372,9 @@ pub struct Stats {
     pub path_switches: u64,
     /// Handshakes answered with a cookie under load (see `Config::max_pending_handshakes`).
     pub cookies_sent: u64,
+    /// Reliable and urgent fragments dropped unacknowledged for going past
+    /// [`Config::max_out_of_order`]; their senders send them again.
+    pub rx_out_of_order_dropped: u64,
 }
 
 /// Per-link counters for one connected peer; see [`Endpoint::peer_stats`].
@@ -2277,8 +2295,11 @@ impl<A: Address> Endpoint<A> {
                 }
                 Ok(Frame::Reliable { seq, fin, data, urgent }) => {
                     let rx = if urgent { &mut link.urx } else { &mut link.rx };
-                    if rx.on_fragment(seq, fin, data, self.config.max_message(urgent), &mut reliable).is_err() {
-                        violation = true;
+                    let budget = self.config.max_out_of_order;
+                    match rx.on_fragment(seq, fin, data, self.config.max_message(urgent), budget, &mut reliable) {
+                        Ok(Took::Taken) => {}
+                        Ok(Took::OverBudget) => self.stats.rx_out_of_order_dropped += 1,
+                        Err(()) => violation = true,
                     }
                 }
                 Ok(Frame::Unreliable(d)) => unreliable.push(d.to_vec()),

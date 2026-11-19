@@ -13,26 +13,56 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// a game frame), as in QUIC's max_ack_delay. Loss is mostly repaired by fast
 /// retransmit, so this only delays recovery of the last packets in a burst.
 const ACK_DELAY: Duration = Duration::from_millis(25);
-/// A fragment unacknowledged after this many sends means the link is dead.
+/// The lowest fragment unacknowledged, sent this many times more since it
+/// became the lowest, means the link is dead. Only the lowest counts: a
+/// receiver always takes the fragment it expects next, but may drop those
+/// past it for its out-of-order budget (`Config::max_out_of_order`) however
+/// often, while the link still delivers.
 const MAX_TRIES: u32 = 16;
+/// Sends past which a fragment unacknowledged while the cumulative ACK moves
+/// is taken as dropped by a receiver short of memory rather than lost again
+/// (NB-150): it drops its back-off when the ACK moves, and once the lowest it
+/// backs off by its sends as the lowest alone. Five losses of one fragment in a
+/// row are rare (p⁵: 3 · 10⁻⁷ at 5% loss), and a congested queue's back-off
+/// doesn't meet them in the simulator's benchmarks (3 did, behind `cc_fair`'s
+/// 1 ms buffer): below it timers are as they were.
+const DROPPED_AFTER: u32 = 5;
 /// The reliable stream's receive window: fragments are buffered from the next
 /// expected one up to this many ahead, and the sender keeps the span of its
 /// fragments in flight under it, so none is sent only to be dropped. It bounds
 /// what a peer can make us hold for the stream to (RECV_WINDOW − 1)·FRAGMENT
 /// out of order, 4.5 MB, plus a message partly assembled (`max_message`,
-/// 1 MiB by default): 5.55 MB. Four times the default `Config::reliable_window`,
-/// so holes in a full flight don't hold up new fragments, and a link with a
-/// large bandwidth-delay product can set `reliable_window` up to 4096.
+/// 1 MiB by default): 5.55 MB; `Config::max_out_of_order` can bound the
+/// out-of-order part lower, as a board's does (NB-150). Four times the default
+/// `Config::reliable_window`, so holes in a full flight don't hold up new
+/// fragments, and a link with a large bandwidth-delay product can set
+/// `reliable_window` up to 4096.
 pub(crate) const RECV_WINDOW: u32 = 4096;
 /// The urgent stream's receive window, which its sender also keeps the span of
 /// fragments in flight under: the SACK bitmap's width, so every urgent
 /// fragment in flight can be acknowledged, and room for a MAX_URGENT message.
 /// With MAX_URGENT it bounds what a peer can make us hold for the urgent
-/// stream to about 135 KB, against 5.55 MB for the reliable one.
+/// stream to about 135 KB, against 5.55 MB for the reliable one; the same
+/// `Config::max_out_of_order` bounds each stream's out-of-order part.
 pub(crate) const URGENT_RECV_WINDOW: u32 = 64;
 /// Largest `Urgent` message (64 KiB), or `Config::max_message` if smaller.
 pub const MAX_URGENT: usize = 64 << 10;
 const _: () = assert!(MAX_URGENT.div_ceil(FRAGMENT) <= URGENT_RECV_WINDOW as usize);
+/// What a fragment held out of order counts against `Config::max_out_of_order`
+/// besides its data: its entry in the buffer and its allocation, about this on
+/// a 32-bit chip. So empty fragments, which carry empty messages, cost a peer
+/// the budget too, not nothing each.
+const HELD_OVERHEAD: usize = 64;
+/// What a full fragment (1,100 B) held out of order counts against
+/// [`Config::max_out_of_order`](crate::Config::max_out_of_order): 1,164 B, its
+/// data and its entry. A smaller fragment counts its data and the same 64 B.
+pub const HELD_FRAGMENT: usize = FRAGMENT + HELD_OVERHEAD;
+/// `Config::max_out_of_order`'s default, the reliable receive window's own
+/// bound: RECV_WINDOW − 1 full fragments held, so the budget never binds.
+pub(crate) const DEFAULT_OUT_OF_ORDER: usize = (RECV_WINDOW as usize - 1) * HELD_FRAGMENT;
+/// A receive budget smaller than the ACK bitmap's reach in full fragments
+/// (64 · 1,164 B) holds nothing past it: see `RelRecv::on_fragment`.
+const REACH: usize = SACK_BITS as usize * HELD_FRAGMENT;
 /// Congestion window at the start, and its floor after loss (fragments).
 const INITIAL_CWND: f64 = 16.0;
 const MIN_CWND: f64 = 4.0;
@@ -77,6 +107,8 @@ struct Fragment {
     first_sent: Instant,
     sent_at: Instant,
     due: Instant,
+    /// Sends so far: the back-off, and Karn's rule. Not the link's failure,
+    /// which is `Stream::lo_sends`.
     tries: u32,
     /// Already scheduled for fast retransmit in this round.
     fast: bool,
@@ -119,6 +151,10 @@ pub struct RecoveryStats {
     /// the cumulative ACK moved.
     pub deferred: u64,
     pub rearmed: u64,
+    /// Timers of fragments sent more than DROPPED_AFTER (5) times brought
+    /// forward when the cumulative ACK moved, to an RTO after their latest
+    /// send: the link delivers, so they don't wait out their back-off (NB-150).
+    pub restarted: u64,
 }
 
 /// Index of the reliable and the urgent stream in `RelSend::streams`.
@@ -140,6 +176,9 @@ struct Stream {
     /// Fragments whose timer was put off for being beyond the SACK bitmap's
     /// reach (see `write_stream`); some may since have been acknowledged.
     deferred: BTreeSet<u32>,
+    /// Sends of the lowest fragment in flight since it became the lowest, the
+    /// first one not counted: past MAX_TRIES the link is dead.
+    lo_sends: u32,
     buffered: usize,
     /// Wire bytes of one copy of each fragment in flight (data and frame header).
     inflight_bytes: usize,
@@ -162,6 +201,7 @@ impl Stream {
             by_due: BTreeSet::new(),
             by_dup: BTreeSet::new(),
             deferred: BTreeSet::new(),
+            lo_sends: 0,
             buffered: 0,
             inflight_bytes: 0,
             probe_at: None,
@@ -445,6 +485,32 @@ impl RelSend {
                 lo.is_some_and(|lo| s - lo > SACK_BITS)
             });
         }
+        // The cumulative ACK moved, so the link delivers: fragments within the
+        // bitmap's reach sent more than DROPPED_AFTER times drop their back-off
+        // and are due an RTO after their latest send. A receiver short of memory
+        // drops what it can't hold past a hole (`Config::max_out_of_order`), so
+        // a fragment may go unacknowledged many times while the hole below it is
+        // repaired, and doubling its timer each time would leave the link
+        // crawling once the hole is filled (NB-150). While nothing moves, every
+        // copy still backs off.
+        if lo != base {
+            st.lo_sends = 0;
+            if let Some(lo) = lo {
+                let Stream { inflight, by_due, .. } = st;
+                // The fragments lo..=lo + SACK_BITS: lo is the first in flight,
+                // and no seq is u32::MAX (push_message). Ranged up to, as fast
+                // retransmit's loop is: a RangeInclusive costs the wasm 640 B.
+                for (&s, f) in inflight.range_mut(..lo.saturating_add(SACK_BITS + 1)) {
+                    let due = f.due.min(now.max(f.sent_at + self.rto));
+                    if f.tries > DROPPED_AFTER && due < f.due {
+                        by_due.remove(&(f.due, s));
+                        by_due.insert((due, s));
+                        f.due = due;
+                        self.recovery.restarted += 1;
+                    }
+                }
+            }
+        }
         let mut queued_too_long = false;
         if let Some((_, r)) = sample {
             self.update_rtt(r);
@@ -600,11 +666,21 @@ impl RelSend {
             }
             wire::put_reliable(out, seq, f.fin, &f.data, urgent);
             f.tries += 1;
-            if f.tries > MAX_TRIES {
-                self.failed = true;
+            // The lowest fragment, sent more than DROPPED_AFTER times before
+            // it became the lowest, backs off by its sends as the lowest: those
+            // before were likely dropped by a receiver short of memory.
+            let mut sends = f.tries;
+            if seq == lo {
+                st.lo_sends += 1;
+                if f.tries - st.lo_sends > DROPPED_AFTER {
+                    sends = st.lo_sends + 1;
+                }
+                if st.lo_sends >= MAX_TRIES {
+                    self.failed = true;
+                }
             }
             f.sent_at = now;
-            let backoff = self.rto.saturating_mul(1 << (f.tries - 1).min(8)).min(MAX_BACKOFF);
+            let backoff = self.rto.saturating_mul(1 << (sends - 1).min(8)).min(MAX_BACKOFF);
             st.by_due.remove(&(f.due, seq));
             f.due = now + backoff;
             st.by_due.insert((f.due, seq));
@@ -709,16 +785,35 @@ pub(crate) struct RelRecv {
     window: u32,
     next: u32,
     buf: BTreeMap<u32, (bool, Vec<u8>)>,
+    /// What `buf` counts against the out-of-order budget: each fragment's data
+    /// and HELD_OVERHEAD.
+    out_of_order: usize,
     assembling: Vec<u8>,
     pub(crate) ack_pending: bool,
 }
 
+/// What [`RelRecv::on_fragment`] did with a fragment that kept to the protocol.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Took {
+    /// Delivered, held, or a copy or one past the window, dropped.
+    Taken,
+    /// Dropped unacknowledged, held out of order past the budget: its sender
+    /// sends it again, as it does a lost one.
+    OverBudget,
+}
+
 impl RelRecv {
     pub(crate) fn new(window: u32) -> Self {
-        RelRecv { window, next: 0, buf: BTreeMap::new(), assembling: Vec::new(), ack_pending: false }
+        RelRecv { window, next: 0, buf: BTreeMap::new(), out_of_order: 0, assembling: Vec::new(), ack_pending: false }
     }
 
     /// Accepts one fragment and appends any messages it completes to `out`.
+    /// One that can't be delivered yet is held while what is held out of order
+    /// stays within `budget` bytes (each fragment's data and HELD_OVERHEAD),
+    /// and dropped otherwise; the next one expected is always taken. A budget
+    /// that can't hold the ACK bitmap's reach (REACH) holds nothing past it: a
+    /// fragment there is reported only once the holes below it are filled, so
+    /// it would take a slot for longer, and its sender would time it from then.
     /// `Err` means the peer broke the protocol (oversized message).
     pub(crate) fn on_fragment(
         &mut self,
@@ -726,28 +821,43 @@ impl RelRecv {
         fin: bool,
         data: &[u8],
         max_message: usize,
+        budget: usize,
         out: &mut Vec<Vec<u8>>,
-    ) -> Result<(), ()> {
+    ) -> Result<Took, ()> {
         // Every sender cuts at FRAGMENT; a larger one would buffer past the bound.
         if data.len() > FRAGMENT {
             return Err(());
         }
         self.ack_pending = true;
         if seq < self.next || seq - self.next >= self.window || self.buf.contains_key(&seq) {
-            return Ok(());
+            return Ok(Took::Taken);
         }
+        let cost = HELD_OVERHEAD + data.len();
+        let past_reach = seq - self.next > SACK_BITS && budget < REACH;
+        if seq != self.next && (self.out_of_order + cost > budget || past_reach) {
+            return Ok(Took::OverBudget);
+        }
+        self.out_of_order += cost;
         self.buf.insert(seq, (fin, data.to_vec()));
         while let Some((fin, d)) = self.buf.remove(&self.next) {
+            self.out_of_order -= HELD_OVERHEAD + d.len();
             self.next = self.next.checked_add(1).ok_or(())?;
-            if self.assembling.len() + d.len() > max_message {
+            let len = self.assembling.len() + d.len();
+            if len > max_message {
                 return Err(());
+            }
+            // Doubled as Vec grows, but never past max_message (NB150-1): Vec's
+            // own doubling, from sizes the peer picks, reserves up to twice it.
+            if len > self.assembling.capacity() {
+                let cap = (2 * self.assembling.capacity()).max(len).min(max_message);
+                self.assembling.reserve_exact(cap - self.assembling.len());
             }
             self.assembling.extend_from_slice(&d);
             if fin {
                 out.push(std::mem::take(&mut self.assembling));
             }
         }
-        Ok(())
+        Ok(Took::Taken)
     }
 
     /// Bytes held: fragments buffered out of order and a message partly assembled.
@@ -793,7 +903,7 @@ mod tests {
         let mut rx = RelRecv::new(RECV_WINDOW);
         let mut out = Vec::new();
         for (s, fin, d) in &frags {
-            rx.on_fragment(*s, *fin, d, 1 << 20, &mut out).unwrap();
+            rx.on_fragment(*s, *fin, d, 1 << 20, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
         }
         assert_eq!(out, vec![msg, vec![]]);
     }
@@ -1078,8 +1188,8 @@ mod tests {
         assert_eq!(seqs(drain_window(&mut tx, t, window)), (RECV_WINDOW..RECV_WINDOW + 65).collect::<Vec<_>>());
         // The receiver's side of it: from 0, it holds up to RECV_WINDOW - 1 ahead.
         let mut rx = RelRecv::new(RECV_WINDOW);
-        rx.on_fragment(RECV_WINDOW - 1, true, &[1], 1 << 20, &mut Vec::new()).unwrap();
-        rx.on_fragment(RECV_WINDOW, true, &[1], 1 << 20, &mut Vec::new()).unwrap();
+        rx.on_fragment(RECV_WINDOW - 1, true, &[1], 1 << 20, DEFAULT_OUT_OF_ORDER, &mut Vec::new()).unwrap();
+        rx.on_fragment(RECV_WINDOW, true, &[1], 1 << 20, DEFAULT_OUT_OF_ORDER, &mut Vec::new()).unwrap();
         assert_eq!(rx.buf.len(), 1);
     }
 
@@ -1144,6 +1254,94 @@ mod tests {
         assert!(tx.failed);
         assert!(resent.iter().all(|&s| s == 0), "{resent:?}");
         assert_eq!(resent.len() as u32, MAX_TRIES - 1, "0 went twice in hole_at_zero");
+    }
+
+    /// NB-150: only the lowest fragment's sends since it became the lowest fail
+    /// the link, as a receiver always takes the one it expects next: 1, sent 15
+    /// times beside 0, has 16 sends of its own once 0 is acknowledged. More than
+    /// DROPPED_AFTER of them before, so its timer drops its back-off as the ACK
+    /// moves, and it backs off by its sends as the lowest alone.
+    #[test]
+    fn the_lowest_fragment_fails_the_link_by_its_own_sends() {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        for i in 0..2u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        assert_eq!(seqs(drain(&mut tx, Instant::ZERO)), vec![0, 1]);
+        let mut t = Instant::ZERO;
+        while tx.streams[REL].inflight[&1].tries < 15 {
+            t = tx.next_due().unwrap();
+            drain(&mut tx, t);
+        }
+        assert!(!tx.failed);
+        assert_eq!(tx.streams[REL].lo_sends, 14);
+        tx.on_ack(t + Duration::from_millis(100), 1, 0, false);
+        assert_eq!(tx.streams[REL].lo_sends, 0);
+        let f = &tx.streams[REL].inflight[&1];
+        assert_eq!(f.due, f.sent_at + tx.rto, "its timer dropped its back-off");
+        while tx.streams[REL].lo_sends == 0 {
+            t = tx.next_due().unwrap();
+            drain(&mut tx, t); // a tail probe, then the resend
+        }
+        assert_eq!(tx.streams[REL].inflight[&1].due, t + tx.rto * 2);
+        while !tx.failed {
+            t = tx.next_due().unwrap();
+            drain(&mut tx, t);
+        }
+        let st = &tx.streams[REL];
+        assert_eq!((st.lo_sends, st.inflight[&1].tries), (MAX_TRIES, 15 + MAX_TRIES));
+    }
+
+    /// NB-150: a receiver that holds 4 full fragments out of order, behind a
+    /// path that turns every burst round, holds a burst's top 4 and drops the
+    /// rest until its lowest lands: one fragment a round at worst. The ones it
+    /// drops go out far more than MAX_TRIES times, yet the link doesn't fail,
+    /// and all 40 arrive in about 16 s, where timers doubling to 10 s took over
+    /// a minute: past DROPPED_AFTER sends, the cumulative ACK's moves restart
+    /// them.
+    #[test]
+    fn drops_past_a_receivers_budget_neither_fail_nor_stall_the_link() {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        tx.cwnd = 40.0;
+        for i in 0..40u8 {
+            tx.push_message(&[i; 1000], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        let mut rx = RelRecv::new(RECV_WINDOW);
+        let one_way = Duration::from_millis(50);
+        type Burst = Vec<(u32, bool, Vec<u8>)>;
+        let mut to_rx: VecDeque<(Instant, Burst)> = VecDeque::new();
+        let mut to_tx: VecDeque<(Instant, u32, u64)> = VecDeque::new();
+        let (mut delivered, mut dropped, mut most_tries) = (Vec::new(), 0, 0);
+        let mut now = Instant::ZERO;
+        while delivered.len() < 40 && now < Instant::from_millis(60_000) {
+            let mut burst = drain_window(&mut tx, now, 1024);
+            if !burst.is_empty() {
+                burst.reverse();
+                to_rx.push_back((now + one_way, burst));
+            }
+            assert!(!tx.failed, "failed at {now:?}");
+            most_tries = tx.streams[REL].inflight.values().map(|f| f.tries).fold(most_tries, u32::max);
+            while to_rx.front().is_some_and(|(at, _)| *at <= now) {
+                for (seq, fin, data) in to_rx.pop_front().unwrap().1 {
+                    let took = rx.on_fragment(seq, fin, &data, 1 << 20, 4 * HELD_FRAGMENT, &mut delivered);
+                    dropped += (took == Ok(Took::OverBudget)) as u32;
+                }
+                let (cum, bits) = rx.ack();
+                to_tx.push_back((now + one_way, cum, bits));
+            }
+            while to_tx.front().is_some_and(|(at, ..)| *at <= now) {
+                let (_, cum, bits) = to_tx.pop_front().unwrap();
+                tx.on_ack(now, cum, bits, false);
+            }
+            now = now + Duration::from_millis(1);
+        }
+        let want: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 1000]).collect();
+        assert_eq!(delivered, want);
+        assert!(most_tries > MAX_TRIES && dropped > 100, "{most_tries} sends, {dropped} dropped");
+        assert!(tx.recovery.restarted > 0);
+        assert!(now < Instant::from_millis(30_000), "{now:?}");
     }
 
     /// One cut per round trip, but a timeout in one cut for random loss deepens
@@ -1344,17 +1542,116 @@ mod tests {
         let mut rx = RelRecv::new(URGENT_RECV_WINDOW);
         let mut out = Vec::new();
         for seq in 1..200 {
-            rx.on_fragment(seq, true, &[1; 100], MAX_URGENT, &mut out).unwrap();
+            rx.on_fragment(seq, true, &[1; 100], MAX_URGENT, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
         }
         assert_eq!(rx.buf.len(), URGENT_RECV_WINDOW as usize - 1);
-        rx.on_fragment(0, true, &[0; 100], MAX_URGENT, &mut out).unwrap();
+        rx.on_fragment(0, true, &[0; 100], MAX_URGENT, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
         assert_eq!(out.len(), URGENT_RECV_WINDOW as usize);
         // An urgent message over MAX_URGENT breaks the protocol.
         let mut rx = RelRecv::new(URGENT_RECV_WINDOW);
         for seq in 0..(MAX_URGENT / FRAGMENT) as u32 {
-            rx.on_fragment(seq, false, &[0; FRAGMENT], MAX_URGENT, &mut out).unwrap();
+            rx.on_fragment(seq, false, &[0; FRAGMENT], MAX_URGENT, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
         }
-        assert!(rx.on_fragment(59, true, &[0; FRAGMENT], MAX_URGENT, &mut out).is_err());
+        assert!(rx.on_fragment(59, true, &[0; FRAGMENT], MAX_URGENT, DEFAULT_OUT_OF_ORDER, &mut out).is_err());
+    }
+
+    /// NB-150: what a stream holds out of order stays within its budget, each
+    /// fragment counted with its entry, so small ones aren't nearly free; one
+    /// past it is dropped and not reported in the ACK, so its sender sends it
+    /// again. The next fragment due is always taken, and what it frees is room
+    /// again. A budget smaller than the ACK bitmap's reach holds nothing past it.
+    #[test]
+    fn the_receiver_holds_at_most_its_out_of_order_budget() {
+        const BUDGET: usize = 4 * HELD_FRAGMENT;
+        fn took(rx: &mut RelRecv, out: &mut Vec<Vec<u8>>, seq: u32, len: usize) -> Took {
+            rx.on_fragment(seq, true, &vec![seq as u8; len], 1 << 20, BUDGET, out).unwrap()
+        }
+        for window in [RECV_WINDOW, URGENT_RECV_WINDOW] {
+            let (mut rx, mut out) = (RelRecv::new(window), Vec::new());
+            // 0 is missing: 1..=4 are held, 5.. dropped.
+            for seq in 1..window {
+                let want = if seq <= 4 { Took::Taken } else { Took::OverBudget };
+                assert_eq!(took(&mut rx, &mut out, seq, FRAGMENT), want, "window {window}, seq {seq}");
+            }
+            assert_eq!((rx.buf.len(), rx.out_of_order), (4, BUDGET));
+            assert_eq!(rx.ack(), (0, 0b1111), "5.. aren't acknowledged");
+            // A copy of a held one is no new cost; the next due is taken at the cap.
+            assert_eq!(took(&mut rx, &mut out, 2, FRAGMENT), Took::Taken);
+            assert_eq!(took(&mut rx, &mut out, 0, FRAGMENT), Took::Taken);
+            assert_eq!((rx.next, rx.buf.len(), rx.out_of_order, out.len()), (5, 0, 0, 5));
+            // Their resends: 7..=10 held, then 5 and 6 deliver them, and 11 is
+            // taken in order.
+            for seq in [7, 8, 9, 10, 5, 6, 11] {
+                assert_eq!(took(&mut rx, &mut out, seq, FRAGMENT), Took::Taken);
+            }
+            assert_eq!((rx.next, rx.buf.len(), rx.out_of_order, out.len()), (12, 0, 0, 12));
+            // Small fragments count 64 B each besides their data.
+            let small = BUDGET / (HELD_OVERHEAD + 10);
+            for seq in 13..window.min(13 + 100) {
+                let want = if seq < 13 + small as u32 { Took::Taken } else { Took::OverBudget };
+                assert_eq!(took(&mut rx, &mut out, seq, 10), want, "window {window}, seq {seq}");
+            }
+            assert_eq!(rx.buf.len(), small.min(window as usize - 13));
+            assert!(rx.out_of_order <= BUDGET);
+            // Empty fragments (empty messages) too, up to 72 by the budget, but
+            // the bitmap's 64 come first.
+            let mut rx = RelRecv::new(window);
+            for seq in 1..window {
+                let want = if seq <= SACK_BITS { Took::Taken } else { Took::OverBudget };
+                assert_eq!(took(&mut rx, &mut out, seq, 0), want, "window {window}, seq {seq}");
+            }
+            assert_eq!(rx.buf.len(), (SACK_BITS as usize).min(window as usize - 1));
+            assert!(BUDGET / HELD_OVERHEAD > SACK_BITS as usize);
+        }
+        // Past the reach, the smallest budget that holds it holds as before.
+        let mut rx = RelRecv::new(RECV_WINDOW);
+        assert_eq!(rx.on_fragment(SACK_BITS + 1, true, &[], 1 << 20, REACH, &mut Vec::new()), Ok(Took::Taken));
+        assert_eq!(rx.on_fragment(SACK_BITS + 2, true, &[], 1 << 20, REACH - 1, &mut Vec::new()), Ok(Took::OverBudget));
+        assert_eq!(rx.buf.len(), 1);
+        // The default never binds before the window: a full window of full
+        // fragments, all past a hole, is held.
+        let mut rx = RelRecv::new(RECV_WINDOW);
+        for seq in 1..RECV_WINDOW {
+            let got = rx.on_fragment(seq, true, &[0; FRAGMENT], 1 << 20, DEFAULT_OUT_OF_ORDER, &mut Vec::new());
+            assert_eq!(got, Ok(Took::Taken));
+        }
+        assert_eq!((rx.buf.len(), rx.out_of_order), (RECV_WINDOW as usize - 1, DEFAULT_OUT_OF_ORDER));
+    }
+
+    /// NB150-1: a message partly assembled reserves at most `max_message`,
+    /// however its sender sizes the fragments. Vec's doubling alone, filled to
+    /// 4,094 B and then one byte more, reserved 8,188 B at a board's 4 KiB cap.
+    /// A message of full fragments still grows by doubling, and one past the
+    /// cap still breaks the protocol.
+    #[test]
+    fn a_message_assembled_reserves_at_most_max_message() {
+        const MAX: usize = 4 << 10;
+        let (mut rx, mut out) = (RelRecv::new(RECV_WINDOW), Vec::new());
+        for (seq, len) in [1000, 1047, 1000, 1047, 1].into_iter().enumerate() {
+            rx.on_fragment(seq as u32, false, &vec![0; len], MAX, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
+            let cap = rx.assembling.capacity();
+            assert!(cap <= MAX, "fragment {seq}: {cap} B reserved for {} B", rx.assembling.len());
+        }
+        rx.on_fragment(5, true, &[0], MAX, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
+        assert_eq!((out.len(), out[0].len()), (1, MAX));
+        assert!(out[0].capacity() <= MAX);
+        for seq in 6..9 {
+            rx.on_fragment(seq, false, &[0; FRAGMENT], MAX, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
+        }
+        assert!(rx.on_fragment(9, true, &[0; MAX - 3 * FRAGMENT + 1], MAX, DEFAULT_OUT_OF_ORDER, &mut out).is_err());
+        // At the default 1 MiB, a message of 954 fragments reserves 11 times,
+        // the last time up to the cap, not past it.
+        let (max, mut rx) = (1 << 20, RelRecv::new(RECV_WINDOW));
+        let (mut seq, mut grown, mut cap) = (0, 0, 0);
+        while rx.assembling.len() < max {
+            let len = FRAGMENT.min(max - rx.assembling.len());
+            rx.on_fragment(seq, false, &vec![0; len], max, DEFAULT_OUT_OF_ORDER, &mut out).unwrap();
+            if rx.assembling.capacity() != cap {
+                (grown, cap) = (grown + 1, rx.assembling.capacity());
+            }
+            seq += 1;
+        }
+        assert_eq!((seq, grown, cap), (954, 11, max));
     }
 
     #[test]
@@ -1473,7 +1770,7 @@ mod tests {
                 to_rx.retain(|(at, u, seq, fin, data)| {
                     let keep = *at > now;
                     if !keep {
-                        rx[*u].on_fragment(*seq, *fin, data, 1 << 20, &mut delivered).unwrap();
+                        rx[*u].on_fragment(*seq, *fin, data, 1 << 20, DEFAULT_OUT_OF_ORDER, &mut delivered).unwrap();
                     }
                     keep
                 });
