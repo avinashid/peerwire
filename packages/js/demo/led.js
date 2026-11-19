@@ -79,14 +79,20 @@ $('via').onchange = () => {
   module($('via').value);
 };
 
+// Ends the link, saying goodbye first: the board then frees its place for the next page at once, where a page that
+// just goes holds it until the board has heard nothing from it for 20 s (NB-136). Over the relays a board takes 4
+// pages at once. The goodbye is sealed now and sent as the relays close (which waits for it).
 function stop() {
   run++;
   clearTimeout(quiet);
+  if (peer) endpoint?.disconnect(peer);
   link?.close();
   endpoint?.close();
   link = endpoint = peer = null;
   setLinked(false);
 }
+// A page that goes says goodbye too, as far as it gets the time to: on a phone that ends the tab, it may not.
+addEventListener('pagehide', () => peer && stop());
 
 $('connect').onclick = async () => {
   stop();
@@ -147,7 +153,12 @@ function online(room, mine) {
       log(`linked with ${peer.slice(0, 12)} over the relays`);
       setLinked(true);
     } catch (e) {
-      if (mine === run) log(`not linked: ${e.code ?? 'error'}: ${e.message}`);
+      if (mine !== run) return;
+      // The board was heard but took no link: it may have its 4 pages linked over the relays, each held while it is
+      // there (NB-136).
+      const busy = "the board didn't answer in time. It takes 4 pages at once over the relays, so it may be busy: " +
+        'try again shortly';
+      log(`not linked: ${e.code === 'timeout' ? busy : `${e.code ?? 'error'}: ${e.message}`}`);
     } finally {
       dialling = false;
     }
