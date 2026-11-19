@@ -171,7 +171,7 @@ release of each.
 | NB97-1 (Low) | **Fixed** by `a00fff5` before NB-097 merged, so never on main (the node drops what came in with a link it refuses, and holds a new link's `AddrObserved`, and the `Replaced` of the link it replaces, until its `Connected` says whether it is admitted), reviewed 2026-11-04, [Connection policy in Rust](#connection-policy-in-rust-nb-097--nb97-1) |
 | NB97-I1, NB97-I2, NB97-I3, NB97-I4 (Info) | NB97-I1, NB97-I2 **fixed** by `a00fff5` (a refused replacement ends the old link with `PathOff`; a link that moves onto a kept relay stops punching, and the answer to an earlier punch moves it nowhere); NB97-I3 accepted (a Rust policy hides no address, the guide says so); NB97-I4 **fixed** by `9131188` (a refused link is closed at the end of the pass, so an admitted link of the same peer that replaced it in the same read is kept), reviewed 2026-11-04, same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
-| NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so), [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
+| NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so); on a board, where one link's worth is far past the heap, it is NB142-1, [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB99-1 (Medium), NB99-2 (Low), NB99-I1 (Info) | **Fixed** by `b2b2919` and `41471eb` before NB-099 merged, so never on main (a relayed address an offer names relabels only the packets that name its claimant's link, and the policy takes it as TURN's for that peer alone; full TURN tables make room for a later peer, a peer holds one offer's IPs, channel numbers are bound again once quiet), reviewed 2026-11-05; residuals accepted, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
 | NB99-I2 (Info) | **Fixed** by `1551da7` (NB-100, merged with NB-101), reviewed 2026-11-05: every claimant of a relayed address is kept, and a claim relabels its claimant's packets alone; the 256-claim cap stays, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
 | NB101-1 (Low), NB101-I1 (Info) | **Fixed** by `ee3ef67` and `016c77f` before NB-101 merged, so never on main (under relay-only with TURN, a relay peer's invite is dialled through the allocation; a link that shows the node's address goes onto an allocation at any of the peer's addresses, or closes without a Close and is dialled afresh through the relay), reviewed 2026-11-05; residuals accepted, [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1) |
@@ -224,6 +224,8 @@ release of each.
 | NB135-I5, NB135-I6 (Info) | **Fixed** by `2261418` and `0c2723d` before NB-135 merged, so never on main: a connection has one answer to PROBEs waiting at most; a bound connection that closes holds its advert 1 to 4 s, whichever end timed out, a cost the lead accepted for v1 on 2026-11-19, reviewed 2026-11-19, same section |
 | NB135-I7 (Info) | **Fixed** by `d8da3f8` before NB-135 merged, so never on main: a link left on a radio connection that closed is dialled again over the next connection that proves its peer, not left until its session times out, reviewed 2026-11-19, same section |
 | NB135-I8 (Info) | **Fixed** by `fb1983a` before NB-135 merged, so never on main: the node's test of the holds closes a standby beside a link left on a radio connection that closed, which takes 1 to 4 s, reviewed 2026-11-19, same section |
+| NB142-1 (Low) | Open: a room member linked to a board can make it hold about 4.6 MB a link of fragments out of order, which NB86-I1 accepts on every node, where a board has tens of KB free, so a few dozen fragments behind one held back restart it, and a PC with the default caps can come close by accident; NB-142's 4 KiB cap leaves it as it was. Fix: a byte budget for what a lane holds out of order, set small on a board, [ESP-NOW's path kind and a board's caps](#esp-nows-path-kind-and-a-boards-caps-nb-142--nb142-1) |
+| NB142-I1 (Info) | **Fixed** by `5f3187b` (NB-142), reviewed 2026-11-19: the Wi-Fi library's tag is quiet before the station's configuration is set, as setting one logged the length of the network's password, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -6700,7 +6702,10 @@ Adverts go out as broadcasts; connections are emulated over unicast frames, OPEN
 ACCEPT, KEEPALIVE, PROBE and CLOSE on 64-bit ids each end draws; and a value of up to
 512 bytes goes in numbered data frames. Above the radio the node's Bluetooth path is
 unchanged: the room advert and its proof, Noise IK, sealed signals and datagrams, and
-`PathKind::Bluetooth`. `peerwire-esp` gives the ESP32's ether (`espnow::EspNowEther`)
+the rank below every UDP path, as a kind of its own since NB-142 (`be41546`),
+`PathKind::EspNow`, where it was `PathKind::Bluetooth`
+([NB-142](#esp-nows-path-kind-and-a-boards-caps-nb-142--nb142-1)). `peerwire-esp` gives
+the ESP32's ether (`espnow::EspNowEther`)
 and `wifi::random_mac`. Reviewed on 2026-11-18 by reading `962b1e2..6382fdf`
 (`pz/NB-135`, not merged) against the node's Bluetooth path. A scratch copy ran the
 review's own tests of the engine and of two nodes on `espnow::FakeAir` (NB135-1,
@@ -7512,6 +7517,98 @@ that closed.
 2026-11-19: the node's test of the holds closes a standby beside a link left on a radio
 connection that closed, and the change that counts that link as a spare now fails it.
 
+### ESP-NOW's path kind and a board's caps (NB-142) — NB142-1
+
+NB-142 gives links over ESP-NOW a path kind of their own, gives a board with a radio
+smaller caps, and adds lines to the radio's examples. `be41546`: a radio names its kind
+(`ble::Radio::kind`, `Bluetooth` by default), and `espnow::EspNow` says
+`PathKind::EspNow`, which `Node::path_kind` reports and a policy must list for links
+over it. `6d8c89e`: with feature `ble` or `espnow`, `peerwire_esp::config()` caps
+messages at 4 KiB and the send buffer at 8 KiB, where they were 16 and 32 KiB.
+`faceb85`: `espnow_mesh` logs each link's round trips and its loop's times, and its idle
+takes turns with one the radio wakes. `5f3187b`: the Wi-Fi library's lines are quiet
+before a configuration is set, and the transmit power is set again once joined.
+`891409d`: `espnow_probe` tries four fixed rates. Reviewed on 2026-11-19 by reading
+`40e841a..891409d` (`pz/NB-142`, not merged) against the node's policy code and ESP-IDF
+v5.5.5. A scratch copy of `891409d` ran one probe of the core's receive window at a
+board's caps (NB142-1); nothing else was re-run.
+
+**What holds.**
+
+- **The kind is the node's own.** The radio's driver names it once, as the node is built
+  (`Traversal::set_radio_kind`); no frame or peer sets it. Every check of a radio
+  connection takes it: the policy's (`Traversal::allows`), a dial's last step
+  (`radio_targets`), `Node::path_kind`, and the rule that a policy of radio kinds alone
+  leaves the UDP socket unused both ways. So a policy that lists `Bluetooth` alone
+  refuses links over ESP-NOW, and the other way round, and the node logs a warning; a
+  linked node whose new policy drops its radio's kind closes the link (`PathOff`). A
+  driver that names a kind that isn't a radio's gets `Bluetooth`, so a `[Direct]` policy
+  still refuses its links. An order with no kind in it, which would count as radio kinds
+  alone, is refused by `Builder::policy` and `Node::set_policy`. A dial with no policy
+  takes `EspNow`, and still not `Signaling`, which a node never dials. The C ABI, the
+  JavaScript package and the Godot binding name no path kind.
+- **Caps.** With a radio, `peerwire_esp::config()` gives 4 KiB messages and an 8 KiB
+  send buffer on both chips; a larger message is refused at the sender and closes the
+  link at the board (`a_board_s_radio_caps_carry_its_largest_message`). They bound what
+  a board sends and assembles, not what a peer makes it hold out of order: NB142-1.
+- **The idle and the watchdog.** `espnow_mesh`'s idle that the radio wakes blocks for a
+  tick (`vTaskDelay(1)`) before it waits on the task's notification, so each pass of the
+  loop blocks at least once, as `peerwire_esp::idle` has since `4b85de1` (NB-133): a
+  flood of frames cuts the waits short but can't keep the idle task from running. The
+  radio's callbacks only signal the notification.
+- **What the new lines say.** `ESPNOW_RTT` and `ESPNOW_LOOP` give each link's round
+  trips and fragment counts and the loop's times, under the short PeerId the report
+  already prints: no key, address or room name. The transmit-power line gives the power,
+  and the country's limit and policy, not the country.
+- **The Wi-Fi library's log.** The tag is now set to error before either of the two
+  configurations the port sets, so nothing the library logs as one is set reaches the
+  console (NB142-I1).
+- **The radio probe.** `espnow_probe`'s receive callback checks the addresses it is
+  given for null before it reads them (`src_addr`, `rx_ctrl`), as at `40e841a`, and
+  takes no frame under 32 bytes, so its reads of a frame's fields stay inside it; a mode
+  number from the air is checked against the list. A rate mode's `PHASE` and `PACK` also
+  go as broadcasts at 1 Mbit/s, carrying the run's random group, the mode and a sequence
+  number, nothing of the room (NB135-I4). It links nothing, and anyone in range who
+  hears its hellos can step it through its modes, as before; it measures the radio on
+  our own boards.
+
+**NB142-1 — A linked member can make a board hold megabytes out of order (Low).**
+NB86-I1 accepts that a linked peer can make each link of any node hold what the receive
+windows take out of order, `RECV_WINDOW` 4,096 fragments of 1,100 B on the reliable lane
+and 64 on the urgent one, which neither `max_message` nor `max_send_buffer` bounds, and
+says to size `max_links` to the memory there is. A board can't: at its 4 KiB cap one
+link can hold 4,581,992 bytes (**theoretical**: 4,095 × 1,100 B + 63 × 1,100 B + 4,096 B
+twice, partly assembled), where a board has tens of KB free: an ESP32-C3's low with the
+Nostr carrier was 43,312 bytes (NB-133). So a few dozen fragments sent past one held
+back (**theoretical**: 43,312 B / 1,100 B, about 39) end in a failed allocation and a
+restart. A room member linked to the board needs nothing more, over the radio as over
+UDP, and can do it again once the board is back. A PC with the default caps can come
+close by accident: its congestion window starts at 16 fragments and grows, so a burst
+whose first fragment is lost leaves the rest of a window waiting (**theoretical**: 15 ×
+1,100 B = 16,500 B at the start). A board's own sends stay under its 8 KiB send buffer,
+so two boards can't. NB-142's cap leaves this as it was; it is older than NB-142.
+Reproduction: a scratch test beside `hostile_peer_pins_bounded_receive_memory` in
+`fuzz.rs`, an endpoint at a board's caps sent sequence numbers 1 to 4,095 and urgent
+ones 1 to 63, with 0 held back on both: it held 4,573,800 bytes, and kept the link. Fix:
+a byte budget for what each lane holds out of order, from `Config`, the present bound by
+default so other nodes don't change, and a few fragments on a board
+(`peerwire_esp::config()`); a fragment that would go past it is dropped unacknowledged,
+as one past the window is, and its sender sends it again. A test like the reproduction,
+at the budget.
+
+**Status: open** (Low), reported on NB-148 at `891409d`.
+
+**NB142-I1 — The Wi-Fi library logged the length of the network's password (Info).**
+NB110c-5's fix set the library's tag to error just after the station's configuration was
+set, and setting one with a password logged its length at warning
+(`OWE is enabled, but … password length is N`, in ESP-IDF v5.5.5's library for both
+chips), so a log people share told how long the password of the board's network was.
+Fix: the tag first.
+
+**Status: fixed** by `5f3187b` (NB-142), reviewed 2026-11-19: `wifi::set_client` sets
+the tag before the configuration, and the open configuration of a station on no network
+is set after it too.
+
 ### `@peerwire/react` hooks (NB-049) — RH-1…RH-6, NB53-1
 
 `@peerwire/react` (`packages/react`, 0.1.0 published from `dec1554`) wraps a room in
@@ -7765,7 +7862,8 @@ congestion rule for tail losses from NB-086 (`b2ae061`, reviewed 2026-11-03).
   - **NB86-I1 (Info, accepted):** the window is the receiver's, so this bound grew
     2.46× on every node, whatever its `reliable_window`. A peer still sends every
     byte it pins, over its own authenticated links only; size `max_links` to the
-    memory there is.
+    memory there is. A board has less than one link's worth, whatever its caps:
+    [NB142-1](#esp-nows-path-kind-and-a-boards-caps-nb-142--nb142-1).
 - **Retransmission.**
   - RTO is 20 ms to 5 s; backoff `rto·2^min(tries-1, 8)`, at most 10 s.
   - After `MAX_TRIES` (16) the link is dead.
