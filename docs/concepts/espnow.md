@@ -4,7 +4,7 @@
 > This is the design of Peerwire over ESP-NOW (NB-135): boards linking with each other over Espressif's ESP-NOW
 > frames, with no Wi-Fi network and no Bluetooth. The connection logic is the `peerwire` feature `espnow`
 > (`espnow::Engine`, sans-IO, with host and fuzz tests); the ESP32 driver is `peerwire-esp` feature `espnow`, and its
-> `espnow_mesh` example links two boards. The protocol below has had its security review, in seven rounds (what it
+> `espnow_mesh` example links two boards. The protocol below has had its security review, in eight rounds (what it
 > found is [below](#forged-frames)). The probe (`espnow_probe`, NB-135) measured the radio on two boards first
 > (NB-138, [below](#limits)), and the defaults stand; the same two boards then ran a link for 5 minutes, once, from
 > before the review's second round (NB-139).
@@ -116,7 +116,8 @@ address, this end's id), and every frame on it carries the receiver's id and mus
 - **Liveness:** a connection with nothing sent on it for 1 s sends a KEEPALIVE; one with nothing heard on it for 5 s
   is gone (`Disconnected`), and so is one whose last 8 frames the radio couldn't deliver. A connect not accepted within
   10 s fails (`ConnectFailed`), as the node's radio contract asks; one whose first OPEN no radio acknowledged fails at
-  once, as no radio is at that address to answer it, made up or gone (NB135-12).
+  once, as no radio is at that address to answer it, made up or gone (NB135-12), and so does one an ACCEPT opened
+  before that verdict came, as one forged from that address can (`Disconnected`, NB135-16).
 - **Closing:** the node closes a connection with a CLOSE, and hears nothing more of it. A CLOSE received isn't taken at
   its word: the receiver sends a PROBE and closes only if nothing comes on the connection within 500 ms. The other end
   answers a PROBE with a KEEPALIVE at once, if it still has the connection.
@@ -164,8 +165,9 @@ OPEN), so a frame to an absent address holds the air for two tries, not four; a 
 its caps, which count the 4 too (NB135-15): it handed the driver all it would take, 32, and the caps saw none of them,
 so a PROBE every 100 ms on a forged connection was answered every time, and seconds of frames to made-up addresses
 waited ahead of every real frame. Each frame's verdict comes back in order (`espnow::TxQueue`), with the tag the radio
-gave the frame, so one that comes late, after its frame was taken as lost (5 s, more than the 3.2 s the 4 can hold the
-air: 4 tries each, of up to 200 ms), is dropped, not taken for the next frame's. A value's queue slot frees once its
+gave the frame, so one that comes late, after its frame was taken as lost (5 s, more than the 4.8 s the 4 can hold the
+air: 4 tries each, a try ending at its send callback, or with none 200 to 300 ms on, when the driver's thread, which
+looks every 100 ms, expires it), is dropped, not taken for the next frame's. A value's queue slot frees once its
 last frame is acknowledged, and a connection whose frames fail 8 times in a row is gone.
 
 ESP-NOW sends a unicast frame only to an address in its peer table, of 20 at most: the driver keeps the 16 it sent to
@@ -178,7 +180,7 @@ ESP-NOW's own encryption (CCMP with a key per peer, for at most 17 peers) isn't 
 | | Default |
 |---|---|
 | Connections | 4, all of them centrals' if need be; 2 bound to no peer. The radio takes one OPEN over its 4 open connections for the node to decide on (NB135-11), its connects under way not counted (NB135-13), and never more than 8 in all |
-| Connects | an OPEN every 500 ms for 10 s; failed at once if no radio acknowledged the first (NB135-12) |
+| Connects | an OPEN every 500 ms for 10 s; failed at once if no radio acknowledged the first (NB135-12), even if an ACCEPT came before the verdict (NB135-16) |
 | Values queued per connection | 8; then the node keeps its own until the radio takes them |
 | Distinct HS1s on unbound connections, across the radio | 2, then one per 5 s, as on a board's Bluetooth |
 | Frames handed to the driver | 4, counted against the caps below; each one's verdict comes back in order, with its tag (NB135-15). The ESP32 driver's queue holds 32 |
@@ -232,9 +234,10 @@ which could jam the channel anyway. What such an attacker can do, frame by frame
 
 | Forged | At most |
 |---|---|
-| ADVERT | a `Seen` for the node, which checks the room's tag (HMAC), 50 at once and then one per 20 ms; 16 wait for it at most. The tag is bound to the address it is sent from, so a copy of a member's advert from another address, made up or a radio of the forger's, is another room's: it drew a connect that held the member's own adverts off for 10 s, and one from a new address as each ran out kept two boards apart (NB135-12). A real advert replayed from its own address, a member's that has gone, draws one OPEN, two tries, and the connect fails at once as no radio acknowledges it (NB135-12); while the replays go on, again 1 to 4 s later |
+| ADVERT | a `Seen` for the node, which checks the room's tag (HMAC), 50 at once and then one per 20 ms; 16 wait for it at most. The tag is bound to the address it is sent from, so a copy of a member's advert from another address, made up or a radio of the forger's, is another room's: it drew a connect that held the member's own adverts off for 10 s, and one from a new address as each ran out kept two boards apart (NB135-12). A real advert replayed from its own address, a member's that has gone, draws one OPEN, two tries, and the connect fails at once as no radio acknowledges it (NB135-12), even if an ACCEPT forged from that address comes before the verdict (NB135-16); while the replays go on, again 1 to 4 s later. With a radio of the forger's at that address, which acknowledges the OPENs and answers none, the connect runs 10 s, and a few such adverts in turn keep a pair apart while they go on (NB135-16, accepted: What stays, below) |
 | OPEN, from made-up addresses | a connection whose central never proves the room, closed after 3 s; 2 of them at most, the unbound ones. They count against none of the node's own connects, which close the oldest if they need its slot, and a new central takes the oldest's place at once, before any connection of the node's own (NB135-14); the radio takes one OPEN over its 4 open connections, its connects under way not counted (NB135-13), and leaves it to the node, silent past that one until the node has decided on it. So OPENs forged to two boards, one each every 1.2 s or twice a second, no longer keep them apart (linked in tens of ms on `FakeAir`), nor do two forged beside two bound ones keep a newcomer out (NB135-11), with a connect of the node's under way beside them too (linked in 0.48 s, NB135-13). OPENs forged as fast as the radio takes them, each right after the node has decided on the last, keep the one over taken: a newcomer's OPENs go unanswered, its connect fails after 10 s, and it connects again 1 to 4 s later (NB135-13), as jamming would cost. Each ACCEPT to a made-up address holds the air for two tries (NB135-3), and waits in the engine, under its caps (NB135-15) |
 | ACCEPT, before the real one | the opener takes the forged id; when the real ACCEPT comes, with another id and within 3 s, the connection closes, even if forged data came meanwhile (NB135-4), and the node connects again 1 to 4 s later (NB135-5). If the attacker also keeps the real one from arriving (jamming), the opener sends to the forged id, the room proof stalls, and the node closes the connection after 3 s and connects again 1 to 4 s later (NB135-10) |
+| ACCEPT, to an OPEN no radio acknowledges | the connection it opens closes at the OPEN's verdict, as the connect fails, and the node connects again 1 to 4 s later: it held one of the node's unbound slots until the room proof's deadline, 3 s, with an ACCEPT forged from a gone member's address while the OPEN's two tries were on the air (NB135-16) |
 | ACCEPT, after the real one, within 3 s of it | the connection closes, though the room's challenge came on it already, and the node connects again 1 to 4 s later, as the radio reports the close as `Dropped`, which says nothing of the other end (NB135-5): one forged frame for each reconnect, as jamming would cost |
 | ACCEPT, more than 3 s after the first | ignored |
 | CLOSE | nothing, unless the attacker also keeps the other end's answer to the PROBE from arriving (jamming): then a close and a reconnect |
@@ -255,7 +258,7 @@ frames can cause (NB135-8, NB135-10), and a link whose connection closed under i
 (NB135-I7).
 Connections, queues and buffers are capped above, and the parser is fuzzed.
 
-The security review of NB-135 (the [threat model](../project/threat-model.md)) found fifteen problems in seven rounds,
+The security review of NB-135 (the [threat model](../project/threat-model.md)) found sixteen problems in eight rounds,
 fixed since, each with a test that was its repro:
 
 - **NB135-1 (Medium):** four forged DATA frames far ahead, sent each way with ids overheard on the air, moved both
@@ -336,6 +339,12 @@ fixed since, each with a test that was its repro:
   grew the driver's peer table past its 16, and past ESP-NOW's 20 a frame to a real peer fails. The radio now hands the
   driver 4 at a time, its caps count them, and each verdict is matched to its frame by a tag: the queue holds 4, a
   value waits 0.1 s, no verdict is taken for another frame's, and the peer table keeps to 16.
+- **NB135-16 (Low, round 8, in NB135-12's fix):** an ACCEPT forged from a gone member's address, with the id of the
+  node's OPEN to it overheard, came while the OPEN's two tries were on the air (~0.2 s on a board, **theoretical**):
+  it opened the connection, and the OPEN's verdict, unacknowledged, then closed nothing. So one overheard OPEN and one
+  forged ACCEPT held one of the node's unbound slots until the room proof's deadline, 3 s, with no connect given up
+  (still open 3 s on, in the engine's test). The verdict now closes it whatever came first, and a real ACCEPT whose
+  OPEN's acknowledgement was lost goes with it: the node connects again 1 to 4 s later.
 
 And four smaller ones: a PROBE was answered every 100 ms even with an answer still waiting for the air (NB135-I5: now
 one waits at most); the end that made a connection held the advert a minute when the other end closed it as its link
@@ -345,6 +354,11 @@ under it stayed on it until its session timed out, 30 s, so the next connection 
 didn't (NB135-I7: it is now dialled again over the next connection that proves its peer, at once); and no test closed a
 standby beside a link left on a connection that had closed, which should hold the advert 1 to 4 s, not a minute
 (NB135-I8: one does now).
+
+The eighth round checked the fixes of NB135-12 to NB135-15 and found NB135-16 in NB135-12's, fixed above. It
+accepted two things for v1, both Low and costing a pair only while a forger goes on, as jamming does: OPENs forged as
+fast as a board decides, which keep a newcomer out of a full one (NB135-13), and replays of gone members' adverts
+with a radio of the forger's at each address (NB135-16). Both are in What stays, below.
 
 What stays, as on any radio: an attacker in range can jam the channel, cut a connection by jamming the answer to a
 PROBE, and hold a dead connection open with forged KEEPALIVEs until the node's own rules close it. Forged DATA frames
@@ -357,9 +371,18 @@ cut. OPENs from made-up addresses, 2 or more within a member's round trip of the
 the member's connection before it proves the room, and it connects again 1 to 4 s later; sent as fast as a board takes
 them, each right after it has decided on the last, they keep the radio's one OPEN over its limits taken, so a newcomer
 that connects to it is kept out while they go on and links within seconds of their end, holding the advert 1 to 4 s
-after each failed connect (NB135-13): a forger that keeps either up is jamming. A replay of a gone member's advert
-from that member's own address still draws a connect, which fails at once (NB110-11's residual, NB135-12). **The MAC
-address is a residual, accepted (NB135-I3):** with `random_mac` a board is a new address on each boot, but one address
+after each failed connect (NB135-13): a forger that keeps either up is jamming. **OPENs that keep the one over taken
+are accepted for v1 (Low, the review's choice 7):** as jamming does, they cost a newcomer only while a forger sends
+one right after each of the node's decisions. A replay of a gone member's advert from that member's own address still
+draws a connect, which fails at once when no radio acknowledges its OPEN, even if an ACCEPT forged from that address
+comes before the verdict (NB110-11's residual, NB135-12, NB135-16). **A radio at a gone member's address is accepted
+for v1 (NB135-16, Low):** it acknowledges the OPENs to it, as any radio does for its own address, and answers none,
+so the connect runs its 10 s. A forger with a few gone members' adverts, each `n` above the node's, and a radio at each
+of their addresses, replaying one whenever fewer than two of the node's connects to them are under way, keeps the
+pair apart while it goes on, and they link as it stops (the review's run: not linked in the 30 s it ran, linked
+0.25 s after; the test's, 10 s: 0.12 s after). It needs the forger's radios to take gone members' addresses, and
+their adverts, and lasts only while it runs. To bound it later, the node could prefer an advert from a device it
+hasn't connected to lately. **The MAC address is a residual, accepted (NB135-I3):** with `random_mac` a board is a new address on each boot, but one address
 for the whole boot, so a listener can tie a boot's adverts together, and a network the board joins sees it too;
 without it, the chip's own address follows the board for good.
 

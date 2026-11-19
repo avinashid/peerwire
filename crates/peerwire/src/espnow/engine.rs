@@ -48,8 +48,9 @@ const PROBE_GAP: Duration = Duration::from_millis(100);
 /// here, under the caps, where an ether that took all it could (32 on an ESP32) held frames the caps never saw, a
 /// PROBE's answer every 100 ms among them, seconds of them ahead of every real frame. One whose verdict hasn't come in
 /// `FLIGHT_TIMEOUT` is taken as lost, so an ether that drops a verdict can't stop the engine sending; the ether's
-/// frames hold the air for 3.2 s at most before then (4 frames, 4 tries each, of up to 200 ms each where the ESP32
-/// driver hears no verdict; a failed try took ~100 ms on NB-139's boards), so one still on the air isn't taken as lost.
+/// frames hold the air for 4.8 s at most before then (4 frames, 4 tries each, a try ending at its send callback, or
+/// with none 200 to 300 ms on, when the ESP32 driver's TX thread, which looks every 100 ms, expires it; a failed try
+/// took ~100 ms on NB-139's boards), so one still on the air isn't taken as lost.
 /// 4, not 1 or 2: a board that polls every 10 ms then hands over up to 400 frames a second, past the ~310 the air
 /// carries (NB-138).
 const MAX_FLIGHT: usize = 4;
