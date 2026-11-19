@@ -171,7 +171,7 @@ release of each.
 | NB97-1 (Low) | **Fixed** by `a00fff5` before NB-097 merged, so never on main (the node drops what came in with a link it refuses, and holds a new link's `AddrObserved`, and the `Replaced` of the link it replaces, until its `Connected` says whether it is admitted), reviewed 2026-11-04, [Connection policy in Rust](#connection-policy-in-rust-nb-097--nb97-1) |
 | NB97-I1, NB97-I2, NB97-I3, NB97-I4 (Info) | NB97-I1, NB97-I2 **fixed** by `a00fff5` (a refused replacement ends the old link with `PathOff`; a link that moves onto a kept relay stops punching, and the answer to an earlier punch moves it nowhere); NB97-I3 accepted (a Rust policy hides no address, the guide says so); NB97-I4 **fixed** by `9131188` (a refused link is closed at the end of the pass, so an admitted link of the same peer that replaced it in the same read is kept), reviewed 2026-11-04, same section |
 | NB79-I1 (Info) | Open, a design call: on IPv6, `'public-only'` still gives members the device's own address (the docs say so since `9ea2200`), [Addresses we give out](#bounds-and-residuals-from-reviews-nb-014nb-043) |
-| NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so); on a board, where one link's worth is far past the heap, it is NB142-1, [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
+| NB86-I1 (Info) | Accepted: since NB-086 (`b2ae061`), a peer can make each link hold about 5.7 MB of received data, not 2.3 MB, on every node; 256 links of `peerwire-peer` can pin about 1.6 GB (the always-on peer guide says so); on a board, where one link's worth was far past the heap, it was NB142-1, fixed by NB-150's `Config::max_out_of_order`, whose default doesn't bind, [Core sessions](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | NB99-1 (Medium), NB99-2 (Low), NB99-I1 (Info) | **Fixed** by `b2b2919` and `41471eb` before NB-099 merged, so never on main (a relayed address an offer names relabels only the packets that name its claimant's link, and the policy takes it as TURN's for that peer alone; full TURN tables make room for a later peer, a peer holds one offer's IPs, channel numbers are bound again once quiet), reviewed 2026-11-05; residuals accepted, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
 | NB99-I2 (Info) | **Fixed** by `1551da7` (NB-100, merged with NB-101), reviewed 2026-11-05: every claimant of a relayed address is kept, and a claim relabels its claimant's packets alone; the 256-claim cap stays, [TURN client in Rust](#turn-client-in-rust-nb-099--nb99-1-nb99-2) |
 | NB101-1 (Low), NB101-I1 (Info) | **Fixed** by `ee3ef67` and `016c77f` before NB-101 merged, so never on main (under relay-only with TURN, a relay peer's invite is dialled through the allocation; a link that shows the node's address goes onto an allocation at any of the peer's addresses, or closes without a Close and is dialled afresh through the relay), reviewed 2026-11-05; residuals accepted, [TURN under relay-only in Rust](#turn-under-relay-only-in-rust-nb-101--nb101-1) |
@@ -224,7 +224,9 @@ release of each.
 | NB135-I5, NB135-I6 (Info) | **Fixed** by `2261418` and `0c2723d` before NB-135 merged, so never on main: a connection has one answer to PROBEs waiting at most; a bound connection that closes holds its advert 1 to 4 s, whichever end timed out, a cost the lead accepted for v1 on 2026-11-19, reviewed 2026-11-19, same section |
 | NB135-I7 (Info) | **Fixed** by `d8da3f8` before NB-135 merged, so never on main: a link left on a radio connection that closed is dialled again over the next connection that proves its peer, not left until its session times out, reviewed 2026-11-19, same section |
 | NB135-I8 (Info) | **Fixed** by `fb1983a` before NB-135 merged, so never on main: the node's test of the holds closes a standby beside a link left on a radio connection that closed, which takes 1 to 4 s, reviewed 2026-11-19, same section |
-| NB142-1 (Low) | Open: a room member linked to a board can make it hold about 4.6 MB a link of fragments out of order, which NB86-I1 accepts on every node, where a board has tens of KB free, so a few dozen fragments behind one held back restart it, and a PC with the default caps can come close by accident; NB-142's 4 KiB cap leaves it as it was. Fix: a byte budget for what a lane holds out of order, set small on a board, [ESP-NOW's path kind and a board's caps](#esp-nows-path-kind-and-a-boards-caps-nb-142--nb142-1) |
+| NB150-1 (Low) | Open: with NB-150 a linked member can still make a link of a board hold 17,504 B with a radio and 42,080 B without, mostly in messages partly assembled, and nearly twice that by the sizes of its fragments, where a C3 has tens of KB free, so one or two links still restart it. Fix: reserve at most `max_message` for a message partly assembled, and a budget for what all of a node's links hold, set on a board, [A board's out-of-order budget](#a-boards-out-of-order-budget-nb-150--nb150-1) |
+| NB150-I1 (Info) | Accepted for v1 by the lead on 2026-11-19, as NB-150's stated cost: a linked peer that acknowledges the lowest fragment once an RTO, and nothing past it, keeps its link and draws a copy of each of up to 65 fragments every RTO, then about 4 once the flight drains, where before any fragment's 17th send failed the link, same section |
+| NB142-1 (Low) | **Fixed** by `c0ca76d` and `e023495` (NB-150), with the sender's `d31a484`, reviewed 2026-11-19: each lane of a board's link holds at most 4 full fragments (4,656 B) out of order, and a fragment past them is dropped unacknowledged and sent again; what a link can still hold, mostly a message partly assembled, is NB150-1, [ESP-NOW's path kind and a board's caps](#esp-nows-path-kind-and-a-boards-caps-nb-142--nb142-1) |
 | NB142-I1 (Info) | **Fixed** by `5f3187b` (NB-142), reviewed 2026-11-19: the Wi-Fi library's tag is quiet before the station's configuration is set, as setting one logged the length of the network's password, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
@@ -7596,7 +7598,11 @@ default so other nodes don't change, and a few fragments on a board
 as one past the window is, and its sender sends it again. A test like the reproduction,
 at the budget.
 
-**Status: open** (Low), reported on NB-148 at `891409d`.
+**Status: fixed** by `c0ca76d` and `e023495` (NB-150), with the sender's `d31a484`,
+reviewed 2026-11-19: each lane of a board's link holds at most 4 full fragments out of
+order, and the reproduction, as `hostile_peer_holds_at_most_the_out_of_order_budget`,
+holds 15,400 B and keeps the link. What a link can still hold is
+[NB150-1](#a-boards-out-of-order-budget-nb-150--nb150-1).
 
 **NB142-I1 — The Wi-Fi library logged the length of the network's password (Info).**
 NB110c-5's fix set the library's tag to error just after the station's configuration was
@@ -7838,6 +7844,102 @@ and the tests hold nested `null`s. `store.mjs` and `doc_crdt.mjs` put an object 
 `Object.prototype` for a run, and check that a 64-deep middle branch is kept. A probe of
 both walks found an own `"__proto__"` key 65 deep still dropped.
 
+### A board's out-of-order budget (NB-150) — NB150-1
+
+NB-150 is the fix for NB142-1. `c0ca76d`: `Config::max_out_of_order`, a cap in bytes on
+what each lane of a link holds out of order, past a fragment still missing; each
+fragment counts its data and 64 B for its entry (`HELD_FRAGMENT`, 1,164 B for a full
+one), one that would go past it is dropped unacknowledged, and
+`Stats::rx_out_of_order_dropped` counts it. `d31a484`: the sender fails a link on the
+lowest unacknowledged fragment's sends alone, and a fragment sent more than 5 times
+(`DROPPED_AFTER`) is due again an RTO after its last send whenever the cumulative ACK
+moves. `e023495`: `peerwire_esp::config()` sets 4 full fragments, 4,656 B
+(`MAX_OUT_OF_ORDER`), in every board build. `c5fa2d2` and `909cf25` add a simulator and
+an ESP-NOW test, and `27c2fa9` the docs. Reviewed on 2026-11-19 by reading
+`9e201ec..909cf25` (`pz/NB-150`, not merged). A scratch copy of `909cf25` ran NB142-1's
+reproduction at a board's budget and a mutant of the budget's check; nothing else was
+re-run.
+
+**What holds.**
+
+- **The count.** `RelRecv::on_fragment` adds a fragment's data and 64 B to its lane's
+  count only as it puts it in the buffer, and takes the same off only as it takes it out
+  to deliver it; nothing else touches the buffer, and a protocol error closes the link
+  with the lane. A copy, or a fragment behind the next one expected or past the window,
+  changes nothing. The next fragment expected is never held to the budget, so a lane
+  always moves.
+- **Nothing dropped is acknowledged.** A fragment past the budget isn't put in the
+  buffer, and an ACK reports the next fragment expected and the buffer only, so its
+  sender sends it again as it would a lost one.
+- **The default never binds.** At most 4,095 fragments wait past the next one, each
+  counted at most 1,164 B (a longer one breaks the protocol first), and the check
+  refuses only what would go past the budget, so the default, 4,095 × 1,164 B =
+  4,766,580 B, takes all the window does: a node on it holds what it did (NB86-I1).
+  `the_receiver_holds_at_most_its_out_of_order_budget` holds a full window at it.
+- **The reach rule.** An ACK's bitmap reports the 64 fragments after the next one
+  expected, and a budget under 64 full fragments (74,496 B) holds none past them, so all
+  it holds can be reported. A board's 4,656 B is under it.
+- **64 B an entry, on a 32-bit chip.** The buffer is a B-tree whose node takes 228 B on
+  a 32-bit chip and holds up to 11 entries, besides each fragment's own allocation and
+  the heap's header for each (**theoretical**: 4 full fragments share one node, about
+  57 B each over their data, and a few bytes of header). On a 64-bit host a node is
+  408 B, about 100 B an entry, which matters only with a small budget there.
+- **The board.** In `hostile_peer_holds_at_most_the_out_of_order_budget`, NB142-1's
+  reproduction at a board's caps and budget, a link holds 15,400 B, where it held
+  4,573,800 B, and keeps the link; the fragment held back then delivers what was held,
+  and what was dropped is taken when sent again. With the budget's check taken out, it
+  and `the_receiver_holds_at_most_its_out_of_order_budget` fail.
+- **The sender.** A receiver always takes the fragment it expects next, so a dead path
+  still fails the link after 16 more sends of the lowest fragment, and the link's 30 s
+  liveness timeout comes first; each send of the lowest adds to its own count and the
+  link's, so their difference can't wrap. A fragment brought forward as the cumulative
+  ACK moves is due an RTO after its last send, no sooner. Congestion state is still per
+  link.
+- **Four fragments.** 4 is the sender's smallest window (`MIN_CWND`), so a sender backed
+  off to it never sends past what a hole leaves room for; 8 would add 9,312 B a link,
+  where the larger part is now a message partly assembled (NB150-1). The simulator's
+  slowdowns under loss and reordering are what the board's memory costs; 4 is right for
+  v1. A radio connection that closes on lossy air (`ble::MAX_DROPS`) is NB-152.
+
+**NB150-1 — What a link can still make a board hold, mostly a message partly assembled,
+can restart a C3 (Low).** With NB-150 a lane holds at most 4,656 B out of order, and a
+message partly assembled up to `max_message`, so a linked peer can make a link of a
+board hold 17,504 B with a radio and 42,080 B without (**theoretical**: twice 4,096 or
+16,384 B and twice 4,656 B, both lanes). A peer that picks the sizes of its fragments
+can nearly double the first part: a vector doubles what it reserves as it fills, so a
+message grown by small fragments to just past 4,094 B reserves 8,188 B (**theoretical**;
+32,752 B at 16 KiB), which makes 25,688 B a link with a radio and 74,816 B without. At a
+board's `max_links` of 8: 205,504 B and 598,528 B (**theoretical**). An ESP32-C3's low
+with the Nostr carrier was 43,312 bytes (NB-133), and a radio's stack takes about 76 KB
+more (NB-138), so one link without a radio, or two with one, can still end in a failed
+allocation and a restart; a room member linked to the board needs nothing more, and a
+few peers that send it their largest messages at once could too. It is older than
+NB-150: the caps have bounded a message partly assembled by its length since they were
+set, and the doubling holds on every node: at the defaults a link can reserve about
+1.1 MB more than the always-on peer guide's figure (**theoretical**). Fix: (a) reserve
+at most `max_message` for a message partly assembled, a few lines in
+`RelRecv::on_fragment`; (b) a budget for what all of a node's links hold received, out
+of order and partly assembled, set on a board, at which the link holding the most is
+closed, as one past `max_message` is; or fewer links on a C3.
+
+**Status: open** (Low), reported on NB-151 at `909cf25`.
+
+**NB150-I1 — A receiver that moves the cumulative ACK keeps the sender resending
+(Info).** Since `d31a484` a link fails on the lowest fragment's sends alone, and when
+the cumulative ACK moves, a fragment within the bitmap's reach sent more than 5 times is
+due again an RTO after its last send. So a linked peer that acknowledges the lowest
+fragment once an RTO, and nothing past it, keeps the link up and draws a copy of each of
+up to 65 fragments every RTO, where before the 17th send of any of them failed the link.
+It is one copy a fragment an RTO, and an RTO is 30 ms at least (`srtt`, 5 ms and the
+25 ms ACK delay); each round's timeouts halve the window, so once the flight drains it
+is about 4 fragments an RTO (`MIN_CWND`) while the sender has data (**theoretical**: 4 ×
+1,100 B / 30 ms, about 147 KB/s; 65 × 1,100 B / 30 ms, about 2.4 MB/s, while a larger
+flight drains). On a board the flight stays under its 8 KiB send buffer. It goes down
+the link's own path, and a linked peer could already cost the sender as much by sending
+to it.
+
+**Status: accepted** for v1 by the lead on 2026-11-19, as NB-150's stated cost.
+
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
 This section records what each earlier review established about resource bounds,
@@ -7859,14 +7961,28 @@ congestion rule for tail losses from NB-086 (`b2ae061`, reviewed 2026-11-03).
     `docs/guides/always-on-peer.md` sizes `PEERWIRE_MAX_PEERS` from it: about 6.1 MB
     allocated per link, so 256 peers can pin about 1.6 GB, and the compose file's
     128 MB is the worst case for about 19.
-  - **NB86-I1 (Info, accepted):** the window is the receiver's, so this bound grew
-    2.46× on every node, whatever its `reliable_window`. A peer still sends every
-    byte it pins, over its own authenticated links only; size `max_links` to the
-    memory there is. A board has less than one link's worth, whatever its caps:
-    [NB142-1](#esp-nows-path-kind-and-a-boards-caps-nb-142--nb142-1).
+  - Since NB-150 (`c0ca76d`), `Config::max_out_of_order` caps in bytes what each lane
+    holds out of order, each fragment counted with 64 B for its entry (`HELD_FRAGMENT`,
+    1,164 B); past it a fragment is dropped unacknowledged and sent again. Its default,
+    4,095 full fragments, is the window's own bound, so the figures here hold on the
+    defaults; a board sets 4 full fragments (`peerwire_esp::MAX_OUT_OF_ORDER`). A
+    message partly assembled can reserve nearly twice its length (NB150-1).
+  - **NB86-I1 (Info, accepted):** the window is the receiver's, so this bound grew 2.46×
+    on every node, whatever its `reliable_window`. A peer still sends every byte it
+    pins, over its own authenticated links only; size `max_links` to the memory there
+    is. A board had less than one link's worth, whatever its caps
+    ([NB142-1](#esp-nows-path-kind-and-a-boards-caps-nb-142--nb142-1)); NB-150's budget
+    caps it there, and what a board's link still holds is
+    [NB150-1](#a-boards-out-of-order-budget-nb-150--nb150-1).
 - **Retransmission.**
-  - RTO is 20 ms to 5 s; backoff `rto·2^min(tries-1, 8)`, at most 10 s.
-  - After `MAX_TRIES` (16) the link is dead.
+  - RTO is 20 ms to 5 s; backoff `rto·2^min(tries-1, 8)`, at most 10 s. Since NB-150
+    (`d31a484`), a fragment sent more than 5 times (`DROPPED_AFTER`) is due again an RTO
+    after its last send when the cumulative ACK moves, and once the lowest backs off by
+    its sends as the lowest (NB150-I1).
+  - After `MAX_TRIES` (16) more sends of the lowest unacknowledged fragment since it
+    became the lowest, the link is dead (NB-150, `d31a484`); before, after the 17th send
+    of any fragment, which a receiver dropping past its budget could reach while the
+    link still delivered.
   - ACKs report a 64-fragment SACK bitmap. Since PERF-10, a fragment beyond the
     bitmap's reach doesn't time out while the hole below it is repaired.
 - **Congestion control.**
