@@ -382,9 +382,9 @@ of their addresses, replaying one whenever fewer than two of the node's connects
 pair apart while it goes on, and they link as it stops (the review's run: not linked in the 30 s it ran, linked
 0.25 s after; the test's, 10 s: 0.12 s after). It needs the forger's radios to take gone members' addresses, and
 their adverts, and lasts only while it runs. To bound it later, the node could prefer an advert from a device it
-hasn't connected to lately. **The MAC address is a residual, accepted (NB135-I3):** with `random_mac` a board is a new address on each boot, but one address
-for the whole boot, so a listener can tie a boot's adverts together, and a network the board joins sees it too;
-without it, the chip's own address follows the board for good.
+hasn't connected to lately. **The MAC address is a residual, accepted (NB135-I3):** with `random_mac` a board is a new
+address on each boot, but one address for the whole boot, so a listener can tie a boot's adverts together, and a network
+the board joins sees it too; without it, the chip's own address follows the board for good.
 
 ## The driver
 

@@ -1583,6 +1583,7 @@ fn sec_replays_from_gone_members_with_radios_at_their_addresses_cost_seconds_onc
          {connects} connects to them"
     );
     assert!(control.is_some_and(|t| t < Duration::from_secs(2)), "control: {control:?}");
+    assert!(connects >= 2, "the replays drew X's two connects: {connects} connects to them");
     let within = forge_for + Duration::from_secs(5);
     assert!(linked.is_some_and(|t| t < within), "within seconds of the forger's end: {linked:?}");
 }
