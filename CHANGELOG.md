@@ -89,6 +89,13 @@ and the commit that fixed it.
   links could have had 5 to 15 KB left at the larger caps. `RADIO`, `MAX_MESSAGE` and `MAX_SEND_BUFFER` are new. A
   peer that sends such a board a larger message has its link closed, as with any cap; the published 0.1.1 has neither
   feature, so its caps don't change.
+- `peerwire-esp` (NB-142): ESP-IDF's Wi-Fi lines are quiet before a configuration is set, as setting one logged the
+  password's length (`OWE is enabled, but ... password length is N`) before they were; and once joined, the transmit
+  power the join was made at is set again and logged, with what it read before and after and the country's limit (not
+  the country), as an ESP32 read 14.75 dBm once joined where 20 dBm was set (NB-138). `wifi::tx_power` is new.
+  `espnow_mesh` logs `ESPNOW_RTT` (each link's smoothed, lowest and path RTT) and `ESPNOW_LOOP` (the main loop's poll,
+  work and idle times) with every report, and its idle takes turns, a minute each, between `peerwire_esp::idle` and
+  one the radio wakes (`PW_ESPNOW_WAKE`), so a board run shows where a round trip's 35 to 42 ms go.
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert

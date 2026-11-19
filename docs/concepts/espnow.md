@@ -217,6 +217,16 @@ With the ESP32 not polling for 2 s while the C3 broadcast 128 frames of 531 B, i
 ~27 KB of heap: from 182,200 B free once joined to ~155,452 B on the C3, from 185,020 B to ~157,848 B on the ESP32. One
 run on two boards: 4 connections at once haven't run on boards.
 
+**Where a round trip goes (NB-142, not run on boards yet):** against ~4 ms for a raw ping of 32 B, the node's round
+trips were 35 to 42 ms. What the code says, **theoretical**: the example's loop sleeps up to 10 ms
+(`peerwire_esp::idle`) and nothing wakes it for a frame, so each end's half of a round trip waits 0 to 10 ms for its
+next pass (10 ms on average for both); the radio hands the driver 4 frames at a time and learns of their verdicts only
+when it is polled, so a datagram of more than 4 frames waits a pass too; every fifth message is 2,000 B, five frames of
+up to 531 B, ~5 ms each at 1 Mbit/s one at a time (~28 ms), which the smoothed RTT takes in; and a report line at
+115200 baud holds the loop for tens of ms. `espnow_mesh` now logs each link's smoothed and lowest RTT
+(`ESPNOW_RTT`) and the loop's times (`ESPNOW_LOOP`), and takes turns a minute each with an idle the radio wakes
+(`Node::set_waker`), so the next run tells these apart.
+
 ## What a listener on the radio sees
 
 - **The address:** every ESP-NOW frame carries its sender's MAC address in the clear. The chip's own (Espressif's
