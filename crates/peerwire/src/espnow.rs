@@ -133,7 +133,8 @@ pub struct Stats {
     /// decided on), and CLOSEs sent for accepts no open waits for.
     pub opens_refused: u64,
     pub refusals: u64,
-    /// Connects given up as no radio acknowledged their OPEN: an address no radio has, made up or gone (NB135-12).
+    /// Connects given up as no radio acknowledged their OPEN: an address no radio has, made up or gone (NB135-12), even
+    /// if an ACCEPT came before the verdict (NB135-16).
     pub connects_unacked: u64,
     /// CLOSEs whose connection answered the probe that followed (forged, or stale), so stayed open.
     pub closes_denied: u64,

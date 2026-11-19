@@ -581,10 +581,13 @@ impl Engine {
             return;
         }
         c.failures += 1;
-        if !c.open() && !c.acked {
+        if !c.acked && (!c.open() || s.kind == Kind::Open) {
             // An OPEN no radio acknowledged, to an address that never has: none is there to answer it (a made-up
             // one, or a member's that went), so the connect fails now, where it held a connect of the node's and the
-            // advert's `n` for `connect_within` (NB135-12).
+            // advert's `n` for `connect_within` (NB135-12). So it does if an ACCEPT came before the verdict: one
+            // forged from that address with the OPEN's overheard id opened the connection, and the verdict then
+            // closed nothing, so it held one of the node's unbound slots until the room proof's deadline (NB135-16).
+            // A real ACCEPT whose OPEN's acknowledgement was lost goes with it, and the node connects again.
             self.stats.connects_unacked += 1;
             self.close(conn, false);
         } else if c.failures >= max && c.open() {
@@ -1519,6 +1522,30 @@ mod tests {
             }
         }
         assert_eq!((opens, p.a.stats().connects_unacked), (20, 1), "10 s of OPENs once a radio acknowledged one");
+    }
+
+    /// NB135-16 (the security review's finding, in NB135-12's fix): a connect to a gone member's address, whose OPEN no
+    /// radio acknowledges, and an ACCEPT forged from that address with the OPEN's overheard id, which comes while the
+    /// OPEN's tries are on the air (~0.2 s on a board): the ACCEPT opened the connection, and the verdict then closed
+    /// nothing, so the connection was still open 3 s on, holding one of the node's unbound slots until the room proof's
+    /// deadline, and no connect was given up. The verdict now closes it, whatever came before it.
+    #[test]
+    fn sec_a_forged_accept_before_the_verdict_does_not_save_a_connect_no_radio_acknowledged() {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        p.a.connect(p.t, device_of(X));
+        let (to, f, _, tag) = p.a.peek().expect("the OPEN");
+        let Ok(Frame::Open { from: mine, .. }) = frame::parse(f) else { panic!("an OPEN") };
+        assert_eq!(to, X);
+        p.a.commit(p.t);
+        // The forger heard the OPEN and answers it from X before the radio's verdict.
+        p.a.handle(p.t + ms(5), X, &Frame::Accept { to: mine, from: 0x77, rx_max: 250 }.encode());
+        let Some(RadioEvent::Connected { conn, device: Some(d), .. }) = p.a.poll_event() else {
+            panic!("the forged ACCEPT opened it")
+        };
+        assert_eq!(d, device_of(X));
+        p.a.outcome(tag, false);
+        assert_eq!(gone(&mut p.a), [RadioEvent::Disconnected { conn }], "closed at the OPEN's verdict");
+        assert_eq!((p.a.stats().connects_unacked, p.a.stats().connections), (1, 0));
     }
 
     /// NB135-13 (the security review's finding): the radio's one OPEN over its limits counted a connect of the node's
