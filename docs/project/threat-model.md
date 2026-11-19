@@ -226,7 +226,7 @@ release of each.
 | NB135-I8 (Info) | **Fixed** by `fb1983a` before NB-135 merged, so never on main: the node's test of the holds closes a standby beside a link left on a radio connection that closed, which takes 1 to 4 s, reviewed 2026-11-19, same section |
 | NB142-1 (Low) | Open: a room member linked to a board can make it hold about 4.6 MB a link of fragments out of order, which NB86-I1 accepts on every node, where a board has tens of KB free, so a few dozen fragments behind one held back restart it, and a PC with the default caps can come close by accident; NB-142's 4 KiB cap leaves it as it was. Fix: a byte budget for what a lane holds out of order, set small on a board, [ESP-NOW's path kind and a board's caps](#esp-nows-path-kind-and-a-boards-caps-nb-142--nb142-1) |
 | NB142-I1 (Info) | **Fixed** by `5f3187b` (NB-142), reviewed 2026-11-19: the Wi-Fi library's tag is quiet before the station's configuration is set, as setting one logged the length of the network's password, same section |
-| NB136-1 (Low) | Open: a pipe whose peer isn't linked keeps off newcomers for 5 s after its last batch, and anyone who reads a board's tag on a relay can post a batch it saw again under a key of its own, so copies every few seconds keep every pipe the board frees and newcomers give up. Fix: count the 5 s from the pipe's first batch, not its last, [A newcomer past the pipe cap](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1) |
+| NB136-1 (Low) | **Fixed** by `44c46bc` before NB-136 merged, so never on main: a pipe whose peer isn't linked kept off newcomers for 5 s after its last batch, and anyone who reads a board's tag on a relay can post a batch it saw again under a key of its own, so copies every few seconds kept every pipe the board freed and newcomers gave up; the 5 s now count from the pipe's dial, so a copy holds a freed pipe 5 s once at most, reviewed 2026-11-19, [A newcomer past the pipe cap](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1) |
 | NB136-I1 (Info) | Accepted for v1 by the lead on 2026-11-19: while a newcomer waits, a page whose events its relay drops, or its carrier loses without counting it, is taken for gone after 20 s, where its link timed out at 30 s, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
@@ -6175,8 +6175,8 @@ fails without its fix.
   times aren't checked), so a relay can deliver one again later. Its data then fails the
   replay window, and a copied HS1 makes a half-open handshake that never completes,
   within the endpoint's caps (on an ESP32, 8 at once and under load 4 from one pipe).
-  Since NB-136 a copy also keeps a freed pipe from newcomers
-  ([NB136-1](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1)).
+  Since NB-136 a copy can also hold a pipe whose link just ended from newcomers, 5 s
+  once at most ([NB136-1](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1), fixed).
 
 **NB126-1 — A guessable default room on an internet LED (Low).** The design reused the
 Bluetooth LED's room: the page and `ble_led` default to `esp32`. Over the internet,
@@ -7629,7 +7629,8 @@ counted by `NostrSignaling`), and `7e5d1e0` has the LED page say goodbye when it
 or the page goes. Reviewed on 2026-11-19 by reading `40e841a..5aa4e01` (`pz/NB-136`, not
 merged). A scratch copy of `5aa4e01` ran one test of the review's own in
 `tests/pipe.rs`, with and without its fix (NB136-1), and with the fix the pipe tests
-beside it; nothing else was re-run.
+beside it; nothing else was re-run. Its fix, `5aa4e01..03ff5fd`, was read the same day,
+with nothing re-run.
 
 **What holds.**
 
@@ -7659,13 +7660,13 @@ beside it; nothing else was re-run.
   only once data comes, so it replaces no live link, and a newcomer that has a pipe by
   then gets its own.
 - **No live page is cut.** A pipe goes to a held newcomer from a peer not linked first:
-  one whose link ended, at once, or one that has had no batch for 5 s (`GRACE`, but see
-  NB136-1). Only then from the linked peer heard from longest ago, once 20 s (halfway
-  from `keepalive` to `idle_timeout`) have passed since then and since the node last may
-  have missed something; its link is dropped with nothing sent and reported as
-  `Timeout`. A page that is there sends at least each `keepalive`, 10 s, and once it has
-  been quiet that long the node asks it each second, so such a page left 10 of the
-  node's pings unanswered, 10 s before its link would have timed out
+  one whose link ended, at once, or one dialled 5 s ago or more (`GRACE`, counted from
+  its dial since NB136-1's fix). Only then from the linked peer heard from longest ago,
+  once 20 s (halfway from `keepalive` to `idle_timeout`) have passed since then and
+  since the node last may have missed something; its link is dropped with nothing sent
+  and reported as `Timeout`. A page that is there sends at least each `keepalive`, 10 s,
+  and once it has been quiet that long the node asks it each second, so such a page left
+  10 of the node's pings unanswered, 10 s before its link would have timed out
   (`sec_newcomers_cannot_cut_a_linked_page_that_is_there`,
   `sec_a_linked_peer_heard_lately_never_gives_way`).
 - **Members.** Anyone with the room name can keep the pipes busy with new ids, each
@@ -7700,7 +7701,14 @@ most; and a test like the reproduction
 (`sec_copied_batches_dont_keep_freed_pipes_from_a_newcomer`). A time inside the batch,
 as offers carry, would refuse copies outright, a change at both ends.
 
-**Status: open** (Low), reported on NB-149 at `5aa4e01`.
+**Status: fixed** by `44c46bc` before NB-136 merged, so never on main, reviewed
+2026-11-19: `Pipe::since` is set when a pipe is made, and again only by the first batch
+from a peer whose link over it ended, and `Pipe::spare` counts `GRACE` from it, so a
+copy holds a freed pipe 5 s once at most. The reproduction is now
+`sec_copied_batches_dont_keep_freed_pipes_from_a_newcomer`, and the unit test of a
+handshake under way posts a copy within `GRACE` without a clock to wait on; with `spare`
+back on the last batch both fail (the lead's run, and the unit test by reading).
+Reported on NB-149 at `5aa4e01`.
 
 **NB136-I1 — Lost events make a page look gone 10 s sooner (Info).** The quiet rule
 trusts the carrier to count what it loses. `NostrSignaling` doesn't count a relay that
