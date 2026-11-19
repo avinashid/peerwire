@@ -340,13 +340,7 @@ fn rtts(node: &Node, n: u8, p: &Passes) {
             format!("{}:srtt_us={srtt}:min_us={min}:path_us={path}:sent={sent}:rtx={rtx}", short(peer))
         })
         .collect();
-    info!(
-        "ESPNOW_RTT node={n} wake_passes={}/{} links={} [{}]",
-        p.waking,
-        p.n,
-        links.len(),
-        links.join(" ")
-    );
+    info!("ESPNOW_RTT node={n} wake_passes={}/{} links={} [{}]", p.waking, p.n, links.len(), links.join(" "));
 }
 
 /// The `ESPNOW_LOOP` line: the passes since the last report, how long they polled, worked and idled, and how long the

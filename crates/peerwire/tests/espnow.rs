@@ -107,9 +107,7 @@ fn an_espnow_link_is_of_espnow_s_own_kind() {
     assert!(!linked, "no link over ESP-NOW under [Bluetooth] in {wait} s (a link took {took:?} under [EspNow])");
 
     a.set_policy(Policy::new([PathKind::Bluetooth])).unwrap();
-    let off = |e: &Event| {
-        matches!(e, Event::Disconnected { peer, reason: peerwire::DisconnectReason::PathOff } if *peer == pb)
-    };
+    let off = |e: &Event| matches!(e, Event::Disconnected { peer, reason: peerwire::DisconnectReason::PathOff } if *peer == pb);
     let mut ev2 = Vec::new();
     let closed = pump(&mut [&mut a, &mut b], &mut ev2, 10, |n| n[0].peers().count() == 0);
     assert!(closed && ev2[0].iter().any(off), "{:?}", ev2[0]);
@@ -159,9 +157,7 @@ fn a_board_s_radio_caps_carry_its_largest_message() {
     let over = vec![9u8; 4 * 1024 + 1];
     peer.send(&pa, Lane::Reliable, &over).unwrap();
     let mut ev = Vec::new();
-    let violation = |e: &Event| {
-        matches!(e, Event::Disconnected { peer, reason: peerwire::DisconnectReason::ProtocolViolation } if *peer == pb)
-    };
+    let violation = |e: &Event| matches!(e, Event::Disconnected { peer, reason: peerwire::DisconnectReason::ProtocolViolation } if *peer == pb);
     let closed = pump(&mut [&mut board, &mut peer], &mut ev, 10, |n| n[0].status(&pb) != Status::Connected);
     assert!(closed && ev[0].iter().any(violation), "{:?}", ev[0]);
     assert!(!got(&ev[0], pb, &over));
