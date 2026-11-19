@@ -21,7 +21,8 @@ pub type Wifi = BlockingWifi<EspWifi<'static>>;
 /// Modem sleep is off: it holds a station's frames until the next beacon, ~100 ms on every round trip. Each attempt
 /// steps the transmit power down (20, 15, 11 and 8.5 dBm, then round again): small C3 boards with a chip antenna often
 /// can't take full power, so the access point hears their short auth frame but never their association request
-/// (NB-091). Each failed attempt logs ESP-IDF's reason for it.
+/// (NB-091). Each failed attempt logs ESP-IDF's reason for it. Once joined, the power of the attempt that joined is set
+/// again, as joining can lower it, and the log says what it reads (NB-142).
 pub fn join(modem: Modem<'static>, sysloop: EspSystemEventLoop, ssid: &str, password: &str) -> anyhow::Result<Wifi> {
     join_until(modem, sysloop, ssid, password, None)
 }
@@ -48,8 +49,7 @@ fn join_until(
 ) -> anyhow::Result<Wifi> {
     let nvs = crate::nvs()?;
     let mut w = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop.clone())?;
-    w.set_configuration(&client(ssid, password)?)?;
-    quiet();
+    set_client(&mut w, ssid, password)?;
     w.start()?;
     sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
     if let Err(e) = attempts(&mut w, &sysloop, ssid, until) {
@@ -100,12 +100,12 @@ fn start(
     let mut w = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop)?;
     // An open network's auth method, or ESP-IDF warns that an empty password can't reach a protected one.
     let none = ClientConfiguration { auth_method: AuthMethod::None, ..Default::default() };
+    quiet();
     w.set_configuration(&Configuration::Client(none))?;
     if let Some(mac) = mac {
         // Only while the station isn't started.
         sys::esp!(unsafe { sys::esp_wifi_set_mac(sys::wifi_interface_t_WIFI_IF_STA, mac.as_ptr()) })?;
     }
-    quiet();
     w.start()?;
     sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
     set_channel(channel)?;
@@ -123,7 +123,7 @@ pub fn connect(
     password: &str,
     within: Duration,
 ) -> anyhow::Result<()> {
-    w.set_configuration(&client(ssid, password)?)?;
+    set_client(w, ssid, password)?;
     attempts(w, sysloop, ssid, Some(Instant::now() + within))?;
     w.wait_netif_up()?;
     Ok(())
@@ -145,6 +145,17 @@ pub fn channel() -> Option<u8> {
     (unsafe { sys::esp_wifi_get_channel(&mut primary, &mut second) } == sys::ESP_OK).then_some(primary)
 }
 
+/// Sets `w` up to join the network `ssid`, with ESP-IDF's Wi-Fi lines quiet first ([`quiet`]): setting the
+/// configuration logs a warning with the password's length (`OWE is enabled, but authmode threshold is .. or password
+/// length is ..`), which went to the console before `quiet` ran, so a log people share told how long the password was
+/// (NB-142). Every configuration with a password goes through here.
+fn set_client(w: &mut Wifi, ssid: &str, password: &str) -> anyhow::Result<()> {
+    let config = client(ssid, password)?;
+    quiet();
+    w.set_configuration(&config)?;
+    Ok(())
+}
+
 /// A station's configuration for the network `ssid`.
 fn client(ssid: &str, password: &str) -> anyhow::Result<Configuration> {
     Ok(Configuration::Client(ClientConfiguration {
@@ -156,9 +167,10 @@ fn client(ssid: &str, password: &str) -> anyhow::Result<Configuration> {
 }
 
 /// ESP-IDF's Wi-Fi library logs under its own tag the network's name and its access point's address on each join
-/// (`connected with …, bssid = …`), and those of other networks in range on some failures (NB110c-5). Its lines from
-/// error up only: each failed attempt is logged here, with its reason. Set after ESP-IDF's own start-up setting, so it
-/// holds.
+/// (`connected with …, bssid = …`), and those of other networks in range on some failures (NB110c-5), and the
+/// password's length as a configuration is set (NB-142). Its lines from error up only: each failed attempt is logged
+/// here, with its reason. Set after ESP-IDF's own start-up setting (a constructor, before `main`), so it holds; and
+/// before any configuration is set.
 fn quiet() {
     unsafe { sys::esp_log_level_set(c"wifi".as_ptr(), sys::esp_log_level_t_ESP_LOG_ERROR) };
 }
@@ -204,6 +216,7 @@ fn attempts(w: &mut Wifi, sysloop: &EspSystemEventLoop, ssid: &str, until: Optio
         }
         if w.is_connected()? {
             info!("joined on attempt {attempt} at {dbm} dBm");
+            keep_tx_power(power);
             break;
         }
         let r = reason.load(Ordering::Relaxed);
@@ -222,6 +235,40 @@ fn attempts(w: &mut Wifi, sysloop: &EspSystemEventLoop, ssid: &str, until: Optio
         std::thread::sleep(Duration::from_millis(500));
     }
     Ok(())
+}
+
+/// Sets the transmit power the join was made at, `power` (ESP-IDF's quarter-dBm), again once joined, and logs what it
+/// reads before and after: an ESP32 read 14.75 dBm once joined where 20 dBm was set before (NB-138). Under ESP-IDF's
+/// default country policy the station takes the access point's country information as it joins, and that sets the
+/// power anew; ESP-IDF caps what is set again at what that country allows, which the line says too, with the policy,
+/// but not the country (NB-142).
+fn keep_tx_power(power: i8) {
+    let joined = tx_power();
+    let again = sys::esp!(unsafe { sys::esp_wifi_set_max_tx_power(power) });
+    let mut country: sys::wifi_country_t = unsafe { std::mem::zeroed() };
+    let limit = (unsafe { sys::esp_wifi_get_country(&mut country) } == sys::ESP_OK).then_some(country);
+    let limit = limit.map_or("?".into(), |c| {
+        let auto = c.policy == sys::wifi_country_policy_t_WIFI_COUNTRY_POLICY_AUTO;
+        format!("{} dBm ({} policy)", c.max_tx_power, if auto { "auto" } else { "manual" })
+    });
+    let dbm = |p: Option<f32>| p.map_or("?".into(), |p| p.to_string());
+    match again {
+        Ok(()) => info!(
+            "TX power {} dBm once joined, {} dBm set again (asked {}); the country allows {limit}",
+            dbm(joined),
+            dbm(tx_power()),
+            f32::from(power) / 4.0
+        ),
+        Err(e) => {
+            warn!("TX power {} dBm once joined; setting it again failed: {e}; the country allows {limit}", dbm(joined))
+        }
+    }
+}
+
+/// The station's maximum transmit power now, in dBm, while Wi-Fi is started.
+pub fn tx_power() -> Option<f32> {
+    let mut p: i8 = 0;
+    (unsafe { sys::esp_wifi_get_max_tx_power(&mut p) } == sys::ESP_OK).then(|| f32::from(p) / 4.0)
 }
 
 /// The signal strength of the access point this station is joined to, in dBm; `None` when it isn't joined.
