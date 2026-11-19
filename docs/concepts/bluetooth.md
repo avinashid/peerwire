@@ -57,6 +57,12 @@ n     4 B     random
 tag   4 B     the first 4 bytes of HMAC-SHA256(ble key, "pw-ble-adv" || n)
 ```
 
+A radio whose adverts all go from one address for as long as it runs (`Radio::address`, [ESP-NOW](espnow.md)'s) binds
+the tag to it: `HMAC-SHA256(ble key, "pw-ble-adv" || n || address)`, the address as the 8 bytes (big-endian) of the
+device id other radios report it as, and a scanner on such a radio takes an advert of its room only from the address
+its tag names, so a copy anyone in range sends from another address isn't one (NB135-12). Bluetooth's adverts each go
+from a new address, and its tag is as above.
+
 That is 30 of the 31 bytes a legacy advert holds. Where the stack allows a scan response, it lists the service UUID
 (type `0x07`) for scanners that filter on service UUIDs, such as Web Bluetooth's device picker.
 
@@ -88,9 +94,12 @@ closing the bound connections a peer makes to it makes that peer connect again e
 member can cost a link more ways than that. Over a radio whose values anyone in range can forge (`Limits::forgeable`,
 [ESP-NOW](espnow.md)'s), so is one whose connection closed for a fault of its link (a message the room proof doesn't
 expect, a wrong answer or proof, 32 messages dropped) or that the other end closed before the room was proven, as one
-forged value can cause either (NB135-8); and one whose connection missed the room proof's deadline, or was proven and
+forged value can cause either (NB135-8); one whose connection missed the room proof's deadline, or was proven and
 bound to no peer when the other end closed it while this peer's link to that peer went nowhere else, as forged frames
-can cause those too (NB135-10). Over Bluetooth, where no third party writes into a connection, those hold 60 s.
+can cause those too (NB135-10); one whose connect failed, as OPENs forged as fast as the radio takes them keep its one
+over its limits taken (NB135-13); and one whose connection closed to make way for another, a new central's or one that
+proved the room into the last unbound slot, as forged frames keep it from proving the room and forged OPENs then make
+it make way (NB135-14). Over Bluetooth, where no third party writes into a connection, those hold 60 s.
 Nothing a peer says of its own advert is taken, as a member could name another's to keep two members apart: so two
 peers may make two connections (a full desktop connects back to the peer that filled it, say), and the
 [second one closes](#binding-a-connection-to-its-peer).
@@ -227,10 +236,10 @@ puts a link on.
 | | Linux | ESP32 |
 |---|---|---|
 | Connections | 8, one of them as the peripheral | 3 |
-| Connections bound to no peer | 4; proven ones (standbys) leave one free: one that proves the room into the last closes the weakest other (unproven, then with no proven peer, then the oldest), so standbys can't lock newcomers out | 2 |
+| Connections bound to no peer | 4; proven ones (standbys) leave one free: one that proves the room into the last closes the weakest other (unproven, then with no proven peer, then the oldest; over a radio anyone in range can write into, a central's that hasn't proven the room before any, NB135-14), so standbys can't lock newcomers out | 2 |
 | Time to prove the room and the peer's identity | 3 s, then the connection closes | same |
 | A connect of the peer's own | up within 12 s, or given up as a failed one; the driver fails it within 10 s | same |
-| A central's connection whose peer hasn't proven who it is | makes way, after 1 s, for a new central over the limits; a second one to a peer, at once. Over a radio anyone in range can write into ([ESP-NOW](espnow.md)'s), one that hasn't proven the room makes way at once, the oldest first (NB135-11) | same |
+| A central's connection whose peer hasn't proven who it is | makes way, after 1 s, for a new central over the limits; a second one to a peer, at once. Over a radio anyone in range can write into ([ESP-NOW](espnow.md)'s), one that hasn't proven the room makes way at once, the oldest first (NB135-11), and before any connection of the peer's own (NB135-14) | same |
 | A proven connection bound to no peer | open while a signal proves a member at least every 60 s | same |
 | Distinct HS1s on an unbound connection | 1 per 10 s (a half-open handshake's life); its resends pass | same |
 | Distinct HS1s on unbound connections, across the radio | 4 at once, then one per 250 ms | 2, then one per 5 s (a C3 answers one in 156 ms: about 3% of it) |
@@ -249,9 +258,10 @@ against a central or a connection that proves the room, as one that never comple
 stalls them can't keep centrals out. Over a radio whose values anyone in range can forge (`Limits::forgeable`,
 [ESP-NOW](espnow.md)'s), where anyone can also open a connection from a made-up address, a central's connection that
 hasn't proven the room counts against none of the peer's own connects, which close the oldest such one if they need
-its slot, and makes way for a new central at any age, the oldest first (NB135-11). Linux takes one central at a time
-because BlueZ sends a notification to every subscribed central (BLE-R8). The addresses naming connections
-(`Hop::Ble`) aren't reused within a process before 2^24 (16.7 million) more connections have been made.
+its slot, and makes way for a new central at any age, the oldest first (NB135-11), before a connection of the peer's
+own that hasn't proven the room either, which holds its advert 1 to 4 s if it makes way (NB135-14). Linux takes one
+central at a time because BlueZ sends a notification to every subscribed central (BLE-R8). The addresses naming
+connections (`Hop::Ble`) aren't reused within a process before 2^24 (16.7 million) more connections have been made.
 
 ## What a listener on the radio sees
 
@@ -296,6 +306,10 @@ pub trait Radio: Send {
     /// forge a value on a connection (`forgeable`, ESP-NOW's; a radio over a medium anyone in range can write into
     /// must set it): `Limits::DESKTOP` unless the driver says otherwise; an ESP32's says `Limits::SMALL`.
     fn limits(&self) -> Limits { Limits::DESKTOP }
+    /// The device other radios report this one's adverts from, if it lasts while the node advertises (ESP-NOW's
+    /// address, kept for the boot): the node binds its advert's tag to it, and takes an advert only from the device its
+    /// tag names (NB135-12). Default: `None`, for adverts that each go from a new address, as Bluetooth's do.
+    fn address(&self) -> Option<DeviceId> { None }
     /// A waker to wake each time it queues an event, so a node asleep until its next timer polls at once; a driver
     /// that never wakes it still works, as a node with a radio polls at least every 50 ms. Default: ignored.
     fn set_waker(&mut self, waker: Waker) {}

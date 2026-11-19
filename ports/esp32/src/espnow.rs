@@ -44,7 +44,7 @@ use esp_idf_svc::sys;
 use log::{info, warn};
 use peerwire::espnow::{frame, EspNow, Ether, Mac, PeerTable, Settings, Touch, TxQueue, BROADCAST, V1_FRAME, V2_FRAME};
 
-/// Frames waiting to go, or with a verdict the node hasn't taken.
+/// Frames waiting to go, or with a verdict the node hasn't taken: more than the radio hands over at once (4, NB135-15).
 pub const TX_QUEUE: usize = 32;
 /// Frames received waiting for the node at most, and their bytes: 16 KB, whoever sends (NB135-2).
 pub const RX_QUEUE: usize = 32;
@@ -98,6 +98,8 @@ pub struct EspNowEther {
     peers: PeerTable,
     max_frame: usize,
     version: u32,
+    /// The station's address, which ESP-NOW's frames go from.
+    mac: Mac,
 }
 
 impl EspNowEther {
@@ -124,13 +126,17 @@ impl EspNowEther {
         let mut version = 0u32;
         sys::esp!(unsafe { sys::esp_now_get_version(&mut version) })?;
         let max_frame = if v2 && version >= 2 { V2_FRAME } else { V1_FRAME };
+        // The station's address, set before Wi-Fi started (`wifi::start_on_channel_as`) and kept for the boot: the
+        // node binds its advert's tag to it (NB135-12).
+        let mut mac: Mac = [0; 6];
+        sys::esp!(unsafe { sys::esp_wifi_get_mac(sys::wifi_interface_t_WIFI_IF_STA, mac.as_mut_ptr()) })?;
         std::thread::Builder::new()
             .name("espnow-tx".into())
             .stack_size(TX_STACK)
             .spawn(move || transmit(shared))
             .map_err(|e| anyhow!("the ESP-NOW thread: {e}"))?;
         info!("ESP-NOW v{version} up, frames of up to {max_frame} B");
-        Ok(EspNowEther { shared, peers: PeerTable::new(PEERS), max_frame, version })
+        Ok(EspNowEther { shared, peers: PeerTable::new(PEERS), max_frame, version, mac })
     }
 
     /// ESP-NOW's version on this chip: 1, or 2 with frames of up to 1470 bytes.
@@ -145,8 +151,10 @@ impl EspNowEther {
 }
 
 impl Ether for EspNowEther {
-    fn send(&mut self, to: Mac, frame: &[u8], tries: u8) -> bool {
-        // Never evicting an address with frames still waiting, whose tries would fail at once (NB135-I2).
+    fn send(&mut self, to: Mac, frame: &[u8], tries: u8, tag: u32) -> bool {
+        // Never evicting an address with frames still waiting, whose tries would fail at once (NB135-I2). The radio
+        // hands over a few frames at a time (NB135-15), so a few addresses wait at most, and the table keeps to PEERS
+        // however many made-up addresses frames go to.
         let touch = {
             let tx = lock(&self.shared.tx);
             self.peers.touch_with(to, |m| tx.has(*m))
@@ -161,14 +169,14 @@ impl Ether for EspNowEther {
                 self.peers.forget(to);
             }
         }
-        let taken = lock(&self.shared.tx).push(to, frame, tries);
+        let taken = lock(&self.shared.tx).push(to, frame, tries, tag);
         if taken {
             self.shared.more.notify_one();
         }
         taken
     }
 
-    fn done(&mut self) -> Option<bool> {
+    fn done(&mut self) -> Option<(u32, bool)> {
         lock(&self.shared.tx).outcome()
     }
 
@@ -181,6 +189,10 @@ impl Ether for EspNowEther {
 
     fn max_frame(&self) -> usize {
         self.max_frame
+    }
+
+    fn mac(&self) -> Mac {
+        self.mac
     }
 
     fn set_waker(&mut self, waker: Waker) {

@@ -59,6 +59,20 @@ and the commit that fixed it.
   where it stayed silent, and never fails a connect of the node's own for its limits, so a node holding two bound
   connections and two forged ones no longer keeps a newcomer out, whose connect failed after 10 s and held the advert
   a minute. Bluetooth is unchanged.
+- ESP-NOW, from its security review's seventh round: copies of a member's advert sent from other addresses no longer
+  keep boards apart (NB135-12): the advert's tag is bound to the address it is sent from, where a board's radio keeps
+  one for the boot (`ble::Radio::address`, new, default `None`; `espnow::Ether::mac`, new, which `peerwire-esp`'s
+  `EspNowEther` reads when ESP-NOW starts), and a node takes an advert of its room only from the address its tag
+  names; and `espnow::Engine` gives up a connect whose first OPEN no radio acknowledged at once, not after 10 s
+  (`Stats::connects_unacked`). The engine's one OPEN over its limits counts open connections, not the node's connects
+  under way, which kept it silent to a newcomer beside one (NB135-13); and over a radio whose values anyone in range
+  can forge (`Limits::forgeable`), a connect that failed, and a close that makes way for another connection, hold the
+  advert 1 to 4 s, not a minute, and a new central takes a central's connection that hasn't proven the room before
+  one of the node's own (NB135-13, NB135-14), so three boards joining at once link within seconds too. The engine
+  hands the ether 4 frames at a time and counts them against its caps, where the ether took up to 32 outside them
+  (NB135-15). `espnow::Ether::send` takes a tag for each frame, and `Ether::done`, `TxQueue::push` and
+  `TxQueue::outcome` carry it, so a verdict is matched to its own frame, never to the next one's after one comes late.
+  Bluetooth is unchanged.
 - `ble` (and so `espnow`): a link that times out closes the radio connections bound to its peer, with no hold on the
   advert, so the next link to the peer comes over a new connection, not one the radio still says is up but that
   carries nothing (NB135-1); and a connection bound to a peer that the radio or the other end closes holds its advert

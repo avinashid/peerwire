@@ -39,14 +39,20 @@ pub const CLOSE_CHECK: Duration = Duration::from_millis(500);
 pub const ACCEPT_RACE: Duration = Duration::from_secs(3);
 /// Frames waiting for the ether at most; connection-less ones (a CLOSE for a connection gone, an advert) at most
 /// `MAX_LOOSE` of them, and refusals one. A connection's own are capped by its values, and by one of each other kind
-/// (NB135-3).
+/// (NB135-3). The caps count the frames the ether holds too (NB135-15).
 const MAX_TX: usize = 256;
 const MAX_LOOSE: usize = 4;
-/// A connection answers PROBEs at most this often, and only while no KEEPALIVE of its waits for the ether (NB135-I5).
+/// A connection answers PROBEs at most this often, and only while no KEEPALIVE of its waits for the air (NB135-I5).
 const PROBE_GAP: Duration = Duration::from_millis(100);
-/// Frames handed to the ether whose verdict hasn't come, at most; one whose verdict hasn't come in this long is taken
-/// as lost, so an ether that drops a verdict can't stop the engine sending.
-const MAX_FLIGHT: usize = 64;
+/// Frames handed to the ether whose verdict hasn't come, at most (NB135-15): what waits for the air beyond these waits
+/// here, under the caps, where an ether that took all it could (32 on an ESP32) held frames the caps never saw, a
+/// PROBE's answer every 100 ms among them, seconds of them ahead of every real frame. One whose verdict hasn't come in
+/// `FLIGHT_TIMEOUT` is taken as lost, so an ether that drops a verdict can't stop the engine sending; the ether's
+/// frames hold the air for 3.2 s at most before then (4 frames, 4 tries each, of up to 200 ms each where the ESP32
+/// driver hears no verdict; a failed try took ~100 ms on NB-139's boards), so one still on the air isn't taken as lost.
+/// 4, not 1 or 2: a board that polls every 10 ms then hands over up to 400 frames a second, past the ~310 the air
+/// carries (NB-138).
+const MAX_FLIGHT: usize = 4;
 const FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The device a node is told of for a MAC address, and back.
@@ -146,10 +152,12 @@ struct Out {
     tries: u8,
 }
 
-/// A frame the ether took, waiting for its verdict.
+/// A frame the ether took, waiting for its verdict: the tag the verdict names it by, its connection and kind, and
+/// when it went.
 struct Sent {
+    tag: u32,
     conn: Option<ConnId>,
-    end: bool,
+    kind: Kind,
     at: Instant,
 }
 
@@ -166,6 +174,8 @@ pub struct Engine {
     next_conn: u32,
     tx: VecDeque<Out>,
     flight: VecDeque<Sent>,
+    /// The tag of the next frame handed to the ether.
+    next_tag: u32,
     events: VecDeque<RadioEvent>,
     seen_queued: usize,
     values_queued: usize,
@@ -189,6 +199,7 @@ impl Engine {
             next_conn: 1,
             tx: VecDeque::new(),
             flight: VecDeque::new(),
+            next_tag: 0,
             events: VecDeque::new(),
             seen_queued: 0,
             values_queued: 0,
@@ -232,7 +243,8 @@ impl Engine {
     }
 
     /// Opens a connection to `device`: OPEN every [`Settings::open_every`] until it is accepted
-    /// ([`RadioEvent::Connected`]), refused or [`Settings::connect_within`] passes ([`RadioEvent::ConnectFailed`]).
+    /// ([`RadioEvent::Connected`]), refused or [`Settings::connect_within`] passes ([`RadioEvent::ConnectFailed`]),
+    /// or at once if no radio acknowledges the first OPEN (NB135-12).
     ///
     /// The limits don't refuse it: the node counts its own connects, and closes a connection that may be forged to
     /// make room for one (NB135-11), but the radio may hold one it hasn't heard of yet, and a connect failed for that
@@ -388,10 +400,20 @@ impl Engine {
         // node decides, as a Bluetooth stack leaves it to the node: it closes one that makes way for it, such as one
         // an OPEN forged from a made-up address made, or closes this one (NB135-11). Silent there, the radio kept
         // every newcomer out of a node with two such beside two bound, and the newcomer's connect failed after 10 s and
-        // held the advert a minute. Past that one, silence, until the node has decided.
+        // held the advert a minute. Past that one, silence, until the node has decided. The limits count open
+        // connections, as the node's choice of one to make way does: a connect of the node's own under way counted
+        // here, so beside one the node took the one over with room to spare, closing none, and the radio was silent
+        // to every OPEN after it (NB135-13). The node counts its connects under way itself; twice the limits in all is
+        // the backstop.
         let limits = self.settings.limits;
+        let open = self.conns.values().filter(|c| c.open()).count();
         let centrals = self.conns.values().filter(|c| !c.central).count();
-        if self.advert.is_none() || self.conns.len() > limits.connections || centrals > limits.centrals {
+        let all = self.conns.len();
+        if self.advert.is_none()
+            || open > limits.connections
+            || centrals > limits.centrals
+            || all > 2 * limits.connections
+        {
             self.stats.opens_refused += 1;
             return;
         }
@@ -526,20 +548,32 @@ impl Engine {
         self.events.push_back(RadioEvent::Value { conn, value });
     }
 
-    /// The ether's verdict on the oldest frame it took and hasn't given one for: delivered (acknowledged, or a
-    /// broadcast that went) or not.
-    pub fn outcome(&mut self, ok: bool) {
-        let Some(s) = self.flight.pop_front() else {
+    /// The ether's verdict on the frame it took as `tag` ([`peek`](Self::peek)): delivered (acknowledged, or a
+    /// broadcast that went) or not. It is matched by its tag, so a verdict that comes after its frame was taken as lost
+    /// (`FLIGHT_TIMEOUT`) is dropped, not taken for the next frame's, and each after it for the one after (NB135-15);
+    /// frames handed over before it whose verdicts never came are taken as lost.
+    pub fn outcome(&mut self, tag: u32, ok: bool) {
+        let Some(i) = self.flight.iter().position(|s| s.tag == tag) else {
             self.stats.stray_verdicts += 1;
             return;
         };
+        for _ in 0..i {
+            self.stats.lost_verdicts += 1;
+            self.land(false);
+        }
+        self.land(ok);
+    }
+
+    /// The verdict on the oldest frame with the ether.
+    fn land(&mut self, ok: bool) {
+        let Some(s) = self.flight.pop_front() else { return };
         if !ok {
             self.stats.tx_failed += 1;
         }
         let max = self.settings.max_failures;
         let Some(conn) = s.conn else { return };
         let Some(c) = self.conns.get_mut(&conn) else { return };
-        if s.end {
+        if s.kind == (Kind::Data { end: true }) {
             c.values = c.values.saturating_sub(1);
         }
         if ok {
@@ -547,7 +581,13 @@ impl Engine {
             return;
         }
         c.failures += 1;
-        if c.failures >= max && c.open() {
+        if !c.open() && !c.acked {
+            // An OPEN no radio acknowledged, to an address that never has: none is there to answer it (a made-up
+            // one, or a member's that went), so the connect fails now, where it held a connect of the node's and the
+            // advert's `n` for `connect_within` (NB135-12).
+            self.stats.connects_unacked += 1;
+            self.close(conn, false);
+        } else if c.failures >= max && c.open() {
             self.stats.closed_failing += 1;
             self.close(conn, false);
         }
@@ -558,10 +598,10 @@ impl Engine {
         // A verdict that never came: the frame is taken as lost.
         while self.flight.front().is_some_and(|s| now.saturating_duration_since(s.at) >= FLIGHT_TIMEOUT) {
             self.stats.lost_verdicts += 1;
-            self.outcome(false);
+            self.land(false);
         }
         if let Some(data) = self.advert.clone().filter(|_| now >= self.next_advert) {
-            if !self.tx.iter().any(|o| o.kind == Kind::Advert) {
+            if !self.held().any(|(_, kind)| kind == Kind::Advert) {
                 self.queue(now, BROADCAST, Frame::Advert { data: &data }, None, Kind::Advert);
             }
             // ±12.5% so two ends don't keep colliding.
@@ -618,21 +658,22 @@ impl Engine {
         }
     }
 
-    /// The next frame for the ether, if there is room for one in flight. [`commit`](Self::commit) once the ether took
-    /// it; leave it if not, and it is offered again.
-    pub fn peek(&self) -> Option<(Mac, &[u8], u8)> {
+    /// The next frame for the ether, the tries it gets, and the tag its verdict names it by
+    /// ([`outcome`](Self::outcome)), if the ether holds fewer than `MAX_FLIGHT` whose verdicts haven't come.
+    /// [`commit`](Self::commit) once the ether took it; leave it if not, and it is offered again.
+    pub fn peek(&self) -> Option<(Mac, &[u8], u8, u32)> {
         if self.flight.len() >= MAX_FLIGHT {
             return None;
         }
-        self.tx.front().map(|o| (o.to, &o.frame[..], o.tries))
+        self.tx.front().map(|o| (o.to, &o.frame[..], o.tries, self.next_tag))
     }
 
     /// The ether took the frame [`peek`](Self::peek) gave.
     pub fn commit(&mut self, now: Instant) {
         let Some(o) = self.tx.pop_front() else { return };
         self.stats.frames_out += 1;
-        let end = matches!(o.kind, Kind::Data { end: true });
-        self.flight.push_back(Sent { conn: o.conn, end, at: now });
+        self.flight.push_back(Sent { tag: self.next_tag, conn: o.conn, kind: o.kind, at: now });
+        self.next_tag = self.next_tag.wrapping_add(1);
     }
 
     pub fn poll_event(&mut self) -> Option<RadioEvent> {
@@ -731,13 +772,14 @@ impl Engine {
 
     /// Queues `f` for `to`: a keepalive is due on `conn` only after [`Settings::keepalive`] with nothing queued.
     ///
-    /// Within the caps (NB135-3): one refusal waiting at most, `MAX_LOOSE` frames of no connection, `MAX_TX` in all;
-    /// what is over goes. A broadcast and a refusal get one try, a frame of a connection that has had one acknowledged
-    /// [`Settings::tries`], and any other, to an address that may be made up, [`Settings::first_tries`].
+    /// Within the caps (NB135-3): one refusal at most, `MAX_LOOSE` frames of no connection, waiting here or with the
+    /// ether (NB135-15), and `MAX_TX` waiting here; what is over goes. A broadcast and a refusal get one try, a frame of
+    /// a connection that has had one acknowledged [`Settings::tries`], and any other, to an address that may be made
+    /// up, [`Settings::first_tries`].
     fn queue(&mut self, now: Instant, to: Mac, f: Frame, conn: Option<ConnId>, kind: Kind) {
         let over = match kind {
-            Kind::Refusal => self.tx.iter().any(|o| o.kind == Kind::Refusal),
-            _ if conn.is_none() => self.tx.iter().filter(|o| o.conn.is_none()).count() >= MAX_LOOSE,
+            Kind::Refusal => self.held().any(|(_, k)| k == Kind::Refusal),
+            _ if conn.is_none() => self.held().filter(|(c, _)| c.is_none()).count() >= MAX_LOOSE,
             _ => false,
         };
         if over || self.tx.len() >= MAX_TX {
@@ -767,9 +809,16 @@ impl Engine {
         true
     }
 
-    /// Whether a frame of `kind` of `conn`'s waits for the ether: one of each kind but data at most (`MAX_TX`).
+    /// The connection and kind of each frame whose verdict hasn't come: waiting here, or with the ether, waiting there
+    /// or on the air. The caps count both, so an ether that holds frames doesn't take them out of the caps (NB135-15).
+    fn held(&self) -> impl Iterator<Item = (Option<ConnId>, Kind)> + '_ {
+        self.tx.iter().map(|o| (o.conn, o.kind)).chain(self.flight.iter().map(|s| (s.conn, s.kind)))
+    }
+
+    /// Whether a frame of `kind` of `conn`'s waits for the air, here or with the ether: one of each kind but data at
+    /// most (`MAX_TX`).
     fn waiting(&self, conn: ConnId, kind: Kind) -> bool {
-        self.tx.iter().any(|o| o.conn == Some(conn) && o.kind == kind)
+        self.held().any(|(c, k)| c == Some(conn) && k == kind)
     }
 
     /// Drops the frames `conn` has waiting for the ether.
@@ -837,10 +886,10 @@ mod tests {
                         true => (&mut self.a, &mut self.b, A, B),
                         false => (&mut self.b, &mut self.a, B, A),
                     };
-                    while let Some((dest, f, _)) = tx.peek() {
+                    while let Some((dest, f, _, tag)) = tx.peek() {
                         let f = f.to_vec();
                         tx.commit(self.t);
-                        tx.outcome(true);
+                        tx.outcome(tag, true);
                         if (dest == to || dest == BROADCAST) && deliver(from, dest, &f) {
                             rx.handle(self.t, from, &f);
                         }
@@ -882,6 +931,15 @@ mod tests {
 
     fn events(e: &mut Engine) -> Vec<RadioEvent> {
         std::iter::from_fn(|| e.poll_event()).collect()
+    }
+
+    /// Hands the ether `e`'s next frame at `t`, and its verdict, `ok`: where it went, and the frame.
+    fn hand(e: &mut Engine, t: Instant, ok: bool) -> Option<(Mac, Vec<u8>)> {
+        let (to, f, _, tag) = e.peek()?;
+        let sent = (to, f.to_vec());
+        e.commit(t);
+        e.outcome(tag, ok);
+        Some(sent)
     }
 
     /// The connections that went, by the events (adverts heard and the rest left out).
@@ -1331,9 +1389,7 @@ mod tests {
         for i in 0..500u32 {
             let mac = [0x02, 0, 0, 0, (i >> 8) as u8, i as u8];
             b.handle(t + ms(u64::from(i)), mac, &Frame::Open { from: u64::from(i) + 1, rx_max: 250 }.encode());
-            while b.peek().is_some() {
-                b.commit(t);
-                b.outcome(true);
+            while hand(&mut b, t, true).is_some() {
                 answers += 1;
             }
         }
@@ -1367,13 +1423,11 @@ mod tests {
     #[test]
     fn connects_fail_when_unanswered_or_out_of_room() {
         let mut p = Pair::new(V1_FRAME, V1_FRAME);
-        // B never answers: an OPEN every 500 ms, given up after 10 s.
+        // B's radio acknowledges each OPEN, and B never answers: an OPEN every 500 ms, given up after 10 s.
         p.a.connect(p.t, device_of(B));
         let mut opens = 0;
         for _ in 0..21 {
-            while p.a.peek().is_some() {
-                p.a.commit(p.t);
-                p.a.outcome(false);
+            while hand(&mut p.a, p.t, true).is_some() {
                 opens += 1;
             }
             p.later(ms(500));
@@ -1405,10 +1459,8 @@ mod tests {
         // What went on the air.
         let sent = |b: &mut Engine| {
             let mut out = Vec::new();
-            while let Some((_, f, _)) = b.peek() {
-                out.push(f.to_vec());
-                b.commit(t);
-                b.outcome(true);
+            while let Some((_, f)) = hand(b, t, true) {
+                out.push(f);
             }
             out
         };
@@ -1440,6 +1492,61 @@ mod tests {
         let opened = sent(&mut b).iter().any(|f| matches!(frame::parse(f), Ok(Frame::Open { .. })));
         assert!(opened, "the connect went");
         assert!(gone(&mut b).is_empty(), "with no ConnectFailed");
+    }
+
+    /// NB135-12 (the security review's finding): a connect to a copy of a member's advert sent from a made-up address
+    /// went on for `connect_within`, 10 s, though no radio acknowledged its OPENs, and held a connect of the node's and
+    /// the advert's `n` that long. One whose first OPEN no radio acknowledges (after its tries) now fails at once; one
+    /// whose OPENs a radio acknowledged goes on to the end, as the other end's node may still answer.
+    #[test]
+    fn sec_a_connect_whose_open_no_radio_acknowledges_fails_at_once() {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        p.a.connect(p.t, device_of(X));
+        assert_eq!(hand(&mut p.a, p.t, false).map(|(to, _)| to), Some(X), "one OPEN");
+        assert_eq!(gone(&mut p.a), [RadioEvent::ConnectFailed { device: device_of(X) }], "failed at once");
+        assert_eq!((p.a.stats().connects_unacked, p.a.stats().connections), (1, 0));
+        // Acknowledged once, then not: on until `connect_within`.
+        p.a.connect(p.t, device_of(B));
+        hand(&mut p.a, p.t, true);
+        let mut opens = 1;
+        for _ in 0..21 {
+            p.later(ms(500));
+            while hand(&mut p.a, p.t, false).is_some() {
+                opens += 1;
+            }
+            if !gone(&mut p.a).is_empty() {
+                break;
+            }
+        }
+        assert_eq!((opens, p.a.stats().connects_unacked), (20, 1), "10 s of OPENs once a radio acknowledged one");
+    }
+
+    /// NB135-13 (the security review's finding): the radio's one OPEN over its limits counted a connect of the node's
+    /// own under way, which the node's choice of a connection to make way for a central doesn't count: beside one,
+    /// the node took the one over with room to spare and closed none, and the radio was silent to every OPEN after it,
+    /// a newcomer's too, whose connect failed. The limits count open connections now: beside a connect under way, a
+    /// radio holding 4 open takes one more for the node to decide on, and is silent past it.
+    #[test]
+    fn sec_the_one_over_counts_open_connections_not_connects_under_way() {
+        let t = Instant::now();
+        let limits = Settings::DEFAULT.limits;
+        let mut b = engine(2, V1_FRAME, t);
+        b.advertise(t, Some(&ADVERT));
+        // A connect of the node's own, to a radio that acknowledges its OPENs and never answers.
+        b.connect(t, device_of(A));
+        while hand(&mut b, t, true).is_some() {}
+        // An OPEN from a made-up address: whether it was answered.
+        let open = |b: &mut Engine, i: u8| {
+            b.handle(t, [0x02, 0, 0, 0, 7, i], &Frame::Open { from: u64::from(i) + 1, rx_max: 250 }.encode());
+            let sent: Vec<(Mac, Vec<u8>)> = std::iter::from_fn(|| hand(b, t, true)).collect();
+            sent.iter().any(|(_, f)| matches!(frame::parse(f), Ok(Frame::Accept { .. })))
+        };
+        for i in 0..limits.connections as u8 {
+            assert!(open(&mut b, i), "{i}: within the limits, the connect under way beside them");
+        }
+        assert!(open(&mut b, 100), "one over the 4 open, for the node to decide on");
+        assert!(!open(&mut b, 101), "and silence past it, until the node has");
+        assert_eq!(b.stats().connections, limits.connections + 2, "the one over, and the connect under way");
     }
 
     #[test]
@@ -1487,9 +1594,7 @@ mod tests {
             assert!(p.a.send(p.t, ca, &value(300, 2)));
         }
         let mut n = 0;
-        while p.a.peek().is_some() {
-            p.a.commit(p.t);
-            p.a.outcome(false);
+        while hand(&mut p.a, p.t, false).is_some() {
             n += 1;
         }
         assert_eq!(n, 8, "4 values of 2 frames, the last of them closing the connection");
@@ -1505,9 +1610,10 @@ mod tests {
         let mut closes = 0;
         for i in 0..50u64 {
             a.handle(t + ms(i * 10), B, &Frame::Accept { to: 7 + i, from: 9, rx_max: 250 }.encode());
-            while let Some((to, f, tries)) = a.peek() {
+            while let Some((to, f, tries, tag)) = a.peek() {
                 assert_eq!((to, frame::parse(f), tries), (B, Ok(Frame::Close { to: 9 }), 1), "one try");
                 a.commit(t);
+                a.outcome(tag, false);
                 closes += 1;
             }
         }
@@ -1554,25 +1660,24 @@ mod tests {
         let s = Settings::DEFAULT;
         p.b.advertise(p.t, Some(&ADVERT));
         p.later(ms(0));
-        assert_eq!(p.b.peek().map(|(to, _, tries)| (to, tries)), Some((BROADCAST, 1)), "an advert");
-        p.b.commit(p.t);
-        p.b.outcome(true);
+        assert_eq!(p.b.peek().map(|(to, _, tries, _)| (to, tries)), Some((BROADCAST, 1)), "an advert");
+        hand(&mut p.b, p.t, true);
         // A replayed advert from an address that isn't there: OPENs with two tries each.
         p.a.connect(p.t, device_of(X));
-        assert_eq!(p.a.peek().map(|(to, _, tries)| (to, tries)), Some((X, s.first_tries)));
-        p.a.commit(p.t);
-        p.a.outcome(false);
+        assert_eq!(p.a.peek().map(|(to, _, tries, _)| (to, tries)), Some((X, s.first_tries)));
+        hand(&mut p.a, p.t, false);
+        assert_eq!(gone(&mut p.a), [RadioEvent::ConnectFailed { device: device_of(X) }], "given up (NB135-12)");
         // A real connection: its frames get two tries until one is acknowledged, then four.
         let (ca, _) = p.link();
         assert!(p.a.send(p.t, ca, b"one"));
-        assert_eq!(p.a.peek().map(|(_, _, tries)| tries), Some(s.tries), "the ACCEPT's been acknowledged");
+        assert_eq!(p.a.peek().map(|(_, _, tries, _)| tries), Some(s.tries), "the ACCEPT's been acknowledged");
         // An ACCEPT to an OPEN's address, which may be made up: two tries.
         let mut b = engine(3, V1_FRAME, p.t);
         b.advertise(p.t, Some(&ADVERT));
         b.handle(p.t, X, &Frame::Open { from: 5, rx_max: 250 }.encode());
         let accept = b
             .peek()
-            .map(|(to, f, tries)| (to, frame::parse(f).is_ok_and(|f| matches!(f, Frame::Accept { .. })), tries));
+            .map(|(to, f, tries, _)| (to, frame::parse(f).is_ok_and(|f| matches!(f, Frame::Accept { .. })), tries));
         assert_eq!(accept, Some((X, true, s.first_tries)));
     }
 
@@ -1596,17 +1701,188 @@ mod tests {
         let k: Vec<u8> = b.tx.iter().filter(|o| o.kind == Kind::Keepalive).map(|o| o.tries).collect();
         assert_eq!(k, [Settings::DEFAULT.first_tries], "one KEEPALIVE waits, with the tries of an address unproven");
         // Once the ether takes it, the next PROBE is answered.
-        while let Some((_, f, _)) = b.peek() {
-            let keepalive = matches!(frame::parse(f), Ok(Frame::Keepalive { .. }));
-            b.commit(t);
-            b.outcome(false);
-            if keepalive {
+        while let Some((_, f)) = hand(&mut b, t, false) {
+            if matches!(frame::parse(&f), Ok(Frame::Keepalive { .. })) {
                 break;
             }
         }
         t += ms(100);
         b.handle(t, x, &Frame::Probe { to: mine }.encode());
         assert_eq!(b.tx.iter().filter(|o| o.kind == Kind::Keepalive).count(), 1);
+    }
+
+    /// What `b` of `p` hands an ESP32's ether over `n` milliseconds from now, with `step` run each millisecond before
+    /// the timers (the forger, and the node's doings): the ether is a queue of 32 that puts one frame on the air at a
+    /// time, 100 ms for a try no radio acknowledges (a board's failed try, NB-139) and 1 ms for one to `a` or a
+    /// broadcast, and a peer table of 16 that evicts no address with a frame waiting, as `EspNowEther` keeps them.
+    /// `a`'s frames reach `b` at once. The most frames the ether's queue held, and the most addresses its peer table
+    /// did; `a`'s events, and when each came.
+    fn on_a_board(
+        p: &mut Pair,
+        n: u64,
+        mut step: impl FnMut(&mut Pair, u64),
+    ) -> (usize, usize, Vec<(Instant, RadioEvent)>) {
+        use crate::espnow::ether::{PeerTable, TxQueue};
+        let start = p.t;
+        let mut q = TxQueue::new(32);
+        let mut peers = PeerTable::new(16);
+        let mut air: Option<(Mac, Vec<u8>, Instant)> = None;
+        let (mut most, mut table, mut seen) = (0, 0, Vec::new());
+        for i in 0..n {
+            let now = start + ms(i);
+            p.t = now;
+            step(p, i);
+            p.a.timers(now);
+            p.b.timers(now);
+            while let Some((to, f, tries, tag)) = p.b.peek() {
+                peers.touch_with(to, |m| q.has(*m));
+                if !q.push(to, f, tries, tag) {
+                    break;
+                }
+                p.b.commit(now);
+            }
+            (most, table) = (most.max(q.len()), table.max(peers.len()));
+            if air.is_none() {
+                if let Some((to, f)) = q.next(now) {
+                    let took = if to == A || to == BROADCAST { ms(1) } else { ms(100) };
+                    air = Some((to, f.to_vec(), now + took));
+                }
+            }
+            if let Some((to, f, end)) = air.take() {
+                if now < end {
+                    air = Some((to, f, end));
+                } else {
+                    if to == A {
+                        p.a.handle(now, B, &f);
+                    }
+                    q.verdict(to == A || to == BROADCAST);
+                }
+            }
+            while let Some((tag, ok)) = q.outcome() {
+                p.b.outcome(tag, ok);
+            }
+            while let Some((dest, f, _, tag)) = p.a.peek() {
+                let f = f.to_vec();
+                p.a.commit(now);
+                p.a.outcome(tag, true);
+                if dest == B {
+                    p.b.handle(now, A, &f);
+                }
+            }
+            seen.extend(events(&mut p.a).into_iter().map(|e| (now, e)));
+            events(&mut p.b);
+        }
+        (most, table, seen)
+    }
+
+    /// NB135-15 (the security review's repro, inverted): connections that OPENs forged from made-up addresses make,
+    /// one at a time, a new one as the node closes the last at its 3 s deadline, whose PROBEs the forger sends every
+    /// 100 ms; and ACCEPTs forged from a new made-up address every 50 ms, which draw refusals. The radio handed the
+    /// ether all it would take, 32 on an ESP32, so the caps saw none of it: a KEEPALIVE answering a PROBE left at once,
+    /// and the next PROBE was answered too. The ether's queue held 32, a value from `b` to `a` waited 4.37 s, and a
+    /// verdict was taken as lost after 5 s; and frames waiting for more than 20 made-up addresses held ESP-NOW's peer
+    /// table, so a frame to a real peer failed. The ether now holds 4 at most, which count against the caps: one PROBE
+    /// answer waits at a time, the value comes within a second, no verdict is lost, and the peer table keeps to its 16.
+    #[test]
+    fn sec_forged_connections_and_refusals_keep_the_ether_to_a_few_frames() {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        let (ca, cb) = p.link();
+        events(&mut p.a);
+        events(&mut p.b);
+        let mut forged: Option<(Mac, ConnId, Instant)> = None;
+        let (mut k, mut probes, mut accepts, mut sent_at) = (0u8, 0u32, 0u32, None);
+        let (most, table, seen) = on_a_board(&mut p, 20_000, |p, i| {
+            let now = p.t;
+            match forged {
+                None => {
+                    k = k.wrapping_add(1);
+                    let m = [0x02, 0xf0, 0, 0, 0, k];
+                    p.b.handle(now, m, &Frame::Open { from: 0x0f00 + u64::from(k), rx_max: 250 }.encode());
+                    let conn = p.b.conns.iter().find(|(_, c)| c.mac == m).map(|(i, _)| *i).expect("taken");
+                    assert!(p.b.send(now, conn, &[0x5a; 33])); // the node's challenge
+                    forged = Some((m, conn, now));
+                }
+                Some((m, conn, opened)) => match p.b.conns.get(&conn).map(|c| c.mine) {
+                    None => forged = None,
+                    Some(_) if now.saturating_duration_since(opened) >= ms(3_000) => {
+                        p.b.disconnect(now, conn); // the node's deadline
+                        forged = None;
+                    }
+                    Some(id) if i % 100 == 0 => {
+                        p.b.handle(now, m, &Frame::Probe { to: id }.encode());
+                        probes += 1;
+                    }
+                    Some(_) => {}
+                },
+            }
+            if i % 50 == 25 {
+                accepts += 1;
+                let m = [0x02, 0xe0, 0, 0, (accepts >> 8) as u8, accepts as u8];
+                let id = 0x0e00 + u64::from(accepts);
+                p.b.handle(now, m, &Frame::Accept { to: id, from: id, rx_max: 250 }.encode());
+            }
+            if i == 8_000 {
+                assert!(p.b.send(now, cb, b"a real value"));
+                sent_at = Some(now);
+            }
+        });
+        let got_at = seen.iter().find_map(|(t, e)| match e {
+            RadioEvent::Value { value, .. } if value == b"a real value" => Some(*t),
+            _ => None,
+        });
+        let took = got_at.zip(sent_at).map(|(g, s)| g - s);
+        let a_lost = seen.iter().any(|(_, e)| *e == RadioEvent::Disconnected { conn: ca });
+        let s = p.b.stats();
+        eprintln!(
+            "forged connections {k}, PROBEs {probes}, forged ACCEPTs {accepts}: the ether's queue held {most} at most, \
+             its peer table {table}; a value took {took:?}; a lost the connection {a_lost}; b: {s:?}"
+        );
+        assert!(most <= MAX_FLIGHT, "the ether held {most}");
+        assert!(table <= 16, "the peer table held {table}");
+        assert_eq!((s.lost_verdicts, s.stray_verdicts), (0, 0), "every verdict, each for its own frame");
+        assert!(!a_lost, "a kept the connection");
+        assert!(took.is_some_and(|t| t < ms(1_000)), "a value within a second: {took:?}");
+    }
+
+    /// NB135-15: a verdict is matched to its frame by its tag. One that comes after its frame was taken as lost
+    /// (`FLIGHT_TIMEOUT`) was taken for the next frame's, and every verdict after it for the frame before its own, until
+    /// none was in flight; it is now dropped. And one that skips a frame (an ether that lost that one's) takes the
+    /// frames before it as lost, not itself.
+    #[test]
+    fn sec_a_late_verdict_is_never_taken_for_the_next_frame() {
+        let mut p = Pair::new(V1_FRAME, V1_FRAME);
+        let (ca, _) = p.link();
+        // Four values of a frame each, handed to the ether a second apart.
+        let tags: Vec<u32> = (0..4u8)
+            .map(|i| {
+                assert!(p.a.send(p.t, ca, &[i]));
+                let (_, _, _, tag) = p.a.peek().expect("a frame");
+                p.a.commit(p.t + ms(1_000 * u64::from(i)));
+                tag
+            })
+            .collect();
+        let in_flight = |p: &Pair| p.a.flight.iter().map(|s| s.tag).collect::<Vec<u32>>();
+        let values = |p: &Pair| p.a.conns[&ca].values;
+        assert_eq!((in_flight(&p), values(&p)), (tags.clone(), 4));
+        // The first one's verdict doesn't come in time: taken as lost.
+        let (a_id, _) = ids(&p);
+        let late = p.t + FLIGHT_TIMEOUT;
+        p.a.handle(late, B, &Frame::Keepalive { to: a_id }.encode()); // b is there
+        p.a.timers(late);
+        assert_eq!(in_flight(&p), tags[1..], "the first taken as lost");
+        assert_eq!((p.a.stats().lost_verdicts, values(&p)), (1, 3));
+        // It comes late: dropped, not taken for the second's.
+        p.a.outcome(tags[0], true);
+        assert_eq!(in_flight(&p), tags[1..], "the late verdict took no other frame's");
+        assert_eq!((p.a.stats().stray_verdicts, values(&p)), (1, 3));
+        // The second's, then the fourth's with the third's lost: each for its own.
+        p.a.outcome(tags[1], true);
+        assert_eq!((in_flight(&p), values(&p)), (tags[2..].to_vec(), 2));
+        p.a.outcome(tags[3], true);
+        assert!(in_flight(&p).is_empty());
+        assert_eq!((p.a.stats().lost_verdicts, values(&p)), (2, 0));
+        p.a.outcome(tags[2], true);
+        assert_eq!(p.a.stats().stray_verdicts, 2, "the third's, late, dropped too");
     }
 
     /// NB135-2: values waiting for a node that doesn't poll are capped in bytes (16 KB), not only in number.

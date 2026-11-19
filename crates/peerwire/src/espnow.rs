@@ -55,7 +55,8 @@ pub struct Settings {
     pub mtu: u16,
     /// How often an advert is broadcast.
     pub advert_every: Duration,
-    /// How often an OPEN goes again while it isn't answered, and how long until a connect is given up.
+    /// How often an OPEN goes again while it isn't answered, and how long until a connect is given up; at once if no
+    /// radio acknowledged its first OPEN (NB135-12).
     pub open_every: Duration,
     pub connect_within: Duration,
     /// A KEEPALIVE goes after this long with nothing sent on a connection, and a connection with nothing heard on it
@@ -128,10 +129,12 @@ pub struct Stats {
     /// (its start or a part was lost) and so were dropped.
     pub gaps: u64,
     pub orphans: u64,
-    /// Opens not taken (not advertising, or one over the limits already, which the node hasn't decided on), and CLOSEs
-    /// sent for accepts no open waits for.
+    /// Opens not taken (not advertising, or one over the limits of open connections already, which the node hasn't
+    /// decided on), and CLOSEs sent for accepts no open waits for.
     pub opens_refused: u64,
     pub refusals: u64,
+    /// Connects given up as no radio acknowledged their OPEN: an address no radio has, made up or gone (NB135-12).
+    pub connects_unacked: u64,
     /// CLOSEs whose connection answered the probe that followed (forged, or stale), so stayed open.
     pub closes_denied: u64,
     /// Connections closed by a second ACCEPT with another id within 3 s of the first: one of the two was forged
@@ -146,7 +149,8 @@ pub struct Stats {
     pub tx_dropped: u64,
     /// Values the node gave that were empty or too long.
     pub values_refused: u64,
-    /// Verdicts with no frame waiting for one, and frames whose verdict never came.
+    /// Verdicts whose tag names no frame waiting for one (a late verdict, for a frame taken as lost already), and frames
+    /// whose verdict never came (in 5 s, or before a later frame's).
     pub stray_verdicts: u64,
     pub lost_verdicts: u64,
 }
@@ -205,26 +209,34 @@ impl<E: Ether> EspNow<E> {
         &mut self.ether
     }
 
-    /// Moves frames and verdicts between the ether and the engine, runs the timers, and hands the ether what is due.
+    /// Moves frames and verdicts between the ether and the engine, runs the timers, and hands the ether what is due:
+    /// a few frames at a time ([`Engine::peek`]), the next as a verdict frees a slot, so what waits for the air waits
+    /// in the engine, under its caps (NB135-15).
     fn pump(&mut self) {
         let now = Instant::now();
+        self.verdicts();
         // Bounded, so a flood can't hold the node: what is left waits for the next poll.
-        for _ in 0..256 {
-            let Some(ok) = self.ether.done() else { break };
-            self.engine.outcome(ok);
-        }
         for _ in 0..256 {
             let Some((from, frame)) = self.ether.recv() else { break };
             self.engine.handle(now, from, &frame);
         }
         self.engine.timers(now);
-        while let Some((to, frame, tries)) = self.engine.peek() {
-            if !self.ether.send(to, frame, tries) {
+        while let Some((to, frame, tries, tag)) = self.engine.peek() {
+            if !self.ether.send(to, frame, tries, tag) {
                 break;
             }
             self.engine.commit(now);
+            self.verdicts(); // an ether whose verdicts are in at once takes the next at once
         }
         *self.watch.0.lock().unwrap_or_else(PoisonError::into_inner) = self.engine.stats();
+    }
+
+    /// Hands the engine the verdicts the ether has, by their tags; bounded, as above.
+    fn verdicts(&mut self) {
+        for _ in 0..256 {
+            let Some((tag, ok)) = self.ether.done() else { break };
+            self.engine.outcome(tag, ok);
+        }
     }
 }
 
@@ -265,6 +277,12 @@ impl<E: Ether> Radio for EspNow<E> {
     /// The settings' limits, with [`Limits::forgeable`] on: anyone in range can forge an ESP-NOW frame (NB135-8).
     fn limits(&self) -> Limits {
         Limits { forgeable: true, ..self.engine.settings().limits }
+    }
+
+    /// The ether's address, which other radios report this one's adverts from ([`device_of`]): the node binds its
+    /// advert's tag to it, so a copy sent from another address isn't taken for it (NB135-12).
+    fn address(&self) -> Option<DeviceId> {
+        Some(device_of(self.ether.mac()))
     }
 
     fn set_waker(&mut self, waker: Waker) {
