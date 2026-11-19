@@ -5,7 +5,8 @@
 
 use peerwire::traversal::Traversal;
 use peerwire::{
-    Event, Lane, MemoryHub, MemorySignaling, Node, PathKind, PeerId, Policy, Role, Signaling, Status, Topic,
+    DisconnectReason, Event, Lane, MemoryHub, MemorySignaling, Node, PathKind, PeerId, Policy, Role, Signaling, Status,
+    Topic,
 };
 use peerwire_core::{sealed, Config, Endpoint, Identity, Instant as CoreInstant};
 use rand_core::{OsRng, RngCore};
@@ -68,6 +69,11 @@ struct Browser {
 
 impl Browser {
     fn new(hub: &MemoryHub, node: PeerId) -> Browser {
+        Browser::with(hub, node, Config::default())
+    }
+
+    /// A browser whose endpoint has `config`.
+    fn with(hub: &MemoryHub, node: PeerId, config: Config) -> Browser {
         let me = Identity::generate(&mut OsRng);
         let mut sig = hub.connect();
         sig.subscribe(Topic::peer(&me.peer_id()));
@@ -75,7 +81,7 @@ impl Browser {
         let mut trav = Traversal::new(&me, [9; 32], unix_ms(), vec![], vec![]);
         trav.join_room(CoreInstant::ZERO, APP, ROOM, Role::Peer, None);
         while trav.poll_signal().is_some() {}
-        let ep = Endpoint::new(&me, Config::default(), [4; 32]);
+        let ep = Endpoint::new(&me, config, [4; 32]);
         Browser { me, ep, sig, trav, epoch: Instant::now(), node, hellos: 0, got: vec![], batches_in: 0 }
     }
 
@@ -307,4 +313,176 @@ fn a_host_sleeps_while_batches_wait_for_the_rate() {
     }
     eprintln!("{polls} polls, {zero} with a zero timeout");
     assert!(zero <= 5, "{zero} of {polls} polls had a zero timeout");
+}
+
+/// NB-136: a board's pipes, 4 at once as on an ESP32 (`Node::set_max_pipes`), with timers short enough for a test: a
+/// keepalive of 1 s and an idle timeout of 8 s, so a pipe's peer has gone quiet after 4.5 s (`pipe::quiet`, halfway).
+const KEEPALIVE: Duration = Duration::from_secs(1);
+const IDLE: Duration = Duration::from_secs(8);
+const QUIET: Duration = Duration::from_millis(4500);
+
+fn short() -> Config {
+    Config { keepalive: KEEPALIVE, idle_timeout: IDLE, ..Config::default() }
+}
+
+fn board(hub: &MemoryHub) -> Node {
+    let mut n = Node::builder()
+        .config(short())
+        .stun_servers(Vec::<String>::new())
+        .signaling(hub.connect())
+        .bind("127.0.0.1:0")
+        .unwrap();
+    n.set_max_pipes(4);
+    n.join_room(APP, ROOM);
+    n
+}
+
+fn id(b: &Browser) -> PeerId {
+    b.me.peer_id()
+}
+
+/// Runs `pages` and the node until `done` or `secs` pass, the node's events going to `ev`. Each round `before` runs
+/// first (an attacker's turn), then the pages, then the node: what `before` sends reaches the node ahead of the pages'.
+fn run(
+    n: &mut Node,
+    pages: &mut [Browser],
+    ev: &mut Vec<Event>,
+    secs: f64,
+    mut before: impl FnMut(),
+    done: impl Fn(&Node, &[Browser], &[Event]) -> bool,
+) -> bool {
+    let until = Instant::now() + Duration::from_secs_f64(secs);
+    while Instant::now() < until {
+        before();
+        pages.iter_mut().for_each(Browser::step);
+        n.poll();
+        ev.extend(std::iter::from_fn(|| n.try_recv_event()));
+        if done(n, pages, ev) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// A new page in `pages` that says its hello, then dials the node.
+fn arrive(n: &mut Node, hub: &MemoryHub, pages: &mut Vec<Browser>, ev: &mut Vec<Event>) -> PeerId {
+    let mut b = Browser::with(hub, n.peer_id(), short());
+    b.hello();
+    pages.push(b);
+    run(n, pages, ev, 0.3, || {}, |_, _, _| false);
+    let b = pages.last_mut().unwrap();
+    b.dial();
+    id(b)
+}
+
+/// Four pages, each linked with the node over its pipe in turn: every pipe taken.
+fn four_linked(n: &mut Node, hub: &MemoryHub, ev: &mut Vec<Event>) -> Vec<Browser> {
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let p = arrive(n, hub, &mut pages, ev);
+        assert!(run(n, &mut pages, ev, 10.0, || {}, |n, _, _| n.status(&p) == Status::Connected), "page linked");
+    }
+    pages
+}
+
+fn left(ev: &[Event]) -> Vec<(PeerId, DisconnectReason)> {
+    ev.iter().filter_map(|e| if let Event::Disconnected { peer, reason } = e { Some((*peer, *reason)) } else { None }).collect()
+}
+
+/// NB-136: with 4 pages linked, one closed with no goodbye holds its pipe only until it has been quiet for `QUIET`:
+/// a fifth page that dials meanwhile is held, then links, well before the closed page's link would have timed out.
+/// The node reports that link as timed out; the three pages still there keep theirs.
+#[test]
+fn a_fifth_page_links_once_a_page_closed_without_a_goodbye_has_gone_quiet() {
+    let hub = MemoryHub::new();
+    let mut n = board(&hub);
+    let nid = n.peer_id();
+    let mut ev = vec![];
+    let mut pages = four_linked(&mut n, &hub, &mut ev);
+    ev.clear();
+    // Page 0 closes, as a phone ends a tab: nothing more from it.
+    let gone = id(&pages.remove(0));
+    let closed = Instant::now();
+    let fifth = arrive(&mut n, &hub, &mut pages, &mut ev);
+    let linked = |n: &Node, p: &[Browser]| n.status(&fifth) == Status::Connected && p[3].ep.is_connected(&nid);
+    assert!(run(&mut n, &mut pages, &mut ev, 10.0, || {}, |n, p, _| linked(n, p)), "the fifth page linked: {ev:?}");
+    let took = closed.elapsed();
+    eprintln!("the fifth page linked {took:?} after the close");
+    assert!(took >= QUIET - KEEPALIVE && took < IDLE, "{took:?}: once the closed page was quiet, before its timeout");
+    assert_eq!(left(&ev), [(gone, DisconnectReason::Timeout)]);
+    assert_eq!(n.status(&gone), Status::Disconnected);
+    assert!(pages[..3].iter().all(|p| n.status(&id(p)) == Status::Connected));
+    assert_eq!(n.path_kind(&fifth), Some(PathKind::Signaling));
+    // Its link works both ways.
+    pages[3].ep.send(&nid, Lane::Reliable, b"led on").unwrap();
+    let got = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::Message { peer, data, .. } if *peer == fifth && data == b"led on"));
+    assert!(run(&mut n, &mut pages, &mut ev, 5.0, || {}, |_, _, ev| got(ev)));
+}
+
+/// NB-136: newcomers can't cut a page that is there. With 4 pages linked, open but saying nothing beyond their
+/// keepalives, three newcomers dial for twice `QUIET`: none links, and every page keeps its link. Once a page leaves
+/// with a goodbye, a newcomer held all this while links at once.
+#[test]
+fn sec_newcomers_cannot_cut_a_linked_page_that_is_there() {
+    let hub = MemoryHub::new();
+    let mut n = board(&hub);
+    let nid = n.peer_id();
+    let mut ev = vec![];
+    let mut pages = four_linked(&mut n, &hub, &mut ev);
+    ev.clear();
+    let newcomers: Vec<PeerId> = (0..3).map(|_| arrive(&mut n, &hub, &mut pages, &mut ev)).collect();
+    let any_in = |n: &Node| newcomers.iter().any(|p| n.status(p) != Status::Disconnected);
+    let cut = run(&mut n, &mut pages, &mut ev, (QUIET * 2).as_secs_f64(), || {}, |n, _, ev| any_in(n) || !left(ev).is_empty());
+    assert!(!cut, "a newcomer linked, or a page was cut: {:?}", left(&ev));
+    assert!(pages[..4].iter().all(|p| n.status(&id(p)) == Status::Connected && p.ep.is_connected(&nid)));
+    // Page 0 leaves, saying so: its pipe goes to a newcomer still dialling, at once.
+    let leaving = id(&pages[0]);
+    pages[0].ep.disconnect(&nid);
+    pages[0].step();
+    pages.remove(0);
+    let left_at = Instant::now();
+    assert!(run(&mut n, &mut pages, &mut ev, 5.0, || {}, |n, _, _| newcomers.iter().any(|p| n.status(p) == Status::Connected)));
+    eprintln!("a newcomer linked {:?} after the goodbye", left_at.elapsed());
+    assert!(left_at.elapsed() < Duration::from_secs(2), "{:?}", left_at.elapsed());
+    assert_eq!(left(&ev), [(leaving, DisconnectReason::ClosedByPeer)]);
+    assert!(pages[..3].iter().all(|p| n.status(&id(p)) == Status::Connected));
+}
+
+/// NB-136: an attacker can't make a page that is there look gone by flooding the node's inbox so the page's batches
+/// are dropped unread (its budget for opening them spent): silence while the node may have missed something says
+/// nothing. With 4 pages linked and a newcomer held, junk spends the budget for longer than `QUIET`, and the pages'
+/// batches are dropped meanwhile; no page is cut, and once the flood ends they are heard again and keep their links.
+#[test]
+fn sec_a_flood_on_the_inbox_doesnt_make_a_page_that_is_there_look_gone() {
+    let hub = MemoryHub::new();
+    let mut n = board(&hub);
+    let nid = n.peer_id();
+    let mut ev = vec![];
+    let mut pages = four_linked(&mut n, &hub, &mut ev);
+    let newcomer = arrive(&mut n, &hub, &mut pages, &mut ev);
+    run(&mut n, &mut pages, &mut ev, 0.3, || {}, |_, _, _| false);
+    ev.clear();
+    let mut attacker = hub.connect();
+    let mut junk = |k: usize| {
+        for _ in 0..k {
+            let mut j = vec![0u8; 120];
+            OsRng.fill_bytes(&mut j);
+            attacker.publish(Topic::peer(&nid), &j);
+        }
+    };
+    junk(100); // the inbox's burst, and more
+    pages[1].ep.send(&nid, Lane::Reliable, b"during").unwrap();
+    let said = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"during"));
+    let flood = (QUIET + Duration::from_secs(1)).as_secs_f64();
+    // Each round, junk ahead of the pages' batches takes every token the budget gains.
+    run(&mut n, &mut pages, &mut ev, flood, || junk(20), |_, _, _| false);
+    assert!(!said(&ev), "the flood dropped the pages' batches");
+    assert_eq!(left(&ev), [], "no page was cut");
+    // The flood ends: the pages are heard again, with what they said, and keep their links; the newcomer is still out.
+    assert!(run(&mut n, &mut pages, &mut ev, 3.0, || {}, |_, _, ev| said(ev)));
+    run(&mut n, &mut pages, &mut ev, 1.0, || {}, |_, _, _| false);
+    assert_eq!(left(&ev), []);
+    assert!(pages[..4].iter().all(|p| n.status(&id(p)) == Status::Connected));
+    assert_eq!(n.status(&newcomer), Status::Disconnected);
 }
