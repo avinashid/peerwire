@@ -79,8 +79,9 @@ The reliable lane is a small transport tuned for real-time traffic:
   ACK-delay allowance (like QUIC's `max_ack_delay`) covers busy game frames and browser event loops. The link is
   dropped once the lowest unacknowledged fragment has gone out 16 more times since it became the lowest: a receiver
   always takes the fragment it expects next, but may drop those after it (below), so only the lowest one's sends say
-  the path is dead. A fragment sent more than 3 times while the cumulative ACK moves is taken as dropped, not lost
-  again: it drops its back-off when the ACK moves, and once the lowest it backs off as if sent 3 times before.
+  the path is dead. A fragment sent more than 5 times while the cumulative ACK moves is taken as dropped, not lost
+  again: it drops its back-off when the ACK moves, and once the lowest it backs off by its sends as the lowest, as if
+  sent once before.
 - **Tail-loss probe.** If nothing is acknowledged for `srtt + 2·rttvar + 4 ms`, the newest fragment is sent again,
   so a lost tail is repaired in about one RTT instead of a full timeout. That matters for sparse traffic, such as a
   lone event. In a steady transfer the ACKs keep coming, and a fragment lost at the end of a burst reaches its

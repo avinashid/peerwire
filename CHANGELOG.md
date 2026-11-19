@@ -105,6 +105,9 @@ and the commit that fixed it.
   sends as the lowest. Before, a PC linked to a board with the cap above could lose the link to reordering alone (the
   board's drops reached 16 sends while it still delivered), or crawl at 10 s a round. Between nodes on the default
   cap, the simulator's `bulk` (clean, 1%, 2%, 5% loss, jitter) and `cc_fair` runs give the same output as before.
+- From NB-150's security review: a message partly assembled reserves at most `Config::max_message`, where Vec's
+  doubling, from fragment sizes a peer picks, could reserve nearly twice it: 8,188 B a lane at a board's 4 KiB cap,
+  8 KB a link past the 17,504 B above, and up to 1.1 MB a link more at the defaults (NB150-1).
 - `peerwire-esp` (NB-142): ESP-IDF's Wi-Fi lines are quiet before a configuration is set, as setting one logged the
   password's length (`OWE is enabled, but ... password length is N`) before they were; and once joined, the transmit
   power the join was made at is set again and logged, with what it read before and after and the country's limit (not

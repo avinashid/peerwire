@@ -110,7 +110,7 @@ complete host loop on std UDP sockets.
   - A receiver holds at most `Config::max_out_of_order` bytes out of order per stream (the
     window's own bound by default, a few fragments on a board) and drops what comes past
     it. So only the lowest unacknowledged fragment, which a receiver always takes, fails
-    the link, after 16 sends since it became the lowest; and a fragment sent more than 3
+    the link, after 16 sends since it became the lowest; and a fragment sent more than 5
     times while the cumulative ACK moves drops its back-off when the ACK moves.
   - The sender keeps in-flight fragments in ordered indexes by retransmission time
     (`by_due`) and urgent-copy time (`by_dup`), so each packet visits only what is due.
