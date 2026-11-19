@@ -2952,9 +2952,9 @@ mod tests {
         }
     }
 
-    /// A node at radio 0 of `air`, with `radio` on it, whose `n` is 2,000: whether it connects to each of `adverts`,
-    /// heard from the device with it, in turn (each `n` above its own, the first connected to giving way), and what it
-    /// advertises.
+    /// A node at radio 0 of `air`, with `radio` on it, whose `n` is 2,000: whether it connects to each of `adverts`
+    /// (each `n` above its own), heard in turn from the device with it, its connects under way forgotten after each,
+    /// and what it advertises.
     fn connects_to(
         air: &FakeAir,
         radio: Box<dyn Radio>,
