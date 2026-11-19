@@ -219,8 +219,8 @@ int32_t pw_stats(const PwEndpoint *h, uint64_t *out);
 | `pw_path_rtt_us` | The round-trip time over the path the link is on now, measured since it moved there. Links race other paths of their kind and take one clearly faster | µs, or -1 if unknown |
 | `pw_stats` | Writes 16 counters to `out`, in this order: `tx_packets`, `rx_packets`, `rx_malformed`, `rx_unknown_session`, `rx_auth_failed`, `rx_replayed`, `rx_handshake_dropped`, `retransmits`, `unreliable_dropped`, `roams`, `relayed`, `relay_dropped`, `punches_sent`, `punch_succeeded`, `punch_failed`, `direct_fallbacks` | 0; `PW_ERR_INVALID`, writing nothing, for a null `h` or `out` |
 
-The core counts more (`spray_probes`, `rx_wrong_peer`, `path_probes`, `path_switches`, `cookies_sent`); the ABI
-doesn't give those.
+The core counts more (`spray_probes`, `rx_wrong_peer`, `path_probes`, `path_switches`, `cookies_sent`,
+`rx_out_of_order_dropped`); the ABI doesn't give those.
 
 ### Sending
 

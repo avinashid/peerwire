@@ -83,7 +83,8 @@ nodes send each other a numbered reliable message every second. `Config` caps me
 with ~250 KB of free heap: 16 KiB messages, a 32 KiB send buffer and 8 links
 (the defaults allow 1 MiB); with a radio (feature `ble` or `espnow`), whose stack takes
 the heap, 4 KiB messages and an 8 KiB send buffer (`peerwire_esp::RADIO`, NB-142), so
-the peers of such a board send it 4 KiB at most. Every 10 s each node logs free heap, the lowest free
+the peers of such a board send it 4 KiB at most. Each lane of a link holds at most 4 full
+fragments out of order (`MAX_OUT_OF_ORDER`, NB-150). Every 10 s each node logs free heap, the lowest free
 heap so far, unused main-task stack and its links' RTTs.
 
 On a board's Wi-Fi it sets its clock by SNTP before binding the `Node`. Room hellos and

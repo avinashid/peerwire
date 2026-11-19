@@ -76,8 +76,11 @@ The reliable lane is a small transport tuned for real-time traffic:
   retransmitted at once, without waiting for a timeout, once per loss: only an ACK for a fragment sent after the
   last copy counts, and a quarter of the minimum RTT is allowed for reordering (as in RACK) before resending.
 - **Retransmission timeout.** 300 ms at first, kept between 20 ms and 5 s, with back-off capped at 10 s. A 25 ms
-  ACK-delay allowance (like QUIC's `max_ack_delay`) covers busy game frames and browser event loops. A fragment is
-  declared lost for good after 16 sends.
+  ACK-delay allowance (like QUIC's `max_ack_delay`) covers busy game frames and browser event loops. The link is
+  dropped once the lowest unacknowledged fragment has gone out 16 more times since it became the lowest: a receiver
+  always takes the fragment it expects next, but may drop those after it (below), so only the lowest one's sends say
+  the path is dead. A fragment sent more than 3 times while the cumulative ACK moves is taken as dropped, not lost
+  again: it drops its back-off when the ACK moves, and once the lowest it backs off as if sent 3 times before.
 - **Tail-loss probe.** If nothing is acknowledged for `srtt + 2·rttvar + 4 ms`, the newest fragment is sent again,
   so a lost tail is repaired in about one RTT instead of a full timeout. That matters for sparse traffic, such as a
   lone event. In a steady transfer the ACKs keep coming, and a fragment lost at the end of a burst reaches its
@@ -87,7 +90,10 @@ The reliable lane is a small transport tuned for real-time traffic:
   queueing delay (RTT above the lowest seen) passes **25 ms**, before any loss. That keeps router and DataChannel
   buffers short.
 - **Receive window.** 4,096 out-of-order fragments are buffered ahead of the next one expected (64 on the urgent
-  stream), and the sender never sends further ahead than that.
+  stream), and the sender never sends further ahead than that. `Config::max_out_of_order` caps the bytes each stream
+  holds out of order, each fragment counted with 64 B for its entry; a fragment past it is dropped unacknowledged and
+  sent again, as if lost. The default is what the window already bounds; a board sets 4 full fragments, and a cap
+  under 64 full fragments holds nothing past the ACK bitmap's 64.
 - **Send buffer.** 4 MiB per link for reliable and for urgent each (`Config::max_send_buffer`); `send` returns
   `WouldBlock` past it.
 - **Liveness.** A keepalive goes out every 10 s, and a link is dropped after 30 s of silence. Links survive address

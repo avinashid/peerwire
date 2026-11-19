@@ -89,6 +89,22 @@ and the commit that fixed it.
   links could have had 5 to 15 KB left at the larger caps. `RADIO`, `MAX_MESSAGE` and `MAX_SEND_BUFFER` are new. A
   peer that sends such a board a larger message has its link closed, as with any cap; the published 0.1.1 has neither
   feature, so its caps don't change.
+- **`Config::max_out_of_order`** (NB-150, NB142-1): a cap on what a link's reliable lane, and its urgent one, each hold
+  out of order, past a fragment still missing. Each fragment counts its data and 64 B for its entry, so a full one
+  counts `HELD_FRAGMENT` (new, 1,164 B) and empty ones aren't free; one that would go past the cap is dropped
+  unacknowledged and its sender sends it again, and a cap under 64 full fragments holds nothing more than 64 past the
+  missing one, which an ACK can't report. The default, 4,766,580 B, is what the receive window already bounds, so a
+  node on it holds what it did. `Stats::rx_out_of_order_dropped` (new) counts the drops. `peerwire-esp`'s `config()`
+  sets 4 full fragments, 4,656 B (`MAX_OUT_OF_ORDER`, new): any linked member could make a board hold 4.5 MB, where a
+  C3 had 43 KB free, and now 17,504 B per link at most with a radio (both lanes, with a message partly assembled on
+  each). `Config` and `Stats` gain a field, so code that builds either without `..Default::default()` must set it.
+- The reliable lanes' sender copes with a receiver that drops what it can't hold (NB-150): a link fails after 16 sends
+  of the lowest unacknowledged fragment since it became the lowest, not of any fragment, as a receiver always takes
+  the fragment it expects next; and a fragment sent more than 5 times while the cumulative ACK moves is taken as
+  dropped, not lost again, so when the ACK moves its timer drops its back-off, and once the lowest it backs off by its
+  sends as the lowest. Before, a PC linked to a board with the cap above could lose the link to reordering alone (the
+  board's drops reached 16 sends while it still delivered), or crawl at 10 s a round. Between nodes on the default
+  cap, the simulator's `bulk` (clean, 1%, 2%, 5% loss, jitter) and `cc_fair` runs give the same output as before.
 - `peerwire-esp` (NB-142): ESP-IDF's Wi-Fi lines are quiet before a configuration is set, as setting one logged the
   password's length (`OWE is enabled, but ... password length is N`) before they were; and once joined, the transmit
   power the join was made at is set again and logged, with what it read before and after and the country's limit (not

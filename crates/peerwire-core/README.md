@@ -107,6 +107,11 @@ complete host loop on std UDP sockets.
   - While the lowest unacknowledged fragment is repaired, fragments beyond the SACK
     bitmap's reach (64 above it) don't time out before the repair does; their timers
     restart when the cumulative ACK moves.
+  - A receiver holds at most `Config::max_out_of_order` bytes out of order per stream (the
+    window's own bound by default, a few fragments on a board) and drops what comes past
+    it. So only the lowest unacknowledged fragment, which a receiver always takes, fails
+    the link, after 16 sends since it became the lowest; and a fragment sent more than 3
+    times while the cumulative ACK moves drops its back-off when the ACK moves.
   - The sender keeps in-flight fragments in ordered indexes by retransmission time
     (`by_due`) and urgent-copy time (`by_dup`), so each packet visits only what is due.
 - **Liveness:** keepalive every 10 s, then a probe every 1 s while the peer is silent, and
