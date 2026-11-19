@@ -342,18 +342,19 @@ fn id(b: &Browser) -> PeerId {
 }
 
 /// Runs `pages` and the node until `done` or `secs` pass, the node's events going to `ev`. Each round `before` runs
-/// first (an attacker's turn), then the pages, then the node: what `before` sends reaches the node ahead of the pages'.
+/// first (an attacker's turn, or the pages'), then the pages, then the node: what `before` sends reaches the node
+/// ahead of what the pages send.
 fn run(
     n: &mut Node,
     pages: &mut [Browser],
     ev: &mut Vec<Event>,
     secs: f64,
-    mut before: impl FnMut(),
+    mut before: impl FnMut(&mut [Browser]),
     done: impl Fn(&Node, &[Browser], &[Event]) -> bool,
 ) -> bool {
     let until = Instant::now() + Duration::from_secs_f64(secs);
     while Instant::now() < until {
-        before();
+        before(pages);
         pages.iter_mut().for_each(Browser::step);
         n.poll();
         ev.extend(std::iter::from_fn(|| n.try_recv_event()));
@@ -370,7 +371,7 @@ fn arrive(n: &mut Node, hub: &MemoryHub, pages: &mut Vec<Browser>, ev: &mut Vec<
     let mut b = Browser::with(hub, n.peer_id(), short());
     b.hello();
     pages.push(b);
-    run(n, pages, ev, 0.3, || {}, |_, _, _| false);
+    run(n, pages, ev, 0.3, |_| {}, |_, _, _| false);
     let b = pages.last_mut().unwrap();
     b.dial();
     id(b)
@@ -381,7 +382,7 @@ fn four_linked(n: &mut Node, hub: &MemoryHub, ev: &mut Vec<Event>) -> Vec<Browse
     let mut pages = Vec::new();
     for _ in 0..4 {
         let p = arrive(n, hub, &mut pages, ev);
-        assert!(run(n, &mut pages, ev, 10.0, || {}, |n, _, _| n.status(&p) == Status::Connected), "page linked");
+        assert!(run(n, &mut pages, ev, 10.0, |_| {}, |n, _, _| n.status(&p) == Status::Connected), "page linked");
     }
     pages
 }
@@ -408,7 +409,7 @@ fn a_fifth_page_links_once_a_page_closed_without_a_goodbye_has_gone_quiet() {
     let closed = Instant::now();
     let fifth = arrive(&mut n, &hub, &mut pages, &mut ev);
     let linked = |n: &Node, p: &[Browser]| n.status(&fifth) == Status::Connected && p[3].ep.is_connected(&nid);
-    assert!(run(&mut n, &mut pages, &mut ev, 10.0, || {}, |n, p, _| linked(n, p)), "the fifth page linked: {ev:?}");
+    assert!(run(&mut n, &mut pages, &mut ev, 10.0, |_| {}, |n, p, _| linked(n, p)), "the fifth page linked: {ev:?}");
     let took = closed.elapsed();
     eprintln!("the fifth page linked {took:?} after the close");
     assert!(took >= QUIET - KEEPALIVE && took < IDLE, "{took:?}: once the closed page was quiet, before its timeout");
@@ -421,7 +422,7 @@ fn a_fifth_page_links_once_a_page_closed_without_a_goodbye_has_gone_quiet() {
     let got = |ev: &[Event]| {
         ev.iter().any(|e| matches!(e, Event::Message { peer, data, .. } if *peer == fifth && data == b"led on"))
     };
-    assert!(run(&mut n, &mut pages, &mut ev, 5.0, || {}, |_, _, ev| got(ev)));
+    assert!(run(&mut n, &mut pages, &mut ev, 5.0, |_| {}, |_, _, ev| got(ev)));
 }
 
 /// NB-136: newcomers can't cut a page that is there. With 4 pages linked, open but saying nothing beyond their
@@ -442,7 +443,7 @@ fn sec_newcomers_cannot_cut_a_linked_page_that_is_there() {
         &mut pages,
         &mut ev,
         (QUIET * 2).as_secs_f64(),
-        || {},
+        |_| {},
         |n, _, ev| any_in(n) || !left(ev).is_empty(),
     );
     assert!(!cut, "a newcomer linked, or a page was cut: {:?}", left(&ev));
@@ -458,7 +459,7 @@ fn sec_newcomers_cannot_cut_a_linked_page_that_is_there() {
         &mut pages,
         &mut ev,
         5.0,
-        || {},
+        |_| {},
         |n, _, _| newcomers.iter().any(|p| n.status(p) == Status::Connected)
     ));
     eprintln!("a newcomer linked {:?} after the goodbye", left_at.elapsed());
@@ -479,7 +480,7 @@ fn sec_a_flood_on_the_inbox_doesnt_make_a_page_that_is_there_look_gone() {
     let mut ev = vec![];
     let mut pages = four_linked(&mut n, &hub, &mut ev);
     let newcomer = arrive(&mut n, &hub, &mut pages, &mut ev);
-    run(&mut n, &mut pages, &mut ev, 0.3, || {}, |_, _, _| false);
+    run(&mut n, &mut pages, &mut ev, 0.3, |_| {}, |_, _, _| false);
     ev.clear();
     let mut attacker = hub.connect();
     let mut junk = |k: usize| {
@@ -496,7 +497,7 @@ fn sec_a_flood_on_the_inbox_doesnt_make_a_page_that_is_there_look_gone() {
     // Each round, ahead of the pages' batches, more junk than the tokens the budget gained since the last (one each
     // 50 ms): the pages' batches find none.
     let mut last = Instant::now();
-    let each_round = || {
+    let each_round = |_: &mut [Browser]| {
         let gained = last.elapsed().as_millis() as usize / 50;
         last = Instant::now();
         junk(gained + 10);
@@ -504,10 +505,20 @@ fn sec_a_flood_on_the_inbox_doesnt_make_a_page_that_is_there_look_gone() {
     run(&mut n, &mut pages, &mut ev, flood, each_round, |_, _, _| false);
     assert!(!said(&ev, b"during"), "the flood dropped the pages' batches");
     assert_eq!(left(&ev), [], "no page was cut");
-    // The flood ends: the pages are heard again and keep their links; the newcomer is still out.
-    pages[1].ep.send(&nid, Lane::Unreliable, b"after").unwrap();
-    assert!(run(&mut n, &mut pages, &mut ev, 3.0, || {}, |_, _, ev| said(ev, b"after")));
-    run(&mut n, &mut pages, &mut ev, 1.0, || {}, |_, _, _| false);
+    // The flood ends: each page, saying something every 500 ms, in turn (8 batches a second in all, under the
+    // inbox's 20), is heard again, and all keep their links; the newcomer is still out.
+    let (start, mut turn) = (Instant::now(), 0u32);
+    let talk = |pages: &mut [Browser]| {
+        while start.elapsed() >= Duration::from_millis(125) * turn {
+            let p = &mut pages[turn as usize % 4];
+            p.ep.send(&nid, Lane::Unreliable, p.me.peer_id().as_bytes()).unwrap();
+            turn += 1;
+        }
+    };
+    let ids: Vec<PeerId> = pages[..4].iter().map(id).collect();
+    let heard = |ev: &[Event]| ids.iter().all(|p| said(ev, p.as_bytes()));
+    assert!(run(&mut n, &mut pages, &mut ev, 4.0, talk, |_, _, ev| heard(ev)), "every page heard after the flood");
+    run(&mut n, &mut pages, &mut ev, 1.0, |_| {}, |_, _, _| false);
     assert_eq!(left(&ev), []);
     assert!(pages[..4].iter().all(|p| n.status(&id(p)) == Status::Connected));
     assert_eq!(n.status(&newcomer), Status::Disconnected);
@@ -535,16 +546,16 @@ fn page_visits_in_a_row_each_link_past_the_pipe_cap() {
             &mut pages,
             &mut ev,
             window.as_secs_f64(),
-            || {},
+            |_| {},
             |n, p, _| n.status(&page) == Status::Connected && p[0].ep.is_connected(&nid),
         );
         took.push(linked.then(|| dialled.elapsed().as_millis()));
         assert!(linked, "visit {}: not linked in {window:?}; so far {took:?}", i + 1);
         pages[0].ep.send(&nid, Lane::Reliable, b"led toggle").unwrap();
-        run(&mut n, &mut pages, &mut ev, 0.6, || {}, |_, _, _| false);
+        run(&mut n, &mut pages, &mut ev, 0.6, |_| {}, |_, _, _| false);
         drop(pages); // closed, with no goodbye
         let left = Duration::from_millis(1500).saturating_sub(start.elapsed());
-        run(&mut n, &mut [], &mut ev, left.as_secs_f64(), || {}, |_, _, _| false);
+        run(&mut n, &mut [], &mut ev, left.as_secs_f64(), |_| {}, |_, _, _| false);
     }
     eprintln!("each visit linked this many ms after its dial: {took:?}");
     let timed_out = left(&ev).iter().filter(|(_, r)| *r == DisconnectReason::Timeout).count();
