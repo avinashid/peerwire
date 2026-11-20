@@ -13,6 +13,8 @@
 // - browser -> native: the page sends a file; the example keeps it; it is the same bytes.
 // - names: a file with a bidi override, a path and a reserved name in its name, both ways: each side shows and keeps
 //   it under the name files.js's cleanName gives.
+// - offers that end before they are answered (NB159-3), with no page: an offer and its cancel in one batch, against
+//   `recv --yes`, `recv` (answered after it ended) and `send` (which declines offers). The example carries on.
 //
 //   node packages/js/test/share_native.mjs                    8 MiB each way, the example built here (cargo, gate
 //                                                             profile, target/share-native)
@@ -27,7 +29,9 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cleanName } from '../demo/share/files.js';
+import * as F from '../demo/share/files.js';
+
+const { cleanName } = F;
 
 const PW = process.env.PLAYWRIGHT ?? '/home/ubuntu/.local/share/playwright-tools/node_modules/playwright/index.mjs';
 const { chromium } = await import(PW);
@@ -76,9 +80,10 @@ function binary() {
   return path.join(dir, 'gate/examples/share');
 }
 
-// Runs the example; resolves to { code, out } when it exits. `peak` holds its peak resident memory (KB).
-function run(bin, args) {
-  const p = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+// Runs the example (its stdin `ignore`, or `pipe` to answer its questions); `exit` resolves to its exit code, `out`
+// is what it printed and `peak` its peak resident memory (KB).
+function run(bin, args, stdin = 'ignore') {
+  const p = spawn(bin, args, { stdio: [stdin, 'pipe', 'pipe'] });
   const r = { proc: p, out: '', peak: 0 };
   p.stdout.setEncoding('utf8').on('data', (d) => (r.out += d));
   p.stderr.setEncoding('utf8').on('data', (d) => (r.out += d));
@@ -316,11 +321,113 @@ async function toNative(ctx, bin, f, label) {
   }
 }
 
+// ---------- offers that end before they are answered (NB159-3) ----------
+
+// The example's one peer over TCP, with no page: it writes Share control messages, those of one say() in one write
+// (one read for the example), and keeps those the example sends.
+async function fakePeer() {
+  const p = { got: [], sock: null };
+  const server = net.createServer((s) => {
+    if (p.sock) return void s.destroy();
+    p.sock = s;
+    let buf = Buffer.alloc(0);
+    s.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32BE(0)) {
+        const m = buf.subarray(4, 4 + buf.readUInt32BE(0));
+        buf = buf.subarray(4 + m.length);
+        const c = m[0] === 0 ? F.decodeControl(m.subarray(1)) : null;
+        if (c) p.got.push(c);
+      }
+    });
+    s.on('error', () => {});
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  p.addr = `tcp://127.0.0.1:${server.address().port}`;
+  // Each as a room message: its length (4 bytes, big-endian), the bytes tag (0), the control frame.
+  p.say = (...ms) => p.sock.write(Buffer.concat(ms.flatMap((m) => {
+    const f = F.encodeControl(m);
+    const head = Buffer.alloc(5);
+    head.writeUInt32BE(1 + f.length);
+    return [head, f];
+  })));
+  p.close = () => {
+    p.sock?.destroy();
+    server.close();
+  };
+  return p;
+}
+// Waits for `ok()` to hold while the example runs: throws with what it printed if it exits or the wait times out.
+async function until(ex, ok, what) {
+  for (const end = Date.now() + WAIT.timeout; !ok();) {
+    if (ex.proc.exitCode !== null || Date.now() > end) {
+      throw new Error(`no ${what}: the example ${ex.proc.exitCode === null ? 'runs' : `exited with ${ex.proc.exitCode}`}:\n${ex.out}`);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+const EMPTY_SHA = createHash('sha256').digest('hex');
+const offerOf = (name) => F.makeOffer({ id: F.newId(), name, size: 0, type: '' });
+
+// An offer and its cancel in one batch, so the offer has ended before the example answers it: `recv --yes` takes it,
+// `recv` asks (and is answered "y" after it ended), `send` declines it. Each carries on: the next offer is kept, or
+// its own file delivered.
+async function endedOffers(bin) {
+  for (const mode of ['recv --yes', 'recv', 'send']) {
+    const p = await fakePeer();
+    const dir = fs.mkdtempSync(path.join(tmp, 'ended-'));
+    const sent = mode === 'send' ? makeFile('sent.bin', 1000) : null;
+    const args = mode === 'send' ? ['send', p.addr, sent.file] : ['recv', p.addr, dir, ...(mode === 'recv' ? [] : ['--yes'])];
+    const ex = run(bin, args, mode === 'recv' ? 'pipe' : 'ignore');
+    try {
+      await until(ex, () => p.sock, 'connection');
+      const gone = offerOf('gone.txt');
+      p.say(gone, { t: 'cancel', id: gone.id });
+      await until(ex, () => ex.out.includes('"gone.txt" ended: the peer cancelled'), 'end of the cancelled offer');
+      let ok;
+      if (mode === 'send') {
+        await until(ex, () => p.got.some((m) => m.t === 'offer'), 'offer');
+        const mine = p.got.find((m) => m.t === 'offer');
+        p.say({ t: 'accept', id: mine.id, have: 0 });
+        await until(ex, () => p.got.some((m) => m.t === 'end' && m.id === mine.id), 'end of its file');
+        const end = p.got.find((m) => m.t === 'end' && m.id === mine.id);
+        p.say({ t: 'done', id: mine.id, ok: true, sha256: end.sha256 });
+        const code = await ex.exit;
+        ok = code === 0 && end.sha256 === sent.sha;
+      } else {
+        if (mode === 'recv') {
+          ex.proc.stdin.write('y\n'); // too late for gone.txt: it answers nothing
+          await new Promise((r) => setTimeout(r, 300));
+        }
+        const kept = offerOf('kept.txt');
+        p.say(kept);
+        if (mode === 'recv') {
+          await until(ex, () => ex.out.includes('accept "kept.txt"? [y/N]'), 'question');
+          ex.proc.stdin.write('y\n');
+        }
+        await until(ex, () => p.got.some((m) => m.t === 'accept' && m.id === kept.id), 'accept');
+        p.say({ t: 'end', id: kept.id, sha256: EMPTY_SHA });
+        await until(ex, () => p.got.some((m) => m.t === 'done' && m.id === kept.id), 'done');
+        const done = p.got.find((m) => m.t === 'done' && m.id === kept.id);
+        ok = done.ok === true && ex.proc.exitCode === null && fs.readdirSync(dir).join() === 'kept.txt';
+      }
+      check(ok, `share ${mode}: an offer cancelled before it was answered, then ${mode === 'send' ? 'its own file delivered (exit 0)' : 'the next offer kept'}`);
+      if (!ok) console.log(ex.out, p.got);
+    } catch (e) {
+      check(false, `share ${mode}: an offer cancelled before it was answered: ${e.message}`);
+    } finally {
+      ex.proc.kill();
+      p.close();
+    }
+  }
+}
+
 let browser;
 let server;
 let port;
 try {
   const bin = binary();
+  await endedOffers(bin);
   ({ port, server } = await serve(root));
   const big = makeFile(`big-${MB}MiB.bin`, MB << 20);
   // A name with a bidi override, a path and a reserved device name: cleaned the same on both sides.

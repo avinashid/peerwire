@@ -25,12 +25,12 @@
 //! `packages/js/test/share_native.mjs` puts this example and the Share page in a browser in one room, as a browser
 //! and a native node can't link directly yet.
 
-use peerwire::files::{self, End, Event as FileEvent, Files, State, TransferId, Wire};
+use peerwire::files::{self, Direction, End, Event as FileEvent, Files, State, TransferId, Wire};
 use peerwire::{DisconnectReason, Event, LanSignaling, Lane, MultiSignaling, Node, PeerId, SendError, Signaling};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -113,7 +113,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let mut files = Files::new();
     let mut offered: HashSet<PeerId> = HashSet::new();
     let mut started: HashMap<TransferId, Instant> = HashMap::new();
-    let mut asking: VecDeque<TransferId> = VecDeque::new();
+    let mut asking: VecDeque<TransferId> = VecDeque::new(); // offers put to the user: a line typed answers the first
+    let mut away: Vec<TransferId> = Vec::new(); // offers to take once their peer's link is back
     let mut outcome: Option<bool> = None; // all delivered (send), or the first file kept (recv --once)
     let mut failures = 0;
     let mut finished_at: Option<Instant> = None;
@@ -189,7 +190,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                     let mime = if mime.is_empty() { String::new() } else { format!(", {mime}") };
                     println!("{peer} offers {name:?} ({}{mime}) [{id:?}]", bytes(size));
                     if o.send {
-                        files.decline(id)?;
+                        answer(&mut files, id, None)?;
                     } else if o.yes {
                         // Each transfer taken holds an open file: a peer gets at most MAX_LIVE at once.
                         let live = files
@@ -198,10 +199,15 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                             .count();
                         if live >= MAX_LIVE {
                             println!("declined [{id:?}]: {live} files from {peer} under way already");
-                            files.decline(id)?;
+                            answer(&mut files, id, None)?;
                         } else {
-                            files.accept_into(id, &o.paths[0])?;
-                            started.insert(id, now);
+                            match answer(&mut files, id, Some(&o.paths[0]))? {
+                                Answer::Given => {
+                                    started.insert(id, now);
+                                }
+                                Answer::Away => away.push(id),
+                                Answer::Ended => {}
+                            }
                         }
                     } else {
                         println!("accept {name:?}? [y/N]");
@@ -215,6 +221,11 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                 FileEvent::Resumed { id, from } => println!("[{id:?}] resumes from piece {}", from + 1),
                 FileEvent::Progress { .. } => {}
                 FileEvent::Ended { id, end } => {
+                    // An offer that ended before it was answered (its sender cancelled it, or its peer left) is
+                    // asked no more: a line typed answers the next one.
+                    let was_asked = asking.front() == Some(&id);
+                    asking.retain(|a| *a != id);
+                    away.retain(|a| *a != id);
                     let Some(info) = files.info(id) else { continue };
                     let secs = started.get(&id).map(|t| now.duration_since(*t).as_secs_f64());
                     let speed = match secs {
@@ -232,23 +243,45 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                         End::Declined => println!("{:?} was declined", info.name),
                         End::Cancelled(why) | End::Failed(why) => println!("{:?} ended: {why}", info.name),
                     }
-                    if !ok {
+                    // Only files this side sent: an offer `send` declined isn't one it failed to deliver.
+                    if !ok && info.direction == Direction::Send {
                         failures += 1;
                     }
                     if !o.send && o.once && outcome.is_none() {
                         outcome = Some(ok);
                     }
+                    if was_asked {
+                        if let Some(next) = asking.front().and_then(|next| files.info(*next)) {
+                            println!("accept {:?}? [y/N]", next.name);
+                        }
+                    }
                 }
             }
         }
+        // Offers taken while their peer's link was down: taken once it is back (or dropped once they end).
+        for id in std::mem::take(&mut away) {
+            match files.info(id) {
+                Some(i) if i.state == State::Offered && i.peer_gone => away.push(id),
+                Some(i) if i.state == State::Offered => match answer(&mut files, id, Some(&o.paths[0]))? {
+                    Answer::Given => {
+                        started.insert(id, now);
+                    }
+                    Answer::Away => away.push(id),
+                    Answer::Ended => {}
+                },
+                _ => {}
+            }
+        }
         while let Ok(line) = typed.try_recv() {
-            if let Some(id) = asking.pop_front() {
-                if matches!(line.trim(), "y" | "Y" | "yes") {
-                    files.accept_into(id, &o.paths[0])?;
+            // A line with no offer waiting (its offer ended) answers nothing.
+            let Some(id) = asking.pop_front() else { continue };
+            let take = matches!(line.trim(), "y" | "Y" | "yes");
+            match answer(&mut files, id, take.then_some(o.paths[0].as_path()))? {
+                Answer::Given if take => {
                     started.insert(id, Instant::now());
-                } else {
-                    files.decline(id)?;
                 }
+                Answer::Away => away.push(id),
+                _ => {}
             }
         }
 
@@ -294,6 +327,36 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             }
             Link::Bridge(_) => std::thread::sleep(Duration::from_millis(2)),
         }
+    }
+}
+
+/// What came of answering an offer.
+enum Answer {
+    Given,
+    /// It had ended first: its sender cancelled it, or its peer left.
+    Ended,
+    /// Its peer's link is down: it can be taken once the link is back.
+    Away,
+}
+
+/// Takes an offer into `dir`, or declines it (`None`). An offer that ended before it was answered, or whose peer's
+/// link is down, doesn't end the run; other errors do.
+fn answer(files: &mut Files, id: TransferId, dir: Option<&Path>) -> Result<Answer, files::Error> {
+    let r = match dir {
+        Some(dir) => files.accept_into(id, dir),
+        None => files.decline(id),
+    };
+    match r {
+        Ok(()) => Ok(Answer::Given),
+        Err(files::Error::NoTransfer) => {
+            println!("[{id:?}] had ended before it was answered");
+            Ok(Answer::Ended)
+        }
+        Err(files::Error::NotConnected) => {
+            println!("[{id:?}] is taken once its peer's link is back");
+            Ok(Answer::Away)
+        }
+        Err(e) => Err(e),
     }
 }
 
