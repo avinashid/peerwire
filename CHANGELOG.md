@@ -8,6 +8,14 @@ and the commit that fixed it.
 
 ## Unreleased: Rust crates
 
+- **Peerwire Share in Rust** (NB-159, [Share protocol](docs/concepts/share-protocol.md)): `peerwire` feature `files`
+  (no dependency of its own) adds `peerwire::files`, the browser Share page's file protocol: offers accepted or
+  declined, 512 KiB pieces each with its SHA-256, a window of 8 pieces per peer, the whole file's SHA-256, a transfer
+  that goes on from the last piece written after a dropped link, data over direct links only, and the page's limits
+  and name cleaning (NFC and format characters from tables made off Node's Unicode data). `Files` is sans-IO and
+  sends through one seam, the `Wire` trait, which `Node` implements; `FileSink` keeps a file only once verified and
+  never replaces one. The example `share` sends and receives from a terminal. A browser and a native node can't link
+  yet, so native apps share with each other for now.
 - **ESP-NOW** (NB-135, [ESP-NOW](docs/concepts/espnow.md)): `peerwire` feature `espnow` (no dependency of its own)
   makes a Bluetooth radio of Espressif's ESP-NOW frames, `espnow::EspNow`, for a platform's `espnow::Ether`, so ESP32
   boards in range link with each other with no network and no Bluetooth, with the room proof, Noise IK and sealing
