@@ -40,6 +40,8 @@ New here? Start with the [introduction](getting-started/introduction.md), then t
   against UDP (a design, not yet run on a radio).
 - [ESP-NOW](concepts/espnow.md): ESP32 boards linking over Espressif's ESP-NOW frames with no network, as a Bluetooth
   radio: connections emulated, what a forged frame can do, and what two boards measured (NB-138, NB-139).
+- [Share protocol](concepts/share-protocol.md): files of any size between members in checked pieces, as the Share
+  page and Rust's `peerwire::files` send them.
 - [Security model](concepts/security-model.md): who can see what, and what nobody in the path can do.
 - [Scaling](concepts/scaling.md): islands and super-peers for rooms bigger than a mesh.
 
