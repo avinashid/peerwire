@@ -1,6 +1,7 @@
 //! Peerwire Share in Rust (feature `files`): files of any size, sent peer to peer in checked pieces, in the protocol
-//! of the Share page (`packages/js/demo/share/`), so a native app sends to and receives from the page's peers as
-//! the page does. `docs/concepts/share-protocol.md` is the protocol; [`frame`] has its bytes and checks.
+//! of the Share page (`packages/js/demo/share/`), byte for byte. `docs/concepts/share-protocol.md` is the protocol;
+//! [`frame`] has its bytes and checks. A browser and a native node can't link yet, so today native apps share with
+//! each other; the protocol is the page's all the same (`packages/js/test/share_native.mjs` checks it).
 //!
 //! A sender offers a file to a peer; the receiver accepts (and picks where it goes) or declines; the file goes in
 //! pieces of 512 KiB on the reliable lane, at most [`WINDOW`] in flight to a peer, each with its SHA-256, and the
