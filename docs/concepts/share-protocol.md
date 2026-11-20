@@ -203,7 +203,8 @@ Per peer: up to `MAX_OFFERS` offers waiting (a name of at most 120 characters ea
 not yet written, so about 8 MiB; per transfer one hash state. A sender holds one piece. Finished transfers are
 forgotten past 200 (the page's rows, Rust's `MAX_KEPT`), oldest first (in Rust, once the app has polled their
 `Ended`). Rust also caps the control messages waiting for a peer whose link takes none (`MAX_OUTBOX`, 256), so a
-peer that stops reading can't grow them.
+peer that stops reading can't grow them. Nothing caps the transfers a peer has under way once accepted, each with an
+open file: a Rust app that accepts without asking caps them per peer (the `share` example's `--yes`, 32).
 
 ## Testing it
 

@@ -579,7 +579,9 @@ impl Files {
         self.offer(peer, &name, "", meta.len(), Box::new(file))
     }
 
-    /// Accepts an offer: the file goes into `sink`.
+    /// Accepts an offer: the file goes into `sink`. Nothing here caps the transfers a peer has under way ([`MAX_OFFERS`]
+    /// caps only offers waiting), and each holds its sink (a [`FileSink`], an open file): an app that accepts without
+    /// asking must cap the live transfers per peer itself, as the `share` example does with `--yes`.
     pub fn accept(&mut self, id: TransferId, sink: Box<dyn Sink>) -> Result<(), Error> {
         let present = &self.present;
         let t = self
@@ -604,6 +606,7 @@ impl Files {
     }
 
     /// Accepts an offer into a [`FileSink`] in `dir`: the file appears there, under its cleaned name, once verified.
+    /// As with [`accept`](Self::accept), an app that accepts without asking must cap the live transfers per peer.
     pub fn accept_into(&mut self, id: TransferId, dir: &Path) -> Result<(), Error> {
         let name = self
             .get(id)
