@@ -164,7 +164,9 @@ impl State {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum End {
     /// Delivered and verified: the whole file's SHA-256, in hex.
-    Done { sha256: String },
+    Done {
+        sha256: String,
+    },
     Declined,
     /// By either side; why, in words.
     Cancelled(String),
@@ -770,8 +772,10 @@ impl Files {
         if self.incoming(&peer, o.id).is_some() {
             return;
         }
-        let waiting =
-            self.transfers.iter().filter(|t| t.dir == Direction::Receive && t.peer == peer && t.state == State::Offered);
+        let waiting = self
+            .transfers
+            .iter()
+            .filter(|t| t.dir == Direction::Receive && t.peer == peer && t.state == State::Offered);
         if waiting.count() >= MAX_OFFERS {
             self.stats.offers_refused += 1;
             self.say(peer, frame::encode_control(&Message::Decline { id: o.id }));
@@ -800,7 +804,8 @@ impl Files {
             State::Sending => {
                 // A resume, on a new link: the receiver says how many pieces it has written.
                 let Some(at) = frame::resume_at(t.count, t.read, have) else {
-                    return self.end_and_tell(id, End::Failed("the receiver asked to resume from a piece never sent".into()));
+                    return self
+                        .end_and_tell(id, End::Failed("the receiver asked to resume from a piece never sent".into()));
                 };
                 t.next = at;
                 t.acked = at;
@@ -845,10 +850,7 @@ impl Files {
     // The transfer to `peer` whose pieces go next: the oldest accepted one with pieces (or its end) still to send.
     fn head(&self, peer: &PeerId) -> Option<usize> {
         self.transfers.iter().position(|t| {
-            t.peer == *peer
-                && t.state == State::Sending
-                && t.gone.is_none()
-                && !(t.end_sent && t.next == t.count)
+            t.peer == *peer && t.state == State::Sending && t.gone.is_none() && !(t.end_sent && t.next == t.count)
         })
     }
 
@@ -910,7 +912,8 @@ impl Files {
     fn on_piece(&mut self, peer: PeerId, f: &[u8]) {
         let Some(p) = frame::decode_piece(f) else { return };
         // Nothing is kept for a transfer we haven't accepted.
-        let Some(id) = self.incoming(&peer, p.id).filter(|&id| self.get(id).is_some_and(|t| t.state == State::Receiving))
+        let Some(id) =
+            self.incoming(&peer, p.id).filter(|&id| self.get(id).is_some_and(|t| t.state == State::Receiving))
         else {
             self.stats.rejected += 1;
             return;

@@ -410,7 +410,10 @@ fn offers_are_checked() {
     // Names: at most MAX_RAW_NAME UTF-16 units as sent, cleaned.
     let named = |name: &str| {
         let j = format!(r#"{{"t":"offer","id":"{ID}","name":{name},"size":1,"piece":524288}}"#);
-        b_takes(&control(&j)).1.into_iter().find_map(|e| if let Event::Offer { name, .. } = e { Some(name) } else { None })
+        b_takes(&control(&j))
+            .1
+            .into_iter()
+            .find_map(|e| if let Event::Offer { name, .. } = e { Some(name) } else { None })
     };
     assert_eq!(named(&format!("\"{}\"", "a".repeat(1024))).unwrap().chars().count(), MAX_NAME);
     assert_eq!(named(&format!("\"{}\"", "a".repeat(1025))), None);
@@ -775,7 +778,12 @@ mod vectors {
                 _ => false,
             };
             if !ok {
-                misses.push(format!("{:?}: {got:?}, files.js {} / {}", String::from_utf8_lossy(&f), c["m"], c["offer"]));
+                misses.push(format!(
+                    "{:?}: {got:?}, files.js {} / {}",
+                    String::from_utf8_lossy(&f),
+                    c["m"],
+                    c["offer"]
+                ));
             }
         }
         assert!(misses.is_empty(), "{} misses:\n{}", misses.len(), misses.join("\n"));
@@ -786,7 +794,14 @@ mod vectors {
         let v = load("pieces.json");
         for c in v["checks"].as_array().unwrap() {
             let n = |i: usize| c[i].as_u64().unwrap();
-            let got = frame::check_piece(n(0), n(1) as u32, frame::piece_count(n(0), n(1) as u32), n(2), n(3) as u32, n(4) as usize);
+            let got = frame::check_piece(
+                n(0),
+                n(1) as u32,
+                frame::piece_count(n(0), n(1) as u32),
+                n(2),
+                n(3) as u32,
+                n(4) as usize,
+            );
             let want = match c[5].as_str().unwrap() {
                 "ok" => Ok(()),
                 "out-of-range" => Err(Refused::OutOfRange),
@@ -803,9 +818,15 @@ mod vectors {
         }
         for c in v["frames"].as_array().unwrap() {
             let f = unhex(&c[0]);
-            let got = frame::decode_piece(&f).map(|p| (p.id.hex(), p.index as u64, frame::hex(p.hash), frame::hex(p.data)));
+            let got =
+                frame::decode_piece(&f).map(|p| (p.id.hex(), p.index as u64, frame::hex(p.hash), frame::hex(p.data)));
             let want = c[1].as_array().map(|w| {
-                (w[0].as_str().unwrap().to_string(), w[1].as_u64().unwrap(), w[2].as_str().unwrap().into(), w[3].as_str().unwrap().into())
+                (
+                    w[0].as_str().unwrap().to_string(),
+                    w[1].as_u64().unwrap(),
+                    w[2].as_str().unwrap().into(),
+                    w[3].as_str().unwrap().into(),
+                )
             });
             assert_eq!(got, want, "{c}");
         }

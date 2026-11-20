@@ -177,20 +177,8 @@ pub fn clean_name_utf16(raw: &[u16]) -> String {
 fn is_js_space(c: char) -> bool {
     matches!(
         c,
-        '\t' | '\n'
-            | '\u{b}'
-            | '\u{c}'
-            | '\r'
-            | ' '
-            | '\u{a0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\u{feff}'
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
     )
 }
 
@@ -235,7 +223,11 @@ pub fn clean_type_utf16(raw: &[u16]) -> String {
     let ok = raw.len() <= MAX_TYPE
         && raw.first().is_some_and(|&c| c < 0x80 && (c as u8).is_ascii_alphanumeric())
         && match raw.iter().position(|&c| c == u16::from(b'/')) {
-            Some(slash) => raw[1..slash].iter().all(|&c| word(c)) && slash + 1 < raw.len() && raw[slash + 1..].iter().all(|&c| word(c)),
+            Some(slash) => {
+                raw[1..slash].iter().all(|&c| word(c))
+                    && slash + 1 < raw.len()
+                    && raw[slash + 1..].iter().all(|&c| word(c))
+            }
             None => false,
         };
     if ok {
@@ -306,17 +298,36 @@ pub fn decode_control(f: &[u8]) -> Option<Control> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// The receiver takes the file (`have` pieces of it already, after a new link).
-    Accept { id: WireId, have: u64 },
-    Decline { id: WireId },
-    Cancel { id: WireId },
+    Accept {
+        id: WireId,
+        have: u64,
+    },
+    Decline {
+        id: WireId,
+    },
+    Cancel {
+        id: WireId,
+    },
     /// The receiver has written `have` pieces.
-    Ack { id: WireId, have: u64 },
+    Ack {
+        id: WireId,
+        have: u64,
+    },
     /// The sender has sent every piece: the whole file's SHA-256.
-    End { id: WireId, sha256: String },
+    End {
+        id: WireId,
+        sha256: String,
+    },
     /// The receiver's verdict: whether the whole file's SHA-256 matched, and the one it got.
-    Done { id: WireId, ok: bool, sha256: String },
+    Done {
+        id: WireId,
+        ok: bool,
+        sha256: String,
+    },
     /// The sender, back on a new link, asks where a transfer is.
-    Resume { id: WireId },
+    Resume {
+        id: WireId,
+    },
 }
 
 /// A control frame (files.js `encodeControl`). Its JSON is short (an id, a number, a hash), never near
@@ -367,7 +378,14 @@ pub struct Offer {
 impl Offer {
     /// The offer of a file this side sends (files.js `makeOffer`), in pieces of [`PIECE`] bytes.
     pub fn new(id: WireId, name: &str, size: u64, mime: &str) -> Offer {
-        Offer { id, name: clean_name(name), size, mime: clean_type(mime), piece: PIECE, count: piece_count(size, PIECE) }
+        Offer {
+            id,
+            name: clean_name(name),
+            size,
+            mime: clean_type(mime),
+            piece: PIECE,
+            count: piece_count(size, PIECE),
+        }
     }
 
     /// Its control frame, with the fields in makeOffer's order.
