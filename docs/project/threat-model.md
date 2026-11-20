@@ -230,6 +230,8 @@ release of each.
 | NB142-I1 (Info) | **Fixed** by `5f3187b` (NB-142), reviewed 2026-11-19: the Wi-Fi library's tag is quiet before the station's configuration is set, as setting one logged the length of the network's password, same section |
 | NB136-1 (Low) | **Fixed** by `44c46bc` before NB-136 merged, so never on main: a pipe whose peer isn't linked kept off newcomers for 5 s after its last batch, and anyone who reads a board's tag on a relay can post a batch it saw again under a key of its own, so copies every few seconds kept every pipe the board freed and newcomers gave up; the 5 s now count from the pipe's dial, so a copy holds a freed pipe 5 s once at most, reviewed 2026-11-19, [A newcomer past the pipe cap](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1) |
 | NB136-I1 (Info) | Accepted for v1 by the lead on 2026-11-19: while a newcomer waits, a page whose events its relay drops, or its carrier loses without counting it, is taken for gone after 20 s, where its link timed out at 30 s, same section |
+| NB159-1, NB159-2 (Low) | Open: when 200 or more transfers are live, one that just ended can be forgotten before the app reads its `Ended`, and the `share` example then panics; the module caps offers waiting, not those accepted, so `share recv --yes` holds a file open for each offer until it runs out. Fix: the example skips such an event and caps what it accepts from a peer, [Peerwire Share in Rust](#peerwire-share-in-rust-nb-159--nb159-1-nb159-2) |
+| NB159-I1, NB159-I2 (Info) | Open: pieces already handed to the node can cross a relay if the link moves (at most the window, sealed); `FileSink` saves under the name it is given, cleaned or not, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -8073,6 +8075,102 @@ the link's own path, and a linked peer could already cost the sender as much by 
 to it.
 
 **Status: accepted** for v1 by the lead on 2026-11-19, as NB-150's stated cost.
+
+### Peerwire Share in Rust (NB-159) — NB159-1, NB159-2
+
+NB-159 adds `peerwire::files` (feature `files`, off by default, and in neither the wasm
+module nor the ESP32 port): the Share page's file protocol in Rust. It reads what a room
+member sends (control messages in JSON, offers, pieces, resumes), and `FileSink` writes
+a received file into a directory. It also adds the `Wire` seam (`impl Wire for Node`:
+reliable room messages, pieces only while the path is `Direct` or `Birthday`), the
+`share` example and `docs/concepts/share-protocol.md`. Reviewed on 2026-11-20 by reading
+`adb13c1..b91f95d` (`pz/NB-159-rust-files`, not merged) against `files.js` and
+`share.js`. A scratch copy of `b91f95d` ran two tests written for the review, NB159-1's
+and NB159-I2's; nothing else was re-run.
+
+**What holds.**
+
+- **Who can send.** Every transfer is looked up by the session's `PeerId` and its
+  transfer id, so a peer reaches only its own transfers with this node. Only
+  `Lane::Reliable` messages are read, and `ClosedByPeer` comes from the peer's own
+  session.
+- **Control messages.** A frame over 4,096 B of JSON is never parsed. `files/json.rs`
+  reads one as `TextDecoder` and `JSON.parse` do, walks nesting with a stack of its own,
+  not recursion, allocates a few times the input at most, and slices text only at
+  character boundaries. No `expect` or index in the module can panic on a peer's input:
+  each `expect` is on a lookup just made or on a field name of the module's own, and
+  each index is bounded first.
+- **Offers.** The id, `size` (1 TiB at most), `piece` (256 KiB to 1,048,522 B), `count`
+  and the name's length are checked as `files.js` checks them, so a transfer has at most
+  2^22 pieces and an index fits its 4 bytes. At most 32 offers from a peer wait for an
+  answer; the rest are declined.
+- **Names.** A name is cleaned before it is shown or saved: no path separator, control
+  or format character, leading dot or Windows device name, and 120 code points at most,
+  cut to 200 bytes by `FileSink`. The sink writes `.peerwire-<16 hex>.part` with
+  `create_new`, claims the final name with `create_new` (so it never replaces a file or
+  follows a link), then renames the part over its own claim. Any end but a verified one
+  deletes the part, and so does dropping the sink; a crash leaves it.
+- **Pieces.** One is taken only for a transfer this side accepted, only if it is the
+  next and only at its exact length; 8 refused cancel the transfer. Each piece's SHA-256
+  is checked before it is written, and the whole file's before it is kept. Pieces are
+  written as they come, so a receiver holds none.
+- **The sender.** It starts on an `accept` whose `have` is 0, resumes only from a piece
+  it has read, counts an `ack` only from the last one to the pieces sent, and ends as
+  delivered only on a `done` with its own SHA-256. It reads a piece only when the window
+  (8 pieces a peer) has room.
+- **Bounds.** At most 256 control messages wait for a peer (more are dropped), 200
+  finished transfers are kept, and a transfer whose peer has been gone 10 minutes fails
+  and deletes its part.
+- **The example's `tcp://` room** is the browser test's hook, not a room: it trusts
+  whoever is at that address, with no key and no encryption, and caps a message at
+  1 MiB.
+
+**NB159-1 — An ended transfer can be forgotten before its event, and the example panics
+(Low).** `Files::prune`, run on each offer made or taken, forgets the oldest finished
+transfers past 200, whatever the app has polled. With 200 or more live it forgets them
+all, so a transfer that just ended can be gone before the app reads its `Ended`, and
+`info` gives `None` for it. `examples/rust/share.rs` calls
+`files.info(id).expect("kept")` on each `Ended`, so it panics. A room member reaches it
+against `share recv --yes`, which accepts every offer: 201 offers, then a `cancel` of
+one and another offer in the same batch of events. Without `--yes` it takes 200 offers
+unanswered, 32 from each of 7 peers, and a `send` with 200 offers unanswered gets there
+when a decline and a new peer come together. In a scratch test of the first case, `info`
+gives `None` for the transfer in the `Ended`. Fix: the example skips an `Ended` whose
+transfer `info` no longer has; or `prune` keeps the transfers ended since the app last
+drained `poll_event`.
+
+**Status: open** (Low), reported on NB-160 at `b91f95d`.
+
+**NB159-2 — A receiver that accepts every offer holds a file open for each (Low).** The
+module caps offers waiting for an answer, not transfers accepted, and a transfer whose
+sender stays linked and sends nothing never times out, as on the page.
+`share recv --yes` accepts every offer, and each `FileSink` holds its part file open, so
+a room member's offers, with no piece sent, hold one file each until the process runs
+out of descriptors. Then `accept_into` fails and the example exits (about a thousand
+offers at the common limit of 1,024 descriptors, **theoretical**). The page asks before
+each accept. Fix: the example declines past a cap of live transfers from a peer (32,
+say), and the module's docs tell an app that accepts by itself to cap them.
+
+**Status: open** (Low), reported on NB-160 at `b91f95d`.
+
+**NB159-I1 — Pieces already sent can cross a relay (Info).** Pieces go to the node only
+while the path is `Direct` or `Birthday`, but once `Node::send` has them they are the
+reliable lane's: if the link moves to a member, a relay peer, TURN or a signalling pipe,
+the lane sends what is unacknowledged that way, at most the window (8 pieces, 4 MiB at
+512 KiB) and the `end`. They stay sealed end to end; the relay carries that much a move.
+`share-protocol.md` says pieces go never through any of these. The lead noted it with
+the branch. Fix: say so in its "Where data may go" and on `impl Wire for Node`.
+
+**Status: open** (Info), reported on NB-160 at `b91f95d`.
+
+**NB159-I2 — `FileSink` saves under the name it is given (Info).**
+`FileSink::create(dir, name)` joins `name` to `dir` as it is. Every name the module
+hands out is cleaned (`Event::Offer`, `accept_into`), but an app that passes one of its
+own, or a peer's raw one, can write outside `dir`: in a scratch test, `../escaped.txt`
+lands beside it. The Rust reference says the sink moves the file to the cleaned name.
+Fix: clean the name in `FileSink::create` (cleaning a clean name changes nothing).
+
+**Status: open** (Info), reported on NB-160 at `b91f95d`.
 
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
