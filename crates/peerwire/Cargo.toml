@@ -16,7 +16,7 @@ include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 [package.metadata.docs.rs]
 # The async host, Nostr signaling, the Bluetooth transport and its ESP-NOW radio as well as the default TURN client;
 # not `testing`, which is for bindings, nor `ble-bluez`, which would build libdbus there.
-features = ["tokio", "nostr", "ble", "espnow"]
+features = ["tokio", "nostr", "ble", "espnow", "files"]
 
 [dependencies]
 peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
@@ -71,6 +71,10 @@ ble-bluez = ["ble", "dep:bluer", "dep:dbus", "dep:futures", "dep:tokio"]
 # ESP-NOW (docs/concepts/espnow.md): a Bluetooth radio over Espressif's ESP-NOW frames, for a platform that gives it
 # its ESP-NOW (`espnow::Ether`); `peerwire-esp` gives the ESP32's. No dependency of its own.
 espnow = ["ble"]
+# Peerwire Share (peerwire::files, docs/concepts/share-protocol.md): files of any size in checked pieces, in the
+# protocol of the Share page, streamed from and to disk. No dependency of its own (sha2 and rand are already here).
+# Off by default; nothing of it is in the wasm module (peerwire-ffi) or the ESP32 port.
+files = []
 # Test hooks (Builder::port_mapping_at, a fake gateway's address; Node::note_sources, where the socket's datagrams
 # came from; ble::FakeAir, radios in one process). Not for apps.
 testing = []
@@ -82,12 +86,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docs_samples)"] }
 [dev-dependencies]
 peerwire-core = { path = "../peerwire-core" }
 # Tests and examples cover the async host and Nostr signaling too, and tests use the test hooks (Node::sources).
-peerwire = { path = ".", features = ["tokio", "nostr", "testing", "ble", "espnow"] }
+peerwire = { path = ".", features = ["tokio", "nostr", "testing", "ble", "espnow", "files"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
 # The fuzz harness (peerwire_sim::fuzz); a dev-only cycle, the harness deals in bytes.
 peerwire-sim = { path = "../peerwire-sim" }
 # The docs' samples of shared docs beside a node (mod doc_samples in src/lib.rs).
 peerwire-sync = { path = "../peerwire-sync" }
+# Reading the golden vectors files.js makes (src/files/tests.rs; already in the lock file through the nostr feature).
+serde_json = "1"
 # ble_chat prints the Bluetooth driver's log (already in the tree through bluer and tungstenite).
 log = "0.4"
 # ble_chat ends on Ctrl-C and SIGTERM, so that its node closes and the BlueZ driver removes the devices it connected
@@ -126,3 +132,8 @@ required-features = ["nostr"]
 name = "nostr_relay"
 path = "../../examples/rust/nostr_relay.rs"
 required-features = ["nostr"]
+
+[[example]]
+name = "share"
+path = "../../examples/rust/share.rs"
+required-features = ["files", "nostr"]
