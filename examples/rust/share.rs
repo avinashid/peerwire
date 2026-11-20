@@ -202,7 +202,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                 FileEvent::Resumed { id, from } => println!("[{id:?}] resumes from piece {}", from + 1),
                 FileEvent::Progress { .. } => {}
                 FileEvent::Ended { id, end } => {
-                    let info = files.info(id).expect("kept");
+                    let Some(info) = files.info(id) else { continue };
                     let secs = started.get(&id).map(|t| now.duration_since(*t).as_secs_f64());
                     let speed = match secs {
                         Some(s) if s > 0.0 => format!(" in {s:.1} s, {:.1} MB/s", info.size as f64 / 1e6 / s),

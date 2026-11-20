@@ -451,6 +451,38 @@ fn offers_past_the_limit_are_declined_and_repeats_ignored() {
     assert_eq!(b.stats().offers_refused, 4);
 }
 
+#[test]
+fn a_transfer_is_kept_until_the_app_has_had_its_end() {
+    // Past MAX_KEPT transfers, all live; then, before the app polls its events, a cancel and another offer, which
+    // prunes: the cancelled one stays, so info() answers for the Ended the app gets next.
+    let mut b = Files::with_seed([2; 32]);
+    b.connected(A);
+    let offer = |b: &mut Files, i: usize| {
+        let j = format!(r#"{{"t":"offer","id":"{i:032x}","name":"n","size":1,"piece":524288}}"#);
+        b.receive_frame(A, &control(&j));
+    };
+    let mut ids = Vec::new();
+    for i in 0..=MAX_KEPT {
+        offer(&mut b, i);
+        let id = offer_id(&Pair::events(&mut b));
+        b.accept(id, Box::new(Mem::default())).unwrap();
+        ids.push(id);
+    }
+    b.cancel(ids[7]).unwrap();
+    offer(&mut b, MAX_KEPT + 1);
+    let events = Pair::events(&mut b);
+    assert!(matches!(ended(&events), Some(End::Cancelled(_))));
+    for e in &events {
+        if let Event::Ended { id, .. } = e {
+            assert_eq!(b.info(*id).map(|i| i.state), Some(State::Cancelled));
+        }
+    }
+    // Once the app has had it, it is the first finished one forgotten.
+    offer(&mut b, MAX_KEPT + 2);
+    assert!(b.info(ids[7]).is_none());
+    assert_eq!(b.transfers().count(), MAX_KEPT + 2);
+}
+
 /// B, having accepted A's offer of `size` bytes in pieces of 262144: B, its sink, and its wire.
 fn accepted(size: u64) -> (Files, Mem, Link, TransferId) {
     let mut b = Files::with_seed([2; 32]);

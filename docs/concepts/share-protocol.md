@@ -201,8 +201,9 @@ When the peer is back (on any link):
 
 Per peer: up to `MAX_OFFERS` offers waiting (a name of at most 120 characters each), and at most `MAX_QUEUED` pieces
 not yet written, so about 8 MiB; per transfer one hash state. A sender holds one piece. Finished transfers are
-forgotten past 200 (the page's rows, Rust's `MAX_KEPT`), oldest first. Rust also caps the control messages waiting
-for a peer whose link takes none (`MAX_OUTBOX`, 256), so a peer that stops reading can't grow them.
+forgotten past 200 (the page's rows, Rust's `MAX_KEPT`), oldest first (in Rust, once the app has polled their
+`Ended`). Rust also caps the control messages waiting for a peer whose link takes none (`MAX_OUTBOX`, 256), so a
+peer that stops reading can't grow them.
 
 ## Testing it
 
