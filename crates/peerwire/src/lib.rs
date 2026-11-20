@@ -61,6 +61,8 @@ pub mod ble;
 mod bluez;
 #[cfg(feature = "espnow")]
 pub mod espnow;
+#[cfg(feature = "files")]
+pub mod files;
 mod lan;
 mod node;
 #[cfg(feature = "nostr")]

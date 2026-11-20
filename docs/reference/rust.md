@@ -66,6 +66,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 | `ble` | Bluetooth LE ([Bluetooth](../concepts/bluetooth.md)): the `peerwire::ble` module (the `Radio` driver trait, `RadioEvent`, `Limits`), `Builder::bluetooth`. The node's side only: a driver comes from `ble-bluez`, or from the app (the ESP32 port's NimBLE one) | nothing |
 | `ble-bluez` | `ble`, and the Linux driver `ble::BlueZ` (BlueZ over D-Bus), which logs what fails and is tried again through `log` | `bluer` 0.17 (`bluetoothd`), `dbus` 0.9 (`vendored`: `libdbus` built from source, so no system package is needed), `futures` 0.3, `log` 0.4, `tokio` 1 (`rt`, `sync`, `macros`) |
 | `espnow` | `ble`, and `peerwire::espnow` ([ESP-NOW](../concepts/espnow.md)): `EspNow`, a Bluetooth radio over ESP-NOW frames for a platform's `espnow::Ether` (the ESP32 port's), its `Settings` and `Stats`, and the sans-IO `Engine` and frame codec under it | nothing |
+| `files` | Peerwire Share: the [`peerwire::files`](#files) module, files of any size between peers in checked pieces, in the protocol of the browser's Share page, and the [`share` example](../../examples/rust/share.rs) | nothing (`sha2` and `rand_chacha` are always in) |
 | `testing` | `Builder::port_mapping_at`, port mapping through a fake gateway; `Node::set_udp_off`; with `ble`, `ble::FakeAir`, radios in one process, and `Node::ble_counts`; with `espnow`, `espnow::FakeAir`, ESP-NOW stations in one process (all hidden from rustdoc). For tests only, not for apps | nothing |
 
 `peerwire-ffi` has one feature, `sync`: the shared-document functions (`pw_docs_*`, `pw_doc_*`) on `peerwire-sync`.
@@ -112,6 +113,7 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `PathKind`, `Policy`, `Hop` | The kinds of path, a connection policy, and the addresses a host with TURN or a radio gives its endpoint (a network address, a peer through this node's TURN allocation, a peer's relayed address, or a radio connection, Bluetooth's or ESP-NOW's) | `src/traversal.rs` |
 | `ble` (feature `ble`) | Bluetooth LE: the `Radio` driver trait, `RadioEvent`, `DeviceId`, `ConnId`, `Limits`, the service's UUIDs, and `BlueZ` with `ble-bluez` (`BlueZ::alias`, `BlueZ::names_this_host`) | `src/ble.rs`, `src/bluez.rs` |
 | `TurnServer` (feature `turn`) | A TURN server and the credentials for it | `src/turn.rs` |
+| `files` (feature `files`) | Peerwire Share: `Files`, its `Event`s, `Wire`, `Source`, `Sink`, `FileSink`, and `files::frame`, the frames and checks ([below](#files)) | `src/files/` |
 | `PortMapping`, `MapProtocol` | Where router port mapping stands | `src/portmap.rs` |
 | `Config`, `ConnectError`, `DisconnectReason`, `Identity`, `Invite`, `Lane`, `PeerId`, `PeerStats`, `SendError`, `Stats`, `HELD_FRAGMENT`, `MAX_UNRELIABLE`, `MAX_URGENT` | Re-exported from `peerwire-core` | `crates/peerwire-core/src` |
 | `traversal` (module) | The sans-IO NAT traversal layer (`Traversal`) that `Node` drives; the simulator drives it too | `src/traversal.rs` |
@@ -662,6 +664,35 @@ one from each socket in turn. A host firewall must let in UDP to the group's por
 guest and public Wi-Fi networks keep clients apart. Browsers can't send UDP. A complete program is
 [`examples/rust/lan_chat.rs`](../../examples/rust/lan_chat.rs): run
 `cargo run -p peerwire --example lan_chat -- kitchen` on two or more machines on one Wi-Fi.
+
+### files
+
+`peerwire::files` (feature `files`, `crates/peerwire/src/files/`) sends and receives files in the
+[Share protocol](../concepts/share-protocol.md), the browser Share page's: offers the receiver accepts or declines,
+pieces of 512 KiB each with its SHA-256, a window of 8 pieces per peer, the whole file's SHA-256 at the end, and a
+transfer that goes on from the last piece written when a dropped link comes back. It reads a file being sent and
+writes one being received a piece at a time, and keeps a received file only once its whole hash matches. Data goes
+only over a direct link. `Files` is sans-IO like `peerwire_sync::Docs`: the host hands it the node's events and the
+time, and it sends through a `Wire`. The module docs have a host loop; [`examples/rust/share.rs`](../../examples/rust/share.rs)
+is a whole program (`share send <room> <file>...`, `share recv <room> <dir>`).
+
+| Item | |
+|---|---|
+| `Files::new()`, `Files::with_seed([u8; 32])` | No transfers yet; transfer ids from the OS's randomness, or from a seed |
+| `handle_event(&mut self, now: Instant, e: &Event) -> bool` | Hands it a node event: `Connected` and `Disconnected` (both also the app's: false), and messages, true if a Share message (taken, or dropped as not valid) |
+| `connected(peer)`, `disconnected(now, peer, reason)` | The same by hand. On `connected`, unanswered offers go again and accepted transfers resume. On `disconnected`, transfers wait for the peer up to `RESUME` (10 min), or end if it closed the link (`ClosedByPeer`) |
+| `receive(peer, lane, message) -> bool`, `receive_frame(peer, frame)` | A room message (true if it was a Share message; only `Reliable` ones are taken), or a bare Share frame |
+| `poll(&mut self, now: Instant, wire: &mut dyn Wire)` | Sends what may go now: held control messages, then pieces while the link carries files and the window has room; fails transfers whose peer didn't come back. Call it from the host loop after the events |
+| `offer(peer, name, mime, size, Box<dyn Source>) -> Result<TransferId, Error>`, `offer_file(peer, &Path)` | Offers a file to a connected peer: the name is cleaned before it goes. `Error::NotConnected`, `TooLarge` (over 1 TiB) or `Io` |
+| `accept(id, Box<dyn Sink>)`, `accept_into(id, dir: &Path)`, `decline(id)` | Answers an `Event::Offer`; `accept_into` writes into a `FileSink` in `dir`. `Error::NoTransfer` if `id` isn't an open offer. Nothing caps the transfers a peer has under way, each with its sink (an open file): an app that accepts without asking caps them per peer itself |
+| `cancel(id)` | Ends a live transfer either way and tells the peer |
+| `poll_event() -> Option<files::Event>` | `Offer { id, peer, name, size, mime }` (name cleaned), `Accepted`, `Progress { id, bytes, size }`, `Resumed { id, from }`, `Ended { id, end }` with `End::Done { sha256 }`, `Declined`, `Cancelled(why)` or `Failed(why)`. Every transfer ends with one `Ended` |
+| `info(id) -> Option<Info>`, `transfers()`, `stats()` | A transfer's peer, direction, `State`, name, size, bytes written, whether its peer is gone, SHA-256, where it was saved; the transfers kept (live ones, finished ones until `poll_event` has handed out their `Ended`, and the last `MAX_KEPT`, 200, finished); counters of what was sent, taken and refused |
+| `trait Wire { send(peer, frame) -> Result<(), SendError>; carries_files(peer) -> bool }` | The one seam between the protocol and the link. `Node` is one: each frame a room message on `Lane::Reliable`, as room.js sends bytes (the tag `0`, then the frame: `files::room_message`, `files::share_frame`), and data only while `path_kind` is `Direct` or `Birthday`. `WouldBlock` holds the frame for the next `poll` |
+| `trait Source { read_at(offset, buf) }`, `trait Sink { write, finish, abort, saved_as }` | Where a file comes from (any `Read + Seek`, such as a `File`) and goes. `FileSink::create(dir, name)` writes `.peerwire-<random>.part` in `dir` and, once verified, moves it to the name cleaned (again, so it stays in `dir`), or `name (2).ext` and on: it never replaces a file. A name longer than 200 bytes is cut, its extension kept |
+| `files::frame` | The frames and checks of `files.js`: `clean_name`, `clean_type`, `Offer`, `parse_offer`, `decode_control`, `encode_control`, `encode_piece`, `decode_piece`, `check_piece`, the limits (`PIECE`, `MIN_PIECE`, `MAX_PIECE`, `WINDOW`, `MAX_CONTROL`, `MAX_SIZE`, …) |
+
+The protocol, its limits and what each side refuses: [Share protocol](../concepts/share-protocol.md).
 
 ## peerwire-core
 

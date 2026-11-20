@@ -24,6 +24,7 @@ what's next. It's updated as parts land; the [changelog](../../CHANGELOG.md) has
 | JavaScript package: rooms over WebRTC, Nostr and BroadcastChannel signaling, fallback routes | ✅ | Node, headless Chromium, local fake relays |
 | Shared documents in JS (`room.doc()`): maps, sets, logs, catch-up, persistence, relay copies | ✅ | Node and browsers, against local fake relays |
 | Shared documents in Rust, Godot and the C ABI (`peerwire-sync`) | ✅ | against `room.doc()`'s own frames |
+| Peerwire Share in Rust (`peerwire::files`, feature `files`): files between native peers in the Share page's protocol | ✅ | loopback between nodes, `files.js`'s own vectors, and the page in headless Chromium over a stand-in room (a browser and a native node can't link yet) |
 | Calls in JS (`room.call()`): audio and video, a mesh of up to 16 | ✅ | Node, and headless Chromium with fake media devices |
 | Offline messages in JS (`openInbox()`) | ✅ | local fake relays |
 | React hooks (`@peerwire/react`) | ✅ | jsdom, and a Vite example |

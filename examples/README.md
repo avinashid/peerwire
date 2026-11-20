@@ -16,6 +16,7 @@ Most work on one machine over loopback; the ones marked **public** use public ST
 | [ble_chat.rs](rust/ble_chat.rs) | the same rooms over Bluetooth LE on Linux (`Builder::bluetooth` with the BlueZ driver) and the LAN, each link's path printed as it comes up and moves; `--no-udp` for the radio alone. See [Bluetooth](../docs/concepts/bluetooth.md#try-it) |
 | [doctor.rs](rust/doctor.rs) | **public.** The doctor: what this network's NAT does (mapping, filtering, IPv6), router port mapping, and whether each Nostr relay and the LAN carrier work, as text or `--json`; with `room <name>`, meeting a peer and whether the link came up direct, relayed or not at all. Results go in [Connectivity in the field](../docs/project/field-connectivity.md) |
 | [nostr_relay.rs](rust/nostr_relay.rs) | a minimal in-memory Nostr relay, for tests and LAN play without internet |
+| [share.rs](rust/share.rs) | Peerwire Share from a terminal (`peerwire::files`, feature `files`): `share send <room> <file>...` offers files to every peer in the room, `share recv <room> <dir>` asks before taking each one and keeps it once its SHA-256 matches; the [Share protocol](../docs/concepts/share-protocol.md) of the browser page, over direct links only |
 
 ```sh
 cargo run -p peerwire --example echo                                  # prints an invite, then echoes
@@ -28,6 +29,8 @@ cargo run -p peerwire --features ble-bluez --example ble_chat -- kitchen   # ove
 cargo run -p peerwire --features nostr --example doctor               # the network report (--json, --redact)
 cargo run -p peerwire --features nostr --example doctor -- room <name>     # then meet a peer running the same
 cargo run -p peerwire --features nostr --example nostr_relay -- 127.0.0.1:7447
+cargo run --release -p peerwire --features files,nostr --example share -- send <room> <file>...  # Peerwire Share
+cargo run --release -p peerwire --features files,nostr --example share -- recv <room> <dir>      # asks for each
 ```
 
 ## Core and simulator
