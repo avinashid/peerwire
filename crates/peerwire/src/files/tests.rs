@@ -451,6 +451,38 @@ fn offers_past_the_limit_are_declined_and_repeats_ignored() {
     assert_eq!(b.stats().offers_refused, 4);
 }
 
+#[test]
+fn a_transfer_is_kept_until_the_app_has_had_its_end() {
+    // Past MAX_KEPT transfers, all live; then, before the app polls its events, a cancel and another offer, which
+    // prunes: the cancelled one stays, so info() answers for the Ended the app gets next.
+    let mut b = Files::with_seed([2; 32]);
+    b.connected(A);
+    let offer = |b: &mut Files, i: usize| {
+        let j = format!(r#"{{"t":"offer","id":"{i:032x}","name":"n","size":1,"piece":524288}}"#);
+        b.receive_frame(A, &control(&j));
+    };
+    let mut ids = Vec::new();
+    for i in 0..=MAX_KEPT {
+        offer(&mut b, i);
+        let id = offer_id(&Pair::events(&mut b));
+        b.accept(id, Box::new(Mem::default())).unwrap();
+        ids.push(id);
+    }
+    b.cancel(ids[7]).unwrap();
+    offer(&mut b, MAX_KEPT + 1);
+    let events = Pair::events(&mut b);
+    assert!(matches!(ended(&events), Some(End::Cancelled(_))));
+    for e in &events {
+        if let Event::Ended { id, .. } = e {
+            assert_eq!(b.info(*id).map(|i| i.state), Some(State::Cancelled));
+        }
+    }
+    // Once the app has had it, it is the first finished one forgotten.
+    offer(&mut b, MAX_KEPT + 2);
+    assert!(b.info(ids[7]).is_none());
+    assert_eq!(b.transfers().count(), MAX_KEPT + 2);
+}
+
 /// B, having accepted A's offer of `size` bytes in pieces of 262144: B, its sink, and its wire.
 fn accepted(size: u64) -> (Files, Mem, Link, TransferId) {
     let mut b = Files::with_seed([2; 32]);
@@ -684,6 +716,23 @@ fn file_sink_keeps_only_verified_files_and_never_replaces_one() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn file_sink_cleans_the_name_it_is_given() {
+    // A name not from an Offer, with a path in it: the file still lands in the directory.
+    let base = std::env::temp_dir().join(format!("pw-files-{}-{}", std::process::id(), line!()));
+    let dir = base.join("in");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, want) in [("../escaped.txt", "_escaped.txt"), ("..", "file"), ("a/../../b", "a_.._.._b")] {
+        let mut s = FileSink::create(&dir, name).unwrap();
+        s.write(b"x").unwrap();
+        s.finish().unwrap();
+        assert_eq!(s.saved_as().unwrap(), dir.join(want), "{name}");
+    }
+    let outside: Vec<_> = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(outside, ["in"]);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
 // ---------- the golden vectors files.js makes (packages/js/test/rust_files.mjs) ----------
 
 mod vectors {
@@ -739,6 +788,12 @@ mod vectors {
             let got = frame::clean_name_utf16(&raw);
             if got != pair[1].as_str().unwrap() {
                 misses.push(format!("{:?} -> {got:?}, files.js {:?}", String::from_utf16_lossy(&raw), pair[1]));
+            }
+            // Cleaned again (as FileSink cleans an Offer's name), a clean name changes at most in its normal form:
+            // cleaning drops characters after NFC, which may leave marks for NFC to compose or reorder.
+            let again = frame::clean_name(&got);
+            if again != super::super::unicode::nfc(&got) {
+                misses.push(format!("{got:?} cleans again to {again:?}, not its NFC"));
             }
         }
         for pair in v["types"].as_array().unwrap() {

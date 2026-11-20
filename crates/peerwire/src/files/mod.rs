@@ -75,7 +75,8 @@ pub const RESUME: Duration = Duration::from_secs(10 * 60);
 pub const MAX_OFFERS: usize = 32;
 /// Pieces refused in one transfer before it fails.
 pub const MAX_REJECTS: u32 = 8;
-/// Finished transfers kept (for [`Files::info`], and to answer a sender back on a new link); the oldest go first.
+/// Finished transfers kept (for [`Files::info`], and to answer a sender back on a new link); the oldest go first,
+/// and only once [`Files::poll_event`] has handed out their [`Event::Ended`].
 pub const MAX_KEPT: usize = 200;
 /// Control messages held for one peer while its link takes none (its send buffer full); past that the newest are
 /// dropped. A peer that stops reading gets nothing more to make this side hold.
@@ -98,7 +99,9 @@ pub trait Wire {
 
 /// Share frames as room messages ([`room_message`]) on [`Lane::Reliable`]. Pieces go only while the link is direct:
 /// [`PathKind::Direct`] or [`PathKind::Birthday`], never through another peer, a relay peer, TURN or the signalling
-/// relays, as the page sends them only over a peer's own WebRTC link (files.js `directForFiles`).
+/// relays, as the page sends them only over a peer's own WebRTC link (files.js `directForFiles`). That is checked
+/// when a piece is handed to [`Node::send`]: if the link's path moves while pieces are in flight, the reliable lane
+/// may resend those (at most [`WINDOW`], and an `end`) over the new path (a relay, TURN or a pipe), still sealed.
 impl Wire for Node {
     fn send(&mut self, peer: &PeerId, frame: &[u8]) -> Result<(), SendError> {
         Node::send(self, peer, Lane::Reliable, &room_message(frame))
@@ -270,7 +273,7 @@ struct Transfer {
     count: u64,
     /// The peer's link dropped then; `None` while it is up.
     gone: Option<Instant>,
-    /// When it ended, as a count of ends, to forget the oldest first.
+    /// When it ended, as a count of ends (its `Event::Ended` is that one), to forget the oldest first.
     ended: u64,
     sha: Option<String>,
     // Sending: the next piece to send, how many the receiver acknowledged, how many the whole-file hash has taken.
@@ -341,7 +344,10 @@ pub struct Files {
     events: VecDeque<Event>,
     rng: ChaCha20Rng,
     next_id: u64,
+    /// Transfers ended, each with its `Event::Ended`, in order.
     ends: u64,
+    /// Of those `Event::Ended`, how many `poll_event` handed out: a transfer whose end is past this isn't forgotten.
+    told: u64,
     buf: Vec<u8>,
     stats: Stats,
 }
@@ -370,6 +376,7 @@ impl Files {
             rng: ChaCha20Rng::from_seed(seed),
             next_id: 1,
             ends: 0,
+            told: 0,
             buf: Vec::new(),
             stats: Stats::default(),
         }
@@ -380,7 +387,8 @@ impl Files {
         self.stats
     }
 
-    /// A transfer, if it is still kept (live ones always are; [`MAX_KEPT`] finished ones).
+    /// A transfer, if it is still kept: live ones always are, and finished ones at least until
+    /// [`poll_event`](Self::poll_event) has handed out their [`Event::Ended`] (then the [`MAX_KEPT`] latest).
     pub fn info(&self, id: TransferId) -> Option<Info> {
         let t = self.get(id)?;
         let pieces = if t.dir == Direction::Send { t.acked } else { t.have };
@@ -406,7 +414,11 @@ impl Files {
 
     /// The next event, if any.
     pub fn poll_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        let e = self.events.pop_front();
+        if let Some(Event::Ended { .. }) = e {
+            self.told += 1;
+        }
+        e
     }
 
     // ----- the node's side -----
@@ -569,7 +581,9 @@ impl Files {
         self.offer(peer, &name, "", meta.len(), Box::new(file))
     }
 
-    /// Accepts an offer: the file goes into `sink`.
+    /// Accepts an offer: the file goes into `sink`. Nothing here caps the transfers a peer has under way ([`MAX_OFFERS`]
+    /// caps only offers waiting), and each holds its sink (a [`FileSink`], an open file): an app that accepts without
+    /// asking must cap the live transfers per peer itself, as the `share` example does with `--yes`.
     pub fn accept(&mut self, id: TransferId, sink: Box<dyn Sink>) -> Result<(), Error> {
         let present = &self.present;
         let t = self
@@ -594,6 +608,7 @@ impl Files {
     }
 
     /// Accepts an offer into a [`FileSink`] in `dir`: the file appears there, under its cleaned name, once verified.
+    /// As with [`accept`](Self::accept), an app that accepts without asking must cap the live transfers per peer.
     pub fn accept_into(&mut self, id: TransferId, dir: &Path) -> Result<(), Error> {
         let name = self
             .get(id)
@@ -677,12 +692,8 @@ impl Files {
 
     // Ends a live transfer: its source or sink closed (a sink's partial file deleted), and an event.
     fn end(&mut self, id: TransferId, end: End) {
-        self.ends += 1;
-        let n = self.ends;
-        let Some(t) = self.get_mut(id) else { return };
-        if !t.live() {
-            return;
-        }
+        let n = self.ends + 1;
+        let Some(t) = self.get_mut(id).filter(|t| t.live()) else { return };
         t.state = match &end {
             End::Done { .. } => State::Done,
             End::Declined => State::Declined,
@@ -698,6 +709,7 @@ impl Files {
                 s.abort();
             }
         }
+        self.ends = n;
         self.events.push_back(Event::Ended { id, end });
     }
 
@@ -709,14 +721,16 @@ impl Files {
         self.end(id, end);
     }
 
-    // Forgets the oldest finished transfers past MAX_KEPT.
+    // Forgets the oldest finished transfers past MAX_KEPT, of those whose Event::Ended the app has had: info() works
+    // for every Ended it gets.
     fn prune(&mut self) {
         let over = self.transfers.len().saturating_sub(MAX_KEPT);
         if over == 0 {
             return;
         }
+        let told = self.told;
         let mut done: Vec<(u64, TransferId)> =
-            self.transfers.iter().filter(|t| !t.live()).map(|t| (t.ended, t.id)).collect();
+            self.transfers.iter().filter(|t| !t.live() && t.ended <= told).map(|t| (t.ended, t.id)).collect();
         done.sort_unstable();
         let gone: HashSet<TransferId> = done.into_iter().take(over).map(|(_, id)| id).collect();
         self.transfers.retain(|t| !gone.contains(&t.id));

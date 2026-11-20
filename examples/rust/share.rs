@@ -15,9 +15,10 @@
 //! - `send` offers each file to every peer that joins, and ends once every offer is answered and every file it sent
 //!   is verified by its receiver (`--stay` keeps offering to peers that join later). Its exit code is 0 if every one
 //!   was delivered.
-//! - `recv` asks before taking each file (`--yes` takes them all), keeps it under its cleaned name only once its
-//!   SHA-256 matches, never replacing a file (`name (2).ext` instead), and runs until stopped (`--once`: until its
-//!   first file ends, with exit code 0 if it was kept).
+//! - `recv` asks before taking each file (`--yes` takes them all, but at most 32 under way from one peer at once:
+//!   it declines more), keeps it under its cleaned name only once its SHA-256 matches, never replacing a file
+//!   (`name (2).ext` instead), and runs until stopped (`--once`: until its first file ends, with exit code 0 if it
+//!   was kept).
 //!
 //! The room may also be `tcp://<host:port>`: the room's messages then go over a TCP connection to that address, each
 //! as its length (4 bytes, big-endian) and the message, to the one peer at the other end. That is how
@@ -34,6 +35,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const APP: &str = "peerwire-share"; // the Share page's app id
+/// Files from one peer `recv --yes` takes at once, each an open file; it declines more.
+const MAX_LIVE: usize = 32;
 const USAGE: &str = "usage: share send <room> <file>... [--stay] | share recv <room> <dir> [--yes] [--once]";
 
 fn main() {
@@ -188,8 +191,18 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                     if o.send {
                         files.decline(id)?;
                     } else if o.yes {
-                        files.accept_into(id, &o.paths[0])?;
-                        started.insert(id, now);
+                        // Each transfer taken holds an open file: a peer gets at most MAX_LIVE at once.
+                        let live = files
+                            .transfers()
+                            .filter(|t| *t != id && files.info(*t).is_some_and(|i| i.peer == peer && i.state.is_live()))
+                            .count();
+                        if live >= MAX_LIVE {
+                            println!("declined [{id:?}]: {live} files from {peer} under way already");
+                            files.decline(id)?;
+                        } else {
+                            files.accept_into(id, &o.paths[0])?;
+                            started.insert(id, now);
+                        }
                     } else {
                         println!("accept {name:?}? [y/N]");
                         asking.push_back(id);
@@ -202,7 +215,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                 FileEvent::Resumed { id, from } => println!("[{id:?}] resumes from piece {}", from + 1),
                 FileEvent::Progress { .. } => {}
                 FileEvent::Ended { id, end } => {
-                    let info = files.info(id).expect("kept");
+                    let Some(info) = files.info(id) else { continue };
                     let secs = started.get(&id).map(|t| now.duration_since(*t).as_secs_f64());
                     let speed = match secs {
                         Some(s) if s > 0.0 => format!(" in {s:.1} s, {:.1} MB/s", info.size as f64 / 1e6 / s),

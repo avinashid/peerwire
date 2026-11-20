@@ -42,7 +42,9 @@ Pieces, and the `end` that follows them, go only while the link to the peer is *
 peer's own WebRTC DataChannel, not through TURN and not a channel adopted from a birthday punch (`directForFiles`);
 in Rust, a link whose `Node::path_kind` is `Direct` or `Birthday` (`impl Wire for Node`). Never through another
 member, a relay peer, TURN or the signalling relays. While the link is anything else, transfers wait. Control
-messages go over whatever link there is.
+messages go over whatever link there is. This is checked as each piece is handed to the link: in Rust, if the link's
+path moves while pieces are in flight, its reliable lane may resend those (at most `WINDOW`, and an `end`) over the
+new path, a relay, TURN or a pipe, still sealed end to end.
 
 ## Limits
 
@@ -201,8 +203,10 @@ When the peer is back (on any link):
 
 Per peer: up to `MAX_OFFERS` offers waiting (a name of at most 120 characters each), and at most `MAX_QUEUED` pieces
 not yet written, so about 8 MiB; per transfer one hash state. A sender holds one piece. Finished transfers are
-forgotten past 200 (the page's rows, Rust's `MAX_KEPT`), oldest first. Rust also caps the control messages waiting
-for a peer whose link takes none (`MAX_OUTBOX`, 256), so a peer that stops reading can't grow them.
+forgotten past 200 (the page's rows, Rust's `MAX_KEPT`), oldest first (in Rust, once the app has polled their
+`Ended`). Rust also caps the control messages waiting for a peer whose link takes none (`MAX_OUTBOX`, 256), so a
+peer that stops reading can't grow them. Nothing caps the transfers a peer has under way once accepted, each with an
+open file: a Rust app that accepts without asking caps them per peer (the `share` example's `--yes`, 32).
 
 ## Testing it
 
