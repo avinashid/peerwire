@@ -42,7 +42,9 @@ Pieces, and the `end` that follows them, go only while the link to the peer is *
 peer's own WebRTC DataChannel, not through TURN and not a channel adopted from a birthday punch (`directForFiles`);
 in Rust, a link whose `Node::path_kind` is `Direct` or `Birthday` (`impl Wire for Node`). Never through another
 member, a relay peer, TURN or the signalling relays. While the link is anything else, transfers wait. Control
-messages go over whatever link there is.
+messages go over whatever link there is. This is checked as each piece is handed to the link: in Rust, if the link's
+path moves while pieces are in flight, its reliable lane may resend those (at most `WINDOW`, and an `end`) over the
+new path, a relay, TURN or a pipe, still sealed end to end.
 
 ## Limits
 

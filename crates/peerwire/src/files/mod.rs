@@ -99,7 +99,9 @@ pub trait Wire {
 
 /// Share frames as room messages ([`room_message`]) on [`Lane::Reliable`]. Pieces go only while the link is direct:
 /// [`PathKind::Direct`] or [`PathKind::Birthday`], never through another peer, a relay peer, TURN or the signalling
-/// relays, as the page sends them only over a peer's own WebRTC link (files.js `directForFiles`).
+/// relays, as the page sends them only over a peer's own WebRTC link (files.js `directForFiles`). That is checked
+/// when a piece is handed to [`Node::send`]: if the link's path moves while pieces are in flight, the reliable lane
+/// may resend those (at most [`WINDOW`], and an `end`) over the new path (a relay, TURN or a pipe), still sealed.
 impl Wire for Node {
     fn send(&mut self, peer: &PeerId, frame: &[u8]) -> Result<(), SendError> {
         Node::send(self, peer, Lane::Reliable, &room_message(frame))
