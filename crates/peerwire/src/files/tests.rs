@@ -716,6 +716,23 @@ fn file_sink_keeps_only_verified_files_and_never_replaces_one() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn file_sink_cleans_the_name_it_is_given() {
+    // A name not from an Offer, with a path in it: the file still lands in the directory.
+    let base = std::env::temp_dir().join(format!("pw-files-{}-{}", std::process::id(), line!()));
+    let dir = base.join("in");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, want) in [("../escaped.txt", "_escaped.txt"), ("..", "file"), ("a/../../b", "a_.._.._b")] {
+        let mut s = FileSink::create(&dir, name).unwrap();
+        s.write(b"x").unwrap();
+        s.finish().unwrap();
+        assert_eq!(s.saved_as().unwrap(), dir.join(want), "{name}");
+    }
+    let outside: Vec<_> = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(outside, ["in"]);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
 // ---------- the golden vectors files.js makes (packages/js/test/rust_files.mjs) ----------
 
 mod vectors {
@@ -771,6 +788,12 @@ mod vectors {
             let got = frame::clean_name_utf16(&raw);
             if got != pair[1].as_str().unwrap() {
                 misses.push(format!("{:?} -> {got:?}, files.js {:?}", String::from_utf16_lossy(&raw), pair[1]));
+            }
+            // Cleaned again (as FileSink cleans an Offer's name), a clean name changes at most in its normal form:
+            // cleaning drops characters after NFC, which may leave marks for NFC to compose or reorder.
+            let again = frame::clean_name(&got);
+            if again != super::super::unicode::nfc(&got) {
+                misses.push(format!("{got:?} cleans again to {again:?}, not its NFC"));
             }
         }
         for pair in v["types"].as_array().unwrap() {

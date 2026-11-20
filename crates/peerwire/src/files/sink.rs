@@ -2,6 +2,7 @@
 //! received in order, and [`FileSink`] writes one into a directory, under its cleaned name only once it is whole and
 //! verified.
 
+use super::frame::clean_name;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -48,13 +49,17 @@ pub struct FileSink {
 }
 
 impl FileSink {
-    /// A sink for a file named `name` (as an [`Offer`](super::Offer) gives it: cleaned) in `dir`, which must exist.
+    /// A sink for a file named `name` in `dir`, which must exist. `name` is cleaned ([`clean_name`]) whatever it is,
+    /// so the file lands in `dir` even for `../x` or a path. An [`Offer`](super::Offer)'s name is clean already: at
+    /// most its Unicode normal form changes (NFC may compose marks that a character the first cleaning dropped kept
+    /// apart).
     pub fn create(dir: &Path, name: &str) -> io::Result<FileSink> {
         let mut rnd = [0u8; 8];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut rnd);
         let path = dir.join(format!(".peerwire-{}.part", super::frame::hex(&rnd)));
         let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
-        Ok(FileSink { dir: dir.to_path_buf(), name: fit(name), part: Some((path, file)), saved: None })
+        let name = fit(&clean_name(name));
+        Ok(FileSink { dir: dir.to_path_buf(), name, part: Some((path, file)), saved: None })
     }
 }
 
