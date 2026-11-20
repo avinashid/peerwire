@@ -136,4 +136,4 @@ required-features = ["nostr"]
 [[example]]
 name = "share"
 path = "../../examples/rust/share.rs"
-required-features = ["files", "nostr"]
+required-features = ["files"]
