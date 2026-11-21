@@ -121,6 +121,8 @@ struct ReadmeDoctests;
 mod doc_samples {
     #[doc = include_str!("../../../README.md")]
     struct Readme;
+    #[doc = include_str!("../../../docs/concepts/native-webrtc.md")]
+    struct ConceptsNativeWebrtc;
     #[doc = include_str!("../../../docs/getting-started/quick-start.md")]
     struct GettingStartedQuickStart;
     #[doc = include_str!("../../../docs/guides/connection-paths.md")]

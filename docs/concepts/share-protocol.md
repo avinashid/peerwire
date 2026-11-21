@@ -13,11 +13,10 @@ This page is the protocol both follow: the frames, the limits, the messages and 
 other sends. `files.js` is its source of truth; the Rust module is checked against vectors it makes
 (`packages/js/test/rust_files.mjs`).
 
-> [!NOTE]
-> A browser and a native node can't link yet: a joinRoom room doesn't dial a native peer, which has no WebRTC
-> ([NAT traversal](nat-traversal.md#messages)). So today browsers share with browsers and native apps with native
-> apps. The two speak the same protocol all the same: `share_native.mjs` runs the page against the Rust example over
-> a stand-in room and checks files both ways, byte for byte.
+A browser and a native node share in one room when the native one is built with the feature `webrtc`
+([Native WebRTC](native-webrtc.md)): it links with the page over a WebRTC DataChannel, as pages link with each other,
+and runs room.js's room layer on that link, so the page lists it as a member and sends it files as it sends a page
+(`share_webrtc.mjs`). Without the feature, browsers share with browsers and native apps with native apps.
 
 ## Messages on a link
 
@@ -40,7 +39,8 @@ digits in control messages; a receiver keys transfers by the sender and the id, 
 
 Pieces, and the `end` that follows them, go only while the link to the peer is **direct**: in a browser, the
 peer's own WebRTC DataChannel, not through TURN and not a channel adopted from a birthday punch (`directForFiles`);
-in Rust, a link whose `Node::path_kind` is `Direct` or `Birthday` (`impl Wire for Node`). Never through another
+in Rust, a link whose `Node::path_kind` is `Direct` or `Birthday` (`impl Wire for Node`): a UDP path, or a page's
+WebRTC DataChannel (feature `webrtc`) while its packets don't go to the page's TURN server. Never through another
 member, a relay peer, TURN or the signalling relays. While the link is anything else, transfers wait. Control
 messages go over whatever link there is. This is checked as each piece is handed to the link: in Rust, if the link's
 path moves while pieces are in flight, its reliable lane may resend those (at most `WINDOW`, and an `end`) over the
@@ -218,6 +218,8 @@ open file: a Rust app that accepts without asking caps them per peer (the `share
   files.js.
 - `node packages/js/test/share_native.mjs`: the page against the Rust `share` example, both ways, over a stand-in
   room; `--mb=1024` for a large file.
+- `node packages/js/test/share_webrtc.mjs`: the page and the `share` example built with `webrtc` in one room, over a
+  real WebRTC link on loopback (a local Nostr relay for the signalling), both ways; `--mb=1024` for a large file.
 
 Measured on the test host (4 aarch64 cores, loopback, 20 November 2026), 1 GiB of random bytes each way, checked
 byte for byte:
@@ -231,3 +233,18 @@ byte for byte:
 The two browser rows run over the test's stand-in room (a WebSocket and a TCP connection on loopback), not a
 Peerwire link, so they measure what the two ends do (read, hash, write, the window and its acks), not a network. The
 example's resident memory peaked at 11 MB in every run: it holds a piece, not the file.
+
+Over a real link (NB-162, 21 November 2026, the same host, 1 GiB each way, checked byte for byte), with the example
+built with `webrtc` and in one room with the page over a WebRTC DataChannel on loopback, the signalling through a
+local Nostr relay; other gates were running beside it (load average 10 to 22 on the 4 cores):
+
+| Direction | How | Speed |
+|---|---|---|
+| native to browser | `share_webrtc.mjs --mb=1024`: the example to the page, which downloads it through its service worker | 2.2 MB/s (495 s) |
+| browser to native | the same test, the page to the example | 5.7 MB/s (189 s) |
+| browser to browser, for scale | `share_browser.mjs --big=64`: two tabs of one Chromium, the same hour | 1.5 MB/s |
+
+On a quiet host, 16 MiB went at 3 to 4 MB/s to the page and 5 to 6.5 MB/s from it. The page sets the pace: it runs
+the core on its main thread, a DataChannel message at a time, and the core's round trip on the link rose from 0.75
+ms to 6 to 36 ms under the load, which its congestion control reads as queueing. The example's resident memory
+peaked at 14 MB, and the relay carried 142 events, 52 KB in all: the signalling alone.

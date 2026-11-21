@@ -198,7 +198,10 @@ impl Rtcs {
 
     /// A new connection's `Rtc`, with this node's candidates.
     fn new_rtc(&self, now: Instant) -> Rtc {
-        let mut rtc = Rtc::builder().set_sctp_max_buffered_amount(MAX_BUFFERED + 64 * 1024).build(now);
+        // The peer's DTLS certificate must match the fingerprint in its description (str0m's default, kept so):
+        // that description came sealed from the peer's PeerId, which binds the DTLS session to it.
+        let config = Rtc::builder().set_fingerprint_verification(true);
+        let mut rtc = config.set_sctp_max_buffered_amount(MAX_BUFFERED + 64 * 1024).build(now);
         for a in &self.local {
             if let Ok(c) = Candidate::host(*a, "udp") {
                 rtc.add_local_candidate(c);
@@ -398,9 +401,15 @@ impl Rtcs {
         true
     }
 
-    /// A datagram the node's socket read from `source` (at its own address `local`): taken (true) if it is a
-    /// browser's, ICE or DTLS on one of these connections. Anything else is the node's.
-    pub(crate) fn receive(&mut self, now: Instant, source: SocketAddr, local: SocketAddr, data: &[u8]) -> bool {
+    /// A datagram the node's socket read from `source`: taken (true) if it is a browser's, ICE or DTLS on one of these
+    /// connections. Anything else is the node's. `local` names the address it came in at, asked only for one taken.
+    pub(crate) fn receive(
+        &mut self,
+        now: Instant,
+        source: SocketAddr,
+        local: impl FnOnce() -> SocketAddr,
+        data: &[u8],
+    ) -> bool {
         if self.conns.is_empty() {
             return false;
         }
@@ -409,13 +418,16 @@ impl Rtcs {
         if !matches!(data.first(), Some(0..=3 | 20..=63)) {
             return false;
         }
-        let Ok(r) = Receive::new(Protocol::Udp, source, local, data) else { return false };
-        let input = Input::Receive(now, r);
-        let Some(peer) = self.conns.iter().find(|(_, c)| c.rtc.accepts(&input)).map(|(p, _)| *p) else {
+        // Which connection takes it (its ICE username, or an address its ICE checked) doesn't depend on where it
+        // came in; what it does there does.
+        let Ok(r) = Receive::new(Protocol::Udp, source, source, data) else { return false };
+        let probe = Input::Receive(now, r);
+        let Some(peer) = self.conns.iter().find(|(_, c)| c.rtc.accepts(&probe)).map(|(p, _)| *p) else {
             return false;
         };
+        let Ok(r) = Receive::new(Protocol::Udp, source, local(), data) else { return false };
         let c = self.conns.get_mut(&peer).expect("there");
-        if c.rtc.handle_input(input).is_err() {
+        if c.rtc.handle_input(Input::Receive(now, r)).is_err() {
             c.dead = true;
         }
         drain(peer, c, &mut self.out);

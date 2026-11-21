@@ -40,8 +40,8 @@ impl Browsers {
         if self.rtcs.counts().0 == 0 {
             return false;
         }
-        let local = local_for(bound, &mut self.routes, source);
-        self.rtcs.receive(wall, source, local, data)
+        let routes = &mut self.routes;
+        self.rtcs.receive(wall, source, || local_for(bound, routes, source), data)
     }
 
     /// A browser's WebRTC signal: an offer is answered if it proves the room key and its sender is a member this
@@ -265,7 +265,13 @@ impl Node {
         }
         match e {
             Ev::Connected { peer, initiator, .. } => {
-                let proof = self.trav.room_pair(room::LINK, &me, &peer)?;
+                // Out of the room (it was left), a browser's link has no room to prove: it closes.
+                let Some(proof) = self.trav.room_pair(room::LINK, &me, &peer) else {
+                    b.closing.push(peer);
+                    self.ep.disconnect(&peer);
+                    self.status.remove(&peer);
+                    return None;
+                };
                 let f = b.members.linked(now, peer, initiator, &proof);
                 self.send_room(peer, f);
                 None

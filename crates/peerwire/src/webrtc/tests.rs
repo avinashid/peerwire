@@ -56,12 +56,12 @@ impl Pair {
         }
         while let Some((dst, d)) = self.a.poll_udp() {
             if dst == self.at[1] {
-                self.b.receive(now, self.at[0], self.at[1], &d);
+                self.b.receive(now, self.at[0], || self.at[1], &d);
             }
         }
         while let Some((dst, d)) = self.b.poll_udp() {
             if dst == self.at[0] {
-                self.a.receive(now, self.at[1], self.at[0], &d);
+                self.a.receive(now, self.at[1], || self.at[0], &d);
             }
         }
         self.a.handle_timeout(now);

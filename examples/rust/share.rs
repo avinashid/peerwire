@@ -352,7 +352,10 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 fn browser(node: &Node, peer: &PeerId) -> String {
     #[cfg(feature = "webrtc")]
     if node.is_browser(peer) {
-        return format!(" browser {}", node.presence(peer).unwrap_or("{}"));
+        // A page says what it likes: its control characters (a terminal's escapes) are shown as U+FFFD.
+        let shown: String =
+            node.presence(peer).unwrap_or("{}").chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect();
+        return format!(" browser {shown}");
     }
     let _ = (node, peer);
     String::new()

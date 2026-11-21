@@ -39,7 +39,9 @@ const room = await joinRoom({ appId: 'my-app', roomId: randomRoomId(), signaling
 ```
 
 Joins a room, and resolves once the signalling is ready and our first hello has gone out. Peers that give the same
-`appId` and `roomId` find each other, link, and show up as [`'peer-join'`](#events).
+`appId` and `roomId` find each other, link, and show up as [`'peer-join'`](#events). A native Rust node built with
+WebRTC (feature `webrtc`) in the same room is one of them, over the same signalling: it links and joins as a page does
+([Native WebRTC](../concepts/native-webrtc.md)).
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
@@ -1013,7 +1015,8 @@ const link = new RelayTransport(endpoint, {
 ```
 
 Links a page (or Node) with a native room member, a Rust node or a board on Wi-Fi, over the room's Nostr relays alone,
-from anywhere: a browser can't dial a native peer over WebRTC, and a board has no WebRTC. The link's datagrams go as
+from anywhere: a board has no WebRTC, and a Rust node has it only with the feature `webrtc` (then a `joinRoom` room
+links with it directly: [Native WebRTC](../concepts/native-webrtc.md)). The link's datagrams go as
 signalling messages, on `WebRtcTransport`'s [pipe](#through-any-nat): sealed to the peer, each batch through one relay,
 a few batches a second. That is slow (a relay trip each way), fine for commands and chat, not for streams.
 
