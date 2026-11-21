@@ -55,7 +55,8 @@ new path, a relay, TURN or a pipe, still sealed end to end.
 | `PIECE` | 524,288 (512 KiB) | The piece size a sender offers, the page and Rust alike |
 | `MIN_PIECE` | 262,144 (256 KiB) | The smallest piece size a receiver takes |
 | `MAX_PIECE` | 1,048,522 | The largest: `MAX_FRAME - 1 - HEADER`, so a piece and the room's tag fill the lane's largest message |
-| `WINDOW` | 8 | Pieces a sender has in flight to one peer (sent, not acknowledged), over all its transfers to it: 4 MiB at `PIECE` |
+| `WINDOW` | 8 | Pieces a sender has in flight to one peer at most (sent, not acknowledged), over all its transfers to it: 4 MiB at `PIECE` |
+| `MIN_WINDOW`, `MAX_WINDOW` | 1 MiB, 4 MiB | The page's window in bytes, within `WINDOW` pieces: see [the sender](#a-transfer) |
 | `MAX_QUEUED` | 16 | Pieces a receiver holds taken but not yet written, over one peer's transfers; more means the sender ignores acks |
 | `MAX_SIZE` | 2^40 (1 TiB) | The largest file |
 | `MAX_CONTROL` | 4,096 | Bytes of a control message's JSON; a longer one is never parsed |
@@ -158,7 +159,12 @@ sender                                           receiver
 
 - an `accept` with `have` exactly 0 (`-0` and `0.0` are 0) starts an offered transfer; any other is ignored;
 - pieces go in order while the link is direct and the peer has fewer than `WINDOW` pieces in flight, over all the
-  transfers to it (the oldest accepted transfer first), each with its own SHA-256;
+  transfers to it (the oldest accepted transfer first), each with its own SHA-256. The page also keeps the bytes in
+  flight under a window of twice the rate its acks come at times the link's round trip, from `MIN_WINDOW` to
+  `MAX_WINDOW` (files.js `windowBytes`): pieces queue on the reliable lane ahead of anything else sent to the peer,
+  a chat message or an `ack`, so it sends no more than keeps the link busy. A chat message sent during a transfer
+  waits behind up to a window: **theoretical** window / rate, 0.1 s for 1 MiB at 10 MB/s, against 0.4 s for 4 MiB.
+  Rust keeps `WINDOW` pieces;
 - each piece goes into the whole file's SHA-256 once, the first time it is read, however often a resume sends it
   again;
 - after the last piece, `end` with the whole file's SHA-256 (an empty file: `end` at once);
@@ -210,7 +216,8 @@ open file: a Rust app that accepts without asking caps them per peer (the `share
 
 ## Testing it
 
-- `node packages/js/test/share.mjs`: files.js alone: framing, hashes, offers, names, `checkPiece`, `resumeAt`.
+- `node packages/js/test/share.mjs`: files.js alone: framing, hashes, offers, names, `checkPiece`, `resumeAt`,
+  `windowBytes`.
 - `node packages/js/test/share_browser.mjs`: the page in headless Chromium, tabs sharing files, hostile peers.
 - `node packages/js/test/rust_files.mjs`: the vectors files.js makes (names, types, control frames valid and
   mutated, piece checks, resumes, the frames each side writes, the streaming hash), which
