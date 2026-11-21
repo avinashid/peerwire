@@ -133,7 +133,7 @@ says goodbye first, on the unreliable lane, then the core's sealed close, as `ro
 | `MAX_ICE_BATCH` | 32 | Candidates in one `ice-batch` (more: dropped whole), and held before our offer's answer |
 | `OPEN_WITHIN` | 15 s | A connection whose DataChannel isn't open by then is dropped; a page dials again at its next hello |
 | `PUBLISH_BURST`, `PUBLISH_EVERY` | 6, 5 s | Offers, answers and copies of either to one peer: a burst, then one per 5 s |
-| `REPLACE_AFTER` | 2 s | A connection is replaced by a new offer from its peer at most this often, and restarts ICE for a page's restart offer at most this often too; a restart offer must bring new ICE credentials (its `ice-ufrag`), or it is refused |
+| `REPLACE_AFTER` | 2 s | A connection is replaced by a new offer from its peer at most this often, and restarts ICE for a page's restart offer at most this often too, or a failed try (which ends the connection); a restart offer must bring new ICE credentials (its `ice-ufrag`), or it is refused |
 | `MAX_BUFFERED` | 1 MiB | Bytes buffered in a connection's SCTP association past which the core's datagrams are dropped |
 | `PROOF_WITHIN` | 10 s | A link's proof must come this soon after it connects |
 | DataChannel message | 1 to 1,232 B | A larger or empty one, or text, is dropped before the core (str0m takes at most 256 KiB) |
@@ -153,7 +153,7 @@ accepted for v1 (NB162-I1), as with the node's other per-node caps, which a memb
   it is on a fallback. A native dialler does neither: a link whose ICE fails ends, and the page dials again at its
   next hello (every 15 s); a page's own restart offer to a native answerer is answered on the same connection if it
   brings new ICE credentials, as webrtc.js's does (`createOffer({ iceRestart: true })`), at most once per
-  `REPLACE_AFTER` (2 s).
+  `REPLACE_AFTER` (2 s) for a restart or a failed try.
 - **TURN on the node's side.** The node has no TURN for WebRTC: its candidates are its own. A page may still reach it
   through its TURN server, and `path_kind` says `Turn` then.
 - **Fallbacks.** When WebRTC can't link a page that dials a node, the page falls back to a pipe over the signalling
@@ -209,9 +209,11 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
   a mark made before it (NB162-1). A hello forged before a native's first offer still marks it until that offer
   comes: meanwhile the node sends it no offer of its own and, with the smaller id, dials it over WebRTC.
 - **ICE restarts.** A page's restart offer on an open connection is taken only with new ICE credentials, on which
-  str0m drops the connection's old candidates and pairs, at most once per `REPLACE_AFTER`, and its candidates are
-  counted afresh (NB162-2). With the same credentials str0m would keep every candidate, so the list, and the time
-  each offer takes, would grow without bound.
+  str0m drops the connection's old candidates and pairs, at most once per `REPLACE_AFTER` for a restart or a failed
+  try, and its candidates are counted afresh (NB162-2). With the same credentials str0m would keep every candidate,
+  so the list, and the time each offer takes, would grow without bound. str0m takes an offer's credentials and
+  candidates before it can still refuse it (with no `a=group`, say), so a failed try counts too, and ends the
+  half-restarted connection, as a failed answer does.
 - **Resource caps.** See [Limits](#limits): connections, descriptions, candidates, the publish budget, the time to
   open, the SCTP buffer, the DataChannel's message size, the proof deadline, the room frames waiting; a presence is
   at most the reliable lane's largest message (1 MiB) per linked page. str0m bounds its own STUN queue (100 checks
@@ -235,9 +237,10 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
 
 - `cargo test -p peerwire --lib -- webrtc:: browser`: two connections over memory (an offer answered, the channel open,
   datagrams both ways, a close seen by ICE); offers without the room proof, malformed signals and floods; restart
-  offers (the same ICE credentials or too soon refused, a real ICE restart answered on the same connection); the
-  room layer (proof, presence, goodbye, doc asks, dropped tags); browser hellos in the traversal, ours and theirs,
-  and one forged for a native, before and after it links (two nodes over memory).
+  offers (the same ICE credentials or too soon refused, a real ICE restart answered on the same connection, one str0m
+  refuses counted and the connection ended); the room layer (proof, presence, goodbye, doc asks, dropped tags);
+  browser hellos in the traversal, ours and theirs, and one forged for a native, before and after it links (two nodes
+  over memory).
 - `cargo test -p peerwire --test webrtc`: native nodes with WebRTC on and off link with each other over UDP as
   ever, their events and raw messages untouched by the room layer.
 - `node packages/js/test/share_webrtc.mjs` (the gate's `share webrtc`): the Share page in headless Chromium and the

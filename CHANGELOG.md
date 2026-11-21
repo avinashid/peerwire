@@ -18,7 +18,8 @@ and the commit that fixed it.
   `room_chat` examples use it: the Share page and `share` send files to each other directly. Before it merged, a
   browser hello stopped marking a peer that has sent a native offer, and such an offer clears the mark, so a member
   can't make a native look like a browser (NB162-1); and a page's ICE restart offer is taken only with new ICE
-  credentials, at most once per 2 s, so restarts can't grow the connection's candidates without bound (NB162-2).
+  credentials, at most once per 2 s for a restart or a failed try (which ends the connection), so restarts can't grow
+  the connection's candidates without bound (NB162-2).
 - **Peerwire Share in Rust** (NB-159, [Share protocol](docs/concepts/share-protocol.md)): `peerwire` feature `files`
   (no dependency of its own) adds `peerwire::files`, the browser Share page's file protocol: offers accepted or
   declined, 512 KiB pieces each with its SHA-256, a window of 8 pieces per peer, the whole file's SHA-256, a transfer
