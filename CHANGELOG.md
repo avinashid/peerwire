@@ -15,7 +15,10 @@ and the commit that fixed it.
   ways, presence, goodbye). Pages of any version link with it, as it also says a browser-shaped hello; natives still
   link with natives over UDP. `Node::is_browser`, `presence`, `set_presence`, `browsers`, `room_text`,
   `room_message_text`, `webrtc_counts`; `Hop::Rtc`, a direct path, so `files` sends pieces over it. The `share` and
-  `room_chat` examples use it: the Share page and `share` send files to each other directly.
+  `room_chat` examples use it: the Share page and `share` send files to each other directly. Before it merged, a
+  browser hello stopped marking a peer that has sent a native offer, and such an offer clears the mark, so a member
+  can't make a native look like a browser (NB162-1); and a page's ICE restart offer is taken only with new ICE
+  credentials, at most once per 2 s, so restarts can't grow the connection's candidates without bound (NB162-2).
 - **Peerwire Share in Rust** (NB-159, [Share protocol](docs/concepts/share-protocol.md)): `peerwire` feature `files`
   (no dependency of its own) adds `peerwire::files`, the browser Share page's file protocol: offers accepted or
   declined, 512 KiB pieces each with its SHA-256, a window of 8 pieces per peer, the whole file's SHA-256, a transfer
@@ -279,6 +282,12 @@ and the commit that fixed it.
   whole file's checked, and is written as it arrives (`showSaveFilePicker`'s writable stream, else a download streamed
   by a service worker, else in memory up to 256 MB). Pieces go only over a peer's own DataChannel, never through the
   signalling relays, a member or TURN, and a transfer whose link drops goes on from the last piece written.
+- **Share demo, faster** (NB-158): the whole-file SHA-256 keeps every sum within int32, about 5 times faster in
+  Chromium, and a sender keeps 1 to 4 MiB in flight to a peer, twice the rate its acks come at times the link's round
+  trip (`windowBytes`), rather than 8 pieces always: pieces queue on the reliable lane ahead of anything else sent to
+  that peer, so a chat message sent during a transfer waits behind 1 MiB on a short link rather than 4 MiB. The
+  protocol is unchanged: at most 8 pieces in flight still, so a receiver on the last release holds no more than it
+  did.
 - **Fix:** `DEFAULT_RELAYS` are `wss://relay.primal.net`, `wss://relay.nostr.net` and `wss://nostr.oxtr.dev`, three
   operators. nos.lol and nostr.mom, two of the three before, now drop our events (signalling and `openInbox` drops
   alike) with no `OK` and pass none on (NB-130). A page on 0.3 still meets one on the new list over relay.primal.net.
