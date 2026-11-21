@@ -8,11 +8,11 @@
 //            'end' | 'done', id, ... }
 //
 // A file is cut into pieces of `piece` bytes (the last may be shorter), each well under the reliable lane's largest
-// message (MAX_FRAME, the room's tag byte included). The sender keeps at most WINDOW pieces it hasn't seen acked, so
-// neither side holds more than a few MiB of a file of any size. The receiver takes pieces only in order and only for a
-// transfer it accepted, checks each piece's SHA-256 (WebCrypto) and the whole file's (Sha256 below, as it streams),
-// writes each piece before it acks it, and on a new link says how many pieces it has (`accept` with `have`), so the
-// sender goes on from there (resumeAt).
+// message (MAX_FRAME, the room's tag byte included). The sender keeps at most windowBytes() of pieces it hasn't seen
+// acked, and at most WINDOW pieces, so neither side holds more than a few MiB of a file of any size. The receiver
+// takes pieces only in order and only for a transfer it accepted, checks each piece's SHA-256 (WebCrypto) and the
+// whole file's (Sha256 below, as it streams), writes each piece before it acks it, and on a new link says how many
+// pieces it has (`accept` with `have`), so the sender goes on from there (resumeAt).
 //
 // Everything a peer sends is untrusted: offers are checked and their names cleaned (parseOffer, cleanName), control
 // messages over MAX_CONTROL bytes are never parsed, and a piece that isn't the next one, is the wrong length or fails
@@ -26,7 +26,9 @@ export const HEADER = 1 + ID_BYTES + 4 + 32;
 export const PIECE = 512 * 1024; // what this page sends
 export const MIN_PIECE = 256 * 1024; // what it takes from others
 export const MAX_PIECE = MAX_FRAME - 1 - HEADER;
-export const WINDOW = 8; // pieces in flight per transfer: 4 MiB at PIECE
+export const WINDOW = 8; // pieces in flight to one peer at most, over all transfers to it: 4 MiB at PIECE
+export const MIN_WINDOW = 1 << 20; // bytes in flight to one peer: windowBytes()
+export const MAX_WINDOW = 4 << 20;
 export const MAX_QUEUED = 2 * WINDOW; // pieces a receiver holds unwritten; more means the sender ignores acks
 export const MAX_SIZE = 2 ** 40; // 1 TiB
 export const MAX_CONTROL = 4096; // bytes of a control message's JSON
@@ -179,13 +181,26 @@ export function resumeAt(t, read, have) {
   return { next: have, offset: Math.min(t.size, have * t.piece) };
 }
 
+// Bytes a sender keeps in flight to one peer (sent, not acked), over all its transfers to it: twice what the link
+// carries in a round trip, `bps` being the bytes a second acked lately and `rttMs` the link's round trip, from
+// MIN_WINDOW to MAX_WINDOW. Pieces wait in the room's reliable lane ahead of whatever goes to the peer after them (a
+// chat message, an ack), so the window is no bigger than keeps the link busy: in Chromium on loopback, 1 MiB moves as
+// much as 4 MiB did, and holds a chat message about 0.1 s where 4 MiB held it 0.6 s (NB-158). A link that carries
+// more each round trip grows it: 100 ms at 20 MB/s reaches MAX_WINDOW in a few seconds.
+export function windowBytes(bps, rttMs) {
+  const bdp = (2 * bps * rttMs) / 1000;
+  return bdp > MIN_WINDOW ? Math.min(MAX_WINDOW, Math.ceil(bdp)) : MIN_WINDOW;
+}
+
 // Whether a route (room.route(peer)) may carry file data: the peer's own WebRTC DataChannel, not through TURN, and not
 // a channel adopted from a birthday punch, whose link goes back to its fallback (the signalling relays) when the
 // channel closes, taking the data not yet acknowledged with it. A direct link that closes ends its session instead.
 export const directForFiles = (r) => r?.kind === 'direct' && !r.turn && !r.adopted;
 
 // SHA-256 over a stream of bytes, as WebCrypto has none: update() with each piece in order, then digest(). About
-// 150 MB/s on one core of the test host, so share.js runs it in a worker (hash-worker.js).
+// 150 MB/s on one core of the test host, so share.js runs it in a worker (hash-worker.js). Every sum is kept within
+// int32 and the state is read without destructuring: written plainly, it took 22% of a core in Chromium during a
+// 6.4 MB/s transfer (30 MB/s), against 5% at 7 MB/s this way (NB-158).
 const K = new Int32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
   0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
@@ -242,7 +257,8 @@ export class Sha256 {
   blocks(b, off, end) {
     const h = this.h;
     const w = W;
-    let [h0, h1, h2, h3, h4, h5, h6, h7] = h;
+    // The state in locals, read one by one: destructuring an Int32Array goes through its iterator.
+    let h0 = h[0], h1 = h[1], h2 = h[2], h3 = h[3], h4 = h[4], h5 = h[5], h6 = h[6], h7 = h[7];
     for (; off < end; off += 64) {
       for (let i = 0; i < 16; i++) {
         const j = off + i * 4;
@@ -253,12 +269,12 @@ export class Sha256 {
         const y = w[i - 2];
         const s0 = ((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3);
         const s1 = ((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10);
-        w[i] = (s0 + w[i - 16] + s1 + w[i - 7]) | 0;
+        w[i] = (((s0 + w[i - 16]) | 0) + ((s1 + w[i - 7]) | 0)) | 0;
       }
       let a = h0, bb = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
       for (let i = 0; i < 64; i++) {
         const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
-        const t1 = (hh + S1 + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+        const t1 = (((((hh + S1) | 0) + ((e & f) ^ (~e & g))) | 0) + ((K[i] + w[i]) | 0)) | 0;
         const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
         const t2 = (S0 + ((a & bb) ^ (a & c) ^ (bb & c))) | 0;
         hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;

@@ -442,9 +442,21 @@ function onDone(t, m) {
   } else if (t.acked === t.count) finish(t, 'failed', 'the receiver’s SHA-256 doesn’t match');
 }
 
-// Pieces in flight to `peer`, over all our transfers to it: at most WINDOW, so the receiver never holds more.
 const sending = (peer) => [...outgoing.values()].filter((t) => t.peer === peer && t.state === 'sending');
-const inFlight = (peer) => sending(peer).reduce((n, t) => n + t.next - t.acked, 0);
+// Whether `peer` may have another piece: what is in flight to it over all our transfers to it (sent, not acked) is
+// under its window in bytes (files.js windowBytes, from how fast its acks come and the link's round trip), and under
+// WINDOW pieces, so the receiver never holds more than MAX_QUEUED.
+function windowOpen(peer) {
+  let pieces = 0;
+  let bytes = 0;
+  let bps = 0;
+  for (const t of sending(peer)) {
+    pieces += t.next - t.acked;
+    bytes += Math.min(t.size, t.next * t.piece) - Math.min(t.size, t.acked * t.piece);
+    bps += t.rate.bps;
+  }
+  return pieces < F.WINDOW && bytes < F.windowBytes(bps, room.rtt(peer) ?? 0);
+}
 // The transfer to `peer` whose pieces go next: the oldest accepted one with pieces (or its end) still to send.
 const head = (peer) => sending(peer).find((t) => t.gone === null && !(t.endSent && t.next === t.count));
 
@@ -456,7 +468,7 @@ async function pump(peer) {
   try {
     for (let t = head(peer); t && direct(peer); t = head(peer)) {
       if (t.next < t.count) {
-        if (inFlight(peer) >= F.WINDOW) break;
+        if (!windowOpen(peer)) break;
         if (!(await sendPiece(t))) break;
       } else if (!(await sendEnd(t))) break;
     }
