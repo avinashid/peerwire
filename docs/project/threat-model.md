@@ -233,8 +233,11 @@ release of each.
 | NB158-I1 (Info) | Open: no test guards `LocalTransport`'s copy of each datagram, without which every datagram posted on a local room's channel would carry the whole of the wasm's memory, keys included; the tests pass with it taken out. Fix: a check that each posted datagram's buffer is its own size, [Datagrams as views, and delayed ACKs](#datagrams-as-views-and-delayed-acks-nb-158--nb158-i1) |
 | NB159-1 (Low) | **Fixed** by `bc2fe5f` before NB-159 merged, so never on main: when 200 or more transfers were live, one that just ended could be forgotten before the app read its `Ended`, and the `share` example then panicked; `prune` now forgets only transfers whose `Ended` the app has polled, and the example skips an `Ended` it has no `info` for, reviewed 2026-11-20, [Peerwire Share in Rust](#peerwire-share-in-rust-nb-159--nb159-1-nb159-2-nb159-3) |
 | NB159-2 (Low) | **Fixed** by `eb56bac` before NB-159 merged, so never on main: `share recv --yes` held a file open for each offer a peer made until it ran out; it now declines an offer from a peer with 32 transfers under way, and the module's docs tell an app that accepts by itself to cap them, reviewed 2026-11-20, same section |
-| NB159-3 (Low) | Open: the `share` example exits when it answers an offer that ended before it did (its sender cancelled it, or its peer left), so a room member's offer and `cancel` in one batch stop `share recv --yes` or `share send`. Fix: the example goes on past `NoTransfer` and `NotConnected` from `accept_into` and `decline`, same section |
+| NB159-3 (Low) | **Fixed** by `bc9f3e7` before NB-159 merged, so never on main: the `share` example ended when it answered an offer that had ended first (its sender cancelled it, or its peer left), so a member's offer and `cancel` in one batch stopped `share recv --yes` or `share send`; it now goes on past `NoTransfer`, takes an offer whose peer's link is down once the link is back, and asks no more about an offer that ended, reviewed 2026-11-21, same section |
 | NB159-I1, NB159-I2 (Info) | **Fixed** by `9386298` and `1b72eec` before NB-159 merged, so never on main: the protocol page and `impl Wire for Node` say a move of the link can carry the pieces in flight over a relay (at most the window, sealed), and `FileSink::create` cleans the name it is given, reviewed 2026-11-20, same section |
+| NB162-1 (Medium) | **Fixed** by `dba6157` before NB-162 merged, so never on main: any room member could say a room.js hello naming a native member's PeerId, and a node with browsers on then ran the room layer on that peer's links for good, dropping its messages and goodbye on a native link already up and closing each new one at 10 s; a hello no longer marks a peer that has sent this node a native offer, which only that peer can seal, and such an offer clears a mark made before it, reviewed 2026-11-21. Accepted for v1 by the lead on 2026-11-21: a hello forged before a native's first offer marks it until that offer comes, [Native WebRTC to pages](#native-webrtc-to-pages-nb-162--nb162-1-nb162-2-nb162-i1) |
+| NB162-2 (Medium) | **Fixed** by `126914b` and `05a9d36` before NB-162 merged, so never on main: a page linked to the node could send offers marked `restart` that added their candidates to the connection's, so the WebRTC library's list of candidates, and the time it took for each offer, grew without bound; a restart offer is now taken only with new ICE credentials, at most once per `REPLACE_AFTER`, its candidates counted afresh, and a try counts before the library takes it, a failed one ending the connection, reviewed 2026-11-21, same section |
+| NB162-I1 (Info) | Accepted for v1 by the lead on 2026-11-21: one member, under fresh keys of its own, can hold all 64 WebRTC connections unopened, so pages fall back to pipes over the relays, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -8231,7 +8234,12 @@ on loopback, at `1b72eec`, the offer and its `cancel` in one write end
 there at `b91f95d`. Fix: the example goes on past `NoTransfer` and `NotConnected` from
 those calls (`share.rs` lines 192, 201, 203, 247 and 250).
 
-**Status: open** (Low), reported on NB-161 at `1b72eec`.
+**Status: fixed** by `bc9f3e7` before NB-159 merged, so never on main, reviewed
+2026-11-21 (NB-165) by reading: every answer to an offer goes through one function
+that goes on past `NoTransfer` (the offer ended) and `NotConnected` (its peer's link is
+down: the offer is taken once the link is back, and `decline` never fails so), an offer
+that ends is asked about no more, and the example's test sends an offer and its
+`cancel` in one batch to `recv --yes`, `recv` and `send`, which all carry on.
 
 **NB159-I1 — Pieces already sent can cross a relay (Info).** Pieces go to the node only
 while the path is `Direct` or `Birthday`, but once `Node::send` has them they are the
@@ -8259,6 +8267,147 @@ its Unicode normal form).
 so `../escaped.txt`, `..` and `a/../../b` stay in `dir` (its test). An offer's name,
 cleaned again, can change only its normal form, and the final name is still claimed
 with `create_new`.
+
+### Native WebRTC to pages (NB-162) — NB162-1, NB162-2, NB162-I1
+
+NB-162 adds the feature `webrtc` (off by default, and in neither the wasm module, the
+ESP32 port nor the C ABI). With `Builder::webrtc(true)`, a node in a room links with
+`joinRoom` pages over a WebRTC DataChannel on its own UDP socket (str0m 0.24.1 on
+`aws-lc-rs`: ICE, DTLS 1.2 by dimpl, SCTP), runs the core's packets over it, and runs
+room.js's room layer on every link to a page. It says a browser-shaped hello
+(`"native":1`) beside its own, and takes pages' hellos and WebRTC signals. Reviewed on
+2026-11-21 by reading `5d526ed..38a0f33` (`pz/NB-162-native-webrtc`, not merged) against
+`room.js`, `webrtc.js` and the str0m, dimpl and `is` sources. A scratch copy of
+`38a0f33` ran tests written for the review: NB162-1's and NB162-2's, with and without
+the fixes below, and random and mutated input into the shared socket's split and the
+description and candidate parsers, which found nothing. The branch's own `webrtc` tests
+were re-run only with those fixes in. The fixes, `38a0f33..b4c543d`, were reviewed on
+2026-11-21 (NB-165) by reading and on a scratch copy of `b4c543d`: NB-163's tests pass,
+each fix's own test fails with that fix alone reverted, and a restart offer that str0m
+fails on part of the way shows NB162-2 still open. Its completion, `05a9d36`, was
+reviewed on 2026-11-21 (NB-166) by reading and on a scratch copy of `48677eb`: NB-165's
+test passes, and the new test fails with the whole fix, or either half of it, reverted.
+
+**What holds.**
+
+- **DTLS and the PeerId.** A description, with its DTLS fingerprint, comes only in a
+  signal sealed by its sender's PeerId (Noise X). str0m compares the SHA-256 of the
+  peer's certificate with it (`set_fingerprint_verification(true)`) and closes on a
+  mismatch, another hash or none; dimpl asks the client for a certificate and checks the
+  signatures of both sides' handshakes. The core's handshake over the channel is taken
+  only from that PeerId (`handle_datagram_from`), and DTLS holds no secret of the
+  room's.
+- **Who gets an answer.** An offer is parsed and answered only with the `pw-rtc-offer`
+  proof for this pair; an answer counts only for an offer of ours still waiting,
+  candidates only for a connection under way, and mDNS names are skipped. Under
+  `Privacy::RelayOnly` there is no WebRTC, and under `PublicOnly` the node's host
+  candidates are public ones alone.
+- **The room layer.** Until a link's `pw-link` proof checks out, only a proof or a
+  goodbye is read; a wrong proof closes the link, and so does none in 10 s. The app sees
+  a page only after its presence (JSON that parses), and a goodbye closes only its
+  sender's link.
+- **The shared socket.** Only a datagram whose first byte is STUN's (0 to 3) or DTLS's
+  (20 to 63) is offered to the connections. A STUN one goes to a connection only with
+  its ICE username and `MESSAGE-INTEGRITY` under the ICE password from the sealed
+  description, anything else only from an address whose ICE check succeeded; the core's
+  `COOKIE` and `HS1C` from any other address go on to the core. str0m's STUN parser
+  drops a Binding request without `USERNAME` before its ICE agent reads one.
+- **Bounds.** 64 connections; descriptions of 32 KiB at most; 64 remote candidates a
+  connection from descriptions and signals (counted afresh at a restart, NB162-2), 512 B
+  each; 15 s to open; a publish budget of 6, then 1 per 5 s, per peer; DataChannel
+  messages of 1 to 1,232 B, binary only; 1 MiB buffered; 1,024 room frames waiting; a
+  presence up to the reliable lane's largest message per page; signals within the
+  inbox's budget (64, then 1 per 50 ms).
+
+**NB162-1 — A forged hello makes a native member a browser (Medium).** A room hello's
+proof is under the room key over the id it names, so any member can say one for
+another's PeerId. A node with browsers on marks that id a browser on any room.js-shaped
+hello (`on_browser_hello`, `traversal.rs` line 1524), and nothing clears the mark. Every
+event of the peer's then goes through the room layer (`webrtc/host.rs` line 263). On a
+native link already up, its messages are dropped as a stranger's (`webrtc/room.rs` line
+122) and its `Disconnected` never reaches the app. A native link that comes up later
+waits for a `pw-link` proof a native never sends and closes at 10 s, each time. The node
+also sends the peer no native offer (`traversal.rs` line 2718) and, with the smaller id,
+dials it over WebRTC. In a scratch test of two nodes on loopback, a forged hello cut the
+app off from a native peer's messages while the link stayed up, and from its goodbye;
+forged before they linked, it kept the peer from the app while the link came and went.
+Fix: a native offer, sealed by its sender's PeerId, clears the mark (`on_offer`,
+`traversal.rs` line 2615), and a hello doesn't mark a peer that has sent one (`heard`).
+With both, the same tests pass; a forged hello can still mark a native before its first
+offer comes.
+
+**Status: fixed** by `dba6157` before NB-162 merged, so never on main, reviewed
+2026-11-21: `on_browser_hello` returns for a peer that has sent this node a native
+offer (`heard`), and `on_offer` clears `browser`. Its test fails with the fix alone
+reverted. **Accepted** for v1 by the lead on 2026-11-21: a hello forged before a
+native's first offer marks it until that offer comes. The native offers when it hears
+this node's hello, and those come at most `HELLO_MAX` (30 s) apart; meanwhile the node
+sends it no offer of its own and, with the smaller id, dials it over WebRTC. The link
+that then comes up is a native's.
+
+**NB162-2 — Restart offers pile up candidates without bound (Medium).** An offer marked
+`restart` on an open connection (`webrtc/mod.rs` lines 310 to 316) is taken with no
+`REPLACE_AFTER` gap, and its candidates aren't counted towards `MAX_CANDIDATES`. With
+the same ICE credentials it is no ICE restart to str0m, whose agent (`is` 0.11.1) adds
+each new remote candidate to a list it caps nowhere (it caps pairs at 100) and scans
+that list for each candidate added. A room member with a page linked to the node, the
+page dialling (its id the smaller), sends such offers within the inbox's budget. In a
+scratch test the answering side's memory grew with each offer and its time for each
+offer grew with the candidates held, so the node's poll would fall behind within a
+minute at 20 offers a second (**theoretical**, from that growth). Fix: take a restart
+offer only if its `a=ice-ufrag` differs from that of the offer answered before (a real
+restart, after which str0m drops the old candidates and pairs), at most once per
+`REPLACE_AFTER`, and count its candidates afresh. With that the same test held nothing
+more, and real restarts stayed bounded.
+
+**Status: fixed** by `126914b` and `05a9d36` before NB-162 merged, so never on main,
+reviewed 2026-11-21. `126914b` (NB-165) takes a restart offer only if its ICE username
+fragment, read where str0m reads it, differs from that of the offer answered before, at
+most once per `REPLACE_AFTER`, and counts its candidates afresh; its test fails with
+that check removed. That wasn't enough alone: str0m's `accept_offer` takes an offer's
+ICE credentials and candidates before the rest of it, which can still fail (an offer
+with no `a=group` does), and the node then kept the fragment and the time of the offer
+answered before, so the same new credentials passed the check again at once and added
+their candidates to the last ones, each time. `05a9d36` (NB-166) counts the try (`made`
+and `ufrag`) before `accept_offer`, and marks the connection `dead` when it fails, as
+for an answer that fails. With both, NB-165's scratch test refuses every such offer at a
+steady cost, and with the node's timers running the connection closes after the first;
+the new test fails with the whole fix, the early count alone or the `dead` mark alone
+reverted.
+
+**Accepted** for v1 by the lead on 2026-11-21, which took anything below Medium in this
+round: a connection that a failed try marks `dead` closes only at its next str0m timer,
+and str0m may first send one ICE check to a candidate the failed offer named (like the
+checks in the first residual below). That is one check per failed try, and each try
+needs an open connection at least `REPLACE_AFTER` old. Fix, if wanted: give a dead
+connection no timeout before it closes, and make the next one due at once while one is
+dead.
+
+**NB162-I1 — One member can fill the connections (Info).** An offer proved for a fresh
+PeerId of a member's own holds one of the 64 connections for up to 15 s unopened
+(`webrtc/mod.rs` line 322), and the inbox opens enough (20 a second) to keep them all
+taken. A page's offer is then refused, and so are the node's own dials, so pages fall
+back to pipes over the relays. Like other per-node caps, a member can fill it under keys
+of its own. Fix, if wanted: when full, drop the oldest connection not yet open rather
+than the new offer.
+
+**Status: accepted** for v1 by the lead on 2026-11-21; `702e701` says so under
+Limits in `docs/concepts/native-webrtc.md`.
+
+**Residuals.**
+
+- ICE checks go to the candidates a page names, up to 64 a connection and 100 pairs,
+  until it opens or 15 s pass: a member can have the node send small STUN checks to
+  addresses it chooses, beside the punches in
+  [Hard-NAT punching](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2).
+  Each is a small fixed check, paced by the ICE agent, with an integrity tag the address
+  can't answer.
+- A page's checks from new source addresses each leave str0m a peer-reflexive candidate;
+  only the page, which holds the ICE password, can make them.
+- A native with browsers on says two hellos each round, the second longer than a page's,
+  so a relay on the room topic can tell one is there (beside NB22-I1).
+- DTLS 1.2 here is dimpl, str0m's own and young; the core's Noise session protects what
+  the link carries either way.
 
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
