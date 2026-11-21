@@ -136,7 +136,7 @@ pub(crate) struct Rtcs {
     budgets: HashMap<PeerId, Budget>,
     out: Out,
     signals: VecDeque<(PeerId, Vec<u8>)>,
-    closed: VecDeque<PeerId>,
+    closed: VecDeque<(PeerId, SocketAddr)>,
     /// Signals refused (malformed, unproven, over a cap or a budget), and datagrams dropped for a full buffer.
     pub(crate) refused: u64,
     pub(crate) congested: u64,
@@ -173,6 +173,11 @@ impl Rtcs {
 
     pub(crate) fn has(&self, peer: &PeerId) -> bool {
         self.conns.contains_key(peer)
+    }
+
+    /// The address naming `peer`'s connection, if it has one.
+    pub(crate) fn at_of(&self, peer: &PeerId) -> Option<SocketAddr> {
+        self.conns.get(peer).map(|c| c.at)
     }
 
     /// Whether `peer`'s packets go to one of its relay (TURN) candidates now: a link through a TURN server.
@@ -490,10 +495,11 @@ impl Rtcs {
                 self.publish(now, peer, msg);
             }
         }
-        let dead: Vec<PeerId> = self.conns.iter().filter(|(_, c)| c.dead).map(|(p, _)| *p).collect();
-        for peer in dead {
+        let dead: Vec<(PeerId, SocketAddr)> =
+            self.conns.iter().filter(|(_, c)| c.dead).map(|(p, c)| (*p, c.at)).collect();
+        for (peer, at) in dead {
             self.close(&peer);
-            self.closed.push_back(peer);
+            self.closed.push_back((peer, at));
         }
     }
 
@@ -552,8 +558,8 @@ impl Rtcs {
         self.out.opened.pop_front()
     }
 
-    /// A connection that ended on its own (its channel closed, ICE lost, or never open in time).
-    pub(crate) fn poll_closed(&mut self) -> Option<PeerId> {
+    /// A connection that ended on its own (its channel closed, ICE lost, or never open in time): its peer and address.
+    pub(crate) fn poll_closed(&mut self) -> Option<(PeerId, SocketAddr)> {
         self.closed.pop_front()
     }
 }

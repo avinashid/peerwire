@@ -24,8 +24,9 @@ pub(super) struct Browsers {
     members: Members,
     /// Room frames that met a full send window, in order.
     outbox: VecDeque<(PeerId, Vec<u8>)>,
-    /// Connections to end once what the core sent them has gone (its close, after a goodbye).
-    closing: Vec<PeerId>,
+    /// Connections to end once what the core sent them has gone (its close, after a goodbye): each peer's, if it is
+    /// still the one named then (a new offer may have replaced it meanwhile).
+    closing: Vec<(PeerId, Option<SocketAddr>)>,
     /// The local address each source reaches this node's socket at, when it is bound to any interface.
     routes: HashMap<IpAddr, IpAddr>,
     /// The public address the connections were last given.
@@ -169,19 +170,15 @@ impl Node {
             self.ep.handle_datagram_from(now, Hop::Rtc(at), &peer, &d);
         }
         let mut lost = Vec::new();
-        while let Some(peer) = b.rtcs.poll_closed() {
-            lost.push(peer);
+        while let Some(closed) = b.rtcs.poll_closed() {
+            lost.push(closed);
         }
         // A connection that ended under a link on it (its channel closed, ICE lost): the link ends now, not at its
-        // idle timeout, with nothing sent (nothing can go).
-        for peer in lost {
-            if matches!(self.ep.path(&peer), Some(Path::Direct(Hop::Rtc(_)))) {
+        // idle timeout, with nothing sent (nothing can go), and is reported so, as a pipe's peer gone quiet is.
+        for (peer, at) in lost {
+            if self.ep.path(&peer) == Some(&Path::Direct(Hop::Rtc(at))) {
                 self.ep.abandon(&peer);
-                self.status.remove(&peer);
-                let joined = self.browsers.as_mut().is_some_and(|b| b.members.gone(&peer));
-                if joined {
-                    self.events.push_back(Ev::Disconnected { peer, reason: DisconnectReason::Timeout });
-                }
+                self.take_event(now, wall, Ev::Disconnected { peer, reason: DisconnectReason::Timeout }, &[]);
             }
         }
     }
@@ -191,7 +188,7 @@ impl Node {
         let Some(b) = self.browsers.as_mut() else { return };
         for peer in b.members.overdue(now) {
             b.members.gone(&peer);
-            b.closing.push(peer);
+            b.closing.push((peer, b.rtcs.at_of(&peer)));
             self.ep.disconnect(&peer);
             self.status.remove(&peer);
         }
@@ -215,8 +212,10 @@ impl Node {
     /// Sends what the connections have for the socket and the carrier, and ends those closing.
     pub(super) fn flush_browsers(&mut self) {
         let Some(b) = self.browsers.as_mut() else { return };
-        for peer in std::mem::take(&mut b.closing) {
-            b.rtcs.close(&peer);
+        for (peer, at) in std::mem::take(&mut b.closing) {
+            if b.rtcs.at_of(&peer) == at {
+                b.rtcs.close(&peer);
+            }
         }
         let v6 = self.local.is_ipv6();
         while let Some((dst, bytes)) = b.rtcs.poll_udp() {
@@ -255,11 +254,12 @@ impl Node {
     /// here), and the rest only while it has. `None`: nothing for the app. Others' events pass as they are.
     pub(super) fn room_event(&mut self, now: peerwire_core::Instant, e: Ev<Addr>) -> Option<Ev<Addr>> {
         let peer = match &e {
-            Ev::ConnectFailed { peer } => *peer,
-            e => about(e)?,
+            Ev::ConnectFailed { peer } => Some(*peer),
+            e => about(e),
         };
         let me = self.ep.peer_id();
-        let b = self.browsers.as_mut()?;
+        // Without browsers on, or about a peer that isn't one: the event as it is.
+        let (Some(peer), Some(b)) = (peer, self.browsers.as_mut()) else { return Some(e) };
         if !self.trav.is_browser(&peer) && !b.members.has(&peer) {
             return Some(e);
         }
@@ -267,7 +267,7 @@ impl Node {
             Ev::Connected { peer, initiator, .. } => {
                 // Out of the room (it was left), a browser's link has no room to prove: it closes.
                 let Some(proof) = self.trav.room_pair(room::LINK, &me, &peer) else {
-                    b.closing.push(peer);
+                    b.closing.push((peer, b.rtcs.at_of(&peer)));
                     self.ep.disconnect(&peer);
                     self.status.remove(&peer);
                     return None;
@@ -293,7 +293,7 @@ impl Node {
                     Step::Close { left } => {
                         let b = self.browsers.as_mut()?;
                         let joined = b.members.gone(&peer);
-                        b.closing.push(peer);
+                        b.closing.push((peer, b.rtcs.at_of(&peer)));
                         self.ep.disconnect(&peer);
                         self.status.remove(&peer);
                         let reason = if left { DisconnectReason::ClosedByPeer } else { DisconnectReason::Timeout };
@@ -304,12 +304,12 @@ impl Node {
             Ev::Disconnected { peer, reason } => {
                 let joined = b.members.gone(&peer);
                 if reason != DisconnectReason::Replaced {
-                    b.closing.push(peer);
+                    b.closing.push((peer, b.rtcs.at_of(&peer)));
                 }
                 joined.then_some(Ev::Disconnected { peer, reason })
             }
             Ev::ConnectFailed { peer } => {
-                b.closing.push(peer);
+                b.closing.push((peer, b.rtcs.at_of(&peer)));
                 None
             }
             e => b.members.joined(&peer).then_some(e),
@@ -338,7 +338,7 @@ impl Node {
         }
         let _ = self.ep.send(peer, Lane::Unreliable, &[room::BYE]);
         b.members.gone(peer);
-        b.closing.push(*peer);
+        b.closing.push((*peer, b.rtcs.at_of(peer)));
     }
 
     /// Whether `peer` is a browser (feature `webrtc`): a `joinRoom` page in this node's room. Its link runs room.js's

@@ -110,7 +110,7 @@ fn a_dial_opens_the_channel_and_carries_datagrams_both_ways() {
     p.a.close(&id(2));
     for i in 0..20_000 {
         p.step();
-        if p.b.poll_closed().is_some() {
+        if p.b.poll_closed().map(|(peer, _)| peer) == Some(id(1)) {
             println!("closed after {} ms", i * 5);
             assert_eq!(p.b.counts(), (0, 0));
             return;
