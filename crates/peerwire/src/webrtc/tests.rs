@@ -69,11 +69,9 @@ impl Pair {
     }
 }
 
-#[test]
-fn a_dial_opens_the_channel_and_carries_datagrams_both_ways() {
-    let mut p = Pair::new();
+/// `a` dials `b` and both channels open: the addresses naming the connection on each side.
+fn open(p: &mut Pair) -> (SocketAddr, SocketAddr) {
     assert!(p.a.dial(p.now, id(2), &[0xab; 32]));
-    assert!(!p.a.dial(p.now, id(2), &[0xab; 32]), "one connection per peer");
     let (mut opened_a, mut opened_b) = (None, None);
     for _ in 0..1000 {
         p.step();
@@ -90,8 +88,12 @@ fn a_dial_opens_the_channel_and_carries_datagrams_both_ways() {
     let (Some((pa, at_a, true)), Some((pb, at_b, false))) = (opened_a, opened_b) else {
         panic!("not open: {opened_a:?} {opened_b:?}")
     };
-    assert_eq!((pa, pb, p.room.admitted), (id(2), id(1), 1));
-    assert_eq!(p.a.counts(), (1, 1));
+    assert_eq!((pa, pb), (id(2), id(1)));
+    (at_a, at_b)
+}
+
+/// A datagram each way over the open connection, `a`'s at `at_a` and `b`'s at `at_b`, each arriving whole.
+fn carries(p: &mut Pair, at_a: SocketAddr, at_b: SocketAddr) {
     p.a.send(&at_a, b"from a");
     p.b.send(&at_b, &[9; MAX_DATAGRAM]);
     let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
@@ -105,6 +107,16 @@ fn a_dial_opens_the_channel_and_carries_datagrams_both_ways() {
     }
     assert_eq!(got_b, [(at_b, id(1), b"from a".to_vec())]);
     assert_eq!(got_a, [(at_a, id(2), vec![9; MAX_DATAGRAM])]);
+}
+
+#[test]
+fn a_dial_opens_the_channel_and_carries_datagrams_both_ways() {
+    let mut p = Pair::new();
+    let (at_a, at_b) = open(&mut p);
+    assert!(!p.a.dial(p.now, id(2), &[0xab; 32]), "one connection per peer");
+    assert_eq!(p.room.admitted, 1);
+    assert_eq!(p.a.counts(), (1, 1));
+    carries(&mut p, at_a, at_b);
     assert!(!p.a.relayed(&id(2)), "host candidates on both sides");
     // Closed on one side, without a word (the node's core says its own close first): the other's ICE sees it go.
     p.a.close(&id(2));
@@ -160,6 +172,77 @@ fn offers_need_the_room_proof_and_signals_a_connection() {
     let before = p.b.refused;
     p.b.signal(p.now, id(1), big.to_string().as_bytes(), &mut p.room);
     assert_eq!(p.b.refused, before + 1);
+}
+
+/// NB162-2: a page's offer marked `restart` on an open connection restarts ICE on it only with new ICE credentials,
+/// at most once per `REPLACE_AFTER`, its candidates counted afresh. One with the same credentials is no restart to
+/// str0m, which would add its candidates to the connection's, uncapped, and scan them all for each one added. A real
+/// restart (str0m's own on the dialling side, new credentials) is answered on the same connection, which carries the
+/// core's datagrams after it; a copy of it gets the answer again.
+#[test]
+fn a_restart_offer_needs_new_ice_credentials_and_comes_at_most_once_per_replace_after() {
+    let mut p = Pair::new();
+    let (at_a, at_b) = open(&mut p);
+    let restart = |sdp: &str| {
+        let m = json!({"kind": "offer", "sdp": {"type": "offer", "sdp": sdp}, "p": "ab".repeat(32), "restart": true});
+        m.to_string().into_bytes()
+    };
+    let first = p.b.conns[&id(1)].offer_sdp.clone().unwrap();
+    let ufrag = first.lines().find_map(|l| l.strip_prefix("a=ice-ufrag:")).unwrap().to_string();
+    let (made, held) = (p.b.conns[&id(1)].made, p.b.conns[&id(1)].candidates);
+    // New credentials, but within REPLACE_AFTER of the connection's offer: refused.
+    assert!(p.now < made + REPLACE_AFTER);
+    p.b.signal(p.now, id(1), &restart(&first.replacen("a=ice-ufrag:", "a=ice-ufrag:zz", 1)), &mut p.room);
+    assert_eq!((p.b.poll_signal(), p.b.refused), (None, 1));
+    // The dialler's offer again, the same credentials, 64 new host candidates each time, before REPLACE_AFTER and
+    // after: refused, unanswered, its candidates not counted.
+    for i in 0..200 {
+        if i == 100 {
+            while p.now < made + REPLACE_AFTER {
+                p.step();
+            }
+        }
+        let more: String =
+            (0..64).map(|k| format!("a=candidate:{k} 1 udp 2113937151 10.0.{i}.{k} 9 typ host\r\n")).collect();
+        let before = p.b.refused;
+        p.b.signal(p.now, id(1), &restart(&format!("{first}{more}")), &mut p.room);
+        assert_eq!(p.b.refused, before + 1, "same ufrag, offer {i}");
+    }
+    assert!(p.b.poll_signal().is_none(), "no answer");
+    assert_eq!((p.b.counts(), p.b.conns[&id(1)].candidates), ((1, 1), held));
+    // A new ufrag in the session part without a password there: str0m reads the media section's credentials, the
+    // same, and so does the check.
+    let t = first.find("\r\nt=").unwrap() + 2;
+    let end = t + first[t..].find("\r\n").unwrap() + 2;
+    let session = format!("{}a=ice-ufrag:{ufrag}x\r\n{}", &first[..end], &first[end..]);
+    assert_eq!(ice_ufrag(&SdpOffer::from_sdp_string(&session).unwrap()).as_deref(), Some(ufrag.as_str()));
+    p.b.signal(p.now, id(1), &restart(&session), &mut p.room);
+    assert!(p.b.poll_signal().is_none());
+    // A real restart, from a's own Rtc, past REPLACE_AFTER: answered on the same connection, its candidates counted
+    // afresh (a's one host candidate).
+    let c = p.a.conns.get_mut(&id(2)).unwrap();
+    let mut api = c.rtc.sdp_api();
+    api.ice_restart(true);
+    let (offer, pending) = api.apply().unwrap();
+    c.pending = Some(pending);
+    let offer = offer.to_sdp_string();
+    p.b.signal(p.now, id(1), &restart(&offer), &mut p.room);
+    let c = &p.b.conns[&id(1)];
+    assert!(c.ufrag.as_deref().is_some_and(|u| u != ufrag) && (c.made, c.candidates) == (p.now, 1));
+    p.step(); // the answer, to a
+    assert!(p.a.conns[&id(2)].pending.is_none(), "a took the answer");
+    p.b.signal(p.now, id(1), &restart(&offer), &mut p.room);
+    assert!(p.b.poll_signal().is_some(), "a copy gets the answer again");
+    // Another with new credentials again, within REPLACE_AFTER of that one: refused.
+    let before = p.b.refused;
+    p.b.signal(p.now, id(1), &restart(&offer.replacen("a=ice-ufrag:", "a=ice-ufrag:yy", 1)), &mut p.room);
+    assert_eq!((p.b.poll_signal(), p.b.refused), (None, before + 1));
+    // ICE checks the pair again, and the same connection carries the core's datagrams.
+    for _ in 0..200 {
+        p.step();
+    }
+    carries(&mut p, at_a, at_b);
+    assert_eq!((p.a.counts(), p.b.counts(), p.room.admitted), ((1, 1), (1, 1), 1), "the same connection");
 }
 
 #[test]

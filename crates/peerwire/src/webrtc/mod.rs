@@ -53,7 +53,8 @@ pub(crate) const MAX_BUFFERED: usize = 1 << 20;
 /// `publishBurst`, `publishEveryMs`), so no peer can keep this node publishing to the relays.
 pub(crate) const PUBLISH_BURST: f64 = 6.0;
 pub(crate) const PUBLISH_EVERY: Duration = Duration::from_secs(5);
-/// A connection is replaced by a new offer from its peer at most once per this long (webrtc.js `retryAnswerMs`).
+/// A connection is replaced by a new offer from its peer, or restarts ICE for a restart offer, at most once per this
+/// long (webrtc.js `retryAnswerMs`).
 pub(crate) const REPLACE_AFTER: Duration = Duration::from_secs(2);
 /// The label webrtc.js gives its one DataChannel.
 const LABEL: &str = "peerwire";
@@ -96,6 +97,8 @@ struct Conn {
     /// Answerer: the description of the offer answered, and the answer's signal, sent again for a copy of it.
     offer_sdp: Option<String>,
     answer_msg: Option<Vec<u8>>,
+    /// Answerer: the ICE username fragment of the offer answered, which a restart offer must change.
+    ufrag: Option<String>,
     /// Dialer: candidates that came before the answer.
     held: Vec<Candidate>,
     /// Remote candidates taken so far, and the addresses of the relay (TURN) ones among them.
@@ -244,6 +247,7 @@ impl Rtcs {
             resend: OFFER_RESEND.iter().map(|d| now + *d).collect(),
             offer_sdp: None,
             answer_msg: None,
+            ufrag: None,
             held: Vec::new(),
             candidates: 0,
             relays: HashSet::new(),
@@ -289,7 +293,7 @@ impl Rtcs {
     }
 
     /// An offer: a copy of the one answered gets the answer again; a new one, proved, makes a connection (replacing
-    /// one that never opened, or one that did when it is an ICE restart: renegotiated on the same connection).
+    /// one that never opened), or restarts ICE on an open one when it is marked `restart`.
     fn on_offer(&mut self, now: Instant, from: PeerId, m: &Value, room: &mut dyn Room) -> bool {
         let Some(sdp) = description(m, "offer") else { return false };
         if let Some(c) = self.conns.get(&from) {
@@ -308,9 +312,18 @@ impl Rtcs {
         let Ok(offer) = SdpOffer::from_sdp_string(&clean_sdp(sdp)) else { return false };
         if let Some(c) = self.conns.get_mut(&from) {
             if m.get("restart").and_then(Value::as_bool) == Some(true) && c.open {
+                // An ICE restart, renegotiated on the open connection: only with new ICE credentials, on which str0m
+                // drops the old remote candidates and pairs, and at most once per REPLACE_AFTER; its candidates are
+                // counted afresh. With the same ones str0m would add its candidates to the old, which nothing caps,
+                // and scan them all for each one added (NB162-2).
+                let ufrag = ice_ufrag(&offer);
+                if ufrag.is_none() || ufrag == c.ufrag || now.saturating_duration_since(c.made) < REPLACE_AFTER {
+                    return false;
+                }
                 let Ok(answer) = c.rtc.sdp_api().accept_offer(offer) else { return false };
                 let msg = answer_msg(&answer);
-                (c.offer_sdp, c.answer_msg) = (Some(sdp.to_string()), Some(msg.clone()));
+                (c.offer_sdp, c.answer_msg, c.ufrag) = (Some(sdp.to_string()), Some(msg.clone()), ufrag);
+                (c.made, c.candidates, c.relays) = (now, candidate_lines(sdp), relay_addrs(sdp));
                 drain(from, c, &mut self.out);
                 return self.publish(now, from, msg);
             }
@@ -322,6 +335,7 @@ impl Rtcs {
         if self.conns.len() >= MAX_CONNS || !room.admit(&from) {
             return false;
         }
+        let ufrag = ice_ufrag(&offer);
         let mut rtc = self.new_rtc(now);
         let Ok(answer) = rtc.sdp_api().accept_offer(offer) else { return false };
         let msg = answer_msg(&answer);
@@ -337,6 +351,7 @@ impl Rtcs {
             resend: VecDeque::new(),
             offer_sdp: Some(sdp.to_string()),
             answer_msg: Some(msg.clone()),
+            ufrag,
             held: Vec::new(),
             candidates: candidate_lines(sdp),
             relays: relay_addrs(sdp),
@@ -631,6 +646,13 @@ fn clean_sdp(sdp: &str) -> String {
         out.push_str(line);
     }
     out
+}
+
+/// The ICE username fragment of `offer`, where str0m reads its ICE credentials: the session's, else the first media
+/// section's with both a ufrag and a password.
+fn ice_ufrag(offer: &SdpOffer) -> Option<String> {
+    let creds = offer.session.ice_creds().or_else(|| offer.media_lines.iter().find_map(|m| m.ice_creds()));
+    creds.map(|c| c.ufrag)
 }
 
 /// Whether candidate line `c` (`candidate:<foundation> <component> <transport> <priority> <address> <port> …`)
