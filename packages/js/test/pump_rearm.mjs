@@ -51,11 +51,16 @@ async function connected(a, b) {
   const a = pw.endpoint();
   const b = pw.endpoint();
   let mode = 'ok';
+  // Delivered later, so copied: a datagram is a view into the wasm's memory, valid only during onTransmit.
   a.onTransmit = (addr, bytes) => {
     if (mode === 'throw') throw new DOMException('send queue is full', 'OperationError');
-    if (mode === 'ok') setImmediate(() => b.receive(1, bytes));
+    const copy = bytes.slice();
+    if (mode === 'ok') setImmediate(() => b.receive(1, copy));
   };
-  b.onTransmit = (addr, bytes) => setImmediate(() => a.receive(2, bytes));
+  b.onTransmit = (addr, bytes) => {
+    const copy = bytes.slice();
+    setImmediate(() => a.receive(2, copy));
+  };
   a.connect(2, b.peerId);
   check(await connected(a, b), 'endpoint pair connected');
 
@@ -143,7 +148,7 @@ async function connected(a, b) {
           q = null;
         });
       }
-      q.push(bytes);
+      q.push(bytes.slice()); // delivered later: a datagram is a view, valid only during onTransmit
     };
   };
   // Counts wasm calls an endpoint makes after its close(): any is a read of its freed handle.

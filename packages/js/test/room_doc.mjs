@@ -101,20 +101,27 @@ console.log(`d joined late and caught up; a left and its writes stayed (${(perfo
     }
     return { k: 'pen', c: '#e5484d', w: 4, p };
   };
-  // b's frames to d, by tag, and those d has taken (and, with the doc not open there, dropped).
+  // b's frames to d, by tag, and those of doc 'wb' b has written to d and d has taken (and, with the doc not open
+  // there, dropped). Only 'wb's: a frame of 'board' from before may still be on its way to d.
   let sent = {};
   let frames = 0;
   let taken = 0;
   const write = b.write.bind(b);
   b.write = (peer, f, lane) => {
-    if (peer === d.self && f[0] >= 7) {
-      sent[f[0]] = (sent[f[0]] ?? 0) + f.length;
-      frames++;
-    }
+    if (peer === d.self && f[0] >= 7) sent[f[0]] = (sent[f[0]] ?? 0) + f.length;
     return write(peer, f, lane);
   };
+  const writeDoc = b.writeDoc.bind(b);
+  b.writeDoc = (peer, m, z) => (peer === d.self && m?.d === 'wb' && frames++, writeDoc(peer, m, z));
   const docFrame = d.docFrame.bind(d);
-  d.docFrame = (peer, text) => (peer === b.self && taken++, docFrame(peer, text));
+  const ofWb = (text) => {
+    try {
+      return JSON.parse(new TextDecoder().decode(text)).d === 'wb';
+    } catch {
+      return false;
+    }
+  };
+  d.docFrame = (peer, text) => (peer === b.self && ofWb(text) && taken++, docFrame(peer, text));
   // b writes the board while c and d don't have it open: they answer b's ask with nothing, so b has caught up.
   const wb = b.doc('wb');
   for (let i = 0; i < 40; i++) wb.set('strokes').add(stroke());

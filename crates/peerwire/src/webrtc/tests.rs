@@ -245,6 +245,48 @@ fn a_restart_offer_needs_new_ice_credentials_and_comes_at_most_once_per_replace_
     assert_eq!((p.a.counts(), p.b.counts(), p.room.admitted), ((1, 1), (1, 1), 1), "the same connection");
 }
 
+/// NB162-2, a failed try: str0m takes a restart offer's new ICE credentials and its candidates before it can still
+/// refuse it (here for having no `a=group`). The try counts all the same, and ends the half-restarted connection;
+/// another with the same credentials and 64 more candidates is refused before str0m, unanswered, and no ICE check
+/// goes to any of the offers' candidates.
+#[test]
+fn a_restart_offer_that_str0m_refuses_still_counts_and_ends_the_connection() {
+    let mut p = Pair::new();
+    let (_, at_b) = open(&mut p);
+    let first = p.b.conns[&id(1)].offer_sdp.clone().unwrap();
+    while p.now < p.b.conns[&id(1)].made + REPLACE_AFTER {
+        p.step();
+    }
+    assert!(first.contains("\r\na=group:"));
+    // New credentials, no a=group, and 64 host candidates on 10.0.{i}.0/24.
+    let bad = |i: u8| {
+        let lines = first.replacen("a=ice-ufrag:", "a=ice-ufrag:zz", 1);
+        let mut sdp: String =
+            lines.lines().filter(|l| !l.starts_with("a=group:")).map(|l| l.to_string() + "\r\n").collect();
+        sdp.extend((0..64).map(|k| format!("a=candidate:{k} 1 udp 2113937151 10.0.{i}.{k} 9 typ host\r\n")));
+        let m = json!({"kind": "offer", "sdp": {"type": "offer", "sdp": sdp}, "p": "ab".repeat(32), "restart": true});
+        m.to_string().into_bytes()
+    };
+    let ours = |p: &mut Pair| p.b.conns.get_mut(&id(1)).map(|c| c.rtc.direct_api().local_ice_credentials());
+    let (before, creds) = (p.b.refused, ours(&mut p));
+    p.b.signal(p.now, id(1), &bad(1), &mut p.room);
+    assert_eq!((p.b.poll_signal(), p.b.refused), (None, before + 1), "refused by str0m");
+    assert_ne!(ours(&mut p), creds, "after it restarted ICE, with new credentials of ours");
+    let half = p.b.conns.get(&id(1));
+    assert!(half.is_none_or(|c| c.dead && c.made == p.now), "the try counts, and the half-restarted connection ends");
+    p.b.signal(p.now, id(1), &bad(2), &mut p.room);
+    assert_eq!((p.b.poll_signal(), p.b.refused), (None, before + 2), "the same credentials: refused");
+    // For 5 s, b alone: nothing goes to the offers' candidates (a half-restarted connection would check them all).
+    let (a_at, mut checked) = (p.at[0], Vec::new());
+    for _ in 0..1000 {
+        p.now += Duration::from_millis(5);
+        p.b.handle_timeout(p.now);
+        checked.extend(std::iter::from_fn(|| p.b.poll_udp()).map(|(dst, _)| dst).filter(|dst| *dst != a_at));
+    }
+    assert_eq!(checked, [], "no ICE check to the offers' candidates");
+    assert_eq!((p.b.poll_closed(), p.b.counts(), p.room.admitted), (Some((id(1), at_b)), (0, 0), 1), "closed");
+}
+
 #[test]
 fn sdp_candidates_naming_no_ip_are_dropped_and_relays_noted() {
     let sdp = "v=0\r\na=candidate:1 1 udp 2113937151 5d2c1d3a-aaaa.local 54321 typ host\r\n\

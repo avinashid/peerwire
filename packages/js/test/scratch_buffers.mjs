@@ -3,7 +3,8 @@
 // toHex/fromHex use lookup tables. This checks that every message still arrives intact
 // when the buffers are reused back to back, across the size boundaries and after wasm
 // memory grows (which detaches every view of the old memory), that the hot path makes
-// no allocation, and that the hex helpers agree with the code they replaced.
+// no allocation, that each datagram goes to onTransmit as a view of the wasm's memory, not a copy (NB-158), and
+// that the hex helpers agree with the code they replaced.
 import { loadPeerwire, Lane, toHex, fromHex } from '../src/peerwire.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
@@ -27,7 +28,16 @@ const spy = (ep) => {
   });
   return ep;
 };
-const wire = (from, to, addr) => (from.onTransmit = (_, d) => setImmediate(() => to.receive(addr, d)));
+// Each datagram is a view into the wasm's memory, valid only during onTransmit: the wire copies it, as it delivers it
+// later. `views` counts those that were views of it.
+let views = 0;
+let datagrams = 0;
+const wire = (from, to, addr) => (from.onTransmit = (_, d) => {
+  datagrams++;
+  views += d.buffer === pw.x.memory.buffer && d.byteOffset === from.txBuf;
+  const copy = d.slice();
+  setImmediate(() => to.receive(addr, copy));
+});
 
 const a = spy(pw.endpoint());
 const b = spy(pw.endpoint());
@@ -69,6 +79,7 @@ const allocsA = a.allocs;
 const allocsB = b.allocs;
 await roundTrip(Array.from({ length: 50 }, (_, i) => (i % 2 ? `message ${i}` : bytes(100 + i * 300, i))), 'hot path');
 check(a.allocs === allocsA && b.allocs === allocsB, `no pw_alloc for sends up to 16 KiB or for received datagrams (${a.allocs - allocsA}, ${b.allocs - allocsB})`);
+check(datagrams > 100 && views === datagrams, `every datagram went to onTransmit as a view of the endpoint's send buffer, not a copy (${views} of ${datagrams})`);
 
 // Hex: every byte, both cases, and the old parseInt reading of anything else.
 const oldFromHex = (s) => Uint8Array.from(s.match(/../g), (h) => parseInt(h, 16));

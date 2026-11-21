@@ -583,9 +583,11 @@ the JS package, which `BleLink` and `BluetoothTransport` need).
 - **Randomness and time** come from JS: `crypto.getRandomValues` for the seed of `pw_endpoint_new` and the
   auxiliary bytes of `pw_nostr_sign`, and a `setTimeout` to the `pw_poll_timeout` deadline that calls
   `pw_handle_timeout` and pumps.
-- **The pump.** `pump()` drains `pw_poll_transmit` into `onTransmit(addr, bytes)` and `pw_poll_event` into `onEvent`
-  (decoded by `decodeEvent`), then sets the timer again. Sends, received datagrams and `addRelay` schedule one pump
-  per JS task (a microtask); `connect`, `connectVia`, `addCandidate` and `disconnect` pump at once.
+- **The pump.** `pump()` drains `pw_poll_transmit` into `onTransmit(addr, bytes)`, `bytes` a view of the scratch
+  buffer it wrote (valid only during the call: [Endpoint](javascript.md#endpoint)), and `pw_poll_event` into
+  `onEvent` (decoded by `decodeEvent`), then sets the timer again, unless it is already set to fire by the new
+  deadline. Sends, received datagrams and `addRelay` schedule one pump per JS task (a microtask); `connect`,
+  `connectVia`, `addCandidate` and `disconnect` pump at once.
 - **Handles are local.** An address is a DataChannel or a signalling pipe, so `endpoint()` passes
   `share_addresses` 0 unless it is given `shareAddresses: true`. `receive(addr, bytes, peer)` calls
   `pw_handle_datagram_from` when it knows the channel's peer, and `pw_handle_datagram` otherwise.

@@ -34,10 +34,16 @@ const [a, b, c] = [pw.endpoint(), pw.endpoint(), pw.endpoint()];
 let keep = false;
 let kept = null;
 const held = []; // b's datagrams after the kept one, while keeping
-a.onTransmit = (addr, bytes) => addr === 2 && setImmediate(() => b.receive(1, bytes, a.id));
+// Datagrams are kept or delivered later, so copied: each is a view into the wasm's memory, valid only during
+// onTransmit.
+a.onTransmit = (addr, bytes) => {
+  const copy = bytes.slice();
+  if (addr === 2) setImmediate(() => b.receive(1, copy, a.id));
+};
 b.onTransmit = (addr, bytes) => {
-  if (keep) return void (kept ? held.push(bytes) : (kept = bytes));
-  setImmediate(() => a.receive(2, bytes, b.id));
+  const copy = bytes.slice();
+  if (keep) return void (kept ? held.push(copy) : (kept = copy));
+  setImmediate(() => a.receive(2, copy, b.id));
 };
 const paths = [];
 const got = [];

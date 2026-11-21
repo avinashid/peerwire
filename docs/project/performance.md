@@ -45,25 +45,33 @@ the reliable lane's scans cost more than the crypto.
 Setup: two hosts, 100 ms RTT, 100 Mbit/s uplinks. 64 MiB is sent as 1 MiB `Reliable` messages that keep the send
 buffer (4 MiB) full, and a 64 B `Urgent` message goes every 20 ms. The default `Config` is used: a window of 1024
 fragments of 1100 B, so the ceiling is about 11 MB/s at 100 ms. The last two rows set `reliable_window` to 4096 on
-both hosts (`--window 4096`). CPU is wall-clock time inside each endpoint, on one aarch64 core.
+both hosts (`--window 4096`). CPU is wall-clock time inside each endpoint, on one aarch64 core, measured before
+NB-158's delayed ACKs; the other columns are with them.
 
 | Link | Throughput | Peak cwnd / inflight | Delay backoffs | Retransmits | Urgent p50 / p99 | Sender CPU per fragment |
 |---|---|---|---|---|---|---|
-| Clean | 9.18 MB/s (7.3 s) | 1511 / 1025 | 1 | 0 | 50 / 130 ms | 5 µs |
-| 1% loss | 0.24 MB/s (284 s) | 336 / 336 | 3 | 659 | 72 / 133 ms | 4 µs |
-| 0–10 ms jitter, drawn per packet (reorders) | 7.10 MB/s (9.5 s) | 970 / 970 | 2 | 3 | 56 / 119 ms | 6 µs |
-| 0–10 ms jitter, in order | 5.85 MB/s (11.5 s) | 865 / 865 | 2 | 0 | 60 / 128 ms | 5 µs |
+| Clean | 9.13 MB/s (7.3 s) | 1508 / 1025 | 1 | 0 | 50 / 130 ms | 5 µs |
+| 1% loss | 0.24 MB/s (283 s) | 209 / 209 | 1 | 654 | 69 / 124 ms | 4 µs |
+| 0–10 ms jitter, drawn per packet (reorders) | 7.08 MB/s (9.5 s) | 964 / 964 | 2 | 0 | 56 / 118 ms | 6 µs |
+| 0–10 ms jitter, in order | 4.98 MB/s (13.5 s) | 709 / 709 | 2 | 0 | 60 / 127 ms | 5 µs |
 | Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60353 / 1026 | 0 | 0 | 50 / 130 ms | 5 µs |
-| Clean, window 4096 | 10.74 MB/s (6.3 s) | 1511 / 1511 | 2 | 0 | 54 / 130 ms | 5 µs |
+| Clean, window 4096 | 10.74 MB/s (6.3 s) | 1508 / 1508 | 2 | 0 | 53 / 130 ms | 5 µs |
 | Clean, 1 Gbit/s uplink, window 4096 | 26.14 MB/s (2.6 s) | 57272 / 3817 | 0 | 0 | 50 / 130 ms | 5 µs |
 
 Inflight counts window slots: a reliable fragment is one, an urgent fragment its share of one by wire size. The
-jitter rows depend on the seed (the table is seed 1): over seeds 1–60 they average 7.39 MB/s per packet and
-5.44 MB/s in order, against 7.39 and 5.42 MB/s before PERF-10 and 7.47 and 5.58 MB/s before PERF-9 (`a6e4a69`),
+jitter rows depend on the seed (the table is seed 1): over seeds 1–60 they average 7.44 MB/s per packet and
+5.25 MB/s in order, against 7.39 and 5.44 MB/s before NB-158's delayed ACKs, 7.39 and 5.42 MB/s before PERF-10 and
+7.47 and 5.58 MB/s before PERF-9 (`a6e4a69`),
 with Urgent p99 120–128 ms against 963–1178 ms. For example:
 `for s in $(seq 1 60); do cargo run -q --release -p peerwire-sim --example bulk -- --jitter 10 --seed $s; done`.
 
 What limits it:
+- **Delayed ACKs (NB-158) leave the simulator's transfers as they were.** The receiver acknowledges 4 fragments in
+  order at a time (or 1 ms after the first), not each: a quarter of the ACKs, which a browser pays for per packet.
+  Seed 1 moved some rows (in order jitter 5.85 → 4.98 MB/s, 1% loss the same 0.24 MB/s with a smaller peak window),
+  but over seeds the jitter rows average 7.44 and 5.25 MB/s against 7.39 and 5.44 before, and the 16 MiB loss runs
+  over seeds 1–40 0.36, 0.24 and 0.17 MB/s at 0.5%, 1% and 2% against 0.35, 0.24 and 0.17. The other rows are
+  unchanged.
 - **One delay backoff costs 15% of the window.** Slow start puts 1024 fragments per RTT on the wire, about
   103 Mbit/s, so the uplink queues. Queueing delay over `QUEUE_TARGET` sets ssthresh to 85% of inflight (about
   870), and congestion avoidance then adds about one fragment per RTT. Before PERF-7B the cut halved the window
@@ -73,7 +81,7 @@ What limits it:
   PERF-7V). Since PERF-7V a loss found by fast retransmit while the latest RTT sample showed under 5 ms of queueing
   is taken as random, as in TCP Veno, and keeps 80% of the window: keeping a share `b` gives
   `√((1+b) / (2(1−b)p))`, **theoretical** 2.12 / √p ≈ 21 fragments, 0.23 MB/s. Over seeds 1–40 the 16 MiB run
-  gets **0.24 MB/s**, and 0.35 and 0.17 MB/s at 0.5% and 2% loss. Before NB-086 timeouts still halved, about 34
+  gets **0.24 MB/s**, and 0.36 and 0.17 MB/s at 0.5% and 2% loss (0.35 at 0.5% before NB-158). Before NB-086 timeouts still halved, about 34
   of its 142 cuts, and it got 0.20, 0.31 and 0.13 MB/s (see tail losses below). At that bound, only a gentler
   response to random loss goes faster: 0.40 MB/s at 1% needs 36 fragments, **theoretical** `b` ≈ 0.93 (two
   such builds are measured below, not shipped). A buffer that overflows usually shows in the RTT first, so that

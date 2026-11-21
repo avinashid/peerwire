@@ -6,8 +6,13 @@ const pw = await loadPeerwire(wasm);
 const a = pw.endpoint();
 const b = pw.endpoint();
 // Handles: a sees b as 2, b sees a as 1.
-a.onTransmit = (addr, bytes) => setImmediate(() => b.receive(1, bytes));
-b.onTransmit = (addr, bytes) => setImmediate(() => a.receive(2, bytes));
+// Delivered later, so copied: `bytes` is a view into the wasm's memory, valid only during the call.
+const wire = (to, addr) => (_, bytes) => {
+  const d = bytes.slice();
+  setImmediate(() => to.receive(addr, d));
+};
+a.onTransmit = wire(b, 1);
+b.onTransmit = wire(a, 2);
 const got = [];
 let connected = 0;
 const done = new Promise((resolve) => {

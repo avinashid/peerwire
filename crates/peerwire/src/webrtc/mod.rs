@@ -315,15 +315,21 @@ impl Rtcs {
                 // An ICE restart, renegotiated on the open connection: only with new ICE credentials, on which str0m
                 // drops the old remote candidates and pairs, and at most once per REPLACE_AFTER; its candidates are
                 // counted afresh. With the same ones str0m would add its candidates to the old, which nothing caps,
-                // and scan them all for each one added (NB162-2).
+                // and scan them all for each one added (NB162-2). The try counts before str0m takes it: str0m sets
+                // the new credentials and adds the candidates before it can still refuse the offer (no `a=group`,
+                // say), so a failed try ends the half-restarted connection, as a failed answer does.
                 let ufrag = ice_ufrag(&offer);
                 if ufrag.is_none() || ufrag == c.ufrag || now.saturating_duration_since(c.made) < REPLACE_AFTER {
                     return false;
                 }
-                let Ok(answer) = c.rtc.sdp_api().accept_offer(offer) else { return false };
+                (c.made, c.ufrag) = (now, ufrag);
+                let Ok(answer) = c.rtc.sdp_api().accept_offer(offer) else {
+                    c.dead = true;
+                    return false;
+                };
                 let msg = answer_msg(&answer);
-                (c.offer_sdp, c.answer_msg, c.ufrag) = (Some(sdp.to_string()), Some(msg.clone()), ufrag);
-                (c.made, c.candidates, c.relays) = (now, candidate_lines(sdp), relay_addrs(sdp));
+                (c.offer_sdp, c.answer_msg) = (Some(sdp.to_string()), Some(msg.clone()));
+                (c.candidates, c.relays) = (candidate_lines(sdp), relay_addrs(sdp));
                 drain(from, c, &mut self.out);
                 return self.publish(now, from, msg);
             }
