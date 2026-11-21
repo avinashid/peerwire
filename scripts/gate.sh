@@ -26,7 +26,7 @@
 #      default 430080 = 420 KB), PLAYWRIGHT (path to playwright's index.mjs),
 #      GATE_JOBS (Node tests at once, default 4), GATE_BROWSER_JOBS (browser tests at once, default 3),
 #      GATE_BASE (what "changed" is measured against, default origin/main),
-#      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 180),
+#      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 180; STEP_TIMEOUT below lets one run longer),
 #      GATE_RETRY (1, the default: a Node or browser test that failed runs once more alone, a pass then is FLAKY;
 #      0: no second run), GATE_RETRY_MAX (more failed tests than this, default 5, run no second time),
 #      NODE_CI (the node binary --strict runs CI's Node tests on, default the newest ~/.nvm/versions/node/v<CI's>.*).
@@ -125,6 +125,7 @@ BROWSER=(
   "chat|node packages/js/test/chat.mjs"
   "share|node packages/js/test/share_browser.mjs"
   "share native|node packages/js/test/share_native.mjs"
+  "share webrtc|node packages/js/test/share_webrtc.mjs"
   "call|node packages/js/test/call_browser.mjs"
   "meet|node packages/js/test/meet.mjs 3"
   "webrtc signals|node packages/js/test/webrtc_signals.mjs"
@@ -143,8 +144,11 @@ BROWSER=(
   "react example|node packages/react/test/example.mjs"
   "site|node packages/js/test/site.mjs"
 )
-# The slowest browser tests (16-66 s on 2 Nov), started first.
-BROWSER_FIRST='^(netlab punch close|netlab mic|call|netlab birthday|meet)$'
+# The slowest browser tests (16-66 s on 2 Nov), started first; share webrtc builds its examples (str0m and AWS-LC
+# with them) before it starts, 4 min cold on 21 Nov.
+BROWSER_FIRST='^(share webrtc|netlab punch close|netlab mic|call|netlab birthday|meet)$'
+# Steps that may run longer than GATE_STEP_TIMEOUT, in seconds: share webrtc's cold build alone took 255 s (NB-162).
+declare -A STEP_TIMEOUT=(["share webrtc"]=600)
 
 # Paths that cannot change a Rust test, clippy or fmt result. Anything else runs the Rust steps: a new crate,
 # Cargo.lock, scripts/ (but the site's), examples/, a crate README (they run as doctests).
@@ -163,7 +167,7 @@ step() {
     0/*) ;;
     124/timeout|137/timeout)
       r=FAIL
-      echo "gate: no exit after GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT}s, killed" >>"$f.log" ;;
+      echo "gate: no exit within its time (GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT}s, or its STEP_TIMEOUT), killed" >>"$f.log" ;;
     *) r=FAIL ;;
   esac
   echo "$r  $name ($((SECONDS - t0))s)" >"$f.res"
@@ -240,7 +244,7 @@ ci_tests() {
 entry() {
   local cmd
   read -ra cmd <<<"${1#*|}"
-  step "${1%%|*}" timeout -k 10 "$GATE_STEP_TIMEOUT" "${cmd[@]}"
+  step "${1%%|*}" timeout -k 10 "${STEP_TIMEOUT[${1%%|*}]:-$GATE_STEP_TIMEOUT}" "${cmd[@]}"
 }
 
 # Size and import count of the browser modules, the default one and the one with Bluetooth: each must stay small and

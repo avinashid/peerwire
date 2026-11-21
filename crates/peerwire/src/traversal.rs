@@ -473,10 +473,11 @@ impl std::fmt::Display for Failure {
 
 /// An address as a host with TURN or a radio gives it to the [`Endpoint`]: a network address, a peer reached through
 /// this node's allocation on one of its TURN servers, a peer's relayed address (on the peer's TURN server), sent to
-/// from this node's own socket, a Bluetooth connection, or a pipe over the signaling relays. All but the first are
-/// [`relayed`](Address::relayed): a link on one punches to the peer's network addresses and moves to the first that
-/// answers. On the wire each is its network address, but a Bluetooth connection's and a pipe's, which go nowhere. More
-/// kinds may come, so a `match` on one outside this crate needs a `_` arm.
+/// from this node's own socket, a Bluetooth connection, a pipe over the signaling relays, or a browser's WebRTC
+/// DataChannel. All but the first and the last are [`relayed`](Address::relayed): a link on one punches to the peer's
+/// network addresses and moves to the first that answers. On the wire each is its network address, but a Bluetooth
+/// connection's, a pipe's and a DataChannel's, which go nowhere. More kinds may come, so a `match` on one outside this
+/// crate needs a `_` arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Hop<A> {
@@ -495,18 +496,25 @@ pub enum Hop<A> {
     /// Bluetooth connection by an address the host picks that no network uses (`Node` takes one in `0.0.0.0/8`, port
     /// 1, per peer). Never offered, told to a peer or decoded, as `Ble`.
     Pipe(A),
+    /// A WebRTC DataChannel to a browser (feature `webrtc`): the peer's datagrams carried over it, its own ICE, DTLS
+    /// and SCTP beneath, on the node's socket. Named like a pipe by an address the host picks that no network uses
+    /// (`Node` takes one in `0.0.0.0/8`, port 2, per peer). A direct path, as a browser counts its DataChannel one
+    /// (it isn't [`relayed`](Address::relayed)), but never offered, told to a peer or decoded, as `Ble`.
+    Rtc(A),
 }
 
 /// The first byte of a [`Hop::Ble`]'s encoding.
 const RADIO_TAG: u8 = 0xb1;
 /// The first byte of a [`Hop::Pipe`]'s encoding.
 const PIPE_TAG: u8 = 0xb2;
+/// The first byte of a [`Hop::Rtc`]'s encoding.
+const RTC_TAG: u8 = 0xb3;
 
 impl<A> Hop<A> {
     /// The network address: the peer's, for `Turn`; for `Ble` and `Pipe`, the one that names the connection.
     pub fn addr(&self) -> &A {
         match self {
-            Hop::Net(a) | Hop::Relayed(a) | Hop::Turn { peer: a, .. } | Hop::Ble(a) | Hop::Pipe(a) => a,
+            Hop::Net(a) | Hop::Relayed(a) | Hop::Turn { peer: a, .. } | Hop::Ble(a) | Hop::Pipe(a) | Hop::Rtc(a) => a,
         }
     }
 }
@@ -516,6 +524,7 @@ impl<A: Address> Address for Hop<A> {
         match self {
             Hop::Ble(_) => out.push(RADIO_TAG),
             Hop::Pipe(_) => out.push(PIPE_TAG),
+            Hop::Rtc(_) => out.push(RTC_TAG),
             _ => {}
         }
         self.addr().encode(out)
@@ -531,7 +540,7 @@ impl<A: Address> Address for Hop<A> {
     }
     fn to_socket_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
-            Hop::Ble(_) | Hop::Pipe(_) => None,
+            Hop::Ble(_) | Hop::Pipe(_) | Hop::Rtc(_) => None,
             _ => self.addr().to_socket_addr(),
         }
     }
@@ -539,7 +548,7 @@ impl<A: Address> Address for Hop<A> {
         A::from_socket_addr(addr).map(Hop::Net)
     }
     fn relayed(&self) -> bool {
-        !matches!(self, Hop::Net(_))
+        !matches!(self, Hop::Net(_) | Hop::Rtc(_))
     }
     fn radio(&self) -> bool {
         matches!(self, Hop::Ble(_) | Hop::Pipe(_))
@@ -691,6 +700,9 @@ struct Remote<A> {
     /// The radio connections proven to reach it, newest first, at most `MAX_RADIO`: a dial to it goes over them too
     /// ([`PathKind::Bluetooth`] or [`PathKind::EspNow`], [`Traversal::radio_kind`]). Never offered.
     radio: Vec<A>,
+    /// It is a browser (a joinRoom page): it said a browser's hello, or sent a WebRTC offer that proved the room key
+    /// (feature `webrtc`). Its links carry room.js's room layer, and it is never sent an offer of ours.
+    browser: bool,
 }
 
 /// A dial run in the steps of a [`Policy`]: the offer it dials, the step to start next, and when.
@@ -724,6 +736,7 @@ impl<A> Default for Remote<A> {
             redial: false,
             hide: false,
             radio: Vec::new(),
+            browser: false,
         }
     }
 }
@@ -812,6 +825,13 @@ pub struct Traversal<A: Address> {
     sockets: VecDeque<Birthday<A>>,
     transmits: VecDeque<Transmit<A>>,
     signals: VecDeque<Signal>,
+    /// Browsers on (feature `webrtc`, [`set_browsers`](Traversal::set_browsers)): this node also says a browser's
+    /// hello and takes browsers' hellos and WebRTC signals.
+    #[cfg(feature = "webrtc")]
+    browsers: bool,
+    /// Browsers whose hello proved the room key and that this node dials (the smaller id dials), for the host.
+    #[cfg(feature = "webrtc")]
+    to_dial: VecDeque<PeerId>,
 }
 
 impl<A: Address> Traversal<A> {
@@ -875,6 +895,10 @@ impl<A: Address> Traversal<A> {
             sockets: VecDeque::new(),
             transmits: VecDeque::new(),
             signals: VecDeque::from([Signal::Subscribe(inbox)]),
+            #[cfg(feature = "webrtc")]
+            browsers: false,
+            #[cfg(feature = "webrtc")]
+            to_dial: VecDeque::new(),
         }
     }
 
@@ -1207,6 +1231,12 @@ impl<A: Address> Traversal<A> {
         self.rng.fill_bytes(&mut nonce);
         let h = hello(&r.key, &self.id, r.role, wall);
         self.signals.push_back(Signal::Publish(r.topic, seal_room(&r.enc, nonce, &h)));
+        #[cfg(feature = "webrtc")]
+        if self.browsers {
+            self.rng.fill_bytes(&mut nonce);
+            let h = browser_hello(&r.key, &self.id, r.role, wall);
+            self.signals.push_back(Signal::Publish(r.topic, seal_room(&r.enc, nonce, &h)));
+        }
     }
 
     /// Stops announcing and answering in the current room. Links stay up.
@@ -1330,6 +1360,22 @@ impl<A: Address> Traversal<A> {
         if let Some(room) = self.room.as_ref().filter(|r| r.topic == topic) {
             // A hello that doesn't open under the room's key (plaintext, another room's, altered) is dropped.
             let body = open_room(&room.enc, payload)?;
+            #[cfg(feature = "webrtc")]
+            if self.browsers {
+                if let Some((from, role, ts, proof)) = parse_browser_hello(&body) {
+                    let fresh = self.wall_ms(now).abs_diff(ts) <= FRESH_MS;
+                    let parts = [&b"pw-hello"[..], from.as_bytes(), &[role as u8], &ts.to_le_bytes()];
+                    if !fresh || from == self.id || !mac_ok(&room.key, &parts, &proof) {
+                        return None;
+                    }
+                    let known = self.remotes.get(&from).is_some_and(|r| r.member.is_some());
+                    self.on_browser_hello(now, ep, from, role);
+                    if !known && self.remotes.get(&from).is_some_and(|r| r.member.is_some()) {
+                        self.answer_hello(now);
+                    }
+                    return Some(from);
+                }
+            }
             let (from, role, ts, proof) = parse_hello(&body)?;
             let fresh = self.wall_ms(now).abs_diff(ts) <= FRESH_MS;
             if fresh && mac_ok(&room.key, &[b"pw-hello", from.as_bytes(), &[role as u8], &ts.to_le_bytes()], &proof) {
@@ -1351,9 +1397,14 @@ impl<A: Address> Traversal<A> {
             }
             let (from, body) = sealed::open(&self.me, payload)?;
             // A pipe batch (JSON; offers start with their version, 1 to 3): kept for the host only as `takes_pipe`
-            // says, and while it takes them (see `poll_piped`).
+            // says, and while it takes them (see `poll_piped`). With browsers on (feature `webrtc`), in a room, any
+            // other JSON is a browser's WebRTC signal, from anyone: the host checks its proof (`pw-rtc-offer`).
             if body.first() == Some(&b'{') {
-                if self.takes_pipe(&from) {
+                #[cfg(feature = "webrtc")]
+                let signal = self.browsers && self.room.is_some() && !crate::pipe::is_batch(&body);
+                #[cfg(not(feature = "webrtc"))]
+                let signal = false;
+                if signal || self.takes_pipe(&from) {
                     match self.piped.len() < MAX_PIPED {
                         true => self.piped.push_back((from, body)),
                         false => self.inbox_missed = Some(now),
@@ -1411,6 +1462,70 @@ impl<A: Address> Traversal<A> {
             member.is_some_and(|role| allowed(Some(room.role), role) && room.expect.is_none_or(|h| h == *from));
         let relay_only = matches!(self.privacy, Privacy::RelayOnly { .. });
         linked && !relay_only && self.policy.as_ref().is_none_or(|p| p.allows(PathKind::Signaling))
+    }
+
+    /// Turns browsers on or off (feature `webrtc`): with them on, in a room, this node also says hello as a browser
+    /// does (`{"t":"hello","from":…,"meta":{"role":…,"ts":…,"p":…,"native":1}}`, which room.js takes and natives
+    /// ignore), takes browsers' hellos ([`is_browser`](Traversal::is_browser)), names those it dials
+    /// ([`poll_browser_dial`](Traversal::poll_browser_dial)), and hands WebRTC signals to the host
+    /// ([`poll_piped`](Traversal::poll_piped)).
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn set_browsers(&mut self, on: bool) {
+        self.browsers = on;
+    }
+
+    /// Whether `peer` is a browser: it said a browser's hello in this node's room, or proved the room key in a WebRTC
+    /// offer ([`admit_browser`](Traversal::admit_browser)).
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn is_browser(&self, peer: &PeerId) -> bool {
+        self.remotes.get(peer).is_some_and(|r| r.browser)
+    }
+
+    /// `peer` sent a WebRTC offer that proved the room key: a browser and a room member (room.js's role, a peer), if
+    /// this node links with one. Whether it does.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn admit_browser(&mut self, now: Instant, peer: PeerId) -> bool {
+        if self.room.is_none() || !self.links_with(&peer, Role::Peer) {
+            return false;
+        }
+        let r = self.remotes.entry(peer).or_default();
+        (r.member, r.browser, r.seen_at) = (r.member.or(Some(Role::Peer)), true, now);
+        true
+    }
+
+    /// The next browser whose hello proved the room key and that this node dials, the smaller id: the host makes a
+    /// WebRTC offer to it unless it has a connection to it.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn poll_browser_dial(&mut self) -> Option<PeerId> {
+        self.to_dial.pop_front()
+    }
+
+    /// The room proof of `label` from `from` to `to` (room.js `proof.pair`): HMAC-SHA256 under the room key over the
+    /// label and both ids. `None` outside a room.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn room_pair(&self, label: &[u8], from: &PeerId, to: &PeerId) -> Option<[u8; 32]> {
+        Some(mac(&self.room.as_ref()?.key, &[label, from.as_bytes(), to.as_bytes()]))
+    }
+
+    /// Whether `proof` is [`room_pair`](Traversal::room_pair)'s, in constant time. False outside a room.
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn room_pair_ok(&self, label: &[u8], from: &PeerId, to: &PeerId, proof: &[u8]) -> bool {
+        self.room.as_ref().is_some_and(|r| mac_ok(&r.key, &[label, from.as_bytes(), to.as_bytes()], proof))
+    }
+
+    /// A browser's hello whose proof checked out: a member, if this node links with its role, and dialled if this
+    /// node has the smaller id and none is linked (within the hellos' budget, as offers are).
+    #[cfg(feature = "webrtc")]
+    fn on_browser_hello(&mut self, now: Instant, ep: &Endpoint<A>, from: PeerId, role: Role) {
+        if !self.links_with(&from, role) {
+            return;
+        }
+        let r = self.remotes.entry(from).or_default();
+        (r.member, r.browser, r.seen_at) = (Some(role), true, now);
+        if self.id < from && !ep.is_connected(&from) && self.hellos.take(now, BURST, REFILL) {
+            self.to_dial.retain(|p| *p != from);
+            self.to_dial.push_back(from);
+        }
     }
 
     /// `body` sealed to `to` for its inbox ([`Topic::peer`]), as an offer is: a pipe batch.
@@ -2600,6 +2715,10 @@ impl<A: Address> Traversal<A> {
     /// with a proof under the room key (sent only while in a room); otherwise
     /// one proved with `to`'s invite key, if we have it.
     fn offer(&mut self, now: Instant, ep: &Endpoint<A>, to: PeerId, reply: bool, room: bool) {
+        // A browser reads no offer of ours (its signals are WebRTC's), and is never told our addresses this way.
+        if self.remotes.get(&to).is_some_and(|r| r.browser) {
+            return;
+        }
         let invite = self.remotes.get(&to).and_then(|r| r.key);
         let (kind, key, label): (_, _, &[u8]) = match (&self.room, room, invite) {
             (Some(r), true, _) => (Proof::Room, Some(r.key), b"pw-offer"),
@@ -2824,6 +2943,44 @@ fn parse_hello(b: &[u8]) -> Option<(PeerId, Role, u64, [u8; 32])> {
     }
     let (mut id, mut proof) = ([0u8; 32], [0u8; 32]);
     (unhex(id_hex, &mut id) && unhex(proof_hex, &mut proof)).then_some((PeerId(id), role, ts.parse().ok()?, proof))
+}
+
+/// The room presence message as room.js says it (`nostr.js` `hello`: `{t, from, meta: {role, ts, p}}`, as
+/// `JSON.stringify` writes it), which a native node with browsers on says too, with `"native":1` after the proof:
+/// room.js takes it as a browser's and dials it over WebRTC, and natives, which say [`hello`] to each other, don't take
+/// it for one ([`parse_browser_hello`] wants nothing after the proof; nodes before NB-162 take no hello without `nb`).
+/// The proof is [`hello`]'s.
+#[cfg(feature = "webrtc")]
+fn browser_hello(key: &[u8; 32], id: &PeerId, role: Role, ts: u64) -> Vec<u8> {
+    let proof = mac(key, &[b"pw-hello", id.as_bytes(), &[role as u8], &ts.to_le_bytes()]);
+    let (id, name, proof) = (hex(id.as_bytes()), role_name(role), hex(&proof));
+    format!("{HELLO_HEAD}{id}{BROWSER_MID}{name}{HELLO_TS}{ts}{HELLO_PROOF}{proof}{BROWSER_NATIVE}").into_bytes()
+}
+
+/// After the id in a browser's hello.
+#[cfg(feature = "webrtc")]
+const BROWSER_MID: &str = r#"","meta":{"role":""#;
+/// What ends a native's browser-shaped hello ([`browser_hello`]).
+#[cfg(feature = "webrtc")]
+const BROWSER_NATIVE: &str = r#"","native":1}}"#;
+
+/// A room.js hello: exactly `{"t":"hello","from":"<id>","meta":{"role":"<role>","ts":<ts>,"p":"<proof>"}}`, as
+/// `JSON.stringify` writes room.js's. A native's ([`browser_hello`]) isn't one, nor one with any other field.
+#[cfg(feature = "webrtc")]
+fn parse_browser_hello(b: &[u8]) -> Option<(PeerId, Role, u64, [u8; 32])> {
+    let s = std::str::from_utf8(b).ok()?;
+    let rest = s.strip_prefix(HELLO_HEAD)?;
+    let (id_hex, rest) = (rest.get(..64)?, rest.get(64..)?);
+    let (role, rest) = rest.strip_prefix(BROWSER_MID)?.strip_suffix(HELLO_TAIL)?.split_once(HELLO_TS)?;
+    let (ts, proof_hex) = rest.split_once(HELLO_PROOF)?;
+    let role = [Role::Peer, Role::Host, Role::Client].into_iter().find(|r| role_name(*r) == role)?;
+    if ts.is_empty() || ts.len() > 19 || !ts.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (mut id, mut proof) = ([0u8; 32], [0u8; 32]);
+    let lower = |h: &str| h.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'));
+    let ok = lower(id_hex) && unhex(id_hex, &mut id) && unhex(proof_hex, &mut proof);
+    ok.then_some((PeerId(id), role, ts.parse().ok()?, proof))
 }
 
 /// What an offer's proof is under (it follows the body, inside the seal).
@@ -4579,6 +4736,112 @@ mod tests {
         }
         let got: Vec<_> = std::iter::from_fn(|| t.poll_piped()).map(|(p, _)| p).collect();
         assert_eq!(got, vec![id(3).peer_id()]);
+    }
+
+    /// NB-162: a browser's hello is room.js's, exactly; a native with browsers on says one too, marked `native`, which
+    /// room.js takes and no native does (nodes before NB-162 take no hello without `nb`, and this parser nothing after
+    /// the proof).
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn browser_hellos_are_room_js_hellos_and_ours_is_for_browsers_alone() {
+        let (key, p, ts) = (room_key(ROOM.0, ROOM.1), id(2).peer_id(), 1_800_000_000_123u64);
+        let proof = mac(&key, &[b"pw-hello", p.as_bytes(), &[Role::Peer as u8], &ts.to_le_bytes()]);
+        // As room.js says it: JSON.stringify({ t: 'hello', from, meta: { role, ts, p } }).
+        let js = format!(
+            r#"{{"t":"hello","from":"{}","meta":{{"role":"peer","ts":{ts},"p":"{}"}}}}"#,
+            hex(p.as_bytes()),
+            hex(&proof)
+        );
+        assert_eq!(parse_browser_hello(js.as_bytes()), Some((p, Role::Peer, ts, proof)));
+        assert_eq!(parse_hello(js.as_bytes()), None, "a native's parser takes no browser's");
+        let ours = browser_hello(&key, &p, Role::Peer, ts);
+        assert_eq!(String::from_utf8(ours.clone()).unwrap(), js.replace(r#""}}"#, r#"","native":1}}"#));
+        assert_eq!((parse_browser_hello(&ours), parse_hello(&ours)), (None, None), "ours is for browsers alone");
+        for bad in [
+            js.replace(&hex(p.as_bytes()), &hex(p.as_bytes()).to_uppercase()),
+            js.replace(r#""role":"peer""#, r#""role":"boss""#),
+            js.replace(&format!(":{ts},"), ":-1,"),
+            js.replace(&format!(":{ts},"), ":12345678901234567890,"),
+            js.replace(r#""}}"#, r#"","x":1}}"#),
+            js.replace(r#"{"t":"hello","#, r#"{"t":"hello", "#),
+        ] {
+            assert_eq!(parse_browser_hello(bad.as_bytes()), None, "{bad}");
+        }
+    }
+
+    /// NB-162: with browsers on, a browser's hello that proves the room key makes it a member and a browser, which this
+    /// node dials (the smaller id) and never sends an offer; its WebRTC signals go to the host from anyone in the room,
+    /// its pipe batches only from members. With browsers off, none of it.
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn browsers_hellos_and_signals_with_browsers_on() {
+        let me = id(1).peer_id();
+        let (key, topic, inbox) = (room_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1), Topic::peer(&me));
+        let enc = room_enc_key(ROOM.0, ROOM.1);
+        let said = |who: &PeerId, ts: u64| {
+            let proof = mac(&key, &[b"pw-hello", who.as_bytes(), &[Role::Peer as u8], &ts.to_le_bytes()]);
+            let js = format!(
+                r#"{{"t":"hello","from":"{}","meta":{{"role":"peer","ts":{ts},"p":"{}"}}}}"#,
+                hex(who.as_bytes()),
+                hex(&proof)
+            );
+            seal_room(&enc, [4; NONCE_LEN], js.as_bytes())
+        };
+        let (larger, smaller) = (id(9).peer_id(), PeerId([0; 32]));
+        assert!(me < larger && smaller < me);
+        // Off: a browser's hello is nobody's.
+        let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        assert_eq!(t.handle_signal(Instant::ZERO, &mut ep, topic, &said(&larger, 0)), None);
+        assert!(!t.is_browser(&larger) && !t.admits(&larger));
+        let offer = br#"{"kind":"offer"}"#;
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &sealed::seal(&id(9), &me, [7; 32], offer).unwrap());
+        assert_eq!(t.poll_piped(), None, "no signal taken with browsers off");
+        // On: we say a browser's hello beside ours.
+        let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        t.set_browsers(true);
+        t.resubscribe(Instant::ZERO);
+        let hellos: Vec<Vec<u8>> = std::iter::from_fn(|| t.poll_signal())
+            .filter_map(|s| match s {
+                Signal::Publish(tp, p) if tp == topic => open_room(&enc, &p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hellos.len(), 2);
+        assert!(parse_hello(&hellos[0]).is_some() && hellos[1].ends_with(br#","native":1}}"#));
+        // A browser's hello: a member and a browser; the larger id is ours to dial, the smaller dials us.
+        let later = Instant::ZERO + Duration::from_secs(3);
+        for (who, dial) in [(larger, Some(larger)), (smaller, None)] {
+            assert_eq!(t.handle_signal(later, &mut ep, topic, &said(&who, 3000)), Some(who));
+            assert!(t.is_browser(&who) && t.admits(&who));
+            assert_eq!(t.poll_browser_dial(), dial);
+            // The first answered at once (the second within HELLO_ANSWER_GAP of it).
+            assert_eq!(said_hellos(&mut t).len(), usize::from(who == larger), "a new member is answered");
+        }
+        // Stale, or another room's: nothing.
+        let stale = said(&id(7).peer_id(), FRESH_MS + 1);
+        assert_eq!(t.handle_signal(Instant::ZERO, &mut ep, topic, &stale), None);
+        assert!(!t.is_browser(&id(7).peer_id()));
+        // No offer of ours ever goes to a browser, even asked for one.
+        t.introduce(Instant::ZERO, &ep, larger, None);
+        assert_eq!(published(&mut t), 0);
+        // A WebRTC signal from anyone in the room goes to the host, a pipe batch only from a member.
+        for who in [id(9), id(6)] {
+            t.handle_signal(Instant::ZERO, &mut ep, inbox, &sealed::seal(&who, &me, [7; 32], offer).unwrap());
+            assert_eq!(t.poll_piped(), Some((who.peer_id(), offer.to_vec())));
+        }
+        let batch = br#"{"kind":"dg","d":["AA=="]}"#;
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &sealed::seal(&id(6), &me, [7; 32], batch).unwrap());
+        assert_eq!(t.poll_piped(), None, "a stranger's batch");
+        // A proved offer admits its sender as a browser; outside a room, nothing.
+        assert!(t.admit_browser(Instant::ZERO, id(6).peer_id()) && t.is_browser(&id(6).peer_id()));
+        let pair = t.room_pair(b"pw-rtc-offer", &id(6).peer_id(), &me).unwrap();
+        assert!(t.room_pair_ok(b"pw-rtc-offer", &id(6).peer_id(), &me, &pair));
+        assert!(!t.room_pair_ok(b"pw-rtc-offer", &me, &id(6).peer_id(), &pair), "one way only");
+        assert!(!t.room_pair_ok(b"pw-link", &id(6).peer_id(), &me, &pair), "one label only");
+        t.leave_room();
+        assert!(!t.admit_browser(Instant::ZERO, id(8).peer_id()) && t.room_pair(b"pw-link", &me, &larger).is_none());
+        t.handle_signal(Instant::ZERO, &mut ep, inbox, &sealed::seal(&id(9), &me, [7; 32], offer).unwrap());
+        assert_eq!(t.poll_piped(), None, "out of the room");
     }
 
     /// The room hellos `t` published, opened: who said it and at what time.

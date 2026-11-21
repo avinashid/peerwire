@@ -76,6 +76,8 @@ mod turn;
 #[cfg(not(feature = "turn"))]
 #[path = "turn_off.rs"]
 mod turn;
+#[cfg(feature = "webrtc")]
+mod webrtc;
 
 #[cfg(feature = "tokio")]
 pub use async_node::AsyncNode;

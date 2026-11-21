@@ -3,14 +3,19 @@
 //! file checked again at the end, read from and written to disk a piece at a time, over direct links only.
 //!
 //! ```sh
-//! cargo run --release -p peerwire --features files,nostr --example share -- send <room> <file>... [--stay]
-//! cargo run --release -p peerwire --features files,nostr --example share -- recv <room> <dir> [--yes] [--once]
+//! cargo run --release -p peerwire --features files,nostr,webrtc --example share -- send <room> <file>... [--stay]
+//! cargo run --release -p peerwire --features files,nostr,webrtc --example share -- recv <room> <dir> [--yes] [--once]
 //! ```
 //!
 //! Copies in the same room find each other on the LAN (`LanSignaling`) and, with the `nostr` feature, over Nostr
 //! relays too, as `room_chat` does; `PW_RELAYS` (relay URLs, comma-separated) replaces the default relays:
 //! `ws://127.0.0.1:7447` for the `nostr_relay` example, with no internet. Anyone who guesses the room's name can join
 //! it, so pick one others can't guess.
+//!
+//! With the `webrtc` feature too, the Share page in a browser is in the room as well: the page at `…/share/#<room>`
+//! (over the Nostr relays, as both use) links with this example over a WebRTC DataChannel, and files go both ways
+//! as between two pages. The page shows this example by its presence, `{"name": "<PW_NAME or 'native'>"}`. The node
+//! binds `PW_BIND` (default `0.0.0.0:0`; `127.0.0.1:0` keeps it on loopback, as `share_webrtc.mjs` does).
 //!
 //! - `send` offers each file to every peer that joins, and ends once every offer is answered and every file it sent
 //!   is verified by its receiver (`--stay` keeps offering to peers that join later). Its exit code is 0 if every one
@@ -22,8 +27,7 @@
 //!
 //! The room may also be `tcp://<host:port>`: the room's messages then go over a TCP connection to that address, each
 //! as its length (4 bytes, big-endian) and the message, to the one peer at the other end. That is how
-//! `packages/js/test/share_native.mjs` puts this example and the Share page in a browser in one room, as a browser
-//! and a native node can't link directly yet.
+//! `packages/js/test/share_native.mjs` puts this example and the Share page in a browser in one room without WebRTC.
 
 use peerwire::files::{self, Direction, End, Event as FileEvent, Files, State, TransferId, Wire};
 use peerwire::{DisconnectReason, Event, LanSignaling, Lane, MultiSignaling, Node, PeerId, SendError, Signaling};
@@ -103,7 +107,15 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                 Ok(urls) => peerwire::NostrSignaling::new(urls.split(',').map(str::trim).filter(|u| !u.is_empty())),
                 Err(_) => peerwire::NostrSignaling::default(),
             }));
-            let mut node = Node::builder().signaling(MultiSignaling::new(carriers)).bind("0.0.0.0:0")?;
+            let builder = Node::builder().signaling(MultiSignaling::new(carriers));
+            #[cfg(feature = "webrtc")]
+            let builder = builder.webrtc(true);
+            let mut node = builder.bind(std::env::var("PW_BIND").as_deref().unwrap_or("0.0.0.0:0"))?;
+            #[cfg(feature = "webrtc")]
+            {
+                let name = std::env::var("PW_NAME").unwrap_or_else(|_| "native".into());
+                node.set_presence(&serde_json::json!({ "name": name }).to_string())?;
+            }
             node.join_room(APP, &o.room);
             println!("{} in room {:?}: waiting for peers", node.peer_id(), o.room);
             Link::Room(Box::new(node))
@@ -143,7 +155,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                     }
                     match e {
                         Event::Connected { peer, path, .. } => {
-                            println!("+ {peer} ({path:?})");
+                            println!("+ {peer} ({path:?}, {:?}){}", node.path_kind(&peer), browser(node, &peer));
                             joined.push(peer);
                         }
                         Event::Disconnected { peer, reason } => println!("- {peer} ({reason:?})"),
@@ -312,10 +324,16 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                 }
             }
         }
-        // Once done, a moment more for the last messages (a receiver's verdict) to go.
+        // Once done, a moment more for the last messages (a receiver's verdict) to go, then goodbye to every peer.
         if let Some(ok) = outcome {
             let at = *finished_at.get_or_insert(now);
             if now.duration_since(at) >= Duration::from_secs(2) {
+                if let Link::Room(node) = &mut link {
+                    let peers: Vec<PeerId> = node.peers().copied().collect();
+                    for p in &peers {
+                        node.disconnect(p);
+                    }
+                }
                 return Ok(if ok { 0 } else { 1 });
             }
         }
@@ -328,6 +346,16 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             Link::Bridge(_) => std::thread::sleep(Duration::from_millis(2)),
         }
     }
+}
+
+/// How a peer that joined shows: a browser with its presence (feature `webrtc`).
+fn browser(node: &Node, peer: &PeerId) -> String {
+    #[cfg(feature = "webrtc")]
+    if node.is_browser(peer) {
+        return format!(" browser {}", node.presence(peer).unwrap_or("{}"));
+    }
+    let _ = (node, peer);
+    String::new()
 }
 
 /// What came of answering an offer.
