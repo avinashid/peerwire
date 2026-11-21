@@ -1,6 +1,7 @@
 // Peerwire Share's piece protocol (demo/share/files.js), in Node: piece and control framing, the per-piece and
 // whole-file SHA-256 against node:crypto, pieces refused out of range, out of order or twice, resume offsets, offers
-// from a hostile peer, file names cleaned, the download header, and which routes may carry file data.
+// from a hostile peer, file names cleaned, the download header, which routes may carry file data, and the sender's
+// window.
 //
 //   node packages/js/test/share.mjs
 
@@ -19,6 +20,11 @@ const enc = new TextEncoder();
 check(F.HEADER === 53 && F.MAX_PIECE === (1 << 20) - 1 - 53, `the piece header is 53 bytes, so a piece is at most ${F.MAX_PIECE} bytes`);
 check(F.PIECE >= F.MIN_PIECE && F.PIECE <= F.MAX_PIECE && F.PIECE === 512 * 1024, 'this page sends 512 KiB pieces, within 256 KiB and MAX_PIECE');
 check(F.WINDOW * F.PIECE <= 4 << 20 && F.MAX_QUEUED === 2 * F.WINDOW, 'at most 4 MiB in flight per peer; a receiver holds at most 2 windows');
+// The sender's window in bytes: twice rate × RTT, from 1 to 4 MiB; with no rate or RTT yet (0, NaN), the least.
+const W = F.windowBytes;
+check(F.MIN_WINDOW === 1 << 20 && F.MAX_WINDOW === 4 << 20 && F.MAX_WINDOW <= F.WINDOW * F.PIECE, 'a window of 1 to 4 MiB, never past WINDOW pieces of PIECE');
+check([W(0, 0), W(10e6, 2), W(0, 500), W(10e6, null), W(NaN, 50), W(10e6, undefined)].every((w) => w === F.MIN_WINDOW), 'no rate or RTT, or a short link: 1 MiB');
+check(W(20e6, 50) === 2e6 && W(5e6, 100) === F.MIN_WINDOW && W(20e6, 100) === 4e6 && W(25e6, 100) === F.MAX_WINDOW && W(1e9, 1e3) === F.MAX_WINDOW, 'twice rate × RTT in between (2 MB at 20 MB/s and 50 ms), 4 MiB at most');
 
 // 2. Piece framing.
 const id = F.newId();

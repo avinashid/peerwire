@@ -8,11 +8,11 @@
 //            'end' | 'done', id, ... }
 //
 // A file is cut into pieces of `piece` bytes (the last may be shorter), each well under the reliable lane's largest
-// message (MAX_FRAME, the room's tag byte included). The sender keeps at most WINDOW pieces it hasn't seen acked, so
-// neither side holds more than a few MiB of a file of any size. The receiver takes pieces only in order and only for a
-// transfer it accepted, checks each piece's SHA-256 (WebCrypto) and the whole file's (Sha256 below, as it streams),
-// writes each piece before it acks it, and on a new link says how many pieces it has (`accept` with `have`), so the
-// sender goes on from there (resumeAt).
+// message (MAX_FRAME, the room's tag byte included). The sender keeps at most windowBytes() of pieces it hasn't seen
+// acked, and at most WINDOW pieces, so neither side holds more than a few MiB of a file of any size. The receiver
+// takes pieces only in order and only for a transfer it accepted, checks each piece's SHA-256 (WebCrypto) and the
+// whole file's (Sha256 below, as it streams), writes each piece before it acks it, and on a new link says how many
+// pieces it has (`accept` with `have`), so the sender goes on from there (resumeAt).
 //
 // Everything a peer sends is untrusted: offers are checked and their names cleaned (parseOffer, cleanName), control
 // messages over MAX_CONTROL bytes are never parsed, and a piece that isn't the next one, is the wrong length or fails
@@ -26,7 +26,9 @@ export const HEADER = 1 + ID_BYTES + 4 + 32;
 export const PIECE = 512 * 1024; // what this page sends
 export const MIN_PIECE = 256 * 1024; // what it takes from others
 export const MAX_PIECE = MAX_FRAME - 1 - HEADER;
-export const WINDOW = 8; // pieces in flight per transfer: 4 MiB at PIECE
+export const WINDOW = 8; // pieces in flight to one peer at most, over all transfers to it: 4 MiB at PIECE
+export const MIN_WINDOW = 1 << 20; // bytes in flight to one peer: windowBytes()
+export const MAX_WINDOW = 4 << 20;
 export const MAX_QUEUED = 2 * WINDOW; // pieces a receiver holds unwritten; more means the sender ignores acks
 export const MAX_SIZE = 2 ** 40; // 1 TiB
 export const MAX_CONTROL = 4096; // bytes of a control message's JSON
@@ -177,6 +179,17 @@ export function sameHash(a, b) {
 export function resumeAt(t, read, have) {
   if (intIn(have, 0, Math.min(t.count, read)) === null) return null;
   return { next: have, offset: Math.min(t.size, have * t.piece) };
+}
+
+// Bytes a sender keeps in flight to one peer (sent, not acked), over all its transfers to it: twice what the link
+// carries in a round trip, `bps` being the bytes a second acked lately and `rttMs` the link's round trip, from
+// MIN_WINDOW to MAX_WINDOW. Pieces wait in the room's reliable lane ahead of whatever goes to the peer after them (a
+// chat message, an ack), so the window is no bigger than keeps the link busy: in Chromium on loopback, 1 MiB moves as
+// much as 4 MiB did, and holds a chat message about 0.1 s where 4 MiB held it 0.6 s (NB-158). A link that carries
+// more each round trip grows it: 100 ms at 20 MB/s reaches MAX_WINDOW in a few seconds.
+export function windowBytes(bps, rttMs) {
+  const bdp = (2 * bps * rttMs) / 1000;
+  return bdp > MIN_WINDOW ? Math.min(MAX_WINDOW, Math.ceil(bdp)) : MIN_WINDOW;
 }
 
 // Whether a route (room.route(peer)) may carry file data: the peer's own WebRTC DataChannel, not through TURN, and not
