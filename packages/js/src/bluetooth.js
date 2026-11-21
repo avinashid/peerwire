@@ -87,6 +87,7 @@ export class BluetoothTransport {
     this.proof = RoomProof.create(name);
     this.sealKey = roomSealKey(name);
     // The endpoint's datagrams to our handles go over their connections; others to the transport that was there.
+    // Conn.datagram copies each into the link at once (BleLink.datagram), so the wasm's view isn't kept.
     const other = endpoint.onTransmit;
     endpoint.onTransmit = (addr, bytes) => {
       const c = this.conns.get(addr);

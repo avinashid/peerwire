@@ -271,6 +271,13 @@ and the commit that fixed it.
   whole file's checked, and is written as it arrives (`showSaveFilePicker`'s writable stream, else a download streamed
   by a service worker, else in memory up to 256 MB). Pieces go only over a peer's own DataChannel, never through the
   signalling relays, a member or TURN, and a transfer whose link drops goes on from the last piece written.
+- **Changed: `Endpoint.onTransmit` gets a view, not a copy** (NB-158, [Endpoint](docs/reference/javascript.md#endpoint)):
+  each datagram is a view into the wasm's memory, valid only until `onTransmit` returns. A transport of your own that
+  keeps a datagram past the call (a queue, a timer, a promise, `postMessage`) must copy it first, `bytes.slice()`;
+  one that sends it at once through an API that copies it, as `RTCDataChannel.send` does, needn't. `LocalTransport`
+  now copies (a structured clone of the view would take the whole of the wasm's memory); the other transports hand
+  the bytes on at once. The endpoint also keeps its timer while it is set to fire by the core's next deadline,
+  rather than setting it again after every pump. Both were a measurable part of a browser's cost per packet.
 - **Share demo, faster** (NB-158): the whole-file SHA-256 keeps every sum within int32, about 5 times faster in
   Chromium, and a sender keeps 1 to 4 MiB in flight to a peer, twice the rate its acks come at times the link's round
   trip (`windowBytes`), rather than 8 pieces always: pieces queue on the reliable lane ahead of anything else sent to

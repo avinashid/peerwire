@@ -31,7 +31,11 @@ const spy = (ep) => {
   return ep;
 };
 // Datagrams sent in one task arrive together in a later one.
-const wire = (from, to, addr) => (from.onTransmit = (_, d) => setImmediate(() => to.receive(addr, d)));
+// Delivered later, so copied: a datagram is a view into the wasm's memory, valid only during onTransmit.
+const wire = (from, to, addr) => (from.onTransmit = (_, d) => {
+  const copy = d.slice();
+  setImmediate(() => to.receive(addr, copy));
+});
 
 const a = spy(pw.endpoint());
 const b = spy(pw.endpoint());
