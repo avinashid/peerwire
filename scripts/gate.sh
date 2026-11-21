@@ -144,11 +144,12 @@ BROWSER=(
   "react example|node packages/react/test/example.mjs"
   "site|node packages/js/test/site.mjs"
 )
-# The slowest browser tests (16-66 s on 2 Nov), started first; share webrtc builds its examples (str0m and AWS-LC
-# with them) before it starts, 4 min cold on 21 Nov.
-BROWSER_FIRST='^(share webrtc|netlab punch close|netlab mic|call|netlab birthday|meet)$'
-# Steps that may run longer than GATE_STEP_TIMEOUT, in seconds: share webrtc's cold build alone took 255 s (NB-162).
-declare -A STEP_TIMEOUT=(["share webrtc"]=600)
+# The slowest browser tests (16-66 s on 2 Nov), started first; share webrtc and share native build the Rust examples
+# they run (one build in target/share-examples, str0m and AWS-LC with it) before they start, 3 to 4 min cold.
+BROWSER_FIRST='^(share webrtc|share native|netlab punch close|netlab mic|call|netlab birthday|meet)$'
+# Steps that may run longer than GATE_STEP_TIMEOUT, in seconds: the cold build of the examples alone took 170 to 255 s
+# on 21 Nov (NB-162), and either of the two may make it.
+declare -A STEP_TIMEOUT=(["share webrtc"]=600 ["share native"]=600)
 
 # Paths that cannot change a Rust test, clippy or fmt result. Anything else runs the Rust steps: a new crate,
 # Cargo.lock, scripts/ (but the site's), examples/, a crate README (they run as doctests).

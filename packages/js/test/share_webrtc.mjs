@@ -16,7 +16,8 @@
 // leaves the host.
 //
 //   node packages/js/test/share_webrtc.mjs                   16 MiB each way, the examples built here (cargo, gate
-//                                                            profile, target/share-webrtc)
+//                                                            profile, target/share-examples, as share_native.mjs
+//                                                            builds them)
 //   node packages/js/test/share_webrtc.mjs --mb=1024 [--bin=dir/with/share/and/room_chat]   1024 MiB each way, timed
 
 import { serve } from './serve.mjs';
@@ -71,8 +72,8 @@ const roomId = () => randomBytes(16).toString('base64url');
 function binaries() {
   const at = (dir) => ({ share: path.join(dir, 'share'), chat: path.join(dir, 'room_chat') });
   if (arg('bin')) return at(arg('bin'));
-  const dir = path.join(repo, 'target/share-webrtc');
-  // Its own target dir, so it never waits on the gate's Rust lane for cargo's lock.
+  const dir = path.join(repo, 'target/share-examples');
+  // Its own target dir, so it never waits on the gate's Rust lane for cargo's lock, and share_native.mjs's build.
   execFileSync('cargo', ['build', '--profile', 'gate', '--target-dir', dir, '-p', 'peerwire', '--features', 'files,nostr,webrtc',
     '--example', 'share', '--example', 'room_chat'], { cwd: repo, stdio: ['ignore', 'ignore', 'inherit'] });
   return at(path.join(dir, 'gate/examples'));
