@@ -2,7 +2,8 @@ use crate::addr::{Address, Path};
 use crate::crypto::{self, ReplayWindow};
 use crate::identity::{Identity, PeerId};
 use crate::reliable::{
-    PushError, RecoveryStats, RelRecv, RelSend, Took, DEFAULT_OUT_OF_ORDER, MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW,
+    PushError, RecoveryStats, RelRecv, RelSend, Took, ACK_DELAY_MAX, ACK_EVERY, DEFAULT_OUT_OF_ORDER, MAX_URGENT,
+    RECV_WINDOW, URGENT_RECV_WINDOW,
 };
 use crate::time::Instant;
 use crate::wire::{
@@ -661,6 +662,12 @@ struct Link {
     ping_pending: bool,
     tx: RelSend,
     rx: RelRecv,
+    /// Reliable fragments (and PINGs) taken since `rx`'s last ACK went out, and
+    /// when that ACK is due: ACK_DELAY_MAX after the first of them, or at once
+    /// (`Instant::ZERO`) once ACK_EVERY have come or one wasn't in order. See
+    /// `ack_later`.
+    unacked: u8,
+    ack_at: Instant,
     /// The urgent stream's receiver: its own sequence space.
     urx: RelRecv,
     unrel: VecDeque<Vec<u8>>,
@@ -691,6 +698,8 @@ impl Link {
             ping_pending: false,
             tx: RelSend::new(),
             rx: RelRecv::new(RECV_WINDOW),
+            unacked: 0,
+            ack_at: now,
             urx: RelRecv::new(URGENT_RECV_WINDOW),
             unrel: VecDeque::new(),
             relay_q: VecDeque::new(),
@@ -700,9 +709,28 @@ impl Link {
         }
     }
 
+    /// A reliable fragment came, `in_order` (the one `rx` expected, with none
+    /// held past a hole, and not a message's last), or a PING (not in order):
+    /// the ACK `rx` owes waits, or is due at once.
+    fn ack_later(&mut self, now: Instant, in_order: bool) {
+        if self.unacked == 0 {
+            self.ack_at = now + ACK_DELAY_MAX;
+        }
+        self.unacked = self.unacked.saturating_add(1);
+        if !in_order || self.unacked >= ACK_EVERY {
+            self.ack_at = Instant::ZERO;
+        }
+    }
+
+    /// Whether the ACK `rx` owes goes now (see `ack_later`); otherwise it goes
+    /// with whatever else the link sends first.
+    fn ack_due(&self, now: Instant) -> bool {
+        self.rx.ack_pending && now >= self.ack_at
+    }
+
     fn has_output(&self, now: Instant, window: usize) -> bool {
         self.ping_pending
-            || self.rx.ack_pending
+            || self.ack_due(now)
             || self.urx.ack_pending
             || !self.unrel.is_empty()
             || !self.relay_q.is_empty()
@@ -2285,8 +2313,11 @@ impl<A: Address> Endpoint<A> {
         let kept = keeps_path(&self.keep_relayed, &sess.path);
         for f in wire::frames(&pt[..n]) {
             match f {
-                // Answered with an ACK, so a silent-side probe gets a reply.
-                Ok(Frame::Ping) => link.rx.ack_pending = true,
+                // Answered with an ACK at once, so a silent-side probe gets a reply.
+                Ok(Frame::Ping) => {
+                    link.rx.ack_pending = true;
+                    link.ack_later(now, false);
+                }
                 Ok(Frame::Ack { cum, bits, urgent }) => {
                     // Data sent over the link's path times it.
                     if let Some(sent) = link.tx.on_ack(now, cum, bits, urgent).filter(|&s| s >= sess.path_since) {
@@ -2295,11 +2326,15 @@ impl<A: Address> Endpoint<A> {
                 }
                 Ok(Frame::Reliable { seq, fin, data, urgent }) => {
                     let rx = if urgent { &mut link.urx } else { &mut link.rx };
+                    let expected = rx.expects();
                     let budget = self.config.max_out_of_order;
                     match rx.on_fragment(seq, fin, data, self.config.max_message(urgent), budget, &mut reliable) {
                         Ok(Took::Taken) => {}
                         Ok(Took::OverBudget) => self.stats.rx_out_of_order_dropped += 1,
                         Err(()) => violation = true,
+                    }
+                    if !urgent {
+                        link.ack_later(now, expected == Some(seq) && !fin);
                     }
                 }
                 Ok(Frame::Unreliable(d)) => unreliable.push(d.to_vec()),
@@ -2875,6 +2910,9 @@ impl<A: Address> Endpoint<A> {
                     if let Some(d) = link.tx.next_due() {
                         min(d);
                     }
+                    if link.rx.ack_pending {
+                        min(link.ack_at);
+                    }
                     if let (Path::Direct(_), Some(_)) = (&sess.path, sess.relay) {
                         min(sess.last_path + self.config.direct_timeout);
                     }
@@ -2926,6 +2964,7 @@ impl<A: Address> Endpoint<A> {
             let direct = matches!(sess.path, Path::Direct(_));
             let cap = if direct { MAX_PLAINTEXT } else { RELAYED_PLAINTEXT };
             let mut pt = Vec::with_capacity(cap);
+            // An ACK `rx` owes goes in any packet, due or not (see ACK_EVERY).
             for (rx, urgent) in [(&mut link.rx, false), (&mut link.urx, true)] {
                 if rx.ack_pending {
                     let (cum, bits) = rx.ack();
@@ -2933,6 +2972,7 @@ impl<A: Address> Endpoint<A> {
                     rx.ack_pending = false;
                 }
             }
+            link.unacked = 0;
             if link.ping_pending {
                 wire::put_ping(&mut pt);
                 link.ping_pending = false;
@@ -5578,5 +5618,87 @@ mod tests {
         }
         assert_eq!(eps[1].last_heard(&a), Some(t), "copies and forgeries leave it");
         assert_eq!(eps[1].last_heard(&ids[1].peer_id()), None);
+    }
+
+    /// NB-158: delayed ACKs. In order, the reliable stream's ACK goes once
+    /// ACK_EVERY fragments wait for it, or ACK_DELAY_MAX after the first of
+    /// them; a message's last fragment, one out of order, one held past a hole
+    /// or filling it, a copy and a PING are answered at once, as is every urgent
+    /// fragment. Every message arrives whatever the order.
+    #[test]
+    fn reliable_acks_wait_for_four_fragments_in_order_or_a_millisecond() {
+        use crate::wire::FRAGMENT;
+        let ids: Vec<Identity> = (1..=2u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let b = ids[1].peer_id();
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().enumerate().map(|(i, id)| Endpoint::new(id, Config::default(), [i as u8; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, 2, b).unwrap();
+        route(&mut eps, &mut t, 300, None);
+        while eps[1].poll_event().is_some() {}
+        // a sends `len` bytes on `lane`, after the link is quiet: its datagrams, one fragment each.
+        let send = |eps: &mut [Endpoint<u32>], t: &mut Instant, lane: Lane, len: usize| -> Vec<Vec<u8>> {
+            route(eps, t, 50, None);
+            eps[0].send(&b, lane, &vec![7; len]).unwrap();
+            std::iter::from_fn(|| eps[0].poll_transmit(*t)).map(|tx| tx.payload).collect()
+        };
+        // b takes each of `data` in the order given: the datagrams it sends at once in answer to each, which a takes.
+        let answers = |eps: &mut [Endpoint<u32>], t: Instant, data: &[&Vec<u8>]| -> Vec<usize> {
+            let mut n = Vec::new();
+            for d in data {
+                eps[1].handle_datagram(t, 1, d);
+                let out: Vec<_> = std::iter::from_fn(|| eps[1].poll_transmit(t)).collect();
+                for tx in &out {
+                    eps[0].handle_datagram(t, 2, &tx.payload);
+                }
+                n.push(out.len());
+            }
+            n
+        };
+
+        // In order: one ACK per 4 fragments, the 16th the message's last.
+        let d = send(&mut eps, &mut t, Lane::Reliable, 16 * FRAGMENT);
+        assert_eq!(d.len(), 16);
+        let order: Vec<&Vec<u8>> = d.iter().collect();
+        assert_eq!(answers(&mut eps, t, &order), [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
+
+        // Two in order, then nothing: the ACK goes ACK_DELAY_MAX after the first; the last fragment's, at once.
+        let d = send(&mut eps, &mut t, Lane::Reliable, 3 * FRAGMENT);
+        assert_eq!(answers(&mut eps, t, &[&d[0], &d[1]]), [0, 0]);
+        assert_eq!(eps[1].poll_timeout(), Some(t + ACK_DELAY_MAX));
+        let early = t + Duration::from_micros(999);
+        eps[1].handle_timeout(early);
+        assert_eq!(std::iter::from_fn(|| eps[1].poll_transmit(early)).count(), 0);
+        eps[1].handle_timeout(t + ACK_DELAY_MAX);
+        assert_eq!(std::iter::from_fn(|| eps[1].poll_transmit(t + ACK_DELAY_MAX)).count(), 1, "due after 1 ms");
+        assert_eq!(answers(&mut eps, t + ACK_DELAY_MAX, &[&d[2]]), [1]);
+
+        // Out of order: a fragment past a hole, one held past it, the one that fills it: each at once; in order
+        // again, it waits; a copy of one taken (seq 19, after the 16 and the 3 above), in a packet of its own, at once.
+        let d = send(&mut eps, &mut t, Lane::Reliable, 6 * FRAGMENT);
+        let mut copy = Vec::new();
+        wire::put_reliable(&mut copy, 19, false, &[7; FRAGMENT], false);
+        let copy = eps[0].seal_raw(&b, &copy).unwrap();
+        assert_eq!(answers(&mut eps, t, &[&d[0], &d[2], &d[3], &d[1], &d[4], &copy, &d[5]]), [0, 1, 1, 1, 0, 1, 1]);
+
+        // A PING: at once, though fragments in order wait.
+        let d = send(&mut eps, &mut t, Lane::Reliable, 3 * FRAGMENT);
+        assert_eq!(answers(&mut eps, t, &[&d[0]]), [0]);
+        let mut ping = Vec::new();
+        wire::put_ping(&mut ping);
+        let ping = eps[0].seal_raw(&b, &ping).unwrap();
+        assert_eq!(answers(&mut eps, t, &[&ping, &d[1], &d[2]]), [1, 0, 1]);
+
+        // Urgent: every fragment at once.
+        let d = send(&mut eps, &mut t, Lane::Urgent, 3 * FRAGMENT);
+        assert_eq!(d.len(), 3);
+        let order: Vec<&Vec<u8>> = d.iter().collect();
+        assert_eq!(answers(&mut eps, t, &order), [1, 1, 1]);
+
+        route(&mut eps, &mut t, 50, None);
+        let sizes: Vec<usize> = std::iter::from_fn(|| eps[1].poll_event())
+            .filter_map(|e| if let Event::Message { data, .. } = e { Some(data.len()) } else { None })
+            .collect();
+        assert_eq!(sizes, [16, 3, 6, 3, 3].map(|n| n * FRAGMENT), "every message, whole and once");
     }
 }

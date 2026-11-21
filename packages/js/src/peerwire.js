@@ -186,6 +186,11 @@ export class Endpoint {
     this.addrBuf = x.pw_alloc(4);
     this.evCap = 64 * 1024;
     this.evBuf = x.pw_alloc(this.evCap);
+    // onTransmit(addr, bytes) sends one datagram. `bytes` is a view into the wasm's memory, valid only until
+    // onTransmit returns: the next datagram, any call into the wasm or a memory grow reuses or detaches it. A
+    // transport that sends it at once with an API that copies it (RTCDataChannel.send, a TypedArray's set) needn't
+    // copy; one that keeps it past the call (queues it, sends it later or from a promise, posts it with
+    // postMessage, which would clone the whole of the wasm's memory) copies it first: bytes.slice() (NB-158).
     this.onTransmit = () => {};
     this.onEvent = () => {};
     // Called at the end of a pump that handled incoming datagrams: ACKs may have
@@ -194,6 +199,7 @@ export class Endpoint {
     this.received = false;
     this.kept = null; // { data, p, n }: see sendRetry
     this.timer = null;
+    this.timerAt = 0n; // when the timer fires (µs, as pw_poll_timeout): see arm()
     this.closed = false;
     this.transmitErrors = 0; // datagrams lost because onTransmit threw
   }
@@ -441,7 +447,8 @@ export class Endpoint {
         const a = this.addrBuf;
         const addr = (m[a] | (m[a + 1] << 8) | (m[a + 2] << 16) | (m[a + 3] << 24)) >>> 0;
         try {
-          this.onTransmit(addr, m.slice(this.txBuf, this.txBuf + n));
+          // A view, not a copy: see onTransmit in the constructor.
+          this.onTransmit(addr, m.subarray(this.txBuf, this.txBuf + n));
         } catch {
           // A datagram the transport couldn't take is a lost datagram; the core retransmits.
           this.transmitErrors++;
@@ -468,12 +475,17 @@ export class Endpoint {
       this.arm();
     }
   }
+  // A timer already set to fire by the endpoint's deadline stays: in a transfer the deadline moves on with every
+  // datagram, and a timer that fires early only calls pw_handle_timeout once more, which re-arms it. One set later
+  // than the deadline is replaced.
   arm() {
     if (this.closed) return;
     const t = this.pw.x.pw_poll_timeout(this.h);
+    if (this.timer && t >= 0n && this.timerAt <= t) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (t < 0n) return;
+    this.timerAt = t;
     const delayMs = Math.max(0, Number(t - nowUs()) / 1000);
     this.timer = setTimeout(() => {
       this.timer = null;

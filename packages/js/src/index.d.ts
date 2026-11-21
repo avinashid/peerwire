@@ -671,7 +671,9 @@ export declare function loadPeerwire(source: string | URL | BufferSource): Promi
 export declare class Endpoint {
   readonly peerId: Uint8Array;
   readonly id: PeerId;
-  /** Called with (transport handle, datagram) for each datagram to send. */
+  /** Called with (transport handle, datagram) for each datagram to send. `bytes` is a view into the wasm's memory,
+   * valid only until onTransmit returns: a transport that keeps it (queues it, sends it later, posts it) copies it
+   * first with `bytes.slice()`; one that sends it at once through an API that copies (RTCDataChannel.send) needn't. */
   onTransmit: (addr: number, bytes: Uint8Array) => void;
   onEvent: (event: EndpointEvent) => void;
   /** Called at the end of a pump that handled incoming datagrams: ACKs may have freed send

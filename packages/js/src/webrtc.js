@@ -371,6 +371,8 @@ export class WebRtcTransport {
     this.carriers = new Map(); // peer hex -> adopted channel (see adopt())
     this.carried = new Map(); // endpoint handle -> the adopted channel carrying it now
     this.seen = new Map(); // peer hex -> what the newest link to it that failed showed of the NATs (see nat())
+    // `bytes` is a view into the wasm's memory, valid only during the call (Endpoint onTransmit): dc.send copies it,
+    // and a pipe takes it as base64 at once, so neither keeps it.
     endpoint.onTransmit = (handle, bytes) => {
       if (loss && Math.random() < loss) {
         this.dropped++;

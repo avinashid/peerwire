@@ -87,7 +87,8 @@ export class RelayTransport {
     this.rtc = new WebRtcTransport(endpoint, this.signaling, {
       pipes: true, pipeBatch: NATIVE_BATCH, rtc: { direct: false, turn: false }, RTCPeerConnection: null,
     });
-    // The endpoint's datagrams to our pipes go over them; others to the transport that was there.
+    // The endpoint's datagrams to our pipes go over them; others to the transport that was there. Neither keeps the
+    // wasm's view past the call (Endpoint onTransmit).
     const piped = endpoint.onTransmit;
     endpoint.onTransmit = (addr, bytes) => (this.rtc.isPipe(addr) ? piped(addr, bytes) : other?.(addr, bytes));
     this.signaling.onHello = (peer, meta) => void this.heard(peer, meta).catch(() => {});

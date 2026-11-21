@@ -15,7 +15,9 @@ export class LocalTransport {
     this.nextHandle = 1;
     endpoint.onTransmit = (handle, bytes) => {
       const peer = this.byHandle.get(handle);
-      if (peer) signaling.send(peer, { kind: 'dg', bytes });
+      // A copy: `bytes` is a view into the wasm's memory, valid only during this call (Endpoint onTransmit), and
+      // postMessage would clone the whole of that memory, keys and all, to every tab on the channel.
+      if (peer) signaling.send(peer, { kind: 'dg', bytes: bytes.slice() });
     };
     signaling.onMessage((from, msg) => {
       if (isPeerId(from) && msg.kind === 'dg' && msg.bytes instanceof Uint8Array) this.ep.receive(this.handle(from), msg.bytes, from);
