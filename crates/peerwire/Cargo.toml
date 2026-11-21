@@ -16,7 +16,7 @@ include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 [package.metadata.docs.rs]
 # The async host, Nostr signaling, the Bluetooth transport and its ESP-NOW radio as well as the default TURN client;
 # not `testing`, which is for bindings, nor `ble-bluez`, which would build libdbus there.
-features = ["tokio", "nostr", "ble", "espnow", "files"]
+features = ["tokio", "nostr", "ble", "espnow", "files", "webrtc"]
 
 [dependencies]
 peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
@@ -47,6 +47,10 @@ bluer = { version = "0.17", optional = true, default-features = false, features 
 dbus = { version = "0.9", optional = true, features = ["vendored"] }
 futures = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 log = { version = "0.4", optional = true }
+# WebRTC to browsers (feature `webrtc`, docs/concepts/native-webrtc.md): sans-IO ICE, DTLS (dimpl) and SCTP data
+# channels, on AWS-LC (aws-lc-rs: str0m's default backend; its `rust-crypto` one pulls AWS-LC in too, for rcgen). 0.24
+# is the newest on our MSRV (0.25 asks for 1.89). serde_json (the `nostr` feature's) reads the browser's signals.
+str0m = { version = "0.24.1", optional = true, default-features = false, features = ["aws-lc-rs"] }
 
 # Private LAN/hotspot addresses for a socket bound to any interface (getifaddrs; libc is already in the tree).
 # ESP-IDF has no getifaddrs.
@@ -75,6 +79,10 @@ espnow = ["ble"]
 # protocol of the Share page, streamed from and to disk. No dependency of its own (sha2 and rand are already here).
 # Off by default; nothing of it is in the wasm module (peerwire-ffi) or the ESP32 port.
 files = []
+# WebRTC to browsers (docs/concepts/native-webrtc.md): in a room, the node links with joinRoom pages over a WebRTC
+# DataChannel on its own socket (str0m), as room.js links pages, with room.js's room layer (the link proof, presence,
+# goodbye) on those links. Off by default; never in the wasm module (peerwire-ffi) or the ESP32 port.
+webrtc = ["dep:str0m", "dep:serde_json"]
 # Test hooks (Builder::port_mapping_at, a fake gateway's address; Node::note_sources, where the socket's datagrams
 # came from; ble::FakeAir, radios in one process). Not for apps.
 testing = []
@@ -85,8 +93,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docs_samples)"] }
 
 [dev-dependencies]
 peerwire-core = { path = "../peerwire-core" }
-# Tests and examples cover the async host and Nostr signaling too, and tests use the test hooks (Node::sources).
-peerwire = { path = ".", features = ["tokio", "nostr", "testing", "ble", "espnow", "files"] }
+# Tests and examples cover the async host, Nostr signaling and WebRTC too, and tests use the test hooks
+# (Node::sources).
+peerwire = { path = ".", features = ["tokio", "nostr", "testing", "ble", "espnow", "files", "webrtc"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
 # The fuzz harness (peerwire_sim::fuzz); a dev-only cycle, the harness deals in bytes.
 peerwire-sim = { path = "../peerwire-sim" }

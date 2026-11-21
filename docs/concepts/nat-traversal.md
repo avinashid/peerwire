@@ -444,7 +444,9 @@ a room proof:
 - Parsing is strict: exact prefix, 64 hex digits, known role, 1 to 19 decimal digits of `ts`, 64 hex digits of
   proof, exact suffix.
 - A hello with a wrong or missing proof, or with `|ts - now| > 60 s`, is dropped before anything else happens.
-  Browser hellos lack `meta.nb` and are ignored; `room.js` doesn't dial a hello with `meta.nb` over WebRTC.
+  Browser hellos lack `meta.nb` and are ignored, but by a node with browsers on (feature `webrtc`), for which the
+  sender is a browser to link with over WebRTC; `room.js` doesn't dial a hello with `meta.nb`, so such a node also
+  says a browser-shaped hello, marked `"native":1` ([Native WebRTC](native-webrtc.md#finding-each-other)).
 - A sealed hello is 316 base64 characters (320 for `client`), a browser's 304 (308): its length, topic and timing
   show a relay that a member announced itself, whether it is native or a browser and whether it is a client, but
   not who (NB22-I1, an accepted residual: hiding it would pad both stacks to one length).

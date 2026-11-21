@@ -808,7 +808,9 @@ export class Room {
   async onHello(peer, meta) {
     // A custom signalling adapter may pass anything along: only PeerIds are dialled.
     // `meta.nb` marks a Rust UDP peer (traversal.rs `hello`), which WebRTC can't dial;
-    // `meta.pw`, which this once checked by mistake, is taken as the same mark.
+    // `meta.pw`, which this once checked by mistake, is taken as the same mark. A Rust node
+    // with WebRTC (feature `webrtc`) says a page's hello besides, marked `meta.native`, and
+    // is dialled from that one as any page is (docs/concepts/native-webrtc.md).
     if (this.left || !isPeerId(peer) || peer === this.self || meta?.nb || meta?.pw) return;
     // Knowing the topic isn't enough: only hellos that prove the room key count.
     if (!(await this.proof.checkHello(peer, meta))) return;

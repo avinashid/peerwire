@@ -19,6 +19,11 @@ use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// The node's side of WebRTC links to browsers (feature `webrtc`): `crate::webrtc` on its socket, and the room layer.
+#[cfg(feature = "webrtc")]
+#[path = "webrtc/host.rs"]
+mod browsers;
+
 /// What the node's endpoint and traversal take as addresses ([`Hop`]): TURN hops besides network addresses.
 type Addr = Hop<SocketAddr>;
 
@@ -110,6 +115,8 @@ pub struct Builder {
     turn: Vec<TurnServer>,
     #[cfg(feature = "ble")]
     radio: Option<Box<dyn Radio>>,
+    #[cfg(feature = "webrtc")]
+    webrtc: bool,
 }
 
 impl Builder {
@@ -217,6 +224,17 @@ impl Builder {
         self
     }
 
+    /// WebRTC links to browsers (feature `webrtc`): in a room, the node links with the room's `joinRoom` pages over
+    /// a WebRTC DataChannel on its own socket, as room.js links pages, and runs room.js's room layer with them (the
+    /// link proof, presence and goodbye): see [`Node::is_browser`] and `docs/concepts/native-webrtc.md`. It says a
+    /// browser's hello besides its own, which room.js dials; native peers still link over UDP. Not under
+    /// [`Privacy::RelayOnly`], whose addresses ICE would give out. Default: off.
+    #[cfg(feature = "webrtc")]
+    pub fn webrtc(mut self, on: bool) -> Self {
+        self.webrtc = on;
+        self
+    }
+
     /// Binds the UDP socket: `"[::]:0"` for any interface, IPv4 and IPv6, and a
     /// free port (see [`Node::bind`]).
     pub fn bind(self, addr: impl ToSocketAddrs) -> io::Result<Node> {
@@ -282,7 +300,11 @@ impl Builder {
             pipes: Pipes::default(),
             #[cfg(feature = "ble")]
             ble,
+            #[cfg(feature = "webrtc")]
+            browsers: None,
         };
+        #[cfg(feature = "webrtc")]
+        node.start_browsers(self.webrtc);
         node.sync_port_mapping();
         node.pump_signals();
         node.set_relay_peers(&self.relay_peers).map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
@@ -326,6 +348,9 @@ pub struct Node {
     /// The Bluetooth side, with a radio ([`Builder::bluetooth`]).
     #[cfg(feature = "ble")]
     ble: Option<Ble>,
+    /// WebRTC links to browsers and their room layer ([`Builder::webrtc`]).
+    #[cfg(feature = "webrtc")]
+    browsers: Option<Box<browsers::Browsers>>,
 }
 
 /// An extra socket, opened for birthday punching.
@@ -399,6 +424,8 @@ impl Node {
             turn: Vec::new(),
             #[cfg(feature = "ble")]
             radio: None,
+            #[cfg(feature = "webrtc")]
+            webrtc: false,
         }
     }
 
@@ -460,6 +487,8 @@ impl Node {
         if let Some(b) = self.ble.as_mut() {
             b.set_enabled(now, !matches!(privacy, Privacy::RelayOnly { .. }));
         }
+        #[cfg(feature = "webrtc")]
+        self.privacy_browsers(privacy);
         if matches!(privacy, Privacy::RelayOnly { .. }) {
             let own = self.trav.relay();
             for r in self.relay_peers.iter().filter(|r| Some(r.peer) != own) {
@@ -816,6 +845,8 @@ impl Node {
 
     /// Closes the link to `peer`, telling it so. No event follows locally.
     pub fn disconnect(&mut self, peer: &PeerId) {
+        #[cfg(feature = "webrtc")]
+        self.bye(peer);
         self.ep.disconnect(peer);
         self.status.remove(peer);
         self.poll();
@@ -869,6 +900,9 @@ impl Node {
             Path::Direct(Hop::Net(_)) => PathKind::Direct,
             Path::Direct(Hop::Ble(_)) => self.trav.radio_kind(),
             Path::Direct(Hop::Pipe(_)) => PathKind::Signaling,
+            #[cfg(feature = "webrtc")]
+            Path::Direct(Hop::Rtc(_)) if self.browsers.as_ref().is_some_and(|b| b.relayed(peer)) => PathKind::Turn,
+            Path::Direct(Hop::Rtc(_)) => PathKind::Direct,
             Path::Direct(_) => PathKind::Turn,
         })
     }
@@ -930,6 +964,13 @@ impl Node {
                     if let Some(s) = self.sources.as_mut() {
                         s.insert(*from.addr());
                     }
+                    // A browser's ICE check or DTLS record, on a WebRTC connection of ours.
+                    #[cfg(feature = "webrtc")]
+                    if let Some(b) = self.browsers.as_mut() {
+                        if b.receive(wall, self.local, *from.addr(), &self.buf[..n]) {
+                            continue;
+                        }
+                    }
                     // From a TURN server of ours: what a peer sent through it, or its answers to TURN requests (its
                     // Binding answers, as a STUN server of ours too, go on to STUN).
                     match self.trav.handle_turn(now, &from, &self.buf[..n]) {
@@ -956,6 +997,11 @@ impl Node {
                 let Some((topic, payload)) = sig.poll() else { break };
                 self.trav.handle_signal(now, &mut self.ep, topic, &payload);
                 while let Some((from, body)) = self.trav.poll_piped() {
+                    #[cfg(feature = "webrtc")]
+                    if let Some(b) = self.browsers.as_mut().filter(|_| !pipe::is_batch(&body)) {
+                        b.signal(now, wall, &mut self.trav, self.ep.peer_id(), from, &body);
+                        continue;
+                    }
                     take_batch(&mut self.pipes, &mut self.ep, now, from, &body);
                 }
             }
@@ -964,6 +1010,8 @@ impl Node {
         self.admit_held(now, wall);
         #[cfg(feature = "ble")]
         self.poll_ble(now);
+        #[cfg(feature = "webrtc")]
+        self.poll_browsers(now, wall);
         if self.ep.poll_timeout().is_some_and(|t| t <= now) {
             self.ep.handle_timeout(now);
         }
@@ -1024,7 +1072,11 @@ impl Node {
         }
         self.report_dropped();
         self.keep_relay_links(wall);
+        #[cfg(feature = "webrtc")]
+        self.room_timers(now, wall);
         self.flush(now);
+        #[cfg(feature = "webrtc")]
+        self.flush_browsers();
         self.flush_pipes(now);
         self.pump_signals();
         #[cfg(feature = "ble")]
@@ -1098,6 +1150,11 @@ impl Node {
             }
             return; // a relay link is the node's own business, not the app's
         }
+        // A browser's: through room.js's room layer first.
+        #[cfg(feature = "webrtc")]
+        let Some(e) = self.room_event(now, e) else {
+            return;
+        };
         self.events.push_back(plain_event(e));
     }
 
@@ -1129,6 +1186,8 @@ impl Node {
         let redial = redial.map(|r| r.retry_at.saturating_duration_since(wall)).min();
         let redial = redial.filter(|_| !matches!(self.privacy(), Privacy::RelayOnly { .. }) && self.relay_peers_on());
         let extra = (!self.extra.is_empty()).then_some(EXTRA_POLL);
+        #[cfg(feature = "webrtc")]
+        let extra = [extra, self.browsers_timeout(wall, now)].into_iter().flatten().min();
         let t = [t, redial, extra].into_iter().flatten().min();
         #[cfg(feature = "ble")]
         let polled = self.signaling.is_some() || self.ble.is_some();
@@ -1247,6 +1306,14 @@ impl Node {
                 self.pipes.send(now, &at, t.payload); // over the signaling relays: flush_pipes
                 continue;
             }
+            if let Hop::Rtc(at) = t.dst {
+                #[cfg(feature = "webrtc")]
+                if let Some(b) = self.browsers.as_mut() {
+                    b.send(&at, &t.payload); // over its DataChannel: flush_browsers
+                }
+                let _ = at; // never to the socket
+                continue;
+            }
             #[cfg(any(test, feature = "testing"))]
             if self.udp_off {
                 continue;
@@ -1334,7 +1401,7 @@ impl Node {
         let (dst, route) = match &t.dst {
             Hop::Net(a) => (a, self.routes.get(a)),
             Hop::Relayed(a) => (a, None),
-            Hop::Turn { .. } | Hop::Ble(_) | Hop::Pipe(_) => return true,
+            Hop::Turn { .. } | Hop::Ble(_) | Hop::Pipe(_) | Hop::Rtc(_) => return true,
         };
         let sock = route.and_then(|id| self.extra.get(id)).map_or(&self.sock, |x| &x.sock);
         match sock.send_to(&t.payload, self.wire_addr(*dst)) {

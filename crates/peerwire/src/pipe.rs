@@ -344,6 +344,12 @@ impl Pipes {
     }
 }
 
+/// Whether `body` (JSON from a peer's inbox) is a pipe batch rather than another signal: it starts as one does.
+#[cfg(feature = "webrtc")]
+pub(crate) fn is_batch(body: &[u8]) -> bool {
+    body.starts_with(br#"{"kind":"dg""#)
+}
+
 /// The datagrams of a batch `body`, if it is one as [`Pipes::take`] and `webrtc.js` write it: 1 to [`MAX_ITEMS`]
 /// base64 datagrams of 1 to [`MAX_DATAGRAM`] bytes. Anything else is `None`: no other JSON is taken.
 pub(crate) fn decode(body: &[u8]) -> Option<Vec<Vec<u8>>> {

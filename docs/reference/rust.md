@@ -67,6 +67,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 | `ble-bluez` | `ble`, and the Linux driver `ble::BlueZ` (BlueZ over D-Bus), which logs what fails and is tried again through `log` | `bluer` 0.17 (`bluetoothd`), `dbus` 0.9 (`vendored`: `libdbus` built from source, so no system package is needed), `futures` 0.3, `log` 0.4, `tokio` 1 (`rt`, `sync`, `macros`) |
 | `espnow` | `ble`, and `peerwire::espnow` ([ESP-NOW](../concepts/espnow.md)): `EspNow`, a Bluetooth radio over ESP-NOW frames for a platform's `espnow::Ether` (the ESP32 port's), its `Settings` and `Stats`, and the sans-IO `Engine` and frame codec under it | nothing |
 | `files` | Peerwire Share: the [`peerwire::files`](#files) module, files of any size between peers in checked pieces, in the protocol of the browser's Share page, and the [`share` example](../../examples/rust/share.rs) | nothing (`sha2` and `rand_chacha` are always in) |
+| `webrtc` | WebRTC links to browsers ([Native WebRTC](../concepts/native-webrtc.md)): `Builder::webrtc`, and the [browser methods](#webrtc) of `Node`. A node in a room links with its `joinRoom` pages over a WebRTC DataChannel on its own socket and runs room.js's room layer with them | `str0m` 0.24 (`aws-lc-rs`: AWS-LC built from C with the host's C compiler, no system package), `serde_json` 1 |
 | `testing` | `Builder::port_mapping_at`, port mapping through a fake gateway; `Node::set_udp_off`; with `ble`, `ble::FakeAir`, radios in one process, and `Node::ble_counts`; with `espnow`, `espnow::FakeAir`, ESP-NOW stations in one process (all hidden from rustdoc). For tests only, not for apps | nothing |
 
 `peerwire-ffi` has one feature, `sync`: the shared-document functions (`pw_docs_*`, `pw_doc_*`) on `peerwire-sync`.
@@ -264,7 +265,7 @@ Messages and links:
 | Method | |
 |---|---|
 | `send(&mut self, peer: &PeerId, lane: Lane, data: &[u8]) -> Result<(), SendError>` | Queues a message; it goes out on the next `poll`. Never blocks: with the reliable send buffer full it returns `SendError::WouldBlock`, and the unreliable lane drops its oldest message. `TooLarge` past the lane's limit (see [Lane](#lane)), `NotConnected` with no link |
-| `disconnect(&mut self, peer: &PeerId)` | Closes the link, telling the peer. No event follows locally |
+| `disconnect(&mut self, peer: &PeerId)` | Closes the link, telling the peer (a browser, feature `webrtc`: room.js's goodbye first). No event follows locally |
 | `status(&self, peer: &PeerId) -> Status` | `Disconnected`, `Connecting` or `Connected` |
 | `peers(&self) -> impl Iterator<Item = &PeerId>` | Peers with a live link, relay peers left out |
 | `peer_stats(&self, peer: &PeerId) -> Option<PeerStats>` | A link's RTT, path RTT, congestion window, fragments sent and retransmitted; `PeerStats::loss()` estimates loss |
@@ -289,6 +290,25 @@ Limits in one `poll` (constants in `node.rs`): at most 4096 datagrams read (`MAX
 messages handled (`MAX_SIGNALS_PER_POLL`). While the socket's send buffer is full, up to 1024 datagrams wait
 (`MAX_PENDING_SENDS`); past that the oldest is dropped, as UDP would.
 
+### webrtc
+
+Feature `webrtc`, with `Builder::webrtc(true)` ([Native WebRTC](../concepts/native-webrtc.md), `src/webrtc/`): in a
+room, the node links with each `joinRoom` page over a WebRTC DataChannel, its path `Direct` (`Turn` while its packets
+go to the page's TURN server) at a `Hop::Rtc` address (`0.0.0.N:2`). A page's link runs room.js's room layer: the app
+sees `Event::Connected` for it only once it has proved the room key and said its presence, and its messages are
+room.js's frames, the tag byte first (0 bytes, 1 text, 2 JSON); `files` frames its own the same way, so Share works
+with pages as it is.
+
+| Method | |
+|---|---|
+| `is_browser(&self, peer: &PeerId) -> bool` | Whether `peer` is a page: it said a browser's hello in this node's room, or sent a WebRTC offer that proved the room key |
+| `presence(&self, peer: &PeerId) -> Option<&str>` | A page's presence, the JSON it said, once it has joined; later ones replace it |
+| `set_presence(&mut self, json: &str) -> io::Result<()>` | This node's presence for pages (room.js `setPresence`), JSON: sent to every page whose proof checked out, and to later ones. `{}` until set. `InvalidInput` if it doesn't parse or is over the reliable lane's largest message |
+| `browsers(&self) -> Vec<PeerId>` | The pages that have joined |
+| `Node::room_text(text: &str) -> Vec<u8>` | Text as room.js frames a string (tag 1), for `send` to a page |
+| `Node::room_message_text(data: &[u8]) -> Option<String>` | A page's text or JSON message's text (tags 1 and 2), as room.js decodes it |
+| `webrtc_counts(&self) -> (usize, usize)` | WebRTC connections, and how many have their DataChannel open |
+
 ### Builder
 
 Options for a `Node`, from `Node::builder()`. Each takes `self` and returns the builder; `bind` ends the chain.
@@ -305,6 +325,7 @@ Options for a `Node`, from `Node::builder()`. Each takes `self` and returns the 
 | `policy` | `Policy` | None: every path, as before policies | Which paths links may take, and in what order (see [Policy](#policy) and `Node::set_policy`) |
 | `turn_servers` | `impl IntoIterator<Item = TurnServer>` | none | Feature `turn`. This node's own TURN servers, as `Node::set_turn_servers` takes them, resolved in `bind`; used only with `PathKind::Turn` in the policy |
 | `bluetooth` | `impl ble::Radio + 'static` | None | Feature `ble`. A Bluetooth LE radio (`ble::BlueZ` on Linux), or ESP-NOW's (`espnow::EspNow`, feature `espnow`): in a room, the node advertises, links with the members it hears over it, with no network, and ranks it below every UDP path, under the kind the radio names (`ble::Radio::kind`: `PathKind::Bluetooth`, or `PathKind::EspNow`), which a policy must list. Off under `Privacy::RelayOnly`. See [Bluetooth](../concepts/bluetooth.md) and [ESP-NOW](../concepts/espnow.md) |
+| `webrtc` | `bool` | `false` | Feature `webrtc`. In a room, links with its `joinRoom` pages over WebRTC, besides its native peers over UDP: it says a browser's hello too, and runs room.js's room layer with pages ([webrtc](#webrtc)). Off under `Privacy::RelayOnly`, whose addresses ICE would give out |
 
 `bind(self, addr: impl ToSocketAddrs) -> io::Result<Node>` binds the socket as `Node::bind` describes. It fails with
 `ErrorKind::InvalidInput` if a relay peer is not an invite, or if the policy is not valid (`Policy::is_valid`).

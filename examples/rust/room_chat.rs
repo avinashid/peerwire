@@ -13,6 +13,10 @@
 //! guesses the room's name can join it, so pick one others can't guess. `PW_RELAYS` (relay URLs,
 //! comma-separated) replaces the default relays: `ws://127.0.0.1:7447` for the `nostr_relay`
 //! example, with no internet.
+//!
+//! With the `webrtc` feature (`--features nostr,webrtc`), `joinRoom` pages in the room (app id
+//! `peerwire-lan-chat`) are in it too, over WebRTC: each shows with its presence, its text messages
+//! as lines, and ours go to it as room.js text. Ours says `{"name": "<PW_NAME or 'room_chat'>"}`.
 
 use peerwire::{Event, LanSignaling, Lane, MultiSignaling, Node, NostrSignaling};
 use std::sync::mpsc;
@@ -27,7 +31,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => NostrSignaling::default(),
     };
     let both = MultiSignaling::new(vec![Box::new(LanSignaling::new()?), Box::new(nostr)]);
-    let mut node = Node::builder().signaling(both).bind(bind)?;
+    let builder = Node::builder().signaling(both);
+    #[cfg(feature = "webrtc")]
+    let builder = builder.webrtc(true);
+    let mut node = builder.bind(bind)?;
+    #[cfg(feature = "webrtc")]
+    node.set_presence(&{
+        let name = std::env::var("PW_NAME").unwrap_or_else(|_| "room_chat".into());
+        serde_json::json!({ "name": name }).to_string()
+    })?;
     node.join_room("peerwire-lan-chat", &room);
     println!("{} in room {room:?} on {}", node.peer_id(), node.local_addr());
 
@@ -43,11 +55,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         node.poll();
         while let Some(event) = node.try_recv_event() {
             match event {
-                Event::Connected { peer, path, .. } => println!("+ {peer} ({path:?})"),
+                Event::Connected { peer, path, .. } => println!("+ {peer} ({path:?}){}", browser(&node, &peer)),
                 Event::Disconnected { peer, .. } => println!("- {peer}"),
                 // Escaped, so a member can't fake another's line or send terminal escapes.
                 Event::Message { peer, data, .. } => {
-                    println!("{peer}: {}", String::from_utf8_lossy(&data).escape_debug())
+                    if let Some(text) = text(&node, &peer, &data) {
+                        println!("{peer}: {}", text.escape_debug())
+                    }
                 }
                 _ => {}
             }
@@ -55,10 +69,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok(line) = typed.try_recv() {
             let peers: Vec<_> = node.peers().copied().collect();
             for peer in &peers {
+                #[cfg(feature = "webrtc")]
+                if node.is_browser(peer) {
+                    node.send(peer, Lane::Reliable, &Node::room_text(&line))?;
+                    continue;
+                }
                 node.send(peer, Lane::Reliable, line.as_bytes())?;
             }
             println!("(sent to {})", peers.len());
         }
         std::thread::sleep(node.next_timeout().unwrap_or(Duration::MAX).min(Duration::from_millis(5)));
     }
+}
+
+/// How a peer that joined shows: a browser with its presence (feature `webrtc`).
+fn browser(node: &Node, peer: &peerwire::PeerId) -> String {
+    #[cfg(feature = "webrtc")]
+    if node.is_browser(peer) {
+        // A page says what it likes: its control characters (a terminal's escapes) are shown as U+FFFD.
+        let shown: String =
+            node.presence(peer).unwrap_or("{}").chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect();
+        return format!(" browser {shown}");
+    }
+    let _ = (node, peer);
+    String::new()
+}
+
+/// A message's text: a native peer's bytes, or a browser's text or JSON message (room.js frames it, a tag first).
+fn text(node: &Node, peer: &peerwire::PeerId, data: &[u8]) -> Option<String> {
+    #[cfg(feature = "webrtc")]
+    if node.is_browser(peer) {
+        return Node::room_message_text(data);
+    }
+    let _ = (node, peer);
+    Some(String::from_utf8_lossy(data).into_owned())
 }

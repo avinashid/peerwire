@@ -17,7 +17,8 @@
 //   `recv --yes`, `recv` (answered after it ended) and `send` (which declines offers). The example carries on.
 //
 //   node packages/js/test/share_native.mjs                    8 MiB each way, the example built here (cargo, gate
-//                                                             profile, target/share-native)
+//                                                             profile, target/share-examples, as share_webrtc.mjs
+//                                                             builds it: whichever comes second finds it built)
 //   node packages/js/test/share_native.mjs --mb=1024 [--bin=path/to/share]   1024 MiB each way, timed
 
 import { serve } from './serve.mjs';
@@ -73,10 +74,12 @@ function makeFile(name, bytes) {
 
 function binary() {
   if (arg('bin')) return arg('bin');
-  const dir = path.join(repo, 'target/share-native');
-  // Its own target dir, so it never waits on the gate's Rust lane for cargo's lock.
-  execFileSync('cargo', ['build', '--profile', 'gate', '--target-dir', dir, '-p', 'peerwire', '--features', 'files', '--example', 'share'],
-    { cwd: repo, stdio: ['ignore', 'ignore', 'inherit'] });
+  const dir = path.join(repo, 'target/share-examples');
+  // Its own target dir, so it never waits on the gate's Rust lane for cargo's lock, and the same build as
+  // share_webrtc.mjs's (features and examples), which the gate runs beside it: one cold build for both. The example
+  // runs here over its TCP bridge, whatever it was built with.
+  execFileSync('cargo', ['build', '--profile', 'gate', '--target-dir', dir, '-p', 'peerwire', '--features', 'files,nostr,webrtc',
+    '--example', 'share', '--example', 'room_chat'], { cwd: repo, stdio: ['ignore', 'ignore', 'inherit'] });
   return path.join(dir, 'gate/examples/share');
 }
 

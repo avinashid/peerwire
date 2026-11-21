@@ -8,6 +8,18 @@ and the commit that fixed it.
 
 ## Unreleased: Rust crates
 
+- **Native WebRTC** (NB-162, [Native WebRTC](docs/concepts/native-webrtc.md)): `peerwire` feature `webrtc` (one new
+  dependency, `str0m` 0.24 on AWS-LC, and the `nostr` feature's `serde_json`) and `Builder::webrtc(true)` put a native
+  node in a browser room: it links with each `joinRoom` page over a WebRTC DataChannel on its own socket, with
+  webrtc.js's signals and the same core packets, and runs room.js's room layer with it (the `pw-link` proof both
+  ways, presence, goodbye). Pages of any version link with it, as it also says a browser-shaped hello; natives still
+  link with natives over UDP. `Node::is_browser`, `presence`, `set_presence`, `browsers`, `room_text`,
+  `room_message_text`, `webrtc_counts`; `Hop::Rtc`, a direct path, so `files` sends pieces over it. The `share` and
+  `room_chat` examples use it: the Share page and `share` send files to each other directly. Before it merged, a
+  browser hello stopped marking a peer that has sent a native offer, and such an offer clears the mark, so a member
+  can't make a native look like a browser (NB162-1); and a page's ICE restart offer is taken only with new ICE
+  credentials, at most once per 2 s for a restart or a failed try (which ends the connection), so restarts can't grow
+  the connection's candidates without bound (NB162-2).
 - **Delayed ACKs** (NB-158, [Protocol](docs/concepts/protocol.md#lanes-and-reliability)): `peerwire-core`'s reliable
   lane acknowledges fragments that come in order 4 at a time, or 1 ms after the first of them, rather than each
   one; a message's last fragment, a fragment out of order, a copy, one that fills a hole and a PING are acknowledged
@@ -20,8 +32,8 @@ and the commit that fixed it.
   that goes on from the last piece written after a dropped link, data over direct links only, and the page's limits
   and name cleaning (NFC and format characters from tables made off Node's Unicode data). `Files` is sans-IO and
   sends through one seam, the `Wire` trait, which `Node` implements; `FileSink` keeps a file only once verified and
-  never replaces one. The example `share` sends and receives from a terminal. A browser and a native node can't link
-  yet, so native apps share with each other for now.
+  never replaces one. The example `share` sends and receives from a terminal, with the Share page too when built with
+  `webrtc` (NB-162).
 - **ESP-NOW** (NB-135, [ESP-NOW](docs/concepts/espnow.md)): `peerwire` feature `espnow` (no dependency of its own)
   makes a Bluetooth radio of Espressif's ESP-NOW frames, `espnow::EspNow`, for a platform's `espnow::Ether`, so ESP32
   boards in range link with each other with no network and no Bluetooth, with the room proof, Noise IK and sealing
