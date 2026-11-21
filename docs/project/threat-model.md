@@ -236,7 +236,7 @@ release of each.
 | NB159-3 (Low) | **Fixed** by `bc9f3e7` before NB-159 merged, so never on main: the `share` example ended when it answered an offer that had ended first (its sender cancelled it, or its peer left), so a member's offer and `cancel` in one batch stopped `share recv --yes` or `share send`; it now goes on past `NoTransfer`, takes an offer whose peer's link is down once the link is back, and asks no more about an offer that ended, reviewed 2026-11-21, same section |
 | NB159-I1, NB159-I2 (Info) | **Fixed** by `9386298` and `1b72eec` before NB-159 merged, so never on main: the protocol page and `impl Wire for Node` say a move of the link can carry the pieces in flight over a relay (at most the window, sealed), and `FileSink::create` cleans the name it is given, reviewed 2026-11-20, same section |
 | NB162-1 (Medium) | **Fixed** by `dba6157` before NB-162 merged, so never on main: any room member could say a room.js hello naming a native member's PeerId, and a node with browsers on then ran the room layer on that peer's links for good, dropping its messages and goodbye on a native link already up and closing each new one at 10 s; a hello no longer marks a peer that has sent this node a native offer, which only that peer can seal, and such an offer clears a mark made before it, reviewed 2026-11-21. Accepted for v1 by the lead on 2026-11-21: a hello forged before a native's first offer marks it until that offer comes, [Native WebRTC to pages](#native-webrtc-to-pages-nb-162--nb162-1-nb162-2-nb162-i1) |
-| NB162-2 (Medium) | Open: a page linked to the node can send offers marked `restart` that add their candidates to the connection's, so the WebRTC library's list of candidates, and the time it takes for each offer, grow without bound. `126914b` refuses one with the credentials of the offer answered before, or within `REPLACE_AFTER`, but not one that the library takes in part and then fails on: the node counts no try, and the same new credentials again add more candidates each time. Fix: count the try before `accept_offer`, and drop the connection when it fails, same section |
+| NB162-2 (Medium) | **Fixed** by `126914b` and `05a9d36` before NB-162 merged, so never on main: a page linked to the node could send offers marked `restart` that added their candidates to the connection's, so the WebRTC library's list of candidates, and the time it took for each offer, grew without bound; a restart offer is now taken only with new ICE credentials, at most once per `REPLACE_AFTER`, its candidates counted afresh, and a try counts before the library takes it, a failed one ending the connection, reviewed 2026-11-21, same section |
 | NB162-I1 (Info) | Accepted for v1 by the lead on 2026-11-21: one member, under fresh keys of its own, can hold all 64 WebRTC connections unopened, so pages fall back to pipes over the relays, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
@@ -8284,7 +8284,9 @@ description and candidate parsers, which found nothing. The branch's own `webrtc
 were re-run only with those fixes in. The fixes, `38a0f33..b4c543d`, were reviewed on
 2026-11-21 (NB-165) by reading and on a scratch copy of `b4c543d`: NB-163's tests pass,
 each fix's own test fails with that fix alone reverted, and a restart offer that str0m
-fails on part of the way shows NB162-2 still open.
+fails on part of the way shows NB162-2 still open. Its completion, `05a9d36`, was
+reviewed on 2026-11-21 (NB-166) by reading and on a scratch copy of `48677eb`: NB-165's
+test passes, and the new test fails with the whole fix, or either half of it, reverted.
 
 **What holds.**
 
@@ -8311,11 +8313,11 @@ fails on part of the way shows NB162-2 still open.
   `COOKIE` and `HS1C` from any other address go on to the core. str0m's STUN parser
   drops a Binding request without `USERNAME` before its ICE agent reads one.
 - **Bounds.** 64 connections; descriptions of 32 KiB at most; 64 remote candidates a
-  connection from descriptions and signals (but see NB162-2), 512 B each; 15 s to open;
-  a publish budget of 6, then 1 per 5 s, per peer; DataChannel messages of 1 to 1,232 B,
-  binary only; 1 MiB buffered; 1,024 room frames waiting; a presence up to the reliable
-  lane's largest message per page; signals within the inbox's budget (64, then 1 per
-  50 ms).
+  connection from descriptions and signals (counted afresh at a restart, NB162-2), 512 B
+  each; 15 s to open; a publish budget of 6, then 1 per 5 s, per peer; DataChannel
+  messages of 1 to 1,232 B, binary only; 1 MiB buffered; 1,024 room frames waiting; a
+  presence up to the reliable lane's largest message per page; signals within the
+  inbox's budget (64, then 1 per 50 ms).
 
 **NB162-1 — A forged hello makes a native member a browser (Medium).** A room hello's
 proof is under the room key over the id it names, so any member can say one for
@@ -8358,20 +8360,28 @@ restart, after which str0m drops the old candidates and pairs), at most once per
 `REPLACE_AFTER`, and count its candidates afresh. With that the same test held nothing
 more, and real restarts stayed bounded.
 
-**Status: open** (Medium), reported on NB-163 at `38a0f33`. `126914b` (reviewed on
-NB-165, 2026-11-21) takes a restart offer only if its ICE username fragment, read where
-str0m reads it, differs from that of the offer answered before, at most once per
-`REPLACE_AFTER`, and counts its candidates afresh; its test fails with that check
-removed. That isn't enough. str0m's `accept_offer` takes an offer's ICE credentials and
-candidates before the rest of it, which can still fail (an offer with no `a=group`
-does), and then the node keeps the fragment and the time of the offer answered before
-(`webrtc/mod.rs` lines 320 to 326). The same new credentials pass the check again at
-once, are no restart to str0m, and add their candidates to the last ones, each time. In
-a scratch test such offers were all refused, yet the time each took grew with the
-candidates held, as before, and the connection stayed up at 20 offers a second. Fix:
-count the try (`made` and `ufrag`) before `accept_offer`, and drop the connection when
-it fails (`dead`, as for an answer that fails). With that, the same test refused each
-offer at a steady cost, and at 20 a second the connection closed after the first.
+**Status: fixed** by `126914b` and `05a9d36` before NB-162 merged, so never on main,
+reviewed 2026-11-21. `126914b` (NB-165) takes a restart offer only if its ICE username
+fragment, read where str0m reads it, differs from that of the offer answered before, at
+most once per `REPLACE_AFTER`, and counts its candidates afresh; its test fails with
+that check removed. That wasn't enough alone: str0m's `accept_offer` takes an offer's
+ICE credentials and candidates before the rest of it, which can still fail (an offer
+with no `a=group` does), and the node then kept the fragment and the time of the offer
+answered before, so the same new credentials passed the check again at once and added
+their candidates to the last ones, each time. `05a9d36` (NB-166) counts the try (`made`
+and `ufrag`) before `accept_offer`, and marks the connection `dead` when it fails, as
+for an answer that fails. With both, NB-165's scratch test refuses every such offer at a
+steady cost, and with the node's timers running the connection closes after the first;
+the new test fails with the whole fix, the early count alone or the `dead` mark alone
+reverted.
+
+**Accepted** for v1 by the lead on 2026-11-21, which took anything below Medium in this
+round: a connection that a failed try marks `dead` closes only at its next str0m timer,
+and str0m may first send one ICE check to a candidate the failed offer named (like the
+checks in the first residual below). That is one check per failed try, and each try
+needs an open connection at least `REPLACE_AFTER` old. Fix, if wanted: give a dead
+connection no timeout before it closes, and make the next one due at once while one is
+dead.
 
 **NB162-I1 — One member can fill the connections (Info).** An offer proved for a fresh
 PeerId of a member's own holds one of the 64 connections for up to 15 s unopened
