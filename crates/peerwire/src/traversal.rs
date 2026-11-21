@@ -700,8 +700,9 @@ struct Remote<A> {
     /// The radio connections proven to reach it, newest first, at most `MAX_RADIO`: a dial to it goes over them too
     /// ([`PathKind::Bluetooth`] or [`PathKind::EspNow`], [`Traversal::radio_kind`]). Never offered.
     radio: Vec<A>,
-    /// It is a browser (a joinRoom page): it said a browser's hello, or sent a WebRTC offer that proved the room key
-    /// (feature `webrtc`). Its links carry room.js's room layer, and it is never sent an offer of ours.
+    /// It is a browser (a joinRoom page): it said a browser's hello before any native offer of its own, or sent a
+    /// WebRTC offer that proved the room key (feature `webrtc`); a native offer from it clears this (NB162-1). Its
+    /// links carry room.js's room layer, and it is never sent an offer of ours.
     browser: bool,
 }
 
@@ -1474,8 +1475,8 @@ impl<A: Address> Traversal<A> {
         self.browsers = on;
     }
 
-    /// Whether `peer` is a browser: it said a browser's hello in this node's room, or proved the room key in a WebRTC
-    /// offer ([`admit_browser`](Traversal::admit_browser)).
+    /// Whether `peer` is a browser: it said a browser's hello in this node's room and has sent no native offer since
+    /// or before, or proved the room key in a WebRTC offer ([`admit_browser`](Traversal::admit_browser)).
     #[cfg(feature = "webrtc")]
     pub(crate) fn is_browser(&self, peer: &PeerId) -> bool {
         self.remotes.get(peer).is_some_and(|r| r.browser)
@@ -1514,10 +1515,12 @@ impl<A: Address> Traversal<A> {
     }
 
     /// A browser's hello whose proof checked out: a member, if this node links with its role, and dialled if this
-    /// node has the smaller id and none is linked (within the hellos' budget, as offers are).
+    /// node has the smaller id and none is linked (within the hellos' budget, as offers are). Not for a peer that has
+    /// sent a native offer (NB162-1): the proof is under the room key over the id the hello names, so any member can
+    /// say one for another's id, but only that peer can seal its offer.
     #[cfg(feature = "webrtc")]
     fn on_browser_hello(&mut self, now: Instant, ep: &Endpoint<A>, from: PeerId, role: Role) {
-        if !self.links_with(&from, role) {
+        if !self.links_with(&from, role) || self.remotes.get(&from).is_some_and(|r| r.heard) {
             return;
         }
         let r = self.remotes.entry(from).or_default();
@@ -2613,6 +2616,8 @@ impl<A: Address> Traversal<A> {
         self.nonces.insert((from, o.nonce), now);
         let r = self.remotes.entry(from).or_default();
         (r.heard, r.nat, r.seen_at, r.offers) = (true, o.nat, now, mine);
+        // A native offer is sealed by its sender: it is no browser, whatever a hello naming it said (NB162-1).
+        r.browser = false;
         r.relays = o.relays.iter().filter(|p| **p != from && **p != self.id).take(MAX_RELAYS).copied().collect();
         if room {
             r.member = Some(o.role);
@@ -4842,6 +4847,100 @@ mod tests {
         assert!(!t.admit_browser(Instant::ZERO, id(8).peer_id()) && t.room_pair(b"pw-link", &me, &larger).is_none());
         t.handle_signal(Instant::ZERO, &mut ep, inbox, &sealed::seal(&id(9), &me, [7; 32], offer).unwrap());
         assert_eq!(t.poll_piped(), None, "out of the room");
+    }
+
+    /// NB162-1: a room hello's proof is under the room key over the id it names, so any member can say a browser's
+    /// hello for a native's id. A node with browsers on takes none for a peer that has sent it a native offer (sealed
+    /// by that peer), and such an offer clears a mark a hello made before it: a native's messages and its goodbye
+    /// reach the app on a link already up, and a link made after a forged hello comes up as a native's.
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn a_forged_browser_hello_makes_no_native_a_browser() {
+        use crate::{Event, Lane, MemoryHub, Node, Signaling, Status};
+        use std::time::{Duration as Span, Instant as Wall, SystemTime, UNIX_EPOCH};
+        let hub = MemoryHub::new();
+        let node = |webrtc: bool| {
+            let b = Node::builder().stun_servers(Vec::<String>::new()).signaling(hub.connect()).webrtc(webrtc);
+            b.bind("127.0.0.1:0").unwrap()
+        };
+        // A third member's carrier says room.js's hello for `who`, its proof under the room key, as room.js does.
+        let (mut forger, mut sent) = (hub.connect(), 0u8);
+        let mut forge = |who: &PeerId| {
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            let proof =
+                mac(&room_key(ROOM.0, ROOM.1), &[b"pw-hello", who.as_bytes(), &[Role::Peer as u8], &ts.to_le_bytes()]);
+            let js = format!(
+                r#"{{"t":"hello","from":"{}","meta":{{"role":"peer","ts":{ts},"p":"{}"}}}}"#,
+                hex(who.as_bytes()),
+                hex(&proof)
+            );
+            sent += 1;
+            let sealed = seal_room(&room_enc_key(ROOM.0, ROOM.1), [sent; NONCE_LEN], js.as_bytes());
+            forger.publish(Topic::room(ROOM.0, ROOM.1), &sealed);
+        };
+        // Polls both until `done` or `ms` pass, keeping n's events.
+        fn pump(
+            n: &mut Node,
+            v: &mut Node,
+            ev: &mut Vec<Event>,
+            ms: u64,
+            done: impl Fn(&Node, &[Event]) -> bool,
+        ) -> bool {
+            let deadline = Wall::now() + Span::from_millis(ms);
+            loop {
+                n.poll();
+                v.poll();
+                ev.extend(std::iter::from_fn(|| n.try_recv_event()));
+                while v.try_recv_event().is_some() {}
+                if done(n, ev) || Wall::now() >= deadline {
+                    return done(n, ev);
+                }
+                std::thread::sleep(Span::from_millis(1));
+            }
+        }
+        // What the app saw of `p`: its link up, its messages, its link gone.
+        fn seen(e: &[Event], p: PeerId) -> (bool, usize, bool) {
+            let up = e.iter().any(|e| matches!(e, Event::Connected { peer, .. } if *peer == p));
+            let said = e.iter().filter(|e| matches!(e, Event::Message { peer, .. } if *peer == p)).count();
+            (up, said, e.iter().any(|e| matches!(e, Event::Disconnected { peer, .. } if *peer == p)))
+        }
+
+        // Linked, then a forged hello: the native stays one, and its messages and its goodbye reach the app.
+        let (mut n, mut v) = (node(true), node(false));
+        let (nid, vid) = (n.peer_id(), v.peer_id());
+        n.join_room(ROOM.0, ROOM.1);
+        v.join_room(ROOM.0, ROOM.1);
+        let mut ev = Vec::new();
+        let up = |n: &Node, e: &[Event]| n.status(&vid) == Status::Connected && seen(e, vid).0;
+        assert!(pump(&mut n, &mut v, &mut ev, 10_000, up), "{ev:?}");
+        forge(&vid);
+        pump(&mut n, &mut v, &mut ev, 100, |_, _| false);
+        assert!(!n.is_browser(&vid), "a peer that sent a native offer is no browser");
+        for i in 0..5u8 {
+            v.send(&nid, Lane::Reliable, &[b'm', i]).unwrap();
+        }
+        assert!(pump(&mut n, &mut v, &mut ev, 5_000, |_, e| seen(e, vid).1 == 5), "{ev:?}");
+        v.disconnect(&nid);
+        assert!(pump(&mut n, &mut v, &mut ev, 5_000, |_, e| seen(e, vid).2), "{ev:?}");
+        drop((n, v));
+
+        // A hello forged before the native's first offer marks it (the residual), and that offer clears the mark.
+        let (mut n, mut v) = (node(true), node(false));
+        let (nid, vid) = (n.peer_id(), v.peer_id());
+        n.join_room(ROOM.0, ROOM.1);
+        let mut ev = Vec::new();
+        pump(&mut n, &mut v, &mut ev, 50, |_, _| false);
+        forge(&vid);
+        pump(&mut n, &mut v, &mut ev, 100, |_, _| false);
+        assert!(n.is_browser(&vid), "marked before any offer of its own");
+        v.join_room(ROOM.0, ROOM.1);
+        let up = |n: &Node, e: &[Event]| n.status(&vid) == Status::Connected && seen(e, vid).0;
+        assert!(pump(&mut n, &mut v, &mut ev, 10_000, up), "{ev:?}");
+        assert!(!n.is_browser(&vid) && n.presence(&vid).is_none(), "its offer cleared the mark");
+        for i in 0..5u8 {
+            v.send(&nid, Lane::Reliable, &[b'm', i]).unwrap();
+        }
+        assert!(pump(&mut n, &mut v, &mut ev, 5_000, |_, e| seen(e, vid).1 == 5), "{ev:?}");
     }
 
     /// The room hellos `t` published, opened: who said it and at what time.
