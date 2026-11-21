@@ -221,7 +221,8 @@ await until('e linked to a', () => a.route(e.self)?.kind === 'direct', 30000);
 const send = b.endpoint.onTransmit;
 const toA = b.transport.byPeer.get(a.self);
 let kept = null;
-b.endpoint.onTransmit = (h, bytes) => (h === toA && !kept ? (kept = bytes) : send(h, bytes));
+// Kept, so copied: a datagram is a view into the wasm's memory, valid only during onTransmit.
+b.endpoint.onTransmit = (h, bytes) => (h === toA && !kept ? (kept = bytes.slice()) : send(h, bytes));
 b.send('one kept back', { to: a.self });
 await until("a datagram of b's for a, kept", () => kept !== null, 5000);
 b.endpoint.onTransmit = send;

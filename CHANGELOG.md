@@ -20,6 +20,12 @@ and the commit that fixed it.
   can't make a native look like a browser (NB162-1); and a page's ICE restart offer is taken only with new ICE
   credentials, at most once per 2 s for a restart or a failed try (which ends the connection), so restarts can't grow
   the connection's candidates without bound (NB162-2).
+- **Delayed ACKs** (NB-158, [Protocol](docs/concepts/protocol.md#lanes-and-reliability)): `peerwire-core`'s reliable
+  lane acknowledges fragments that come in order 4 at a time, or 1 ms after the first of them, rather than each
+  one; a message's last fragment, a fragment out of order, a copy, one that fills a hole and a PING are acknowledged
+  at once, as is every urgent fragment, and any packet the receiver sends carries a pending ACK. The ACK frame is
+  unchanged, so peers that acknowledge every fragment (0.1.0, `peerwire-esp` 0.1.1, `@peerwire/js` 0.3.1)
+  interoperate. Half of a bulk transfer's packets were ACKs, which cost a browser as much as data packets.
 - **Peerwire Share in Rust** (NB-159, [Share protocol](docs/concepts/share-protocol.md)): `peerwire` feature `files`
   (no dependency of its own) adds `peerwire::files`, the browser Share page's file protocol: offers accepted or
   declined, 512 KiB pieces each with its SHA-256, a window of 8 pieces per peer, the whole file's SHA-256, a transfer
@@ -283,6 +289,14 @@ and the commit that fixed it.
   whole file's checked, and is written as it arrives (`showSaveFilePicker`'s writable stream, else a download streamed
   by a service worker, else in memory up to 256 MB). Pieces go only over a peer's own DataChannel, never through the
   signalling relays, a member or TURN, and a transfer whose link drops goes on from the last piece written.
+- The wasm acknowledges reliable fragments 4 at a time (delayed ACKs: see the Rust crates above, NB-158).
+- **Changed: `Endpoint.onTransmit` gets a view, not a copy** (NB-158, [Endpoint](docs/reference/javascript.md#endpoint)):
+  each datagram is a view into the wasm's memory, valid only until `onTransmit` returns. A transport of your own that
+  keeps a datagram past the call (a queue, a timer, a promise, `postMessage`) must copy it first, `bytes.slice()`;
+  one that sends it at once through an API that copies it, as `RTCDataChannel.send` does, needn't. `LocalTransport`
+  now copies (a structured clone of the view would take the whole of the wasm's memory); the other transports hand
+  the bytes on at once. The endpoint also keeps its timer while it is set to fire by the core's next deadline,
+  rather than setting it again after every pump. Both were a measurable part of a browser's cost per packet.
 - **Share demo, faster** (NB-158): the whole-file SHA-256 keeps every sum within int32, about 5 times faster in
   Chromium, and a sender keeps 1 to 4 MiB in flight to a peer, twice the rate its acks come at times the link's round
   trip (`windowBytes`), rather than 8 pieces always: pieces queue on the reliable lane ahead of anything else sent to

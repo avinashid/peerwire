@@ -18,6 +18,16 @@ const until = async (what, cond, ms = 10000) => {
   }
 };
 const opts = { appId: 'peerwire-test', roomId: `node-${process.pid}` };
+// NB158-I1: onTransmit hands LocalTransport a view into the wasm's memory, so it must post a copy of the datagram;
+// posting the view would structured-clone that whole memory, keys and all, to everyone on the channel.
+const tap = new BroadcastChannel(`peerwire/${opts.appId}/${opts.roomId}`);
+let dgs = 0;
+tap.onmessage = ({ data: m }) => {
+  if (m?.body?.kind !== 'dg') return;
+  dgs++;
+  const { buffer, byteLength } = m.body.bytes;
+  if (buffer.byteLength !== byteLength) fail(`a ${byteLength} B datagram posted in a ${buffer.byteLength} B buffer`);
+};
 const t0 = performance.now();
 const [a, b, c] = await Promise.all(['ana', 'bo', 'cy'].map((name) => joinRoom({ ...opts, presence: { name } })));
 const got = new Map([a, b, c].map((r) => [r, []]));
@@ -92,6 +102,9 @@ await until('peer-leave', () => a.peers.length === 1 && b.peers.length === 1);
 if (!left.some(([who, peer, reason]) => who === a.self && peer === c.self && reason === 'left')) fail(`leave reason ${JSON.stringify(left)}`);
 await a.leave();
 await b.leave();
+tap.close();
+if (dgs === 0) fail('saw no datagrams on the room channel');
+console.log(`${dgs} datagrams on the room channel, each posted in a buffer of its own: ok`);
 
 // A room dials every member, so it takes 'direct' or 'public-only' and nothing else.
 for (const privacy of ['relay-only', 'bogus']) {

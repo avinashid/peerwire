@@ -13,6 +13,20 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// a game frame), as in QUIC's max_ack_delay. Loss is mostly repaired by fast
 /// retransmit, so this only delays recovery of the last packets in a burst.
 const ACK_DELAY: Duration = Duration::from_millis(25);
+/// Delayed ACKs, as TCP's and QUIC's: while the reliable stream's fragments come
+/// in order, with none held past a hole, its ACK waits for ACK_EVERY of them or
+/// ACK_DELAY_MAX after the first, whichever is first, and anything the link
+/// sends meanwhile carries it. A message's last fragment, one out of order, a
+/// copy, one that fills a hole and a PING are acknowledged at once: a message
+/// of one fragment is acknowledged as it always was, and fast retransmit and
+/// the sender's tail-loss probe wait on the others. One ACK per fragment made
+/// half of a bulk transfer's packets ACKs, which cost a browser as much as data
+/// packets (NB-158). Senders allow a receiver ACK_DELAY to acknowledge, far
+/// more than this, and grow their window by the fragments an ACK covers, not
+/// by ACKs. The urgent stream acknowledges every fragment at once.
+pub(crate) const ACK_EVERY: u8 = 4;
+pub(crate) const ACK_DELAY_MAX: Duration = Duration::from_millis(1);
+const _: () = assert!(ACK_DELAY_MAX.as_micros() * 10 <= ACK_DELAY.as_micros());
 /// The lowest fragment unacknowledged, sent this many times more since it
 /// became the lowest, means the link is dead. Only the lowest counts: a
 /// receiver always takes the fragment it expects next, but may drop those
@@ -864,6 +878,12 @@ impl RelRecv {
     #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         self.buf.values().map(|(_, d)| d.len()).sum::<usize>() + self.assembling.len()
+    }
+
+    /// The fragment expected next, unless one is held past a hole: a fragment
+    /// that comes then is in order (see ACK_EVERY).
+    pub(crate) fn expects(&self) -> Option<u32> {
+        self.buf.is_empty().then_some(self.next)
     }
 
     pub(crate) fn ack(&self) -> (u32, u64) {

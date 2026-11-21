@@ -230,6 +230,7 @@ release of each.
 | NB142-I1 (Info) | **Fixed** by `5f3187b` (NB-142), reviewed 2026-11-19: the Wi-Fi library's tag is quiet before the station's configuration is set, as setting one logged the length of the network's password, same section |
 | NB136-1 (Low) | **Fixed** by `44c46bc` before NB-136 merged, so never on main: a pipe whose peer isn't linked kept off newcomers for 5 s after its last batch, and anyone who reads a board's tag on a relay can post a batch it saw again under a key of its own, so copies every few seconds kept every pipe the board freed and newcomers gave up; the 5 s now count from the pipe's dial, so a copy holds a freed pipe 5 s once at most, reviewed 2026-11-19, [A newcomer past the pipe cap](#a-newcomer-past-the-pipe-cap-nb-136--nb136-1) |
 | NB136-I1 (Info) | Accepted for v1 by the lead on 2026-11-19: while a newcomer waits, a page whose events its relay drops, or its carrier loses without counting it, is taken for gone after 20 s, where its link timed out at 30 s, same section |
+| NB158-I1 (Info) | Open: no test guards `LocalTransport`'s copy of each datagram, without which every datagram posted on a local room's channel would carry the whole of the wasm's memory, keys included; the tests pass with it taken out. Fix: a check that each posted datagram's buffer is its own size, [Datagrams as views, and delayed ACKs](#datagrams-as-views-and-delayed-acks-nb-158--nb158-i1) |
 | NB159-1 (Low) | **Fixed** by `bc2fe5f` before NB-159 merged, so never on main: when 200 or more transfers were live, one that just ended could be forgotten before the app read its `Ended`, and the `share` example then panicked; `prune` now forgets only transfers whose `Ended` the app has polled, and the example skips an `Ended` it has no `info` for, reviewed 2026-11-20, [Peerwire Share in Rust](#peerwire-share-in-rust-nb-159--nb159-1-nb159-2-nb159-3) |
 | NB159-2 (Low) | **Fixed** by `eb56bac` before NB-159 merged, so never on main: `share recv --yes` held a file open for each offer a peer made until it ran out; it now declines an offer from a peer with 32 transfers under way, and the module's docs tell an app that accepts by itself to cap them, reviewed 2026-11-20, same section |
 | NB159-3 (Low) | Open: the `share` example exits when it answers an offer that ended before it did (its sender cancelled it, or its peer left), so a room member's offer and `cancel` in one batch stop `share recv --yes` or `share send`. Fix: the example goes on past `NoTransfer` and `NotConnected` from `accept_into` and `decline`, same section |
@@ -8077,6 +8078,57 @@ the link's own path, and a linked peer could already cost the sender as much by 
 to it.
 
 **Status: accepted** for v1 by the lead on 2026-11-19, as NB-150's stated cost.
+
+### Datagrams as views, and delayed ACKs (NB-158) — NB158-I1
+
+NB-158's changes to the library. `f629423`: the JS endpoint hands `onTransmit` a view of
+its send buffer in the wasm's memory, valid only until the call returns, where it handed
+a copy; `LocalTransport` now copies, and the endpoint keeps a timer that already fires
+by the core's next deadline. `7b07c29`: delayed ACKs in `peerwire-core`; while the
+reliable stream's fragments come in order, its ACK waits for 4 of them (`ACK_EVERY`) or
+1 ms after the first (`ACK_DELAY_MAX`). Reviewed on 2026-11-21 by reading
+`777ee2e..2a17dbe` (`pz/NB-158-share-speed`, not merged). A scratch copy of `2a17dbe`
+ran the probes and the mutant below; nothing else was re-run.
+
+**What holds.**
+
+- **No transport keeps or posts the view.** `WebRtcTransport` sends it at once with
+  `RTCDataChannel.send`, which copies the view's bytes, or encodes it as base64 at once
+  for a pipe; `RelayTransport` hands it on at once; `BluetoothTransport` copies it into
+  its link (`BleLink.datagram`) before any wasm call; `LocalTransport` posts a copy. The
+  demos and `@peerwire/react` set no `onTransmit` of their own, the C ABI still copies
+  each datagram into the caller's buffer, and the test wires that deliver later copy.
+- **Why `LocalTransport` copies.** A structured clone of a view takes its whole buffer:
+  posted as it is, each datagram would carry the wasm's memory, keys included, to every
+  listener on the room's channel. A probe on a local room in Node saw each posted
+  datagram in a buffer of its own size; with the copy taken out, in one of 1,376,256 B,
+  while every message still arrived.
+- **A transport that breaks the contract.** While the endpoint is open the view holds
+  sealed datagrams only, so one sent late carries another, or parts of two, which its
+  receiver drops as a copy or as one that doesn't open; a view of memory that has grown
+  is detached and sends nothing. After
+  `close()` its buffer is freed: two probes that kept a view, then made identities and
+  Nostr keys in the same instance, found none of them in it. The contract is stated in
+  `index.d.ts`, the JS reference and the C ABI page.
+- **The timer.** A timer kept fires at or before the new deadline, so none is missed;
+  one that fires early only calls `pw_handle_timeout` once more, which arms the next. A
+  deadline that moves earlier, none, and `close()` still replace or clear it.
+- **Delayed ACKs.** A fragment out of order, a copy, one held past a hole or filling it,
+  a message's last fragment and a PING are acknowledged at once, as is every urgent
+  fragment, so fast retransmit and the tail-loss probe see their ACKs as before; a
+  fragment a board drops past its `MAX_OUT_OF_ORDER` is out of order. The core's
+  deadline includes the ACK's, so a sender out of window has its ACK within 1 ms and the
+  host's timer, or, where that timer is late (a hidden tab), on the copy its tail-loss
+  probe sends. The sender is unchanged: its RTO allows 25 ms for a receiver's ACK, and
+  its RTT samples skip fragments sent again or probed. A peer draws no more ACKs than it
+  sends packets, as before, and the state is a count and a time a link, freed with it.
+
+**NB158-I1 — No test guards `LocalTransport`'s copy (Info).** With the copy taken out,
+`room_node.mjs`, `room_leave.mjs` and `room_proof.mjs` still pass, as a view posted
+whole still delivers its datagram. Fix: a check in a local room's test that each
+datagram posted on the channel is in a buffer of its own size, as the probe above does.
+
+**Status: open** (Info), reported on NB-164 at `2a17dbe`.
 
 ### Peerwire Share in Rust (NB-159) — NB159-1, NB159-2, NB159-3
 

@@ -74,7 +74,11 @@ const pw = await loadPeerwire(wasm);
 const eps = [pw.endpoint({ relayOnly: true }), pw.endpoint(), pw.endpoint()];
 const [a, r, b] = eps;
 eps.forEach((ep, i) => {
-  ep.onTransmit = (to, bytes) => setImmediate(() => eps[to].receive(i, bytes));
+  // Delivered later, so copied: a datagram is a view into the wasm's memory, valid only during onTransmit.
+  ep.onTransmit = (to, bytes) => {
+    const copy = bytes.slice();
+    setImmediate(() => eps[to].receive(i, copy));
+  };
 });
 const events = eps.map(() => []);
 eps.forEach((ep, i) => {

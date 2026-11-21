@@ -830,7 +830,7 @@ characters: ids from signalling are untrusted and never reach wasm memory unchec
 | Member | |
 |---|---|
 | `peerId: Uint8Array`, `id: PeerId` | Our identity, as bytes and as hex. |
-| `onTransmit: (addr, bytes) => void` | Called with (transport handle, datagram) for each datagram to send. |
+| `onTransmit: (addr, bytes) => void` | Called with (transport handle, datagram) for each datagram to send. `bytes` is a view into the wasm's memory, valid only until `onTransmit` returns (see below). |
 | `onEvent: (event) => void` | Called with each [`EndpointEvent`](#endpointevent). |
 | `onDrain: (() => void) \| null` | Called at the end of a pump that handled incoming datagrams: ACKs may have freed send window, so a sender that got -3 can try again. |
 | `transmitErrors: number` | Datagrams lost because `onTransmit` threw; the endpoint keeps running and retransmits. |
@@ -854,6 +854,16 @@ characters: ids from signalling are untrusted and never reach wasm memory unchec
 `setSlow`, `addRelay`, `addCandidate`, `disconnect` and `setRelayOnly` have more to their rules than fits here: their
 comments in `index.d.ts` are the reference. The numbers in them (a probe every half second for 5 s, a relay held off
 for a minute and up to 16 minutes, 5 rounds 2 s apart) are the core's.
+
+**A transport that keeps a datagram copies it.** The `bytes` given to `onTransmit` are a view into the wasm's
+memory, not a copy (since NB-158: copying each datagram was a measurable part of a browser's cost per packet). They
+hold the datagram only until `onTransmit` returns: the next datagram goes in the same place, and a wasm call that
+grows the memory detaches the view. A transport that sends it at once through an API that copies it, as
+`RTCDataChannel.send` and `Uint8Array.prototype.set` do, needs no copy. One that keeps it past the call (a queue, a
+timer, a promise, a test wire that delivers it later) copies it first, with `bytes.slice()`. So does one that
+posts it (`postMessage`, `BroadcastChannel`): a structured clone of the view takes the whole of the wasm's memory
+with it, keys included. In this package `LocalTransport` copies for that reason; `WebRtcTransport` (a DataChannel,
+or a pipe's base64), `RelayTransport` and `BluetoothTransport` hand the bytes on at once.
 
 ### EndpointEvent
 

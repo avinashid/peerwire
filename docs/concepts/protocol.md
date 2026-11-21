@@ -75,6 +75,13 @@ The reliable lane is a small transport tuned for real-time traffic:
 - **Selective ACKs.** A cumulative ACK plus a 64-bit bitmap. Fragments 3 sequence numbers behind the highest ACK are
   retransmitted at once, without waiting for a timeout, once per loss: only an ACK for a fragment sent after the
   last copy counts, and a quarter of the minimum RTT is allowed for reordering (as in RACK) before resending.
+- **Delayed ACKs.** While reliable fragments come in order, with none held past a hole, the receiver acknowledges
+  every 4th, or 1 ms after the first unacknowledged one came, whichever is first, and any packet it sends meanwhile
+  carries the ACK. A message's last fragment, a fragment out of order, one held past a hole or filling it, a copy
+  and a PING are acknowledged at once, as is every urgent fragment: a message of one fragment is acknowledged as soon
+  as it comes, and fast retransmit and the tail-loss probe see their ACKs at once. The ACK frame is the same, so
+  peers that acknowledge every fragment interoperate. One ACK per fragment made half of a bulk transfer's packets
+  ACKs, which cost a browser as much as data packets (NB-158).
 - **Retransmission timeout.** 300 ms at first, kept between 20 ms and 5 s, with back-off capped at 10 s. A 25 ms
   ACK-delay allowance (like QUIC's `max_ack_delay`) covers busy game frames and browser event loops. The link is
   dropped once the lowest unacknowledged fragment has gone out 16 more times since it became the lowest: a receiver

@@ -190,7 +190,7 @@ check(JSON.stringify(a.told) === JSON.stringify([[b.id, 'seen']]) && JSON.string
   await c.sig.hello({ nb: 1, ...(await proof.hello(c.id, 'client')) });
   await until('k lists the host', () => k.t.peers.includes(h.id));
   let hs = null;
-  c.ep.onTransmit = (_addr, bytes) => void (hs ??= bytes);
+  c.ep.onTransmit = (_addr, bytes) => void (hs ??= bytes.slice()); // a view, valid only during the call
   c.ep.connect(1, k.id);
   await until('c makes a handshake', () => hs);
   const bad = k.t.rtc.badSignals;
@@ -281,7 +281,7 @@ const batches = []; // the datagrams' sizes in each pipe batch a sends
 {
   const e = await client();
   let hs = null;
-  e.ep.onTransmit = (_addr, bytes) => void (hs ??= bytes);
+  e.ep.onTransmit = (_addr, bytes) => void (hs ??= bytes.slice()); // a view, valid only during the call
   e.ep.connect(1, a.id);
   await until('e makes a handshake', () => hs);
   const bad = a.t.rtc.badSignals;
