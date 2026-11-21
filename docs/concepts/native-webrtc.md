@@ -219,6 +219,8 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
 - `cargo test -p peerwire --lib -- webrtc:: browser`: two connections over memory (an offer answered, the channel open,
   datagrams both ways, a close seen by ICE); offers without the room proof, malformed signals and floods; the
   room layer (proof, presence, goodbye, doc asks, dropped tags); browser hellos in the traversal, ours and theirs.
+- `cargo test -p peerwire --test webrtc`: native nodes with WebRTC on and off link with each other over UDP as
+  ever, their events and raw messages untouched by the room layer.
 - `node packages/js/test/share_webrtc.mjs` (the gate's `share webrtc`): the Share page in headless Chromium and the
   `share` example, and a `joinRoom` page and `room_chat`, in one room over a Nostr relay on loopback
   (`nostr_relay.mjs`), with no STUN server: files both ways byte for byte over the DataChannel (the page says the
