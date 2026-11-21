@@ -232,11 +232,11 @@ release of each.
 | NB136-I1 (Info) | Accepted for v1 by the lead on 2026-11-19: while a newcomer waits, a page whose events its relay drops, or its carrier loses without counting it, is taken for gone after 20 s, where its link timed out at 30 s, same section |
 | NB159-1 (Low) | **Fixed** by `bc2fe5f` before NB-159 merged, so never on main: when 200 or more transfers were live, one that just ended could be forgotten before the app read its `Ended`, and the `share` example then panicked; `prune` now forgets only transfers whose `Ended` the app has polled, and the example skips an `Ended` it has no `info` for, reviewed 2026-11-20, [Peerwire Share in Rust](#peerwire-share-in-rust-nb-159--nb159-1-nb159-2-nb159-3) |
 | NB159-2 (Low) | **Fixed** by `eb56bac` before NB-159 merged, so never on main: `share recv --yes` held a file open for each offer a peer made until it ran out; it now declines an offer from a peer with 32 transfers under way, and the module's docs tell an app that accepts by itself to cap them, reviewed 2026-11-20, same section |
-| NB159-3 (Low) | Open: the `share` example exits when it answers an offer that ended before it did (its sender cancelled it, or its peer left), so a room member's offer and `cancel` in one batch stop `share recv --yes` or `share send`. Fix: the example goes on past `NoTransfer` and `NotConnected` from `accept_into` and `decline`, same section |
+| NB159-3 (Low) | **Fixed** by `bc9f3e7` before NB-159 merged, so never on main: the `share` example ended when it answered an offer that had ended first (its sender cancelled it, or its peer left), so a member's offer and `cancel` in one batch stopped `share recv --yes` or `share send`; it now goes on past `NoTransfer`, takes an offer whose peer's link is down once the link is back, and asks no more about an offer that ended, reviewed 2026-11-21, same section |
 | NB159-I1, NB159-I2 (Info) | **Fixed** by `9386298` and `1b72eec` before NB-159 merged, so never on main: the protocol page and `impl Wire for Node` say a move of the link can carry the pieces in flight over a relay (at most the window, sealed), and `FileSink::create` cleans the name it is given, reviewed 2026-11-20, same section |
-| NB162-1 (Medium) | Open: any room member can say a room.js hello naming a native member's PeerId, and a node with browsers on then runs the room layer on that peer's links for good: it drops the peer's messages and goodbye on a native link already up, and closes each new one at 10 s. Fix: a native offer, sealed by its sender, clears the mark, and a hello doesn't mark a peer that has sent one, [Native WebRTC to pages](#native-webrtc-to-pages-nb-162--nb162-1-nb162-2-nb162-i1) |
-| NB162-2 (Medium) | Open: a page linked to the node can send offers marked `restart` with the same ICE credentials and new candidates, each taken at once and none counted, so the WebRTC library's list of candidates, and the time it takes for each offer, grow without bound. Fix: take a restart only with new ICE credentials, at most once per `REPLACE_AFTER`, and count its candidates afresh, same section |
-| NB162-I1 (Info) | Open: one member, under fresh keys of its own, can hold all 64 WebRTC connections unopened, so pages fall back to pipes over the relays, same section |
+| NB162-1 (Medium) | **Fixed** by `dba6157` before NB-162 merged, so never on main: any room member could say a room.js hello naming a native member's PeerId, and a node with browsers on then ran the room layer on that peer's links for good, dropping its messages and goodbye on a native link already up and closing each new one at 10 s; a hello no longer marks a peer that has sent this node a native offer, which only that peer can seal, and such an offer clears a mark made before it, reviewed 2026-11-21. Accepted for v1 by the lead on 2026-11-21: a hello forged before a native's first offer marks it until that offer comes, [Native WebRTC to pages](#native-webrtc-to-pages-nb-162--nb162-1-nb162-2-nb162-i1) |
+| NB162-2 (Medium) | Open: a page linked to the node can send offers marked `restart` that add their candidates to the connection's, so the WebRTC library's list of candidates, and the time it takes for each offer, grow without bound. `126914b` refuses one with the credentials of the offer answered before, or within `REPLACE_AFTER`, but not one that the library takes in part and then fails on: the node counts no try, and the same new credentials again add more candidates each time. Fix: count the try before `accept_offer`, and drop the connection when it fails, same section |
+| NB162-I1 (Info) | Accepted for v1 by the lead on 2026-11-21: one member, under fresh keys of its own, can hold all 64 WebRTC connections unopened, so pages fall back to pipes over the relays, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -8182,7 +8182,12 @@ on loopback, at `1b72eec`, the offer and its `cancel` in one write end
 there at `b91f95d`. Fix: the example goes on past `NoTransfer` and `NotConnected` from
 those calls (`share.rs` lines 192, 201, 203, 247 and 250).
 
-**Status: open** (Low), reported on NB-161 at `1b72eec`.
+**Status: fixed** by `bc9f3e7` before NB-159 merged, so never on main, reviewed
+2026-11-21 (NB-165) by reading: every answer to an offer goes through one function
+that goes on past `NoTransfer` (the offer ended) and `NotConnected` (its peer's link is
+down: the offer is taken once the link is back, and `decline` never fails so), an offer
+that ends is asked about no more, and the example's test sends an offer and its
+`cancel` in one batch to `recv --yes`, `recv` and `send`, which all carry on.
 
 **NB159-I1 — Pieces already sent can cross a relay (Info).** Pieces go to the node only
 while the path is `Direct` or `Birthday`, but once `Node::send` has them they are the
@@ -8224,7 +8229,10 @@ room.js's room layer on every link to a page. It says a browser-shaped hello
 `38a0f33` ran tests written for the review: NB162-1's and NB162-2's, with and without
 the fixes below, and random and mutated input into the shared socket's split and the
 description and candidate parsers, which found nothing. The branch's own `webrtc` tests
-were re-run only with those fixes in.
+were re-run only with those fixes in. The fixes, `38a0f33..b4c543d`, were reviewed on
+2026-11-21 (NB-165) by reading and on a scratch copy of `b4c543d`: NB-163's tests pass,
+each fix's own test fails with that fix alone reverted, and a restart offer that str0m
+fails on part of the way shows NB162-2 still open.
 
 **What holds.**
 
@@ -8274,7 +8282,14 @@ Fix: a native offer, sealed by its sender's PeerId, clears the mark (`on_offer`,
 With both, the same tests pass; a forged hello can still mark a native before its first
 offer comes.
 
-**Status: open** (Medium), reported on NB-163 at `38a0f33`.
+**Status: fixed** by `dba6157` before NB-162 merged, so never on main, reviewed
+2026-11-21: `on_browser_hello` returns for a peer that has sent this node a native
+offer (`heard`), and `on_offer` clears `browser`. Its test fails with the fix alone
+reverted. **Accepted** for v1 by the lead on 2026-11-21: a hello forged before a
+native's first offer marks it until that offer comes. The native offers when it hears
+this node's hello, and those come at most `HELLO_MAX` (30 s) apart; meanwhile the node
+sends it no offer of its own and, with the smaller id, dials it over WebRTC. The link
+that then comes up is a native's.
 
 **NB162-2 — Restart offers pile up candidates without bound (Medium).** An offer marked
 `restart` on an open connection (`webrtc/mod.rs` lines 310 to 316) is taken with no
@@ -8291,7 +8306,20 @@ restart, after which str0m drops the old candidates and pairs), at most once per
 `REPLACE_AFTER`, and count its candidates afresh. With that the same test held nothing
 more, and real restarts stayed bounded.
 
-**Status: open** (Medium), reported on NB-163 at `38a0f33`.
+**Status: open** (Medium), reported on NB-163 at `38a0f33`. `126914b` (reviewed on
+NB-165, 2026-11-21) takes a restart offer only if its ICE username fragment, read where
+str0m reads it, differs from that of the offer answered before, at most once per
+`REPLACE_AFTER`, and counts its candidates afresh; its test fails with that check
+removed. That isn't enough. str0m's `accept_offer` takes an offer's ICE credentials and
+candidates before the rest of it, which can still fail (an offer with no `a=group`
+does), and then the node keeps the fragment and the time of the offer answered before
+(`webrtc/mod.rs` lines 320 to 326). The same new credentials pass the check again at
+once, are no restart to str0m, and add their candidates to the last ones, each time. In
+a scratch test such offers were all refused, yet the time each took grew with the
+candidates held, as before, and the connection stayed up at 20 offers a second. Fix:
+count the try (`made` and `ufrag`) before `accept_offer`, and drop the connection when
+it fails (`dead`, as for an answer that fails). With that, the same test refused each
+offer at a steady cost, and at 20 a second the connection closed after the first.
 
 **NB162-I1 — One member can fill the connections (Info).** An offer proved for a fresh
 PeerId of a member's own holds one of the 64 connections for up to 15 s unopened
@@ -8301,7 +8329,8 @@ back to pipes over the relays. Like other per-node caps, a member can fill it un
 of its own. Fix, if wanted: when full, drop the oldest connection not yet open rather
 than the new offer.
 
-**Status: open** (Info), reported on NB-163 at `38a0f33`.
+**Status: accepted** for v1 by the lead on 2026-11-21; `702e701` says so under
+Limits in `docs/concepts/native-webrtc.md`.
 
 **Residuals.**
 
