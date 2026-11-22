@@ -58,7 +58,10 @@ pub(crate) const MAX_BUFFERED: usize = 1 << 20;
 /// are up to 1191 B, sends it. A larger target would only add room for the core datagrams that carry more beside a
 /// full fragment (an ACK: 1150 B; up to `MAX_DATAGRAM`), which still go as two packets, as before. And this one stays
 /// under the core's own limit, `MAX_DATAGRAM` (1232 B: IPv6's minimum MTU, 1280 B, less the IPv6 and UDP headers), so
-/// str0m doesn't aim past what a path that carries the core's own datagrams must carry.
+/// str0m doesn't aim past what a path that carries the core's own datagrams must carry. It can still pass it: its
+/// packer counts neither the last chunk's header nor any chunk's padding when it bundles small datagrams into one
+/// packet (those queued behind SCTP's congestion window), so a burst of 33 B ones goes in packets of up to 1245 B,
+/// where str0m's default held them to 1193 B (docs/concepts/native-webrtc.md, Security). A full one is never bundled.
 pub(crate) const RTC_MTU: usize = 1137 + 48 + 40;
 /// Offers, answers and copies of either to one peer: a burst, then one per `PUBLISH_EVERY` (webrtc.js
 /// `publishBurst`, `publishEveryMs`), so no peer can keep this node publishing to the relays.

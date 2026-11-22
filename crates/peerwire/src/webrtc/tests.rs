@@ -452,7 +452,8 @@ fn records_for(mtu: usize, datagrams: &[Vec<u8>]) -> (usize, Pair) {
 
 /// NB-168: a datagram of a bulk transfer, one full fragment, goes in one SCTP packet, one DTLS record and one UDP
 /// datagram, as a browser sends it; str0m's default MTU (1150) split it in two, and so does one byte less than
-/// `RTC_MTU`, the smallest that doesn't. Nothing str0m sends, its handshake included, is over the core's own limit.
+/// `RTC_MTU`, the smallest that doesn't. Nothing str0m sends here, its handshake included, is over the core's own
+/// limit (a burst of tiny datagrams, bundled, can be: see `RTC_MTU`).
 #[test]
 fn a_bulk_transfers_datagram_goes_in_one_packet() {
     // A full fragment's datagram, the smallest over MAX_UNRELIABLE: most of the transfer's. A few carry an ACK too.
@@ -468,4 +469,28 @@ fn a_bulk_transfers_datagram_goes_in_one_packet() {
     assert!(largest <= MAX_DATAGRAM, "the largest UDP datagram either end sent: {largest} B");
     let (records, _) = records_for(RTC_MTU - 1, &full[..20]);
     assert_eq!(records, 40, "a byte less and each goes in two");
+}
+
+/// NB-168, what the larger target costs: str0m bundles the datagrams queued behind SCTP's congestion window, and its
+/// packer counts neither the last chunk's header nor any chunk's padding. A burst of 3,000 datagrams of 33 B (3 B of
+/// padding each) goes in packets past the core's limit at `RTC_MTU` (1245 B), where str0m's default held it to 1193 B,
+/// but within the bound worked out in docs/concepts/native-webrtc.md (1285 B); every datagram arrives.
+#[test]
+fn a_burst_of_small_datagrams_passes_the_target_by_little() {
+    let largest = |mtu: usize| {
+        let mut p = Pair::new();
+        (p.a.mtu, p.b.mtu) = (mtu, mtu);
+        let (at_a, _) = open(&mut p);
+        let start = p.wire[0].len();
+        for _ in 0..3000 {
+            p.a.send(&at_a, &[5; 33]);
+        }
+        for _ in 0..400 {
+            p.step();
+        }
+        assert_eq!((std::iter::from_fn(|| p.b.poll_datagram()).count(), p.a.congested), (3000, 0));
+        p.wire[0][start..].iter().map(|(_, len)| *len).max().unwrap()
+    };
+    assert_eq!(largest(1150), 1193, "str0m's default target");
+    assert_eq!(largest(RTC_MTU), 1245);
 }
