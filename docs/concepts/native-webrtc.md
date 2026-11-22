@@ -279,4 +279,6 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
 Measured on the test host (4 aarch64 cores, loopback, headless Chromium, 21 November 2026), 1 GiB of random bytes each
 way, checked byte for byte, with other gates running beside it: 2.2 MB/s from the example to the page and 5.7 MB/s
 from the page to the example, where two tabs of one Chromium shared at 1.5 MB/s the same hour; see
-[Share protocol](share-protocol.md#testing-it).
+[Share protocol](share-protocol.md#testing-it). With `RTC_MTU` (NB-168, 22 November 2026, other work on 1.4 to 1.9
+of the cores), the median of 3 runs: 9.02 MB/s from the example to the page, where `main` got 5.39 MB/s, and 10.47
+MB/s from the page, with the wasm's faster crypto too, where `main` got 9.76 MB/s.

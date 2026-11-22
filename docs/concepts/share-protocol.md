@@ -255,3 +255,23 @@ On a quiet host, 16 MiB went at 3 to 4 MB/s to the page and 5 to 6.5 MB/s from i
 the core on its main thread, a DataChannel message at a time, and the core's round trip on the link rose from 0.75
 ms to 6 to 36 ms under the load, which its congestion control reads as queueing. The example's resident memory
 peaked at 14 MB, and the relay carried 142 events, 52 KB in all: the signalling alone.
+
+NB-168 (22 November 2026, the same host, 1 GiB of random bytes, checked byte for byte) made three changes: str0m's
+MTU target, so each datagram of a bulk transfer goes to a page in one SCTP packet, not two
+([Native WebRTC](native-webrtc.md#security)); SHA-256 on the CPU's SHA instructions in native builds on aarch64; and
+the wasm's per-packet crypto at `opt-level=3`. `main` before them (`9ef406b`) and after, each run from the accept to
+the verdict, the two builds' runs taken in turn, each after the load average fell under 2.5; the median of 3 runs
+(browser to browser: of 5). Other work kept 1.4 to 1.9 of the 4 cores busy through the first three rows, and 0.2
+to 2.1 through the last:
+
+| Link | How | Before | After |
+|---|---|---|---|
+| native to native | two `share` examples (release build with `files,nostr,webrtc`) in one room over a local Nostr relay (`nostr_relay.mjs`), on a direct UDP link | 39.3 MB/s | 72.2 MB/s |
+| native to browser | the same example and the Share page in headless Chromium, set up as `share_webrtc.mjs` does, the page saving to its origin's file system | 5.39 MB/s | 9.02 MB/s |
+| browser to native | the same, the page to the example | 9.76 MB/s | 10.47 MB/s |
+| browser to browser | two tabs of one headless Chromium, `?signal=local`, saving to disk | 10.04 MB/s | 11.40 MB/s |
+
+Native to native, each side hashes every byte twice, which took 29% of its CPU in software (perf, NB-167). Native to
+browser, the page gets half as many packets for the same data. Browser to browser, the pages' main threads did 16 to
+22% less work per MB, but Chromium's network-service thread, which carries both tabs' packets, was at 75 to 82% and
+the host nearly full: on the runs with the host otherwise quiet, 11.1 against 11.9 MB/s.
