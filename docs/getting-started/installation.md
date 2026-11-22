@@ -10,7 +10,7 @@ npm install @peerwire/js
 ```
 
 It runs in browsers and in Node 20 or later. The package is plain ES modules with TypeScript types, plus one
-WebAssembly file, `peerwire_ffi.wasm` (~350 KB, no imports). Bundlers such as Vite, webpack and esbuild find the
+WebAssembly file, `peerwire_ffi.wasm` (~360 KB, no imports). Bundlers such as Vite, webpack and esbuild find the
 wasm next to the package on their own.
 
 Node has no WebRTC of its own. Rooms with `signaling: 'local'` work in one Node process (and its workers) without

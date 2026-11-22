@@ -49,6 +49,20 @@ pub(crate) const OFFER_RESEND: [Duration; 2] = [Duration::from_millis(3000), Dur
 /// Above this many bytes buffered in a connection's SCTP association, the core's datagrams are dropped, as from a
 /// full UDP buffer, and its congestion control backs off (webrtc.js `MAX_BUFFERED`).
 pub(crate) const MAX_BUFFERED: usize = 1 << 20;
+/// str0m's MTU target: the UDP payload it aims to keep each packet within, DTLS handshake flights included (NB-168).
+/// str0m leaves the target less 48 B (its DTLS budget) and 40 B (its SCTP one) for the data of one SCTP DATA chunk.
+/// Its default, 1150, left 1062 B, so each datagram of a bulk transfer went as two SCTP packets, two DTLS records and
+/// two UDP datagrams, and both ends paid every packet's cost twice. Such a datagram is one full 1100 B fragment:
+/// 1137 B with the core's 13 B header, 8 B frame header and 16 B tag. 1225 is the smallest target with room for it,
+/// so it goes in one packet (1205 B of UDP payload with DTLS 1.2's AES-GCM), as a browser's dcSCTP, whose SCTP packets
+/// are up to 1191 B, sends it. A larger target would only add room for the core datagrams that carry more beside a
+/// full fragment (an ACK: 1150 B; up to `MAX_DATAGRAM`), which still go as two packets, as before. And this one stays
+/// under the core's own limit, `MAX_DATAGRAM` (1232 B: IPv6's minimum MTU, 1280 B, less the IPv6 and UDP headers), so
+/// str0m doesn't aim past what a path that carries the core's own datagrams must carry. It can still pass it: its
+/// packer counts neither the last chunk's header nor any chunk's padding when it bundles small datagrams into one
+/// packet (those queued behind SCTP's congestion window), so a burst of 33 B ones goes in packets of up to 1245 B,
+/// where str0m's default held them to 1193 B (docs/concepts/native-webrtc.md, Security). A full one is never bundled.
+pub(crate) const RTC_MTU: usize = 1137 + 48 + 40;
 /// Offers, answers and copies of either to one peer: a burst, then one per `PUBLISH_EVERY` (webrtc.js
 /// `publishBurst`, `publishEveryMs`), so no peer can keep this node publishing to the relays.
 pub(crate) const PUBLISH_BURST: f64 = 6.0;
@@ -140,6 +154,8 @@ pub(crate) struct Rtcs {
     out: Out,
     signals: VecDeque<(PeerId, Vec<u8>)>,
     closed: VecDeque<(PeerId, SocketAddr)>,
+    /// str0m's MTU target for connections made from now on: [`RTC_MTU`] (the tests try others).
+    mtu: usize,
     /// Signals refused (malformed, unproven, over a cap or a budget), and datagrams dropped for a full buffer.
     pub(crate) refused: u64,
     pub(crate) congested: u64,
@@ -158,6 +174,7 @@ impl Rtcs {
             out: Out::default(),
             signals: VecDeque::new(),
             closed: VecDeque::new(),
+            mtu: RTC_MTU,
             refused: 0,
             congested: 0,
         }
@@ -209,6 +226,8 @@ impl Rtcs {
         // The peer's DTLS certificate must match the fingerprint in its description (str0m's default, kept so):
         // that description came sealed from the peer's PeerId, which binds the DTLS session to it.
         let config = Rtc::builder().set_fingerprint_verification(true);
+        // str0m logs (tracing) a packet it makes over the core's own limit: its warning threshold, the range's end.
+        let config = config.set_mtu(self.mtu..=MAX_DATAGRAM.max(self.mtu));
         let mut rtc = config.set_sctp_max_buffered_amount(MAX_BUFFERED + 64 * 1024).build(now);
         for a in &self.local {
             if let Ok(c) = Candidate::host(*a, "udp") {

@@ -82,7 +82,7 @@ multiplayer.multiplayer_peer = peer`,
     },
   ],
   featuresTitle: 'Everything between two peers, nothing in the middle',
-  // [icon, title, text]; the text is markdown (code spans); {wasm} is the built wasm's size, "~350 KB".
+  // [icon, title, text]; the text is markdown (code spans); {wasm} is the built wasm's size, "~360 KB".
   features: [
     ['server', 'No backend', 'Peers meet by room name or invite over untrusted signaling: public Nostr relays, an ' +
       'invite link or QR code, or LAN multicast. There\'s no signaling server, TURN server or backend of yours.'],

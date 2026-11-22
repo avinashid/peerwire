@@ -28,7 +28,7 @@ it on each platform:
 
 | Platform | Use |
 |---|---|
-| Browsers and Node 20+ | [`@peerwire/js`](../reference/javascript.md) (a ~350 KB WebAssembly module with no imports, over WebRTC DataChannels), and [`@peerwire/react`](../guides/react.md) |
+| Browsers and Node 20+ | [`@peerwire/js`](../reference/javascript.md) (a ~360 KB WebAssembly module with no imports, over WebRTC DataChannels), and [`@peerwire/react`](../guides/react.md) |
 | Linux, macOS, Windows | the [`peerwire`](../reference/rust.md) crate: `Node` (blocking) or `AsyncNode` (tokio) on a UDP socket |
 | Godot 4.3+ (desktop) | [`PeerwireMultiplayerPeer`](../guides/godot.md), a GDExtension |
 | Swift, Kotlin, Dart, C | the [C ABI](../reference/c-abi.md) (`pw_*`), as a native library |

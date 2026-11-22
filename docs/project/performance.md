@@ -31,8 +31,10 @@ message.
 |---|---|---|
 | Reliable messages over UDP loopback, one core (aarch64) | ~1.2 M msg/s | `cargo run --release -p peerwire-core --example udp_pair` |
 | Handshake | 1 RTT (Noise IK) | `tests/endpoint.rs` |
-| WebAssembly module | ~350 KB (356,750 B on 5 Nov 2026), 0 imports | `./packages/js/build.sh` |
+| WebAssembly module | ~360 KB (364,844 B on 22 Nov 2026), 0 imports | `./packages/js/build.sh` |
 | Two endpoints in Node: connect, then 1000 × 64 B + 64 KiB | connect 53 ms, transfer 51 ms | `node packages/js/test/node_pair.mjs` |
+| The same, both ends' CPU per 1,100 B unreliable message, against the wasm before NB-168 (its crypto at `opt-level=s`) | 19.5 µs, against 44.4 µs (22 Nov 2026) | `cd packages/js && node test/bench.mjs --ab=<main's packages/js> --only=reliable` |
+| Share, 1 GiB on loopback: native ↔ native, native → page, page → native, page ↔ page (22 Nov 2026) | 72.2, 9.02, 10.47, 11.40 MB/s | [Share protocol](../concepts/share-protocol.md#testing-it) |
 | Super-peer dies mid-game | detected in 267 ms; affected players' p99 316 ms; 0 stalls; every event delivered | `tests/arena.rs` |
 
 **Theoretical ceiling.** ChaCha20-Poly1305 runs at roughly 1–2 GB/s per modern core. A full 1232 B packet

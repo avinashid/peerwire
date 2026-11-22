@@ -18,7 +18,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  WASM_MAX_BYTES: 358400  # same default as scripts/gate.sh (350 KiB)
+  WASM_MAX_BYTES: 366592  # same default as scripts/gate.sh (358 KiB)
   WASM_BLE_MAX_BYTES: 430080  # peerwire_ffi_ble.wasm, as scripts/gate.sh (420 KiB)
 
 jobs:

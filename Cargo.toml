@@ -23,8 +23,23 @@ homepage = "https://avinashid.github.io/peerwire/"
 # CI's msrv job builds the published crates with it. Resolver 3 has cargo update pick dependencies that fit it.
 rust-version = "1.88"
 
+# The release profile: cargo's defaults, which native builds take as they are. The browser module's build
+# (packages/js/build.sh) sets it, through CARGO_PROFILE_RELEASE_*, to opt-level "s" (with LTO, one codegen unit, abort
+# on panic, stripped) for everything but these three: the core's per-packet crypto (ChaCha20-Poly1305, through snow),
+# which at "s" took about a third of a page's main thread for each datagram. At opt-level 3 it takes the core less
+# than half the time per datagram, for about 6.6 KB more wasm (NB-167, NB-168). Native release builds are at
+# opt-level 3 already, so this changes nothing for them, nor for the gate profile below.
+[profile.release.package.snow]
+opt-level = 3
+
+[profile.release.package.chacha20]
+opt-level = 3
+
+[profile.release.package.poly1305]
+opt-level = 3
+
 # The test builds of scripts/gate.sh (docs/project/testing.md). Neither changes what ships: that is the release
-# profile, left at cargo's defaults.
+# profile.
 # gate: the release tests, built incrementally, so a change rebuilds only what it touched. Same code as release:
 # opt-level 3, no debug assertions, integer overflow wraps.
 [profile.gate]

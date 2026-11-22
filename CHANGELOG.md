@@ -8,6 +8,18 @@ and the commit that fixed it.
 
 ## Unreleased: Rust crates
 
+- **Faster Share over native links** (NB-168, [Share protocol](docs/concepts/share-protocol.md#testing-it)), from
+  NB-167's measurements:
+  - `peerwire` with `webrtc`: str0m's MTU target is 1,225 B (`RTC_MTU`), not str0m's default of 1,150 B, so each
+    datagram of a bulk transfer (one full fragment, 1,137 B) goes to a page in one SCTP packet of 1,205 B of UDP
+    payload, as a browser sends it, not two. The target stays under the core's 1,232 B, though str0m can bundle a
+    burst of small datagrams into packets past it (1,245 B in a test; 1,193 B before); nothing else on the link
+    changes ([Native WebRTC](docs/concepts/native-webrtc.md#security)). Native to browser on the test host: 5.4 to
+    9.0 MB/s.
+  - `peerwire` on aarch64 Linux, Android and Apple: SHA-256 on the CPU's SHA instructions where it has them (`sha2`'s
+    `asm` feature, checked at run time). One new dependency there, `sha2-asm` 0.6 (MIT), which builds with the host's
+    C compiler. Share hashes every byte twice on each side: native to native on the test host went from 39 to
+    72 MB/s. x86-64 already hashed on SHA-NI; Windows on ARM, the wasm module and the ESP32 port are unchanged.
 - **Native WebRTC** (NB-162, [Native WebRTC](docs/concepts/native-webrtc.md)): `peerwire` feature `webrtc` (one new
   dependency, `str0m` 0.24 on AWS-LC, and the `nostr` feature's `serde_json`) and `Builder::webrtc(true)` put a native
   node in a browser room: it links with each `joinRoom` page over a WebRTC DataChannel on its own socket, with
@@ -266,6 +278,12 @@ and the commit that fixed it.
 
 ## Unreleased: `@peerwire/js`
 
+- **Faster crypto in the wasm** (NB-168): `peerwire_ffi.wasm` builds the core's per-packet crypto (`snow`, `chacha20`,
+  `poly1305`) at `opt-level=3`, the rest at `s` as before. Both ends of a link in Node 22 take 19 µs of CPU for an
+  1,100 B datagram, where they took 44 µs (`test/bench.mjs --ab`). Browser to browser Share on the test host went
+  from 10.0 to 11.4 MB/s, its pages' main threads doing 16 to 22% less work per MB; Chromium's network thread sets
+  the pace there. The module is 364,844 B (from 358,228 B), and the size limit of the gate and CI 366,592 B (358 KiB,
+  from 350 KiB); `peerwire_ffi_ble.wasm` is 417,953 B.
 - **Bluetooth in the browser** (NB-110d, [Bluetooth](docs/concepts/bluetooth.md)): `BluetoothTransport`, a Web
   Bluetooth central (Chrome and Edge, Android Chrome) that links a page with a native room member nearby, such as a
   board running `ble_led`, with no network. The protocol is the wasm's: the module with Bluetooth,

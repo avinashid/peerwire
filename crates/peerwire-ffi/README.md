@@ -3,7 +3,7 @@
 A C ABI over the [`peerwire-core`](../peerwire-core) `Endpoint`: one surface for every host
 that isn't Rust.
 
-- Built for `wasm32-unknown-unknown`, it is a WebAssembly module of about 350 KB with
+- Built for `wasm32-unknown-unknown`, it is a WebAssembly module of about 360 KB with
   **no imports** (no wasm-bindgen, no WASI). The browser package [`@peerwire/js`](../../packages/js)
   loads it and supplies WebRTC DataChannels, timers and randomness from JavaScript.
 - Built natively, it is a shared or static library (`cdylib`, `staticlib`) for Dart FFI,
@@ -20,8 +20,8 @@ datagrams.
 cargo build --release -p peerwire-ffi     # -> target/release/libpeerwire_ffi.{so,dylib,dll,a}
 ```
 
-CI and `scripts/gate.sh` fail the wasm build if it grows past 350 KiB (`WASM_MAX_BYTES`,
-358400 bytes) or gains an import. `build.sh` also builds `peerwire_ffi_ble.wasm`, with the
+CI and `scripts/gate.sh` fail the wasm build if it grows past 358 KiB (`WASM_MAX_BYTES`,
+366592 bytes) or gains an import. `build.sh` also builds `peerwire_ffi_ble.wasm`, with the
 `ble` feature, which has a limit of its own (`WASM_BLE_MAX_BYTES`, 420 KiB).
 
 ## Conventions

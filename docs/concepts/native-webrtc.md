@@ -99,7 +99,9 @@ core and the policy, and `Node::path_kind` says `Direct`, or `Turn` while its pa
 candidate, so [Share](share-protocol.md#where-data-may-go) sends pieces over it as a page does over its own
 DataChannel. The core's datagrams go on the channel while the connection has at most 1 MiB buffered, as webrtc.js
 sends them; past that they are dropped, as a full UDP buffer drops them, and the core's congestion control backs off.
-A connection whose channel closes or whose ICE fails ends its link at once (`Disconnected`, `Timeout`).
+Each datagram of a bulk transfer (one full fragment, 1,137 B) goes in one SCTP packet, as a browser sends it: str0m's
+MTU target is 1,225 B (`RTC_MTU`), the smallest with room for it, where str0m's default (1,150 B) split each in two
+(NB-168). A connection whose channel closes or whose ICE fails ends its link at once (`Disconnected`, `Timeout`).
 
 ## The room layer
 
@@ -135,6 +137,7 @@ says goodbye first, on the unreliable lane, then the core's sealed close, as `ro
 | `PUBLISH_BURST`, `PUBLISH_EVERY` | 6, 5 s | Offers, answers and copies of either to one peer: a burst, then one per 5 s |
 | `REPLACE_AFTER` | 2 s | A connection is replaced by a new offer from its peer at most this often, and restarts ICE for a page's restart offer at most this often too, or a failed try (which ends the connection); a restart offer must bring new ICE credentials (its `ice-ufrag`), or it is refused |
 | `MAX_BUFFERED` | 1 MiB | Bytes buffered in a connection's SCTP association past which the core's datagrams are dropped |
+| `RTC_MTU` | 1,225 B | str0m's MTU target: the UDP payload it aims each packet at, its handshake's too. It leaves 88 B less (its DTLS and SCTP budgets), 1,137 B, for one SCTP chunk: a bulk transfer's datagram |
 | `PROOF_WITHIN` | 10 s | A link's proof must come this soon after it connects |
 | DataChannel message | 1 to 1,232 B | A larger or empty one, or text, is dropped before the core (str0m takes at most 256 KiB) |
 | room frames waiting | 1,024 | Room frames (proofs, presence, doc answers) waiting for send window, over all browsers |
@@ -218,6 +221,35 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
   open, the SCTP buffer, the DataChannel's message size, the proof deadline, the room frames waiting; a presence is
   at most the reliable lane's largest message (1 MiB) per linked page. str0m bounds its own STUN queue (100 checks
   before the remote credentials) and sctp-proto its receive window (1 MiB).
+- **Packet size (NB-168).** str0m's MTU target is 1,225 B (`RTC_MTU`) where its default was 1,150 B, so the core's
+  datagram of a bulk transfer goes in one SCTP packet of 1,205 B of UDP payload (DTLS 1.2 with AES-GCM), not two.
+  That is under the core's own limit for a UDP datagram (`MAX_DATAGRAM`, 1,232 B: IPv6's minimum MTU less the IPv6
+  and UDP headers) and a browser's own largest (1,228 B, from dcSCTP's 1,191 B SCTP packets), and the DTLS
+  handshake's flights stay smaller (587 and 634 B between two str0m ends). A path that carries the core's own
+  datagrams or a browser's carries these. Only an IPv4 path with an MTU under 1,233 B (below IPv6's minimum) that
+  passed str0m's old packets (up to 1,129 B of UDP payload with data) would now drop the bulk ones, as it drops the
+  core's own full datagrams and a browser's. A core datagram larger than a full fragment (one with an ACK or a relay
+  header too, up to 1,232 B) still goes as two packets, as before. Nothing else changes: the DataChannel's settings,
+  what it carries, the core's wire format and its crypto are the same. Test:
+  `webrtc::tests::a_bulk_transfers_datagram_goes_in_one_packet`.
+
+  One way past the target, which the larger one widens: str0m bundles the small datagrams queued behind SCTP's
+  congestion window into as few packets as it can, and its packer leaves the last chunk's 16 B header and every
+  chunk's padding (up to 3 B) out of its count. Two str0m ends in memory sent a burst of 3,000 datagrams of 33 B
+  in packets of up to 1,245 B, 73 of 334 over 1,232 B, where str0m's default target held the same burst to 1,193 B
+  (`webrtc::tests::a_burst_of_small_datagrams_passes_the_target_by_little`). About 1,285 B is the most it can come
+  to (**theoretical**: 22 chunks of 33 B and one of 73 B, each padded by 3 B, with AES-GCM). A path that can't carry
+  such a packet (one at IPv6's minimum MTU carries 1,232 B of UDP payload) drops it, and its datagrams are lost like
+  any others: the core sends reliable data again. A full datagram is never bundled (any other chunk beside it would
+  pass the target), and the core packs a tick's messages into one datagram, so it takes many small datagrams in a
+  burst faster than SCTP's window. But on a path that drops packets over about 1,232 B (IPv6 at its minimum MTU, or a
+  1,280 B tunnel), a steady stream of small datagrams past SCTP's window keeps losing those bundles: in security's
+  probe, with 50 ms each way, 2,000 datagrams of 33 B a second lost about 18%, and at 8,000 a second that direction
+  collapsed. The link stays up (each lost chunk is abandoned with a FORWARD-TSN) and single datagrams still get
+  through, and a room member relaying through the node to that page can cause it within the relay's budget
+  (256 KiB/s). It is [NB168-1](../project/threat-model.md#str0ms-packet-size-nb-168--nb168-1) (Low, open), fixed only
+  by a change to sctp-proto's packer upstream (count the next chunk's 16 B header and the padding), after which an
+  `RTC_MTU` of 1,228 B keeps every packet within 1,205 B.
 - **What parses peer-controlled data.** `serde_json`: signals (after the seal opened: a room member or anyone who
   knows our PeerId and sends to our inbox, within its budget), presence and JSON messages, doc asks. str0m's SDP
   parser (combine): an offer's description only once its room proof checked out, an answer's only from the peer we
@@ -238,7 +270,9 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
 - `cargo test -p peerwire --lib -- webrtc:: browser`: two connections over memory (an offer answered, the channel open,
   datagrams both ways, a close seen by ICE); offers without the room proof, malformed signals and floods; restart
   offers (the same ICE credentials or too soon refused, a real ICE restart answered on the same connection, one str0m
-  refuses counted and the connection ended); the room layer (proof, presence, goodbye, doc asks, dropped tags);
+  refuses counted and the connection ended); a bulk transfer's datagrams, from two core endpoints, one SCTP packet
+  each at `RTC_MTU` and two a byte under it, and no packet over 1,232 B, and a burst of small ones bundled past it
+  by little (NB-168); the room layer (proof, presence, goodbye, doc asks, dropped tags);
   browser hellos in the traversal, ours and theirs, and one forged for a native, before and after it links (two nodes
   over memory).
 - `cargo test -p peerwire --test webrtc`: native nodes with WebRTC on and off link with each other over UDP as
@@ -252,4 +286,6 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
 Measured on the test host (4 aarch64 cores, loopback, headless Chromium, 21 November 2026), 1 GiB of random bytes each
 way, checked byte for byte, with other gates running beside it: 2.2 MB/s from the example to the page and 5.7 MB/s
 from the page to the example, where two tabs of one Chromium shared at 1.5 MB/s the same hour; see
-[Share protocol](share-protocol.md#testing-it).
+[Share protocol](share-protocol.md#testing-it). With `RTC_MTU` (NB-168, 22 November 2026, other work on 1.4 to 1.9
+of the cores), the median of 3 runs: 9.02 MB/s from the example to the page, where `main` got 5.39 MB/s, and 10.47
+MB/s from the page, with the wasm's faster crypto too, where `main` got 9.76 MB/s.

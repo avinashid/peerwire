@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds the browser module into packages/js/pkg/ (size-optimised, no wasm-bindgen needed).
+# Builds the browser module into packages/js/pkg/ (size-optimised, no wasm-bindgen needed). The core's per-packet
+# crypto (snow, chacha20, poly1305) stays at opt-level 3: the workspace's Cargo.toml says so for the release profile.
 set -e
 cd "$(dirname "$0")/../.."
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
