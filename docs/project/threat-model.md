@@ -238,6 +238,7 @@ release of each.
 | NB162-1 (Medium) | **Fixed** by `dba6157` before NB-162 merged, so never on main: any room member could say a room.js hello naming a native member's PeerId, and a node with browsers on then ran the room layer on that peer's links for good, dropping its messages and goodbye on a native link already up and closing each new one at 10 s; a hello no longer marks a peer that has sent this node a native offer, which only that peer can seal, and such an offer clears a mark made before it, reviewed 2026-11-21. Accepted for v1 by the lead on 2026-11-21: a hello forged before a native's first offer marks it until that offer comes, [Native WebRTC to pages](#native-webrtc-to-pages-nb-162--nb162-1-nb162-2-nb162-i1) |
 | NB162-2 (Medium) | **Fixed** by `126914b` and `05a9d36` before NB-162 merged, so never on main: a page linked to the node could send offers marked `restart` that added their candidates to the connection's, so the WebRTC library's list of candidates, and the time it took for each offer, grew without bound; a restart offer is now taken only with new ICE credentials, at most once per `REPLACE_AFTER`, its candidates counted afresh, and a try counts before the library takes it, a failed one ending the connection, reviewed 2026-11-21, same section |
 | NB162-I1 (Info) | Accepted for v1 by the lead on 2026-11-21: one member, under fresh keys of its own, can hold all 64 WebRTC connections unopened, so pages fall back to pipes over the relays, same section |
+| NB168-1 (Low) | Open: at str0m's MTU target of 1,225 B (NB-168), its SCTP packer can bundle small datagrams into packets of up to 1,285 B of UDP payload (**theoretical**), which a path at IPv6's minimum MTU drops; under a steady stream of them past SCTP's window that direction of the link then carries few, and a member relaying through the node to a page can cause it on such a path; the fix is in sctp-proto's packer (upstream), reported on NB-169 at `79c3160`, [str0m's packet size](#str0ms-packet-size-nb-168--nb168-1) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -8408,6 +8409,69 @@ Limits in `docs/concepts/native-webrtc.md`.
   so a relay on the room topic can tell one is there (beside NB22-I1).
 - DTLS 1.2 here is dimpl, str0m's own and young; the core's Noise session protects what
   the link carries either way.
+
+### str0m's packet size (NB-168) — NB168-1
+
+NB-168's first fix, `3650669` and `cdcc8d6`: with `webrtc`, str0m's MTU target is
+1,225 B (`RTC_MTU`, where its default is 1,150 B) and its warning threshold
+`MAX_DATAGRAM` (1,232 B), so the datagram of a bulk transfer, one full fragment of
+1,137 B, goes in one SCTP packet, one DTLS record and one UDP datagram rather than two.
+Reviewed on 2026-11-22 by reading `9ef406b..79c3160` (`pz/NB-168-speed-fixes`, not
+merged) against the str0m 0.24.1, dimpl 0.7.6 and sctp-proto 0.10.8 sources. A scratch
+copy of `79c3160` ran the branch's two new tests, which both fail with the `set_mtu`
+call removed, and probes over a path that drops every UDP datagram over 1,232 B; nothing
+else was re-run. NB-168's other fixes (SHA-256 on the CPU's own instructions, the wasm's
+crypto at `opt-level` 3) change no protocol and need no verdict.
+
+**What holds.**
+
+- **Only sizes change.** The diff sets the target and the threshold and nothing else:
+  the DataChannel (unordered, no retransmits), its 1 MiB buffer, what it carries, the
+  core's wire format and its crypto are as before. The threshold only has str0m log a
+  larger packet.
+- **One packet a bulk datagram.** str0m gives an SCTP DATA chunk at most the target less
+  88 B, 1,137 B, so a full datagram is one chunk and fills its packet, with nothing
+  bundled beside it: 1,205 B of UDP payload with DTLS 1.2's AES-GCM (37 B a record),
+  within `MAX_DATAGRAM` and a page's own largest (1,228 B). dimpl splits the DTLS
+  handshake's flights to the target and packs several records into one datagram only up
+  to it; STUN checks and SCTP's own chunks are small and as before.
+- **Paths.** A path that carries the core's full datagrams or a page's carries these.
+  Only an IPv4 path with an MTU under 1,233 B, which carried str0m's old packets, now
+  drops them, as it drops the core's and a page's.
+
+**NB168-1 — Bundles of small datagrams pass 1,232 B (Low).** str0m bundles the DATA
+chunks queued behind SCTP's congestion window into as few packets as it can, and
+sctp-proto's packer (`bundle_data_chunks_into_packets`) counts neither the next chunk's
+16 B header nor any chunk's padding (up to 3 B). At the new target a packet of small
+datagrams can so reach 1,285 B of UDP payload (**theoretical**: 22 datagrams of 33 B and
+one of 73 B, each padded by 3 B, in one record; the core's smallest sealed datagram, a
+PING, is 30 B), or 1,257 B for datagrams the node relays (at least 63 B); at the default
+target these bounds are 1,209 B and 1,181 B, within `MAX_DATAGRAM`. A path at IPv6's
+minimum MTU (1,232 B of UDP payload), or an IPv4 one under 1,313 B, drops such a packet
+while it carries the bulk datagrams and a page's.
+
+It is no stall in SCTP: the channel is unordered with no retransmits, so a lost chunk is
+abandoned (FORWARD-TSN, a packet of its own) and never bundled again, and the link stays
+up. But `Rtcs::send` hands str0m each datagram at once, so small ones are bundled only
+while SCTP's window is full, and then each lost bundle shrinks the window or backs off
+its retransmission timer, so more of them queue and are bundled. In scratch probes
+through a 1,232 B cap, with 50 ms each way, a steady stream of small datagrams past the
+window had that direction of the link carry only a small part of them, and fill its
+buffer, for as long as the stream lasted, where the default target lost none; single
+datagrams after it went through. The stream can come from the node's own app, from the
+peer at the other end (each datagram out of order draws an ACK), or from a member
+relaying through the node to that page within the relay's budget (256 KiB/s a peer).
+Only the last hurts a third party, and it needs such a path between the node and the
+page.
+
+Fix: count the next chunk's header and every chunk's padding in sctp-proto's packer
+(upstream; a `[patch]` here would not reach the crate's users). With that, a target of
+1,228 B keeps every packet, bundles too, within 1,205 B. Until then, str0m's default
+target avoids it, at the cost of NB-168's speed-up.
+
+**Status: open** (Low), reported on NB-169 at `79c3160`; below Medium, so it doesn't
+hold NB-168 back in this round. `cdcc8d6` notes it in `docs/concepts/native-webrtc.md`
+(Security).
 
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
