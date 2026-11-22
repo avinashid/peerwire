@@ -73,7 +73,7 @@ each result.
 ## From source
 
 ```sh
-./packages/js/build.sh                         # -> packages/js/pkg/peerwire_ffi.wasm (356,750 bytes on main)
+./packages/js/build.sh                         # -> packages/js/pkg/peerwire_ffi.wasm (364,844 bytes on main)
 python3 -m http.server -d packages/js 8000     # any static server; the demos are in demo/
 ```
 

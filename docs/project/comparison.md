@@ -6,7 +6,7 @@ Peerwire is ahead only on the roadmap, the table says *planned*.
 | | Peerwire | GunJS | Yjs + y-webrtc | PeerJS | libp2p | Trystero | Hyperswarm |
 |---|---|---|---|---|---|---|---|
 | Core language | Rust (wasm, C ABI, JS) | JS | JS | JS | Go, Rust, JS, … | JS | JS (Node) |
-| Runs in browsers | yes, ~350 KB wasm | yes | yes | yes | yes (limited transports) | yes | no |
+| Runs in browsers | yes, ~360 KB wasm | yes | yes | yes | yes (limited transports) | yes | no |
 | Runs natively / mobile | yes (Rust, C ABI, Godot; ESP32 prototype) | Node | Node | no | yes | no | Node, Bare |
 | Needs a server you run | **no** (uses public Nostr relays and STUN, which you can swap) | relay peers in practice | signaling server | PeerServer | bootstrap nodes | **no** | no (public DHT) |
 | Signaling | invite/QR, BroadcastChannel, Nostr, LAN multicast; DHT planned | relay peers | WebSocket server | PeerServer | DHT, rendezvous | Nostr, BitTorrent, MQTT, IPFS | DHT |

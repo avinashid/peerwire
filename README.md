@@ -122,7 +122,7 @@ The [quick start](docs/getting-started/quick-start.md) walks through each of the
 
 | Package | What it is |
 |---|---|
-| [`@peerwire/js`](packages/js) | Browsers and Node: rooms over WebRTC, shared documents, calls, offline messages. The core as a ~350 KB WebAssembly module with no imports. |
+| [`@peerwire/js`](packages/js) | Browsers and Node: rooms over WebRTC, shared documents, calls, offline messages. The core as a ~360 KB WebAssembly module with no imports. |
 | [`@peerwire/react`](packages/react) | React hooks: rooms, members, chat, shared and per-member state. TypeScript. |
 | [`peerwire`](crates/peerwire) | Rust: `Node` and `AsyncNode` on a UDP socket, with STUN, rooms, NAT traversal and signaling over Nostr, the LAN (multicast and broadcast) or in-process. |
 | [`peerwire-core`](crates/peerwire-core) | The sans-IO session core: identity, Noise IK, lanes, congestion control, peer relay, hole punching. |

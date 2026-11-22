@@ -40,16 +40,18 @@ ble = ["peerwire-core/ble"]
 --features sync,ble`).
 
 `packages/js/build.sh` builds for `wasm32-unknown-unknown` into `target/web` with `opt-level=s`, LTO, one codegen
-unit, stripped symbols and `panic=abort`, then copies the module to `packages/js/pkg/`. `scripts/gate.sh` and CI
-(`.github/scripts/wasm-check.mjs`) fail if the module is over `WASM_MAX_BYTES` (358,400 bytes, 350 KiB) or has any
+unit, stripped symbols and `panic=abort`, then copies the module to `packages/js/pkg/`. The core's per-packet crypto
+(`snow`, `chacha20`, `poly1305`) is built at `opt-level=3` all the same (the workspace's `Cargo.toml`): that takes
+the core less than half the time per datagram, for about 6.6 KB more (NB-168). `scripts/gate.sh` and CI
+(`.github/scripts/wasm-check.mjs`) fail if the module is over `WASM_MAX_BYTES` (366,592 bytes, 358 KiB) or has any
 import. It builds `peerwire_ffi_ble.wasm` too, the same with `ble`: AES-GCM, HMAC-SHA256 and Ed25519 signatures make
 it about 52 KB larger, so only a page that uses Bluetooth loads it, and it has a limit of its own,
-`WASM_BLE_MAX_BYTES` (430,080 bytes, 420 KiB). On `be/NB-110d` (`e16ea68` and this change) the gate's `wasm
-size+imports` step reports, after `packages/js/build.sh`:
+`WASM_BLE_MAX_BYTES` (430,080 bytes, 420 KiB). On `pz/NB-168-speed-fixes` the gate's `wasm size+imports` step
+reports, after `packages/js/build.sh`:
 
 ```text
-packages/js/pkg/peerwire_ffi.wasm: 356894 bytes (limit 358400), 0 imports
-packages/js/pkg/peerwire_ffi_ble.wasm: 409421 bytes (limit 430080), 0 imports
+packages/js/pkg/peerwire_ffi.wasm: 364844 bytes (limit 366592), 0 imports
+packages/js/pkg/peerwire_ffi_ble.wasm: 417953 bytes (limit 430080), 0 imports
 ```
 
 ## Conventions

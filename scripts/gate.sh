@@ -22,7 +22,7 @@
 # The docs' samples are tested too (NB-070): the Rust ones compile, never run, in "rust doc samples" (on a change to
 # Rust or Markdown); the JS ones and every link in "node docs samples" and "node docs links".
 #
-# Env: WASM_MAX_BYTES (default 358400 = 350 KB), WASM_BLE_MAX_BYTES (the module with Bluetooth, peerwire_ffi_ble.wasm:
+# Env: WASM_MAX_BYTES (default 366592 = 358 KiB), WASM_BLE_MAX_BYTES (the module with Bluetooth, peerwire_ffi_ble.wasm:
 #      default 430080 = 420 KB), PLAYWRIGHT (path to playwright's index.mjs),
 #      GATE_JOBS (Node tests at once, default 4), GATE_BROWSER_JOBS (browser tests at once, default 3),
 #      GATE_BASE (what "changed" is measured against, default origin/main),
@@ -48,7 +48,7 @@ done
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 if ! command -v node >/dev/null && [ -s "$HOME/.nvm/nvm.sh" ]; then . "$HOME/.nvm/nvm.sh" >/dev/null; fi
 
-WASM_MAX_BYTES=${WASM_MAX_BYTES:-358400}
+WASM_MAX_BYTES=${WASM_MAX_BYTES:-366592}
 WASM_BLE_MAX_BYTES=${WASM_BLE_MAX_BYTES:-430080}
 WASM=packages/js/pkg/peerwire_ffi.wasm
 WASM_BLE=packages/js/pkg/peerwire_ffi_ble.wasm

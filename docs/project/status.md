@@ -30,7 +30,7 @@ what's next. It's updated as parts land; the [changelog](../../CHANGELOG.md) has
 | Offline messages in JS (`openInbox()`) | ✅ | local fake relays |
 | React hooks (`@peerwire/react`) | ✅ | jsdom, and a Vite example |
 | Godot 4 `PeerwireMultiplayerPeer` (desktop) | ✅ | headless Godot 4.7 |
-| C ABI and the WebAssembly module (~350 KB, no imports) | ✅ | size and import checks on every build |
+| C ABI and the WebAssembly module (~360 KB, no imports) | ✅ | size and import checks on every build |
 | Always-on peer (`peerwire-peer`) in Docker | ✅ | Docker on loopback |
 | Game layer: fixed-point maths, Hilbert islands, desync detection; arena simulation | ✅ | unit tests, the simulator |
 | ESP32-C3 and ESP32 (ESP32-WROOM-32) | 🧪 prototype | Espressif's QEMU only |
