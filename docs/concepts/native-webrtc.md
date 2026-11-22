@@ -99,7 +99,9 @@ core and the policy, and `Node::path_kind` says `Direct`, or `Turn` while its pa
 candidate, so [Share](share-protocol.md#where-data-may-go) sends pieces over it as a page does over its own
 DataChannel. The core's datagrams go on the channel while the connection has at most 1 MiB buffered, as webrtc.js
 sends them; past that they are dropped, as a full UDP buffer drops them, and the core's congestion control backs off.
-A connection whose channel closes or whose ICE fails ends its link at once (`Disconnected`, `Timeout`).
+Each datagram of a bulk transfer (one full fragment, 1,137 B) goes in one SCTP packet, as a browser sends it: str0m's
+MTU target is 1,225 B (`RTC_MTU`), the smallest with room for it, where str0m's default (1,150 B) split each in two
+(NB-168). A connection whose channel closes or whose ICE fails ends its link at once (`Disconnected`, `Timeout`).
 
 ## The room layer
 
@@ -135,6 +137,7 @@ says goodbye first, on the unreliable lane, then the core's sealed close, as `ro
 | `PUBLISH_BURST`, `PUBLISH_EVERY` | 6, 5 s | Offers, answers and copies of either to one peer: a burst, then one per 5 s |
 | `REPLACE_AFTER` | 2 s | A connection is replaced by a new offer from its peer at most this often, and restarts ICE for a page's restart offer at most this often too, or a failed try (which ends the connection); a restart offer must bring new ICE credentials (its `ice-ufrag`), or it is refused |
 | `MAX_BUFFERED` | 1 MiB | Bytes buffered in a connection's SCTP association past which the core's datagrams are dropped |
+| `RTC_MTU` | 1,225 B | str0m's MTU target: the UDP payload it aims each packet at, its handshake's too. It leaves 88 B less (its DTLS and SCTP budgets), 1,137 B, for one SCTP chunk: a bulk transfer's datagram |
 | `PROOF_WITHIN` | 10 s | A link's proof must come this soon after it connects |
 | DataChannel message | 1 to 1,232 B | A larger or empty one, or text, is dropped before the core (str0m takes at most 256 KiB) |
 | room frames waiting | 1,024 | Room frames (proofs, presence, doc answers) waiting for send window, over all browsers |
@@ -218,6 +221,17 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
   open, the SCTP buffer, the DataChannel's message size, the proof deadline, the room frames waiting; a presence is
   at most the reliable lane's largest message (1 MiB) per linked page. str0m bounds its own STUN queue (100 checks
   before the remote credentials) and sctp-proto its receive window (1 MiB).
+- **Packet size (NB-168).** str0m's MTU target is 1,225 B (`RTC_MTU`) where its default was 1,150 B, so the core's
+  datagram of a bulk transfer goes in one SCTP packet of 1,205 B of UDP payload (DTLS 1.2 with AES-GCM), not two.
+  That is under the core's own limit for a UDP datagram (`MAX_DATAGRAM`, 1,232 B: IPv6's minimum MTU less the IPv6
+  and UDP headers) and a browser's own largest (1,228 B, from dcSCTP's 1,191 B SCTP packets), and the DTLS
+  handshake's flights stay smaller (587 and 634 B between two str0m ends). A path that carries the core's own
+  datagrams or a browser's carries these. Only an IPv4 path with an MTU under 1,233 B (below IPv6's minimum) that
+  passed str0m's old packets (up to 1,129 B of UDP payload with data) would now drop the bulk ones, as it drops the
+  core's own full datagrams and a browser's. A core datagram larger than a full fragment (one with an ACK or a relay
+  header too, up to 1,232 B) still goes as two packets, as before. Nothing else changes: the DataChannel's settings,
+  what it carries, the core's wire format and its crypto are the same. Test:
+  `webrtc::tests::a_bulk_transfers_datagram_goes_in_one_packet`.
 - **What parses peer-controlled data.** `serde_json`: signals (after the seal opened: a room member or anyone who
   knows our PeerId and sends to our inbox, within its budget), presence and JSON messages, doc asks. str0m's SDP
   parser (combine): an offer's description only once its room proof checked out, an answer's only from the peer we
@@ -238,7 +252,9 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
 - `cargo test -p peerwire --lib -- webrtc:: browser`: two connections over memory (an offer answered, the channel open,
   datagrams both ways, a close seen by ICE); offers without the room proof, malformed signals and floods; restart
   offers (the same ICE credentials or too soon refused, a real ICE restart answered on the same connection, one str0m
-  refuses counted and the connection ended); the room layer (proof, presence, goodbye, doc asks, dropped tags);
+  refuses counted and the connection ended); a bulk transfer's datagrams, from two core endpoints, one SCTP packet
+  each at `RTC_MTU` and two a byte under it, and no packet over 1,232 B (NB-168); the room layer (proof, presence,
+  goodbye, doc asks, dropped tags);
   browser hellos in the traversal, ours and theirs, and one forged for a native, before and after it links (two nodes
   over memory).
 - `cargo test -p peerwire --test webrtc`: native nodes with WebRTC on and off link with each other over UDP as

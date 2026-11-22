@@ -29,6 +29,8 @@ struct Pair {
     at: [SocketAddr; 2],
     room: Open,
     now: Instant,
+    /// The UDP datagrams each side sent to the other: their first byte and length.
+    wire: [Vec<(u8, usize)>; 2],
 }
 
 impl Pair {
@@ -40,6 +42,7 @@ impl Pair {
             at,
             room: Open { admitted: 0 },
             now: Instant::now(),
+            wire: [Vec::new(), Vec::new()],
         }
     }
 
@@ -56,11 +59,13 @@ impl Pair {
         }
         while let Some((dst, d)) = self.a.poll_udp() {
             if dst == self.at[1] {
+                self.wire[0].push((d[0], d.len()));
                 self.b.receive(now, self.at[0], || self.at[1], &d);
             }
         }
         while let Some((dst, d)) = self.b.poll_udp() {
             if dst == self.at[0] {
+                self.wire[1].push((d[0], d.len()));
                 self.a.receive(now, self.at[1], || self.at[0], &d);
             }
         }
@@ -382,4 +387,85 @@ fn json_is_read_as_room_js_reads_it() {
     assert_eq!(room::json_text(b"\"\xff\"").as_deref(), Some("\"\u{fffd}\""));
     assert_eq!(room::json_text(b"{} x"), None);
     assert_eq!(room::json_text(b""), None);
+}
+
+// ---------- the MTU (NB-168) ----------
+
+type CoreEnd = peerwire_core::Endpoint<SocketAddr>;
+
+/// Hands what `from` (at `src`) sends to `to` until it has nothing more, keeping a copy in `out`.
+fn hand(now: peerwire_core::Instant, from: &mut CoreEnd, to: &mut CoreEnd, src: SocketAddr, out: &mut Vec<Vec<u8>>) {
+    from.handle_timeout(now);
+    while let Some(t) = from.poll_transmit(now) {
+        to.handle_datagram(now, src, &t.payload);
+        out.push(t.payload);
+    }
+}
+
+/// The datagrams of a bulk transfer on the core's reliable lane, as a big file goes: one endpoint sends another
+/// 256 KiB, in memory. Both ways: the handshake and the receiver's ACKs too.
+fn core_bulk_datagrams() -> Vec<Vec<u8>> {
+    use peerwire_core::{Config, Endpoint, Event, Identity};
+    let (ia, ib) = (Identity::from_secret_bytes(&[1; 32]), Identity::from_secret_bytes(&[2; 32]));
+    let at: [SocketAddr; 2] = ["127.0.0.1:1".parse().unwrap(), "127.0.0.1:2".parse().unwrap()];
+    let mut a: CoreEnd = Endpoint::new(&ia, Config::default(), [3; 32]);
+    let mut b: CoreEnd = Endpoint::new(&ib, Config::default(), [4; 32]);
+    let mut now = peerwire_core::Instant::ZERO;
+    a.connect(now, at[1], ib.peer_id()).unwrap();
+    let (msg, mut out, mut sent) = (vec![7u8; 256 << 10], Vec::new(), false);
+    for _ in 0..60_000 {
+        now = now + Duration::from_millis(1);
+        hand(now, &mut a, &mut b, at[0], &mut out);
+        hand(now, &mut b, &mut a, at[1], &mut out);
+        if !sent && a.is_connected(&ib.peer_id()) {
+            a.send(&ib.peer_id(), Lane::Reliable, &msg).unwrap();
+            sent = true;
+        }
+        while let Some(e) = b.poll_event() {
+            if matches!(e, Event::Message { data, .. } if data == msg) {
+                return out;
+            }
+        }
+    }
+    panic!("the transfer didn't end");
+}
+
+/// Sends `datagrams` from `a` to `b`, one per step, over a connection whose two ends have str0m MTU target `mtu`, and
+/// checks each arrives whole: how many DTLS records of application data (first byte 23, RFC 7983) `a` sent for them.
+fn records_for(mtu: usize, datagrams: &[Vec<u8>]) -> (usize, Pair) {
+    let mut p = Pair::new();
+    (p.a.mtu, p.b.mtu) = (mtu, mtu);
+    let (at_a, _) = open(&mut p);
+    for _ in 0..20 {
+        p.step();
+    }
+    let records = |p: &Pair| p.wire[0].iter().filter(|(first, _)| *first == 23).count();
+    let (before, mut got) = (records(&p), Vec::new());
+    for d in datagrams {
+        p.a.send(&at_a, d);
+        p.step();
+        got.extend(std::iter::from_fn(|| p.b.poll_datagram()).map(|(_, _, d)| d));
+    }
+    assert!(got == datagrams, "each arrives whole, at MTU {mtu}");
+    (records(&p) - before, p)
+}
+
+/// NB-168: a datagram of a bulk transfer, one full fragment, goes in one SCTP packet, one DTLS record and one UDP
+/// datagram, as a browser sends it; str0m's default MTU (1150) split it in two, and so does one byte less than
+/// `RTC_MTU`, the smallest that doesn't. Nothing str0m sends, its handshake included, is over the core's own limit.
+#[test]
+fn a_bulk_transfers_datagram_goes_in_one_packet() {
+    // A full fragment's datagram, the smallest over MAX_UNRELIABLE: most of the transfer's. A few carry an ACK too.
+    let bulk = core_bulk_datagrams();
+    let size = bulk.iter().map(Vec::len).filter(|len| *len > peerwire_core::MAX_UNRELIABLE).min().unwrap();
+    let full: Vec<Vec<u8>> = bulk.iter().filter(|d| d.len() == size).cloned().collect();
+    assert!(full.len() * 100 > bulk.len() * 95, "{} of {} datagrams of {size} B", full.len(), bulk.len());
+    assert_eq!(size, RTC_MTU - 48 - 40, "the room str0m leaves a DATA chunk at RTC_MTU");
+
+    let (records, p) = records_for(RTC_MTU, &full);
+    assert_eq!(records, full.len(), "one record, one packet, for each");
+    let largest = p.wire.iter().flatten().map(|(_, len)| *len).max().unwrap();
+    assert!(largest <= MAX_DATAGRAM, "the largest UDP datagram either end sent: {largest} B");
+    let (records, _) = records_for(RTC_MTU - 1, &full[..20]);
+    assert_eq!(records, 40, "a byte less and each goes in two");
 }
