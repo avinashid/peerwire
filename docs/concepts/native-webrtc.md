@@ -242,7 +242,14 @@ packets are the core's, sealed end to end by its Noise session whatever carries 
   such a packet (one at IPv6's minimum MTU carries 1,232 B of UDP payload) drops it, and its datagrams are lost like
   any others: the core sends reliable data again. A full datagram is never bundled (any other chunk beside it would
   pass the target), and the core packs a tick's messages into one datagram, so it takes many small datagrams in a
-  burst faster than SCTP's window (NB-168, open).
+  burst faster than SCTP's window. But on a path that drops packets over about 1,232 B (IPv6 at its minimum MTU, or a
+  1,280 B tunnel), a steady stream of small datagrams past SCTP's window keeps losing those bundles: in security's
+  probe, with 50 ms each way, 2,000 datagrams of 33 B a second lost about 18%, and at 8,000 a second that direction
+  collapsed. The link stays up (each lost chunk is abandoned with a FORWARD-TSN) and single datagrams still get
+  through, and a room member relaying through the node to that page can cause it within the relay's budget
+  (256 KiB/s). It is [NB168-1](../project/threat-model.md#str0ms-packet-size-nb-168--nb168-1) (Low, open), fixed only
+  by a change to sctp-proto's packer upstream (count the next chunk's 16 B header and the padding), after which an
+  `RTC_MTU` of 1,228 B keeps every packet within 1,205 B.
 - **What parses peer-controlled data.** `serde_json`: signals (after the seal opened: a room member or anyone who
   knows our PeerId and sends to our inbox, within its budget), presence and JSON messages, doc asks. str0m's SDP
   parser (combine): an offer's description only once its room proof checked out, an answer's only from the peer we
