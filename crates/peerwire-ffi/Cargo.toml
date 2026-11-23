@@ -30,8 +30,8 @@ sync = ["dep:peerwire-sync"]
 ble = ["peerwire-core/ble"]
 
 [dependencies]
-peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
-peerwire-sync = { version = "0.1.0", path = "../peerwire-sync", optional = true }
+peerwire-core = { version = "0.2.0", path = "../peerwire-core" }
+peerwire-sync = { version = "0.2.0", path = "../peerwire-sync", optional = true }
 rand_core = "0.6"
 rand_chacha = "0.3"
 k256 = { version = "0.13", default-features = false, features = ["schnorr", "arithmetic"] }

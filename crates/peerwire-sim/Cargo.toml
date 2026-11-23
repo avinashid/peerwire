@@ -15,7 +15,7 @@ include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [dependencies]
 # The TURN codec, for the TURN server (src/turn.rs).
-peerwire-core = { version = "0.1.0", path = "../peerwire-core", features = ["turn"] }
+peerwire-core = { version = "0.2.0", path = "../peerwire-core", features = ["turn"] }
 rand_core = "0.6"
 rand_chacha = "0.3"
 

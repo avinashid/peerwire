@@ -4,7 +4,8 @@
 //! connects to the members it hears, proves the room and who it is on each connection, and then carries room hellos,
 //! offers and datagrams over it: a Bluetooth connection is one more path for a link, ranked below every UDP one
 //! ([`PathKind::Bluetooth`](crate::PathKind::Bluetooth)). The node does all of that itself; a driver only advertises,
-//! scans, connects and moves GATT values. Feature `ble-bluez` has the Linux driver, `BlueZ` (`ble::BlueZ`).
+//! scans, connects and moves GATT values. The Linux driver, `BlueZ` (feature `ble-bluez`), isn't in 0.2.0: it comes
+//! back once it has passed its test on real hardware.
 //!
 //! Like any carrier it is untrusted: everything that crosses it is sealed and proved as it is over a relay, and a
 //! listener on the radio sees adverts that change every 15 minutes, sizes and timing, not who is in the room.
@@ -25,8 +26,6 @@ use std::sync::OnceLock;
 use std::task::Waker;
 use std::time::Duration;
 
-#[cfg(feature = "ble-bluez")]
-pub use crate::bluez::BlueZ;
 pub(crate) use peerwire_core::ble::{advert, ble_key};
 pub use peerwire_core::ble::{MIN_ATT_MTU, RX_UUID, SERVICE_UUID, TX_UUID};
 

@@ -7,7 +7,7 @@ each of the others. How the parts fit: [architecture](../concepts/architecture.m
 
 ## Crates
 
-Every crate has the workspace version 0.1.0, edition 2021, `rust-version` 1.88 (the oldest Rust that builds it, which
+Every crate has the workspace version 0.2.0, edition 2021, `rust-version` 1.88 (the oldest Rust that builds it, which
 CI checks) and the license `MIT OR Apache-2.0` (root `Cargo.toml`). All but the Godot binding are on crates.io.
 
 | Package | Path | What it is | Published |
@@ -33,7 +33,7 @@ That is, in `Cargo.toml`:
 
 ```toml
 [dependencies]
-peerwire = { version = "0.1.0", features = ["tokio", "nostr"] }
+peerwire = { version = "0.2.0", features = ["tokio", "nostr"] }
 ```
 
 To build from `main` between releases, depend on the git repository instead. Cargo finds each package by name in the
@@ -63,8 +63,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 | `turn` (default) | A TURN client: [`TurnServer`](#turnserver), `Builder::turn_servers`, `Node::set_turn_servers`, `Node::turn_status`. Without it `PathKind::Turn` is still a kind, but no node has TURN servers | `peerwire-core`'s `turn`: `hmac` 0.12, `sha1` 0.10, `md-5` 0.10 |
 | `tokio` | [`AsyncNode`](#asyncnode) | `tokio` 1 with `net`, `time`, `macros`, `rt` |
 | `nostr` | [`NostrSignaling`](#nostrsignaling) and the `peerwire::nostr` module | `tungstenite` 0.24, `rustls` 0.23 (`ring`), `webpki-roots` 1, `k256` 0.13, `serde_json` 1 |
-| `ble` | Bluetooth LE ([Bluetooth](../concepts/bluetooth.md)): the `peerwire::ble` module (the `Radio` driver trait, `RadioEvent`, `Limits`), `Builder::bluetooth`. The node's side only: a driver comes from `ble-bluez`, or from the app (the ESP32 port's NimBLE one) | nothing |
-| `ble-bluez` | `ble`, and the Linux driver `ble::BlueZ` (BlueZ over D-Bus), which logs what fails and is tried again through `log` | `bluer` 0.17 (`bluetoothd`), `dbus` 0.9 (`vendored`: `libdbus` built from source, so no system package is needed), `futures` 0.3, `log` 0.4, `tokio` 1 (`rt`, `sync`, `macros`) |
+| `ble` | Bluetooth LE ([Bluetooth](../concepts/bluetooth.md)): the `peerwire::ble` module (the `Radio` driver trait, `RadioEvent`, `Limits`), `Builder::bluetooth`. The node's side only: a driver comes from the app (the ESP32 port's NimBLE one). The Linux driver, `ble::BlueZ` (feature `ble-bluez`), isn't in 0.2.0: it comes back after its test on real hardware | nothing |
 | `espnow` | `ble`, and `peerwire::espnow` ([ESP-NOW](../concepts/espnow.md)): `EspNow`, a Bluetooth radio over ESP-NOW frames for a platform's `espnow::Ether` (the ESP32 port's), its `Settings` and `Stats`, and the sans-IO `Engine` and frame codec under it | nothing |
 | `files` | Peerwire Share: the [`peerwire::files`](#files) module, files of any size between peers in checked pieces, in the protocol of the browser's Share page, and the [`share` example](../../examples/rust/share.rs) | nothing (`sha2` and `rand_chacha` are always in) |
 | `webrtc` | WebRTC links to browsers ([Native WebRTC](../concepts/native-webrtc.md)): `Builder::webrtc`, and the [browser methods](#webrtc) of `Node`. A node in a room links with its `joinRoom` pages over a WebRTC DataChannel on its own socket and runs room.js's room layer with them | `str0m` 0.24 (`aws-lc-rs`: AWS-LC built from C with the host's C compiler, no system package), `serde_json` 1 |
@@ -112,7 +111,7 @@ What `use peerwire::…` gives (from `crates/peerwire/src/lib.rs`):
 | `NostrSignaling` (feature `nostr`) | A carrier over Nostr relays. The `peerwire::nostr` module also has `DEFAULT_RELAYS`, `KIND`, `NostrStats`, `RelayStats` and `RelayWatch` | `src/nostr.rs` |
 | `Privacy`, `Role`, `NatType`, `Failure`, `Side` | Which addresses a node gives out, room roles, the NAT type, why a dial failed | `src/traversal.rs` |
 | `PathKind`, `Policy`, `Hop` | The kinds of path, a connection policy, and the addresses a host with TURN or a radio gives its endpoint (a network address, a peer through this node's TURN allocation, a peer's relayed address, or a radio connection, Bluetooth's or ESP-NOW's) | `src/traversal.rs` |
-| `ble` (feature `ble`) | Bluetooth LE: the `Radio` driver trait, `RadioEvent`, `DeviceId`, `ConnId`, `Limits`, the service's UUIDs, and `BlueZ` with `ble-bluez` (`BlueZ::alias`, `BlueZ::names_this_host`) | `src/ble.rs`, `src/bluez.rs` |
+| `ble` (feature `ble`) | Bluetooth LE: the `Radio` driver trait, `RadioEvent`, `DeviceId`, `ConnId`, `Limits` and the service's UUIDs | `src/ble.rs` |
 | `TurnServer` (feature `turn`) | A TURN server and the credentials for it | `src/turn.rs` |
 | `files` (feature `files`) | Peerwire Share: `Files`, its `Event`s, `Wire`, `Source`, `Sink`, `FileSink`, and `files::frame`, the frames and checks ([below](#files)) | `src/files/` |
 | `PortMapping`, `MapProtocol` | Where router port mapping stands | `src/portmap.rs` |
@@ -324,7 +323,7 @@ Options for a `Node`, from `Node::builder()`. Each takes `self` and returns the 
 | `relay_peers` | `impl IntoIterator<Item = S>`, `S: Into<String>` | None | Invites of always-on peers to keep linked as relays (see `Node::set_relay_peers`) |
 | `policy` | `Policy` | None: every path, as before policies | Which paths links may take, and in what order (see [Policy](#policy) and `Node::set_policy`) |
 | `turn_servers` | `impl IntoIterator<Item = TurnServer>` | none | Feature `turn`. This node's own TURN servers, as `Node::set_turn_servers` takes them, resolved in `bind`; used only with `PathKind::Turn` in the policy |
-| `bluetooth` | `impl ble::Radio + 'static` | None | Feature `ble`. A Bluetooth LE radio (`ble::BlueZ` on Linux), or ESP-NOW's (`espnow::EspNow`, feature `espnow`): in a room, the node advertises, links with the members it hears over it, with no network, and ranks it below every UDP path, under the kind the radio names (`ble::Radio::kind`: `PathKind::Bluetooth`, or `PathKind::EspNow`), which a policy must list. Off under `Privacy::RelayOnly`. See [Bluetooth](../concepts/bluetooth.md) and [ESP-NOW](../concepts/espnow.md) |
+| `bluetooth` | `impl ble::Radio + 'static` | None | Feature `ble`. A Bluetooth LE radio (the app's own `ble::Radio`; the ESP32 port's NimBLE one), or ESP-NOW's (`espnow::EspNow`, feature `espnow`): in a room, the node advertises, links with the members it hears over it, with no network, and ranks it below every UDP path, under the kind the radio names (`ble::Radio::kind`: `PathKind::Bluetooth`, or `PathKind::EspNow`), which a policy must list. Off under `Privacy::RelayOnly`. See [Bluetooth](../concepts/bluetooth.md) and [ESP-NOW](../concepts/espnow.md) |
 | `webrtc` | `bool` | `false` | Feature `webrtc`. In a room, links with its `joinRoom` pages over WebRTC, besides its native peers over UDP: it says a browser's hello too, and runs room.js's room layer with pages ([webrtc](#webrtc)). Off under `Privacy::RelayOnly`, whose addresses ICE would give out |
 
 `bind(self, addr: impl ToSocketAddrs) -> io::Result<Node>` binds the socket as `Node::bind` describes. It fails with

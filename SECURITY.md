@@ -12,7 +12,8 @@ repository. Don't open a public issue. We aim to acknowledge within 7 days.
 
 - the `peerwire-core` handshake, wire format, relaying and NAT traversal;
 - the C ABI (`peerwire-ffi`) and the JavaScript glue;
-- the Bluetooth LE transport (`peerwire` features `ble` and `ble-bluez`, and the ESP32's in `peerwire-esp`);
+- the Bluetooth LE transport (`peerwire` feature `ble`, and the ESP32's in `peerwire-esp`; the Linux driver,
+  feature `ble-bluez`, is held out of the 0.2.0 crates until its hardware test);
 - the signaling adapters.
 
 ## Threat model

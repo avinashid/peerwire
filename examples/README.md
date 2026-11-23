@@ -13,10 +13,12 @@ Most work on one machine over loopback; the ones marked **public** use public ST
 | [echo_async.rs](rust/echo_async.rs) | the same with `peerwire::AsyncNode` on tokio |
 | [lan_chat.rs](rust/lan_chat.rs) | chat on one LAN with no internet: copies in the same room find each other over UDP multicast (`LanSignaling`) |
 | [room_chat.rs](rust/room_chat.rs) | the same rooms on the LAN and across the internet at once: `LanSignaling` and `NostrSignaling` in one `MultiSignaling`; with `webrtc`, `joinRoom` pages in the room too ([Native WebRTC](../docs/concepts/native-webrtc.md)) |
-| [ble_chat.rs](rust/ble_chat.rs) | the same rooms over Bluetooth LE on Linux (`Builder::bluetooth` with the BlueZ driver) and the LAN, each link's path printed as it comes up and moves; `--no-udp` for the radio alone. See [Bluetooth](../docs/concepts/bluetooth.md#try-it) |
 | [doctor.rs](rust/doctor.rs) | **public.** The doctor: what this network's NAT does (mapping, filtering, IPv6), router port mapping, and whether each Nostr relay and the LAN carrier work, as text or `--json`; with `room <name>`, meeting a peer and whether the link came up direct, relayed or not at all. Results go in [Connectivity in the field](../docs/project/field-connectivity.md) |
 | [nostr_relay.rs](rust/nostr_relay.rs) | a minimal in-memory Nostr relay, for tests and LAN play without internet |
 | [share.rs](rust/share.rs) | Peerwire Share from a terminal (`peerwire::files`, feature `files`): `share send <room> <file>...` offers files to every peer in the room, `share recv <room> <dir>` asks before taking each one and keeps it once its SHA-256 matches; the [Share protocol](../docs/concepts/share-protocol.md) of the browser page, over direct links only; with `webrtc`, with the Share page itself |
+
+`ble_chat`, the same rooms over Bluetooth LE on Linux, comes back with the BlueZ driver once that has passed its test
+on real hardware: neither is in the 0.2.0 crates ([Bluetooth](../docs/concepts/bluetooth.md#try-it)).
 
 ```sh
 cargo run -p peerwire --example echo                                  # prints an invite, then echoes
@@ -25,7 +27,6 @@ cargo run -p peerwire --features tokio --example echo_async           # the same
 cargo run -p peerwire --features tokio --example echo_async -- pw:…
 cargo run -p peerwire --example lan_chat -- kitchen                   # on two or more machines on one LAN
 cargo run -p peerwire --features nostr --example room_chat -- kitchen # on the LAN and over Nostr relays
-cargo run -p peerwire --features ble-bluez --example ble_chat -- kitchen   # over Bluetooth and the LAN (Linux)
 cargo run -p peerwire --features nostr --example doctor               # the network report (--json, --redact)
 cargo run -p peerwire --features nostr --example doctor -- room <name>     # then meet a peer running the same
 cargo run -p peerwire --features nostr --example nostr_relay -- 127.0.0.1:7447

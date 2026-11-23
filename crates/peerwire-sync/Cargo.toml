@@ -14,7 +14,7 @@ categories = ["data-structures", "network-programming"]
 include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [dependencies]
-peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
+peerwire-core = { version = "0.2.0", path = "../peerwire-core" }
 rand_core = "0.6"
 rand_chacha = "0.3"
 
