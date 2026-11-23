@@ -276,7 +276,7 @@ and the commit that fixed it.
   last took a new authenticated packet, and `Signaling::missed` (0 by default; `NostrSignaling` counts events dropped
   for a full inbox and its time without a relay) what a carrier may have lost.
 
-## Unreleased: `@peerwire/js`
+## `@peerwire/js` 0.4.0 (2026-11-23)
 
 - **Faster crypto in the wasm** (NB-168): `peerwire_ffi.wasm` builds the core's per-packet crypto (`snow`, `chacha20`,
   `poly1305`) at `opt-level=3`, the rest at `s` as before. Both ends of a link in Node 22 take 19 µs of CPU for an
