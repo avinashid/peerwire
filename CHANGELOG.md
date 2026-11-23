@@ -6,8 +6,29 @@ versioning](https://semver.org); before 1.0, a minor version may break the API.
 Every security finding behind a fix below is in the [threat model](docs/project/threat-model.md), with its severity
 and the commit that fixed it.
 
-## Unreleased: Rust crates
+## Rust crates 0.2.0 (2026-11-23)
 
+The Godot extension, built from source, has these changes too. `peerwire-esp` stays at 0.1.1, on the 0.1 crates: its
+entries below come with its next release.
+
+- **On crates.io:** `peerwire`, `peerwire-core`, `peerwire-sync`, `peerwire-game`, `peerwire-sim`, `peerwire-ffi` and
+  `peerwire-peer` 0.2.0. Before 1.0 a minor version may break the API, so a requirement of `"0.1"` doesn't take them:
+  ask for `"0.2"`. New since 0.1.0, in short: faster Share between natives and to browsers (NB-168), native nodes in
+  browser rooms over WebRTC (NB-162), Peerwire Share in Rust, which goes on from the last piece written after a
+  dropped link (NB-159), delayed ACKs (NB-158), Bluetooth LE and ESP-NOW (features `ble` and `espnow`), links over the
+  relays (NB-126), and the fixes below. What breaks:
+  - `peerwire-core`: `Config` gains `max_out_of_order` and `Stats` `rx_out_of_order_dropped` (NB-150), so code that
+    builds either field by field, without `..Default::default()`, must set them;
+  - `peerwire`: `Hop` has new variants (`Ble`, `Pipe`, `Rtc`) and is `#[non_exhaustive]`, so a `match` on it needs a
+    `_` arm, and `Traversal::handle_signal` returns the member a hello or an offer proved;
+  - `peerwire-ffi` is on `peerwire-core` 0.2, with feature `ble` (`pw_ble_*`) new; no `pw_*` signature of 0.1.0
+    changed;
+  - `peerwire-peer` is on `peerwire` 0.2; `peerwire-sync` and `peerwire-sim` are on `peerwire-core` 0.2, their sources
+    otherwise unchanged, and `peerwire-game` changed nothing but its version: the crates go together as one set.
+- **Not in 0.2.0: Bluetooth's Linux driver.** `peerwire`'s feature `ble-bluez` (`ble::BlueZ`, BlueZ over D-Bus) and
+  its example `ble_chat` are held back until the driver has passed its test on real hardware, and come back in a
+  later release; the entries on them below say what they come back with. Feature `ble` is in: a node takes the app's
+  own `ble::Radio`, or ESP-NOW's (`espnow`).
 - **Faster Share over native links** (NB-168, [Share protocol](docs/concepts/share-protocol.md#testing-it)), from
   NB-167's measurements:
   - `peerwire` with `webrtc`: str0m's MTU target is 1,225 B (`RTC_MTU`), not str0m's default of 1,150 B, so each
@@ -20,6 +41,10 @@ and the commit that fixed it.
     `asm` feature, checked at run time). One new dependency there, `sha2-asm` 0.6 (MIT), which builds with the host's
     C compiler. Share hashes every byte twice on each side: native to native on the test host went from 39 to
     72 MB/s. x86-64 already hashed on SHA-NI; Windows on ARM, the wasm module and the ESP32 port are unchanged.
+  - The per-packet crypto (`snow`, `chacha20`, `poly1305`) is built at opt-level 3 in the wasm module, whose build is
+    at `s` otherwise (the workspace's release profile; see `@peerwire/js` 0.4.0). Native release builds were at 3
+    already, and Cargo takes profiles only from the workspace it builds, so an app that depends on these crates builds
+    as before.
 - **Native WebRTC** (NB-162, [Native WebRTC](docs/concepts/native-webrtc.md)): `peerwire` feature `webrtc` (one new
   dependency, `str0m` 0.24 on AWS-LC, and the `nostr` feature's `serde_json`) and `Builder::webrtc(true)` put a native
   node in a browser room: it links with each `joinRoom` page over a WebRTC DataChannel on its own socket, with
@@ -121,7 +146,7 @@ and the commit that fixed it.
   kinds alone leaves the UDP socket unused, as `[Bluetooth]` did. An ESP-NOW node whose policy was
   `[PathKind::Bluetooth]` must now list `EspNow`: with `Bluetooth` alone its radio carries no link, and the node logs a
   warning. `Traversal::radio_kind` and `Traversal::set_radio_kind` are new. `PathKind` is `#[non_exhaustive]`, so a
-  `match` on it has a `_` arm already and no code breaks; neither radio kind is in a published crate yet.
+  `match` on it has a `_` arm already and no code breaks; neither radio kind was in 0.1.0.
 - `peerwire-esp` (NB-142): with a radio (feature `ble` or `espnow`), `config()` caps messages at 4 KiB and the send
   buffer at 8 KiB, not 16 and 32 KiB: Bluetooth takes ~76 KB of a C3's heap, and a C3 with Bluetooth and ESP-NOW and 4
   links could have had 5 to 15 KB left at the larger caps. `RADIO`, `MAX_MESSAGE` and `MAX_SEND_BUFFER` are new. A
@@ -175,19 +200,18 @@ and the commit that fixed it.
 - **Bluetooth LE** (NB-110, [Bluetooth](docs/concepts/bluetooth.md)): `peerwire` feature `ble` (its one dependency
   `log`) gives a node a radio, `Builder::bluetooth`: in a room it advertises, links with the members it hears with no
   network, and ranks the radio below every UDP path (`PathKind::Bluetooth`, not in `Policy::default()`, off under
-  `Privacy::RelayOnly`); a link that loses UDP comes back over the radio, and moves to UDP again once it works.
-  Feature `ble-bluez` adds the Linux driver, `ble::BlueZ`, which tries again what fails and follows the default
-  adapter, and reports a link that drops at once (NB-114). It holds its scan off while it connects, 3 s at a time
-  between runs of 2 s: with the scan on, Linux started a connect only at the scan's next report of the device, 10 s
-  on, and the connect failed (NB-116). The node and the driver log each connection (at `debug`, and failures at
-  `info`), devices named by a hash, never an address. Drivers implement `ble::Radio`; the ESP32's is in
-  `peerwire-esp`.
-- `ble::BlueZ` keeps to its own links: it removes from BlueZ the devices it connected to that BlueZ didn't know
-  before, uses no device that lists HID, and closes only the links it asked BlueZ to make, at once if their device
-  lists HID later (NB110-13, NB110-14, NB110-16). Unless `/etc/bluetooth/input.conf` sets `LEAutoSecurity` false,
-  BlueZ asks to pair with a device that serves HID, on the driver's links too, and the driver says so as it starts
-  (at `info`). A central connect waits its turn at most `SETUP` from asking, reports a failure before the next connect
-  may start, and hands the turn on only once the scan has resumed (NB116-2, NB116-3, NB116-4).
+  `Privacy::RelayOnly`); a link that loses UDP comes back over the radio, and moves to UDP again once it works. Feature
+  `ble-bluez` adds the Linux driver, `ble::BlueZ` (held out of 0.2.0, above), which tries again what fails and follows
+  the default adapter, and reports a link that drops at once (NB-114). It holds its scan off while it connects, 3 s at a
+  time between runs of 2 s: with the scan on, Linux started a connect only at the scan's next report of the device, 10 s
+  on, and the connect failed (NB-116). The node and the driver log each connection (at `debug`, and failures at `info`),
+  devices named by a hash, never an address. Drivers implement `ble::Radio`; the ESP32's is in `peerwire-esp`.
+- `ble::BlueZ` (held out of 0.2.0, above) keeps to its own links: it removes from BlueZ the devices it connected to that
+  BlueZ didn't know before, uses no device that lists HID, and closes only the links it asked BlueZ to make, at once if
+  their device lists HID later (NB110-13, NB110-14, NB110-16). Unless `/etc/bluetooth/input.conf` sets `LEAutoSecurity`
+  false, BlueZ asks to pair with a device that serves HID, on the driver's links too, and the driver says so as it
+  starts (at `info`). A central connect waits its turn at most `SETUP` from asking, reports a failure before the next
+  connect may start, and hands the turn on only once the scan has resumed (NB116-2, NB116-3, NB116-4).
 - `peerwire-esp`: feature `ble`, the ESP32's driver, `ble::Nimble`, on ESP-IDF's NimBLE (ESP32-C3 and ESP32): three
   links, a new non-resolvable random address with each advert, and no bonds (a pairing hands over no keys, and its
   connection is closed). The `ble` example is a room member that sets its clock over Wi-Fi, then links over
@@ -203,8 +227,8 @@ and the commit that fixed it.
   a native peer's (NB-119). The connection's event queue keeps a `CLOSED` past its limit, and `pw_ble_timeout`'s
   deadline can't wrap or go negative (NB110d-I2).
 - **Breaking:** `peerwire::Hop` has a new variant, `Ble`, and is `#[non_exhaustive]` from now on, so a `match` on it
-  outside the crate needs a `_` arm (the next release of `peerwire` is 0.2; `peerwire-peer` and `peerwire-esp` move
-  with it). `Traversal::handle_signal` returns the member a hello or an offer proved (it returned nothing), and
+  outside the crate needs a `_` arm (so `peerwire` is 0.2, and `peerwire-peer` with it; `peerwire-esp` moves at its
+  next release). `Traversal::handle_signal` returns the member a hello or an offer proved (it returned nothing), and
   `Traversal::radio_reaches`, `Traversal::forget_radio` and `Traversal::room_hello` are new, and so are
   `Node::set_waker` (feature `ble`) and `AsyncNode` waking on its radio.
 - **Fix,** `peerwire-esp`: a board whose first NTP server didn't answer within 2 s could hang at boot, with no
