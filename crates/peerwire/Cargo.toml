@@ -15,7 +15,7 @@ include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [package.metadata.docs.rs]
 # The async host, Nostr signaling, the Bluetooth transport and its ESP-NOW radio as well as the default TURN client;
-# not `testing`, which is for bindings, nor `ble-bluez`, which would build libdbus there.
+# not `testing`, which is for bindings.
 features = ["tokio", "nostr", "ble", "espnow", "files", "webrtc"]
 
 [dependencies]
@@ -39,13 +39,7 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 webpki-roots = { version = "1", optional = true }
 k256 = { version = "0.13", optional = true, default-features = false, features = ["schnorr", "arithmetic"] }
 serde_json = { version = "1", optional = true }
-# The Linux Bluetooth driver (feature `ble-bluez`): BlueZ over D-Bus. `dbus` only to build libdbus from source
-# (`vendored`), as a host may have no libdbus headers or pkg-config; futures for bluer's streams (already its own).
-# log (features `ble` and `nostr`) for the radio's connections, what fails and is tried again, and pipes held or
-# given up (already bluer's and tungstenite's).
-bluer = { version = "0.17", optional = true, default-features = false, features = ["bluetoothd"] }
-dbus = { version = "0.9", optional = true, features = ["vendored"] }
-futures = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+# log (features `ble` and `nostr`) for the radio's connections, and pipes held or given up (already tungstenite's).
 log = { version = "0.4", optional = true }
 # WebRTC to browsers (feature `webrtc`, docs/concepts/native-webrtc.md): sans-IO ICE, DTLS (dimpl) and SCTP data
 # channels, on AWS-LC (aws-lc-rs: str0m's default backend; its `rust-crypto` one pulls AWS-LC in too, for rcgen). 0.24
@@ -77,9 +71,10 @@ turn = ["peerwire-core/turn"]
 tokio = ["dep:tokio"]
 nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:serde_json", "dep:log"]
 # Bluetooth LE (docs/concepts/bluetooth.md): the radio driver trait and the node's side of it (Builder::bluetooth),
-# which logs its connections through `log`. Off by default; `ble-bluez` adds the Linux driver.
+# which logs its connections through `log`. Off by default. The Linux driver (`ble::BlueZ`, feature `ble-bluez`, on
+# BlueZ over D-Bus) is held out of 0.2.0 until it has passed its test on real hardware; an app gives the node its own
+# `ble::Radio` meanwhile.
 ble = ["dep:log", "peerwire-core/ble"]
-ble-bluez = ["ble", "dep:bluer", "dep:dbus", "dep:futures", "dep:tokio"]
 # ESP-NOW (docs/concepts/espnow.md): a Bluetooth radio over Espressif's ESP-NOW frames, for a platform that gives it
 # its ESP-NOW (`espnow::Ether`); `peerwire-esp` gives the ESP32's. No dependency of its own.
 espnow = ["ble"]
@@ -111,11 +106,6 @@ peerwire-sim = { path = "../peerwire-sim" }
 peerwire-sync = { path = "../peerwire-sync" }
 # Reading the golden vectors files.js makes (src/files/tests.rs; already in the lock file through the nostr feature).
 serde_json = "1"
-# ble_chat prints the Bluetooth driver's log (already in the tree through bluer and tungstenite).
-log = "0.4"
-# ble_chat ends on Ctrl-C and SIGTERM, so that its node closes and the BlueZ driver removes the devices it connected
-# to, which a signal's default action would skip. 3.4.5 uses the nix (0.29) bluer brings.
-ctrlc = { version = "3.4.5", features = ["termination"] }
 
 [[example]]
 name = "echo"
@@ -134,11 +124,6 @@ path = "../../examples/rust/lan_chat.rs"
 name = "room_chat"
 path = "../../examples/rust/room_chat.rs"
 required-features = ["nostr"]
-
-[[example]]
-name = "ble_chat"
-path = "../../examples/rust/ble_chat.rs"
-required-features = ["ble-bluez"]
 
 [[example]]
 name = "doctor"

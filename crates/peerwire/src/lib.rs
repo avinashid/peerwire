@@ -57,8 +57,6 @@
 mod async_node;
 #[cfg(feature = "ble")]
 pub mod ble;
-#[cfg(feature = "ble-bluez")]
-mod bluez;
 #[cfg(feature = "espnow")]
 pub mod espnow;
 #[cfg(feature = "files")]
