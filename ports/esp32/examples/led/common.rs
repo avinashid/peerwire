@@ -12,7 +12,7 @@ use peerwire_esp::peerwire::{Lane, Node, PeerId};
 const CFG_ADDR: u32 = 0x3F_F000;
 const WIFI_OFFSET: usize = 0x40;
 const ROOM_OFFSET: usize = 0xC0;
-/// The app of `lan_chat`, `room_chat` and `ble_chat` (examples/rust).
+/// The app of `lan_chat` and `room_chat` (examples/rust), and the LED page's (`packages/js/demo/led.html`).
 pub const APP: &str = "peerwire-lan-chat";
 /// The LED's GPIO, `PW_LED_PIN` when building, and whether it's lit when the pin is high, `PW_LED_HIGH`.
 const LED_PIN: Option<&str> = option_env!("PW_LED_PIN");

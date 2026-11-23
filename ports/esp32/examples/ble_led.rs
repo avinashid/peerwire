@@ -1,8 +1,8 @@
 //! The board's own LED, switched by a peer in its room over Bluetooth LE (NB-125), on an ESP32-C3 or ESP32.
 //!
-//! A peer sends `led on`, `led off` or `led toggle` (`led` alone asks), say as a line typed in `ble_chat` on a Linux
-//! PC nearby, and the board switches its LED and answers `led: on` or `led: off`. It tells each peer that links the
-//! LED's state and the commands, answers anything else with "echo: " and the message, and takes the same commands, with
+//! A peer sends `led on`, `led off` or `led toggle` (`led` alone asks), say from the LED page in Android Chrome nearby,
+//! and the board switches its LED and answers `led: on` or `led: off`. It tells each peer that links the LED's state
+//! and the commands, answers anything else with "echo: " and the message, and takes the same commands, with
 //! `id` and `id new`, on the serial console. Anyone in the room can switch the LED: the room's name is the key.
 //!
 //! The LED is GPIO8, lit when the pin is low, as on the ESP32-C3 SuperMini. For another board, build with `PW_LED_PIN`
@@ -13,12 +13,11 @@
 //! As the `ble` example does, it joins room.sh's room ("esp32" if the flash names none) of the `lan_chat` app over
 //! Bluetooth alone. Room hellos must be within a minute of the receiver's clock, and the board has none of its own: if
 //! wifi.sh saved a network and it is there within 20 s, the board sets its clock by SNTP and turns Wi-Fi off; if not,
-//! it takes the time from the first room member that links (a PC's `ble_chat`, a phone's browser page). Wi-Fi is never
-//! needed. Build it with `FEATURES=ble EXAMPLE=ble_led ./build.sh`, then flash out/ble_led.bin; on the PC:
-//!
-//! ```sh
-//! cargo run -p peerwire --features ble-bluez --example ble_chat -- ROOM --no-udp
-//! ```
+//! it takes the time from the first room member that links (the LED page on a phone, say). Wi-Fi is never needed.
+//! Build it with `FEATURES=ble EXAMPLE=ble_led ./build.sh` and flash out/ble_led.bin. Then, in the repo, build the wasm
+//! (`packages/js/build.sh`), serve `packages/js` over https and open `demo/led.html` in Android Chrome (Web Bluetooth
+//! needs a secure page), with `?room=` if room.sh named a room (docs/concepts/bluetooth.md). A Linux PC's `ble_chat`
+//! switches it too once the Linux driver is back: the driver and `ble_chat` aren't in the 0.2.0 crates or on main.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};

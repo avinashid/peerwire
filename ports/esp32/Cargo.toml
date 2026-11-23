@@ -40,13 +40,13 @@ required-features = ["nostr"]
 name = "ble_probe"
 required-features = ["ble"]
 
-# A room member over Bluetooth with Wi-Fi off, for a PC running `ble_chat` (NB-110c):
-# `FEATURES=ble EXAMPLE=ble ./build.sh`.
+# A room member over Bluetooth with Wi-Fi off, for a browser's `BluetoothTransport` nearby, or a PC's `ble_chat` once
+# the Linux driver is back (NB-110c): `FEATURES=ble EXAMPLE=ble ./build.sh`.
 [[example]]
 name = "ble"
 required-features = ["ble"]
 
-# The board's LED, switched by `ble_chat` in its room over Bluetooth (NB-125):
+# The board's LED, switched by the LED page (packages/js/demo/led.html) in its room over Bluetooth (NB-125):
 # `FEATURES=ble EXAMPLE=ble_led ./build.sh`; `PW_LED_PIN`, `PW_LED_HIGH` for another board's LED.
 [[example]]
 name = "ble_led"
@@ -78,7 +78,7 @@ opt-level = "z"
 
 [dependencies]
 # Without the default TURN client (NB-099): a follow-up, as is its code size here.
-peerwire = { version = "0.1.0", path = "../../crates/peerwire", default-features = false }
+peerwire = { version = "0.2.0", path = "../../crates/peerwire", default-features = false }
 esp-idf-svc = "0.53"
 log = "0.4"
 anyhow = "1"
@@ -89,7 +89,7 @@ esp32-nimble = { version = "0.13", optional = true }
 
 [dev-dependencies]
 # ble_probe times a handshake between two endpoints in memory.
-peerwire-core = { version = "0.1.0", path = "../../crates/peerwire-core" }
+peerwire-core = { version = "0.2.0", path = "../../crates/peerwire-core" }
 
 [build-dependencies]
 embuild = "0.33.5"
