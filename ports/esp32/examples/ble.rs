@@ -4,12 +4,13 @@
 //! record in the last flash sector, as the mesh example reads it, the board first tries that Wi-Fi for up to 20 s and
 //! sets its clock by SNTP, starts NimBLE and logs the heap with both radios on, then turns Wi-Fi off. With no network,
 //! it takes the time from the first room member that links over Bluetooth. It joins room.sh's room ("esp32" if the
-//! flash names none) of the `lan_chat` and `room_chat` app, over Bluetooth alone: a PC nearby running `ble_chat` in
-//! that room links with it over the radio.
+//! flash names none) of the `lan_chat` and `room_chat` app, over Bluetooth alone: a browser's `BluetoothTransport`
+//! nearby in that room (the LED page, `packages/js/demo/led.html`) links with it over the radio, as a PC's `ble_chat`
+//! does once the Linux driver is back (the driver and `ble_chat` aren't in the 0.2.0 crates or on main).
 //!
 //! Built with `PW_KEEP_WIFI` set, it keeps Wi-Fi on and its socket on the board's address, with no signaling: a peer
 //! is still found over Bluetooth only, and a link moves to UDP once that works (the spec's Paths: UDP first), so a PC
-//! on the same network running `ble_chat` without `--no-udp` sees it move.
+//! on the same network running `ble_chat` without `--no-udp` sees it move. A browser's link stays on the radio.
 //!
 //! It logs each link with its path kind, answers each message with "echo: " and the message, sends each linked peer
 //! a numbered message every 5 s (every fourth one 2,000 B, a few GATT values long), and logs the links, the free heap
