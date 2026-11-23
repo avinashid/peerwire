@@ -963,7 +963,8 @@ globalThis.document?.querySelector('button')?.addEventListener('click', async ()
 ```
 
 Bluetooth LE in the browser, with Web Bluetooth (Chrome and Edge; on a phone, Android Chrome), as a central only: the
-user picks a device nearby that runs Peerwire (a Linux machine running `ble_chat`, an ESP32 board running `ble_led`)
+user picks a device nearby that runs Peerwire (an ESP32 board running `ble_led`; a Linux machine running `ble_chat`
+once the Linux driver is back, [Bluetooth](../concepts/bluetooth.md))
 and the page links with the room member there over Bluetooth alone, with no network. Two browsers can't link this way,
 and Firefox, Safari and every iPhone browser have no Web Bluetooth. The protocol ([Bluetooth](../concepts/bluetooth.md))
 runs in the wasm; the transport moves GATT values, one write without response at a time, 20 bytes at most each, as Web

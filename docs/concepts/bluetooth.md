@@ -6,6 +6,11 @@
 > connection's protocol (the framing, the room proof, identity proofs and sealed signals) is in `peerwire-core`
 > (`ble.rs`, `ble::Link` with feature `ble`); the node's side is the `peerwire` feature `ble`, the Linux driver
 > `ble-bluez`, and the browser's `BluetoothTransport` in `@peerwire/js`. Nothing here has run over a real radio yet.
+>
+> The Linux driver (`ble::BlueZ`, feature `ble-bluez`) and its example `ble_chat` aren't in the 0.2.0 crates, nor on
+> main: they come back once the driver has passed its test on real hardware. What this page says of them is the design
+> they come back with. Feature `ble` is in 0.2.0, with ESP-NOW and the C ABI's Bluetooth: an app gives the node its
+> own `ble::Radio` meanwhile.
 
 Peers near each other link over Bluetooth LE when they share no network: a laptop and an ESP32 board with the Wi-Fi
 down, say. A Bluetooth connection is one more path for a link, beside its UDP paths: the same identities, Noise
@@ -14,7 +19,7 @@ radio too, so no network is needed at all. It is opt-in: a node uses the radio o
 
 | Platform | Connects out | Is found and accepted | Notes |
 |---|---|---|---|
-| Rust on Linux (BlueZ) | yes | yes, one central at a time | feature `ble-bluez` |
+| Rust on Linux (BlueZ) | yes | yes, one central at a time | feature `ble-bluez`, not in 0.2.0 (above) |
 | ESP32-C3 and ESP32 (NimBLE) | yes | yes | NB-110c; three connections at most |
 | Chrome and Edge, Android Chrome | yes, after the user picks the device | no | NB-110d; central only, `BluetoothTransport` |
 | Firefox, Safari, every iPhone browser | no | no | no Web Bluetooth |
@@ -335,8 +340,8 @@ goes down, unless the node closed it: till then the node takes it to be up, and 
 for an ACCEPT that may be forged, NB135-5): the node connects to that advert again 1 to 4 s later, not a minute.
 A driver that never sends `Advertising` is taken to advertise as asked. `Builder::bluetooth(radio)` gives a node its
 radio; `Node::poll` drains its events, and `Node::set_waker` (which `AsyncNode` calls itself) hands it a waker.
-Feature `ble-bluez` adds the Linux driver, `BlueZ`; the ESP32's NimBLE driver lives in `peerwire-esp` (NB-110c), and
-tests use an in-process pair of fake radios.
+Feature `ble-bluez` adds the Linux driver, `BlueZ` (not in 0.2.0: see the note at the top); the ESP32's NimBLE driver
+lives in `peerwire-esp` (NB-110c), and tests use an in-process pair of fake radios.
 
 ## Platforms
 
@@ -498,9 +503,10 @@ tests use an in-process pair of fake radios.
 
 ## Try it
 
-`ble_chat` (`examples/rust/ble_chat.rs`) joins a room over the radio and the LAN on Linux, and prints the path each
-link takes (`Direct` over UDP, `Bluetooth` over the radio), again each time it moves. Run it on two machines nearby,
-or beside an ESP32 in the same room (`room_chat`'s rooms, app `peerwire-lan-chat`):
+`ble_chat` comes back with the Linux driver after its hardware test: it isn't on main or in 0.2.0 meanwhile, so the
+commands below are what it runs with then. It joins a room over the radio and the LAN on Linux, and prints the path
+each link takes (`Direct` over UDP, `Bluetooth` over the radio), again each time it moves. Run it on two machines
+nearby, or beside an ESP32 in the same room (`room_chat`'s rooms, app `peerwire-lan-chat`):
 
 ```sh
 cargo run -p peerwire --features ble-bluez --example ble_chat -- kitchen            # UDP first, the radio as well
