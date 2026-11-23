@@ -78,7 +78,7 @@ opt-level = "z"
 
 [dependencies]
 # Without the default TURN client (NB-099): a follow-up, as is its code size here.
-peerwire = { version = "0.1.0", path = "../../crates/peerwire", default-features = false }
+peerwire = { version = "0.2.0", path = "../../crates/peerwire", default-features = false }
 esp-idf-svc = "0.53"
 log = "0.4"
 anyhow = "1"
@@ -89,7 +89,7 @@ esp32-nimble = { version = "0.13", optional = true }
 
 [dev-dependencies]
 # ble_probe times a handshake between two endpoints in memory.
-peerwire-core = { version = "0.1.0", path = "../../crates/peerwire-core" }
+peerwire-core = { version = "0.2.0", path = "../../crates/peerwire-core" }
 
 [build-dependencies]
 embuild = "0.33.5"
