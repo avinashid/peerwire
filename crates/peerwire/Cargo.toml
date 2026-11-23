@@ -19,7 +19,7 @@ include = ["/src", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 features = ["tokio", "nostr", "ble", "espnow", "files", "webrtc"]
 
 [dependencies]
-peerwire-core = { version = "0.1.0", path = "../peerwire-core" }
+peerwire-core = { version = "0.2.0", path = "../peerwire-core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # Deterministic randomness in the sans-IO traversal (already used by peerwire-sim and peerwire-ffi).
 rand_chacha = "0.3"

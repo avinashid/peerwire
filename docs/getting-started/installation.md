@@ -44,7 +44,7 @@ That adds to `Cargo.toml`:
 
 ```toml
 [dependencies]
-peerwire = { version = "0.1.0", features = ["nostr", "tokio"] }
+peerwire = { version = "0.2.0", features = ["nostr", "tokio"] }
 ```
 
 | Feature | Adds |
@@ -53,7 +53,7 @@ peerwire = { version = "0.1.0", features = ["nostr", "tokio"] }
 | `tokio` | `AsyncNode`: the node as a tokio task that waits on its socket and timers |
 
 With neither feature, you get the blocking `Node`, invites, `MemoryHub` for tests and `LanSignaling` for the local
-network. Before 1.0 a minor version may break the API, and `0.1.0` there takes 0.1 releases only.
+network. Before 1.0 a minor version may break the API, and `0.2.0` there takes 0.2 releases only.
 
 To build from `main` between releases, take it from git instead, with `rev = "…"` to pin a commit:
 

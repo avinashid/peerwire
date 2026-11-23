@@ -918,7 +918,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "peerwire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "hmac",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "peerwire-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "peerwire-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "hmac",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "peerwire-game"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "peerwire-godot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "godot",
  "peerwire",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "peerwire-peer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "peerwire",
  "rand_core 0.6.4",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "peerwire-sim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "peerwire",
  "peerwire-core",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "peerwire-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "peerwire-core",
  "peerwire-sim",

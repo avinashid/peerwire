@@ -10,7 +10,7 @@ what's next. It's updated as parts land; the [changelog](../../CHANGELOG.md) has
 |---|---|---|
 | `@peerwire/js` | 0.4.0 on npm (23 Nov 2026) | 0.4.0 |
 | `@peerwire/react` | 0.1.1 on npm (1 Nov 2026) | 0.1.1 |
-| Rust crates | 0.1.0 on crates.io (5 Nov 2026) | 0.1.0 |
+| Rust crates | 0.2.0 on crates.io (23 Nov 2026); `peerwire-esp` 0.1.1 (5 Nov 2026) | 0.2.0; `peerwire-esp` 0.1.1 |
 | Godot extension | built from source | |
 
 ## What works

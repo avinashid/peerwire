@@ -7,7 +7,7 @@ each of the others. How the parts fit: [architecture](../concepts/architecture.m
 
 ## Crates
 
-Every crate has the workspace version 0.1.0, edition 2021, `rust-version` 1.88 (the oldest Rust that builds it, which
+Every crate has the workspace version 0.2.0, edition 2021, `rust-version` 1.88 (the oldest Rust that builds it, which
 CI checks) and the license `MIT OR Apache-2.0` (root `Cargo.toml`). All but the Godot binding are on crates.io.
 
 | Package | Path | What it is | Published |
@@ -33,7 +33,7 @@ That is, in `Cargo.toml`:
 
 ```toml
 [dependencies]
-peerwire = { version = "0.1.0", features = ["tokio", "nostr"] }
+peerwire = { version = "0.2.0", features = ["tokio", "nostr"] }
 ```
 
 To build from `main` between releases, depend on the git repository instead. Cargo finds each package by name in the
